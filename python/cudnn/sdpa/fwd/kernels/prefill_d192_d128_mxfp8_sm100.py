@@ -157,6 +157,18 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
     return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
+def _exp2_chunk0_e4_6pairs(vec):
+    values = []
+    for i in range(0, int(vec.shape[0]), 2):
+        if i < 30 and i % 10 < 4:
+            x, y = ex2_emulation_2(vec[i], vec[i + 1])
+        else:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
+        values.extend((x, y))
+    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
+
+
 def _exp2_mixed_late(vec):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
@@ -306,8 +318,10 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 
 
-# Kernel TMEM layout: P aliases each S_acc tail (4:1 FP8 pack), while block
-# scale operands reuse transiently dead regions within the 512-column limit.
+# Kernel TMEM layout: each logical P cross-inplaces the opposite S_acc tail
+# (4:1 FP8 pack), while block-scale operands reuse transiently dead regions
+# within the 512-column limit.  This lets the next score MMA issue before the
+# preceding PV MMA, guarded by the softmax score-loaded handoff.
 @dataclass(frozen=True)
 class KernelTmemLayout:
     # Blackwell SM10.0 512-col TMEM cap.
@@ -319,10 +333,9 @@ class KernelTmemLayout:
     O0_OFF: int = 256
     O1_OFF: int = 384
 
-    # FP8 P is 4:1-packed at the S_acc tails (96 / 224); the lower halves of each
-    # S_acc slot (< P) are free for reloaded SF operands.
-    P0_OFF: int = 96
-    P1_OFF: int = 224
+    # Logical P0 occupies physical S_acc_1; logical P1 occupies S_acc_0.
+    P0_OFF: int = 224
+    P1_OFF: int = 96
 
     SF_HEAD_OFFSET: int = 8
     SF_AFTER_P_OFFSET: int = 32
@@ -344,12 +357,11 @@ class KernelTmemLayout:
     SF_K0_PRO_OFF: int = 256 + SF_TMEM_COLS_Q  # 264
     SF_Q1_PRO_OFF: int = 256 + SF_TMEM_COLS_Q + SF_TMEM_COLS_K  # 272
     SF_K1_PRO_OFF: int = 256 + 2 * SF_TMEM_COLS_Q + SF_TMEM_COLS_K  # 280
-    # BMM2 SF_P/V per sub-tile (S_acc region + SF_AFTER_P_OFFSET); the existing
-    # bmm2_ready wait already proves softmax read all of S_acc, so no extra gate.
-    SF_P0_OFF: int = SF_AFTER_P_OFFSET  # 32
-    SF_V0_OFF: int = SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 36
-    SF_P1_OFF: int = 128 + SF_AFTER_P_OFFSET  # 160
-    SF_V1_OFF: int = 128 + SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 164
+    # BMM2 SF_P/V follow their cross-inplaced logical P operands.
+    SF_P0_OFF: int = 128 + SF_AFTER_P_OFFSET  # 160
+    SF_V0_OFF: int = 128 + SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 164
+    SF_P1_OFF: int = SF_AFTER_P_OFFSET  # 32
+    SF_V1_OFF: int = SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 36
 
 
 LAYOUT = KernelTmemLayout()
@@ -524,6 +536,12 @@ def _kernel(
     # Leader-waited (P8): both CTAs' softmax arrive_on_leader → init = CTA_MMA.
     mb_softmax_ldtm = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
 
+    # Per-CTA one-way handoffs guarding cross-inplaced P stores.  Each score
+    # stream publishes one token after its four softmax warps have completed
+    # TMEM->register loads.  P0 consumes S1 tokens; P1 consumes S0 tokens one
+    # phase later so next-S0 can issue before prior-P0V.
+    mb_p_inplace = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
+
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
     sched = Sched(
@@ -570,6 +588,7 @@ def _kernel(
                 # Leader-waited (P8): each softmax warp elect-arrives after its own
                 # S_acc LDTM+wait → SOFTMAX_WG_WARPS arrives per CTA × CTA_MMA CTAs.
                 nvvm.mbarrier_init(mb_softmax_ldtm.subview(qs), CFG.SOFTMAX_WG_WARPS * CFG.CTA_MMA)
+                nvvm.mbarrier_init(mb_p_inplace.subview(qs), CFG.SOFTMAX_WG_WARPS)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
 
@@ -603,7 +622,12 @@ def _kernel(
         else CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS
     )
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < softmax_first_end:
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == 0):
+            nvvm.setmaxregister(200, nvvm.SetMaxRegisterAction.INCREASE)
+        elif cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS != 0):
+            nvvm.setmaxregister(192, nvvm.SetMaxRegisterAction.INCREASE)
+        else:
+            nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(MERGE_SOFTMAX_WGS):
             sub_tile_id = (warp_idx - cutlass.Int32(CFG.SOFTMAX_WG0_BASE)) // cutlass.Int32(CFG.SOFTMAX_WG_WARPS)
         else:
@@ -619,6 +643,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_p_inplace=mb_p_inplace,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -628,7 +653,12 @@ def _kernel(
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.CORR_WARP_BASE:
-        nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == 0):
+            nvvm.setmaxregister(200, nvvm.SetMaxRegisterAction.INCREASE)
+        elif cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS != 0):
+            nvvm.setmaxregister(192, nvvm.SetMaxRegisterAction.INCREASE)
+        else:
+            nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=1,
             seqlen_q=seqlen_q,
@@ -640,6 +670,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_p_inplace=mb_p_inplace,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -649,7 +680,12 @@ def _kernel(
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
-        nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == 0):
+            nvvm.setmaxregister(72, nvvm.SetMaxRegisterAction.DECREASE)
+        elif cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS != 0):
+            nvvm.setmaxregister(88, nvvm.SetMaxRegisterAction.DECREASE)
+        else:
+            nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _correction_warp_group(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
@@ -924,9 +960,15 @@ def _tmaldg_warp_group(
 
             bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
             if cutlass.const_expr(CFG.CTA_MMA == 2):
-                if is_leader:
-                    if nvvm.elect_sync():
-                        bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
+                if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_NONE):
+                    bars.mb_k_full[kv_state.idx].arrive(
+                        n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES,
+                        pred=is_leader & nvvm.elect_sync(),
+                    )
+                else:
+                    if is_leader:
+                        if nvvm.elect_sync():
+                            bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
             else:
                 if nvvm.elect_sync():
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
@@ -1004,9 +1046,15 @@ def _tmaldg_warp_group(
 
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
-                    if is_leader:
-                        if nvvm.elect_sync():
-                            bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
+                    if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_NONE):
+                        bars.mb_k_full[kv_state.idx].arrive(
+                            n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES,
+                            pred=is_leader & nvvm.elect_sync(),
+                        )
+                    else:
+                        if is_leader:
+                            if nvvm.elect_sync():
+                                bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
                 else:
                     if nvvm.elect_sync():
                         bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES)
@@ -1033,9 +1081,15 @@ def _tmaldg_warp_group(
 
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
-                    if is_leader:
-                        if nvvm.elect_sync():
-                            bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES)
+                    if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_NONE):
+                        bars.mb_v_full[kv_state.idx].arrive(
+                            n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES,
+                            pred=is_leader & nvvm.elect_sync(),
+                        )
+                    else:
+                        if is_leader:
+                            if nvvm.elect_sync():
+                                bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES)
                 else:
                     if nvvm.elect_sync():
                         bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES)
@@ -1336,10 +1390,96 @@ def _mma_warp_group(
                 multicast=nvvm.Tcgen05CpMulticast.WARPX4,
             )
 
+    def _utccp_bmm1_sf_block(tmem_sf_q, tmem_sf_k, smem_desc_q, smem_desc_k, sf_block: int):
+        nvvm.tcgen05_cp(
+            nvvm.Tcgen05CpShape.SHAPE_32X128B,
+            tmem_sf_q.subview(sf_block * SF_REGISTERS_PER_BLOCK),
+            smem_desc_q + sf_block * (SF_BYTES_PER_BLOCK // 16),
+            group=CTA_GROUP_KIND,
+            multicast=nvvm.Tcgen05CpMulticast.WARPX4,
+        )
+        nvvm.tcgen05_cp(
+            nvvm.Tcgen05CpShape.SHAPE_32X128B,
+            tmem_sf_k.subview(sf_block * SF_REGISTERS_PER_BLOCK),
+            smem_desc_k + sf_block * (SF_BYTES_PER_BLOCK // 16),
+            group=CTA_GROUP_KIND,
+            multicast=nvvm.Tcgen05CpMulticast.WARPX4,
+        )
+
+    def _launch_bmm1(
+        bmm1_desc_arg,
+        desc_q,
+        desc_k,
+        tmem_s,
+        tmem_sf_q,
+        tmem_sf_k,
+        smem_desc_q_sf,
+        smem_desc_k_sf,
+        interleave_bmm2_sf=False,
+        interleave_bmm2_p_sf=False,
+        tmem_sf_p=None,
+        tmem_sf_v=None,
+        smem_desc_p_sf=None,
+        smem_desc_v_sf=None,
+    ):
+        if cutlass.const_expr(SF_NUM_BLOCKS_K == 2):
+            first_k_count = (
+                1 if cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS != 0) else SF_BLOCK_DIM_K
+            )
+            # Block 0 covers the first four K steps.  E4 causal gives block 1
+            # extra lead time; other paths delay it to the exact-use frontier.
+            if nvvm.elect_sync():
+                _utccp_bmm1_sf_block(tmem_sf_q, tmem_sf_k, smem_desc_q_sf, smem_desc_k_sf, 0)
+            mma_ss(
+                bmm1_desc_arg,
+                desc_q,
+                desc_k,
+                tmem_s,
+                tmem_sf_a=tmem_sf_q,
+                tmem_sf_b=tmem_sf_k,
+                k_count=first_k_count,
+            )
+            if cutlass.const_expr(interleave_bmm2_sf):
+                if nvvm.elect_sync():
+                    _utccp_bmm2_sf(tmem_sf_p, tmem_sf_v, smem_desc_p_sf, smem_desc_v_sf)
+            if cutlass.const_expr(interleave_bmm2_p_sf):
+                if nvvm.elect_sync():
+                    _utccp_bmm2_p_sf(tmem_sf_p, smem_desc_p_sf)
+            if nvvm.elect_sync():
+                _utccp_bmm1_sf_block(tmem_sf_q, tmem_sf_k, smem_desc_q_sf, smem_desc_k_sf, 1)
+            mma_ss(
+                bmm1_desc_arg,
+                desc_q,
+                desc_k,
+                tmem_s,
+                tmem_sf_a=tmem_sf_q,
+                tmem_sf_b=tmem_sf_k,
+                accumulate=True,
+                k_start=first_k_count,
+                k_count=bmm1_desc_arg.num_k_steps - first_k_count,
+            )
+        else:
+            if nvvm.elect_sync():
+                _utccp_bmm1_sf(tmem_sf_q, tmem_sf_k, smem_desc_q_sf, smem_desc_k_sf)
+            mma_ss(
+                bmm1_desc_arg,
+                desc_q,
+                desc_k,
+                tmem_s,
+                tmem_sf_a=tmem_sf_q,
+                tmem_sf_b=tmem_sf_k,
+            )
+
     def _utccp_bmm2_sf(tmem_sf_p, tmem_sf_v, smem_desc_p, smem_desc_v):
         # SF_P is the constant P_SF; SF_V is per-kv-tile.  Both single-block (llama).
         # desc_P_SF_0 passed explicitly (DSL-value closure capture is unstaged).
         nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+
+    def _utccp_bmm2_p_sf(tmem_sf_p, smem_desc_p):
+        nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_p, smem_desc_p, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
+
+    def _utccp_bmm2_v_sf(tmem_sf_v, smem_desc_v):
         nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32X128B, tmem_sf_v, smem_desc_v, group=CTA_GROUP_KIND, multicast=nvvm.Tcgen05CpMulticast.WARPX4)
 
     if cutlass.const_expr(CFG.MASK_FLAGS == 0):
@@ -1380,6 +1520,19 @@ def _mma_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
+        skip_s0_tail = cutlass.Boolean(False)
+        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
+            # Recompute for every persistent tile: scheduler payload, effective
+            # sequence lengths, and therefore the causal tail all change.
+            cga_q_row_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+            s0_last_q = cga_q_row_base + cutlass.Int32(
+                (CFG.CTA_MMA - 1) * CFG.TILES_Q * CFG.TILE_M + CFG.TILE_M - 1
+            )
+            causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+            s0_last_valid_k = s0_last_q + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)
+            tail_k_begin = (kv_right - cutlass.Int32(1)) * cutlass.Int32(CFG.TILE_N)
+            skip_s0_tail = ((kv_right - kv_left) > cutlass.Int32(1)) & (tail_k_begin > s0_last_valid_k)
+
         if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
             # Empty mainloop — keep softmax/correction phase trackers in lockstep with non-empty path.
             bars.mb_empty_mainloop.wait(empty_mainloop_phase)
@@ -1395,9 +1548,16 @@ def _mma_warp_group(
             bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
             desc_K = sK[kv_state.idx].desc()
             desc_K_SF = sK_SF[kv_state.idx].desc()
-            if nvvm.elect_sync():
-                _utccp_bmm1_sf(tmem_SF_Q0_pro, tmem_SF_K0_pro, desc_Q_SF_0, desc_K_SF)
-            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), tmem_sf_a=tmem_SF_Q0_pro, tmem_sf_b=tmem_SF_K0_pro)
+            _launch_bmm1(
+                bmm1_desc,
+                desc_Q0,
+                desc_K,
+                tmem_raw.subview(LAYOUT.S0_OFF),
+                tmem_SF_Q0_pro,
+                tmem_SF_K0_pro,
+                desc_Q_SF_0,
+                desc_K_SF,
+            )
             if nvvm.elect_sync():
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1408,9 +1568,16 @@ def _mma_warp_group(
             # Prologue SF is O-region-dead, so this wait is alignment-only.
             wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
             ldtm_phase0 = ldtm_phase0 ^ 1
-            if nvvm.elect_sync():
-                _utccp_bmm1_sf(tmem_SF_Q1_pro, tmem_SF_K1_pro, desc_Q_SF_1, desc_K_SF)
-            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), tmem_sf_a=tmem_SF_Q1_pro, tmem_sf_b=tmem_SF_K1_pro)
+            _launch_bmm1(
+                bmm1_desc,
+                desc_Q1,
+                desc_K,
+                tmem_raw.subview(LAYOUT.S1_OFF),
+                tmem_SF_Q1_pro,
+                tmem_SF_K1_pro,
+                desc_Q_SF_1,
+                desc_K_SF,
+            )
             if nvvm.elect_sync():
                 bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
@@ -1421,16 +1588,44 @@ def _mma_warp_group(
                 old_state = kv_state
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
+                # Cross-inplace schedule: next S0 precedes prior P0V.  P0 lives
+                # in physical S1, so softmax1's LDTM token proves both that the
+                # Q/K-SF scratch is free and that P0 may be stored there.
+                bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
+                desc_K = sK[kv_state.idx].desc()
+                desc_K_SF = sK_SF[kv_state.idx].desc()
+                wait(mb_softmax_ldtm.subview(1), ldtm_phase1)
+                ldtm_phase1 = ldtm_phase1 ^ 1
+                _launch_bmm1(
+                    bmm1_desc,
+                    desc_Q0,
+                    desc_K,
+                    tmem_raw.subview(LAYOUT.S0_OFF),
+                    tmem_SF_Q0,
+                    tmem_SF_K0,
+                    desc_Q_SF_0,
+                    desc_K_SF,
+                    interleave_bmm2_p_sf=(CFG.MASK_FLAGS == 0),
+                    tmem_sf_p=tmem_SF_P0,
+                    smem_desc_p_sf=desc_P_SF_0,
+                )
+                if nvvm.elect_sync():
+                    bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+
+                # Keep the masked-path P-SF copy ahead of the V wait.
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
+
                 bars.mb_v_full[old_state.idx].wait(old_state.phase)
                 desc_V = sV[old_state.idx].desc()
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
 
-                # BMM2[sub0] → O_0.  SF_P0/V0 reload into S_acc_0 scratch (32/36);
-                # the bmm2_ready wait already proves softmax[0] read all of S_acc_0.
-                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                # Prior P0V consumes cross-inplaced P0/SF from physical S1.
                 if nvvm.elect_sync():
-                    _utccp_bmm2_sf(tmem_SF_P0, tmem_SF_V0, desc_P_SF_0, desc_V_SF)
+                    _utccp_bmm2_v_sf(tmem_SF_V0, desc_V_SF)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1459,25 +1654,41 @@ def _mma_warp_group(
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
-                # BMM1[sub0] next-kv → S_acc_0.  SF_Q0/K0 ping-pong into S_acc_1
-                # scratch (136/140); wait tile1's softmax LDTM (ONE-behind) so its
-                # read of S_acc_1 completed before the leader-broadcast UTCCP
-                # (cta_group::2 self-fills both CTAs) overwrites it.
-                bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
-                desc_K = sK[kv_state.idx].desc()
-                desc_K_SF = sK_SF[kv_state.idx].desc()
-                wait(mb_softmax_ldtm.subview(1), ldtm_phase1)
-                ldtm_phase1 = ldtm_phase1 ^ 1
+                # Next S1 follows prior P0V.  It waits until softmax0 has read
+                # next S0; that same token lets P1 overwrite physical S0.
+                wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
+                ldtm_phase0 = ldtm_phase0 ^ 1
+                _launch_bmm1(
+                    bmm1_desc,
+                    desc_Q1,
+                    desc_K,
+                    tmem_raw.subview(LAYOUT.S1_OFF),
+                    tmem_SF_Q1,
+                    tmem_SF_K1,
+                    desc_Q_SF_1,
+                    desc_K_SF,
+                    interleave_bmm2_sf=(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == 0),
+                    tmem_sf_p=tmem_SF_P1,
+                    tmem_sf_v=tmem_SF_V1,
+                    smem_desc_p_sf=desc_P_SF_0,
+                    smem_desc_v_sf=desc_V_SF,
+                )
                 if nvvm.elect_sync():
-                    _utccp_bmm1_sf(tmem_SF_Q0, tmem_SF_K0, desc_Q_SF_0, desc_K_SF)
-                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), tmem_sf_a=tmem_SF_Q0, tmem_sf_b=tmem_SF_K0)
-                if nvvm.elect_sync():
-                    bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+                    bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
-                # BMM2[sub1] → O_1.  SF_P1/V1 reload into S_acc_1 scratch (160/164).
+                if cutlass.const_expr(CFG.DTYPE_QKV == 0):
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_sf(tmem_SF_P1, tmem_SF_V1, desc_P_SF_0, desc_V_SF)
+
+                # E5 causal has already consumed S0 and V is resident.  Stage
+                # both disjoint P1/V1 scale operands while softmax produces P1.
+                if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS != 0):
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_sf(tmem_SF_P1, tmem_SF_V1, desc_P_SF_0, desc_V_SF)
+
+                # Prior P1V consumes cross-inplaced P1/SF from physical S0.
                 bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
-                if nvvm.elect_sync():
-                    _utccp_bmm2_sf(tmem_SF_P1, tmem_SF_V1, desc_P_SF_0, desc_V_SF)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1507,18 +1718,6 @@ def _mma_warp_group(
                     bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                     bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
-                # BMM1[sub1] next-kv → S_acc_1.  SF_Q1/K1 ping-pong into S_acc_0
-                # scratch (8/12); wait tile0's softmax LDTM (SAME-iter — BMM1[sub0]
-                # above just wrote this iter's S_acc_0, which softmax[0] must read).
-                wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
-                ldtm_phase0 = ldtm_phase0 ^ 1
-                if nvvm.elect_sync():
-                    _utccp_bmm1_sf(tmem_SF_Q1, tmem_SF_K1, desc_Q_SF_1, desc_K_SF)
-                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), tmem_sf_a=tmem_SF_Q1, tmem_sf_b=tmem_SF_K1)
-                if nvvm.elect_sync():
-                    bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
-                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
-
                 bmm2_ready_phase = bmm2_ready_phase ^ 1
 
             # Epilogue: BMM2 for last kv (always runs — n_kv >= 1).
@@ -1526,40 +1725,53 @@ def _mma_warp_group(
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
                     bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
+            if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS != 0):
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                if ~skip_s0_tail:
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
             desc_V = sV[kv_state.idx].desc()
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
 
             # Epilogue BMM2[sub0] → O_0.  SF_P0/V0 reload into S_acc_0 scratch.
-            bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
-            if nvvm.elect_sync():
-                _utccp_bmm2_sf(tmem_SF_P0, tmem_SF_V0, desc_P_SF_0, desc_V_SF)
+            if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS != 0):
+                if ~skip_s0_tail:
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_v_sf(tmem_SF_V0, desc_V_SF)
+            else:
+                bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
+                if ~skip_s0_tail:
+                    if nvvm.elect_sync():
+                        _utccp_bmm2_sf(tmem_SF_P0, tmem_SF_V0, desc_P_SF_0, desc_V_SF)
             accum_b2 = is_not_first_bmm2_epi
-            for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(
-                    bmm2_desc,
-                    (tmem_raw.subview(LAYOUT.P0_OFF)),
-                    desc_V,
-                    (tmem_raw.subview(LAYOUT.O0_OFF)),
-                    local_k,
-                    accum_b2,
-                    tmem_sf_a=tmem_SF_P0,
-                    tmem_sf_b=tmem_SF_V0,
-                )
-                accum_b2 = cutlass.Boolean(True)
+            if ~skip_s0_tail:
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P0_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O0_OFF)),
+                        local_k,
+                        accum_b2,
+                        tmem_sf_a=tmem_SF_P0,
+                        tmem_sf_b=tmem_SF_V0,
+                    )
+                    accum_b2 = cutlass.Boolean(True)
             bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase)
-            for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(
-                    bmm2_desc,
-                    (tmem_raw.subview(LAYOUT.P0_OFF)),
-                    desc_V,
-                    (tmem_raw.subview(LAYOUT.O0_OFF)),
-                    NUM_KPHASES_PV_PER_CHUNK + local_k,
-                    cutlass.Boolean(True),
-                    tmem_sf_a=tmem_SF_P0,
-                    tmem_sf_b=tmem_SF_V0,
-                )
+            if ~skip_s0_tail:
+                for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P0_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O0_OFF)),
+                        NUM_KPHASES_PV_PER_CHUNK + local_k,
+                        cutlass.Boolean(True),
+                        tmem_sf_a=tmem_SF_P0,
+                        tmem_sf_b=tmem_SF_V0,
+                    )
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1652,6 +1864,7 @@ def _softmax_kv_body(
     sStats_raw,
     bars,
     mb_softmax_ldtm,
+    mb_p_inplace,
     tid_in_wg,
     q_abs,
     eff_seqlen_kv,
@@ -1661,9 +1874,10 @@ def _softmax_kv_body(
     total_sum,
     bmm1_phase,
     stat_empty_phase,
+    p_inplace_phase,
     leader_cta_id,
 ):
-    """Per-iter softmax body — returns (total_max, total_sum, bmm1_phase, stat_empty_phase).
+    """Per-iter softmax body with cross-inplaced P ownership handoff.
 
     Compile-time apply_mask picks fast HW max (tcgen05.ld.red.f32.max)
     vs slow path (load → apply_mask_chunk → software row_max).  The HW
@@ -1684,6 +1898,8 @@ def _softmax_kv_body(
 
     bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase)
     bmm1_phase = bmm1_phase ^ 1
+    if cutlass.const_expr(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_NONE):
+        bmm1_phase = cute.arch.make_warp_uniform(bmm1_phase)
 
     # TMEM allocation is stable for the lifetime of the persistent kernel.
     s_addr_a = tmem_base + cutlass.Int32(tmem_S_off + 0)
@@ -1797,12 +2013,20 @@ def _softmax_kv_body(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
     if nvvm.elect_sync():
         arrive_on_leader(mb_softmax_ldtm.subview(sub_tile_id), leader_cta_id, CFG.CTA_MMA)
+        nvvm.mbarrier_arrive(mb_p_inplace.subview(sub_tile_id))
 
     current_max = cute.math.max(max_a, max_b) * scale_log2
 
-    # sync the two softmax warpgroups before the stat-store.
-    if sub_tile_id == 1:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    # Serialize the two E5M2 probability bursts with a one-way ping-pong.
+    # Other specializations retain the original symmetric rendezvous.
+    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+        if sub_tile_id == 0:
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+        else:
+            nvvm.barrier_cta_sync(barrier_id=9, thread_count=256)
+    else:
+        if sub_tile_id == 1:
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     old_total_max = total_max
     is_first = total_max == NEG_INF
@@ -1829,10 +2053,20 @@ def _softmax_kv_body(
 
     reg_S_a = reg_S_a * scale_log2 - new_total_max
     reg_S_b = reg_S_b * scale_log2 - new_total_max
-    reg_P_a = _exp2_chunk0_mask_aware(reg_S_a, apply_mask)
-    # Expose conversion and row reduction as independent chains before the P store.
-    p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+    if cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == MASK_NONE and sub_tile_id == 1):
+        reg_P_a = _exp2_chunk0_e4_6pairs(reg_S_a)
+    else:
+        reg_P_a = _exp2_chunk0_mask_aware(reg_S_a, apply_mask)
     sum_a_pair = row_reduction_pair_64(reg_P_a)
+    p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+    # P0 writes physical S1 after S1 is read.  P1 is deliberately one S0
+    # token behind, so P1(i) waits for the read of next S0(i+1).
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        p_inplace_slot = cutlass.Int32(1) - sub_tile_id
+    else:
+        p_inplace_slot = 1 if sub_tile_id == 0 else 0
+    wait(mb_p_inplace.subview(p_inplace_slot), p_inplace_phase)
+    p_inplace_phase = p_inplace_phase ^ 1
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -1843,8 +2077,14 @@ def _softmax_kv_body(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    if sub_tile_id == 0:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+        if sub_tile_id == 0:
+            nvvm.barrier_cta_arrive(9, 256)
+        else:
+            nvvm.barrier_cta_arrive(8, 256)
+    else:
+        if sub_tile_id == 0:
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     sum_b_pair = row_reduction_pair_64(reg_P_b)
     new_p_sum_pair = sum_a_pair + sum_b_pair
@@ -1854,7 +2094,7 @@ def _softmax_kv_body(
     bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase)
     stat_empty_phase = stat_empty_phase ^ 1
 
-    return total_max, total_sum, bmm1_phase, stat_empty_phase
+    return total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase
 
 
 @cute.jit
@@ -1869,6 +2109,7 @@ def _softmax_warp_group(
     bars,
     sched,
     mb_softmax_ldtm,
+    mb_p_inplace,
     seq_kv_lens_tensor,
     n_q_supers,
     n_qh,
@@ -1895,6 +2136,7 @@ def _softmax_warp_group(
 
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
+    p_inplace_phase = cutlass.Int32(0)
     epilogue_state = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
 
     # total_sum kept as Vector[Float32,2] so per-iter update lowers to packed FMUL2 + FADD2.
@@ -1931,6 +2173,10 @@ def _softmax_warp_group(
         softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
         tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
 
+    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+        if sub_tile_id == 1:
+            nvvm.barrier_cta_arrive(8, 256)
+
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1938,6 +2184,12 @@ def _softmax_warp_group(
         # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
         bars.mb_o_empty[0].wait(epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
+
+        # Seed P1 one S0 token behind.  Empty tiles produce no score tokens.
+        if bounds.right > bounds.left:
+            if sub_tile_id == 1:
+                wait(mb_p_inplace.subview(0), p_inplace_phase)
+                p_inplace_phase = p_inplace_phase ^ 1
 
         total_max = NEG_INF
         total_sum = cutlass.Vector.from_elements(
@@ -1953,7 +2205,7 @@ def _softmax_warp_group(
         # MASK_NONE: bounds collapse so masked sub-loops fold out at trace time.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
@@ -1961,6 +2213,7 @@ def _softmax_warp_group(
                     sStats_raw,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     tid_in_wg,
                     q_abs,
                     eff_seqlen_kv,
@@ -1970,11 +2223,12 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
                     leader_cta_id,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
@@ -1982,6 +2236,7 @@ def _softmax_warp_group(
                     sStats_raw,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     tid_in_wg,
                     q_abs,
                     eff_seqlen_kv,
@@ -1991,10 +2246,11 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
                     leader_cta_id,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
@@ -2002,6 +2258,7 @@ def _softmax_warp_group(
                     sStats_raw,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     tid_in_wg,
                     q_abs,
                     eff_seqlen_kv,
@@ -2011,12 +2268,13 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
                     leader_cta_id,
                 )
             if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
                 read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
@@ -2024,6 +2282,7 @@ def _softmax_warp_group(
                     sStats_raw,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     tid_in_wg,
                     q_abs,
                     eff_seqlen_kv,
@@ -2033,8 +2292,16 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
                     leader_cta_id,
                 )
+
+        # Equal-sized score streams need one final S0 token for the last P1.
+        # This balances stage1's seed plus one cross-store wait per KV.
+        if bounds.right > bounds.left:
+            if sub_tile_id == 0:
+                if nvvm.elect_sync():
+                    nvvm.mbarrier_arrive(mb_p_inplace.subview(0))
 
         # Per-tile balance: softmax 1 bootstrap + n_kv end-of-body waits = n_kv+1 = corr fires.
         total_sum_scalar = total_sum[0] + total_sum[1]
@@ -2142,7 +2409,6 @@ def _correction_warp_group(
             bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
-            tmem_base_iter = tmem_ptr_i32.load()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
 
@@ -2157,12 +2423,12 @@ def _correction_warp_group(
 
                 bars.mb_stat_empty[qs].arrive()
 
-                bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
-
                 # vec_scale_pair emits mul_packed_f32x2; without it the DSL lowers to scalar FMUL inside this runtime-if.
                 if ~all_alpha_one:
+                    bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
+                    tmem_base_rescale = tmem_ptr_i32.load()
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                        o_addr = tmem_base_iter + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_addr = tmem_base_rescale + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
                         o_chunk = nvvm.tcgen05_ld(
                             "32x32b",
                             nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
@@ -2170,7 +2436,7 @@ def _correction_warp_group(
                         )
                         o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
                         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
 
                 bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
@@ -2261,14 +2527,22 @@ def _correction_warp_group(
                     bars.mb_o_empty[qs].wait(o_empty_phase)
                 smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
-            # One atomic per valid row (invalid/OOB rows must not poison the global amax).
-            if _row_valid:
-                nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
-
             # fence_proxy needed before TMA reads SMEM written by tcgen05_st.
             nvvm.fence_proxy("async.shared", space="cta")
-
             bars.mb_o_full[qs].arrive()
+
+            # The global amax is independent of the O TMA store.  Publish O
+            # first so the store warp can overlap this atomic and the next qs.
+            if cutlass.const_expr(CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == 0):
+                _amax_o_warp_input = cutlass.Float32(0.0)
+                if _row_valid:
+                    _amax_o_warp_input = _amax_o_local
+                _amax_o_warp = cute.arch.warp_redux_sync(_amax_o_warp_input, "fmax")
+                if (tid_in_wg & cutlass.Int32(31)) == 0:
+                    nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_warp.bitcast(cutlass.Int32))
+            else:
+                if _row_valid:
+                    nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
         stat_full_phase = stat_full_phase ^ 1
         o_empty_phase = o_empty_phase ^ 1
