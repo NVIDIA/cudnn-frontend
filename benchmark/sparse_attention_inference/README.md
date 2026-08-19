@@ -47,13 +47,18 @@ grid), head_dim 128:
 | `wan14b-720p` | 40 | 92160 |
 | `minimax-h3-5s` | 56 | 31488 |
 | `minimax-h3-15s` | 56 | 91392 |
+| `hunyuan-720p` | 24 | 119040 |
+| `mochi-480p` | 24 | 44544 |
 
 The MiniMax-H3 cases use the open-weights attention config (56 heads,
 head_dim 128) at its published sequence scales (~31k visual tokens per
 1344x768 124-frame clip, ~91k for 15 s, padded to 256-token blocks). H3
 ships with full attention and lists sparse attention as planned, so the
 dense bar reflects its current per-layer cost and the sparse bars the
-available headroom.
+available headroom. HunyuanVideo (720p, 129 frames, ~118.8k tokens) is the
+workhorse shape of the sparse-attention literature (VSA, STA, SVG), and
+Mochi-1 (480p, 163 frames, ~44.5k tokens) is a common mid-length target;
+both use 24 heads x head_dim 128 per their open-weights configs.
 
 Custom shapes: `--cases 12x65536` (heads x seqlen). The default sparsity is
 0.9, the value video sparse-attention deployments typically target.

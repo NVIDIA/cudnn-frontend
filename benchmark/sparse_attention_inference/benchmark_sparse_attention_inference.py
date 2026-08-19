@@ -61,6 +61,12 @@ CASES = {
     # so the dense bar is its current cost and the sparse bars the headroom.
     "minimax-h3-5s": (56, 31488),
     "minimax-h3-15s": (56, 91392),
+    # HunyuanVideo 13B (24 heads x d128): 720p 129-frame default is ~118.8k
+    # tokens; the workhorse shape of the sparse-attention literature (VSA,
+    # STA, SVG). Mochi-1 (24 heads x d128): 480p 163-frame is ~44.5k tokens.
+    # Both padded to 256-token blocks.
+    "hunyuan-720p": (24, 119040),
+    "mochi-480p": (24, 44544),
 }
 
 
