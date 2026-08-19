@@ -604,18 +604,33 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta):
     return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES) <= _PIPE_SMEM_MAX
 
 
-def _pipe_bwd_cap(R, wn):
-    # Cap is N-driven: the dgamma/dbeta partials cost ~ ctas*C, so ``ctas ~ N/4096``
-    # keeps the partials a ~constant (~4%) fraction of the data traffic while filling
-    # the machine (measured optimum). Small blocks (wn<=2, tiny C) need a higher floor
-    # to reach occupancy; a max of 12x avoids over-subscribing the finalize at huge N.
+def _pipe_bwd_cap(R, wn, C, cache_xd):
     global _SM_COUNT
     if _SM_COUNT is None:
         import torch
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    floor = 2 if wn <= 2 else 1
-    mult = max(floor, min(12, round(R / 4096)))
-    return min(R, _SM_COUNT * mult)
+    NSM = _SM_COUNT
+    if cache_xd:
+        # Occupancy-aware cap: the optimum balances three limits (measured by a
+        # per-shape cap sweep -- this formula reproduces every mid-C optimum exactly).
+        #   occ    -- don't launch more CTAs/SM than smem allows (extra waves don't help
+        #             a memory-bound kernel and only grow the finalize).
+        #   budget -- the finalize reads the [ctas,C] partials, so cap ctas*C to a fixed
+        #             traffic budget (~2M elems) -- this is why smaller C wants MORE CTAs
+        #             (mixtral C4096 -> 3x) and larger C fewer (nemotronh C8192 -> 1x).
+        #   rows   -- keep >=~6 rows/CTA so the software pipeline amortizes its prologue
+        #             (8 was too aggressive -- capped deepseek-2048 to 1x vs its 2x opt).
+        smem = _pipe_bwd_smem(C, wn, 3)
+        occ = max(1, _PIPE_SMEM_MAX // smem)
+        budget = max(1, (2 * 1024 * 1024) // (NSM * C))
+        rows = max(1, R // (NSM * 6))
+        mult = max(1, min(occ, budget, rows))
+    else:
+        # Non-cached (large N): N-driven keeps the partials a ~constant fraction of the
+        # data traffic. wn<=2 (tiny C) needs a higher floor to reach occupancy.
+        floor = 2 if wn <= 2 else 1
+        mult = max(floor, min(12, round(R / 4096)))
+    return min(R, NSM * mult)
 
 
 def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg):
@@ -626,7 +641,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta)
     STAGES = _pipe_bwd_actual_stages(cache_xd)
     block_threads = (wn + 1) * 32
-    ctas = _pipe_bwd_cap(R, wn)
+    ctas = _pipe_bwd_cap(R, wn, C, cache_xd)
     if mean is None:
         mean = rstd
 
