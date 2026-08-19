@@ -1321,8 +1321,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
             self._value_error_if(
                 float(situ_beta1) != self.situ_beta1,
-                "situ_beta1 is specialized at compile time; construct and compile "
-                f"the API with situ_beta1={situ_beta1}",
+                "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
         _reject_unsupported_rubin_glu_tune_params(
             self._is_rubin_kernel,
