@@ -66,7 +66,7 @@ _SM100_KERNEL_FILES = {
     (128, 128): "prefill_d128_f16_sm100.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
-# block-scale MXFP8 kernel (d128 only); the output dtype is encoded the same way.
+# FP8 kernel family; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
     torch.float8_e4m3fn: DTYPE_E4M3,
     torch.float8_e5m2: DTYPE_E5M2,
@@ -74,12 +74,25 @@ _SM100_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-# d128 FP8 kernels (E4M3/E5M2 in, BF16/FP16/FP8 out). Block-scale MXFP8 (per-32-block
-# E8M0 SF) vs per-tensor FP8 (scalar descales). Selected by the graph op (sdpa_mxfp8 vs
-# sdpa_fp8); the f16/bf16 flavors use _SM100_KERNEL_FILES.
-_SM100_MXFP8_KERNEL_FILE = "prefill_d128_mxfp8_sm100.py"
-_SM100_FP8_KERNEL_FILE = "prefill_d128_fp8_sm100.py"
+# FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
+# Both FP8 paths have exact d128/d128 and d192/d128 kernels.
+_SM100_MXFP8_KERNEL_FILES = {
+    (128, 128): "prefill_d128_mxfp8_sm100.py",
+    (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
+}
 _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
+_SM100_FP8_KERNEL_FILES = {
+    (128, 128): "prefill_d128_fp8_sm100.py",
+    (192, 128): "prefill_d192_d128_fp8_sm100.py",
+}
+
+
+def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
+    if device_cc == (10, 7):
+        return frozenset({(128, 128)})
+    return frozenset({(128, 128), (192, 128)})
+
+
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
@@ -204,7 +217,7 @@ def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     the tile box stays the compile-time D, so loads past d_qk / d_v hardware
     zero-fill (adding exact zero terms to every QK^T dot product — S, softmax
     and P·V are bit-identical to the unpadded problem) and O stores past d_v
-    are OOB-clipped. FP8/MXFP8 stays exact-match d128 (gated in
+    are OOB-clipped. FP8/MXFP8 uses exact native shapes (gated in
     check_support); alignment (d % 8, the TMA 16-byte global-stride rule at
     2 bytes/elem) is also gated in check_support / engines.mismatch.
     """
@@ -231,11 +244,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     dense K=64 FP8 path baked in — see prefill_d128_fp8_sm107.py)."""
 
     tag = _flavor_tag(flavor)
-    if fp8 and pertensor and rubin:
+    if fp8 and pertensor and rubin and flavor == (128, 128):
         filename = _SM107_FP8_KERNEL_FILE
         tag = f"sdpa_fwd_sm107_fp8_{tag}"
     elif fp8:
-        filename = _SM100_FP8_KERNEL_FILE if pertensor else _SM100_MXFP8_KERNEL_FILE
+        filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
     else:
         filename = _SM100_KERNEL_FILES[flavor]
@@ -782,11 +795,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
-        # FP8/MXFP8: exact-match d128 only — the FP8 kernels' SF plumbing and
-        # QMMA geometry are not audited for envelope zero-padding.
+        # FP8 paths use exact native shapes. SM100 supports d128/d128 and
+        # d192/d128; Rubin currently supports only per-tensor FP8 d128.
+        fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         self._value_error_if(
-            self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"FP8/MXFP8 (E4M3/E5M2 inputs) requires exact D_QK=D_V=128 (no envelope padding); got (D_QK={d_qk}, D_V={d_v})",
+            self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
+            f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires an exact native shape in {sorted(fp8_shapes)} "
+            f"(no envelope padding); got (D_QK={d_qk}, D_V={d_v})",
         )
         # Envelope alignment gate: the TMA descriptors are built from the
         # actual tensor extents, and cuTensorMapEncodeTiled requires every
@@ -936,16 +951,37 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_v=d_v_sched,
                 elem_bytes=1 if self._fp8 else 2,
             )
+        lpt_head_group = 1
+        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
+            lpt_head_group = 8
+        lpt_q_tiles = 0
+        if self._fp8 and self.flavor == (192, 128) and not self.thd:
+            lpt_q_tiles = (self.s_q_max + 511) // 512
+        template_window_right = self.window_right
+        if (
+            self._fp8
+            and self._pertensor
+            and self.flavor == (192, 128)
+            and self.window_left is None
+            and self.window_right is None
+            and not self.seq_kv_lens_present
+        ):
+            # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
+            # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
+            # selects the equivalent masked-interior lowering.
+            template_window_right = self.s_k_max
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
-            window_right=self.window_right,
+            window_right=template_window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
+            lpt_head_group=lpt_head_group,
+            lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
         )
@@ -960,7 +996,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # f16-only.
             self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
         elif self._fp8:
-            # FP8/MXFP8 kernels are exact-match d128 (gated in check_support);
+            # FP8/MXFP8 kernels use exact native shapes (gated in check_support);
             # their compile() has no envelope head-dim parameters. has_lse=False
             # (no Stats output) compiles the LSE store out — no dummy buffer at
             # any level (the amax_o atomicMax write is independent).
@@ -1483,7 +1519,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         if self.thd:
-            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense d128 only); see issue #552")
+            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense only); see issue #552")
         if sf_q is None or sf_k is None or sf_v is None:
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k/sf_v (block-scale descale tensors)")
 

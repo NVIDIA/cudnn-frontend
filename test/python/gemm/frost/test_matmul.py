@@ -2346,21 +2346,32 @@ def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
     assert reason in str(e.value)
 
 
-def test_split_tiles_are_by_name_only() -> None:
-    """Split geometries are reachable only through `by_name` synthesis, so they
-    stay out of the funnel's candidate set, the CUDNN_GEMM_TEST_FULL sweep and the
-    benchmarks' default config set (which is built from the funnel). They are still
-    measurable by name: `benchmark_matmul.py --configs` resolves an unknown label
-    through `by_name`."""
+def test_catalog_enumerates_the_mma_m_axis() -> None:
+    """M is enumerated as (mma_inst_m, num_mma_m); `cta_tile_m` is their PRODUCT,
+    not an axis. So a split tile is an ordinary catalog geometry and reaches the
+    funnel, the CUDNN_GEMM_TEST_FULL sweep and the benchmarks' default config set.
+    `num_mma_m == 1` is enumerated first, so an unqualified `cta_tile_m` lookup
+    still lands on the unsplit tile — several suites rely on that."""
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.kernel_registry import candidates
+    from cudnn.gemm.frost.tile_config import _M_AXES
 
-    assert all(c.num_mma_m == 1 for c in CATALOG)
+    sm100 = [c for c in CATALOG if c.pipeline == "sm100"]
+    assert {(c.mma_inst_m, c.num_mma_m) for c in sm100} == set(_M_AXES)
+    assert all(c.cta_tile_m == c.mma_inst_m * c.num_mma_m for c in CATALOG)
+    # sm103 / sm107 pin the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
+    # mma_inst_m % 128 == 0); sm107 still splits, sm103 does not (supports_multi_mma_m=False).
+    assert {c.mma_inst_m for c in CATALOG if c.pipeline != "sm100"} == {128}
+    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm107"} == {1, 2}
+    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm103"} == {1}
+    # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
+    assert next(c for c in sm100 if c.cta_tile_m == 128).num_mma_m == 1
+
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
     B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
     g.matmul(A=A, B=B, name="mm").set_output(True)
-    assert all(cfg.num_mma_m == 1 for _t, cfg in candidates(analyze(g)))
+    assert {cfg.num_mma_m for _t, cfg in candidates(analyze(g))} == {1, 2}
 
 
 @pytest.mark.parametrize(

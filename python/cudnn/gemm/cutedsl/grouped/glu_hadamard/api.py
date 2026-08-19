@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any, Optional, Tuple
 
@@ -81,6 +82,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         vector_f32: bool = False,
         m_aligned: int = 256,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
     ):
@@ -157,6 +160,17 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.act_func = act_func
+        self.situ_beta1 = float(situ_beta1)
+        self.situ_beta2 = float(situ_beta2)
+        if self.act_func == "situglu":
+            self._value_error_if(
+                not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
+                f"situ_beta1 must be finite and positive, got {self.situ_beta1}",
+            )
+            self._value_error_if(
+                not math.isfinite(self.situ_beta2) or self.situ_beta2 <= 0.0,
+                f"situ_beta2 must be finite and positive, got {self.situ_beta2}",
+            )
         self.use_dynamic_sched = use_dynamic_sched
         self.use_tmem_post_rht_amax = use_tmem_post_rht_amax
         self._kernel = BlockScaledMoEGroupedGemmGluHadamardKernel
@@ -258,8 +272,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
         self._value_error_if(self.sf_vec_size not in [16, 32], f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
         self._value_error_if(
-            self.act_func not in ["swiglu", "geglu", "srelu"],
-            f"act_func must be 'swiglu', 'geglu', or 'srelu', got {self.act_func}",
+            self.act_func not in ["swiglu", "geglu", "situglu", "srelu"],
+            f"act_func must be 'swiglu', 'geglu', 'situglu', or 'srelu', got {self.act_func}",
         )
         self._value_error_if(
             not self.use_2cta_instrs or self.mma_tiler_mn != (256, 256), f"Hadamard fusion requires mma_tiler_mn=(256, 256), got {self.mma_tiler_mn}"
@@ -333,6 +347,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
             act_func=self.act_func,
+            situ_beta1=self.situ_beta1,
             enable_bias=self.bias_desc is not None,
             use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
         )
@@ -442,6 +457,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
             max_active_clusters,
             fake_stream,
             cached_linear_offset,
+            cutlass.Float32(self.situ_beta1),
+            cutlass.Float32(self.situ_beta2),
             options="--enable-tvm-ffi",
         )
 
@@ -462,6 +479,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 post_rht_amax_tensor: Optional[torch.Tensor],
                 bias_tensor: Optional[torch.Tensor],
                 stream: cuda.CUstream,
+                situ_beta1: float,
+                situ_beta2: float,
             ) -> None:
                 compiled_kernel(
                     a_tensor,
@@ -483,6 +502,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                     bias_tensor,
                     stream,
                     cached_linear_offset,
+                    cutlass.Float32(situ_beta1),
+                    cutlass.Float32(situ_beta2),
                 )
 
             self._compiled_kernel = tensor_api
@@ -506,6 +527,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 post_rht_amax_tensor: Optional[torch.Tensor],
                 bias_tensor: Optional[torch.Tensor],
                 stream: cuda.CUstream,
+                situ_beta1: float,
+                situ_beta2: float,
             ) -> None:
                 compiled_kernel(
                     a_tensor,
@@ -527,6 +550,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                     bias_tensor,
                     stream,
                     cached_linear_offset,
+                    cutlass.Float32(situ_beta1),
+                    cutlass.Float32(situ_beta2),
                 )
 
             self._compiled_kernel = tensor_api
@@ -548,6 +573,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         post_rht_amax_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         import torch
@@ -559,6 +586,19 @@ class GroupedGemmGluHadamardSm100(APIBase):
             return
         if current_stream is None:
             current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
+        if self.act_func == "situglu":
+            self._value_error_if(
+                not math.isfinite(situ_beta1) or situ_beta1 <= 0.0,
+                f"situ_beta1 must be finite and positive, got {situ_beta1}",
+            )
+            self._value_error_if(
+                not math.isfinite(situ_beta2) or situ_beta2 <= 0.0,
+                f"situ_beta2 must be finite and positive, got {situ_beta2}",
+            )
+            self._value_error_if(
+                float(situ_beta1) != self.situ_beta1,
+                "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
+            )
         if hadamard_tensor is None:
             hadamard_tensor = self.hadamard_tensor
         else:
@@ -586,6 +626,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 post_rht_amax_tensor,
                 bias_tensor,
                 current_stream,
+                situ_beta1,
+                situ_beta2,
             )
         else:
             if b_ptrs is None or sfb_ptrs is None:
@@ -605,6 +647,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 post_rht_amax_tensor,
                 bias_tensor,
                 current_stream,
+                situ_beta1,
+                situ_beta2,
             )
 
 
@@ -636,6 +680,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     vector_f32: bool = False,
     m_aligned: int = 256,
     act_func: str = "swiglu",
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
     use_dynamic_sched: bool = False,
     use_tmem_post_rht_amax: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
@@ -712,9 +758,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         stride_signature = tuple(None if idx in dynamic_stride_dims else value for idx, value in enumerate(tensor.stride()))
         return static_shape_suffix, stride_signature, tensor.dtype
 
+    situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
     cache_key = (
         weight_mode,
         act_func,
+        situ_beta1_cache_signature,
         a_tensor.shape[1:],
         tuple(b_tensor.shape) if is_dense else b_shape,
         c_tensor.shape[1:],
@@ -763,6 +811,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             vector_f32=vector_f32,
             m_aligned=m_aligned,
             act_func=act_func,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             use_dynamic_sched=use_dynamic_sched,
             use_tmem_post_rht_amax=use_tmem_post_rht_amax,
         )
@@ -794,6 +844,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             amax_tensor=amax_tensor,
             post_rht_amax_tensor=post_rht_amax_tensor,
             bias_tensor=bias_tensor,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
     else:
@@ -810,6 +862,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             amax_tensor=amax_tensor,
             post_rht_amax_tensor=post_rht_amax_tensor,
             bias_tensor=bias_tensor,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
     return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor, post_rht_amax_tensor=post_rht_amax_tensor)

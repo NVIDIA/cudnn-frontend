@@ -1,7 +1,7 @@
 # Attention Inference Benchmark
 
 Benchmarks attention for **inference**, split into two phases (mirroring
-forward/backward in `../sdpa_benchmark_training`):
+forward/backward in `../attention_training`):
 
 - **context** — prefill, in two kinds, both reported in **TFLOPS**:
   - *full*: `s_q == s_kv`, contiguous Q/K/V, compute-bound;
@@ -52,7 +52,7 @@ into the fp8 graph — those cases record as unsupported).
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted
 once) and **unabsorbed** in prefill — which is dense training-style attention
-and lives in `../sdpa_benchmark_training`.
+and lives in `../attention_training`.
 
 ## Usage
 

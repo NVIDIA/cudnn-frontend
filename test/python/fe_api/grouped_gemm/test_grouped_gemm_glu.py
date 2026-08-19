@@ -682,6 +682,10 @@ def _test_grouped_gemm_glu_dense_wrapper(
     omit_prob=False,
     use_single_group_runtime_offsets=False,
     sf_fp8_dtype_override=None,
+    act_func="swiglu",
+    situ_beta1=4.0,
+    situ_beta2=25.0,
+    skip_reference=False,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -705,6 +709,9 @@ def _test_grouped_gemm_glu_dense_wrapper(
         enable_bias=enable_bias,
     )
     cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
+    cfg["act_func"] = act_func
+    cfg["situ_beta1"] = situ_beta1
+    cfg["situ_beta2"] = situ_beta2
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -755,7 +762,9 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 vector_f32=cfg["vector_f32"],
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
-                act_func="swiglu",
+                act_func=act_func,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
@@ -763,8 +772,32 @@ def _test_grouped_gemm_glu_dense_wrapper(
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
-    check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+    if not skip_reference:
+        check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
     return inputs, outputs, cfg
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_dense_wrapper_situglu_mxfp8(request):
+    """Smoke-test the dense MXFP8 compile and execute path for SiTU-GLU."""
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        act_func="situglu",
+        skip_reference=True,
+    )
 
 
 @pytest.mark.L0
@@ -1233,6 +1266,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
     b_major="k",
     enable_bias=False,
     use_dynamic_sched=False,
+    situ_beta1=4.0,
+    situ_beta2=25.0,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -1256,6 +1291,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
         act_func,
         b_major=b_major,
     )
+    cfg["situ_beta1"] = situ_beta1
+    cfg["situ_beta2"] = situ_beta2
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1298,6 +1335,8 @@ def _test_grouped_gemm_glu_discrete_wrapper(
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
                 act_func=cfg["act_func"],
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
@@ -1305,6 +1344,41 @@ def _test_grouped_gemm_glu_discrete_wrapper(
         pytest.skip(f"Unsupported testcase: {e}")
 
     check_ref_discrete_grouped_gemm(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("ab_dtype", "d_dtype", "sf_dtype", "sf_vec_size"),
+    [
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e8m0fnu, 32),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e8m0fnu, 32),
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e4m3fn, 16),
+    ],
+    ids=["mxfp4", "mxfp8", "nvfp4"],
+)
+@pytest.mark.parametrize(("situ_beta1", "situ_beta2"), [(4.0, 25.0), (2.0, 8.0)])
+def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, sf_dtype, sf_vec_size, situ_beta1, situ_beta2, request):
+    """Exercise SiTU-GLU with the inherited MXFP4, MXFP8, and NVFP4 layouts."""
+
+    _test_grouped_gemm_glu_discrete_wrapper(
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="situglu",
+        request=request,
+        b_major="k",
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
+    )
 
 
 @pytest.mark.L0

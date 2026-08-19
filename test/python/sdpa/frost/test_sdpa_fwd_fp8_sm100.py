@@ -4,9 +4,9 @@
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the ``sdpa_fwd_prefill_sm100_d128_fp8`` engine, and validates O against an fp32-dequant
-reference. ``Amax_O`` is produced in-kernel (atomicMax over the
-pre-cast fp32 values); both are checked.
+the exact d128/d128 or d192/d128 engine, and validates O against an fp32-dequant
+reference. ``Amax_O`` is produced in-kernel (atomicMax over the pre-cast fp32 values)
+and checked.
 
 cuDNN's ``sdpa_fp8`` op exposes causal / bottom-right / sliding-window masks, attention
 sink, and a padding mask (per-batch ``seq_len_kv`` → KV-side masking, tested here). THD /
@@ -68,20 +68,38 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
         probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)
         return torch.matmul(probs[..., :s_kv], v_e)
+    row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
     return torch.matmul(probs, v_e)
 
 
 def _run(
-    B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0, stats=True, sync_debug=False
+    B,
+    H_q,
+    H_kv,
+    S_q,
+    S_kv,
+    in_key,
+    out_dt,
+    *,
+    scale,
+    sdpa_kwargs,
+    sink=None,
+    seq_lens_kv=None,
+    s_scale=1.0,
+    s_descale_gain=1.0,
+    stats=True,
+    sync_debug=False,
+    d_qk=128,
+    d_v=128,
 ):
     import cudnn
 
     dev = "cuda"
-    D = 128
-    Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
-    Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
+    Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+    Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
+    Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
@@ -90,7 +108,7 @@ def _run(
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H_q, D, device=dev, dtype=out_dt).transpose(1, 2)
+    Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -137,7 +155,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, fp8=True))
+    _select_engine(g, engine_name(d_qk, d_v=d_v, fp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -221,6 +239,73 @@ def test_fp8_output_dtypes(in_key, out_key):
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(1, 8, 8, 512, 512, in_key, _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_output_dtypes(in_key, out_key):
+    """Exact DSv3 shape: FP8 Q/K use d192 while V and O use d128."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_o_ref = _run(
+        1,
+        8,
+        8,
+        512,
+        512,
+        in_key,
+        _OUT[out_key],
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_masks(mask):
+    # B*H_q=16 selects the grouped LPT decoder used by the target workload.
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_zero_length_kv():
+    """A zero-length KV batch must produce a finite zero output."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs={},
+        seq_lens_kv=[256, 0],
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0

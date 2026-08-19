@@ -10,7 +10,7 @@ shaped work, so it lives in the context phase's chunked kind here (the config
 is bidirectional: context_causal=False). Full prefill covers the self-
 attention over the whole clip, and generation sweeps the standard MTP widths
 against the cached clip for completeness. The training suite carries its own
-forward-only sweep of the same model (`sdpa_benchmark_training`).
+forward-only sweep of the same model (`attention_training`).
 """
 
 from ..config_types import InferenceBenchmarkConfig, ModelPreset
