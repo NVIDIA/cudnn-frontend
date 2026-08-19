@@ -82,12 +82,3 @@ are visible. Architectures are reported in isolation, never merged.
   descales).
 - cuDNN `sink_token` does not support s_q==1; sink decode rows on cudnn
   record that limitation.
-
-## qwen3vl_vit (vision-encoder inference)
-
-The Qwen3-VL vision tower's self-attention is an inference workload
-(forward-only, bidirectional over patch tokens), so it lives in this suite as
-a context-phase-only config (`configs/qwen3vl_vit.py`): an encoder has no KV
-cache, so there is no generation phase and no kv-cache dtype axis. It
-previously sat in the training suite; its results here are native
-inference-schema measurements.
