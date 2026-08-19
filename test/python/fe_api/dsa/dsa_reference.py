@@ -282,17 +282,19 @@ def check_ref_indexer_top_k(
     # effective length. The DSA kernel returns indices for a particular row; we
     # verify that the set of picked indices matches the reference set.
     n_rows = input_values.shape[0]
+    batch = seq_lens.shape[0]
+    rows_per_batch = n_rows // batch
     for r in range(n_rows):
-        # Build sets of picked indices, but cap at the smaller of the effective
-        # lengths. The reference pads with zeros beyond seq_lens[b]; so do
-        # actual. We rely on value equality at matched indices via the value
-        # tensor check when return_val is True.
-        ref_set = set(int(i) for i in idx_ref[r].tolist())
-        act_set = set(int(i) for i in idx_actual[r].tolist())
+        # Only the first min(top_k, seq_lens[b]) entries of a row are picked.
+        # Past that the reference pads with zeros while the kernel leaves its
+        # sentinel init, so comparing whole rows compares two paddings.
+        k_eff = min(top_k, int(seq_lens[r // rows_per_batch].item()))
+        ref_set = set(int(i) for i in idx_ref[r, :k_eff].tolist())
+        act_set = set(int(i) for i in idx_actual[r, :k_eff].tolist())
         # Values within the effective top-k slice should match after sorting.
         if return_val:
-            ref_sorted = torch.sort(val_ref[r]).values
-            act_sorted = torch.sort(val_actual[r].to(val_ref.dtype)).values
+            ref_sorted = torch.sort(val_ref[r, :k_eff]).values
+            act_sorted = torch.sort(val_actual[r, :k_eff].to(val_ref.dtype)).values
             torch.testing.assert_close(act_sorted, ref_sorted, atol=atol, rtol=rtol)
 
 
