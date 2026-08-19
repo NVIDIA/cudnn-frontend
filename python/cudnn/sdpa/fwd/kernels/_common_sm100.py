@@ -607,16 +607,12 @@ def make_sdpa_helpers(
 
                 @cute.jit
                 def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-                    row, head, batch = decode_linear_tile_lpt_grouped(
-                        _lpt_linear(bidx), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group
-                    )
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(bidx), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group)
                     return _lpt_q_super(row, cta_in_pair), head, batch
 
                 @cute.jit
                 def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-                    row, head, batch = decode_linear_tile_lpt_grouped(
-                        _lpt_linear(t0), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group
-                    )
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(t0), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group)
                     return _lpt_q_super(row, cta_in_pair), head, batch
 
             else:

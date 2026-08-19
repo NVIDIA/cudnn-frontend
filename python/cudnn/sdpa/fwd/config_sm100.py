@@ -814,8 +814,7 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d192 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
             cfg.STAGES_KV == (2 if fp8 else 1) * cfg.CTA_MMA,
-            "d192: STAGES_KV must scale with input dtype and cluster width "
-            "(FP8: 2/4 at cga1/cga2; half: 1/2)",
+            "d192: STAGES_KV must scale with input dtype and cluster width " "(FP8: 2/4 at cga1/cga2; half: 1/2)",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -837,8 +836,7 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             "d192: Q/K swizzle must be 64B for FP8 and 128B for BF16/FP16",
         ),
         (
-            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE)
-            and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
+            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
             "d192: V/O swizzle is inconsistent with the input/output dtype",
         ),
     )

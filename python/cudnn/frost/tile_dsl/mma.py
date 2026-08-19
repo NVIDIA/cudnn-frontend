@@ -93,18 +93,7 @@ def mma_m16n8k32_f32(
 
 
 @cute.jit
-def mma_ss(
-    desc,
-    desc_a_base,
-    desc_b_base,
-    tmem_c,
-    tmem_sf_a=None,
-    tmem_sf_b=None,
-    accumulate: bool = False,
-    k_start: int = 0,
-    k_count=None,
-    fence_code: cutlass.Constexpr[bool] = False,
-):
+def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=None, accumulate: bool = False, k_start: int = 0, k_count=None):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1
     else:
@@ -152,8 +141,6 @@ def mma_ss(
                 )
             else:
                 nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, da, db, desc.idesc, enable_input_d)
-        if cutlass.const_expr(fence_code):
-            cute.arch.inline_ptx('.pragma "next knob FenceCode";')
         enable_input_d = True
 
 
@@ -202,17 +189,7 @@ def mma_ts(desc, tmem_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=Non
 
 
 @cute.jit
-def mma_ts_step(
-    desc,
-    tmem_a_base,
-    desc_b_base,
-    tmem_c,
-    k_idx: int,
-    accumulate,
-    tmem_sf_a=None,
-    tmem_sf_b=None,
-    fence_code: cutlass.Constexpr[bool] = False,
-):
+def mma_ts_step(desc, tmem_a_base, desc_b_base, tmem_c, k_idx: int, accumulate, tmem_sf_a=None, tmem_sf_b=None):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1
     else:
@@ -244,8 +221,6 @@ def mma_ts_step(
             )
         else:
             nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, dp, db, desc.idesc, accumulate)
-    if cutlass.const_expr(fence_code):
-        cute.arch.inline_ptx('.pragma "next knob FenceCode";')
 
 
 @cute.jit
