@@ -2195,6 +2195,9 @@ def test_grouped_gemm_glu_bf16_rejects_sf_fp8_dtype_override(request):
     This is what the None default buys: with an "e4m3" default the value would
     always be non-None and could not be distinguished from an explicit request.
     """
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
     except ImportError:
