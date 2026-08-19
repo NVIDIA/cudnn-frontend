@@ -23,6 +23,7 @@ from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluB
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
+import math
 import os
 from typing import Literal, Tuple, Optional
 
@@ -127,6 +128,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
@@ -165,7 +167,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param vector_f32: Use vectorized f32 operations
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
-        :param act_func: Activation function, one of "swiglu" or "geglu"
+        :param act_func: Activation function, one of "swiglu", "geglu", or "situglu"
+        :param situ_beta1: Compile-time gate tanh scale for SiTU-GLU. The default
+            ``4.0`` enables an exact sigmoid-reuse specialization.
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
@@ -247,6 +251,12 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
         self.act_func = act_func
+        self.situ_beta1 = float(situ_beta1)
+        if self.act_func == "situglu":
+            self._value_error_if(
+                not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
+                f"situ_beta1 must be finite and positive, got {self.situ_beta1}",
+            )
         if self.weight_mode == MoEWeightMode.DENSE:
             self.b_major = b_major  # stored for both modes
 
@@ -526,8 +536,12 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         # ---- Activation function validation (both modes) ----
         self._value_error_if(
-            self.act_func not in ["swiglu", "geglu"],
-            f"act_func must be 'swiglu' or 'geglu', got {self.act_func}",
+            self.act_func not in ["swiglu", "geglu", "situglu"],
+            f"act_func must be 'swiglu', 'geglu', or 'situglu', got {self.act_func}",
+        )
+        self._not_implemented_error_if(
+            self._is_rubin_kernel and self.act_func == "situglu",
+            "Rubin grouped GEMM GLU does not support situglu",
         )
 
         # ---- Discrete-mode-specific validation ----
@@ -673,6 +687,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             act_func=self.act_func,
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
+            **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
             # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
             # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
@@ -915,6 +930,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                     "geglu_alpha": cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
                     "glu_clamp_max": cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
                     "glu_clamp_min": cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
+                    "situ_beta1": cutlass.Float32(4.0),
+                    "situ_beta2": cutlass.Float32(25.0),
                 }
             )
         _compiled_kernel = cute.compile(gemm_glu, **compile_kwargs)
@@ -943,6 +960,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             geglu_alpha: float = 1.702,
             glu_clamp_max: float = 7.0,
             glu_clamp_min: float = -7.0,
+            situ_beta1: float = 4.0,
+            situ_beta2: float = 25.0,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
@@ -976,6 +995,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                     cutlass.Float32(geglu_alpha),
                     cutlass.Float32(glu_clamp_max),
                     cutlass.Float32(glu_clamp_min),
+                    cutlass.Float32(situ_beta1),
+                    cutlass.Float32(situ_beta2),
                 )
 
         self._compiled_kernel = tensor_api
@@ -1114,6 +1135,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
                 cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
                 cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
+                cutlass.Float32(4.0),
+                cutlass.Float32(25.0),
                 options="--enable-tvm-ffi",
             )
 
@@ -1148,6 +1171,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             geglu_alpha: float = 1.702,
             glu_clamp_max: float = 7.0,
             glu_clamp_min: float = -7.0,
+            situ_beta1: float = 4.0,
+            situ_beta2: float = 25.0,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             b_ptrs_addr = int(b_ptrs_device.data_ptr())
@@ -1184,6 +1209,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                     cutlass.Float32(geglu_alpha),
                     cutlass.Float32(glu_clamp_max),
                     cutlass.Float32(glu_clamp_min),
+                    cutlass.Float32(situ_beta1),
+                    cutlass.Float32(situ_beta2),
                 )
 
         self._compiled_kernel = tensor_api
@@ -1218,6 +1245,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Execute the compiled kernel.
@@ -1261,6 +1290,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param glu_clamp_min: Lower clamp limit applied only to ``up`` (the
             kernel never lower-clamps ``gate``). Default ``-7.0``. Ignored
             when ``act_func == "swiglu"``.
+        :param situ_beta1: Gate tanh scale for SiTU-GLU. Default ``4.0``.
+        :param situ_beta2: Up-branch tanh scale for SiTU-GLU. Default ``25.0``.
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
@@ -1279,6 +1310,20 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         # that pre-date the explicit linear_offset kwarg.
         if linear_offset is None:
             linear_offset = 1.0 if self.act_func == "geglu" else 0.0
+        if self.act_func == "situglu":
+            self._value_error_if(
+                not math.isfinite(situ_beta1) or situ_beta1 <= 0.0,
+                f"situ_beta1 must be finite and positive, got {situ_beta1}",
+            )
+            self._value_error_if(
+                not math.isfinite(situ_beta2) or situ_beta2 <= 0.0,
+                f"situ_beta2 must be finite and positive, got {situ_beta2}",
+            )
+            self._value_error_if(
+                float(situ_beta1) != self.situ_beta1,
+                "situ_beta1 is specialized at compile time; construct and compile "
+                f"the API with situ_beta1={situ_beta1}",
+            )
         _reject_unsupported_rubin_glu_tune_params(
             self._is_rubin_kernel,
             geglu_alpha,
@@ -1315,6 +1360,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
                 glu_clamp_min=glu_clamp_min,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
             )
         else:
             self._compiled_kernel(
@@ -1338,6 +1385,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
                 glu_clamp_min=glu_clamp_min,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
             )
 
         self._logger.debug("Execute completed")
