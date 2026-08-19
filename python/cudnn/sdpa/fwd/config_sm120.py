@@ -71,6 +71,11 @@ class TemplateParams:
     sched_policy: int = SCHED_NATURAL
     q_tile: int = SEQ_Q_TILES[0]
     kv_tile: int = SEQ_KV_TILES[0]
+    # KV split: each Q tile's KV-tile range [min_kv_tile, num_kv_tiles) is cut
+    # into ``split_kv`` contiguous chunks, each run by its own CTA writing a
+    # partial (O, LSE) that kernels/split_combine_sm100.py reduces.  1 = off.
+    # Opt-in only -- the graph front door never selects it.
+    split_kv: int = 1
 
 
 def validate_params(
@@ -94,6 +99,22 @@ def validate_params(
         raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
     if params.dtype_o not in allowed_o_dtypes:
         raise ValueError(f"SM120 SDPA: dtype_o must be one of {allowed_o_dtypes}; got {params.dtype_o}")
+    if params.split_kv < 1:
+        raise ValueError(f"SM120 SDPA: split_kv must be >= 1 (1 = KV-split off); got {params.split_kv}")
+    if params.split_kv > 1:
+        # Each of these would need extra machinery in the combine pass.
+        if params.thd_varlen:
+            raise ValueError("SM120 SDPA: split_kv > 1 is dense-only (THD packs its own flat grid)")
+        if params.has_sink:
+            # The sink logit is folded into the softmax denominator per tile, so
+            # every split would add its own copy of it.
+            raise ValueError("SM120 SDPA: split_kv > 1 with an attention sink is not supported")
+        if params.sched_policy != SCHED_NATURAL:
+            # The split index rides the NATURAL grid's batch axis (y = batch +
+            # split*B); LPT / LPT_L2 flatten the grid to 1-D and derive the batch
+            # from the linear tile id, so there is no axis left to fold it into.
+            raise ValueError(f"SM120 SDPA: split_kv > 1 currently requires SCHED_NATURAL; got sched_policy={params.sched_policy}")
+
     if params.window_right is not None and params.window_right < 0:
         raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or >= 0 (0 = plain causal); got {params.window_right}")
     if not allow_right_band and params.window_right not in (None, 0):

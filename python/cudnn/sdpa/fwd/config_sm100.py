@@ -88,10 +88,37 @@ class TemplateParams:
     seq_q_lens_present: bool = False
     sched_policy: int = SCHED_NATURAL
     thd_varlen: bool = False
+    # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
+    # chunks, each run as its own persistent tile writing a partial (O, LSE)
+    # that kernels/split_combine_sm100.py reduces.  1 = off (byte-identical
+    # codegen to the single-pass kernel).
+    split_kv: int = 1
+    # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA
+    # pair share one MMA, each holding half of every K/V tile); 1 = cga1, one
+    # independent CTA per tile.
+    #
+    # cga1 has no collective MMA to halve per-CTA K/V, so at a fixed STAGES_KV
+    # it doubles that footprint.  d128 buys the 64 KiB back by aliasing Q and O
+    # into one slab (make_cfg_d128 turns QO_ALIAS on for cga1; see
+    # _validate_cfg_d128's SMEM check); the fp8 family instead scales the stage
+    # count with the width so stages x per-CTA-buffer stays constant.
+    cta_mma: int = 2
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
     # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
     fused_ldtm_stat: bool = False
+
+
+# split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
+# a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
+# kernel reads them.  Accepting them elsewhere would silently ignore them — and
+# for split_kv that is not merely surprising but WRONG: the caller sizes an
+# (S*B)-batch partial workspace and runs the combine, while the kernel keeps
+# writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
+# than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
+# corrupt the result instead of dropping out.  Grow these sets as flavors land.
+_SPLIT_KV_FLAVORS = frozenset({"d128", "d192", "d256", "d512"})
+_CTA_MMA_FLAVORS = frozenset({"d128", "d192"})
 
 
 def _validate_params(flavor: str, k: TemplateParams) -> None:
@@ -121,6 +148,31 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
     if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
+    if k.cta_mma not in (1, 2):
+        raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
+    # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor,
+    # but only make_cfg_d128 threads them into a Cfg and only the d128 kernel
+    # reads them.  Accepting them elsewhere would silently ignore them — and for
+    # split_kv that is not merely surprising but WRONG: the caller sizes an
+    # (S*B)-batch partial workspace and runs the combine, while the kernel keeps
+    # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
+    # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
+    # corrupt the result instead of dropping out.  Reject at the door.
+    if k.split_kv != 1 and flavor not in _SPLIT_KV_FLAVORS:
+        raise ValueError(f"{flavor}: split_kv is not implemented on this flavor (got {k.split_kv}); supported: {sorted(_SPLIT_KV_FLAVORS)}")
+    if k.cta_mma != 2 and flavor not in _CTA_MMA_FLAVORS:
+        raise ValueError(f"{flavor}: cta_mma is not selectable on this flavor (got {k.cta_mma}); supported: {sorted(_CTA_MMA_FLAVORS)}")
+    if k.split_kv < 1:
+        raise ValueError(f"{flavor}: split_kv must be >= 1 (1 = KV-split off); got {k.split_kv}")
+    if k.split_kv > 1:
+        # Each of these would need extra machinery in the combine pass, so the
+        # backstop rejects them rather than silently producing a wrong answer.
+        if k.thd_varlen:
+            raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
+        if k.has_sink:
+            # The sink logit is folded into the softmax denominator in the
+            # per-tile epilogue, so every split would add its own copy of it.
+            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -290,6 +342,9 @@ class CfgD256:
 
     THD_VARLEN: int = 0
 
+    # KV split; 1 = off.  See TemplateParams.split_kv.
+    SPLIT_KV: int = 1
+
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
@@ -335,6 +390,7 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        SPLIT_KV=int(params.split_kv),
     )
     _validate_cfg_d256(cfg)
     return cfg, _tma_iters(cfg)
@@ -429,6 +485,9 @@ class CfgD512:
 
     THD_VARLEN: int = 0
 
+    # KV split; 1 = off.  See TemplateParams.split_kv.
+    SPLIT_KV: int = 1
+
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
@@ -478,6 +537,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        SPLIT_KV=int(params.split_kv),
     )
     _validate_cfg_d512(cfg)
     return cfg, _tma_iters(cfg)
@@ -575,6 +635,34 @@ class CfgD128:
 
     THD_VARLEN: int = 0
 
+    # KV split; 1 = off.  See TemplateParams.split_kv.
+    SPLIT_KV: int = 1
+
+
+# Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
+_SM100_MAX_DYN_SMEM = 227 * 1024
+
+
+def _d128_smem_bytes(cfg) -> int:
+    """Data-buffer SMEM for the d128 pipeline (barriers/TMEM ptr are noise).
+
+    Q and O are TILES_Q slabs each; under QO_ALIAS they share one slab sized to
+    the larger.  K/V are STAGES_KV buffers each, and their PER-CTA size is
+    divided by CTA_MMA because the cga2 collective MMA lets a CTA pair hold half
+    of every tile.  That divisor is exactly what cga1 gives up, which is why
+    cga1 needs the Q/O alias to break even:
+
+        cga2, no alias : 64(Q) + 64(O) + 32(K) + 32(V) = 192 KiB
+        cga1, no alias : 64(Q) + 64(O) + 64(K) + 64(V) = 256 KiB  (over cap)
+        cga1, alias    : 64(Q u O)     + 64(K) + 64(V) = 192 KiB
+    """
+    q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
+    k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
+    return qo + k + v
+
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
     """Consistency checks on the (mostly hardcoded) d128 (llama) geometry."""
@@ -583,14 +671,27 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d128: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d128: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d128: per-role regs must be multiples of 8"),
-        (cfg.CGA_M == 2 and cfg.CTA_MMA == 2, "d128 SM100 is cga2-only (CGA_M == CTA_MMA == 2)"),
+        (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d128 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
+        (
+            cfg.QO_ALIAS == 1 if cfg.CTA_MMA == 1 else True,
+            "d128 cga1: QO_ALIAS is mandatory — cga1 doubles per-CTA K/V (no collective MMA to halve it), "
+            "so Q and O must share one slab to stay inside the SMEM cap",
+        ),
+        (
+            _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
+            f"d128: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
+        ),
         (cfg.TILE_K == 128 and cfg.TILE_O == 128, "d128: d_qk = d_v = 128"),
         (cfg.TILES_Q == 2, "d128 (llama): TILES_Q must be 2"),
         (cfg.SOFTMAX_WARPGROUPS == 2, "d128 (llama): SOFTMAX_WARPGROUPS must be 2"),
         (cfg.CORRECTION_WARPS == 4, "d128 (llama): CORRECTION_WARPS must be 4"),
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.STAGES_KV == (4 if _fp8 else 2), "d128 SM100: STAGES_KV must be 4 (fp8/mxfp8) / 2 (f16, 192 KiB SMEM budget)"),
+        (
+            cfg.STAGES_KV == ((2 if cfg.CTA_MMA == 1 else 4) if _fp8 else 2),
+            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 at cga1 — "
+            "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
+        ),
         (
             cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if _fp8 else 16),
             "d128: TILE_K_HW must be 32 (fp8/mxfp8 K=32 QMMA) / 16 (f16, 1-chunk on SM10x)",
@@ -621,14 +722,27 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_O=b_o,
+        CGA_M=params.cta_mma,
+        CTA_MMA=params.cta_mma,
+        # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
+        # one slab to stay under the SMEM cap (_validate_cfg_d128 enforces it).
+        QO_ALIAS=1 if params.cta_mma == 1 else 0,
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
-        V_SWZ_BYTES=v_swz_bytes(128, 2, b),
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
         TILE_K_HW_BMM2=tile_k_hw_fp8,
-        STAGES_KV=4 if fp8 else 2,
+        # KV stage depth scales with the cluster width, as in cuDNN's own
+        # kernels (stages_kv = N * CTA_MMA): cga1 has no collective MMA to halve
+        # per-CTA K/V, so the stage count halves instead to keep the product --
+        # and hence the SMEM -- constant.  Only the fp8 family needs this here:
+        # f16/bf16 already fit at cga1 by aliasing Q and O, and their verified
+        # cga1 configuration keeps STAGES_KV=2.  mxfp8 additionally stages E8M0
+        # scale factors that the SMEM model cannot see, and at STAGES_KV=4 that
+        # pushed a cga1 CTA to 237024 B against the 232448 B cap.
+        STAGES_KV=(2 if params.cta_mma == 1 else 4) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -638,6 +752,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        SPLIT_KV=int(params.split_kv),
     )
     _validate_cfg_d128(cfg)
     return cfg, _tma_iters(cfg)
@@ -657,6 +772,24 @@ class CfgD192(CfgD128):
     CORRECTION_REGS: int = 88
 
 
+def _d192_smem_bytes(cfg) -> int:
+    """Data-buffer SMEM for the d192 pipeline (Q/O always aliased).
+
+    Same shape as _d128_smem_bytes, but d_qk = 192 makes the Q and K slabs 1.5x
+    the d128 ones, which is why this flavor needs a shallower KV pipeline:
+
+        cga2, STAGES_KV=2 : 96(Q u O) + 48(K) + 32(V) = 176 KiB
+        cga1, STAGES_KV=2 : 96        + 96    + 64    = 256 KiB  (over cap)
+        cga1, STAGES_KV=1 : 96        + 48    + 32    = 176 KiB
+    """
+    q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
+    k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
+    return qo + k + v
+
+
 def _validate_cfg_d192(cfg: CfgD192) -> None:
     """Consistency checks on the native DSv3 d192/d128 geometry."""
     checks = (
@@ -665,7 +798,16 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d192: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d192: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d192: per-role regs must be multiples of 8"),
-        (cfg.CGA_M == 2 and cfg.CTA_MMA == 2, "d192 SM100 is cga2-only (CGA_M == CTA_MMA == 2)"),
+        (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d192 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
+        (
+            cfg.STAGES_KV == (1 if cfg.CTA_MMA == 1 else 2),
+            "d192: STAGES_KV must scale with the cluster width (2 at cga2, 1 at cga1) — cga1 doubles per-CTA K/V, "
+            "and cuDNN's own d192 kernel uses stages_kv = 1 * CTA_MMA for exactly this reason",
+        ),
+        (
+            _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
+            f"d192: SMEM {_d192_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
+        ),
         (cfg.TILE_K == 192 and cfg.TILE_O == 128, "d192: expected D_QK tile 192 and D_V tile 128"),
         (cfg.QO_ALIAS == 1, "d192: Q/O SMEM alias is required to stay within SM100 SMEM budget"),
         (cfg.TILES_Q == 2, "d192: TILES_Q must be 2"),
@@ -673,7 +815,6 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.CORRECTION_WARPS == 4, "d192: CORRECTION_WARPS must be 4"),
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d192: 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d192: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.STAGES_KV == 2, "d192 SM100: STAGES_KV must be 2 for BF16/FP16"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d192: TILE_K_HW must be 16 for BF16/FP16 on SM10x"),
         (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128, "d192: Q/K swizzle must be 128B"),
         (cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128, "d192: V/O swizzle must be 128B"),
@@ -691,9 +832,15 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         DTYPE_O=params.dtype_qkv,
         BPE=b,
         BPE_O=b,
+        SPLIT_KV=int(params.split_kv),
         Q_SWZ_BYTES=q_swz_bytes(192, b),
         K_SWZ_BYTES=q_swz_bytes(192, b),
-        V_SWZ_BYTES=v_swz_bytes(128, 2, b),
+        CGA_M=params.cta_mma,
+        CTA_MMA=params.cta_mma,
+        # cuDNN's d192 kernel uses stages_kv = 1 * CTA_MMA; cga1 doubles per-CTA
+        # K/V, so the stage count has to halve to keep the CTA inside the cap.
+        STAGES_KV=1 if params.cta_mma == 1 else 2,
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
         O_SWZ_BYTES=o_swz_bytes(128, b),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
