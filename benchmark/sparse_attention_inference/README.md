@@ -6,11 +6,27 @@ FA4-lineage CuTe DSL arm (`flash_attn.cute`) on identical block masks.
 
 ## What is measured
 
-The workload models video-diffusion sparse attention (e.g. VSA): batch 1,
-head_dim 128, bf16, non-causal, and a data-dependent boolean block mask per
-head. Masks are seeded top-k selections of KV blocks per query block, with
-the diagonal block always kept. Both arms attend exactly the same token set
-in every cell.
+The workload models video-generation sparse attention: batch 1, head_dim
+128, bf16, and a boolean block mask. Blocks are selected all-or-nothing, and
+both arms attend exactly the same token set in every cell. Two mask families
+are provided (`--mask`):
+
+- **`topk`** (default) — data-dependent per-head masks: seeded top-k
+  selections of KV blocks per query block, diagonal block always kept.
+  Models VSA-style learned sparsity; a different scatter per head and per
+  row, and changing the granularity changes the selection problem itself.
+- **`frame_causal`** — a structural mask for autoregressive video: tokens
+  are grouped into frames of `--frame-size` tokens, and each query attends
+  its own full frame, the previous `--window` frames (`-1` = all), and
+  frame 0 as an anchor (disable with `--no-anchor`). The mask is identical
+  across heads, rows within a frame share the same blocks in long
+  contiguous runs, and per-row block counts vary (early frames attend
+  little, late frames the most), exercising the variable-count metadata
+  contract. Because the frame size is a multiple of every granularity, the
+  same token set is expressed exactly at 64, 128, and 256 — for this family
+  the granularity sweep isolates pure kernel efficiency on one fixed
+  workload. The defaults (`--frame-size 2048 --window 1` + anchor) land
+  near 90% sparsity at these sequence lengths.
 
 Three sparse-block granularities are swept — **64, 128, and 256** tokens —
 at each requested sparsity, plus one **dense** run per case (every block

@@ -10,11 +10,15 @@ identical block masks, across sparse-block granularities of 64, 128, and 256
 tokens. A dense run (every block selected) is included per case to show the
 kernel's peak as an upper reference for the sparse bars.
 
-The workload models video-diffusion sparse attention (e.g. VSA): batch 1,
-head_dim 128, bf16, non-causal, per-head data-dependent block masks selected
-by top-k with the diagonal block always kept. The default cases are Wan2.1
-text-to-video shapes — 1.3B (12 heads) and 14B (40 heads) at 480P
-(S = 24x32x52 = 39936 latent tokens) and 720P (S = 24x48x80 = 92160).
+The workload models video-generation sparse attention: batch 1, head_dim
+128, bf16. Two mask families are supported (``--mask``): data-dependent
+per-head top-k selection with the diagonal block kept (VSA-style learned
+sparsity, the default) and structural frame-causal masks (autoregressive
+video: each query attends its own frame plus a window of previous frames
+and an anchor frame). Blocks are selected all-or-nothing in both families.
+The default cases are Wan2.1 text-to-video shapes — 1.3B (12 heads) and 14B
+(40 heads) at 480P (S = 24x32x52 = 39936 latent tokens) and 720P
+(S = 24x48x80 = 92160) — plus MiniMax-H3 (56 heads, ~31k/~91k tokens).
 
 Reported TFLOPS count only the selected blocks:
 
@@ -29,6 +33,8 @@ Usage:
     python benchmark_sparse_attention_inference.py
     python benchmark_sparse_attention_inference.py --cases wan14b-480p --sparsities 0.8,0.9
     python benchmark_sparse_attention_inference.py --granularities 64,128 --csv results.csv
+    python benchmark_sparse_attention_inference.py --mask frame_causal
+    python benchmark_sparse_attention_inference.py --mask frame_causal --window -1 --frame-size 4096
     python benchmark_sparse_attention_inference.py --check
     python benchmark_sparse_attention_inference.py --plot results.png
 """
@@ -64,8 +70,14 @@ CASES = {
 }
 
 
-def make_block_mask(num_heads, seqlen, granularity, sparsity, seed=0):
-    """Per-head boolean block mask: top-k of NB blocks per row, diagonal kept."""
+def make_topk_mask(num_heads, seqlen, granularity, sparsity, seed=0):
+    """Per-head boolean block mask: top-k of NB blocks per row, diagonal kept.
+
+    Models learned, data-dependent sparsity (e.g. VSA): a different mask per
+    head and per query block. Changing the granularity changes the selection
+    problem itself, so the granularity sweep compares finer against coarser
+    selections of the same target sparsity.
+    """
     nb = seqlen // granularity
     keep = nb if sparsity == 0.0 else max(1, round((1.0 - sparsity) * nb))
     gen = torch.Generator("cpu").manual_seed(seed)
@@ -73,8 +85,31 @@ def make_block_mask(num_heads, seqlen, granularity, sparsity, seed=0):
     eye = torch.eye(nb, dtype=torch.bool).unsqueeze(0).expand_as(scores)
     scores = scores.masked_fill(eye, 2.0)  # diagonal block always selected
     top = torch.topk(scores, keep, -1).indices
-    mask = torch.zeros(num_heads, nb, nb, dtype=torch.bool).scatter_(-1, top, True)
-    return mask, keep
+    return torch.zeros(num_heads, nb, nb, dtype=torch.bool).scatter_(-1, top, True)
+
+
+def make_frame_causal_mask(num_heads, seqlen, granularity, frame_size, window, anchor):
+    """Structural mask for autoregressive video generation.
+
+    Tokens are grouped into frames of ``frame_size`` tokens; every query
+    attends its own full frame plus the previous ``window`` frames (all of
+    them if ``window < 0``), plus frame 0 when ``anchor`` is set. The mask is
+    identical across heads and across rows within a frame, blocks are
+    selected all-or-nothing, and — because ``frame_size`` is a multiple of
+    every granularity — the same token set is expressed exactly at 64, 128,
+    and 256, isolating pure kernel efficiency on one fixed workload.
+    """
+    if frame_size % granularity:
+        raise ValueError(f"frame_size {frame_size} must be a multiple of granularity {granularity}")
+    nb = seqlen // granularity
+    frame = torch.arange(nb) * granularity // frame_size
+    q_frame, kv_frame = frame.view(-1, 1), frame.view(1, -1)
+    mask = kv_frame <= q_frame
+    if window >= 0:
+        mask &= q_frame - kv_frame <= window
+    if anchor:
+        mask |= kv_frame == 0
+    return mask.unsqueeze(0).expand(num_heads, nb, nb).contiguous()
 
 
 def expand_mask(mask, factor):
@@ -83,11 +118,18 @@ def expand_mask(mask, factor):
 
 
 def mask_to_indices(mask):
-    """Boolean (H, NBq, NBk) mask -> sorted per-row column indices + counts."""
+    """Boolean (H, NBq, NBk) mask -> count-prefixed per-row column indices.
+
+    Each row holds its selected column indices in ascending order in the
+    first ``counts`` slots; the remaining slots up to the row-max capacity
+    are padding (valid but unselected block ids), ignored by kernels that
+    take per-row counts.
+    """
     counts = mask.sum(-1)
     cap = int(counts.max())
-    idx = mask.to(torch.int8).argsort(dim=-1, descending=True, stable=True)[..., :cap]
-    idx, _ = idx.sort(dim=-1)
+    nb = mask.shape[-1]
+    key = torch.arange(nb) + (~mask).long() * nb  # selected first, each ascending
+    idx = key.argsort(dim=-1)[..., :cap]
     return idx.to(torch.int32).contiguous(), counts.to(torch.int32).contiguous(), cap
 
 
@@ -109,12 +151,15 @@ def run_cudnn(q, k, v, mask, granularity):
     idx, counts, cap = mask_to_indices(mask)
     idx = idx.unsqueeze(0).cuda()
     nums = None
-    if sparse_block_size == 128 and cap % 2:
-        # The blk128 fixed-count path requires an even count; odd per-row
-        # counts go through the variable-count contract with padded capacity.
-        idx = torch.cat([idx, idx[..., -1:]], -1)
+    variable = bool((counts != counts.view(-1)[0]).any())
+    if variable or (sparse_block_size == 128 and cap % 2):
+        # Variable per-row counts, and odd fixed counts on the blk128 path
+        # (which requires an even fixed count), go through the
+        # variable-count contract; capacity is padded to keep it even.
         nums = counts.unsqueeze(0).cuda()
-        cap += 1
+        if sparse_block_size == 128 and cap % 2:
+            idx = torch.cat([idx, idx[..., -1:]], -1)
+            cap += 1
     return lambda: block_sparse_attention_forward(
         q, k, v, idx, block_sparse_num=cap, q2k_block_nums=nums,
         sparse_block_size=sparse_block_size, layout="bshd",
@@ -186,37 +231,42 @@ def time_fn(fn, warmup=3, target_ms=500.0, max_iters=50):
     return start.elapsed_time(end) / iters
 
 
-def bench_cell(arm, num_heads, seqlen, granularity, sparsity):
-    mask, keep = make_block_mask(num_heads, seqlen, granularity, sparsity)
+def bench_cell(arm, num_heads, seqlen, granularity, mask):
     q, k, v = make_qkv(num_heads, seqlen)
     fn = ARMS[arm](q, k, v, mask, granularity)
     ms = time_fn(fn)
-    flops = 4 * num_heads * HEAD_DIM * seqlen * keep * granularity
+    # 2 matmuls (QK^T, PV) over the selected blocks only.
+    flops = 4 * HEAD_DIM * granularity * granularity * int(mask.sum())
     return ms, flops / ms * 1e-9
 
 
 def check_parity(arms):
-    """Small-shape parity of every arm/granularity against an fp32 reference."""
-    num_heads, seqlen, sparsity = 4, 4096, 0.9
+    """Small-shape parity of every arm/family/granularity vs an fp32 reference."""
+    num_heads, seqlen = 4, 4096
     failures = 0
     for granularity in (64, 128, 256):
-        mask, _ = make_block_mask(num_heads, seqlen, granularity, sparsity)
-        q, k, v = make_qkv(num_heads, seqlen)
-        qf, kf, vf = (t.squeeze(0).permute(1, 0, 2).float() for t in (q, k, v))
-        scores = qf @ kf.transpose(-1, -2) / math.sqrt(HEAD_DIM)
-        token_mask = expand_mask(mask, granularity).cuda()
-        scores = scores.masked_fill(~token_mask, float("-inf"))
-        ref = (scores.softmax(-1) @ vf).permute(1, 0, 2)
-        floor = (ref.to(torch.bfloat16).float() - ref).abs().max().item()
-        for arm in arms:
-            if arm == "fa4" and granularity < 256:
-                continue  # FA4's Q aggregation attends a superset; not comparable
-            out = ARMS[arm](q, k, v, mask, granularity)()[0]
-            err = (out.squeeze(0).float() - ref).abs().max().item()
-            ok = err < 8 * max(floor, 1e-3)
-            failures += not ok
-            print(f"parity {arm} blk{granularity}: max_err={err:.3e} "
-                  f"bf16_floor={floor:.3e} -> {'PASS' if ok else 'FAIL'}")
+        families = {
+            "topk": make_topk_mask(num_heads, seqlen, granularity, 0.9),
+            "frame_causal": make_frame_causal_mask(
+                num_heads, seqlen, granularity, frame_size=1024, window=1, anchor=True),
+        }
+        for family, mask in families.items():
+            q, k, v = make_qkv(num_heads, seqlen)
+            qf, kf, vf = (t.squeeze(0).permute(1, 0, 2).float() for t in (q, k, v))
+            scores = qf @ kf.transpose(-1, -2) / math.sqrt(HEAD_DIM)
+            token_mask = expand_mask(mask, granularity).cuda()
+            scores = scores.masked_fill(~token_mask, float("-inf"))
+            ref = (scores.softmax(-1) @ vf).permute(1, 0, 2)
+            floor = (ref.to(torch.bfloat16).float() - ref).abs().max().item()
+            for arm in arms:
+                if arm == "fa4" and granularity < 256 and family == "topk":
+                    continue  # FA4's Q aggregation attends a superset; not comparable
+                out = ARMS[arm](q, k, v, mask, granularity)()[0]
+                err = (out.squeeze(0).float() - ref).abs().max().item()
+                ok = err < 8 * max(floor, 1e-3)
+                failures += not ok
+                print(f"parity {arm} {family} blk{granularity}: max_err={err:.3e} "
+                      f"bf16_floor={floor:.3e} -> {'PASS' if ok else 'FAIL'}")
     return failures
 
 
@@ -264,7 +314,20 @@ def main():
                         help="comma-separated case names, or HxS pairs like 12x39936")
     parser.add_argument("--granularities", default="64,128,256")
     parser.add_argument("--sparsities", default="0.9",
-                        help="comma-separated block-sparsity fractions (0 = dense)")
+                        help="comma-separated block-sparsity fractions (0 = dense); "
+                             "topk masks only")
+    parser.add_argument("--mask", default="topk", choices=["topk", "frame_causal"],
+                        help="mask family: data-dependent top-k (VSA-style) or "
+                             "structural frame-causal (autoregressive video)")
+    parser.add_argument("--frame-size", type=int, default=2048,
+                        help="frame_causal: tokens per frame (multiple of every "
+                             "granularity run)")
+    parser.add_argument("--window", type=int, default=1,
+                        help="frame_causal: previous frames attended (-1 = all); "
+                             "the default window of 1 plus the anchor lands near "
+                             "90%% sparsity at these sequence lengths")
+    parser.add_argument("--no-anchor", action="store_true",
+                        help="frame_causal: do not always attend frame 0")
     parser.add_argument("--arms", default="cudnn,fa4")
     parser.add_argument("--no-dense", action="store_true",
                         help="skip the dense peak-reference run per case")
@@ -303,15 +366,30 @@ def main():
     rows = []
     print(f"{'case':<14} {'arm':<6} {'blk':>4} {'sparsity':>8} {'ms':>9} {'TFLOP/s':>8}")
     for case, (num_heads, seqlen) in cases.items():
-        grid = [(g, s) for s in sparsities for g in granularities]
+        grid = []
+        for granularity in granularities:
+            if args.mask == "frame_causal":
+                if args.frame_size % granularity:
+                    print(f"{case}: skipping blk{granularity} (frame_size "
+                          f"{args.frame_size} not a multiple of it)")
+                    continue
+                grid.append((granularity, make_frame_causal_mask(
+                    num_heads, seqlen, granularity, args.frame_size,
+                    args.window, not args.no_anchor)))
+            else:
+                grid.extend((granularity, make_topk_mask(
+                    num_heads, seqlen, granularity, s)) for s in sparsities)
         if not args.no_dense:
-            grid.append((128, 0.0))  # dense peak reference, granularity-independent
-        for granularity, sparsity in grid:
+            # Dense peak reference: every block selected, granularity-independent.
+            grid.append((128, make_topk_mask(num_heads, seqlen, 128, 0.0)))
+        for granularity, mask in grid:
+            sparsity = 1.0 - mask.float().mean().item()
             for arm in arms:
-                ms, tflops = bench_cell(arm, num_heads, seqlen, granularity, sparsity)
-                rows.append(dict(case=case, arm=arm, granularity=granularity,
-                                 sparsity=sparsity, ms=round(ms, 3), tflops=round(tflops, 1)))
-                label = "dense" if sparsity == 0.0 else f"{sparsity:.0%}"
+                ms, tflops = bench_cell(arm, num_heads, seqlen, granularity, mask)
+                rows.append(dict(case=case, arm=arm, mask=args.mask,
+                                 granularity=granularity, sparsity=round(sparsity, 4),
+                                 ms=round(ms, 3), tflops=round(tflops, 1)))
+                label = "dense" if sparsity == 0.0 else f"{sparsity:.1%}"
                 print(f"{case:<14} {arm:<6} {granularity:>4} {label:>8} "
                       f"{ms:>9.3f} {tflops:>8.0f}")
 
