@@ -456,8 +456,8 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
 def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen is deferred (dense execute only for v1), so thd=False here even
-    though the kernel itself supports it.
+    THD/varlen is not supported by the current MXFP8 kernels, so this engine is
+    intentionally dense-only.
     """
 
     d_v = d if d_v is None else d_v
