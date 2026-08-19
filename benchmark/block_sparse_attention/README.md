@@ -86,9 +86,11 @@ Custom shapes: `--cases 12x65536` (heads x seqlen). The default sparsity is
 ## Decode shape
 
 `--decode-q N` switches to the chunked autoregressive-generation shape: the
-query is only the last N tokens of the sequence, attending the full KV
-history (s_q << s_kv). Both mask families support it — top-k keeps the
-query's own block instead of the diagonal, and frame-causal places the
+query is only the last N tokens, attending the KV history so far
+(s_q << s_kv). The KV length is swept over `--decode-kv-fracs` of the case's
+sequence length (default 25/50/75/100%), modeling the per-step cost as
+generated frames accumulate. Both mask families support it — top-k keeps
+the query's own block instead of the diagonal, and frame-causal places the
 queries in the final frame. Forward only.
 
 ## Requirements

@@ -391,11 +391,16 @@ def plot(rows, path):
     colors = {"cudnn": "#76b900", "fa4": "#FFD700"}
     names = {"cudnn": "cuDNN BSA", "fa4": "FAv4 CuTe BSA"}
     cases = list(dict.fromkeys(r["case"] for r in rows))
-    fig, axes = plt.subplots(1, len(cases), figsize=(6 * len(cases), 4.5), squeeze=False)
+    groups = max(len({(r["granularity"], r["sparsity"], r["direction"], r.get("seqlen_kv"))
+                      for r in rows if r["case"] == c}) for c in cases)
+    fig, axes = plt.subplots(1, len(cases), figsize=(max(6.0, 0.75 * groups) * len(cases), 4.5),
+                             squeeze=False)
     for ax, case in zip(axes[0], cases):
         cells = [r for r in rows if r["case"] == case]
         def cell_label(r):
             base = "dense" if r["sparsity"] == 0.0 else f"blk{r['granularity']} {int(r['sparsity'] * 100)}%"
+            if r.get("seqlen_q"):
+                return f"{base}\nkv{round(r['seqlen_kv'] / 1024)}k"
             return f"{base}\n{r['direction']}"
 
         labels = list(dict.fromkeys(cell_label(r) for r in cells))
@@ -443,8 +448,12 @@ def main():
                         help="frame_causal: do not always attend frame 0")
     parser.add_argument("--decode-q", type=int, default=0,
                         help="decode shape: query is only the last N tokens of the "
-                             "sequence attending the full KV history (chunked "
+                             "sequence attending the KV history so far (chunked "
                              "autoregressive generation). Forward only.")
+    parser.add_argument("--decode-kv-fracs", default="0.25,0.5,0.75,1.0",
+                        help="decode shape: fractions of the case seqlen to use as "
+                             "the KV history length, modeling per-step cost as "
+                             "generated frames accumulate")
     parser.add_argument("--arms", default="cudnn,fa4")
     parser.add_argument("--direction", default="both", choices=["fwd", "bwd", "both"])
     parser.add_argument("--no-dense", action="store_true",
@@ -482,51 +491,63 @@ def main():
     sparsities = [float(s) for s in args.sparsities.split(",")]
 
     rows = []
-    print(f"{'case':<14} {'arm':<6} {'dir':<4} {'blk':>4} {'sparsity':>8} "
-          f"{'ms':>9} {'TFLOP/s':>8}")
+    print(f"{'case':<14} {'arm':<6} {'dir':<4} {'blk':>4} {'s_kv':>6} "
+          f"{'sparsity':>8} {'ms':>9} {'TFLOP/s':>8}")
     for case, (num_heads, seqlen) in cases.items():
         seqlen_q = args.decode_q
+        kv_lens = [seqlen]
+        if seqlen_q:
+            # Sweep the KV history length: per-step decode cost as generated
+            # frames accumulate. Lengths align to the frame size so
+            # frame_causal masks stay exact at every granularity.
+            align = args.frame_size
+            kv_lens = sorted({
+                max(seqlen_q + align, round(seqlen * float(f) / align) * align)
+                for f in args.decode_kv_fracs.split(",")})
         grid = []
-        for granularity in granularities:
-            if seqlen_q and seqlen_q % granularity:
-                print(f"{case}: skipping blk{granularity} (--decode-q {seqlen_q} "
-                      f"not a multiple of it)")
-                continue
-            if args.mask == "frame_causal":
-                if args.frame_size % granularity:
-                    print(f"{case}: skipping blk{granularity} (frame_size "
-                          f"{args.frame_size} not a multiple of it)")
+        for kv_len in kv_lens:
+            for granularity in granularities:
+                if seqlen_q and seqlen_q % granularity:
+                    print(f"{case}: skipping blk{granularity} (--decode-q {seqlen_q} "
+                          f"not a multiple of it)")
                     continue
-                grid.append((granularity, make_frame_causal_mask(
-                    num_heads, seqlen, granularity, args.frame_size,
-                    args.window, not args.no_anchor, seqlen_q=seqlen_q)))
-            else:
-                grid.extend((granularity, make_topk_mask(
-                    num_heads, seqlen, granularity, s, seqlen_q=seqlen_q))
-                    for s in sparsities)
+                if args.mask == "frame_causal":
+                    if args.frame_size % granularity:
+                        print(f"{case}: skipping blk{granularity} (frame_size "
+                              f"{args.frame_size} not a multiple of it)")
+                        continue
+                    grid.append((granularity, kv_len, make_frame_causal_mask(
+                        num_heads, kv_len, granularity, args.frame_size,
+                        args.window, not args.no_anchor, seqlen_q=seqlen_q)))
+                else:
+                    grid.extend((granularity, kv_len, make_topk_mask(
+                        num_heads, kv_len, granularity, s, seqlen_q=seqlen_q))
+                        for s in sparsities)
         if not args.no_dense:
-            # Dense peak reference: every block selected, granularity-independent.
-            grid.append((128, make_topk_mask(num_heads, seqlen, 128, 0.0,
-                                             seqlen_q=seqlen_q)))
+            # Dense peak reference: every block selected, granularity-independent
+            # (at the longest KV history in decode mode).
+            grid.append((128, kv_lens[-1], make_topk_mask(
+                num_heads, kv_lens[-1], 128, 0.0, seqlen_q=seqlen_q)))
         if seqlen_q:
             if args.direction != "fwd":
                 print("decode shape is forward-only; running fwd")
             directions = ["fwd"]
         else:
             directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
-        for granularity, mask in grid:
+        for granularity, kv_len, mask in grid:
             sparsity = 1.0 - mask.float().mean().item()
             for direction in directions:
                 for arm in arms:
-                    ms, tflops = bench_cell(arm, num_heads, seqlen, granularity,
+                    ms, tflops = bench_cell(arm, num_heads, kv_len, granularity,
                                             mask, direction, seqlen_q)
                     rows.append(dict(case=case, arm=arm, mask=args.mask,
                                      direction=direction, granularity=granularity,
+                                     seqlen_q=seqlen_q, seqlen_kv=kv_len,
                                      sparsity=round(sparsity, 4),
                                      ms=round(ms, 3), tflops=round(tflops, 1)))
                     label = "dense" if sparsity == 0.0 else f"{sparsity:.1%}"
                     print(f"{case:<14} {arm:<6} {direction:<4} {granularity:>4} "
-                          f"{label:>8} {ms:>9.3f} {tflops:>8.0f}")
+                          f"{kv_len:>6} {label:>8} {ms:>9.3f} {tflops:>8.0f}")
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
