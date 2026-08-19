@@ -550,13 +550,19 @@ def _pipe_bwd_smem(C, wn, STAGES):
     return 2 * STAGES * C * 2 + C * 2 + wn * 8 + (2 * STAGES + 1) * 8 + 64
 
 
-def _bwd_cache_xd(ldgs, V, R, C, has_beta):
+def _bwd_cache_xd(ldgs, V, R, C, has_beta, wn):
     """Whether pass2 caches xhat/dxhat in registers (skips the smem re-read). Costs
-    (2+npb)*ldgs*V fp32 regs -> lowers occupancy, a win only when occupancy isn't the
-    limiter (R*C<=48M crossover: mixtral 33M helps, llama3-70b 67M regresses) and the
-    register budget doesn't spill."""
+    (2+npb)*ldgs*V fp32 regs and lowers occupancy, so it's a win only when enough
+    occupancy remains to hide latency at this work size. The crossover scales with the
+    CACHED occupancy: high-occ (small C) tolerates caching at much larger R*C than
+    low-occ (large C). Measured: C4096 (occ4) caches at 64M (llama3-8b 0.89->0.92),
+    but C8192 (occ2) caches only up to ~48M (nemotronh 32M helps, llama3-70b 64M
+    regresses 0.95->0.86). -> threshold ~ 24M * cached_occ. Register budget gates spills."""
     npb = 2 if has_beta else 1
-    return ((2 + npb) * ldgs * V <= 120) and (R * C <= 48 * 1024 * 1024)
+    if (2 + npb) * ldgs * V > 120:
+        return False
+    occ = max(1, _PIPE_SMEM_MAX // _pipe_bwd_smem(C, wn, 3))
+    return R * C <= 24 * 1024 * 1024 * occ
 
 
 def _pipe_bwd_actual_stages(cache_xd):
@@ -600,7 +606,7 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta):
     # Use the ACTUAL stage count (cached -> 3) so the smem bound matches what the kernel
     # allocates -- a fixed STAGES=3 bound would wrongly reject non-cached large C
     # (llama31 C=16384 actually runs at 2 = 160KB, but 3 = 229KB > cap).
-    STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta))
+    STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta, wn))
     return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES) <= _PIPE_SMEM_MAX
 
 
@@ -638,7 +644,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 
     tpr, wn, ldgs, V = wcfg
     R, C = spec.R, spec.M
-    cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta)
+    cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta, wn)
     STAGES = _pipe_bwd_actual_stages(cache_xd)
     block_threads = (wn + 1) * 32
     ctas = _pipe_bwd_cap(R, wn, C, cache_xd)
