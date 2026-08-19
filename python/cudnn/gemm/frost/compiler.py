@@ -648,9 +648,8 @@ def _render_tile_constants(
 
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
         smem_n = cfg.cta_tile_n // cta_group
-        per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes + 2 * 8
-        fixed = 2 * acc_stages * 8 + 8
-        avail = _sm_smem_ab_budget_bytes(cfg.pipeline) - fixed
+        per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes
+        avail = _sm_smem_ab_budget_bytes(cfg.pipeline)
         ab_stages_mg = min(avail // per_stage, _AB_STAGES_CAP)
         if ab_stages_mg < 1:
             raise NotImplementedError(
@@ -1222,24 +1221,17 @@ def _render_block_scale_tile_constants(
                 )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
-    # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 3 mbar: the
-    # block-scale templates give the scale factors their own ring (ab_full,
-    # ab_empty, sf_full) so the MMA can utccp the SFs without waiting on A+B.
-    per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes) + 3 * 8
     from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
 
-    fixed = 2 * acc_stages * 8 + 8
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
-    if use_tma_store_epi:
-        fixed += _smem_d_bytes(cfg, chain)
-    ab_stages = max(1, min((_sm_smem_ab_budget_bytes(cfg.pipeline) - fixed) // per_stage, _AB_STAGES_CAP))
+    ab_budget = _sm_smem_ab_budget_bytes(cfg.pipeline) - (_smem_d_bytes(cfg, chain) if use_tma_store_epi else 0)
     if is_sm103:
         # CUTLASS-style sm103 pipeline: an AB stage is ONE 128-B-K chunk (a
         # third of the 384-B K-tile), and SF rides its OWN ring (own warp,
         # own mbars) at 12-SF-per-row group granularity — 4 groups per K-tile
         # at VS16, 2 at VS32 (both 12 SFs/row). Data-only AB stages + a fixed
-        # SF ring replace the combined per-K-tile stage above.
+        # SF ring, instead of one combined per-K-tile stage.
         sf_stages = 6
         a_chunk_bytes = cta_m * 128
         b_chunk_bytes = (cta_n // cta_group) * 128
@@ -1247,13 +1239,17 @@ def _render_block_scale_tile_constants(
         # SFB is loaded FULL per CTA (the pair MMA reads each CTA's own TMEM
         # SFB across the whole pair-N range) — same convention as sm100.
         sfb_group_bytes = cta_n * 12
-        sf_ring_bytes = sf_stages * (na * sfa_group_bytes + nb * sfb_group_bytes + 2 * 8)
-        per_ab_stage = na * a_chunk_bytes + nb * b_chunk_bytes + 2 * 8
-        ab_stages = min((_sm_smem_ab_budget_bytes(cfg.pipeline) - fixed - sf_ring_bytes) // per_ab_stage, _AB_STAGES_CAP)
+        sf_ring_bytes = sf_stages * (na * sfa_group_bytes + nb * sfb_group_bytes)
+        per_ab_stage = na * a_chunk_bytes + nb * b_chunk_bytes
+        ab_stages = min((ab_budget - sf_ring_bytes) // per_ab_stage, _AB_STAGES_CAP)
         if ab_stages < 3:
             raise NotImplementedError(
                 f"block-scale {cfg.name!r}: only {ab_stages} 128-B AB chunk " f"stages fit in SMEM — the sm103 pipeline needs >= 3 (one " f"K-tile in flight)"
             )
+    else:
+        # One stage covers a whole K-tile: packed data + SF per DISTINCT operand.
+        per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes)
+        ab_stages = max(1, min(ab_budget // per_stage, _AB_STAGES_CAP))
 
     out_dt = chain.output_dtype
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)

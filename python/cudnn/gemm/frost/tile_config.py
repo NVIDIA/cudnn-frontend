@@ -106,16 +106,14 @@ def smem_max_ab_stages(
     cta_tile_k_bytes: int,
     *,
     cta_group: int = 1,
-    acc_stages: int = 2,
     extra_smem_bytes: int = 0,
     extra_per_stage_bytes: int = 0,
     pipeline: str,
     device=None,
 ) -> int:
     smem_b_n = cta_tile_n // cta_group
-    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes + 2 * 8
-    fixed = 2 * acc_stages * 8 + 8
-    avail = _sm_smem_ab_budget_bytes(pipeline, device) - fixed - extra_smem_bytes
+    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes
+    avail = _sm_smem_ab_budget_bytes(pipeline, device) - extra_smem_bytes
     if avail < per_stage:
         raise ValueError(
             f"tile ({cta_tile_m},{cta_tile_n},K={cta_tile_k_bytes}B) "
@@ -315,7 +313,6 @@ class TileConfig:
             self.cta_tile_n,
             self.cta_tile_k_bytes,
             cta_group=cta_group,
-            acc_stages=self.acc_stages,
             extra_smem_bytes=extra_smem_bytes,
             extra_per_stage_bytes=extra_per_stage_bytes,
             pipeline=self.pipeline,
