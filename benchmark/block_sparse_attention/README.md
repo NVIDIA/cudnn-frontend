@@ -1,4 +1,4 @@
-# Sparse Attention Inference Benchmark
+# Block Sparse Attention Benchmark
 
 Microbenchmark of block-sparse attention (BSA) forward and backward, driven
 through the public `cudnn.block_sparse_attention_forward`/`_backward` APIs,
@@ -96,12 +96,21 @@ Custom shapes: `--cases 12x65536` (heads x seqlen). The default sparsity is
 ## How to run
 
 ```bash
-python benchmark_sparse_attention_inference.py                    # full default grid
-python benchmark_sparse_attention_inference.py --cases wan14b-480p --sparsities 0.8,0.9
-python benchmark_sparse_attention_inference.py --csv results.csv --plot results.png
-python benchmark_sparse_attention_inference.py --check            # fp32 parity checks
+python benchmark_block_sparse_attention.py                    # full default grid
+python benchmark_block_sparse_attention.py --cases wan14b-480p --sparsities 0.8,0.9
+python benchmark_block_sparse_attention.py --csv results.csv --plot results.png
+python benchmark_block_sparse_attention.py --check            # fp32 parity checks
 ```
 
 Timing uses CUDA events with an adaptive iteration count (~0.5 s per cell
 after warmup). `--check` validates every arm and granularity against an fp32
 masked-softmax reference at a small shape before trusting the numbers.
+
+## Example results
+
+`results/` holds one full run of both mask families on a B200 (SM100,
+clock-locked at 847 MHz — absolute TFLOPS scale with clocks; relative
+comparisons are the point):
+
+![topk](results/topk_b200.png)
+![frame_causal](results/frame_causal_b200.png)

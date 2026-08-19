@@ -31,13 +31,13 @@ re-expressed at the granularity it supports (see ``--help`` and the README),
 so TFLOPS stay comparable as work-done-per-second on the requested mask.
 
 Usage:
-    python benchmark_sparse_attention_inference.py
-    python benchmark_sparse_attention_inference.py --cases wan14b-480p --sparsities 0.8,0.9
-    python benchmark_sparse_attention_inference.py --granularities 64,128 --csv results.csv
-    python benchmark_sparse_attention_inference.py --mask frame_causal
-    python benchmark_sparse_attention_inference.py --mask frame_causal --window -1 --frame-size 4096
-    python benchmark_sparse_attention_inference.py --check
-    python benchmark_sparse_attention_inference.py --plot results.png
+    python benchmark_block_sparse_attention.py
+    python benchmark_block_sparse_attention.py --cases wan14b-480p --sparsities 0.8,0.9
+    python benchmark_block_sparse_attention.py --granularities 64,128 --csv results.csv
+    python benchmark_block_sparse_attention.py --mask frame_causal
+    python benchmark_block_sparse_attention.py --mask frame_causal --window -1 --frame-size 4096
+    python benchmark_block_sparse_attention.py --check
+    python benchmark_block_sparse_attention.py --plot results.png
 """
 
 import argparse
@@ -379,7 +379,7 @@ def plot(rows, path):
         ax.set_title(case, fontsize=11)
         ax.legend(fontsize=8)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Block-sparse attention inference forward", fontsize=12)
+    fig.suptitle("Block-sparse attention", fontsize=12)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     print(f"wrote {path}")
