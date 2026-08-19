@@ -1906,7 +1906,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
         # The K3-default specialization always uses packed FP32x2 arithmetic. This is an
         # activation-specific optimization and is independent of the generic vectorized_f32 knob.
-        if cutlass.const_expr(self.situ_beta1 == 4.0):
+        if cutlass.const_expr(beta1 == 4.0):
             fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
             fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
             square_alpha2 = (square_alpha, square_alpha)

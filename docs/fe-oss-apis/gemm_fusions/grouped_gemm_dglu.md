@@ -147,7 +147,9 @@ $$
 $$
 
 and returns `ref * prob * T_u * dT_g/dG` and
-`ref * prob * T_g * dT_u/dU`. `dprob` accumulates `ref * T_g * T_u`.
+`ref * prob * T_g * dT_u/dU`. `dprob` accumulates the reduction of
+`ref * T_g * T_u` across the output columns in 32-column chunks, producing
+shape `(valid_m, 1, 1)`.
 The beta values are compile-time specialization values and therefore belong to
 the dGLU compiled-kernel cache key.
 

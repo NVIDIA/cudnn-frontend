@@ -758,7 +758,6 @@ def _test_grouped_gemm_dglu_dense_wrapper(
     act_func="dswiglu",
     situ_beta1=4.0,
     situ_beta2=25.0,
-    skip_reference=False,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -863,15 +862,14 @@ def _test_grouped_gemm_dglu_dense_wrapper(
         pytest.skip(f"Unsupported testcase: {e}")
 
     torch.cuda.synchronize()
-    if not skip_reference:
-        check_ref_grouped_gemm_dswiglu(inputs, wrapper_outputs, cfg, skip_ref=cfg["skip_ref"])
+    check_ref_grouped_gemm_dswiglu(inputs, wrapper_outputs, cfg, skip_ref=cfg["skip_ref"])
     return inputs, wrapper_outputs, cfg
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request):
-    """Smoke-test the dense MXFP8 compile and execute path for dSiTU-GLU."""
+    """Validate dense MXFP8 dSiTU-GLU outputs against the PyTorch reference."""
 
     _test_grouped_gemm_dglu_dense_wrapper(
         ab_dtype=torch.float8_e4m3fn,
@@ -888,7 +886,6 @@ def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request):
         discrete_col_sfd=False,
         request=request,
         act_func="dsituglu",
-        skip_reference=True,
     )
 
 
