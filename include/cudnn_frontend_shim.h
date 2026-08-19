@@ -523,7 +523,8 @@ causal_conv1d_backward(cudaStream_t stream,
 
 inline bool
 is_gnn_agg_simple_available() {
-#if CUDNN_VERSION >= 92600
+// cuDNN GNN APIs are introduced in 9.26 and are not supported on Windows.
+#if CUDNN_VERSION >= 92600 && !defined(_WIN32)
 #if defined(NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
     return get_symbol("cudnnGnnAggSimpleForward") != nullptr && get_symbol("cudnnGnnAggSimpleBackward") != nullptr;
 #else
@@ -534,7 +535,7 @@ is_gnn_agg_simple_available() {
 #endif
 }
 
-#if CUDNN_VERSION >= 92600
+#if CUDNN_VERSION >= 92600 && !defined(_WIN32)
 inline cudnnStatus_t
 gnn_agg_simple_forward(cudaStream_t stream,
                        const cudnnGnnCscGraph_t *graph,
