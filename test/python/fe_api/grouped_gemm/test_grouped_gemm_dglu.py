@@ -868,8 +868,27 @@ def _test_grouped_gemm_dglu_dense_wrapper(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request):
-    """Validate dense MXFP8 dSiTU-GLU outputs against the PyTorch reference."""
+@pytest.mark.parametrize(
+    "alpha_beta_dtype,situ_beta1,vector_f32",
+    [
+        pytest.param(torch.float32, 4.0, False, id="fp32-default-scalar"),
+        pytest.param(torch.bfloat16, 4.0, False, id="bf16-default-scalar"),
+        pytest.param(torch.bfloat16, 4.0, True, id="bf16-default-vector"),
+        pytest.param(torch.bfloat16, 2.0, False, id="bf16-generic-scalar"),
+        pytest.param(torch.bfloat16, 2.0, True, id="bf16-generic-vector"),
+    ],
+)
+def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request, alpha_beta_dtype, situ_beta1, vector_f32):
+    """Validate dense MXFP8 dSiTU-GLU with caller-provided scaling dtypes.
+
+    Transformer Engine supplies BF16 alpha and beta tensors in its MXFP8 fused
+    grouped-MLP path. Cover both the K3-default packed specialization and the
+    generic-beta implementation, with the generic vectorization knob on and off.
+    """
+
+    def cast_scaling_tensors(inputs, _cfg):
+        inputs["alpha_tensor"] = inputs["alpha_tensor"].to(alpha_beta_dtype)
+        inputs["beta_tensor"] = inputs["beta_tensor"].to(alpha_beta_dtype)
 
     _test_grouped_gemm_dglu_dense_wrapper(
         ab_dtype=torch.float8_e4m3fn,
@@ -882,10 +901,12 @@ def test_grouped_gemm_dglu_dense_wrapper_dsituglu_mxfp8(request):
         cluster_shape_mn=(2, 1),
         sf_vec_size=32,
         sf_dtype=torch.float8_e8m0fnu,
-        vector_f32=False,
+        vector_f32=vector_f32,
         discrete_col_sfd=False,
         request=request,
+        input_mutator=cast_scaling_tensors,
         act_func="dsituglu",
+        situ_beta1=situ_beta1,
     )
 
 

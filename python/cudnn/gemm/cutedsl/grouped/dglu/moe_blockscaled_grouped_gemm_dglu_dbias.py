@@ -1903,19 +1903,22 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         beta2_f32 = cutlass.Float32(beta2)
         beta1_rcp = cutlass.Float32(1.0 / beta1)
         beta2_rcp = cutlass.Float32(1.0 / beta2)
+        square_alpha_f32 = cutlass.Float32(square_alpha)
+        beta_val_f32 = cutlass.Float32(beta_val)
+        mprob_f32 = cutlass.Float32(mProb)
 
         # The K3-default specialization always uses packed FP32x2 arithmetic. This is an
         # activation-specific optimization and is independent of the generic vectorized_f32 knob.
         if cutlass.const_expr(beta1 == 4.0):
             fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
             fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
-            square_alpha2 = (square_alpha, square_alpha)
-            beta_val2 = (beta_val, beta_val)
+            square_alpha2 = (square_alpha_f32, square_alpha_f32)
+            beta_val2 = (beta_val_f32, beta_val_f32)
             beta1_2 = (beta1_f32, beta1_f32)
             beta2_2 = (beta2_f32, beta2_f32)
             beta1_rcp2 = (beta1_rcp, beta1_rcp)
             beta2_rcp2 = (beta2_rcp, beta2_rcp)
-            mprob2 = (mProb, mProb)
+            mprob2 = (mprob_f32, mprob_f32)
             ones2 = (cutlass.Float32(1.0), cutlass.Float32(1.0))
             halves2 = (cutlass.Float32(0.5), cutlass.Float32(0.5))
             twos2 = (cutlass.Float32(2.0), cutlass.Float32(2.0))
@@ -1992,9 +1995,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             return dgate_vec.load(), dup_vec.load(), dprob_swiglu
 
         for i in cutlass.range_constexpr(cute.size(acc_vec)):
-            grad = acc_vec[i] * square_alpha
-            gate = gate_vec[i].to(cutlass.Float32) * beta_val
-            up = up_vec[i].to(cutlass.Float32) * beta_val
+            grad = acc_vec[i] * square_alpha_f32
+            gate = gate_vec[i].to(cutlass.Float32) * beta_val_f32
+            up = up_vec[i].to(cutlass.Float32) * beta_val_f32
             gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
             up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
             sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
@@ -2005,7 +2008,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             up_grad = cutlass.Float32(1.0) - up_tanh * up_tanh
             activation_grad = grad
             if cutlass.const_expr(self.has_prob):
-                activation_grad = grad * mProb
+                activation_grad = grad * mprob_f32
             dgate_vec[i] = activation_grad * up_value * gate_grad
             dup_vec[i] = activation_grad * gate_value * up_grad
             if cutlass.const_expr(self.generate_dprob):
