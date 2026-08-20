@@ -3165,6 +3165,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
 
+        # Graph Stats / score declarations arrive as (B, H, S, 1); the kernels
+        # write [B, H, SQ] — rebind the squeezed view (zero-cost, same storage).
+        if lse_tensor is not None and lse_tensor.ndim == 4:
+            lse_tensor = lse_tensor.squeeze(-1)
+        if score_max_tensor is not None and score_max_tensor.ndim == 4:
+            score_max_tensor = score_max_tensor.squeeze(-1)
+        if score_sum_tensor is not None and score_sum_tensor.ndim == 4:
+            score_sum_tensor = score_sum_tensor.squeeze(-1)
+
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         kernel = _sm80_kernel_mod(self.flavor)
         device = q_tensor.device
