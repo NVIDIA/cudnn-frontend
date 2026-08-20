@@ -561,8 +561,7 @@ def _sm80_spec() -> EngineSpec:
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
     caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
     gated off (the standalone wrapper's varlen path serves THD); knob domains
-    are empty (no tunables wired).  ALiBi / block_mask / score-stats graphs are
-    deliberately NOT served — the row declines and the backend takes them."""
+    are empty (no tunables wired)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(

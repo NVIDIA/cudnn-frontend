@@ -1034,25 +1034,16 @@ def _sdpa_kernel(
         # B-operand (K) via ldmatrix.x4 — halves the inner-loop ldmatrix
         # instruction count vs the x2 variant (load 2 adjacent n_frags per
         # call).  tile_n must be a multiple of 16 (N//8 even).
-        # block_on is Python True — the dense path traces the guarded bodies
         # below unconditionally (byte-identical codegen).
-        block_on = True
-
-        if block_on:
-            K_frag_cur = load_b_smem_x4(
-                sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-            )
-            for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
-                if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
-                    K_frag_next = load_b_smem_x4(
-                        sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-                    )
-                mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
-                if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
-                    K_frag_cur = K_frag_next
-        else:
-            for _i in cutlass.range_constexpr(m_blocks * QK_N_FRAGS * 4):
-                S_acc[_i] = cutlass.Float32(-3.4028235e38)
+        K_frag_cur = load_b_smem_x4(sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
+        for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
+            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+                K_frag_next = load_b_smem_x4(
+                    sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                )
+            mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
+            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+                K_frag_cur = K_frag_next
 
         # ---- ONLINE SOFTMAX -----------------------------------------------
         # Per-lane: rowwise max → reduce → update m_state → rescale O & l →
@@ -1295,17 +1286,15 @@ def _sdpa_kernel(
         # SV B-operand (V) also via ldmatrix.x4 — bigger win here than QK
         # because d_v // 8 is large (32 at d_v=256, 16 at d_v=128), so the
         # halving cuts the per-k-step ldmatrix count from {32,16} to {16,8}.
-        # block_on is Python-True: the body traces unconditionally.
-        if block_on:
-            V_frag_cur = load_b_smem_x4(sV_cur, k_step=0, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
-            for k_chunk in cutlass.range_constexpr(SV_K_CHUNKS):
-                if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
-                    V_frag_next = load_b_smem_x4(
-                        sV_cur, k_step=k_chunk + 1, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-                    )
-                mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=d_v, ab_dtype=io_dtype)
-                if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
-                    V_frag_cur = V_frag_next
+        V_frag_cur = load_b_smem_x4(sV_cur, k_step=0, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
+        for k_chunk in cutlass.range_constexpr(SV_K_CHUNKS):
+            if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
+                V_frag_next = load_b_smem_x4(
+                    sV_cur, k_step=k_chunk + 1, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                )
+            mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=d_v, ab_dtype=io_dtype)
+            if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
+                V_frag_cur = V_frag_next
 
         # End-of-iter CTA barrier — REQUIRED because next iter's V_pref
         # writes to sV[next_stage(i+1)] = sV[cur_stage(i)] = the SAME slot

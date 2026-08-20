@@ -479,8 +479,6 @@ def _sm80_spec() -> EngineSpec:
             dbias=True,
             dsink=True,
             bias=True,
-            # ALiBi / block_mask graphs are deliberately NOT served — the row
-            # declines and the backend takes them (matches the fwd row).
             right_band_widening=True,
             seq_q_trim=False,
             swa=True,
