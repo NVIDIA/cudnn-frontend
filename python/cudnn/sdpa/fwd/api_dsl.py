@@ -1203,7 +1203,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # FP8/MXFP8 flavors carry two more slots for the packed-total-
             # clamped K/V runtime descriptors (see the kernels' THD closures).
             o_desc_slots = b + (3 if self._fp8 else 1)
-            return ws_align((3 * b + 2) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+            return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
         if self.split_kv > 1:
@@ -1520,7 +1520,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
         with _torch_stream_context(current_stream, dev):
-            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -1544,7 +1544,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             o_desc_slots = b + (3 if self._fp8 else 1)
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
-        units = self._thd_unit_envelope()
+        # PERSISTENT THD grid: cap the launch at what the device can hold
+        # resident (one cluster per CTA_MMA SMs) instead of the plan-time
+        # envelope. The kernel pulls units from a device-bounded counter, so
+        # the grid no longer has to cover the work list -- which is what made
+        # 38-84% of clusters dead.
+        _env = self._thd_unit_envelope()
+        _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
+        _sms = torch.cuda.get_device_properties(q_buf.device).multi_processor_count
+        if getattr(self._k_mod, "THD_PERSISTENT", False):
+            units = min(_env, max(1, _sms // max(1, _cta_mma)))
+            _dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
+            if _dbg > 0:
+                units = min(_env, _dbg)
+        else:
+            units = _env  # CLC path: the grid must BE the work list
 
         Q = self._thd_view(q_buf, self.q_desc, t_q)
         O = self._thd_view(o_buf, self.o_desc, t_q)
@@ -2778,6 +2792,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             None,  # thd_q_lens / thd_kv_lens / thd_lens_form: THD-only, folded out
             None,
             None,
+            cutlass.Int32(0),  # thd_n_ctas: THD-only persistent grid extent
             current_stream,
         )
         if self.split_kv > 1:
@@ -2944,6 +2959,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.q_lens_dev if pack is not None else None,
             pack.kv_lens_dev if pack is not None else None,
             cutlass.Int32(pack.lens_form) if pack is not None else None,
+            cutlass.Int32(0),  # thd_n_ctas: unused on this path (no persistent grid)
             current_stream,
         )
         # Both of these consume what the kernel just wrote, so they belong on
@@ -3025,7 +3041,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # validation — AGENTS.md Rule 3; cu prefixes are normalized by the
         # setup kernel).
         with _torch_stream_context(current_stream, dev):
-            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -3177,8 +3193,25 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.q_lens_dev,
             pack.kv_lens_dev,
             cutlass.Int32(pack.lens_form),
+            cutlass.Int32(self._thd_persistent_ctas(pack.Q.device)),
             current_stream,
         )
+
+    def _thd_persistent_ctas(self, device) -> int:
+        """CTA count for the persistent THD grid.
+
+        Sized to the MACHINE, not to the work: the live unit total is a
+        device-side quantity (issue #552), a CTA with nothing left to claim just
+        retires, and one with more work loops. So over-launching is harmless and
+        under-launching only costs parallelism. One CTA per SM matches the
+        kernel's ``min_blocks_per_mp``.
+        """
+        forced = int(os.environ.get("FROST_THD_CTAS", "0"))
+        if forced > 0:
+            return forced
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        per_sm = int(os.environ.get("FROST_THD_CTAS_PER_SM", "1"))
+        return max(1, sms * max(1, per_sm))
 
     def scratch_workspace_bytes(self) -> int:
         if self.thd:
@@ -3192,7 +3225,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
             b = self.batch_size
-            return ws_align((3 * b + 2) * 4)
+            return ws_align((4 * b + 4) * 4)
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.
