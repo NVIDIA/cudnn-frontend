@@ -1147,6 +1147,14 @@ def _render_block_scale_tile_constants(
         # span); SFA is one block per M sub-block, so its M instructions stay
         # independent.
         num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
+        if num_sf_words * insts_per_word != num_kblocks:
+            raise NotImplementedError(
+                f"block-scale {cfg.name!r}: {num_sf_words} SF word(s) x {insts_per_word} "
+                f"instruction(s) per word covers {num_sf_words * insts_per_word} K-blocks, "
+                f"but the K-tile has {num_kblocks}. The MMA would read scale bytes that were "
+                f"never staged, or skip the trailing K-blocks. Reachable only if the "
+                f"cta_tile_k_bytes == 128 requirement is relaxed."
+            )
         sfa_tmem_cols = sfa_nb_m * _REGISTERS_PER_BLOCK
         sfb_tmem_cols = mma_nb_n * _REGISTERS_PER_BLOCK
     # utccp SMEM-source offsets (16-byte units). One 128×4 atom = 512 B = 32;

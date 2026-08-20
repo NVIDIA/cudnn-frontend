@@ -313,7 +313,6 @@ def _kernel(
 
     sA_bytes = sA_elems * (ab_dtype.width // 8)
     sB_bytes = sB_elems * (ab_dtype.width // 8)
-    num_tma_copy_bytes = num_a_operands * (sA_bytes + sfa_smem_bytes) + num_b_operands * (sB_bytes + sfb_smem_bytes)
     ab_only_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
     sf_only_copy_bytes = num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes
 

@@ -283,7 +283,6 @@ def _kernel(
         sB_tma_bytes = sB_elems * (ab_load_b_dtype.width // 8)
     else:
         sB_tma_bytes = sB_bytes
-    num_tma_copy_bytes = sA_tma_bytes + sB_tma_bytes
 
     idesc = cutlass.experimental.primitives.Tcgen05InstrDesc.build(
         a_dtype=mma_a_dtype,
