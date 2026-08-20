@@ -18,8 +18,8 @@ same 16x factor as the depth, retaining the LM-head/layer FLOP ratio.
 The proxy exposes three independent axes:
 
 - stock FLA versus `cudnn.fla` for linear GDN (`--accelerate_attn`, PR #596);
-- stock FLA `GatedMLP` versus `cudnn.gemm.ops.swiglu_mlp`
-  (`--accelerate_mlp`, PR #609); and
+- stock FLA `GatedMLP` versus the opt-in `cudnn.fla` `gated_mlp` target backed
+  by `cudnn.gemm.ops.swiglu_mlp` (`--accelerate_mlp`, PR #609); and
 - vanilla `torch.nn.functional.scaled_dot_product_attention` versus FE's direct
   cuDNN-backend d256 op (`--full_attn_backend`, develop #335).
 
@@ -109,7 +109,9 @@ python benchmark/e2e/Qwen3.8/run_model.py --preset qwen3.5-27b --inspect  # equi
 
 Requires a cuDNN build with the fused GEMM engine and the cuDNN >= 9.23 backend
 d256 SDPA path on an SM100 (Blackwell) device; `flash-linear-attention` provides
-the model. The benchmark rejects the older OSS/CuteDSL d256 SDPA fallback.
+the model. The MLP target requires FLA 0.5.2 and admits its validated plain,
+local, bias-free BF16 `swish` module; unsupported runtime configurations fall
+back to FLA. The benchmark rejects the older OSS/CuteDSL d256 SDPA fallback.
 
 ## Add a model
 
