@@ -83,11 +83,13 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
-    # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
-    # row_max_reduction (see _softmax_kv_body); tmem_load_max_reduction_tile
-    # is not imported.
+    # cc10.0: manual tcgen05_ld + row_max_reduction on the MASK_NONE path.
+    # cc10.3 (FUSED_LDTM_STAT) fuses load + row-max into one
+    # tcgen05.ld.red.f32.max via tmem_load_max_reduction_x64, exactly like
+    # the MXFP8 kernel (and the SM107 sibling, which bakes it).
     row_reduction_pair,
     row_max_reduction,
+    tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
 )
@@ -159,6 +161,11 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     lpt_tile_coords,
     make_sdpa_helpers,
 )
+
+# cc10.3 fuses the S_acc row-max into the LDTM; cc10.0 lacks the instruction
+# and keeps the manual load + software reduction. Set by the adapter from the
+# device capability (see api_dsl.compile()).
+FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
 
@@ -1307,9 +1314,21 @@ def _softmax_kv_body(
         current_max_unscaled = chunks_max[0]
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    elif cutlass.const_expr(FUSED_LDTM_STAT != 0):
+        # cc10.3: one tcgen05.ld.red.f32.max per 64-col chunk does the S_acc
+        # load AND the row-max in one op (data regs + max at index CHUNK).
+        # Unmasked iters only — the fused max reduces before a mask could be
+        # applied (masked iters take the software path above).
+        res_chunks = [tmem_load_max_reduction_x64(s_addr_base + cutlass.Int32(c * CHUNK)) for c in range(N_CHUNKS)]
+        raw_chunks = [cutlass.Vector.from_elements(tuple(r[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32) for r in res_chunks]
+        chunks_max = [cutlass.Vector.from_elements((r[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0] for r in res_chunks]
+        reg_S_vec = vec_concat(raw_chunks)
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
-        # SM100: manual row-max (no LDTM.STAT / tmem_load_max_reduction_tile) —
-        # the masked path's pattern sans mask.  S_acc is FP32 regardless of dtype.
+        # cc10.0: manual row-max (no LDTM.STAT) — the masked path's pattern
+        # sans mask.  S_acc is FP32 regardless of dtype.
         raw_chunks = [
             nvvm.tcgen05_ld(
                 "32x32b",
