@@ -1456,8 +1456,10 @@ class Graph : public ICudnn, public INode {
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
         // The driver-API engines read the calling THREAD's context stack, and a
         // thread that has done no CUDA work yet (a PyTorch autograd worker) has
-        // none. All roads reach here, so every backend and OSS execute is covered.
-        {
+        // none. All roads reach here, so every execute is covered; the steady
+        // state is one cuCtxGetCurrent, and the stream query only runs when a
+        // context actually has to be established.
+        if (!detail::has_current_context()) {
             cudaStream_t stream = nullptr;
             detail::get_stream(handle, &stream);
             detail::ensure_current_context(stream);

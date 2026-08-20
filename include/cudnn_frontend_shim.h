@@ -471,6 +471,24 @@ get_driver_entry_point(const char *name) {
 #endif
 }
 
+// True when the calling thread already has a context. One driver call, so the
+// execute path can skip the rest -- including the stream query -- in the steady
+// state.
+inline bool
+has_current_context() {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using PfnCtxGetCurrent            = CUresult(CUDAAPI *)(CUcontext *);
+    static const auto ctx_get_current = reinterpret_cast<PfnCtxGetCurrent>(get_driver_entry_point("cuCtxGetCurrent"));
+    if (ctx_get_current == nullptr) {
+        return true;  // cannot tell; leave the thread alone
+    }
+    CUcontext current = nullptr;
+    return ctx_get_current(&current) == CUDA_SUCCESS && current != nullptr;
+#else
+    return true;
+#endif
+}
+
 // Bind a driver context to the calling thread when it has none: a driver-API
 // launch reads that stack, and a thread that has done no CUDA work has nothing
 // on it (a PyTorch autograd worker). A bound context is left alone -- it is
