@@ -111,7 +111,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: E402
 # ``d_qk`` / ``d_v`` are now Constexpr params on the kernel (folded at trace
 # time); the flavor (Llama d=128, GPT-OSS d=64, …) is picked by the driver
 # by the adapter's per-flavor knob table
-# (``cudnn.sdpa.fwd.api._FLAVOR_KNOBS``).  Knob defaults
+# (``cudnn.sdpa.fwd.api_dsl._SM80_FLAVOR_KNOBS``).  Knob defaults
 # below match the Llama flavor — overridden per-flavor in
 # the adapter's knob table and threaded through ``forward()``.
 DEFAULT_TILE_M = 128
@@ -2107,6 +2107,13 @@ def forward(
     # LSB-first along kv-blocks; bit set ⇒ tile
     # KEPT, unset ⇒ masked.  Kernel skips QK + SV
     # mma for off blocks.  Dense-only.  None → off.
+    out_o: Optional[torch.Tensor] = None,  # [B, SQ, H, d_v] caller-provided output
+    # buffer (Q dtype, contiguous); None →
+    # allocate.  Dense-only (THD allocates).
+    out_lse: Optional[torch.Tensor] = None,  # [B, H, SQ] fp32 contiguous LSE buffer;
+    # None → allocate (used when return_lse).
+    out_score_max: Optional[torch.Tensor] = None,  # [B, H, SQ] fp32; None → allocate
+    out_score_sum: Optional[torch.Tensor] = None,  # (used when return_score_stats).
 ):
     """Run SM80 SDPA prefill for an MHA-shaped (B, S, H, D) Q/K/V triple.
 
@@ -2225,12 +2232,37 @@ def forward(
     # Allocate output / LSE sized to the actual (possibly uneven) shapes —
     # the kernel writes only the valid (row, col) range via STG predication.
     # Output dim follows V (= d_v), which can differ from Q's d_qk (DSv3).
-    out_o = torch.zeros(B, SQ, H, d_v, dtype=Q.dtype, device=Q.device)
-    LSE = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+    # Caller-bound out_* buffers skip the allocation.  Rows a feature path
+    # never touches (seq_len_q trim, zero-length padded batches, block-masked
+    # rows) rely on zero-init, so zero a bound buffer only when such a path is
+    # active — the plain / causal / SWA dense paths write every valid element.
+    _needs_zero_init = (seq_len_q is not None) or (seq_kv_lens is not None) or (block_mask is not None)
+    if out_o is None:
+        out_o = torch.zeros(B, SQ, H, d_v, dtype=Q.dtype, device=Q.device)
+    else:
+        assert out_o.shape == (B, SQ, H, d_v) and out_o.dtype == Q.dtype and out_o.is_contiguous(), (
+            f"out_o must be a contiguous [{B}, {SQ}, {H}, {d_v}] {Q.dtype} tensor; " f"got shape {tuple(out_o.shape)} dtype {out_o.dtype}"
+        )
+        if _needs_zero_init:
+            out_o.zero_()
+    if out_lse is None:
+        LSE = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+    else:
+        assert out_lse.shape == (B, H, SQ) and out_lse.dtype == torch.float32 and out_lse.is_contiguous(), (
+            f"out_lse must be a contiguous [{B}, {H}, {SQ}] fp32 tensor; " f"got shape {tuple(out_lse.shape)} dtype {out_lse.dtype}"
+        )
+        LSE = out_lse
+        if _needs_zero_init:
+            LSE.zero_()
     # SCORE_MAX / SCORE_SUM [B,H,SQ] (or 1-elem dummies when not requested).
     if return_score_stats:
-        SCORE_MAX = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
-        SCORE_SUM = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+        SCORE_MAX = out_score_max if out_score_max is not None else torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+        SCORE_SUM = out_score_sum if out_score_sum is not None else torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+        if _needs_zero_init:
+            if out_score_max is not None:
+                SCORE_MAX.zero_()
+            if out_score_sum is not None:
+                SCORE_SUM.zero_()
     else:
         SCORE_MAX = torch.ones(1, dtype=torch.float32, device=Q.device)
         SCORE_SUM = torch.ones(1, dtype=torch.float32, device=Q.device)

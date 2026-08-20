@@ -83,8 +83,6 @@ def _get_current_stream(device: torch.device):
     return torch.cuda.current_stream(device).cuda_stream
 
 
-
-
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return _TORCH_DTYPE_TO_CUDNN[dtype]
@@ -95,10 +93,6 @@ def _diagonal_alignment_enum(val: int):
     if val == 0:
         return cudnn.diagonal_alignment.TOP_LEFT
     return cudnn.diagonal_alignment.BOTTOM_RIGHT
-
-
-
-
 
 
 def _make_fprop_cache_key(
@@ -629,8 +623,6 @@ def _sdpa_fake(
     O = torch.empty(B, H_q, S_q, D_v, dtype=q.dtype, device=q.device)
     Stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device)
     return O, Stats
-
-
 
 
 def _sdpa_bwd_impl(

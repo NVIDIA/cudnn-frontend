@@ -14,8 +14,6 @@ import torch
 
 from cudnn.api_base import APIBase, TupleDict
 
-
-
 _logger = logging.getLogger(__name__)
 
 
@@ -146,7 +144,7 @@ def _bshd(t: torch.Tensor) -> torch.Tensor:
 class SdpabwdSm80(APIBase):
     """SM80 (A100) SDPA backward.
 
-    Mirrors ``SdpafwdSm80``.  Inputs are the forward activations (Q/K/V/O), the
+    Mirrors the SM80 forward adapter.  Inputs are the forward activations (Q/K/V/O), the
     loss gradient dO, and the forward stats LSE.  Outputs dQ/dK/dV (+ dBias when
     an additive bias is present).
     """

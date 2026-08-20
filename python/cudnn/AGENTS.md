@@ -103,7 +103,6 @@ none is precedent:
   declaration would drop the KV-only-padding population these kernels serve
   correctly. It goes away when the FP8 kernels get the epilogue trim; until
   then the read is what keeps a short length from being silently ignored.
-- The ragged cache-key `max()` in `sdpa/{fwd,bwd}/api.py`.
 - `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
   (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
   wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
