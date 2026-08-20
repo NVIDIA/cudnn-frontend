@@ -58,7 +58,7 @@ def _build_fwd_graph(**sdpa_kwargs):
     k = g.tensor(name="k", dim=(B, H, S, D), stride=st, data_type=_HALF)
     v = g.tensor(name="v", dim=(B, H, S, D), stride=st, data_type=_HALF)
     o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True, **sdpa_kwargs)
-    o.set_output(True).set_data_type(_HALF)
+    o.set_output(True).set_dim((B, H, S, D)).set_stride(st).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     return g, q, k, v, o, stats
 
