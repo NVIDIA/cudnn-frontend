@@ -1293,10 +1293,14 @@ _CFG_128 = "CONFIG_sm103_128x128x384_128x128x48_cluster1x1"
 _CFG_256 = "CONFIG_sm103_128x256x384_128x256x48_cluster1x1"
 
 # The kernel compiles on any Blackwell-family GPU (the K=96 mode is an idesc
-# bit, not a mnemonic); it RUNS only on sm103.
+# bit, not a mnemonic); it RUNS on the sm103 pipeline's arch range, which is
+# PIPELINE_ARCH_RANGES["sm103"] = ((103, 110),) -- NOT just sm_103. Gating this
+# on `_SM != 103` skipped every sm103 test on a 10.7 part, which is exactly the
+# hardware the sm103 `num_mma_m > 1` bug was found on. Same shape as
+# `requires_sm107`.
 requires_sm103 = pytest.mark.skipif(
-    _SM != 103,
-    reason="sm103 block-scale kernels run only on an SM 103 GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not (103 <= _SM < 110),
+    reason="sm103 block-scale kernels run only on 103 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 

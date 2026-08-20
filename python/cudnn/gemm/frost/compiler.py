@@ -1091,15 +1091,9 @@ def _render_block_scale_tile_constants(
 
     cta_m = cfg.cta_tile_m
     cta_n = cfg.cta_tile_n
-    if is_sm103:
-        # sm103 stages one 128-B K chunk per AB stage rather than a whole K-tile,
-        # so it does not carry the plain (MN x K-tile) TMA box the sliced multicast
-        # splits. Keep the single issuer + full-cluster ab_empty release.
-        bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = 1, 1, True
-    else:
-        bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = _mcast_slice_plan(
-            chain.matmul.a_major, chain.matmul.b_major, cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group, cta_m, cta_n // cta_group
-        )
+    bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = _mcast_slice_plan(
+        chain.matmul.a_major, chain.matmul.b_major, cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group, cta_m, cta_n // cta_group
+    )
     # MMA K-instruction width (sm100 → 32 bytes): fp4 → 64 elems, fp8 → 32.
     mma_inst_k_bytes = cfg.mma_inst_k_bytes
     mma_inst_k_elems = mma_inst_k_bytes * 8 // data_elem_bits

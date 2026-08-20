@@ -492,7 +492,39 @@ def _kernel(
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         sA_stage = smem_a_list[_ai].subview(a_chunk_packed_elems * stage)
                         tma_a_desc = tma_a_descs[_ai]
-                        if cutlass.const_expr(multicast_a):
+                        if cutlass.const_expr(a_mcast_slices > 1):
+                            _a_rows = cta_tile_mnk[0] // a_mcast_slices
+                            _a_row_elems = a_chunk_packed_elems // cta_tile_mnk[0]
+                            if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+                                # Preferred-only launch: the slice count IS the group size, so every
+                                # CTA loads exactly its own slice.
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(n_rank * _a_rows * _a_row_elems),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=nvvm.CTAGroup.CTA_1,
+                                    )
+                            else:
+                                # Mixed CGA: a fallback cluster has fewer CTAs than the preferred one
+                                # the slice count was baked from, so each covers that many more slices.
+                                _a_per_cta = a_mcast_slices // cluster_n
+                                for _asl in cutlass.range(_a_per_cta):
+                                    _a_idx = n_rank * _a_per_cta + _asl
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sA_stage.subview(_a_idx * _a_rows * _a_row_elems),
+                                            tma_a_desc.get_ptr(),
+                                            (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_l_a),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_a,
+                                            group=nvvm.CTAGroup.CTA_1,
+                                        )
+                        elif cutlass.const_expr(multicast_a):
                             if n_rank == 0:
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -519,7 +551,39 @@ def _kernel(
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         sB_stage = smem_b_list[_bj].subview(b_chunk_packed_elems * stage)
                         tma_b_desc = tma_b_descs[_bj]
-                        if cutlass.const_expr(multicast_b):
+                        if cutlass.const_expr(b_mcast_slices > 1):
+                            _b_rows = cta_tile_mnk[1] // b_mcast_slices
+                            _b_row_elems = b_chunk_packed_elems // cta_tile_mnk[1]
+                            if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+                                # Preferred-only launch: the slice count IS the group size, so every
+                                # CTA loads exactly its own slice.
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sB_stage.subview(m_rank * _b_rows * _b_row_elems),
+                                        tma_b_desc.get_ptr(),
+                                        (coord_k, coord_n_per_cta + m_rank * _b_rows, tile_l_b),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_b,
+                                        group=nvvm.CTAGroup.CTA_1,
+                                    )
+                            else:
+                                # Mixed CGA: a fallback cluster has fewer CTAs than the preferred one
+                                # the slice count was baked from, so each covers that many more slices.
+                                _b_per_cta = b_mcast_slices // cluster_m
+                                for _bsl in cutlass.range(_b_per_cta):
+                                    _b_idx = m_rank * _b_per_cta + _bsl
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sB_stage.subview(_b_idx * _b_rows * _b_row_elems),
+                                            tma_b_desc.get_ptr(),
+                                            (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_l_b),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_b,
+                                            group=nvvm.CTAGroup.CTA_1,
+                                        )
+                        elif cutlass.const_expr(multicast_b):
                             if m_rank == 0:
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -1357,7 +1421,7 @@ def _host(
                     a_stride_m * ab_dtype.width // 128,
                     a_stride_l * ab_dtype.width // 128,
                 ],
-                box_dims=[ab_tma_box_k_elems, cta_tile_mnk[0], 1],
+                box_dims=[ab_tma_box_k_elems, cta_tile_mnk[0] // a_mcast_slices, 1],
                 swizzle=ab_tma_swizzle,
                 tma_format=ab_tma_format,
             )
@@ -1395,7 +1459,7 @@ def _host(
                     b_stride_n * ab_dtype.width // 128,
                     b_stride_l * ab_dtype.width // 128,
                 ],
-                box_dims=[ab_tma_box_k_elems, cta_tile_mnk[1], 1],
+                box_dims=[ab_tma_box_k_elems, cta_tile_mnk[1] // b_mcast_slices, 1],
                 swizzle=ab_tma_swizzle,
                 tma_format=ab_tma_format,
             )
