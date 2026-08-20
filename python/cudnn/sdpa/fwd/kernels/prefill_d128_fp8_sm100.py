@@ -202,7 +202,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # The setup kernel builds it DEVICE-side from the caller's length tensors and
 # the adapter launches the plan-time envelope grid (issue #552) — no length
 # ever reaches the host.
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
@@ -568,6 +568,7 @@ def _kernel(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            o_desc_words=o_desc_words,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -617,6 +618,7 @@ def _tmaldg_warp_group(
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
+    o_desc_words,
     n_q_supers,
     n_qh,
     n_batch,
@@ -635,8 +637,23 @@ def _tmaldg_warp_group(
     kv_state = PipelineState.start(phase=1)
 
     tma_q = GmemTileTma(tma_q_desc)
-    tma_k = GmemTileTma(tma_k_desc)
-    tma_v = GmemTileTma(tma_v_desc)
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
+        # slots n_batch+1 / n_batch+2), whose seq extent is clamped to the
+        # packed KV total cu_k[B]. The last sequence's tile steps past that
+        # total into the buffer's capacity tail; through the clamped
+        # descriptors those rows are TMA-OOB and land as EXACT ZEROS — a NaN
+        # tail (test_mhas_v2 poisons it) would otherwise wipe the tile via
+        # BMM2's P·V (0 · NaN == NaN) and, on cc10.3, the pre-mask fused-LDTM
+        # row-max. Same closure shape as the dense GmemTileTma, so every load
+        # site below is branch-free.
+        _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
+        tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
+    else:
+        tma_k = GmemTileTma(tma_k_desc)
+        tma_v = GmemTileTma(tma_v_desc)
 
     q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init,
@@ -1810,6 +1827,11 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
+            # Dead row (no valid KV column at all): O := 0 in BOTH branches
+            # (with a sink the denominator is finite but the O numerator is an
+            # empty sum).  total_sum >= 2^P_CAST_LOG2_SCALE for any alive row
+            # so this never fires spuriously.
+            row_dead = total_sum <= cutlass.Float32(0.0)
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
@@ -1825,6 +1847,10 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = o_scale_fused / cute.math.max(total_sum, cutlass.Float32(1e-30))
+                # Dead row without a sink: LSE := -inf on top of O := 0.
+                neg_inf_lse = cutlass.Float32(float("-inf"))
+                lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), neg_inf_lse.ir_value(), lse_val.ir_value()))
+                inv_sum = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
 
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
@@ -1892,14 +1918,19 @@ def _correction_warp_group(
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     o_scaled = o_chunk * inv_sum
+                    # Dead-row sanitize: an empty mainloop never writes O TMEM,
+                    # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
+                    # cannot zero it — select 0 explicitly (keeps amax_o clean).
+                    _zero_f = cutlass.Float32(0.0)
+                    o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
 
                     for _i in cutlass.range_constexpr(O_CHUNK):
-                        _e = o_scaled[_i]
+                        _e = o_elems[_i]
                         _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
 
                     # Plain range (not range_constexpr) — extraction at Python trace time.
                     o_packed_v = fp32_to_fp8_pack(
-                        [o_scaled[i] for i in range(16)],
+                        [o_elems[i] for i in range(16)],
                         dtype=OUT_STORAGE_DTYPE,
                     )
 
@@ -1934,6 +1965,14 @@ def _correction_warp_group(
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     o_scaled_h = o_chunk * inv_sum
+                    # Dead-row sanitize — see the fp8-pack path above.
+                    _zero_f = cutlass.Float32(0.0)
+                    o_scaled_h = cutlass.Vector.from_elements(
+                        tuple(
+                            cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled_h[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)
+                        ),
+                        cutlass.Float32,
+                    )
                     for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
                         _e = o_scaled_h[_i]
                         _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
@@ -2097,9 +2136,15 @@ def _host(
         # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
         # Per-token element stride of packed O (o_tensor.stride[1] = QH * d_v)
         # — NOT CFG.TILE_O, which is only coincidentally right at QH == 1.
-        _build_thd_meta_o_descs_kernel(
+        # The FP8 setup variant also clamps runtime K/V descriptors to the
+        # packed KV total (slots n_batch+1/+2 of o_desc_words) so tile-tail
+        # loads past it zero-fill instead of reading the buffer's capacity
+        # tail — a NaN tail would poison BMM2's P·V (0 · NaN == NaN).
+        _build_thd_meta_o_kv_descs_kernel(
             o_tensor,
             tma_o_desc,
+            tma_k_desc,
+            tma_v_desc,
             o_desc_words,
             seq_kv_lens_tensor,
             thd_q_lens_tensor,
@@ -2264,9 +2309,11 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    # Per-batch O TMA-descriptor array (16 int64 = 128 B each) + 1 pad slot;
-    # dummy 1-elem when THD off (kernel never reads it).
-    _odesc_len = (b * _TENSOR_MAP_QWORDS + _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
+    # Per-batch O TMA-descriptor array (16 int64 = 128 B each) + 1 pad slot +
+    # the packed-total-clamped K and V runtime descriptors (slots n_batch+1 /
+    # n_batch+2 — see the THD tma_k/tma_v closures); dummy 1-elem when THD
+    # off (kernel never reads it).
+    _odesc_len = ((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
         (_odesc_len,),

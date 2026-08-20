@@ -496,6 +496,10 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     exactly the kernel's per-sequence-TILE-padded SF layout."""
     from sdpa.mxfp8_quant import quantize_to_mxfp8
 
+    if s == 0:
+        # Zero-length sequence: no tokens, no SF tiles.
+        empty = t_1hsd.new_zeros((1, h, 0, d))
+        return empty.to(fp8), empty.float(), torch.zeros((h, 0, 128 * d // _BLOCK), dtype=torch.uint8, device=t_1hsd.device)
     data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(t_1hsd, 1, h, s, d, _BLOCK, fp8, with_ref=True)
     n_tiles = _cdiv(s, 128)
     if columnwise:
@@ -560,8 +564,14 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     sfv_pk = torch.cat(sfv_seqs, dim=1).contiguous()
 
     def _dense_buf(packed, s_max, h, dt):
+        # Dense-capacity storage; packed tokens in the leading elements (THD
+        # contract). The capacity tail is NaN-POISONED (test_mhas_v2 parity):
+        # the last sequence's KV tile steps past the packed total, and those
+        # tail loads must land as zeros through the setup kernel's
+        # packed-total-clamped K/V descriptors — a leaked NaN would wipe the
+        # tile via BMM2's P·V (0 · NaN == NaN).
         stride = (s_max * h * D, D, h * D, 1)
-        stor = torch.zeros(B * s_max * h * D, device=dev, dtype=dt)
+        stor = torch.full((B * s_max * h * D,), float("nan"), device=dev, dtype=torch.float32).to(dt)
         stor[: packed.numel()] = packed.reshape(-1)
         return stor, stor.as_strided((B, h, s_max, D), stride), stride
 
@@ -669,6 +679,10 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
 
     o_ref = torch.zeros(T_q, H_q, D, device=dev, dtype=torch.float32)
     for b in range(B):
+        if cu_q[b + 1] == cu_q[b] or cu_k[b + 1] == cu_k[b]:
+            # Zero-length Q contributes no rows; zero-length KV leaves every
+            # row of the sequence dead — O := 0 (o_ref is pre-zeroed).
+            continue
         qd = q8_seqs[b].float() * dq_seqs[b]
         kd = k8_seqs[b].float() * dk_seqs[b]
         vd = v8_seqs[b].float() * dv_seqs[b]
@@ -722,6 +736,17 @@ def test_mxfp8_thd_stats():
     o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True)
     _check(o_out, o_ref, torch.float16, "e4m3")
     assert lse is not None and torch.isfinite(lse).all()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_zero_len_kv():
+    """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
+    zero-KV sequence's rows are dead — the epilogue must come back O := 0,
+    not the unwritten O TMEM (garbage survives `* inv_sum(=0)` when NaN)."""
+    scale = 1.0 / math.sqrt(128)
+    o_out, o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale)
+    _check(o_out, o_ref, torch.float16, "e4m3")
 
 
 @pytest.mark.L0

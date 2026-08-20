@@ -398,9 +398,14 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     v8, dv = _quant(v_pk, in_key)
 
     def _dense_buf(packed, s_max, h, dt):
-        # Dense-capacity storage; packed tokens in the leading elements (THD contract).
+        # Dense-capacity storage; packed tokens in the leading elements (THD
+        # contract). The capacity tail is NaN-POISONED (test_mhas_v2 parity):
+        # the last sequence's KV tile steps past the packed total, and those
+        # tail loads must land as zeros through the setup kernel's
+        # packed-total-clamped K/V descriptors — a leaked NaN would wipe the
+        # tile via BMM2's P·V (0 · NaN == NaN).
         stride = (s_max * h * D, D, h * D, 1)
-        stor = torch.zeros(B * s_max * h * D, device=dev, dtype=dt)
+        stor = torch.full((B * s_max * h * D,), float("nan"), device=dev, dtype=torch.float32).to(dt)
         stor[: packed.numel()] = packed.reshape(-1)
         return stor, stor.as_strided((B, h, s_max, D), stride), stride
 
@@ -507,6 +512,14 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     o_ref = torch.zeros(T_q, H_q, D, device=dev, dtype=torch.float32)
     lse_ref = torch.zeros(T_q, H_q, dtype=torch.float32, device=dev)
     for b in range(B):
+        if cu_q[b + 1] == cu_q[b]:
+            continue
+        if cu_k[b + 1] == cu_k[b]:
+            # Zero-length KV: every Q row of the sequence is dead — O := 0
+            # (o_ref is pre-zeroed) and, sink-less, LSE := -inf.
+            if stats:
+                lse_ref[cu_q[b] : cu_q[b + 1]] = sink.flatten().to(lse_ref) if sink is not None else float("-inf")
+            continue
         qb = (q8[cu_q[b] : cu_q[b + 1]].float() * dq).permute(1, 0, 2).unsqueeze(0)
         kb = (k8[cu_k[b] : cu_k[b + 1]].float() * dk).permute(1, 0, 2).unsqueeze(0)
         vb = (v8[cu_k[b] : cu_k[b + 1]].float() * dv).permute(1, 0, 2).unsqueeze(0)
@@ -578,6 +591,21 @@ def test_fp8_thd_stats():
     out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=scale, causal=True, stats=True)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_zero_len_kv():
+    """Zero-length Q and KV sequences (test_mhas_v2 ragged parity, e.g.
+    seq_len_q=[126, 0, 60] / seq_len_kv=[0, 83, 77]): the zero-KV sequence's
+    rows are dead — the epilogue must come back O := 0 / LSE := -inf, not the
+    unwritten O TMEM (garbage survives `* inv_sum(=0)` when it is NaN)."""
+    scale = 1.0 / math.sqrt(128)
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=scale, stats=True)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2, equal_nan=False)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e5m2", scale=scale)
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
 
 
 @pytest.mark.L0

@@ -80,6 +80,80 @@ def build_thd_meta_kernel(
 
 
 @cute.kernel
+def build_thd_meta_o_kv_descs_kernel(
+    o_tensor: cute.Tensor,
+    base_o_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    o_desc_words: cute.Tensor,
+    meta_t: cute.Tensor,
+    q_lens_t: cute.Tensor,
+    kv_lens_t: cute.Tensor,
+    lens_form: cutlass.Int32,
+    n_qh: cutlass.Int32,
+    n_batch: cutlass.Int32,
+    o_row_stride: cutlass.Int32,
+) -> None:
+    """``build_thd_meta_o_descs_kernel`` + packed-total-clamped K/V descriptors
+    (the FP8/MXFP8 THD flavors).
+
+    The K/V loads tile in TILE_N rows, so the LAST sequence's tile steps past
+    the packed KV total into the buffer's capacity tail — caller-owned bytes
+    that may be NaN (test_mhas_v2 poisons them deliberately). Masked S columns
+    are NaN-safe (the mask is a select), but BMM2's ``P·V`` is not
+    (``0 · NaN == NaN`` wipes every valid row of the tile), and on cc10.3 the
+    fused-LDTM row-max reduces S BEFORE the mask. So the setup thread also
+    copies the K and V base descriptors into ``o_desc_words`` slots
+    ``n_batch+1`` / ``n_batch+2`` with their seq extent (GLOBAL_DIM ord=2)
+    patched to the packed total ``cu_k[B]`` — tile-tail loads past it become
+    TMA-OOB and land as EXACT ZEROS in SMEM (zero V nulls the masked P·V
+    terms; zero K keeps the pre-mask row-max finite). Slot ``n_batch`` stays
+    the never-built dead-unit pad slot."""
+    if nvvm.elect_sync():
+        meta = cutlass.make_array_view(meta_t)
+        write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+        cuq0 = n_batch
+        o_ptr = o_tensor.iterator.raw_ptr()
+        desc_base = o_desc_words.iterator.raw_ptr()
+        src_words = Pointer(base_o_desc.get_ptr(), dtype=cutlass.Int64)
+        row_elems = o_row_stride
+        for b in cutlass.range(0, n_batch, 1, unroll=1):
+            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
+            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+                (dptr + i).store((src_words + i).load())
+            cu_q_b = cutlass.Int32(meta[cuq0 + b])
+            s_i = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cu_q_b
+            row_base = o_ptr + cu_q_b * row_elems
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_ADDRESS,
+                dptr,
+                new_value=row_base.toint(cutlass.Int64),
+            )
+            nvvm.tensormap_replace(
+                nvvm.TensormapField.GLOBAL_DIM,
+                dptr,
+                new_value=s_i,
+                ord=2,
+            )
+        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+        k_dptr = desc_base + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (k_dptr + i).store((k_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (v_dptr + i).store((v_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
+        nvvm.fence_proxy_release(
+            nvvm.MemScope.GPU,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
+@cute.kernel
 def build_thd_meta_o_descs_kernel(
     o_tensor: cute.Tensor,
     base_o_desc: cutlass.GridConstant[tmap.TensorMap],

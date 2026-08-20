@@ -1042,7 +1042,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # kernel (issue #552). o_desc: 16 int64 per
             # sequence + 16 spare, the per-sequence O TMA descriptors the
             # builder kernel fills.
-            return ws_align((3 * b + 2) * 4) + ws_align((b * 16 + 16) * 8) + (0 if self.has_sink else ws_align(qh * 4))
+            # o_desc: 16 int64 per sequence + the dead-unit pad slot; the
+            # FP8/MXFP8 flavors carry two more slots for the packed-total-
+            # clamped K/V runtime descriptors (see the kernels' THD closures).
+            o_desc_slots = b + (3 if self._fp8 else 1)
+            return ws_align((3 * b + 2) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
         # Dense padded-Q lens bind directly as their own kernel parameter
@@ -1332,7 +1336,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # before any consumer read, so stale bytes never survive — a fill
         # here is a wasted kernel launch on the execute hot path (Rule 1).
         with _torch_stream_context(current_stream, dev):
-            o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.empty(b * 16 + 16, dtype=torch.int64, device=dev)
+            # +2 slots on the FP8/MXFP8 flavors: the packed-total-clamped K/V
+            # runtime descriptors the setup kernel writes after the pad slot.
+            o_desc_slots = b + (3 if self._fp8 else 1)
+            o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
         units = self._thd_unit_envelope()
 
