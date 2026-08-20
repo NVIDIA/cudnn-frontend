@@ -91,7 +91,8 @@ def test_sdpa_bwd_sm80_smoke():
 @torch_fork_set_rng(seed=0)
 def test_sdpa_bwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
     try:
-        from cudnn.sdpa import sdpa_bwd_wrapper_sm80, sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -144,7 +145,8 @@ def test_sdpa_bwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
 def test_sdpa_bwd_sm80_deterministic_repeatable():
     """deterministic=True must produce bitwise-identical dQ across runs."""
     try:
-        from cudnn.sdpa import sdpa_bwd_wrapper_sm80, sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 

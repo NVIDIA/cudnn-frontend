@@ -124,21 +124,6 @@ SCHED_DEFAULT = 0  # 3-D grid (kv_tile, head, batch); no reorder (byte-identical
 SCHED_LPT = 1  # 1-D kv-major grid for causal load-balance
 
 
-def default_alibi_slopes(n_heads: int) -> torch.Tensor:
-    """Standard ALiBi per-head slopes (Press et al. geometric sequence; mirrors
-    cuDNN test_mhas + the forward kernel's ``default_alibi_slopes``).  Returns a
-    ``[H]`` fp32 CPU tensor of raw slopes (``backward`` divides by the softmax
-    scale before handing them to the kernel)."""
-    n = 2 ** math.floor(math.log2(n_heads))
-    m0 = 2.0 ** (-8.0 / n)
-    slopes = [m0**i for i in range(1, 1 + n)]
-    if n < n_heads:
-        mh0 = 2.0 ** (-4.0 / n)
-        extra = [mh0**i for i in range(1, 1 + 2 * (n_heads - n), 2)]
-        slopes = slopes + extra
-    return torch.tensor(slopes[:n_heads], dtype=torch.float32)
-
-
 def _mask_p(p, kv_abs, q_abs, *, mask_flags: int, swa_window: int, causal_bottom_right: int, causal_diag, eff_skv, right_bound):
     """Zero a recomputed softmax probability ``p`` if its ``(kv_abs, q_abs)``
     cell is masked.  Mirrors ``tile_dsl.mask.apply_mask_chunk`` but per-scalar
@@ -209,11 +194,9 @@ def _bprop_kernel(
     LSE: cute.Tensor,  # [B, H, SQ] fp32 (natural-log)
     DO_DOT: cute.Tensor,  # [B, H, SQ] fp32 (sum_d O*dO, "delta")
     SEQ_KV_LENS: cute.Tensor,  # [B] int32 (per-batch KV length; dummy if unused)
-    ALIBI_COEF: cute.Tensor,  # [H] fp32 per-head ALiBi coef (slope/scale; dummy if unused)
     BIAS: cute.Tensor,  # [1|B, H, SQ, SKV] additive bias (dummy if unused)
     DBIAS: cute.Tensor,  # [1|B, H, SQ, SKV] fp32 bias-grad accumulator (atomicAdd)
     ROPE_CS: cute.Tensor,  # [max_s, d_qk//2, 2] fp32 (cos,sin); dummy if unused
-    BLOCK_MASK: cute.Tensor,  # [B,H,ceil(SQ/128),ceil(ceil(SKV/128)/8)] uint8; dummy if unused
     CU_Q: cute.Tensor,  # [B+1] int32 cumulative Q seqlens (THD/varlen); dummy otherwise.
     CU_K: cute.Tensor,  # [B+1] int32 cumulative KV seqlens (THD/varlen); dummy otherwise.
     SEQ_LEN_Q: cute.Tensor,  # [B] int32 (per-batch Q length; PADDED dense — dummy if unused)
@@ -230,11 +213,9 @@ def _bprop_kernel(
     swa_window: cutlass.Constexpr[int],  # SWA window W (compile-time)
     causal_bottom_right: cutlass.Constexpr[int],  # bottom-right causal alignment
     has_seq_kv_lens: cutlass.Constexpr[bool],  # read SEQ_KV_LENS[batch] for PADDED
-    has_alibi: cutlass.Constexpr[bool],  # add ALIBI_COEF[head]*(k-q) to S
     has_bias: cutlass.Constexpr[bool],  # add BIAS[.,h,q,k] to S; dump dBias
     bias_is_fp32: cutlass.Constexpr[bool],  # BIAS dtype (fp32 vs io_dtype)
     has_rope: cutlass.Constexpr[bool],  # rotate Q/K in SMEM; un-rotate dQ/dK
-    has_block_mask: cutlass.Constexpr[bool],  # 128x128 block-sparsity → zero P for off blocks
     has_seq_len_q: cutlass.Constexpr[bool],  # read SEQ_LEN_Q[batch] → per-batch q-pad (dense PADDED)
     THD_VARLEN: cutlass.Constexpr[bool],  # packed [1,T,H,D] + CU_Q/CU_K; per-batch S_q/S_kv
     deterministic: cutlass.Constexpr[bool],  # gate the dQ semaphore relay (folds out → byte-identical fast path)
@@ -355,12 +336,6 @@ def _bprop_kernel(
     # packed per-seq s_kv_b - s_q_b; dense full folds to SKV - SQ (eff_skv=SKV,
     # q_bound=SQ).  Only consulted for causal_bottom_right (TL uses q_lim=q_abs).
     causal_diag = (s_kv_b - s_q_b) if cutlass.const_expr(THD_VARLEN) else (eff_skv - q_bound)
-    # ALiBi per-head coef (slope/scale); added to UNSCALED acc1 so *scale later
-    # yields slope*(k-q).  Folds out when has_alibi is False.
-    if cutlass.const_expr(has_alibi):
-        alibi_coef_h = Pointer(cutlass.make_array_view(ALIBI_COEF).data_ptr() + head, dtype=cutlass.Float32).load()
-    else:
-        alibi_coef_h = cutlass.Float32(0.0)
     # Bias / dBias base offset for this (batch, head): [.,H,SQ,SKV] row-major.
     # bias_bstride == 0 ⇒ bias broadcast over batch (all batches share the same
     # [1,H,SQ,SKV] slice → dBias atomicAdd reduces over batch for free).
@@ -708,20 +683,6 @@ def _bprop_kernel(
             # (bias is dense-only; kv_bound == SKV here.)
             ka = _clamp_lt(kv_a, kv_bound) if cutlass.const_expr(GATE_KV) else kv_a
             ka8 = _clamp_lt(kv_a8, kv_bound) if cutlass.const_expr(GATE_KV) else kv_a8
-            # Block-mask: tile (64×64) never straddles a 128-block boundary, so
-            # the (qblk,kvblk) bit is CONSTANT across this q-tile × kv-tile.  Read
-            # it once → block_mult ∈ {1,0}; multiply P by it (off ⇒ P=0 ⇒
-            # dS/dK/dV/dQ inherit).  Correctness tier (no compute-skip yet).
-            if cutlass.const_expr(has_block_mask):
-                _bm_nkvblk = (SKV + 127) // 128
-                _bm_nkvbyte = (_bm_nkvblk + 7) // 8
-                _bm_nqblk = (SQ + 127) // 128
-                _bm_qblk = q_base // cutlass.Int32(128)
-                _bm_kvblk = kv_base // cutlass.Int32(128)
-                _bm_off = ((batch * cutlass.Int32(H) + head) * cutlass.Int32(_bm_nqblk) + _bm_qblk) * cutlass.Int32(_bm_nkvbyte) + _bm_kvblk // cutlass.Int32(8)
-                _bm_byte = Pointer(cutlass.make_array_view(BLOCK_MASK).data_ptr() + _bm_off, dtype=cutlass.Uint8).load()
-                _bm_on = ((_bm_byte.to(cutlass.Int32) >> (_bm_kvblk % cutlass.Int32(8))) & cutlass.Int32(1)) != cutlass.Int32(0)
-                block_mult = cutlass.Float32(arith.select(_bm_on.ir_value(), cutlass.Float32(1.0).ir_value(), cutlass.Float32(0.0).ir_value()))
             for nf in cutlass.range_constexpr(S_NFRAGS):
                 qc0 = q_base + cutlass.Int32(nf * 8 + 0) + cutlass.Int32(2) * p_lane
                 qc1 = qc0 + cutlass.Int32(1)
@@ -746,14 +707,6 @@ def _bprop_kernel(
                     acc1[off + 1] = acc1[off + 1] + b01.to(cutlass.Float32) * inv_softmax_scale
                     acc1[off + 2] = acc1[off + 2] + b10.to(cutlass.Float32) * inv_softmax_scale
                     acc1[off + 3] = acc1[off + 3] + b11.to(cutlass.Float32) * inv_softmax_scale
-                # ALiBi: add slope/scale·(k-q) to UNSCALED acc1 before exp2
-                # (post-scale → slope·(k-q)).  Matches the forward; folds out
-                # at has_alibi=False.  P then carries it to sg1 via sP.
-                if cutlass.const_expr(has_alibi):
-                    acc1[off + 0] = acc1[off + 0] + alibi_coef_h * (kv_a - qc0).to(cutlass.Float32)
-                    acc1[off + 1] = acc1[off + 1] + alibi_coef_h * (kv_a - qc1).to(cutlass.Float32)
-                    acc1[off + 2] = acc1[off + 2] + alibi_coef_h * (kv_a8 - qc0).to(cutlass.Float32)
-                    acc1[off + 3] = acc1[off + 3] + alibi_coef_h * (kv_a8 - qc1).to(cutlass.Float32)
                 p0 = cute.math.exp2(acc1[off + 0] * softmax_scale_log2 - lse0, fastmath=True)
                 p1 = cute.math.exp2(acc1[off + 1] * softmax_scale_log2 - lse1, fastmath=True)
                 p2 = cute.math.exp2(acc1[off + 2] * softmax_scale_log2 - lse0, fastmath=True)
@@ -785,12 +738,6 @@ def _bprop_kernel(
                     p1 = _mask_p(p1, kv_a, qc1, **_mk)
                     p2 = _mask_p(p2, kv_a8, qc0, **_mk)
                     p3 = _mask_p(p3, kv_a8, qc1, **_mk)
-                # Block-mask gate (whole tile on/off): P=0 when the block is off.
-                if cutlass.const_expr(has_block_mask):
-                    p0 = p0 * block_mult
-                    p1 = p1 * block_mult
-                    p2 = p2 * block_mult
-                    p3 = p3 * block_mult
                 # Partial-tile / THD bounds: zero P for padded kv-rows
                 # (kv >= S_kv) and padded q-cols (q >= S_q).  Keeps dV/dS/dBias
                 # clean; the dQ dSᵀ·K term over padded kv is already 0 via the K
@@ -1354,11 +1301,9 @@ def _bprop_host(
     LSE: cute.Tensor,
     DO_DOT: cute.Tensor,
     SEQ_KV_LENS: cute.Tensor,
-    ALIBI_COEF: cute.Tensor,
     BIAS: cute.Tensor,
     DBIAS: cute.Tensor,
     ROPE_CS: cute.Tensor,
-    BLOCK_MASK: cute.Tensor,
     CU_Q: cute.Tensor,
     CU_K: cute.Tensor,
     SEQ_LEN_Q: cute.Tensor,
@@ -1375,11 +1320,9 @@ def _bprop_host(
     swa_window: cutlass.Constexpr[int],
     causal_bottom_right: cutlass.Constexpr[int],
     has_seq_kv_lens: cutlass.Constexpr[bool],
-    has_alibi: cutlass.Constexpr[bool],
     has_bias: cutlass.Constexpr[bool],
     bias_is_fp32: cutlass.Constexpr[bool],
     has_rope: cutlass.Constexpr[bool],
-    has_block_mask: cutlass.Constexpr[bool],
     has_seq_len_q: cutlass.Constexpr[bool],
     thd_varlen: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
@@ -1421,11 +1364,9 @@ def _bprop_host(
         LSE,
         DO_DOT,
         SEQ_KV_LENS,
-        ALIBI_COEF,
         BIAS,
         DBIAS,
         ROPE_CS,
-        BLOCK_MASK,
         CU_Q,
         CU_K,
         SEQ_LEN_Q,
@@ -1442,11 +1383,9 @@ def _bprop_host(
         swa_window,
         causal_bottom_right,
         has_seq_kv_lens,
-        has_alibi,
         has_bias,
         bias_is_fp32,
         has_rope,
-        has_block_mask,
         has_seq_len_q,
         thd_varlen,
         deterministic,
@@ -1538,13 +1477,11 @@ def _compile_main(
     swa_window=0,
     causal_bottom_right=0,
     has_seq_kv_lens=False,
-    has_alibi=False,
     has_bias=False,
     bias_is_fp32=True,
     bias_batch=1,
     has_rope=False,
     rope_max_s=1,
-    has_block_mask=False,
     has_seq_len_q=False,
     thd_varlen=False,
     n_seq=1,
@@ -1568,7 +1505,6 @@ def _compile_main(
     # seq_kv_lens [B] int32 — a real tensor only when PADDED; a 1-elem dummy
     # otherwise (the kernel never reads it when has_seq_kv_lens is False).
     fsk = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (B if has_seq_kv_lens else 1,), stride_order=(0,), assumed_align=16)
-    fab = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (H if has_alibi else 1,), stride_order=(0,), assumed_align=16)
     # BIAS / DBIAS [bias_batch, H, SQ, SKV] (bias_batch ∈ {1 (broadcast), B}); a
     # 1-elem dummy when has_bias is False.  bias_dt = fp32 or io_dtype.
     bias_dt = cutlass.Float32 if bias_is_fp32 else io_dtype
@@ -1583,13 +1519,6 @@ def _compile_main(
         frope = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (rope_max_s, d_qk // 2, 2), stride_order=(2, 1, 0), assumed_align=16)
     else:
         frope = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
-    # block_mask [B, H, ceil(SQ/128), ceil(ceil(SKV/128)/8)] uint8; 1-elem dummy.
-    if has_block_mask:
-        _nqblk = (SQ + 127) // 128
-        _nkvbyte = ((SKV + 127) // 128 + 7) // 8
-        fbm = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (B, H, _nqblk, _nkvbyte), stride_order=(3, 2, 1, 0), assumed_align=16)
-    else:
-        fbm = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (1,), stride_order=(0,), assumed_align=16)
     # cu_q / cu_k [n_seq+1] int32 (THD packed cumulative seqlens); 1-elem dummy
     # otherwise (the kernel reads them only when thd_varlen).
     _cu_n = (n_seq + 1) if thd_varlen else 1
@@ -1613,11 +1542,9 @@ def _compile_main(
         fl,
         fdt,
         fsk,
-        fab,
         fbias,
         fdbias,
         frope,
-        fbm,
         fcuq,
         fcuk,
         fsq,
@@ -1634,11 +1561,9 @@ def _compile_main(
         int(swa_window),
         int(causal_bottom_right),
         bool(has_seq_kv_lens),
-        bool(has_alibi),
         bool(has_bias),
         bool(bias_is_fp32),
         bool(has_rope),
-        bool(has_block_mask),
         bool(has_seq_len_q),
         bool(thd_varlen),
         bool(deterministic),
@@ -1713,11 +1638,9 @@ def backward(
     causal_bottom_right: bool = False,  # bottom-right causal alignment
     seq_kv_lens: Optional[torch.Tensor] = None,  # [B] int32 per-batch KV length
     seq_len_q: Optional[torch.Tensor] = None,  # [B] int32 per-batch Q length (dense PADDED)
-    alibi_slopes: Optional[torch.Tensor] = None,  # [H] fp32 raw ALiBi slopes
     bias: Optional[torch.Tensor] = None,  # [1|B, H, SQ, SKV] additive bias
     rope_freqs: Optional[torch.Tensor] = None,  # [max_s, .., d_qk] RoPE angles
     sinks: Optional[torch.Tensor] = None,  # [H] fp32 sink logits → dSink output
-    block_mask: Optional[torch.Tensor] = None,  # [B,H,nqblk,nkvbyte] uint8 128×128 sparsity
     cu_seqlens_q: Optional[torch.Tensor] = None,  # [n_seq+1] int32 cumulative Q seqlens (THD)
     cu_seqlens_k: Optional[torch.Tensor] = None,  # [n_seq+1] int32 cumulative KV seqlens (THD)
     tile_kv: int = _LLAMA_CFG.TILE_KV,
@@ -1804,7 +1727,6 @@ def backward(
     if has_seq_kv_lens:
         mask_flags |= MASK_PADDED
     cbr = 1 if causal_bottom_right else 0
-    has_alibi = alibi_slopes is not None
     has_bias = bias is not None
     if has_bias:
         assert bias.dim() == 4 and bias.shape[1] == H, f"bias must be [1|B, H, SQ, SKV]; got {tuple(bias.shape)}"
@@ -1835,19 +1757,13 @@ def backward(
     if has_sink:
         sinks_t = sinks.to(dtype=torch.float32, device=Q.device).reshape(H).contiguous()
         dsink_t = torch.zeros(H, dtype=torch.float32, device=Q.device)
-    has_block_mask = block_mask is not None
-    if has_block_mask:
-        assert not has_seq_kv_lens, "block_mask is dense-only on SM80 bprop"
-        block_mask_t = block_mask.to(dtype=torch.uint8, device=Q.device).contiguous()
-    else:
-        block_mask_t = torch.zeros(1, dtype=torch.uint8, device=Q.device)
-    # THD is dense-feature-only for now (bias/rope/block_mask/sink/seq_kv_lens
-    # are dense-only); per-sequence padding is handled by the packed bounds, not
+    # THD is dense-feature-only for now (bias/rope/sink/seq_kv_lens are
+    # dense-only); per-sequence padding is handled by the packed bounds, not
     # the PADDED mask.  THD uses SCHED_DEFAULT (LPT+THD is a future tweak).
     if thd:
         assert not (
-            has_bias or has_rope or has_block_mask or has_sink or has_seq_kv_lens or has_seq_len_q
-        ), "THD/varlen bprop: bias/rope/block_mask/sink/seq_kv_lens/seq_len_q not supported yet"
+            has_bias or has_rope or has_sink or has_seq_kv_lens or has_seq_len_q
+        ), "THD/varlen bprop: bias/rope/sink/seq_kv_lens/seq_len_q not supported yet"
         sched_policy = SCHED_DEFAULT
     # RoPE staging reuses the sDQ SMEM buffer, which the d_qk > 128 configs
     # drop (dq_smem_coalesce) to stay under the 164 KiB dynamic-SMEM cap —
@@ -1873,11 +1789,9 @@ def backward(
     # last straddling tile zero-fills OOB rows on load, masks P=0 for kv>=SKV /
     # q>=SQ, clamps LSE/do_dot/bias reads, and row-gates the dV/dK/dQ/dBias
     # stores (all compile-time gated on SQ%tile_q / SKV%tile_kv → dense path is
-    # byte-identical).  RoPE/block_mask still require alignment (see below).
+    # byte-identical).  RoPE still requires alignment (see below).
     if has_rope and (SQ % tile_q or SKV % tile_kv):
         raise NotImplementedError("SM80 bprop: RoPE requires SQ/SKV tile-aligned")
-    if has_block_mask and (SQ % tile_q or SKV % tile_kv):
-        raise NotImplementedError("SM80 bprop: block_mask requires SQ/SKV tile-aligned")
     # dQ M-tiling: tile_q rows are covered by warps_per_sg warps × 16 × M_BLOCKS,
     # so tile_q must be an exact multiple of warps_per_sg*16 (llama 64→1 block,
     # gptoss 128→2).  dV/dK/BMM1 keep M=tile_kv=warps_per_sg*16 (1 block).
@@ -1927,11 +1841,6 @@ def backward(
         cu_k_t = torch.zeros(1, dtype=torch.int32, device=Q.device)
         grid_kv_tiles = 0
         grid_batch = 0
-    # ALiBi coef = raw slope / scale (kernel adds to UNSCALED QK).
-    if has_alibi:
-        alibi_coef_t = (alibi_slopes.to(dtype=torch.float32, device=Q.device) / float(scale)).contiguous()
-    else:
-        alibi_coef_t = torch.zeros(1, dtype=torch.float32, device=Q.device)
     # Bias + dBias (fp32 accumulator, same shape as bias; atomicAdd reduces over
     # batch when bias is broadcast [1,H,SQ,SKV]).
     if has_bias:
@@ -1977,13 +1886,11 @@ def backward(
         swa_window=swa_window,
         causal_bottom_right=cbr,
         has_seq_kv_lens=has_seq_kv_lens,
-        has_alibi=has_alibi,
         has_bias=has_bias,
         bias_is_fp32=bias_is_fp32,
         bias_batch=bias_batch,
         has_rope=has_rope,
         rope_max_s=rope_max_s,
-        has_block_mask=has_block_mask,
         has_seq_len_q=has_seq_len_q,
         thd_varlen=thd,
         n_seq=n_seq,
@@ -2002,11 +1909,9 @@ def backward(
         from_dlpack(lse_t),
         from_dlpack(dot_t),
         from_dlpack(seqk_t),
-        from_dlpack(alibi_coef_t),
         from_dlpack(bias_t),
         from_dlpack(dbias_t),
         from_dlpack(rope_cs_t),
-        from_dlpack(block_mask_t),
         from_dlpack(cu_q_t),
         from_dlpack(cu_k_t),
         from_dlpack(seqq_t),

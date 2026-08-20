@@ -25,6 +25,7 @@ engines may share one template. Neither direction is 1:1.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -43,6 +44,7 @@ from cudnn.sdpa import graph_analyzer as ga
 # at build time. Capabilities/mismatch below stay import-free.
 _SM100 = "SdpaFwdDslSm100"
 _SM120 = "SdpaFwdDslSm120"
+_SM80 = "SdpaFwdDslSm80"
 
 
 def _adapter(name: str):
@@ -155,11 +157,12 @@ class Capabilities:
     # low-precision sink path without affecting its non-sink coverage.
     sink_dtypes: Optional[frozenset] = None
     stats: bool = False
-    # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
-    # store), so a stats-less graph needs no dummy-LSE workspace chunk. Every
-    # lower_dsl_prefill row sets True (the SM100 FP8/MXFP8 flavors were the
-    # last holdouts); the SM80 row keeps the False default but lowers through
-    # its own adapter (lower_sm80_prefill), which never reads this flag.
+    # The adapter accepts lse_tensor=None, so a stats-less graph needs no
+    # dummy-LSE workspace chunk. Every row sets True. The SM100/SM120 kernels
+    # None-specialize the LSE store (compiled out entirely); the SM80 kernels
+    # still compute LSE into a kernel-internal buffer when unbound — a
+    # pre-existing allocation on that path, tracked with its other
+    # TemplateParams-conversion follow-ups.
     lse_optional: bool = False
     # THD lowerings assume FULLY-PACKED storage: the packed addressing is
     # re-derived as prefix(lens) x token stride, and the graph's bound
@@ -552,13 +555,13 @@ def _sm100_fp8_spec(
 
 
 def _sm80_spec() -> EngineSpec:
-    """SM80 (A100) prefill row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``fwd/api.py``), which owns kernel-flavor selection
-    (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
+    """SM80 (A100) prefill row: lowers through ``lower_dsl_prefill`` onto the
+    ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
+    selection (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
     caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
-    gated off (the standalone wrappers serve THD); knob domains are empty
-    (no tunables wired)."""
+    gated off (the standalone wrapper's varlen path serves THD); knob domains
+    are empty (no tunables wired)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
@@ -571,10 +574,6 @@ def _sm80_spec() -> EngineSpec:
             d_pad_multiple=1,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
-            alibi=True,
-            block_mask=True,
-            score_max=True,
-            score_sum_exp=True,
             right_band_widening=True,
             causal=True,
             bottom_right=True,
@@ -585,77 +584,17 @@ def _sm80_spec() -> EngineSpec:
             stats=True,
             padded_stats=True,
             decode=False,
+            # The kernels implement the dense padded-Q trim natively
+            # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
+            # are written explicitly by the kernel (O := 0, LSE := -inf).
+            dense_seq_q_trim=True,
+            lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
             sched_policies=frozenset(),
         ),
-        lower=lower_sm80_prefill,
+        lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
-
-
-def lower_sm80_prefill(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None):
-    """Lower the SM80 prefill row through the ``cudnn.sdpa`` SM80 adapter."""
-    from cudnn.sdpa.fwd.api import sdpa_fwd_wrapper_sm80
-
-    binding = ga.SdpaBinding(
-        q=facts.q_t,
-        k=facts.k_t,
-        v=facts.v_t,
-        o=facts.o_t,
-        stats=facts.stats_t,
-        bias=facts.bias_t,
-        sink_token=facts.sink_t,
-        seq_len_kv=facts.seq_kv_t,
-        seq_len_q=facts.seq_q_t,
-        block_mask=facts.block_mask_t,
-        score_max=facts.score_max_t,
-        score_sum_exp=facts.score_sum_exp_t,
-    )
-    mask_args = ga.adapter_mask_args(facts)
-    wants_score_stats = facts.has_score_max or facts.has_score_sum_exp
-
-    def _execute(variant_pack, stream=None):
-        resolved = ga.resolve_variant_pack(variant_pack, binding)
-        # dense_flex delivery: the adapter requires BSHD-physical buffers, so
-        # normalize here (zero-copy when already BSHD; repeat_interleave's
-        # GQA expansion is BHSD-contiguous and always needs it).
-        q_buf = ga.to_bshd_physical(resolved[id(facts.q_t)])
-        k_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.k_t)], facts.h_q))
-        v_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.v_t)], facts.h_q))
-
-        out = sdpa_fwd_wrapper_sm80(
-            q_buf,
-            k_buf,
-            v_buf,
-            scale_softmax=facts.scale,
-            return_score_stats=wants_score_stats,
-            # Stream from the caller's handle (ExecutionContext.stream);
-            # None keeps the current stream.
-            current_stream=stream,
-            **mask_args,
-            **ga.adapter_feature_buffers(facts, resolved),
-        )
-
-        # copy_ casts in place; no .to() (which would allocate a staging
-        # tensor per execute). The kernel outputs are contiguous, so the
-        # reshapes are pure views.
-        resolved[id(facts.o_t)].copy_(out["o_tensor"])
-        if facts.wants_stats:
-            stats_buf = resolved.get(id(facts.stats_t))
-            if stats_buf is not None:
-                stats_buf.copy_(out["lse_tensor"].view(stats_buf.shape))
-        if wants_score_stats:
-            for t_ref, key in ((facts.score_max_t, "score_max"), (facts.score_sum_exp_t, "score_sum_exp")):
-                buf = resolved.get(id(t_ref)) if t_ref is not None else None
-                if buf is not None:
-                    buf.copy_(out[key].view(buf.shape))
-        return None
-
-    # Executor contract (engine._FrostSdpaFwdPlan): torch-native host code,
-    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
-    _execute.workspace_bytes = 0
-    _execute.binding = binding
-    return _execute
 
 
 def _sm120_spec() -> EngineSpec:
@@ -807,6 +746,13 @@ def lower_dsl_prefill(
     api_scratch_bytes = api.scratch_workspace_bytes()
     total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
 
+    # SM80-only feature operand (bias): the row's capability gate admitted it,
+    # and the adapter's execute() declares the matching optional keyword —
+    # forwarded below only when both hold. ALiBi / block_mask / score-stats
+    # graphs never reach a FROST row (every capability row declines them, so
+    # the backend serves them).
+    _extra_exec_keys = {"bias_tensor"} & set(inspect.signature(type(api).execute).parameters)
+
     binding = ga.SdpaBinding(
         q=facts.q_t,
         k=facts.k_t,
@@ -818,6 +764,7 @@ def lower_dsl_prefill(
         seq_len_q=seq_q_t,
         cu_seq_len_q=facts.cu_seq_q_t,
         cu_seq_len_kv=facts.cu_seq_kv_t,
+        bias=facts.bias_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
@@ -867,7 +814,8 @@ def lower_dsl_prefill(
         # lse_optional (the kernel compiles the LSE store out) — no dummy.
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
-        # bias/block_mask/alibi stay None for these rows (mismatch gates them).
+        # bias flows only to adapters declaring the keyword (the SM80 row);
+        # every other feature operand is gated off by mismatch for all rows.
         feature_ops = ga.resolve_feature_operands(facts, resolved)
         sinks_buf = feature_ops.sinks
         seq_kv_buf = feature_ops.seq_kv_lens
@@ -925,6 +873,10 @@ def lower_dsl_prefill(
                 descale_v=dv_buf,
                 scale_o=so_buf,
             )
+        if _extra_exec_keys:
+            # SM80 feature operand (mismatch admitted it for this row).
+            if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
+                execute_kwargs["bias_tensor"] = feature_ops.bias
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
         api.execute(**execute_kwargs)

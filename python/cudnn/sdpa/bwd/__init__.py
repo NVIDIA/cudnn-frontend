@@ -14,8 +14,6 @@ import importlib
 from typing import Any
 
 _LAZY_EXPORTS = {
-    "SdpabwdSm100D256": (".api", "SdpabwdSm100D256"),
-    "sdpa_bwd_wrapper_sm100_d256": (".api", "sdpa_bwd_wrapper_sm100_d256"),
     "SdpaBwdDsl": (".api_dsl", "SdpaBwdDsl"),
     "SdpaBwdDslSm120": (".api_dsl", "SdpaBwdDslSm120"),
     "sdpa_bwd_wrapper_dsl_sm120": (".api_dsl", "sdpa_bwd_wrapper_dsl_sm120"),

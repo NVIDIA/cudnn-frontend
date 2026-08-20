@@ -28,7 +28,6 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 ## Open-source (frontend-only) kernel APIs
 
 - [FE OSS APIs overview — full catalog and usage pattern](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/overview.md)
-- [SDPA forward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_fwd_d256.md), [SDPA backward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_bwd_d256.md)
 - [Block-sparse attention (BSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/bsa.md), [DeepSeek sparse attention (DSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/dsa.md), [Native sparse attention (NSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/nsa.md)
 - [GEMM fusions (amax, SwiGLU, sReLU, grouped/discrete MoE variants)](https://github.com/NVIDIA/cudnn-frontend/tree/main/docs/fe-oss-apis/gemm_fusions)
 - [RMSNorm + RHT + Amax](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_rht_amax.md), [RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_silu.md)

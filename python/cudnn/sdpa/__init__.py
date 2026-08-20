@@ -3,41 +3,39 @@
 
 """cudnn.sdpa: scaled dot-product attention (forward and backward).
 
-Exports resolve on first attribute access (PEP 562). Eager imports here used to
-drag the CuTe DSL — measured ~1.0 s and 357 modules — into any process that
-merely asked whether an SDPA engine might serve a graph. Support checks need
-the capability tables, not the lowering, so the lowering is not imported until
+This package level is reserved for the ARCH-AGNOSTIC standalone entry points
+(a single ``sdpa_fwd_wrapper`` / ``sdpa_bwd_wrapper`` that resolves the
+adapter from the device, mirroring how the other FE OSS families expose one
+entry point). Until those land it deliberately exports nothing.
+
+The per-architecture adapters and wrappers — the pinning / benchmarking tier —
+live one level down and are imported from there directly:
+
+    from cudnn.sdpa.fwd import SdpaFwdDslSm100, SdpaFwdDslSm120, SdpaFwdDslSm80
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm100, sdpa_fwd_wrapper_dsl_sm120, sdpa_fwd_wrapper_sm80
+    from cudnn.sdpa.bwd import SdpaBwdDslSm120, SdpabwdSm80
+    from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120, sdpa_bwd_wrapper_sm80
+
+Submodule imports stay lazy there (PEP 562): eager imports used to drag the
+CuTe DSL — measured ~1.0 s and 357 modules — into any process that merely
+asked whether an SDPA engine might serve a graph. Support checks need the
+capability tables, not the lowering, so the lowering is not imported until
 something decides to build.
 """
 
-import importlib
 from typing import Any
 
-_LAZY_EXPORTS = {
-    "SdpabwdSm100D256": (".bwd", "SdpabwdSm100D256"),
-    "sdpa_bwd_wrapper_sm100_d256": (".bwd", "sdpa_bwd_wrapper_sm100_d256"),
-    "SdpafwdSm100D256": (".fwd", "SdpafwdSm100D256"),
-    "sdpa_fwd_wrapper_sm100_d256": (".fwd", "sdpa_fwd_wrapper_sm100_d256"),
-    "SdpafwdSm80": (".fwd", "SdpafwdSm80"),
-    "sdpa_fwd_wrapper_sm80": (".fwd", "sdpa_fwd_wrapper_sm80"),
-    "SdpabwdSm80": (".bwd", "SdpabwdSm80"),
-    "sdpa_bwd_wrapper_sm80": (".bwd", "sdpa_bwd_wrapper_sm80"),
-}
+_LAZY_EXPORTS: dict = {}
 
 __all__ = list(_LAZY_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
-    target = _LAZY_EXPORTS.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module, attr = target
-    value = getattr(importlib.import_module(module, __name__), attr)
-    globals()[name] = value  # resolve once
-    return value
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r} — the per-arch SDPA APIs are imported from "
+        f"cudnn.sdpa.fwd / cudnn.sdpa.bwd; this level is reserved for the arch-agnostic wrappers"
+    )
 
 
 def __dir__():
-    # Union, not just __all__: returning only the lazy names hid every normal
-    # module attribute, __name__ included.
     return sorted(set(globals()) | set(__all__))

@@ -109,7 +109,7 @@ from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass._mlir.dialects import arith
 
 # Pick up the in-tree tile_dsl wrappers (mma, load_tile_2d, cp_async_*).
-from cudnn.frost.tile_dsl.mma import load_b_smem, load_b_smem_x4, mma_step  # noqa: E402
+from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
@@ -127,7 +127,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: E402
 # ``d_qk`` / ``d_v`` are now Constexpr params on the kernel (folded at trace
 # time); the flavor (Llama d=128, GPT-OSS d=64, …) is picked by the driver
 # by the adapter's per-flavor knob table
-# (``cudnn.sdpa.fwd.api._FLAVOR_KNOBS``).  Knob defaults
+# (``cudnn.sdpa.fwd.api_dsl._SM80_FLAVOR_KNOBS``).  Knob defaults
 # below match the Llama flavor — overridden per-flavor in
 # the adapter's knob table and threaded through ``forward()``.
 DEFAULT_TILE_M = 128
@@ -148,28 +148,6 @@ SCHED_LPT_L2 = 2  # 1-D grid, block-cyclic over L2-sized (batch, head) groups
 # ordering WITHIN each block.
 
 
-def default_alibi_slopes(n_heads: int) -> torch.Tensor:
-    """Standard ALiBi per-head slopes (mirrors cuDNN test_mhas + the
-    Press et al. geometric sequence).
-
-    For ``n = 2**floor(log2(H))`` heads the slopes are ``(2**(-8/n))**i`` for
-    ``i = 1..n``; when ``H`` is not a power of two the remaining ``H - n``
-    heads use the interleaved ``(2**(-4/n))**(2i-1)`` sequence.  Returns a
-    ``[H]`` float32 CPU tensor — divide by the softmax scale before handing
-    it to ``forward(alibi_slopes=...)`` is NOT needed (forward does that).
-    """
-    import math
-
-    n = 2 ** math.floor(math.log2(n_heads))
-    m0 = 2.0 ** (-8.0 / n)
-    slopes = [m0**i for i in range(1, 1 + n)]
-    if n < n_heads:
-        mh0 = 2.0 ** (-4.0 / n)
-        extra = [mh0**i for i in range(1, 1 + 2 * (n_heads - n), 2)]
-        slopes = slopes + extra
-    return torch.tensor(slopes[:n_heads], dtype=torch.float32)
-
-
 # ---------------------------------------------------------------------------
 # Kernel.
 # ---------------------------------------------------------------------------
@@ -180,25 +158,12 @@ def _sdpa_kernel(
     V: cute.Tensor,  # [B, SKV, HQ, D_V]  fp16
     O: cute.Tensor,  # [B, SQ,  HQ, D_V]  fp16  (output)
     LSE: cute.Tensor,  # [B, HQ, SQ]        fp32  (LSE in natural log)
-    SCORE_MAX: cute.Tensor,  # [B, HQ, SQ] fp32 — per-row softmax max (scaled-logit,
-    # natural units = ln2 * row_max_log2).  Consulted only
-    # when has_score_stats; a 1-elem dummy otherwise.
-    SCORE_SUM: cute.Tensor,  # [B, HQ, SQ] fp32 — per-row sum exp(s - max) (the
-    # softmax denominator, incl. the sink term).  LSE ==
-    # SCORE_MAX + ln(SCORE_SUM).  1-elem dummy when unused.
     seq_kv_lens: cute.Tensor,  # [B] int32 — per-batch effective KV length (padded
     # mask).  Consulted only when has_seq_kv_lens; a
     # 1-elem dummy is passed otherwise.
     seq_len_q: cute.Tensor,  # [B] int32 — per-batch effective Q length.  Consulted
     # only when has_seq_len_q (BR diagonal under padding);
     # a 1-elem dummy is passed otherwise.
-    alibi_coef: cute.Tensor,  # [H] fp32 — per-Q-head ALiBi coefficient ALREADY
-    # divided by the softmax scale (= slope_h / scale).
-    # Consulted only when has_alibi; a 1-elem dummy is
-    # passed otherwise.  Injected pre-scale into S_acc so
-    # the late ``* softmax_scale_log2`` reproduces the
-    # reference ``slope_h * (k - q) * log2(e)`` in the
-    # log2 domain.
     sinks: cute.Tensor,  # [H] fp32 — per-Q-head sink logit in log2 units
     # (= sink_h * log2(e), the same log2-of-scaled-logit
     # units as row_max).  Consulted only when has_sink;
@@ -222,13 +187,6 @@ def _sdpa_kernel(
     # a 1-elem dummy is passed otherwise.  Applied as
     # the half-split rotate_half to Q AND K in SMEM
     # before ldmatrix (dense-only; no THD).
-    block_mask: cute.Tensor,  # [B, H, ceil(SQ/128), ceil(ceil(SKV/128)/8)] uint8
-    # — coarse 128x128 block-sparsity, bit-packed along
-    # the kv-block dim (8 kv-blocks/byte, LSB-first):
-    # bit set ⇒ (qblk,kvblk) tile KEPT; unset ⇒ whole
-    # 128x128 tile masked.  Consulted only when
-    # has_block_mask; 1-elem dummy otherwise.  The
-    # mainloop skips the QK + SV mma for off blocks.
     tile_m: cutlass.Constexpr[int],  # Q rows / CTA  (64 or 128)
     num_warps: cutlass.Constexpr[int],  # warps / CTA   (4  or 8)
     tile_n: cutlass.Constexpr[int],  # KV rows / iter (64 default; 128 doubles
@@ -259,9 +217,6 @@ def _sdpa_kernel(
     has_seq_len_q: cutlass.Constexpr[bool],  # True ⇒ read per-batch effective Q
     # length from seq_len_q[batch] (BR diagonal
     # base = eff_skv - eff_sq under padding).
-    has_alibi: cutlass.Constexpr[bool],  # True ⇒ add the per-head ALiBi bias
-    # ``alibi_coef[head] * (k_col - q_row)`` to
-    # S_acc (pre-scale) on every kv-iter.
     has_sink: cutlass.Constexpr[bool],  # True ⇒ add the per-head sink logit to the
     # softmax denominator at finalize.
     has_bias: cutlass.Constexpr[bool],  # True ⇒ add the additive attention bias
@@ -272,14 +227,9 @@ def _sdpa_kernel(
     # from the cu_* diffs, GMEM seq coords are
     # offset by cu_q[b]/cu_k[b], and over-provisioned
     # tiles (q_row_base >= S_q_b) run 0 kv-iters.
-    has_score_stats: cutlass.Constexpr[bool],  # True ⇒ also write SCORE_MAX +
-    # SCORE_SUM (per-row softmax max + denom).
     has_rope: cutlass.Constexpr[bool],  # True ⇒ rotate Q + K in SMEM via the
     # half-split RoPE before ldmatrix, using
     # the precomputed rope_cs (cos,sin) table.
-    has_block_mask: cutlass.Constexpr[bool],  # True ⇒ read the 128x128 block-sparsity
-    # mask and skip the QK + SV mma for off
-    # (fully-masked) kv-blocks (dense-only).
     sched_policy: cutlass.Constexpr[int],  # SCHED_DEFAULT / LPT / LPT_L2.
     sched_l2_bytes: cutlass.Constexpr[int],  # L2 budget for SCHED_LPT_L2 sizing.
     n_kv_tiles: cutlass.Int32,  # runtime — host computes round_up(SKV/tile_n)
@@ -441,9 +391,6 @@ def _sdpa_kernel(
     V_view = cutlass.make_array_view(V)
     O_view = cutlass.make_array_view(O)
     LSE_view = cutlass.make_array_view(LSE)
-    if cutlass.const_expr(has_score_stats):
-        SCORE_MAX_view = cutlass.make_array_view(SCORE_MAX)
-        SCORE_SUM_view = cutlass.make_array_view(SCORE_SUM)
 
     # Shapes (B, S, H, D).  GQA/MQA: H_q (Q heads) may exceed H_kv (K/V
     # heads) when H_q % H_kv == 0.  ``heads_per_kv`` Q-heads share each
@@ -455,15 +402,6 @@ def _sdpa_kernel(
     H_kv = K.shape[2]  # H_kv (== H for MHA)
     heads_per_kv = H // H_kv  # Python int — folds at trace time
     kv_head_idx = head_idx if heads_per_kv == 1 else (head_idx // cutlass.Int32(heads_per_kv))
-
-    # ALiBi per-head coefficient (= slope_h / scale), read once per tile.  When
-    # has_alibi is False the const_expr arm folds away and the dummy 0.0 keeps
-    # the injection block below traceable (it is itself const_expr-gated).
-    if cutlass.const_expr(has_alibi):
-        _alibi_ptr = cutlass.make_array_view(alibi_coef).data_ptr()
-        alibi_coef_h = Pointer(_alibi_ptr, dtype=cutlass.Float32)[head_idx]
-    else:
-        alibi_coef_h = cutlass.Float32(0.0)
 
     # Additive-bias per-head base pointer (element-addressed).  bias is
     # [1, H, SQ, SKV] (broadcast over batch): head stride = SQ*SKV, q stride =
@@ -539,17 +477,6 @@ def _sdpa_kernel(
     else:
         LSE_BASE = cutlass.Int64(batch_idx) * H_i64 * SQ_i64 + cutlass.Int64(head_idx) * SQ_i64 + cutlass.Int64(q_row_base)
 
-    # Block-mask: per-CTA base into the bit-packed [B,H,nqblk,nkvbyte] uint8.
-    # 128x128 block granularity (TILE-independent); this q-tile's block row =
-    # q_row_base // 128.  Dense-only (THD forced off when has_block_mask).
-    if cutlass.const_expr(has_block_mask):
-        BM_NQBLK = (SQ + 127) // 128  # ceil(SQ/128), Python int
-        BM_NKVBLK = (SKV + 127) // 128  # ceil(SKV/128)
-        BM_NKVBYTE = (BM_NKVBLK + 7) // 8  # ceil(nkvblk/8) bytes/row
-        bm_qblk = cutlass.Int32(q_row_base) // cutlass.Int32(128)
-        bm_row_base = ((batch_idx * cutlass.Int32(H) + head_idx) * cutlass.Int32(BM_NQBLK) + bm_qblk) * cutlass.Int32(BM_NKVBYTE)  # uint8-element offset
-        bm_pp = Pointer(cutlass.make_array_view(block_mask).data_ptr(), dtype=cutlass.Uint8)
-
     # K/V offsets parameterised on kv_row_base (variable in mainloop).  Uses
     # H_kv and kv_head_idx (Q-heads sharing a KV head land at the same K/V
     # tile but accumulate into distinct Q rows + O rows).  K uses d_runtime
@@ -563,10 +490,6 @@ def _sdpa_kernel(
     q_gmem = Q_view.data_ptr() + Q_BASE
     o_gmem = O_view.data_ptr() + O_BASE
     lse_gmem = LSE_view.data_ptr() + LSE_BASE
-    # SCORE_MAX / SCORE_SUM share LSE's [B, HQ, SQ] (or packed [1,HQ,T]) layout.
-    if cutlass.const_expr(has_score_stats):
-        score_max_gmem = SCORE_MAX_view.data_ptr() + LSE_BASE
-        score_sum_gmem = SCORE_SUM_view.data_ptr() + LSE_BASE
     k_gmem_batch_head = K_view.data_ptr() + K_BATCH_OFF + K_HEAD_OFF
     v_gmem_batch_head = V_view.data_ptr() + V_BATCH_OFF + V_HEAD_OFF
     # Per-iter element advance: ``+ TILE_N rows`` on a Float16-typed ptr.
@@ -1014,7 +937,7 @@ def _sdpa_kernel(
             cache=nvvm.LoadCacheModifier.CG,
             swizzle=True,
             valid_rows=kv_valid_rows,
-            valid_cols=valid_cols,
+            valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
             row_base=kv_row_base_cur,
         )
         cp_async_commit()  # group: V[i]
@@ -1117,39 +1040,15 @@ def _sdpa_kernel(
         # B-operand (K) via ldmatrix.x4 — halves the inner-loop ldmatrix
         # instruction count vs the x2 variant (load 2 adjacent n_frags per
         # call).  tile_n must be a multiple of 16 (N//8 even).
-        # ---- Block-mask skip (the user's design) --------------------------
-        # Read THIS (qblk, kvblk) block bit (CTA-uniform).  ``block_on`` is a
-        # Python ``True`` when has_block_mask is off → ``if block_on:`` below is
-        # a pure-Python if (traces the body unconditionally, dense path is
-        # byte-identical).  When has_block_mask is on it's a runtime cutlass.Boolean
-        # → ``if block_on:`` becomes a runtime branch that skips the QK + SV mma
-        # for fully-masked blocks.  Block granularity is 128x128, so
-        # kvblk = (kv_iter*tile_n)//128 (tile_n=64 → two iters share a block).
-        if cutlass.const_expr(has_block_mask):
-            bm_kvblk = (kv_iter * cutlass.Int32(tile_n)) // cutlass.Int32(128)
-            bm_byte = bm_pp[bm_row_base + (bm_kvblk // cutlass.Int32(8))]
-            bm_bit = bm_kvblk % cutlass.Int32(8)
-            block_on = ((bm_byte.to(cutlass.Int32) >> bm_bit) & cutlass.Int32(1)) != cutlass.Int32(0)
-        else:
-            block_on = True  # Python bool → unconditional
-
-        if block_on:
-            K_frag_cur = load_b_smem_x4(
-                sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-            )
-            for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
-                if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
-                    K_frag_next = load_b_smem_x4(
-                        sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-                    )
-                mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
-                if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
-                    K_frag_cur = K_frag_next
-        else:
-            # Fully-masked block → set S to -FLT_MAX so the unconditional
-            # softmax produces P=0 (no contribution; m/l/O state unchanged).
-            for _i in cutlass.range_constexpr(m_blocks * QK_N_FRAGS * 4):
-                S_acc[_i] = cutlass.Float32(-3.4028235e38)
+        K_frag_cur = load_b_smem_x4(sK_cur, k_step=0, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
+        for k_chunk in cutlass.range_constexpr(QK_K_CHUNKS):
+            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+                K_frag_next = load_b_smem_x4(
+                    sK_cur, k_step=k_chunk + 1, N=tile_n, sB_elems_per_row=ELEMS_PER_ROW_K, b_trans=False, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                )
+            mma_step(S_acc, Q_frag, K_frag_cur, k_step=k_chunk, M=m_per_warp, N=tile_n, ab_dtype=io_dtype)
+            if cutlass.const_expr(k_chunk + 1 < QK_K_CHUNKS):
+                K_frag_cur = K_frag_next
 
         # ---- ONLINE SOFTMAX -----------------------------------------------
         # Per-lane: rowwise max → reduce → update m_state → rescale O & l →
@@ -1207,33 +1106,6 @@ def _sdpa_kernel(
             if cutlass.const_expr(has_bias):
                 for j in cutlass.range_constexpr(QK_N_FRAGS * 4):
                     S_acc[s_base + j] = S_acc[s_base + j] + bias_frag[s_base + j]
-
-            # 0a) ALiBi positional bias (pre-scale).  Added on EVERY kv-iter
-            #     (interior + boundary), unlike the mask pre-pass which only
-            #     runs on boundary iters.  ``alibi_coef_h = slope_h / scale``,
-            #     so adding ``coef_h * (k_col - q_row)`` to the un-scaled S_acc
-            #     and letting the later ``* softmax_scale_log2`` run reproduces
-            #     the reference's post-scale ``s += (k - q) * slope_h`` exactly
-            #     in the log2 domain.  Masked cols are overwritten to -FLT_MAX
-            #     by the block below, so order (alibi before mask) is correct.
-            if cutlass.const_expr(has_alibi):
-                # Distinct local names (``alq_*`` / ``alc_*``) — the mask block
-                # below reuses ``col_a``/``col_b`` inside a runtime ``if``, and
-                # the CuteDSL AST analyzer conflates same-named locals bound
-                # before vs inside a dynamic ``if``.
-                alq_top = cutlass.Int32(q_row_base) + cutlass.Int32(warp_m_base) + cutlass.Int32(m_block * 16) + g_lane
-                alq_bot = alq_top + cutlass.Int32(8)
-                for k in cutlass.range_constexpr(QK_N_FRAGS):
-                    alc_a = kv_col_base + cutlass.Int32(k * 8) + cutlass.Int32(2) * p_lane
-                    alc_b = alc_a + cutlass.Int32(1)
-                    d_ta = (alc_a - alq_top).to(cutlass.Float32)
-                    d_tb = (alc_b - alq_top).to(cutlass.Float32)
-                    d_ba = (alc_a - alq_bot).to(cutlass.Float32)
-                    d_bb = (alc_b - alq_bot).to(cutlass.Float32)
-                    S_acc[s_base + k * 4 + 0] = S_acc[s_base + k * 4 + 0] + alibi_coef_h * d_ta
-                    S_acc[s_base + k * 4 + 1] = S_acc[s_base + k * 4 + 1] + alibi_coef_h * d_tb
-                    S_acc[s_base + k * 4 + 2] = S_acc[s_base + k * 4 + 2] + alibi_coef_h * d_ba
-                    S_acc[s_base + k * 4 + 3] = S_acc[s_base + k * 4 + 3] + alibi_coef_h * d_bb
 
             # 0) Per-element attention mask (PADDED / CAUSAL / SWA).
             #    Sets S_acc[masked_col] = -FLT_MAX so the column does not
@@ -1327,12 +1199,7 @@ def _sdpa_kernel(
             #    8.0 matches the upstream
             #    `_common.rescale_threshold(...)` value for BF16/FP16/TF32:
             #    defer the rescale to amortize the α=1 fast path.
-            # The deferred-rescale skip leaves row_max BELOW the true row max (by
-            # up to the threshold) — fine for O/LSE (max+log(sum) is invariant),
-            # but score_max must be the TRUE max for cuDNN parity.  So when
-            # score-stats are requested, force threshold 0 (always track the true
-            # running max → exact score_max / score_sum_exp).
-            RESCALE_THRESHOLD = cutlass.Float32(0.0 if cutlass.const_expr(has_score_stats) else 8.0)
+            RESCALE_THRESHOLD = cutlass.Float32(8.0)
             m_top_prev = row_max[row_state_lo]
             m_bot_prev = row_max[row_state_hi]
             update_top = (m_top_iter - m_top_prev) > RESCALE_THRESHOLD
@@ -1424,19 +1291,15 @@ def _sdpa_kernel(
         # SV B-operand (V) also via ldmatrix.x4 — bigger win here than QK
         # because d_v // 8 is large (32 at d_v=256, 16 at d_v=128), so the
         # halving cuts the per-k-step ldmatrix count from {32,16} to {16,8}.
-        # Block-mask skip: off blocks contributed P=0, so the SV mma would add
-        # nothing — skip it (and the V ldmatrix).  ``block_on`` is Python-True
-        # when has_block_mask is off (unconditional, dense byte-identical).
-        if block_on:
-            V_frag_cur = load_b_smem_x4(sV_cur, k_step=0, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
-            for k_chunk in cutlass.range_constexpr(SV_K_CHUNKS):
-                if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
-                    V_frag_next = load_b_smem_x4(
-                        sV_cur, k_step=k_chunk + 1, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
-                    )
-                mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=d_v, ab_dtype=io_dtype)
-                if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
-                    V_frag_cur = V_frag_next
+        V_frag_cur = load_b_smem_x4(sV_cur, k_step=0, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES)
+        for k_chunk in cutlass.range_constexpr(SV_K_CHUNKS):
+            if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
+                V_frag_next = load_b_smem_x4(
+                    sV_cur, k_step=k_chunk + 1, N=d_v, sB_elems_per_row=ELEMS_PER_ROW_V, b_trans=True, lane=lane, swizzle=True, elem_bytes=ELEM_BYTES
+                )
+            mma_step(O_acc, P_frag, V_frag_cur, k_step=k_chunk, M=m_per_warp, N=d_v, ab_dtype=io_dtype)
+            if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
+                V_frag_cur = V_frag_next
 
         # No per-iter end-of-iter barrier:  with V double-buffered, iter
         # (i+2)'s V cp.async write to sV[i%2] is naturally fenced by
@@ -1536,18 +1399,6 @@ def _sdpa_kernel(
             lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
         lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top)
         lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot)
-        # Optional softmax-stat outputs: score_max = ln2 * row_max (scaled-logit
-        # natural max), score_sum_exp = row_sum (denom incl. sink).  Same per-row
-        # predication as LSE.
-        if cutlass.const_expr(has_score_stats):
-            smax_top = LN2 * row_max[row_state_lo]
-            smax_bot = LN2 * row_max[row_state_hi]
-            ssum_top = row_sum[row_state_lo]
-            ssum_bot = row_sum[row_state_hi]
-            smax_top_ptr = score_max_gmem + cutlass.Int64(block_row_top)
-            smax_bot_ptr = score_max_gmem + cutlass.Int64(block_row_bot)
-            ssum_top_ptr = score_sum_gmem + cutlass.Int64(block_row_top)
-            ssum_bot_ptr = score_sum_gmem + cutlass.Int64(block_row_bot)
 
         # Row predication for OOB Q-rows when ~is_even_mn.  All 4 lanes of a
         # threadquad share the same row → predicate is uniform within the
@@ -1558,24 +1409,13 @@ def _sdpa_kernel(
         if cutlass.const_expr(is_even_mn):
             _stf(lse_top_ptr, lse_top)
             _stf(lse_bot_ptr, lse_bot)
-            if cutlass.const_expr(has_score_stats):
-                _stf(smax_top_ptr, smax_top)
-                _stf(smax_bot_ptr, smax_bot)
-                _stf(ssum_top_ptr, ssum_top)
-                _stf(ssum_bot_ptr, ssum_bot)
         else:
             top_abs = q_row_base_i32 + block_row_top
             bot_abs = q_row_base_i32 + block_row_bot
             if top_abs < sq_store_bound:
                 _stf(lse_top_ptr, lse_top)
-                if cutlass.const_expr(has_score_stats):
-                    _stf(smax_top_ptr, smax_top)
-                    _stf(ssum_top_ptr, ssum_top)
             if bot_abs < sq_store_bound:
                 _stf(lse_bot_ptr, lse_bot)
-                if cutlass.const_expr(has_score_stats):
-                    _stf(smax_bot_ptr, smax_bot)
-                    _stf(ssum_bot_ptr, ssum_bot)
 
     # ---- Final normalization + SMEM-staged STG.128 epilogue --------------
     # Naïve scalar per-lane STG (the previous epilogue) emits 2-fp16 stores
@@ -1687,19 +1527,17 @@ def _sdpa_kernel(
         gmem_addr = o_gmem + row.to(cutlass.Int64) * row_stride64 + (col_chunk * elems_per_chunk_i32).to(cutlass.Int64)
         # SMEM load is unconditional — sO_buf is sized for the full tile_m ×
         # D_V and any OOB lanes wrote dummy data there.  GMEM STG.128 must
-        # skip OOB (row or col) so we don't touch GMEM past the user tensor.
+        # skip OOB rows so we don't touch GMEM past the user tensor.  Columns
+        # are never trimmed: O is always the compile-time d_v wide (the
+        # adapter pads V up to it, and padded-V columns compute to exact
+        # zero), while d_runtime is the Q/K head dim — trimming on it dropped
+        # the real O columns [D, d_v) whenever a graph declared d_qk < d_v.
         vec = Pointer(smem_addr.data_ptr(), dtype=cutlass.Int32).load(alignment=16, count=4)
-        if cutlass.const_expr(is_even_mn and is_even_k):
+        if cutlass.const_expr(is_even_mn):
             Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
         else:
-            in_bounds = cutlass.Int32(1)
-            if cutlass.const_expr(not is_even_mn):
-                row_abs_i32 = q_row_base_i32 + row
-                in_bounds = in_bounds * cutlass.Int32(row_abs_i32 < sq_store_bound)
-            if cutlass.const_expr(not is_even_k):
-                col_abs_end = (col_chunk + cutlass.Int32(1)) * elems_per_chunk_i32
-                in_bounds = in_bounds * cutlass.Int32(col_abs_end <= d_runtime)
-            if in_bounds != cutlass.Int32(0):
+            row_abs_i32 = q_row_base_i32 + row
+            if row_abs_i32 < sq_store_bound:
                 Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
 
 
@@ -1713,17 +1551,13 @@ def _sdpa_host(
     V: cute.Tensor,
     O: cute.Tensor,
     LSE: cute.Tensor,
-    SCORE_MAX: cute.Tensor,
-    SCORE_SUM: cute.Tensor,
     seq_kv_lens: cute.Tensor,
     seq_len_q: cute.Tensor,
-    alibi_coef: cute.Tensor,
     sinks: cute.Tensor,
     bias: cute.Tensor,
     cu_q: cute.Tensor,
     cu_k: cute.Tensor,
     rope_cs: cute.Tensor,
-    block_mask: cute.Tensor,
     tile_m: cutlass.Constexpr[int],
     num_warps: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
@@ -1737,14 +1571,11 @@ def _sdpa_host(
     causal_bottom_right: cutlass.Constexpr[bool],
     has_seq_kv_lens: cutlass.Constexpr[bool],
     has_seq_len_q: cutlass.Constexpr[bool],
-    has_alibi: cutlass.Constexpr[bool],
     has_sink: cutlass.Constexpr[bool],
     has_bias: cutlass.Constexpr[bool],
     bias_is_fp32: cutlass.Constexpr[bool],
     THD_VARLEN: cutlass.Constexpr[bool],
-    has_score_stats: cutlass.Constexpr[bool],
     has_rope: cutlass.Constexpr[bool],
-    has_block_mask: cutlass.Constexpr[bool],
     sched_policy: cutlass.Constexpr[int],
     sched_l2_bytes: cutlass.Constexpr[int],
     n_kv_tiles: cutlass.Int32,  # runtime — collapses JIT compile time
@@ -1781,17 +1612,13 @@ def _sdpa_host(
         V,
         O,
         LSE,
-        SCORE_MAX,
-        SCORE_SUM,
         seq_kv_lens,
         seq_len_q,
-        alibi_coef,
         sinks,
         bias,
         cu_q,
         cu_k,
         rope_cs,
-        block_mask,
         tile_m,
         num_warps,
         tile_n,
@@ -1805,14 +1632,11 @@ def _sdpa_host(
         causal_bottom_right,
         has_seq_kv_lens,
         has_seq_len_q,
-        has_alibi,
         has_sink,
         has_bias,
         bias_is_fp32,
         THD_VARLEN,
-        has_score_stats,
         has_rope,
-        has_block_mask,
         sched_policy,
         sched_l2_bytes,
         n_kv_tiles,
@@ -1859,16 +1683,13 @@ def _compile_cached(
     causal_bottom_right: bool,
     has_seq_kv_lens: bool,
     has_seq_len_q: bool,
-    has_alibi: bool,
     has_sink: bool,
     has_bias: bool,
     bias_is_fp32: bool,
     THD_VARLEN: bool,
     n_batch_logical: int,
-    has_score_stats: bool,
     has_rope: bool,
     rope_max_s: int,
-    has_block_mask: bool,
     sched_policy: int,
     sched_l2_bytes: int,
 ):
@@ -1911,19 +1732,6 @@ def _compile_cached(
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
-    # SCORE_MAX / SCORE_SUM [B, H, SQ] fp32 (or 1-elem dummies when unused).
-    fake_score_max = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        ((B, H, SQ) if has_score_stats else (1,)),
-        stride_order=((2, 1, 0) if has_score_stats else (0,)),
-        assumed_align=16,
-    )
-    fake_score_sum = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        ((B, H, SQ) if has_score_stats else (1,)),
-        stride_order=((2, 1, 0) if has_score_stats else (0,)),
-        assumed_align=16,
-    )
     # Per-batch KV / Q lengths [B] int32 (or a 1-elem dummy when unused).
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -1934,13 +1742,6 @@ def _compile_cached(
     fake_seq_len_q = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (B if has_seq_len_q else 1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    # Per-Q-head ALiBi coefficient [H] fp32 (or a 1-elem dummy when unused).
-    fake_alibi_coef = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (H if has_alibi else 1,),
         stride_order=(0,),
         assumed_align=4,
     )
@@ -1970,15 +1771,6 @@ def _compile_cached(
         stride_order=((2, 1, 0) if has_rope else (0,)),
         assumed_align=16,
     )
-    # Block-mask [B, H, ceil(SQ/128), ceil(ceil(SKV/128)/8)] uint8 (or dummy).
-    _bm_nqblk = (SQ + 127) // 128
-    _bm_nkvbyte = (((SKV + 127) // 128) + 7) // 8
-    fake_block_mask = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        ((B, H, _bm_nqblk, _bm_nkvbyte) if has_block_mask else (1,)),
-        stride_order=((3, 2, 1, 0) if has_block_mask else (0,)),
-        assumed_align=4,
-    )
     fake_n_kv_tiles = cutlass.Int32(0)
     fake_scale = cutlass.Float32(0.0)
     fake_sq_rt = cutlass.Int32(0)
@@ -1998,17 +1790,13 @@ def _compile_cached(
         fake_v,
         fake_o,
         fake_lse,
-        fake_score_max,
-        fake_score_sum,
         fake_seq_kv_lens,
         fake_seq_len_q,
-        fake_alibi_coef,
         fake_sinks,
         fake_bias,
         fake_cu_q,
         fake_cu_k,
         fake_rope_cs,
-        fake_block_mask,
         tile_m,
         num_warps,
         tile_n,
@@ -2022,14 +1810,11 @@ def _compile_cached(
         causal_bottom_right,
         has_seq_kv_lens,
         has_seq_len_q,
-        has_alibi,
         has_sink,
         has_bias,
         bias_is_fp32,
         THD_VARLEN,
-        has_score_stats,
         has_rope,
-        has_block_mask,
         sched_policy,
         sched_l2_bytes,
         fake_n_kv_tiles,
@@ -2055,8 +1840,6 @@ def forward(
     V: torch.Tensor,  # [B, SKV, H, D] fp16
     scale: Optional[float] = None,
     return_lse: bool = False,
-    return_score_stats: bool = False,  # also return (score_max, score_sum_exp):
-    # per-row softmax max (scaled-logit) + denom.
     *,
     tile_m: int = DEFAULT_TILE_M,
     num_warps: int = DEFAULT_NUM_WARPS,
@@ -2076,11 +1859,6 @@ def forward(
     # → bottom-right diagonal under padding
     # (br_base = eff_skv - eff_sq); only used
     # with causal_bottom_right.
-    alibi_slopes: Optional[torch.Tensor] = None,  # [H] fp32 per-Q-head ALiBi slopes
-    # (the reference's `m`, NOT divided by
-    # scale — forward divides).  Use
-    # default_alibi_slopes(H) for the cuDNN
-    # standard slopes.  None → no ALiBi bias.
     sinks: Optional[torch.Tensor] = None,  # [H] fp32 per-Q-head sink logits in
     # SCALED-logit (natural) units — joins the
     # softmax denominator only (V_sink = 0).
@@ -2119,13 +1897,11 @@ def forward(
     # rotate_half is applied to Q AND K in-kernel.
     # Dense-only (no THD); max_s must cover
     # max(SQ, SKV).  None → no RoPE.
-    block_mask: Optional[torch.Tensor] = None,  # coarse 128x128 block-sparsity mask
-    # (cuDNN `block_mask` convention): bit-packed
-    # UINT8 [B, H, ceil(SQ/128), ceil(ceil(SKV/128)/8)],
-    # LSB-first along the kv-block dim; bit set ⇒
-    # (qblk,kvblk) tile KEPT, unset ⇒ fully masked.
-    # The kernel skips the QK + SV mma for off
-    # blocks.  Dense-only (no THD).  None → no mask.
+    out_o: Optional[torch.Tensor] = None,  # [B, SQ, H, d_v] caller-provided output
+    # buffer (Q dtype, contiguous); None →
+    # allocate.  Dense-only (THD allocates).
+    out_lse: Optional[torch.Tensor] = None,  # [B, H, SQ] fp32 contiguous LSE buffer;
+    # None → allocate (used when return_lse).
 ):
     """Run SM80 SDPA prefill for an MHA-shaped (B, S, H, D) Q/K/V triple.
 
@@ -2239,17 +2015,33 @@ def forward(
     scale_log2 = scale * math.log2(math.e)
 
     # Allocate output / LSE sized to the actual (possibly uneven) shapes —
-    # the kernel writes only the valid (row, col) range via STG predication.
-    # Output dim follows V (= d_v), which can differ from Q's d_qk (DSv3).
-    out_o = torch.zeros(B, SQ, H, d_v, dtype=Q.dtype, device=Q.device)
-    LSE = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
-    # SCORE_MAX / SCORE_SUM [B,H,SQ] (or 1-elem dummies when not requested).
-    if return_score_stats:
-        SCORE_MAX = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
-        SCORE_SUM = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+    # the kernel writes the full row x d_v range via STG (rows predicated on
+    # sq_store_bound only).  Output dim follows V (= d_v), which can differ
+    # from Q's d_qk (DSv3).  Caller-bound out_* buffers skip the allocation.
+    # The zero-fill below is DEFENSIVE, not load-bearing: the dense epilogue
+    # stores every in-bounds row unconditionally (zero-KV-iteration tiles
+    # route through the store with row_sum=0, trimmed rows are written
+    # explicitly with O=0 / LSE=-inf, and THD never receives bound outputs).
+    # Kept so a bound buffer can never surface uninitialized memory if a
+    # future feature path skips rows.
+    _needs_zero_init = (seq_len_q is not None) or (seq_kv_lens is not None)
+    if out_o is None:
+        out_o = torch.zeros(B, SQ, H, d_v, dtype=Q.dtype, device=Q.device)
     else:
-        SCORE_MAX = torch.ones(1, dtype=torch.float32, device=Q.device)
-        SCORE_SUM = torch.ones(1, dtype=torch.float32, device=Q.device)
+        assert out_o.shape == (B, SQ, H, d_v) and out_o.dtype == Q.dtype and out_o.is_contiguous(), (
+            f"out_o must be a contiguous [{B}, {SQ}, {H}, {d_v}] {Q.dtype} tensor; " f"got shape {tuple(out_o.shape)} dtype {out_o.dtype}"
+        )
+        if _needs_zero_init:
+            out_o.zero_()
+    if out_lse is None:
+        LSE = torch.zeros(B, H, SQ, dtype=torch.float32, device=Q.device)
+    else:
+        assert out_lse.shape == (B, H, SQ) and out_lse.dtype == torch.float32 and out_lse.is_contiguous(), (
+            f"out_lse must be a contiguous [{B}, {H}, {SQ}] fp32 tensor; " f"got shape {tuple(out_lse.shape)} dtype {out_lse.dtype}"
+        )
+        LSE = out_lse
+        if _needs_zero_init:
+            LSE.zero_()
 
     # Per-batch padded mask: [B] int32 KV lengths (or a 1-elem dummy when
     # unused — the kernel never reads it under has_seq_kv_lens=False).
@@ -2266,15 +2058,6 @@ def forward(
         seq_len_q_t = seq_len_q.to(dtype=torch.int32, device=Q.device).contiguous()
     else:
         seq_len_q_t = torch.ones(1, dtype=torch.int32, device=Q.device)
-
-    # Per-Q-head ALiBi coefficient = slope_h / scale (the kernel injects it
-    # pre-scale into S_acc; the late * scale_log2 reproduces slope_h*(k-q)*log2e).
-    has_alibi = alibi_slopes is not None
-    if has_alibi:
-        assert alibi_slopes.shape == (H,), f"alibi_slopes must be shape ({H},); got {tuple(alibi_slopes.shape)}"
-        alibi_coef_t = (alibi_slopes.to(dtype=torch.float32, device=Q.device) / float(scale)).contiguous()
-    else:
-        alibi_coef_t = torch.ones(1, dtype=torch.float32, device=Q.device)
 
     # Per-Q-head sink logits → log2 units (= sink * log2(e)) so they share the
     # kernel's log2-of-scaled-logit max domain.
@@ -2318,36 +2101,18 @@ def forward(
         rope_max_s = 1
         rope_cs_t = torch.ones(1, dtype=torch.float32, device=Q.device)
 
-    # Block-mask: bit-packed uint8 [B, H, ceil(SQ/128), ceil(ceil(SKV/128)/8)].
-    has_block_mask = block_mask is not None
-    if has_block_mask:
-        assert not THD_VARLEN, "block_mask is dense-only (no THD/varlen) on SM80"
-        _nqblk = (SQ + 127) // 128
-        _nkvblk = (SKV + 127) // 128
-        _nkvbyte = (_nkvblk + 7) // 8
-        assert tuple(block_mask.shape) == (B, H, _nqblk, _nkvbyte), (
-            f"block_mask must be ({B},{H},{_nqblk},{_nkvbyte}) uint8 " f"(bit-packed kv-blocks); got {tuple(block_mask.shape)}"
-        )
-        block_mask_t = block_mask.to(dtype=torch.uint8, device=Q.device).contiguous()
-    else:
-        block_mask_t = torch.ones(1, dtype=torch.uint8, device=Q.device)
-
     cQ = from_dlpack(Q)
     cK = from_dlpack(K)
     cV = from_dlpack(V)
     cO = from_dlpack(out_o)
     cLSE = from_dlpack(LSE)
-    cSMAX = from_dlpack(SCORE_MAX)
-    cSSUM = from_dlpack(SCORE_SUM)
     cSEQK = from_dlpack(seq_kv_lens_t)
     cSEQQ = from_dlpack(seq_len_q_t)
-    cALIBI = from_dlpack(alibi_coef_t)
     cSINKS = from_dlpack(sinks_t)
     cBIAS = from_dlpack(bias_t)
     cCUQ = from_dlpack(cu_q_t)
     cCUK = from_dlpack(cu_k_t)
     cROPE = from_dlpack(rope_cs_t)
-    cBM = from_dlpack(block_mask_t)
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -2383,16 +2148,13 @@ def forward(
         bool(causal_bottom_right),
         bool(has_seq_kv_lens),
         bool(has_seq_len_q),
-        bool(has_alibi),
         bool(has_sink),
         bool(has_bias),
         bool(bias_is_fp32),
         bool(THD_VARLEN),
         int(n_batch_logical),
-        bool(return_score_stats),
         bool(has_rope),
         int(rope_max_s),
-        bool(has_block_mask),
         sched_policy,
         sched_l2_bytes,
     )
@@ -2402,17 +2164,13 @@ def forward(
         cV,
         cO,
         cLSE,
-        cSMAX,
-        cSSUM,
         cSEQK,
         cSEQQ,
-        cALIBI,
         cSINKS,
         cBIAS,
         cCUQ,
         cCUK,
         cROPE,
-        cBM,
         n_kv_tiles,
         cutlass.Float32(scale_log2),
         sq_rt,
@@ -2424,10 +2182,6 @@ def forward(
         cutlass.Int32(n_batch_logical),
         stream,
     )
-    if return_score_stats:
-        if return_lse:
-            return (out_o, LSE, SCORE_MAX, SCORE_SUM)
-        return (out_o, SCORE_MAX, SCORE_SUM)
     if return_lse:
         return (out_o, LSE)
     return out_o

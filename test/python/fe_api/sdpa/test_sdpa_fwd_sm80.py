@@ -96,7 +96,7 @@ def test_sdpa_fwd_sm80_smoke():
 def test_sdpa_fwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
     """End-to-end check against torch reference SDPA (full sweep, L2)."""
     try:
-        from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -147,7 +147,7 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
     test_mhas_v2::test_sdpa_random_bwd_L0 once a random config combined a
     tile-aligned S_q with bottom-right padding."""
     try:
-        from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
@@ -179,19 +179,19 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
 def test_sdpa_fwd_sm80_check_support_rejections():
     """check_support rejects out-of-envelope heads and bad layouts eagerly."""
     try:
-        from cudnn.sdpa import SdpafwdSm80
+        from cudnn.sdpa.fwd import SdpaFwdDslSm80
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
     b, h, s = 1, 4, 128
     q = torch.zeros((b, s, h, 512), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
     lse = torch.zeros((b, h, s), dtype=torch.float32, device="cuda")
-    api = SdpafwdSm80(sample_q=q, sample_k=q, sample_v=q, sample_o=q, sample_lse=lse)
+    api = SdpaFwdDslSm80(sample_q=q, sample_k=q, sample_v=q, sample_o=q, sample_lse=lse)
     with pytest.raises(ValueError, match="exceeds"):
         api.check_support()
 
     q64 = torch.zeros((b, s, h, 64), dtype=torch.float32, device="cuda").permute(0, 2, 1, 3)
     lse64 = torch.zeros((b, h, s), dtype=torch.float32, device="cuda")
-    api = SdpafwdSm80(sample_q=q64, sample_k=q64, sample_v=q64, sample_o=q64, sample_lse=lse64)
+    api = SdpaFwdDslSm80(sample_q=q64, sample_k=q64, sample_v=q64, sample_o=q64, sample_lse=lse64)
     with pytest.raises(ValueError, match="dtype"):
         api.check_support()

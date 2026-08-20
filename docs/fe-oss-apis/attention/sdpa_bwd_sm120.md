@@ -31,7 +31,7 @@ and an SM120 or SM121 device.
 ## API Usage
 
 ```python
-from cudnn.sdpa import sdpa_bwd_wrapper_dsl_sm120
+from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120
 
 grads = sdpa_bwd_wrapper_dsl_sm120(
     q_tensor=q, k_tensor=k, v_tensor=v,

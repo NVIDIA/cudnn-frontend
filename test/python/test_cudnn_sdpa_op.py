@@ -10,17 +10,13 @@ numerical correctness against a PyTorch reference for both O and dQ/dK/dV.
 All tensors use BHSD layout (batch, num_heads, seq_len, head_dim).
 """
 
-import importlib
 import math
 
 import pytest
 import torch
 
 import cudnn
-from cudnn.experimental.ops import sdpa as sdpa_module
 from cudnn.experimental.ops.sdpa import (
-    _CUDNN_BACKEND_D256_VERSION,
-    _bprop_cache,
     _fprop_cache,
     scaled_dot_product_attention,
 )
@@ -151,20 +147,19 @@ def sdpa_reference_fwd_bwd(
     )
 
 
+# cuDNN 9.23.0 added d=256 SDPA fprop and bprop support in the backend; the
+# op no longer carries an OSS fallback for older backends.
+_D256_BACKEND_MIN_VERSION = 92300
+
+
 def _skip_if_unsupported_d256(D):
     if D != 256:
         return
+    if cudnn.backend_version() < _D256_BACKEND_MIN_VERSION:
+        pytest.skip(f"d=256 SDPA requires cuDNN backend >= {_D256_BACKEND_MIN_VERSION}")
     major, _ = torch.cuda.get_device_capability()
-    if cudnn.backend_version() >= _CUDNN_BACKEND_D256_VERSION:
-        if major < 9:
-            pytest.skip("d=256 backward path requires SM90+")
-        return
-    if major < 10:
-        pytest.skip("d=256 backward path requires SM100+")
-    try:
-        importlib.import_module("cudnn.sdpa")
-    except ImportError:
-        pytest.skip("d=256 OSS SDPA path requires optional cutedsl dependencies in this environment")
+    if major < 9:
+        pytest.skip("d=256 backward path requires SM90+")
 
 
 # ---------------------------------------------------------------------------
@@ -196,78 +191,6 @@ class TestCudnnSdpa:
         # Reference
         o_ref, dq_ref, dk_ref, dv_ref = sdpa_reference_fwd_bwd(q, k, v)
 
-        torch.testing.assert_close(o.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(q.grad.float(), dq_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(k.grad.float(), dk_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(v.grad.float(), dv_ref.float(), atol=2e-2, rtol=2e-2)
-
-    @pytest.mark.L0
-    def test_d256_uses_oss_forward_path(self):
-        if cudnn.backend_version() >= _CUDNN_BACKEND_D256_VERSION:
-            pytest.skip(f"cuDNN backend {cudnn.backend_version()} handles d=256 itself; OSS path is intentionally bypassed")
-        _skip_if_unsupported_d256(256)
-        try:
-            importlib.import_module("cudnn.sdpa")
-        except ImportError:
-            pytest.skip("OSS SDPA d=256 optional dependencies are not installed in this environment")
-
-        B, H, S, D = 2, 8, 128, 256
-        _fprop_cache.clear()
-
-        q = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-        k = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-        v = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-
-        o = scaled_dot_product_attention(q, k, v)
-        loss = o.sum()
-        loss.backward()
-
-        o_ref, dq_ref, dk_ref, dv_ref = sdpa_reference_fwd_bwd(q, k, v)
-
-        assert len(_fprop_cache) == 0, "D=256 OSS forward path should bypass the cuDNN graph cache"
-        torch.testing.assert_close(o.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(q.grad.float(), dq_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(k.grad.float(), dk_ref.float(), atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(v.grad.float(), dv_ref.float(), atol=2e-2, rtol=2e-2)
-
-    @pytest.mark.L0
-    def test_d256_uses_cudnn_backend_on_cudnn_9_23_plus(self, monkeypatch):
-        """When the cuDNN backend supports d=256 itself (>= 9.23.0), the OSS (cuteDSL) custom ops
-        must not be invoked. Replaces both `sdpa_fwd_d256` and `sdpa_bwd_d256` on the module with
-        a sentinel that fails the test if it is ever called, and corroborates with the cuDNN
-        graph cache being populated."""
-        if cudnn.backend_version() < _CUDNN_BACKEND_D256_VERSION:
-            pytest.skip(
-                f"cuDNN backend {cudnn.backend_version()} < {_CUDNN_BACKEND_D256_VERSION}; " "the cuDNN backend d=256 path is not available in this build"
-            )
-        _skip_if_unsupported_d256(256)
-
-        oss_calls = []
-
-        def _oss_sentinel(*args, **kwargs):
-            oss_calls.append(("oss", args, kwargs))
-            raise AssertionError("OSS d=256 custom op was invoked but the cuDNN backend should have handled it")
-
-        monkeypatch.setattr(sdpa_module, "sdpa_fwd_d256", _oss_sentinel)
-        monkeypatch.setattr(sdpa_module, "sdpa_bwd_d256", _oss_sentinel)
-
-        B, H, S, D = 2, 8, 128, 256
-        _fprop_cache.clear()
-        _bprop_cache.clear()
-
-        q = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-        k = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-        v = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-
-        o = scaled_dot_product_attention(q, k, v)
-        loss = o.sum()
-        loss.backward()
-
-        o_ref, dq_ref, dk_ref, dv_ref = sdpa_reference_fwd_bwd(q, k, v)
-
-        assert oss_calls == [], f"OSS d=256 custom op was invoked {len(oss_calls)} time(s); cuDNN backend should have handled the call"
-        assert len(_fprop_cache) == 1, "D=256 on cuDNN 9.23+ should populate the cuDNN backend fprop cache"
-        assert len(_bprop_cache) == 1, "D=256 on cuDNN 9.23+ should populate the cuDNN backend bprop cache"
         torch.testing.assert_close(o.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(q.grad.float(), dq_ref.float(), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(k.grad.float(), dk_ref.float(), atol=2e-2, rtol=2e-2)
