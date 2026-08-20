@@ -1288,6 +1288,8 @@ def grouped_gemm_glu_wrapper_sm100(
         geglu_alpha,
         glu_clamp_max,
         glu_clamp_min,
+        situ_beta1,
+        situ_beta2,
         use_dynamic_sched,
         use_single_group_runtime_offsets,
         generate_c,

@@ -1338,6 +1338,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         geglu_alpha,
         glu_clamp_max,
         glu_clamp_min,
+        situ_beta1,
+        situ_beta2,
         epilogue_op,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
