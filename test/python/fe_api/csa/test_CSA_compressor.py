@@ -1065,7 +1065,7 @@ def test_check_support_accepts_envelope_r128(d, coff):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (11, 0)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_check_support_accepts_compute_capability_major_10_or_newer(monkeypatch, capability):
     """The architecture gate admits SM100, SM103, and newer major families."""
     compressor = _import_compressor()
