@@ -193,6 +193,18 @@ class FactorialStatisticsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             compare_results(current, previous)
 
+    def test_cross_run_comparison_labels_missing_or_nonnumeric_p50(self):
+        for invalid in (None, "not-a-number"):
+            with self.subTest(invalid=invalid):
+                previous = self._metadata()
+                current = self._metadata()
+                if invalid is None:
+                    del previous["summary"]["111"]["p50_ms"]
+                else:
+                    previous["summary"]["111"]["p50_ms"] = invalid
+                with self.assertRaisesRegex(ValueError, "111 treatment summaries must contain numeric p50_ms values"):
+                    compare_results(current, previous)
+
     def test_torch_baseline_route_contract_is_strict(self):
         valid = {
             "can_use_flash": True,
