@@ -13,6 +13,7 @@ already in sys.modules, so probing sys.modules never triggers an import.
 
 from __future__ import annotations
 
+import functools
 import sys
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -152,6 +153,9 @@ def get_compute_capability() -> Tuple[int, int]:
     return major, minor
 
 
+# Memoized: pure function of (shape, stride), called per input tensor on every
+# CuTeDSL launch to build the cache key; bounded since keys are shape-derived.
+@functools.lru_cache(maxsize=4096)
 def canonicalize_unit_dim_strides(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> Tuple[int, ...]:
     """Give extent-1 dims the dense "outermost" stride (numel) so that layouts that differ
     only in unit-dim strides -- which the kernels cannot observe -- compare and compile equal."""
