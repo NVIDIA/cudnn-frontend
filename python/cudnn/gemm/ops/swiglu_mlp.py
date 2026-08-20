@@ -22,16 +22,25 @@ than the ~4x[M,I] torch autograd already keeps. The backward runs the dSwiGLU as
 ONE two-output cuDNN pointwise kernel (``dup`` and ``dgate`` from a single graph;
 cuDNN's tensor-ir engine declines multi-output but another engine serves it),
 which reads the inputs once and is ~2x the two single-output kernels it replaces.
-With that and the saved pre-activations, the full fwd+bwd step is ~1.02-1.04x
-faster than a torch autograd MLP on the Qwen3.5-27B shape (B200). By default the ``dh = dout @ Wd``
-dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL) kernel that never
-materialises ``dh`` to HBM (set ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate
-nvjet GEMM + one-kernel pointwise, which it falls back to anyway if FROST cannot
-serve a shape/arch/thread). On this dense bf16 shape FROST ties the pointwise path
-(~1.15ms each, B200 M8192 stage) -- ~1% behind only because its cuTeDSL GEMM trails
-nvjet -- and the fusion advantage grows as the workload gets pointwise-heavier
-(fp8, MoE). Numerically matches torch to bf16 noise on the output and all four
-gradients.
+With that and the saved pre-activations, a balanced B200 run measured the full
+fwd+bwd step at ~1.11x the eager torch autograd MLP on the Qwen3.5-27B shape
+(the exact ratio is workload/runtime dependent). By default the
+``dh = dout @ Wd`` dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL)
+kernel that never materialises ``dh`` to HBM (set
+``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate nvjet GEMM + one-kernel
+pointwise, which it falls back to anyway if FROST cannot serve a
+shape/arch/thread). The dense large-M path uses the B200-tuned 2-CTA
+M128/N256/K128, cluster2x1, CLC strategy; its bare GEMM is at nvjet parity and
+the fused epilogue turns the avoided ``dh`` round-trip into a net win.
+Numerically matches torch to bf16 noise on the output and all four gradients.
+
+At the public call boundary the op snapshots GradMode and each input's
+``requires_grad`` into a small mask. Inference and Wd-only training use an h-only
+forward graph; partial-gradient training retains only the tensors its requested
+input gradients consume and skips unrelated backward GEMMs. Full all-gradient
+training takes the same kernels as above. The mask follows ``requires_grad`` at
+forward time; it cannot infer a narrower target list passed later to
+``torch.autograd.grad``.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -60,6 +69,12 @@ _MM_CACHE = {}
 _SWIGLU_CACHE = {}
 _DSWIGLU_CACHE = {}
 _AUTOTUNE_ITERS = 20
+
+_GRAD_X = 1 << 0
+_GRAD_WG = 1 << 1
+_GRAD_WU = 1 << 2
+_GRAD_WD = 1 << 3
+_GRAD_FC1 = _GRAD_X | _GRAD_WG | _GRAD_WU
 
 
 def _handle(device):
@@ -139,21 +154,21 @@ def _mm(a2, b2):
     return out.squeeze(0)
 
 
-def _swiglu_act(x, Wg, Wu):
+def _swiglu_act(x, Wg, Wu, *, save_preacts=True):
     """Fused ``h = silu(x@Wg^T) * (x@Wu^T)`` in ONE cuDNN kernel, also emitting the
-    two pre-activations ``gate = x@Wg^T`` and ``up = x@Wu^T`` (the GEMM
-    accumulators the fusion already computes) so the backward reads them instead of
-    recomputing two GEMMs. All three come from the single fused plan -- the extra
-    epilogue stores add ~14% to the forward but drop the two ~25% recompute GEMMs
-    from the backward (measured 1-kernel on SM100; the accumulators are stored in
-    the epilogue, no copy kernel appended). ``x:[M,H]``, ``Wg,Wu:[I,H]`` bound as
-    strided ``.t()`` views (no transpose copy). Returns ``(h, gate, up)`` ``:[M,I]``."""
+    two pre-activations ``gate = x@Wg^T`` and ``up = x@Wu^T`` when
+    ``save_preacts=True``. All requested outputs come from the single fused plan;
+    their cost is plan/runtime dependent, but they drop the two recompute GEMMs
+    from a full backward. In inference or a Wd-only backward,
+    ``save_preacts=False`` selects an h-only graph and avoids those side stores.
+    ``x:[M,H]``, ``Wg,Wu:[I,H]`` are bound as strided ``.t()`` views (no transpose
+    copy). Returns ``(h, gate, up)`` ``:[M,I]``; gate/up are ``None`` for h-only."""
     h, stream = _handle(x.device)
     M, H = x.shape
     interm = Wg.shape[0]
     xv = x.unsqueeze(0)
     wg, wu = Wg.t().unsqueeze(0), Wu.t().unsqueeze(0)  # [1,H,interm] column-major views, no copy
-    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), x.device.index, stream)
+    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), bool(save_preacts), x.device.index, stream)
     e = _SWIGLU_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
@@ -165,22 +180,36 @@ def _swiglu_act(x, Wg, Wu):
         up = g.matmul(name="up", A=X, B=WU, compute_data_type=_FP32)
         hh = g.mul(a=sg, b=up)
         hh.set_output(True).set_data_type(_BF16)
-        gate.set_output(True).set_data_type(_BF16)  # saved for backward -> no recompute GEMM
-        up.set_output(True).set_data_type(_BF16)
+        # Keep h numerically independent of whether the pre-activations are exposed:
+        # the full-training graph consumes BF16-rounded gate/up, so the h-only graph
+        # must retain those intermediate dtypes even though it does not store them.
+        gate.set_data_type(_BF16)
+        up.set_data_type(_BF16)
+        if save_preacts:
+            gate.set_output(True)  # saved for backward -> no recompute GEMM
+            up.set_output(True)
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        best, ws = _autotune(g, h, {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0), gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
+        vp = {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0)}
+        if save_preacts:
+            gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+            ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+            vp.update({gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
+        best, ws = _autotune(g, h, vp)
         e = (g, X, WG, WU, hh, gate, up, best, ws)
         _SWIGLU_CACHE[key] = e
     g, X, WG, WU, hh, gate, up, best, ws = e
     hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-    gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-    ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-    g.execute_plan_at_index({X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0), gate: gb.unsqueeze(0), up: ub.unsqueeze(0)}, ws, index=best, handle=h)
+    vp = {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0)}
+    if save_preacts:
+        gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        vp.update({gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
+    else:
+        gb = ub = None
+    g.execute_plan_at_index(vp, ws, index=best, handle=h)
     return hb, gb, ub
 
 
@@ -303,33 +332,77 @@ def _frost_dswiglu(dout2, Wd, gate, up):
 
 class _SwigluMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, Wg, Wu, Wd):
+    def forward(ctx, x, Wg, Wu, Wd, grad_mask):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
-        h, gate, up = _swiglu_act(x2, Wg, Wu)  # fused: 1 kernel, also emits gate/up for the backward
+        need_fc1_grad = bool(grad_mask & _GRAD_FC1)
+        h, gate, up = _swiglu_act(
+            x2,
+            Wg,
+            Wu,
+            save_preacts=need_fc1_grad,
+        )  # fused: h-only unless an FC1-related backward needs gate/up
         out = _mm(h, Wd.t())  # transposed weight view; cuDNN reads it column-major, no copy
-        ctx.save_for_backward(x2, Wg, Wu, Wd, h, gate, up)
+
+        saved_names = []
+        saved_tensors = []
+
+        def save(name, tensor):
+            saved_names.append(name)
+            saved_tensors.append(tensor)
+
+        if grad_mask & (_GRAD_WG | _GRAD_WU):
+            save("x2", x2)
+        if grad_mask & _GRAD_X:
+            save("Wg", Wg)
+            save("Wu", Wu)
+        if need_fc1_grad:
+            save("Wd", Wd)
+            save("gate", gate)
+            # P1 keeps the existing dual-output dSwiGLU for every FC1-related
+            # backward. A later single-output specialization can omit up for a
+            # Wu-only gradient.
+            save("up", up)
+        if grad_mask & _GRAD_WD:
+            save("h", h)
+
+        ctx.save_for_backward(*saved_tensors)
+        ctx.saved_names = tuple(saved_names)
+        ctx.grad_mask = grad_mask
         ctx.shp = shp
+        ctx.out_features = Wd.shape[0]
         return out.reshape(*shp[:-1], Wd.shape[0])
 
     @staticmethod
     def backward(ctx, dout):
-        x2, Wg, Wu, Wd, h, gate, up = ctx.saved_tensors  # gate/up saved by the fused forward, not recomputed
-        dout2 = dout.reshape(-1, Wd.shape[0])
-        dWd = _mm(dout2.t(), h)
-        # dh = dout@Wd + dSwiGLU as ONE FROST kernel; fall back to a separate dh
-        # GEMM + two pointwise kernels if FROST cannot serve this shape/arch.
-        if _FROST_BWD:
-            try:
-                dgate, dup = _frost_dswiglu(dout2, Wd, gate, up)
-            except Exception:
+        saved = dict(zip(ctx.saved_names, ctx.saved_tensors))
+        grad_mask = ctx.grad_mask
+        dout2 = dout.reshape(-1, ctx.out_features)
+
+        dWd = _mm(dout2.t(), saved["h"]) if grad_mask & _GRAD_WD else None
+
+        if grad_mask & _GRAD_FC1:
+            Wd, gate, up = (saved[name] for name in ("Wd", "gate", "up"))
+            # P1 retains the existing dual-output dSwiGLU whenever either output
+            # is needed. It still skips the whole stage for a Wd-only backward.
+            if _FROST_BWD:
+                try:
+                    dgate, dup = _frost_dswiglu(dout2, Wd, gate, up)
+                except Exception:
+                    dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
+            else:
                 dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
         else:
-            dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
-        dx = _mm(dgate, Wg) + _mm(dup, Wu)
-        dWg = _mm(dgate.t(), x2)
-        dWu = _mm(dup.t(), x2)
-        return dx.reshape(*ctx.shp), dWg, dWu, dWd
+            dgate = dup = None
+
+        if grad_mask & _GRAD_X:
+            dx = _mm(dgate, saved["Wg"]) + _mm(dup, saved["Wu"])
+            dx = dx.reshape(*ctx.shp)
+        else:
+            dx = None
+        dWg = _mm(dgate.t(), saved["x2"]) if grad_mask & _GRAD_WG else None
+        dWu = _mm(dup.t(), saved["x2"]) if grad_mask & _GRAD_WU else None
+        return dx, dWg, dWu, dWd, None
 
 
 def swiglu_mlp(x, Wg, Wu, Wd):
@@ -362,4 +435,13 @@ def swiglu_mlp(x, Wg, Wu, Wd):
             f"cudnn.gemm.swiglu_mlp: shape mismatch — x[...,{H}], Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}; "
             f"expected Wg/Wu = [I, {H}] and Wd = [{H}, I]"
         )
-    return _SwigluMLP.apply(x, Wg, Wu, Wd)
+    # A custom Function's forward always runs with GradMode disabled, while
+    # ctx.needs_input_grad still mirrors the inputs' requires_grad flags even under
+    # an outer no_grad()/inference_mode(). Capture the outer state here so inference
+    # selects the h-only graph even when model parameters remain trainable.
+    grad_mask = 0
+    if torch.is_grad_enabled():
+        for bit, tensor in ((_GRAD_X, x), (_GRAD_WG, Wg), (_GRAD_WU, Wu), (_GRAD_WD, Wd)):
+            if tensor.requires_grad:
+                grad_mask |= bit
+    return _SwigluMLP.apply(x, Wg, Wu, Wd, grad_mask)
