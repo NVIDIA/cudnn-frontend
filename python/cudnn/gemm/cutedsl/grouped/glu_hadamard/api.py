@@ -586,10 +586,6 @@ class GroupedGemmGluHadamardSm100(APIBase):
             situ_beta1 = self.situ_beta1
         if situ_beta2 is None:
             situ_beta2 = self.situ_beta2
-        if a_tensor.shape[0] == 0:
-            return
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
         if self.act_func == "situglu":
             self._value_error_if(
                 not math.isfinite(situ_beta1) or situ_beta1 <= 0.0,
@@ -603,6 +599,10 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 float(situ_beta1) != self.situ_beta1,
                 "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
+        if a_tensor.shape[0] == 0:
+            return
+        if current_stream is None:
+            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
         if hadamard_tensor is None:
             hadamard_tensor = self.hadamard_tensor
         else:

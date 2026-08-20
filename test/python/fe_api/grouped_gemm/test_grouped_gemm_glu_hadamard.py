@@ -191,6 +191,9 @@ def _run_compile_execute(
     enable_bias=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    execute_empty_input=False,
+    execute_situ_beta1=None,
+    execute_situ_beta2=None,
 ):
     cfg = _make_cfg(request, ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size, enable_bias=enable_bias)
     inputs = allocate_grouped_gemm_input_tensors(
@@ -235,7 +238,7 @@ def _run_compile_execute(
     api.check_support()
     api.compile()
     api.execute(
-        a_tensor=inputs["a_tensor"],
+        a_tensor=inputs["a_tensor"][:0] if execute_empty_input else inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
         c_tensor=outputs["c_tensor"],
         d_tensor=outputs["d_tensor"],
@@ -247,8 +250,12 @@ def _run_compile_execute(
         amax_tensor=outputs["amax_tensor"],
         post_rht_amax_tensor=outputs["post_rht_amax_tensor"],
         bias_tensor=inputs["bias_tensor"],
+        situ_beta1=execute_situ_beta1,
+        situ_beta2=execute_situ_beta2,
     )
 
+    if execute_empty_input:
+        return
     _check_reference(inputs, outputs, cfg, act_func=act_func, situ_beta1=situ_beta1, situ_beta2=situ_beta2)
 
 
@@ -407,6 +414,31 @@ def test_grouped_gemm_glu_hadamard_execute_uses_compiled_situglu_betas(request):
         situ_beta1=2.0,
         situ_beta2=8.0,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("execute_situ_beta1", "execute_situ_beta2", "match"),
+    [(0.0, None, "situ_beta1"), (None, float("nan"), "situ_beta2")],
+)
+def test_grouped_gemm_glu_hadamard_execute_empty_input_validates_situglu_betas(
+    request,
+    execute_situ_beta1,
+    execute_situ_beta2,
+    match,
+):
+    with pytest.raises(ValueError, match=match):
+        _run_compile_execute(
+            request,
+            ab_dtype=torch.float4_e2m1fn_x2,
+            sf_dtype=torch.float8_e8m0fnu,
+            sf_vec_size=16,
+            act_func="situglu",
+            execute_empty_input=True,
+            execute_situ_beta1=execute_situ_beta1,
+            execute_situ_beta2=execute_situ_beta2,
+        )
 
 
 @pytest.mark.L0
