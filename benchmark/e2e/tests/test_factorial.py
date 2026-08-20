@@ -194,7 +194,7 @@ class FactorialStatisticsTest(unittest.TestCase):
             compare_results(current, previous)
 
     def test_cross_run_comparison_labels_missing_or_nonnumeric_p50(self):
-        for invalid in (None, "not-a-number"):
+        for invalid in (None, "not-a-number", 10**10000):
             with self.subTest(invalid=invalid):
                 previous = self._metadata()
                 current = self._metadata()

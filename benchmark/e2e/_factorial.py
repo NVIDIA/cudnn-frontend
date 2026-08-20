@@ -242,7 +242,7 @@ def compare_results(current, previous):
         try:
             current_p50 = float(current_summary[bits]["p50_ms"])
             previous_p50 = float(previous_summary[bits]["p50_ms"])
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"{bits} treatment summaries must contain numeric p50_ms values") from error
         if not all(math.isfinite(value) and value > 0.0 for value in (current_p50, previous_p50)):
             raise ValueError(f"{bits} p50 values must be finite and positive")
