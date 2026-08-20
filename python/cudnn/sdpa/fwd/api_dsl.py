@@ -1052,7 +1052,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sched_policy = self.sched_policy
         if sched_policy is None:
             sched_policy = SCHED_NATURAL
-            if self.window_right is not None:
+            # THD is excluded: the LPT decodes assume a dense rectangular
+            # tile space, while a ragged batch carries its own scheduler,
+            # which walks the live units through batch_remap.
+            if self.window_right is not None and not self.thd:
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape
@@ -2584,7 +2587,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sched_policy = self.sched_policy
         if sched_policy is None:
             sched_policy = SCHED_NATURAL
-            if self.window_right is not None:
+            # THD is excluded: the LPT decodes assume a dense rectangular
+            # tile space, while a ragged batch carries its own scheduler,
+            # which walks the live units through batch_remap.
+            if self.window_right is not None and not self.thd:
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape

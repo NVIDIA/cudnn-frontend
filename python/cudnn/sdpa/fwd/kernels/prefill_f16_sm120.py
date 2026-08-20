@@ -1412,7 +1412,7 @@ class SM120FusedMultiHeadAttentionForward:
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync(0)
 
-        if cutlass.const_expr(self.thd_varlen and THD_PERSISTENT and self.sched_policy == SCHED_NATURAL):
+        if cutlass.const_expr(self.thd_varlen and THD_PERSISTENT):
             # Persistent grid: the launch is sized to the MACHINE, not to the
             # plan-time envelope, and each CTA pulls units from a device-side
             # counter until the live total runs out. That total depends on the
@@ -1734,7 +1734,7 @@ class SM120FusedMultiHeadAttentionForward:
             grid = (n_q_tiles, n_batch * self.split_kv, n_head)
         # Persistent THD: a flat, machine-sized grid -- the unit a CTA works on
         # comes from the claim counter, not from its block index.
-        _persistent = self.thd_varlen and THD_PERSISTENT and self.sched_policy == SCHED_NATURAL
+        _persistent = self.thd_varlen and THD_PERSISTENT
         if cutlass.const_expr(_persistent):
             grid = (thd_n_ctas, cutlass.Int32(1), cutlass.Int32(1))
         self.kernel(
