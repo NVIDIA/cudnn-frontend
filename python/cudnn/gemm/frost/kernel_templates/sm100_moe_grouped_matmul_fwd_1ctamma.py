@@ -381,8 +381,7 @@ def _kernel(
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if elect_one:
-                nvvm.griddepcontrol("wait")
+            nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
         ab_iter = cutlass.Int32(0)
         sched_stage = cutlass.Int32(0)
@@ -464,9 +463,6 @@ def _kernel(
 
                     a_issue = (not multicast_a) or (n_rank == 0)
                     if cutlass.const_expr(a_mcast_slices > 1):
-                        # Every CTA of the A multicast group loads its own slice, which is what
-                        # lets the narrow ab_empty release stay correct. MoE has no mixed CGA, so
-                        # that is exactly one slice per CTA.
                         a_data_issue = True
                         _a_off = n_rank * (cta_tile_mnk[0] // a_mcast_slices)
                     else:
@@ -528,14 +524,14 @@ def _kernel(
         tail_phase = ab_empty_phase_bit
         if tail_stage == 0 and ab_iter != 0:
             tail_phase = tail_phase ^ 1
-        for _ in range(ab_stages - 1):
-            tail_stage = tail_stage + 1
-            if tail_stage == ab_stages:
-                tail_stage = cutlass.Int32(0)
-                tail_phase = tail_phase ^ 1
-        if elect_one:
-            while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
-                pass
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+            for _ in range(ab_stages):
+                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
+                tail_stage = tail_stage + 1
+                if tail_stage == ab_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
 
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -663,26 +659,23 @@ def _kernel(
                 tile_iter += 1
 
         if cutlass.const_expr(USE_PDL):
-            if elect_one:
-                nvvm.griddepcontrol("launch_dependents")
+            nvvm.griddepcontrol("launch_dependents")
 
         if tile_iter != 0:
             tail_stage = acc_stage
             tail_phase = acc_empty_phase_bit
-            if elect_one:
-                for _ in range(acc_stages):
-                    tail_stage = tail_stage + 1
-                    if tail_stage == acc_stages:
-                        tail_stage = cutlass.Int32(0)
-                        tail_phase = tail_phase ^ 1
-                    while not nvvm.mbarrier_try_wait_parity(
-                        acc_empty_mbar_ptr.subview(tail_stage),
-                        tail_phase,
-                        time_limit=10_000_000,
-                    ):
-                        pass
+            for _ in range(acc_stages):
+                tail_stage = tail_stage + 1
+                if tail_stage == acc_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
+                while not nvvm.mbarrier_try_wait_parity(
+                    acc_empty_mbar_ptr.subview(tail_stage),
+                    tail_phase,
+                    time_limit=10_000_000,
+                ):
+                    pass
 
-        nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
         _tcgen05_dealloc(

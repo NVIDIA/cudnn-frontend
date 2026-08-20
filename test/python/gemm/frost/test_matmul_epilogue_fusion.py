@@ -2527,14 +2527,7 @@ def _pw_aux_order(compiled, aux_bufs):
 
 
 def _prod_dim1(s):
-    """Product along dim 1, computed on the CPU.
-
-    `Tensor.prod` along a dim is one of the few torch reductions that NVRTC-JITs
-    its kernel (`reduction_prod_kernel`), so on a part newer than the bundled
-    nvrtc wheel it fails on the REFERENCE side while the kernel under test is
-    fine. The tile is 128x128, so the host round trip is free and the math is
-    identical.
-    """
+    """Product along dim 1 on the CPU -- torch's device-side `prod` NVRTC-JITs its kernel."""
     return s.cpu().prod(dim=1, keepdim=True).to(s.device)
 
 

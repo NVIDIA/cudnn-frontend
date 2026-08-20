@@ -468,8 +468,7 @@ def _kernel(
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if elect_one:
-                nvvm.griddepcontrol("wait")
+            nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
         ab_stage_cur = cutlass.Int32(0)  # incremental ring walk — no div in the loop
         tile_m = init_tile_m
@@ -510,8 +509,6 @@ def _kernel(
                             _a_rows = cta_tile_mnk[0] // a_mcast_slices
                             _a_row_elems = a_chunk_packed_elems // cta_tile_mnk[0]
                             if cutlass.const_expr(fallback_cluster_shape_mnk is None):
-                                # Preferred-only launch: the slice count IS the group size, so every
-                                # CTA loads exactly its own slice.
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage.subview(n_rank * _a_rows * _a_row_elems),
@@ -523,7 +520,6 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_2,
                                     )
                             else:
-                                # Mixed CGA: a fallback cluster has fewer CTAs than the preferred one
                                 # the slice count was baked from, so each covers that many more slices.
                                 _a_per_cta = a_mcast_slices // cluster_n
                                 for _asl in cutlass.range(_a_per_cta):
@@ -569,8 +565,6 @@ def _kernel(
                             _b_rows = cta_tile_mnk[1] // b_mcast_slices
                             _b_row_elems = b_chunk_packed_elems // cta_tile_mnk[1]
                             if cutlass.const_expr(fallback_cluster_shape_mnk is None):
-                                # Preferred-only launch: the slice count IS the group size, so every
-                                # CTA loads exactly its own slice.
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(pair_m_idx * _b_rows * _b_row_elems),
@@ -582,7 +576,6 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_2,
                                     )
                             else:
-                                # Mixed CGA: a fallback cluster has fewer CTAs than the preferred one
                                 # the slice count was baked from, so each covers that many more slices.
                                 _b_per_cta = b_mcast_slices // (cluster_m // cta_group)
                                 for _bsl in cutlass.range(_b_per_cta):
@@ -655,20 +648,19 @@ def _kernel(
         # incremental advance already flipped the phase on wrap.
         tail_stage = ab_stage_cur
         tail_phase = ab_empty_phase_bit
-        for _ in range(ab_stages - 1):
-            tail_stage = tail_stage + 1
-            if tail_stage == ab_stages:
-                tail_stage = cutlass.Int32(0)
-                tail_phase = tail_phase ^ 1
-        if elect_one:
-            while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
-                pass
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+            for _ in range(ab_stages):
+                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
+                tail_stage = tail_stage + 1
+                if tail_stage == ab_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
 
     if warp_idx == sf_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if elect_one:
-                nvvm.griddepcontrol("wait")
+            nvvm.griddepcontrol("wait")
         sf_empty_phase_bit = cutlass.Int32(1)
         sf_stage_cur = cutlass.Int32(0)  # incremental ring walk — no div in the loop
         tile_m = init_tile_m
@@ -791,14 +783,14 @@ def _kernel(
 
         tail_stage = sf_stage_cur
         tail_phase = sf_empty_phase_bit
-        for _ in range(sf_stages - 1):
-            tail_stage = tail_stage + 1
-            if tail_stage == sf_stages:
-                tail_stage = cutlass.Int32(0)
-                tail_phase = tail_phase ^ 1
-        if elect_one:
-            while not nvvm.mbarrier_try_wait_parity(sf_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
-                pass
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+            for _ in range(sf_stages):
+                while not nvvm.mbarrier_try_wait_parity(sf_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
+                tail_stage = tail_stage + 1
+                if tail_stage == sf_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
 
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(mma_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -1139,19 +1131,17 @@ def _kernel(
                 tile_iter += 1
 
             if cutlass.const_expr(USE_PDL):
-                if elect_one:
-                    nvvm.griddepcontrol("launch_dependents")
+                nvvm.griddepcontrol("launch_dependents")
 
             tail_stage = acc_stage
             tail_phase = acc_empty_phase_bit
-            if elect_one:
-                for _ in range(acc_stages):
-                    tail_stage = tail_stage + 1
-                    if tail_stage == acc_stages:
-                        tail_stage = cutlass.Int32(0)
-                        tail_phase = tail_phase ^ 1
-                    while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
-                        pass
+            for _ in range(acc_stages):
+                tail_stage = tail_stage + 1
+                if tail_stage == acc_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
+                while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
             nvvm.bar_warp_sync(0xFFFFFFFF)
 
             # Asymmetric pair rendezvous on the TMEM free: leader waits its own
@@ -1194,8 +1184,7 @@ def _kernel(
                 tile_iter += 1
 
             if cutlass.const_expr(USE_PDL):
-                if elect_one:
-                    nvvm.griddepcontrol("launch_dependents")
+                nvvm.griddepcontrol("launch_dependents")
 
             nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_2)
             peer_mbar = nvvm.mapa(tmem_dealloc_mbar_ptr, peer_cta_rank)

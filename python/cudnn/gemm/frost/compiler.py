@@ -907,9 +907,6 @@ def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
     return max_active_clusters(cfg.cgrp_size_m * cfg.cgrp_size_n, device)
 
 
-# A TMA box must start on a whole SMEM swizzle atom, which is 8 rows for every
-# swizzle mode we emit (s128b / s64b), so a multicast slice has to be a multiple
-# of that many rows.
 _SMEM_SWIZZLE_ATOM_ROWS = 8
 
 
@@ -925,29 +922,12 @@ def _mcast_slice_plan(
     per_cta_a: bool = False,
     per_cta_b: bool = False,
 ) -> tuple[int, int, bool]:
-    """How the cluster splits each operand's TMA load, CUTLASS-style.
-
-    Every CTA of a multicast group loads its own slice and multicasts it to the
-    group, so a CTA's `ab_full` is only complete once EVERY peer in its row and
-    column has issued for that stage. That coupling is what makes the narrow
-    (row-union-column) `ab_empty` mask safe: without it the counting barrier can
-    be flipped by one peer's credit twice over while the CTA's own MMA is still
-    reading the buffer. Returns (a_slices, b_slices, needs_full_empty_mask).
-    """
-    # A mainloop-fused operand under 2-CTA MMA is loaded per CTA (the follower's
-    # mainloop warp has to know when ITS tile landed), so there is no group to
-    # slice -- and, per the closure test below, nothing it can close either.
+    """(a_slices, b_slices, needs_full_empty_mask) for the cluster's TMA multicast."""
     a_group = 1 if per_cta_a else cluster_n
     b_group = 1 if per_cta_b else cluster_m // cta_group
     atom = _SMEM_SWIZZLE_ATOM_ROWS
     a_slices = a_group if (a_major == "k" and a_group > 1 and cta_smem_m % (a_group * atom) == 0) else 1
     b_slices = b_group if (b_major == "k" and b_group > 1 and cta_smem_n % (b_group * atom) == 0) else 1
-    # An operand closes the release only if the CLUSTER does not spread it (that
-    # dimension is 1, so the narrow mask is the whole cluster anyway) or every peer
-    # issues its own slice. A per-CTA load couples nothing and closes NOTHING --
-    # reading `a_group` here instead of the cluster dim would call a mainloop-fused
-    # operand closed and leave a two-dimensional cluster on the narrow mask with no
-    # interlock at all.
     a_closed = cluster_n == 1 or a_slices > 1
     b_closed = cluster_m // cta_group == 1 or b_slices > 1
     return a_slices, b_slices, not (a_closed and b_closed)
