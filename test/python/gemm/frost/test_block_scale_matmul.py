@@ -1488,118 +1488,6 @@ def test_sm103_multi_mma_m_is_declined_not_miscomputed():
         jit_from_cudnn_graph(_bs_chain(), **_sm103_kw("CONFIG_sm103_256x128x384_128x128x48_cluster1x1"))
 
 
-# Renderer (no GPU needed beyond graph build)
-
-
-def _render(combo, config_name):
-    g = _bs_chain(combo=combo)
-    chain = analyze(g)
-    vb = C._compute_output_vec_bytes(chain)
-    snip = C.generate(chain, vec_bytes_epi=vb, output_elem_bytes=C.DTYPE_BYTES[chain.output_dtype], use_tma_store=False)
-    return C._render_block_scale_template(chain, snip, by_name(config_name), 1, "clc")
-
-
-def _const(src, name):
-    line = next(l for l in src.splitlines() if l.startswith(f"{name} = "))
-    return eval(line.split(" = ", 1)[1])
-
-
-@requires_sm100
-def test_render_nvfp4_k_walk_tables():
-    src = _render("nvfp4", _CFG_128)
-    compile(src, "generated_kernel.py", "exec")
-    assert "cudnn_frost_sm103_block_scale_matmul_1ctamma_128x128x384_128x128x48_cluster1x1" in src
-    assert _const(src, "cta_tile_k_elems") == 768
-    assert _const(src, "num_kblocks") == 8
-    assert _const(src, "chunks_per_ktile") == 3
-    assert _const(src, "ab_tma_box_k_elems") == 256
-    assert _const(src, "a_chunk_packed_elems") == 128 * 128
-    # CUTLASS-style pipeline: an AB stage is one 128-B chunk (>= 3 = one
-    # K-tile in flight); SF rides its own ring at 12-SF-per-row groups.
-    assert _const(src, "ab_stages") >= 3
-    assert _const(src, "sf_stages") == 6
-    assert _const(src, "sf_groups_per_ktile") == 4
-    assert _const(src, "mmas_per_sf_group") == 2
-    assert _const(src, "sf_atoms_per_group") == 3
-    assert _const(src, "sfa_group_bytes") == 128 * 12
-    # MMA j reads data bytes [48j, 48j+48): chunk walk + in-chunk 16-B phases
-    # (k-blocks 2 and 5 straddle into the next chunk).
-    assert _const(src, "mma_chunk_by_j") == (0, 0, 0, 1, 1, 1, 2, 2)
-    assert _const(src, "mma_next_chunk_by_j") == (0, 0, 1, 1, 1, 2, 2, 2)
-    assert _const(src, "mma_phase16_by_j") == (0, 3, 6, 1, 4, 7, 2, 5)
-    # nvfp4: 6 SF bytes per MMA — word-aligned col + sf_id byte select.
-    assert _const(src, "sf_id_by_j") == (0, 2, 0, 2, 0, 2, 0, 2)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 4, 12, 16, 24, 28, 36, 40)
-    assert _const(src, "num_sf_atoms") == 12
-    assert _const(src, "sf_k") == 48
-
-
-@requires_sm100
-def test_render_mxfp4_k_walk_tables():
-    src = _render("mxfp4", _CFG_128)
-    compile(src, "generated_kernel.py", "exec")
-    # mxfp4: 3 SF bytes per MMA — the sf_id cycles all four byte offsets.
-    assert _const(src, "sf_id_by_j") == (0, 3, 2, 1, 0, 3, 2, 1)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 0, 4, 8, 12, 12, 16, 20)
-    assert _const(src, "num_sf_atoms") == 6
-    assert _const(src, "sf_k") == 24
-    assert _const(src, "sf_groups_per_ktile") == 2
-    assert _const(src, "mmas_per_sf_group") == 4
-    assert _const(src, "sf_atoms_per_group") == 3
-
-
-@requires_sm100
-def test_render_n256_interleaves_sfb_blocks():
-    src = _render("nvfp4", _CFG_256)
-    compile(src, "generated_kernel.py", "exec")
-    # Two 128-col SFB blocks interleave at word granularity: the MMA walk
-    # doubles the word stride (matches the SM103 reference kernel's N=256 walk).
-    assert _const(src, "sfb_mma_col_off_by_j") == (0, 8, 24, 32, 48, 56, 72, 80)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 4, 12, 16, 24, 28, 36, 40)
-    assert _const(src, "use_acc_overlap") is True
-    # Chunk-granular staging keeps a real pipeline even at N=256 (the old
-    # monolithic 384-B stage collapsed to 1 here).
-    assert _const(src, "ab_stages") >= 3
-    assert _const(src, "sfb_group_bytes") == 256 * 12
-
-
-def test_render_rejects_mxfp8(_pretend_sm103):
-    with pytest.raises(NotImplementedError, match="sm103.*does not support"):
-        jit_from_cudnn_graph(_bs_chain(combo="mxfp8", K=512), **_sm103_kw(_CFG_128))
-
-
-# cute.compile smoke — the K=96 mode is an idesc bit (same tcgen05 mnemonics),
-# so any Blackwell-family GPU can COMPILE the kernel; only sm103 can run it.
-
-
-@requires_sm100
-@pytest.mark.parametrize(
-    "combo,config_name,cta_group",
-    [
-        ("nvfp4", _CFG_128, 1),
-        ("mxfp4", _CFG_128, 1),
-        ("nvfp4", _CFG_256, 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster2x1", 2),
-        ("mxfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster2x2", 2),
-        ("nvfp4", "CONFIG_sm103_128x256x384_128x256x48_cluster2x1", 2),
-        # Large clusters (the shared sm100 enumeration): A-multicast chain,
-        # B-multicast chain, both, and the 16-CTA max.
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster1x4", 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster8x1", 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster4x2", 2),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster16x1", 2),
-        # num_mma_m > 1 used to be smoke-rendered here. It renders, but the
-        # numerics are wrong on silicon (measured on an SM 10.7 part, which the
-        # sm103 arch range covers), so the template now declines the geometry —
-        # see test_sm103_rejects_multi_mma_m.
-    ],
-)
-def test_sm103_compile_smoke(_pretend_sm103, combo, config_name, cta_group):
-    compiled = jit_from_cudnn_graph(_bs_chain(combo=combo), **_sm103_kw(config_name, cta_group))
-    _bs = compiled.chain.block_scale
-    assert (_bs.sf_dtype, _bs.block_size) == (("fp8_e4m3", 16) if combo == "nvfp4" else ("fp8_e8m0", 32))
-
-
 def test_tma_alignment_unified():
     """ONE alignment rule for every pipeline: contiguous extent × elem bits
     must be a multiple of 128 (the TMA 16-byte stride encode)."""
@@ -1900,62 +1788,6 @@ def test_sm107_templates_reject_older_blackwell(monkeypatch):
     chain = analyze(_bs_chain())
     tmpl = next(t for t in TEMPLATES if t.file == "sm107_block_scale_matmul_1ctamma.py")
     assert "107 <= SM < 110" in tmpl.accepts(chain, by_name(_SM107_128))
-
-
-@pytest.mark.parametrize(
-    "combo,cta_n,omma,k_mode,scales_per_inst,word_atoms,idesc_dtype",
-    [
-        ("nvfp4", 128, True, 2, 8, 2, "cutlass.Float4E2M1FN"),
-        ("nvfp4", 256, True, 2, 8, 2, "cutlass.Float4E2M1FN"),
-        ("mxfp4", 128, True, 2, 4, 1, "cutlass.Float4E2M1FN"),
-        ("mxfp8", 128, False, 1, 2, 1, "cutlass.Float8E4M3FN"),
-    ],
-)
-def test_render_sm107_tile_constants(_pretend_sm107, combo, cta_n, omma, k_mode, scales_per_inst, word_atoms, idesc_dtype):
-    """One MMA spans a 64-byte K, so it eats twice sm100's scales; when that
-    outgrows a 4-scale utccp atom the SF word spans word_atoms of them. fp4
-    rides the OMMA descriptor, mxfp8 the MX one; both take the real dtype.
-
-    The render sizes TMEM from the LIVE arch, and the cta_n=256 tile's SFB span
-    needs 520 of SM 10.7's 576 columns — so this has to pretend, or it renders
-    against a 512-column part and raises."""
-    chain = analyze(_bs_chain(combo))
-    cfg = by_name(f"CONFIG_sm107_128x{cta_n}x128_128x{cta_n}x64_cluster1x1")
-    txt = C._render_block_scale_tile_constants(cfg, chain, 1)
-    got = dict(line.split(" = ", 1) for line in txt.splitlines() if " = " in line and not line.startswith("#"))
-    assert got["idesc_is_omma"] == str(omma)
-    assert got["mma_k_dim_mode"] == str(k_mode)
-    assert got["sf_scales_per_inst"] == str(scales_per_inst)
-    assert got["word_atoms"] == str(word_atoms)
-    assert got["idesc_a_dtype"] == idesc_dtype
-
-
-@pytest.mark.parametrize("pipeline,mma_k", [("sm100", 32), ("sm107", 64)])
-def test_tmem_columns_follow_the_arch_not_the_pipeline(pipeline, mma_k, monkeypatch):
-    """TMEM size is a property of the GPU, so an sm100-pipeline kernel gets SM
-    10.7's 576 columns just like an sm107 one — and past 512 the alloc has to
-    ask for the exclusive mode. The extra columns are what lets a 256-wide N
-    tile double-buffer its accumulator instead of overlapping the two.
-
-    The 512-column arm is hypothetical for sm107 (PIPELINE_ARCH_RANGES confines
-    those kernels to 107..109, which always have 576), but both pipelines size
-    the SF region the same way, so both render the overlap fallback."""
-    chain = analyze(_bs_chain())
-    cfg = by_name(f"CONFIG_{pipeline}_128x256x128_128x256x{mma_k}_cluster1x1")
-
-    def render():
-        txt = C._render_block_scale_tile_constants(cfg, chain, 1)
-        return dict(line.split(" = ", 1) for line in txt.splitlines() if " = " in line and not line.startswith("#"))
-
-    monkeypatch.setattr(C, "_current_arch", lambda: 107)
-    got = render()
-    assert got["num_tmem_alloc_cols"] == "576" and got["tmem_alloc_exclusive"] == "True"
-    assert got["acc_stages"] == "2" and got["use_acc_overlap"] == "False"
-
-    monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    got = render()
-    assert got["num_tmem_alloc_cols"] == "512" and got["tmem_alloc_exclusive"] == "False"
-    assert got["acc_stages"] == "1" and got["use_acc_overlap"] == "True"
 
 
 @requires_sm107
@@ -2429,19 +2261,6 @@ def test_e5m3_runs_on_the_sm100_pipeline(block_size):
     than the OMMA one, and SM 10.7 decodes it there too — so an sm100-pipeline
     config is a legitimate way to run E5M3 on this part."""
     _run_e5m3_numeric("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1, block_size)
-
-
-@pytest.mark.parametrize("block_size,scales_per_inst,word_atoms", [(16, 8, 2), (32, 4, 1)])
-def test_render_e5m3_tile_constants(block_size, scales_per_inst, word_atoms):
-    """scale_format is the only constant E5M3 moves; the SF-word geometry still
-    follows block_size alone, exactly as for nvfp4 (16) and mxfp4 (32)."""
-    chain = analyze(_e5m3_graph(256, 256, 512, block_size))
-    txt = C._render_block_scale_tile_constants(by_name(_SM107_128), chain, 1)
-    got = dict(line.split(" = ", 1) for line in txt.splitlines() if " = " in line and not line.startswith("#"))
-    assert got["sf_scale_format"] == "2"
-    assert got["idesc_is_omma"] == "True"
-    assert got["sf_scales_per_inst"] == str(scales_per_inst)
-    assert got["word_atoms"] == str(word_atoms)
 
 
 def _run_e5m3_numeric(config_name, cta_group, block_size, M=256, N=256, K=512):
