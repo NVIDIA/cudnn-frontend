@@ -417,6 +417,140 @@ cuda_get_device(int *device) {
     NV_FE_CALL_TO_CUDA(cuda_get_device, cudaGetDevice, device);
 }
 
+// Driver entry points resolved through the runtime, so the front end never links
+// libcuda.so -- the same approach as cu_tensor_map_encode_tiled(). Returns
+// nullptr when the entry point is unavailable.
+inline void *
+get_driver_entry_point(const char *name) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    void *pfn = nullptr;
+    cudaDriverEntryPointQueryResult query_result;
+    cudaError_t err;
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+#if CUDART_VERSION >= 12080
+    using GetEntryPointFn =
+        cudaError_t (*)(const char *, void **, unsigned int, int, cudaDriverEntryPointQueryResult *);
+    const char *resolver = "cudaGetDriverEntryPointByVersion";
+#else
+    using GetEntryPointFn =
+        cudaError_t (*)(const char *, void **, unsigned long long, cudaDriverEntryPointQueryResult *);
+    const char *resolver = "cudaGetDriverEntryPoint";
+#endif
+    GetEntryPointFn get_entry_point = nullptr;
+    // get_cuda_symbol throws when the library or symbol is missing; this lookup is
+    // best-effort and runs inside a static initializer, so it must not escape.
+#ifndef NV_CUDNN_DISABLE_EXCEPTION
+    try {
+        get_entry_point = reinterpret_cast<GetEntryPointFn>(get_cuda_symbol(CudaLibrary::CUDART, resolver));
+    } catch (...) {
+        return nullptr;
+    }
+#else
+    get_entry_point = reinterpret_cast<GetEntryPointFn>(get_cuda_symbol(CudaLibrary::CUDART, resolver));
+#endif
+    if (get_entry_point == nullptr) {
+        return nullptr;
+    }
+#if CUDART_VERSION >= 12080
+    err = get_entry_point(name, &pfn, 12000, cudaEnableDefault, &query_result);
+#else
+    err = get_entry_point(name, &pfn, cudaEnableDefault, &query_result);
+#endif
+#elif CUDART_VERSION >= 12080
+    err = cudaGetDriverEntryPointByVersion(name, &pfn, 12000, cudaEnableDefault, &query_result);
+#else
+    err = cudaGetDriverEntryPoint(name, &pfn, cudaEnableDefault, &query_result);
+#endif
+    if (err != cudaSuccess || query_result != cudaDriverEntryPointSuccess) {
+        return nullptr;
+    }
+    return pfn;
+#else
+    (void)name;
+    return nullptr;
+#endif
+}
+
+// True when the calling thread already has a context. One driver call, so the
+// execute path can skip the rest -- including the stream query -- in the steady
+// state.
+inline bool
+has_current_context() {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using PfnCtxGetCurrent            = CUresult(CUDAAPI *)(CUcontext *);
+    static const auto ctx_get_current = reinterpret_cast<PfnCtxGetCurrent>(get_driver_entry_point("cuCtxGetCurrent"));
+    if (ctx_get_current == nullptr) {
+        return true;  // cannot tell; leave the thread alone
+    }
+    CUcontext current = nullptr;
+    return ctx_get_current(&current) == CUDA_SUCCESS && current != nullptr;
+#else
+    return true;
+#endif
+}
+
+// Bind a driver context to the calling thread when it has none: a driver-API
+// launch reads that stack, and a thread that has done no CUDA work has nothing
+// on it (a PyTorch autograd worker). A bound context is left alone -- it is
+// process-wide and the caller chose it. A real stream names the right context;
+// the default-stream handles name none, so the runtime's device decides there.
+// Best-effort: what this cannot establish fails at the launch.
+inline void
+ensure_current_context(cudaStream_t stream) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using PfnCtxGetCurrent    = CUresult(CUDAAPI *)(CUcontext *);
+    using PfnCtxSetCurrent    = CUresult(CUDAAPI *)(CUcontext);
+    using PfnStreamGetCtx     = CUresult(CUDAAPI *)(CUstream, CUcontext *);
+    using PfnDeviceGet        = CUresult(CUDAAPI *)(CUdevice *, int);
+    using PfnPrimaryCtxRetain = CUresult(CUDAAPI *)(CUcontext *, CUdevice);
+
+    // Thread-safe static initialization (C++11): the lookups happen once.
+    static const auto ctx_get_current = reinterpret_cast<PfnCtxGetCurrent>(get_driver_entry_point("cuCtxGetCurrent"));
+    static const auto ctx_set_current = reinterpret_cast<PfnCtxSetCurrent>(get_driver_entry_point("cuCtxSetCurrent"));
+    static const auto stream_get_ctx  = reinterpret_cast<PfnStreamGetCtx>(get_driver_entry_point("cuStreamGetCtx"));
+    static const auto device_get      = reinterpret_cast<PfnDeviceGet>(get_driver_entry_point("cuDeviceGet"));
+    static const auto primary_retain =
+        reinterpret_cast<PfnPrimaryCtxRetain>(get_driver_entry_point("cuDevicePrimaryCtxRetain"));
+    if (ctx_get_current == nullptr || ctx_set_current == nullptr) {
+        return;
+    }
+
+    CUcontext current = nullptr;
+    if (ctx_get_current(&current) == CUDA_SUCCESS && current != nullptr) {
+        return;
+    }
+
+    const bool names_a_context = stream != nullptr && stream != reinterpret_cast<cudaStream_t>(CU_STREAM_LEGACY) &&
+                                 stream != reinterpret_cast<cudaStream_t>(CU_STREAM_PER_THREAD);
+    if (names_a_context && stream_get_ctx != nullptr) {
+        CUcontext stream_ctx = nullptr;
+        if (stream_get_ctx(reinterpret_cast<CUstream>(stream), &stream_ctx) == CUDA_SUCCESS && stream_ctx != nullptr) {
+            ctx_set_current(stream_ctx);
+            return;
+        }
+    }
+
+    if (device_get == nullptr || primary_retain == nullptr) {
+        return;
+    }
+    int ordinal = 0;
+    if (cuda_get_device(&ordinal) != cudaSuccess) {
+        return;
+    }
+    CUdevice device = 0;
+    if (device_get(&device, ordinal) != CUDA_SUCCESS) {
+        return;
+    }
+    // Retained for the process lifetime, like the primary context itself.
+    CUcontext primary = nullptr;
+    if (primary_retain(&primary, device) == CUDA_SUCCESS) {
+        ctx_set_current(primary);
+    }
+#else
+    (void)stream;
+#endif
+}
+
 inline cudaError_t
 cuda_pointer_get_attributes(cudaPointerAttributes *attributes, const void *ptr) {
     NV_FE_CALL_TO_CUDA(cuda_pointer_get_attributes, cudaPointerGetAttributes, attributes, ptr);

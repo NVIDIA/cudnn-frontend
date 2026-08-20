@@ -1777,10 +1777,10 @@ class pygraph:
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
             ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
-            # A JIT engine talks to the driver directly, which reads the calling
-            # THREAD's context stack -- and an autograd backward runs on a worker
-            # thread that has none. Once here, so every python engine is covered.
-            ensure_current_context(ctx.stream)
+            # A JIT engine launches through the driver, which reads the calling
+            # thread's context stack; an autograd worker has none. The handle's
+            # device decides when the stream names no context.
+            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
