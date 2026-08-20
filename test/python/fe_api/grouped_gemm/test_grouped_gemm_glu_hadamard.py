@@ -256,7 +256,16 @@ def _run_compile_execute(
 
     if execute_empty_input:
         return
-    _check_reference(inputs, outputs, cfg, act_func=act_func, situ_beta1=situ_beta1, situ_beta2=situ_beta2)
+    reference_situ_beta1 = situ_beta1 if execute_situ_beta1 is None else execute_situ_beta1
+    reference_situ_beta2 = situ_beta2 if execute_situ_beta2 is None else execute_situ_beta2
+    _check_reference(
+        inputs,
+        outputs,
+        cfg,
+        act_func=act_func,
+        situ_beta1=reference_situ_beta1,
+        situ_beta2=reference_situ_beta2,
+    )
 
 
 def _run_wrapper(
@@ -413,6 +422,22 @@ def test_grouped_gemm_glu_hadamard_execute_uses_compiled_situglu_betas(request):
         act_func="situglu",
         situ_beta1=2.0,
         situ_beta2=8.0,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_execute_uses_runtime_situglu_beta2(request):
+    # beta2 is a runtime scalar, so execute() may override the value stored by
+    # the compiled API object. Verify both the launch and numerical reference
+    # use the explicit execution-time value.
+    _run_compile_execute(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+        act_func="situglu",
+        execute_situ_beta2=8.0,
     )
 
 
