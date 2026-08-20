@@ -1,0 +1,13 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,8836,8836,16,16,80,80,gqa,,64,0.346912,1152.291,260.817,3.2602,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,15376,15376,16,16,80,80,gqa,,64,0.98592,1227.764,159.699,1.9962,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,24336,24336,16,16,80,80,gqa,,64,2.338528,1296.659,106.563,1.332,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,35344,35344,16,16,80,80,gqa,,64,4.85376,1317.72,74.565,0.9321,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,47376,47376,16,16,80,80,gqa,,64,8.681728,1323.673,55.879,0.6985,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn,bfloat16,bfloat16,1,62500,62500,16,16,80,80,gqa,,64,14.99008,1334.216,42.695,0.5337,20,True,,NVIDIA GB300,cudnn 9.26.0,
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,8836,8836,16,16,80,80,gqa,,64,0.532832,750.224,169.811,2.1226,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,15376,15376,16,16,80,80,gqa,,64,1.283456,943.139,122.677,1.5335,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,24336,24336,16,16,80,80,gqa,,64,2.890272,1049.131,86.22,1.0778,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,35344,35344,16,16,80,80,gqa,,64,5.786624,1105.29,62.545,0.7818,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,47376,47376,16,16,80,80,gqa,,64,9.943936,1155.656,48.787,0.6098,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen3vl_vit,qwen3vl_vit,context,cudnn_oss,bfloat16,bfloat16,1,62500,62500,16,16,80,80,gqa,,64,17.176064,1164.411,37.261,0.4658,20,True,,NVIDIA GB300,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
