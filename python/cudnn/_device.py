@@ -61,9 +61,8 @@ def _device_handle(device: int):
 
 @functools.lru_cache(maxsize=1)
 def _default_streams() -> frozenset:
-    """Stream handles that name no context of their own. ``cuStreamGetCtx``
-    answers for the CALLING THREAD's current context on all of them, so they
-    cannot say which GPU the work belongs to."""
+    """Handles that name no context: ``cuStreamGetCtx`` answers for the calling
+    thread's current context on all of them."""
     drv = _driver()
     if drv is None:
         return frozenset({0})
@@ -72,11 +71,8 @@ def _default_streams() -> frozenset:
 
 @functools.lru_cache(maxsize=None)
 def _primary_context(device: int):
-    """This process's retained primary context for ``device``, or ``None``.
-
-    Retained once per ordinal and held for the process lifetime, like the
-    primary context itself: a retain per execute would grow the usage count
-    without bound, and holding one is what makes caching the handle safe."""
+    """The retained primary context for ``device``, or ``None``. Once per
+    ordinal: a retain per execute would grow the usage count without bound."""
     drv = _driver()
     if drv is None:
         return None
@@ -89,10 +85,7 @@ def _primary_context(device: int):
 
 def _runtime_device():
     """Ordinal the CUDA *runtime* holds current on this thread, or ``None``.
-
-    The driver cannot answer this: ``cudaSetDevice`` moves a runtime
-    thread-local slot and binds no context, which is exactly the state
-    :func:`ensure_current_context` exists to repair."""
+    The driver cannot see that slot."""
     try:
         import cuda.bindings.runtime as rt
     except ImportError:
@@ -105,30 +98,12 @@ def _runtime_device():
 def ensure_current_context(stream=None, device=None) -> None:
     """Bind the context this work runs in to the calling thread.
 
-    JIT engines reach the driver directly (``cuTensorMapEncodeTiled``,
-    ``cuLaunchKernelEx``, the cuTile launcher) and the driver reads the CALLING
-    thread's context stack, and a PyTorch autograd backward runs on a worker
-    thread whose stack is empty (measured: ``cuCtxGetCurrent()`` is 0 inside
-    ``backward()``), so the first driver call there fails with
-    ``CUDA_ERROR_INVALID_CONTEXT``. A runtime-API launch would have bound one as
-    a side effect; a driver-API launch does not.
-
-    *Which* context is right depends on the stream. A real stream carries one,
-    and that is the answer. The default-stream handles (``0``,
-    ``CU_STREAM_LEGACY``, ``CU_STREAM_PER_THREAD``) carry none — they resolve
-    against whatever is current — so there ``device`` decides, and a context on
-    another GPU is replaced rather than accepted. Accepting it is not benign:
-    under a foreign context a default stream runs the work on that context's
-    GPU, where the pointers are invalid, so it surfaces as an async fault at
-    some later sync instead of at the launch. With no ``device`` named there is
-    nothing to correct, so a bound context is left alone and only a cold thread
-    is given one — the rung order ``frost.device.ambient_device`` documents (a
-    bound driver context is process-wide and authoritative; the runtime's
-    thread-local slot is second).
-
-    Best-effort by contract: a context this cannot establish fails at the
-    launch, with the launch's own diagnostics. The primary-context retain is
-    held for the process lifetime, like the primary context itself."""
+    A driver-API launch reads the calling thread's context stack; an autograd
+    backward runs on a worker whose stack is empty. A real stream names the
+    right context; the default-stream handles name none, so ``device`` decides
+    there. With no ``device``, a bound context is authoritative and only a cold
+    thread is given one (``frost.device.ambient_device``'s rung order).
+    Best-effort: what this cannot establish fails at the launch."""
     drv = _driver()
     if drv is None:
         return
