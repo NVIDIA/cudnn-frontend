@@ -479,8 +479,8 @@ def _sm80_spec() -> EngineSpec:
             dbias=True,
             dsink=True,
             bias=True,
-            alibi=True,
-            block_mask=True,
+            # ALiBi / block_mask graphs are deliberately NOT served — the row
+            # declines and the backend takes them (matches the fwd row).
             right_band_widening=True,
             seq_q_trim=False,
             swa=True,
@@ -507,7 +507,6 @@ def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any 
         sink_token=facts.sink_t,
         seq_len_kv=facts.seq_kv_t,
         seq_len_q=facts.seq_q_t,
-        block_mask=facts.block_mask_t,
         do=facts.do_t,
         dq=facts.dq_t,
         dk=facts.dk_t,

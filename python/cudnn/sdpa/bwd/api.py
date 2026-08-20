@@ -66,8 +66,8 @@ def _load_kernel_module(key: str = "f16"):
     """Lazily import + cache an SM80 BPROP kernel module.
 
     ``"f16"`` is the GENERIC kernel (``bprop_f16_sm80``): fully parameterized
-    on d_qk/d_v with the full feature set (masks / bias / dBias / alibi /
-    sink / rope / block_mask / THD / deterministic).  ``"d64"`` is the
+    on d_qk/d_v with the full feature set (masks / bias / dBias /
+    sink / rope / THD / deterministic).  ``"d64"`` is the
     dedicated plain-dense d=64 MHA perf variant (~2x faster on A100); it
     supports NO features — its ``backward(**_ignored)`` silently swallows
     every feature kwarg, so callers must never rely on the signature filter
@@ -96,7 +96,7 @@ def _d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token, righ
         return False
     if mask_token != "none" or right_bound != 0 or causal_bottom_right:
         return False
-    for feature in ("seq_kv_lens", "seq_len_q", "bias", "alibi_slopes", "sinks", "rope_freqs", "block_mask"):
+    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
         if bw_kwargs.get(feature) is not None:
             return False
     if bw_kwargs.get("deterministic"):
@@ -315,10 +315,8 @@ class SdpabwdSm80(APIBase):
         seq_kv_lens: Optional[torch.Tensor] = None,
         seq_len_q: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        alibi: bool = False,
         sinks: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
-        block_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False,
     ) -> None:
         self._logger.debug("Entering execute (bwd)")
@@ -327,11 +325,6 @@ class SdpabwdSm80(APIBase):
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
 
         kernel = _load_kernel_module()
-
-        alibi_slopes = None
-        if alibi:
-            h_q = q_tensor.shape[1]  # BHSD
-            alibi_slopes = kernel.default_alibi_slopes(h_q).to(q_tensor.device)
 
         # BHSD → BSHD for the kernel.
         Q, K, V = _bshd(q_tensor), _bshd(k_tensor), _bshd(v_tensor)
@@ -357,10 +350,8 @@ class SdpabwdSm80(APIBase):
             seq_kv_lens=seq_kv_lens,
             seq_len_q=seq_len_q,
             bias=bias_tensor,
-            alibi_slopes=alibi_slopes,
             sinks=sinks,
             rope_freqs=rope_freqs,
-            block_mask=block_mask,
             deterministic=bool(deterministic),
         )
         # Route plain dense MHA d=64 calls to the dedicated perf kernel
@@ -420,7 +411,7 @@ class SdpabwdSm80(APIBase):
 # ---------------------------------------------------------------------------
 # THD / varlen backward (mirrors fwd/api.py::_thd_forward).
 # ---------------------------------------------------------------------------
-def _thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, alibi=False, sinks=None, deterministic=False):
+def _thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False):
     """THD / varlen backward: q/k/v/o/do are PACKED ``[1, T, H, D]`` (BSHD,
     B==1 — no transpose), ``lse`` is packed ``[1, H, T_q]`` (head-major,
     matching the kernel's THD LSE layout), and cu_q/cu_k are ``[n_seq+1]``
@@ -459,7 +450,6 @@ def _thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, 
         mask_token, swa = "none", 0
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
     kernel = _load_kernel_module()
-    alibi_slopes = kernel.default_alibi_slopes(h_q).to(q.device) if alibi else None
     sinks_t = sinks.to(dtype=torch.float32, device=q.device).reshape(h_q).contiguous() if sinks is not None else None
     bw_kwargs = dict(
         scale=scale_softmax,
@@ -469,7 +459,6 @@ def _thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, 
         causal_bottom_right=bool(causal_bottom_right),
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
-        alibi_slopes=alibi_slopes,
         sinks=sinks_t,
         deterministic=bool(deterministic),
     )
@@ -514,10 +503,8 @@ def sdpa_bwd_wrapper_sm80(
     seq_kv_lens: Optional[torch.Tensor] = None,
     seq_len_q: Optional[torch.Tensor] = None,
     bias_tensor: Optional[torch.Tensor] = None,
-    alibi: bool = False,
     sinks: Optional[torch.Tensor] = None,
     rope_freqs: Optional[torch.Tensor] = None,
-    block_mask: Optional[torch.Tensor] = None,
     cum_seqlen_q_tensor: Optional[torch.Tensor] = None,
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
@@ -526,18 +513,19 @@ def sdpa_bwd_wrapper_sm80(
 
     Returns ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...
     [, dbias_tensor=...])`` (BHSD grads; dBias head-major [., H, SQ, SKV]).
+    ALiBi and block_mask are not supported (use the graph API, which routes
+    them to the cuDNN backend); bias/dBias remain fully served.
     """
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
     # transpose + dense grad alloc (mirrors fwd/api.py's THD branch).
     if cum_seqlen_q_tensor is not None:
         # Reject dense-only features up front: _thd_backward accepts only
-        # alibi/sinks/deterministic, and silently computing gradients without
-        # a requested feature is worse than an error.
+        # sinks/deterministic, and silently computing gradients without a
+        # requested feature is worse than an error.
         for label, present in (
             ("bias_tensor", bias_tensor is not None),
             ("rope_freqs", rope_freqs is not None),
-            ("block_mask", block_mask is not None),
             ("seq_kv_lens", seq_kv_lens is not None),
             ("seq_len_q", seq_len_q is not None),
         ):
@@ -557,7 +545,6 @@ def sdpa_bwd_wrapper_sm80(
                 is_causal=is_causal,
                 window_size=window_size,
                 causal_bottom_right=causal_bottom_right,
-                alibi=alibi,
                 sinks=sinks,
                 deterministic=deterministic,
             )
@@ -594,10 +581,8 @@ def sdpa_bwd_wrapper_sm80(
         seq_kv_lens is not None,
         bias_tensor is not None,
         (bias_tensor.dtype if bias_tensor is not None else None),
-        bool(alibi),
         sinks is not None,
         rope_freqs is not None,
-        block_mask is not None,
         q_tensor.device,
     )
     sdpa_bwd = _cache_of_objects.get(cache_key)
@@ -638,10 +623,8 @@ def sdpa_bwd_wrapper_sm80(
         seq_kv_lens=seq_kv_lens,
         seq_len_q=seq_len_q,
         bias_tensor=bias_tensor,
-        alibi=alibi,
         sinks=sinks,
         rope_freqs=rope_freqs,
-        block_mask=block_mask,
         deterministic=deterministic,
     )
 
