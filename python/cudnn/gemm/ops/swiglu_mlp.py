@@ -22,8 +22,8 @@ than the ~4x[M,I] torch autograd already keeps. The backward runs the dSwiGLU as
 ONE two-output cuDNN pointwise kernel (``dup`` and ``dgate`` from a single graph;
 cuDNN's tensor-ir engine declines multi-output but another engine serves it),
 which reads the inputs once and is ~2x the two single-output kernels it replaces.
-With that and the saved pre-activations, the full fwd+bwd step runs ~0.96-0.98x a
-torch autograd MLP on the Qwen3.5-27B shape (B200). By default the ``dh = dout @ Wd``
+With that and the saved pre-activations, the full fwd+bwd step is ~1.02-1.04x
+faster than a torch autograd MLP on the Qwen3.5-27B shape (B200). By default the ``dh = dout @ Wd``
 dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL) kernel that never
 materialises ``dh`` to HBM (set ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate
 nvjet GEMM + one-kernel pointwise, which it falls back to anyway if FROST cannot
