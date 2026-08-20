@@ -13,6 +13,11 @@ import torch.utils.checkpoint
 
 fla_mlp = pytest.importorskip("fla.modules.mlp")
 
+try:
+    _FLA_VERSION = metadata.version("flash-linear-attention")
+except metadata.PackageNotFoundError:
+    _FLA_VERSION = None
+
 from cudnn.fla import accelerate_fla, is_accelerated, mlp_last_path, restore_fla
 from cudnn.fla.gated_mlp import make_gated_mlp_forward
 
@@ -23,7 +28,7 @@ pytestmark = [
         reason="cuDNN SwiGLU-MLP fusion requires SM100",
     ),
     pytest.mark.skipif(
-        metadata.version("flash-linear-attention") != "0.5.2",
+        _FLA_VERSION != "0.5.2",
         reason="the production GatedMLP shim intentionally supports FLA 0.5.2 exactly",
     ),
 ]

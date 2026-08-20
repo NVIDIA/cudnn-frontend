@@ -164,6 +164,7 @@ def accelerate_fla(verbose: bool = True, *, targets: str | Iterable[str] | None 
     available = {target for target in requested if is_accelerated(target)}
     resolved = []
     missing = []
+    rejection_reasons = {}
 
     for target in requested:
         if is_accelerated(target):
@@ -172,29 +173,33 @@ def accelerate_fla(verbose: bool = True, *, targets: str | Iterable[str] | None 
         spec = _TARGETS[target]
         try:
             module = importlib.import_module(spec.module_path)
-        except ImportError:
+        except ImportError as error:
             missing.append(target)
+            rejection_reasons[target] = str(error) or f"cannot import {spec.module_path}"
             continue
         owner = getattr(module, spec.owner_attribute, None) if spec.owner_attribute is not None else module
         if owner is None:
             missing.append(target)
+            rejection_reasons[target] = f"{spec.module_path} has no {spec.owner_attribute} owner"
             continue
         original = getattr(owner, spec.attribute, None)
         if original is None:
             missing.append(target)
+            rejection_reasons[target] = f"the target owner has no {spec.attribute} attribute"
             continue
         try:
             replacement = spec.make_replacement(module, owner, original)
-        except ImportError:
+        except ImportError as error:
             missing.append(target)
+            rejection_reasons[target] = str(error) or "the installed target does not match the supported contract"
             continue
         resolved.append((target, spec, owner, original, replacement))
 
     # An explicit selection is a contract: never silently apply only a subset.
     # The legacy no-target call retains its best-effort GDN/KDA behavior.
     if targets is not None and missing:
-        names = ", ".join(missing)
-        raise ImportError(f"accelerate_fla() could not find supported FLA target(s): {names}")
+        details = ", ".join(f"{target} ({rejection_reasons[target]})" if target in rejection_reasons else target for target in missing)
+        raise ImportError(f"accelerate_fla() could not enable FLA target(s): {details}")
 
     newly_patched = []
     for target, spec, owner, original, replacement in resolved:

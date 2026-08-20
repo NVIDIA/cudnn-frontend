@@ -403,7 +403,7 @@ def test_public_mlp_activation_rejects_unsupported_fla_version(monkeypatch):
     monkeypatch.setattr(fla_api, "_supports_installed_fla", lambda: False)
     monkeypatch.setattr(fla_api, "_ORIGINALS", {})
 
-    with pytest.raises(ImportError, match="could not find supported FLA target"):
+    with pytest.raises(ImportError, match="requires flash-linear-attention==0.5.2"):
         fla_api.accelerate_fla(verbose=False, targets="gated_mlp")
 
     assert module.GatedMLP.forward is original
@@ -423,7 +423,7 @@ def test_public_mlp_activation_rejects_prewrapped_class_method(monkeypatch):
     monkeypatch.setattr(fla_api, "_supports_installed_fla", lambda: True)
     monkeypatch.setattr(fla_api, "_ORIGINALS", {})
 
-    with pytest.raises(ImportError, match="could not find supported FLA target"):
+    with pytest.raises(ImportError, match="was replaced before cuDNN acceleration"):
         fla_api.accelerate_fla(verbose=False, targets="gated_mlp")
 
     assert module.GatedMLP.forward is third_party
