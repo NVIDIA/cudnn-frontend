@@ -1069,9 +1069,9 @@ def _kernel(
         sched_full_phase = cutlass.Int32(0)
 
         row_id_with_warp_offset = base_row_id + warp_idx * 32
-        if cutlass.const_expr(cols_per_acc_stage >= 32):
-            t2r_inst_repx = 32
-            subtile_cnt = cols_per_acc_stage // 32
+        if cutlass.const_expr(cols_per_acc_stage >= epi_n):
+            t2r_inst_repx = epi_n
+            subtile_cnt = cols_per_acc_stage // epi_n
         else:
             t2r_inst_repx = cols_per_acc_stage
             subtile_cnt = 1

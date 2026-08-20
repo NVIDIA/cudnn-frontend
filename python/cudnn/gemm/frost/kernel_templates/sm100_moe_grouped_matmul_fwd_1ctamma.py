@@ -709,7 +709,7 @@ def _kernel(
 
         # One M block's accumulator columns are contiguous, so one span list
         # drains all of them.
-        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m)
+        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2

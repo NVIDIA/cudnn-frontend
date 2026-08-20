@@ -953,8 +953,8 @@ def _kernel(
             row_id_with_warp_offset = base_row_id + warp_idx * 32
 
         # One M block's accumulator columns are contiguous.
-        subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, 32)
-        t2r_inst_repx = epi_tile_mn[1]
+        subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, epi_n)
+        t2r_inst_repx = epi_n
         if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
             ld_half_off = 0
@@ -1027,9 +1027,9 @@ def _kernel(
                     for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                         if cutlass.const_expr(use_acc_overlap):
                             _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
-                            subtile_col_offset = _sub * 32
+                            subtile_col_offset = _sub * epi_n
                         else:
-                            subtile_col_offset = subtile_idx * 32
+                            subtile_col_offset = subtile_idx * epi_n
                         c_rmem_vecs = []
                         for g in cutlass.range_constexpr(num_gemms):
                             tmem = cutlass.inttoptr(

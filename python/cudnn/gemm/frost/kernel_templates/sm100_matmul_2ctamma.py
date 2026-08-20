@@ -855,7 +855,7 @@ def _kernel(
         row_id_with_warp_offset = base_row_id + warp_idx * 32
         # One M block's accumulator columns are contiguous, so one span list
         # drains all of them.
-        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m)
+        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
         lane = tidx % 32
@@ -936,7 +936,7 @@ def _kernel(
                             ld_row = base_row_id + warp_idx * 32 + _h * 16
                             ld_addr = (ld_row << 16) | ld_col
                             ld_tmem = cutlass.inttoptr(ld_addr, 6, mma_c_dtype)
-                            _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=4)
+                            _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=epi_n // 8)
                             if cutlass.const_expr(acc_widen_to_fp32):
                                 _accf = _lv.to(cutlass.Float32)
                                 _lv = _accf + cutlass.full_like(_accf, 0.0)
@@ -947,7 +947,7 @@ def _kernel(
                             # @@INJECT_EPILOGUE@@
 
                             _i32 = vec_out.bitcast(cutlass.Int32)
-                            for _blk in cutlass.range_constexpr(2):
+                            for _blk in cutlass.range_constexpr(epi_n // 16):
                                 _regs = [_i32[_blk * 4 + _j] for _j in range(4)]
                                 _n_full = (lane % 8) + 8 * (lane // 16) + 16 * _blk
                                 _m_base = warp_idx * 32 + _h * 16 + 8 * ((lane // 8) % 2)
@@ -972,7 +972,7 @@ def _kernel(
 
                         # @@INJECT_EPILOGUE@@
 
-                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=cutlass.Swizzle(2, 4, 3))
+                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=epi_smem_swizzle)
 
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(
@@ -1197,7 +1197,7 @@ def _host(
                 out_stride_l_0 * cd_dtype.width // 128,
             ],
             box_dims=[epi_tile_mn[1], epi_tile_mn[0], 1],
-            swizzle=(_tma.TensorMapSwizzle.s64b if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
+            swizzle=(epi_tma_swizzle if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
         )
     tma_c_desc_list = [tma_c_desc]
     # @@TMA_STORE_ONLY:END@@

@@ -772,7 +772,7 @@ def _kernel(
         row_id_with_warp_offset = base_row_id + warp_idx * 32
         # One M block's accumulator columns are contiguous, so one span list
         # drains all of them.
-        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m)
+        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
         lane = tidx % 32

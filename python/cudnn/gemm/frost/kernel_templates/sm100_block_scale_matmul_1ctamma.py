@@ -959,8 +959,8 @@ def _kernel(
             row_id_with_warp_offset = base_row_id + warp_idx * 32
 
         # One M block's accumulator columns are contiguous.
-        subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, 32)
-        t2r_inst_repx = epi_tile_mn[1]
+        subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, epi_n)
+        t2r_inst_repx = epi_n
         if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
             ld_half_off = 0
@@ -1012,9 +1012,9 @@ def _kernel(
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     if cutlass.const_expr(use_acc_overlap):
                         _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
-                        subtile_col_offset = _sub * 32
+                        subtile_col_offset = _sub * epi_n
                     else:
-                        subtile_col_offset = subtile_idx * 32
+                        subtile_col_offset = subtile_idx * epi_n
                     if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
                         c_rmem_vecs = []
                         for g in cutlass.range_constexpr(num_gemms):
@@ -1052,7 +1052,7 @@ def _kernel(
                             ld_row = base_row_id + warp_idx * 32 + _h * 16
                             ld_addr = (ld_row << 16) | ld_col
                             ld_tmem = cutlass.inttoptr(ld_addr, 6, cutlass.Float32)
-                            _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=4)
+                            _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=epi_n // 8)
                             vec_f32 = _lv
                             col_j = col
                             linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
@@ -1060,7 +1060,7 @@ def _kernel(
                             # @@INJECT_EPILOGUE@@
 
                             _i32 = vec_out.bitcast(cutlass.Int32)
-                            for _blk in cutlass.range_constexpr(2):
+                            for _blk in cutlass.range_constexpr(epi_n // 16):
                                 _regs = [_i32[_blk * 4 + _j] for _j in range(4)]
                                 _n_full = (lane % 8) + 8 * (lane // 16) + 16 * _blk
                                 _m_base = warp_idx * 32 + _h * 16 + 8 * ((lane // 8) % 2)
@@ -1085,7 +1085,7 @@ def _kernel(
 
                         # @@INJECT_EPILOGUE@@
 
-                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=cutlass.Swizzle(2, 4, 3))
+                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=epi_smem_swizzle)
 
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(
@@ -1350,7 +1350,7 @@ def _host(
                 out_stride_l_0 * cd_dtype.width // 128,
             ],
             box_dims=[epi_tile_mn[1], epi_tile_mn[0], 1],
-            swizzle=(_tma.TensorMapSwizzle.s64b if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
+            swizzle=(epi_tma_swizzle if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
         )
     tma_c_desc_list = [tma_c_desc]
     # @@TMA_STORE_ONLY:END@@
