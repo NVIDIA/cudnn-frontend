@@ -403,7 +403,7 @@ def test_public_mlp_activation_rejects_unsupported_fla_version(monkeypatch):
     monkeypatch.setattr(fla_api, "_supports_installed_fla", lambda: False)
     monkeypatch.setattr(fla_api, "_ORIGINALS", {})
 
-    with pytest.raises(ImportError, match="requires flash-linear-attention==0.5.2"):
+    with pytest.raises(ImportError, match=r"requires flash-linear-attention==0\.5\.2"):
         fla_api.accelerate_fla(verbose=False, targets="gated_mlp")
 
     assert module.GatedMLP.forward is original

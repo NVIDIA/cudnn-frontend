@@ -66,7 +66,8 @@ release:
 
 ```bash
 pip install flash-linear-attention==0.5.2
+pip install "nvidia-cudnn-frontend[cutedsl]"
 ```
 
-The selected cuDNN kernel may require the optional dependencies documented for
-its FE-OSS API, including the `cutedsl` extra for the fused GEMM path.
+The `cutedsl` extra supplies the optional dependencies required by the fused
+GEMM path used by the native `gated_mlp` target.
