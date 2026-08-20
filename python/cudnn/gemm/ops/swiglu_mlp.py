@@ -227,11 +227,16 @@ def _dswiglu(dh, gate, up):
 
 
 _FROST_DSWIGLU_CACHE = {}
-# OFF by default: the FROST dgrad+dSwiGLU kernel is correct and its fused stage wins
-# ~1.15-2.64x, but the full backward is GEMM-bound (the forward now saves gate/up, so
-# the two recompute GEMMs are already gone) and the fused stage does not move the full
-# backward past the pointwise path -- so there is no full-backward reason to enable it.
-_FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "0") != "0"
+# ON by default (set CUDNN_GEMM_SWIGLU_FROST_BWD=0 to force the pointwise path). On
+# this dense bf16 shape the FROST fused dgrad+dSwiGLU (one cuTeDSL kernel, dh never
+# materialised to HBM) ties the separate nvjet GEMM + one-kernel pointwise (~1.15ms
+# each, B200 M8192 stage) -- ~1% behind only because its cuTeDSL GEMM trails nvjet.
+# It is the default so it stays exercised and Yanqin can close that GEMM gap, and
+# because the fusion advantage grows as the workload gets pointwise-heavier (fp8
+# halves the GEMM and adds quant/scale pointwise; MoE grouped GEMMs are smaller and
+# more memory-bound). Falls back to the pointwise path if FROST cannot serve a
+# shape/arch/thread (e.g. no CUDA context on an autograd worker thread).
+_FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
 
 
 def _frost_dswiglu(dout2, Wd, gate, up):
