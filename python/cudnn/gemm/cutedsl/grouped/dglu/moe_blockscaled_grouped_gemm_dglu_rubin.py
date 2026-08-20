@@ -2034,17 +2034,15 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 if cutlass.const_expr(self.has_prob):
                     dy1_0, dy1_1 = fmul2((dy1_0, dy1_1), mprob2)
 
-                x1_filter_0 = y1_0 if x1_0 <= geglu_max_value else cutlass.Float32(0.0)
-                x1_filter_1 = y1_1 if x1_1 <= geglu_max_value else cutlass.Float32(0.0)
+                x1_filter_0 = cutlass.Float32(1.0) if x1_0 <= geglu_max_value else cutlass.Float32(0.0)
+                x1_filter_1 = cutlass.Float32(1.0) if x1_1 <= geglu_max_value else cutlass.Float32(0.0)
 
                 dx1_vec[i], dx1_vec[i + 1] = fmul2((dy1_0, dy1_1), (cutlass.Float32(x1_filter_0), cutlass.Float32(x1_filter_1)))
 
                 # dy2 = g * y1 * sigmoid_out * mProb
                 dy2_0, dy2_1 = fmul2(y1, acc_mul_sigmoid_prob)
-                x2_filter_0 = x2_0 if x2_0 <= geglu_max_value else x_dtype(0.0)
-                x2_filter_1 = x2_1 if x2_1 <= geglu_max_value else x_dtype(0.0)
-                x2_filter_0 = y2_0 if x2_filter_0 >= geglu_min_value else cutlass.Float32(0.0)
-                x2_filter_1 = y2_1 if x2_filter_1 >= geglu_min_value else cutlass.Float32(0.0)
+                x2_filter_0 = cutlass.Float32(1.0) if (x2_0 >= geglu_min_value and x2_0 <= geglu_max_value) else cutlass.Float32(0.0)
+                x2_filter_1 = cutlass.Float32(1.0) if (x2_1 >= geglu_min_value and x2_1 <= geglu_max_value) else cutlass.Float32(0.0)
                 dx2_vec[i], dx2_vec[i + 1] = fmul2((dy2_0, dy2_1), (cutlass.Float32(x2_filter_0), cutlass.Float32(x2_filter_1)))
 
                 if cutlass.const_expr(self.generate_dprob):
@@ -2082,9 +2080,8 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 dy1 = g * sigmoid_out * (1 + 1.702 * y1 * (1 - sigmoid_out)) * (y2 + linear_offset)
                 dy2 = g * y1 * sigmoid_out
 
-                x1_filter = x1_vec_load[i] if x1_vec_load[i] <= 7.0 else 0.0
-                x2_filter = x2_vec_load[i] if x2_vec_load[i] <= 7.0 else 0.0
-                x2_filter = x2_filter if x2_filter >= -7.0 else 0.0
+                x1_filter = 1.0 if x1_vec_load[i] <= 7.0 else 0.0
+                x2_filter = 1.0 if (x2_vec_load[i] >= -7.0 and x2_vec_load[i] <= 7.0) else 0.0
 
                 dx1_vec[i] = x1_filter * dy1
                 dx2_vec[i] = x2_filter * dy2
