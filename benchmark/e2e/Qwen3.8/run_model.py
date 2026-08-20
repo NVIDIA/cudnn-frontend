@@ -10,19 +10,23 @@ preserves the repeated layer work without allocating the full 64-layer model.
 Qwen3.5/3.6-27B have the same kernel-relevant layer dimensions and are available
 as alias presets. Models without a published, reproducible config are not guessed.
 
-Two cuDNN swaps, each behind a flag:
+Three independent backend choices:
   --accelerate_mlp   route the SwiGLU MLP through cudnn.gemm.ops.swiglu_mlp (PR #609).
                      The forward fuses the two FC1 GEMMs with SwiGLU and the
                      backward fuses the dgrad GEMM + dSwiGLU into FROST.
   --accelerate_attn  route linear attention through cudnn.fla (PR #596), if installed.
                      This is measured independently from the MLP swap.
+  --full_attn_backend
+                     choose vanilla torch SDPA or the FE public cuDNN-backend
+                     SDPA op for the common full-attention layer.
 
-Full-attention layers call the cuDNN Frontend Torch SDPA op directly as a
-flash-attn stand-in, so no flash-attn install is needed.  This bypasses the
-tested Torch 2.13 dispatch guard that does not select cuDNN for head-dim 256.
-The benchmark requires the cuDNN >= 9.23 backend d256 path and explicitly
-forbids FE's older OSS/CuteDSL d256 fallback.  Requires an SM100 (Blackwell)
-device.
+Full-attention layers use a Torch-SDPA-compatible flash-attn stand-in, so no
+flash-attn install is needed.  The default calls the cuDNN Frontend op directly,
+bypassing the tested Torch 2.13 dispatch guard that does not select cuDNN for
+head-dim 256; ``--full_attn_backend torch`` restores the vanilla dispatcher for
+an exact A/B.  The cuDNN arm requires the cuDNN >= 9.23 backend d256 path and
+explicitly forbids FE's older OSS/CuteDSL d256 fallback.  Requires an SM100
+(Blackwell) device.
 
     python benchmark/e2e/Qwen3.8/run_model.py --accelerate_mlp 1 --accelerate_attn 1
 """
@@ -38,15 +42,19 @@ from _perfshare import pick_sm100, profile_and_report  # noqa: E402
 
 
 def _wire_sdpa_attention():
-    """Replace FLA's flash-attn dependency with FE's cuDNN-backend Torch op.
+    """Build switchable Torch/cuDNN SDPA adapters for FLA full attention.
 
     FE #335 routes d256 through the backend graph on cuDNN >= 9.23 and otherwise
     falls back to Sdpafwd/SdpabwdSm100D256, which are OSS/CuteDSL kernels.  This
-    perf benchmark rejects the latter rather than silently measuring it.
+    perf benchmark rejects the latter rather than silently measuring it.  Both
+    adapters receive the same projected/rotated Q/K/V and return the same packed
+    BLHD layout.  Thus QKV/RoPE/O remain common code and are included in module
+    and model timings; only the SDPA core changes across this axis.
     """
     import cudnn
     import cudnn.experimental.ops.sdpa as cudnn_sdpa_module
     import fla.layers.attn as fla_attn
+    import torch.nn.functional as F
 
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").lower() in (
         "1",
@@ -76,7 +84,15 @@ def _wire_sdpa_attention():
     cudnn_sdpa_module.sdpa_bwd_d256 = _forbid_oss_d256
     cudnn_sdpa = cudnn_sdpa_module.scaled_dot_product_attention
 
-    def _sdpa_flash(
+    def _prepare(q, k, v, window_size):
+        qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))  # [B,L,H,D] -> [B,H,L,D]
+        if kt.shape[1] != vt.shape[1] or qt.shape[1] % kt.shape[1] != 0:
+            raise ValueError(f"invalid GQA heads: Q/K/V={qt.shape[1]}/{kt.shape[1]}/{vt.shape[1]}")
+        if not isinstance(window_size, tuple) or len(window_size) != 2:
+            raise ValueError(f"expected flash-attn window_size tuple, got {window_size!r}")
+        return qt, kt, vt
+
+    def _torch_sdpa_flash(
         q,
         k,
         v,
@@ -86,11 +102,31 @@ def _wire_sdpa_attention():
         window_size=(-1, -1),
         **kw,
     ):
-        qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))  # [B,L,H,D] -> [B,H,L,D]
-        if kt.shape[1] != vt.shape[1] or qt.shape[1] % kt.shape[1] != 0:
-            raise ValueError(f"invalid GQA heads: Q/K/V={qt.shape[1]}/{kt.shape[1]}/{vt.shape[1]}")
-        if not isinstance(window_size, tuple) or len(window_size) != 2:
-            raise ValueError(f"expected flash-attn window_size tuple, got {window_size!r}")
+        qt, kt, vt = _prepare(q, k, v, window_size)
+        if window_size != (-1, -1):
+            raise NotImplementedError("the vanilla torch full-attention A/B supports only the full causal window")
+        o = F.scaled_dot_product_attention(
+            qt,
+            kt,
+            vt,
+            is_causal=causal,
+            scale=softmax_scale,
+            dropout_p=dropout_p,
+            enable_gqa=qt.shape[1] != kt.shape[1],
+        )
+        return o.transpose(1, 2).contiguous()
+
+    def _cudnn_sdpa_flash(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        **kw,
+    ):
+        qt, kt, vt = _prepare(q, k, v, window_size)
         o = cudnn_sdpa(
             qt,
             kt,
@@ -106,10 +142,20 @@ def _wire_sdpa_attention():
         # wrapper returns packed BHSD, so normalize once before FLA flattens H*D.
         return o.transpose(1, 2).contiguous()
 
-    fla_attn.flash_attn_func = _sdpa_flash
+    adapters = {"torch": _torch_sdpa_flash, "cudnn": _cudnn_sdpa_flash}
+
+    def select(name):
+        try:
+            fla_attn.flash_attn_func = adapters[name]
+        except KeyError:
+            raise ValueError(f"unknown full-attention backend {name!r}; choices={tuple(adapters)}") from None
+        return name
+
+    select("cudnn")
+    return select
 
 
-_wire_sdpa_attention()
+_set_full_attention_backend = _wire_sdpa_attention()
 
 from fla.models.gated_deltanet import (
     GatedDeltaNetForCausalLM,
@@ -252,11 +298,18 @@ def main():
         help="route linear attention through cudnn.fla (PR #596)",
     )
     ap.add_argument(
+        "--full_attn_backend",
+        choices=("torch", "cudnn"),
+        default="cudnn",
+        help="full-attention SDPA core; QKV/O projections are common",
+    )
+    ap.add_argument(
         "--inspect",
         action="store_true",
         help="print model structure + GEMM sites and exit",
     )
     args = ap.parse_args()
+    _set_full_attention_backend(args.full_attn_backend)
 
     shape = MODEL_PRESETS[args.preset].copy()
     for name in shape:
@@ -288,7 +341,13 @@ def main():
         _accelerate_mlp()
 
     ids = torch.randint(0, shape["vocab"], (args.bs, args.seq), device=dev)
-    extra = (lambda: f"linear-attn op path: {attn_path()}") if attn_path is not None else None
+
+    def extra():
+        paths = [f"full-attn SDPA: {args.full_attn_backend}"]
+        if attn_path is not None:
+            paths.append(f"linear-attn op path: {attn_path()}")
+        return ", ".join(paths)
+
     profile_and_report(model, ids, extra_path=extra)
 
 
