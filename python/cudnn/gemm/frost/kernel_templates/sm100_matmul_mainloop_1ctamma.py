@@ -298,6 +298,7 @@ def _kernel(
     # TMEM accumulator layout, per acc stage:
     #   M block mi, N block ni -> columns
     #   [mi*epi_cols_per_mma_m + ni*mma_inst_shape_mnk[1], +N), all at lane base 0.
+    epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
     epi_cols_per_mma_m = cta_tile_mnk[1]
     cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
@@ -1004,17 +1005,11 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
-        # The drain layout follows the MMA INSTRUCTION's M (the TMEM row
-        # organisation), not the CTA tile's: at hardware M=64 the accumulator
-        # occupies data paths 0-15 of each sub-partition, so the 32-data-path
-        # LDTM layout cannot be used to read it.
         if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             row_id_with_warp_offset = base_row_id
         else:
             row_id_with_warp_offset = base_row_id + warp_idx * 32
 
-        # One M block's accumulator columns are contiguous (the N-direction MMAs
-        # tile them), so one span list drains all of them.
         epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
@@ -1031,7 +1026,7 @@ def _kernel(
 
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
-            coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
+            coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
 
             acc_stage = tile_iter % acc_stages
             if acc_stage == 0 and tile_iter != 0:
@@ -1042,11 +1037,8 @@ def _kernel(
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            # One pass per MMA-M block: the 4 epilogue warps cover mma_inst M
-            # rows at a time, so a CTA tile of num_mma_m blocks drains in
-            # num_mma_m passes over its own column region.
             for mi in cutlass.range_constexpr(num_mma_m):
-                coord_m = coord_m_tile + mi * mma_inst_shape_mnk[0]
+                coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * cols_per_acc_stage) for g in range(num_gemms)]
 
@@ -1083,7 +1075,7 @@ def _kernel(
                         if elect_one:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-                    col = coord_n + subtile_col_offset
+                    col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES

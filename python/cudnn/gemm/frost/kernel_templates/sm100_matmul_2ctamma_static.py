@@ -713,8 +713,7 @@ def _kernel(
         is_valid = cutlass.Int32(1)
 
         row_id_with_warp_offset = base_row_id + warp_idx * 32
-        # One M block's accumulator columns are contiguous, so one span list
-        # drains all of them.
+
         epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
@@ -739,9 +738,6 @@ def _kernel(
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            # One pass per MMA-M block: the 4 epilogue warps cover this CTA's
-            # epi_rows_per_mma_m rows at a time, so a CTA tile of num_mma_m blocks
-            # drains in num_mma_m passes over its own column region.
             for mi in cutlass.range_constexpr(num_mma_m):
                 coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
@@ -758,7 +754,6 @@ def _kernel(
 
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     subtile_col_offset, subtile_w = epi_spans[subtile_idx]
-
                     if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
                         c_rmem_vecs = []
                         for g in cutlass.range_constexpr(num_gemms):
