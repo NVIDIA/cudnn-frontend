@@ -90,6 +90,83 @@ def _sole(values):
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+# --- KV split (see choose_split_kv) ----------------------------------------
+# Largest split considered; past this the reduction outgrows the parallelism.
+_SPLIT_KV_MAX = 16
+# A split thinner than this is prologue/epilogue dominated.
+_SPLIT_KV_MIN_TILES = 2
+# What a CTA-tile costs beyond its KV loop (Q load, prologue, epilogue), in
+# units of one KV tile. Empirical: re-measure if the per-tile fixed cost moves.
+_SPLIT_KV_CTA_COST = 21.0
+
+
+def choose_split_kv(
+    *,
+    q_tiles: int,
+    heads_q: int,
+    batch: int,
+    kv_tiles: int,
+    sm_count: int,
+    ctas_per_tile: int = 1,
+    max_split: int = _SPLIT_KV_MAX,
+) -> int:
+    """How many KV chunks to cut each Q tile into; 1 = do not split.
+
+    A prefill launch is ``q_tiles * heads_q * batch`` independent tiles, each
+    walking the whole KV loop.  When that product is below the SM count the chip
+    idles however long the loop is; splitting multiplies the tile count by ``s``
+    and divides each tile's KV work by it, then pays one reduction over the
+    partials.
+
+    A CTA holds its tile for the whole loop, so a launch costs whole WAVES.
+    Minimise, over powers of two:
+
+        waves(s) = ceil(base_ctas * s / sm_count)
+        cost(s)  = waves(s) * (ceil(kv_tiles / s) + CTA_COST)
+
+    CTA_COST is what a tile re-pays whatever its loop length, so it sits inside
+    the wave term -- once per CTA-tile, not once per split.
+
+    What falls out: an under-full launch splits until the wave is full; an
+    over-full one with a partial-wave tail splits FINER to smooth it, even past
+    the SM count; an exactly balanced one (base_ctas = k * sm_count) has no tail
+    and never splits.
+
+    Powers of two only, because ``split_kv`` is a TemplateParams field and so a
+    kernel-module cache key -- an unrestricted choice mints a compiled
+    specialization per shape.
+
+    Returns 1 when there is nothing to split or nothing beats not splitting.
+    Bounded by ``max_split``, by ``kv_tiles`` (more splits than tiles would
+    leave some provably empty) and by ``_SPLIT_KV_MIN_TILES``.
+    """
+    if min(q_tiles, heads_q, batch, kv_tiles, sm_count, ctas_per_tile) <= 0:
+        return 1
+    base_ctas = q_tiles * heads_q * batch * ctas_per_tile
+    if kv_tiles <= 1:
+        return 1
+
+    best_split = 1
+    best_cost = float(_ceil_div(base_ctas, sm_count) * (kv_tiles + _SPLIT_KV_CTA_COST))
+    split = 2
+    while split <= min(max_split, kv_tiles):
+        # Every split must stay thick enough to amortise its own prologue and
+        # epilogue. The chunking hands the remainder to the leading splits, so
+        # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
+        if kv_tiles // split < _SPLIT_KV_MIN_TILES:
+            break
+        waves = _ceil_div(base_ctas * split, sm_count)
+        cost = waves * (_ceil_div(kv_tiles, split) + _SPLIT_KV_CTA_COST)
+        if cost < best_cost:
+            best_split, best_cost = split, cost
+        split <<= 1
+    return best_split
+
+
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
@@ -194,14 +271,20 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     return [primary if primary in domain else _sole(domain) or SCHED_NATURAL] + runners
 
 
-def _split_points(caps: Capabilities, facts) -> List[Optional[int]]:
-    """Ordered split-KV candidates.
+def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Optional[int], cga: Optional[int]) -> List[Optional[int]]:
+    """Ordered split-KV candidates for the chosen tile geometry.
 
-    Splitting pays only when the natural grid underfills the machine (the
-    decode/short-prefill regime) and each split still has KV rows to walk.
+    The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
+    facts-level launch geometry (``tile_m*cga`` rows per tile — the propose
+    tier's approximation of the kernel Cfg's exact ``TILES_Q*TILE_M*CTA_MMA``).
     The generator respects the split path's structural limits (dense-only, no
     sink — mismatch() enforces the same, so an emitted >1 never reaches a
     kernel that cannot honor it).
+
+    The split point is deliberately a RUNNER-UP behind no-split until sweeps
+    justify flipping the default: first-build behavior stays exactly what this
+    dispatch has always done, and autotune / select_plan reach the split plan
+    today.
     """
     domain = caps.split_kvs
     if len(domain) <= 1:
@@ -209,22 +292,28 @@ def _split_points(caps: Capabilities, facts) -> List[Optional[int]]:
     no_split = 1 if 1 in domain else min(domain)
     if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
         return [no_split]
-    sm_count = facts.device_sm_count or 0
-    grid = -(-facts.s_q // 128) * facts.h_q * facts.b
-    kv_tiles = -(-facts.s_kv // 128)
-    if sm_count <= 0 or grid >= sm_count or kv_tiles < 2:
+    if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        # The combine reduces partials in half precision; reducing QUANTIZED
+        # partials would lose what the split is meant to be neutral about.
         return [no_split]
-    # Underfilled: offer the smallest split that fills the machine (capped by
-    # the domain and by one KV tile per split) BEHIND the no-split primary.
-    # Deliberately a runner-up until sweeps justify flipping the default: the
-    # first-build behavior stays exactly what this dispatch has always done,
-    # and autotune / select_plan reach the split plan today.
-    want = -(-sm_count // max(grid, 1))
-    usable = [s for s in sorted(domain) if s > 1 and s <= kv_tiles]
+    sm_count = facts.device_sm_count or 0
+    if sm_count <= 0:
+        return [no_split]
+    rows_per_tile = (tile_m or 128) * (cga or 1)
+    split = choose_split_kv(
+        q_tiles=_ceil_div(facts.s_q, rows_per_tile),
+        heads_q=facts.h_q,
+        batch=facts.b,
+        kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
+        sm_count=sm_count,
+        ctas_per_tile=cga or 1,
+        max_split=max(domain),
+    )
+    # Snap the model's power-of-two answer down into the declared domain.
+    usable = [s for s in sorted(domain) if 1 < s <= split]
     if not usable:
         return [no_split]
-    split = next((s for s in usable if s >= want), usable[-1])
-    return [no_split, split]
+    return [no_split, usable[-1]]
 
 
 def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
@@ -254,12 +343,13 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     caps = spec.capabilities
     tiles = _tile_points(spec, facts)
     scheds = _sched_points(caps, facts)
-    splits = _split_points(caps, facts)
+    cga = _cga_points(caps)[0]
+    splits = _split_points(caps, facts, tiles[0][0], tiles[0][1], cga)
     base = SdpaFwdKnobs(
         sched_policy=scheds[0],
         tile_m=tiles[0][0],
         tile_n=tiles[0][1],
-        cga=_cga_points(caps)[0],
+        cga=cga,
         split_kv=splits[0],
         softmax_precision=_softmax_points(caps)[0],
     )
@@ -269,7 +359,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     for policy in scheds[1:]:
         out.append(replace(base, sched_policy=policy))
     for split in splits[1:]:
-        out.append(replace(base, split_kv=split))
+        # Split sets ride the plain scheduler: the SM120 config bars a split
+        # under the LPT remaps, and in the underfilled regime a split targets
+        # the LPT balancing is moot — the split itself levels the grid.
+        out.append(replace(base, split_kv=split, sched_policy=SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else base.sched_policy))
     seen, unique = set(), []
     for knobs in out:
         if knobs not in seen:

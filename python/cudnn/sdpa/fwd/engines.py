@@ -279,12 +279,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
-        if knobs.split_kv is not None and knobs.split_kv > 1 and (facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim):
+        if knobs.split_kv is not None and knobs.split_kv > 1:
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
-            return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+                return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+                # The combine reduces partials in half precision; reducing
+                # QUANTIZED partials would lose what the split must be
+                # numerically neutral about.
+                return "split_kv > 1 on a quantized graph requires a bf16/fp16 O"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -517,6 +523,9 @@ def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # Only the d128 mxfp8 kernel wires SplitHelpers; the split path
+            # also needs a half-precision O (mismatch's facts x knobs gate).
+            split_kvs=frozenset({1, 2, 4}) if d == 128 else frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -584,6 +593,11 @@ def _sm100_fp8_spec(
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # Only the d128 fp8 kernel wires SplitHelpers (the d192x128 file
+            # forks its own scheduler and has no split path). Split partials
+            # reduce in half precision, so mismatch()'s facts x knobs gate
+            # additionally requires a bf16/fp16 O on the quantized rows.
+            split_kvs=frozenset({1, 2, 4}) if d == 128 else frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -667,6 +681,11 @@ def _sm120_spec() -> EngineSpec:
             cu_seq_len=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking + the shared split_combine pass
+            # (the combine is one block per row — arch-agnostic). The config
+            # backstop bars a split under the LPT remaps, so the heuristic's
+            # split sets ride SCHED_NATURAL.
+            split_kvs=frozenset({1, 2, 4}),
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
