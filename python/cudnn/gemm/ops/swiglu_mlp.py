@@ -23,14 +23,15 @@ ONE two-output cuDNN pointwise kernel (``dup`` and ``dgate`` from a single graph
 cuDNN's tensor-ir engine declines multi-output but another engine serves it),
 which reads the inputs once and is ~2x the two single-output kernels it replaces.
 With that and the saved pre-activations, the full fwd+bwd step runs ~0.96-0.98x a
-torch autograd MLP on the Qwen3.5-27B shape (B200). (An opt-in
-``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path fuses the ``dh = dout @ Wd`` dgrad GEMM with
-the dSwiGLU into one FROST kernel, taking the natural down weight directly, no
-transpose. It avoids materialising ``dh`` to HBM but its cuTeDSL GEMM currently
-ties the separate nvjet GEMM + one-kernel pointwise (~1.15ms each, B200 M8192
-stage), so with the backward GEMM-bound it does not move the full step; off by
-default pending FROST GEMM tuning.) Numerically matches torch to bf16 noise on the
-output and all four gradients.
+torch autograd MLP on the Qwen3.5-27B shape (B200). By default the ``dh = dout @ Wd``
+dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL) kernel that never
+materialises ``dh`` to HBM (set ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate
+nvjet GEMM + one-kernel pointwise, which it falls back to anyway if FROST cannot
+serve a shape/arch/thread). On this dense bf16 shape FROST ties the pointwise path
+(~1.15ms each, B200 M8192 stage) -- ~1% behind only because its cuTeDSL GEMM trails
+nvjet -- and the fusion advantage grows as the workload gets pointwise-heavier
+(fp8, MoE). Numerically matches torch to bf16 noise on the output and all four
+gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -249,14 +250,17 @@ def _frost_dswiglu(dout2, Wd, gate, up):
 
     FROST takes the natural down weight directly (an N-major / I-contiguous B -- no
     transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
-    view). The fused stage beats the separate dh GEMM + two pointwise kernels
-    (~1.15-2.64x, Qwen3.5-27B, SM100), but the full backward is GEMM-bound so the fused
-    stage does not move it: the forward already saves gate/up, so the two recompute
-    GEMMs that once dominated the backward are gone, and what remains (dWd, dh, dx, dWg,
-    dWu) is pure GEMM that FROST's dgrad+epilogue fusion cannot shrink. Kept as an
-    opt-in experiment, not a win. Not a transpose problem (dense bf16 needs none;
-    ``dg.t()`` is a free view) and not a host-overhead one (host is ~1% of these
-    compute-bound GEMMs, and #612 already cut it)."""
+    view) and keeps ``dh`` on-chip (no HBM round-trip). This is the DEFAULT backward
+    stage. On this dense bf16 shape it TIES the separate nvjet GEMM + one-kernel
+    pointwise (~1.15ms each, B200 M8192) -- ~1% behind only because its cuTeDSL GEMM
+    trails nvjet, which eats the ``dh`` round-trip it saves; tile autotune does not
+    help (the fixed ``_cfg`` 128x256 is already the best CATALOG tile). Kept the
+    default so it stays exercised and the cuTeDSL GEMM gap can be closed, and because
+    the fusion advantage grows as the workload gets pointwise-heavier (fp8 halves the
+    GEMM and adds quant/scale; MoE grouped GEMMs are smaller, more memory-bound). Not
+    a transpose problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a
+    host-overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
+    it)."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
 
