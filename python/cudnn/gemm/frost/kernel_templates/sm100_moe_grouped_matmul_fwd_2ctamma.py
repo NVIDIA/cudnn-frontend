@@ -769,13 +769,14 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
 
+        # @@EPILOGUE_SETUP:BEGIN@@
         row_id_with_warp_offset = base_row_id + warp_idx * 32
-        # One M block's accumulator columns are contiguous, so one span list
-        # drains all of them.
+
         epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
         subtile_cnt = len(epi_spans)
         shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
         lane = tidx % 32
+        # @@EPILOGUE_SETUP:END@@
 
         while is_valid != 0:
             while not nvvm.mbarrier_try_wait_parity(
@@ -800,6 +801,7 @@ def _kernel(
 
             if is_valid != 0:
                 coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+                # @@EPILOGUE_DRAIN:BEGIN@@
                 coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * pair_n_size
                 if cutlass.const_expr(epi_rows_per_mma_m == 64):
                     coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
@@ -808,18 +810,11 @@ def _kernel(
                 if acc_stage == 0 and tile_iter != 0:
                     acc_full_phase_bit = acc_full_phase_bit ^ 1
 
-                while not nvvm.mbarrier_try_wait_parity(
-                    acc_full_mbar_ptr.subview(acc_stage),
-                    acc_full_phase_bit,
-                    time_limit=10_000_000,
-                ):
+                while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr.subview(acc_stage), acc_full_phase_bit, time_limit=10_000_000):
                     pass
 
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-                # One pass per MMA-M block: the 4 epilogue warps cover this CTA's rows for
-                # one block at a time, so a CTA tile of num_mma_m blocks drains in
-                # num_mma_m passes over its own column region.
                 for mi in cutlass.range_constexpr(num_mma_m):
                     coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                     mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
@@ -841,14 +836,14 @@ def _kernel(
                             subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
                             tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
                             _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                            # INT8 int32 accumulate → widen to fp32 (skipped for int32 output).
                             if cutlass.const_expr(acc_widen_to_fp32):
                                 _accf = _cv.to(cutlass.Float32)
+                                # `+ 0.0` forces a fresh fp32 register so int32->fp32 isn't folded into an invalid int32->fp8 cast.
                                 _cv = _accf + cutlass.full_like(_accf, 0.0)
                             c_rmem_vecs.append(_cv)
                         c_rmem_vec = c_rmem_vecs[0]
 
-                        # Exactly one acc_empty arrive per epilogue warp per tile —
-                        # the mbar counts warps, not M blocks.
                         if mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1:
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -860,6 +855,7 @@ def _kernel(
                                 )
 
                         col = coord_n_c + subtile_col_offset
+
                         if row_active and row < group_end:
                             for j in cutlass.range_constexpr(subtile_w // vsize):
                                 col_j = col + j * vsize
@@ -869,6 +865,9 @@ def _kernel(
                                     # @@INJECT_STG_VEC_BINDINGS@@
 
                                     # @@INJECT_EPILOGUE@@
+
+                # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
+                # @@EPILOGUE_DRAIN:END@@
                 tile_iter += 1
 
     if warp_idx == unused_warp_id:

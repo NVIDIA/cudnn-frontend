@@ -42,6 +42,7 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+    epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
@@ -58,6 +59,9 @@ from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
 # @@INJECT_TILE_CONSTANTS@@
+
+if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
+    raise NotImplementedError(f"{__name__}: acc overlap reverses subtiles by index, which needs a uniform drain width")
 
 
 CLC_SCHED_STAGES = 2
@@ -330,7 +334,7 @@ def _kernel(
     ab_only_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
     sf_only_copy_bytes = num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes
 
-    cols_per_acc_stage = cta_tile_mnk[1]
+    epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
 
     # @@INJECT_TAP_PTRS@@
@@ -1009,21 +1013,14 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
-        if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
-            row_id_with_warp_offset = base_row_id
-        else:
-            row_id_with_warp_offset = base_row_id + warp_idx * 32
+        # @@EPILOGUE_SETUP:BEGIN@@
+        row_id_with_warp_offset = base_row_id + warp_idx * 32
 
-        # One M block's accumulator columns are contiguous.
-        subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, epi_n)
-        t2r_inst_repx = epi_n
-        if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
-            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
-            ld_half_off = 0
-        else:
-            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
-            ld_half_off = None
+        epi_spans = _epi_subtile_spans(epi_cols_per_mma_m, epi_n)
+        subtile_cnt = len(epi_spans)
+        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
         lane = tidx % 32
+        # @@EPILOGUE_SETUP:END@@
 
         # @@TMA_STORE_ONLY:BEGIN@@
         epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
@@ -1031,7 +1028,8 @@ def _kernel(
 
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
-            coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
+            # @@EPILOGUE_DRAIN:BEGIN@@
+            coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
 
             acc_stage = tile_iter % acc_stages
             if acc_stage == 0 and tile_iter != 0:
@@ -1046,22 +1044,18 @@ def _kernel(
             else:
                 acc_buf_parity = cutlass.Int32(0)
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-            # One pass per MMA-M block over its own column region.
+
             for mi in cutlass.range_constexpr(num_mma_m):
                 if cutlass.const_expr(use_acc_overlap and num_mma_m > 1):
                     _mi = mi + (1 - acc_buf_parity) * (num_mma_m - 1 - 2 * mi)
                 else:
                     _mi = mi
-                coord_m = coord_m_tile + _mi * mma_inst_shape_mnk[0]
+                coord_m = coord_m_tile + _mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + _mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * acc_gemm_stride) for g in range(num_gemms)]
 
-                if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
-                    row = coord_m + warp_idx * 16 + lane
-                    row_active = lane < 16
-                else:
-                    row = coord_m + tidx
-                    row_active = True
+                row = coord_m + tidx
+                row_active = True
 
                 # @@INJECT_AUX_VIEWS@@
 
@@ -1069,17 +1063,16 @@ def _kernel(
                     if cutlass.const_expr(use_acc_overlap):
                         _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
                         subtile_col_offset = _sub * epi_n
+                        subtile_w = epi_n
                     else:
-                        subtile_col_offset = subtile_idx * epi_n
+                        subtile_col_offset, subtile_w = epi_spans[subtile_idx]
                     if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
                         c_rmem_vecs = []
                         for g in cutlass.range_constexpr(num_gemms):
-                            tmem = cutlass.inttoptr(
-                                tmem_col_addr_gemms[g] + subtile_col_offset,
-                                6,
-                                cutlass.Float32,
-                            )
-                            c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx, offset=ld_half_off))
+                            subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
+                            tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
+                            _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                            c_rmem_vecs.append(_cv)
                         c_rmem_vec = c_rmem_vecs[0]
 
                     if cutlass.const_expr(((not use_acc_overlap) or cd_out_is_m_major) and not (use_tma_store_epi and cd_out_is_m_major)):
@@ -1095,19 +1088,19 @@ def _kernel(
                         if elect_one:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-                    col = coord_n + subtile_col_offset
+                    col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                     smem_subtile_ptr = smem_d_ptr.subview(epi_stage_idx * epi_subtile_elems)
-                    smem_thr_ptr = smem_subtile_ptr.subview(tidx * t2r_inst_repx)
+                    smem_thr_ptr = smem_subtile_ptr.subview(tidx * subtile_w)
 
                     if cutlass.const_expr(cd_out_is_m_major):
                         ld_col = mi_col_base + subtile_col_offset
                         for _h in cutlass.range(2, unroll_full=True):
                             ld_row = base_row_id + warp_idx * 32 + _h * 16
                             ld_addr = (ld_row << 16) | ld_col
-                            ld_tmem = cutlass.inttoptr(ld_addr, 6, cutlass.Float32)
+                            ld_tmem = cutlass.inttoptr(ld_addr, 6, mma_c_dtype)
                             _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=epi_n // 8)
                             vec_f32 = _lv
                             col_j = col
@@ -1177,7 +1170,7 @@ def _kernel(
 
                     # @@STG_ONLY:BEGIN@@
                     if row_active and row < M:
-                        for j in cutlass.range_constexpr(t2r_inst_repx // vsize):
+                        for j in cutlass.range_constexpr(subtile_w // vsize):
                             col_j = col + j * vsize
                             if col_j + vsize <= N:
                                 vec_f32 = c_rmem_vec[j * vsize : (j + 1) * vsize]
@@ -1194,6 +1187,7 @@ def _kernel(
                 if elect_one:
                     nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
+            # @@EPILOGUE_DRAIN:END@@
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_epi = clc_full_phase_epi ^ 1
