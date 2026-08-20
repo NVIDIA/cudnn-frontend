@@ -68,6 +68,16 @@ cutedsl = [
     "cuda-python",
     "apache-tvm-ffi>=0.1.11",
 ]
+cutile = [
+    # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
+    # extra pins cuda-toolkit>=13.2,<13.4, and that upper bound would cap the
+    # whole environment's toolkit and shut out CUDA 12 entirely. Without it,
+    # cuda.tile falls back to a system `tileiras`, the same way this package
+    # already leaves GPU wheels to the user. Engines that cannot import the
+    # runtime decline in check_support, so a missing compiler costs those
+    # engines and nothing else.
+    "cuda-tile>=1.4; python_version >= '3.10'",
+]
 
 [dependency-groups]
 dev = [
