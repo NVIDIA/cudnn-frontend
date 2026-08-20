@@ -28,6 +28,10 @@ Torch SDPA; it is not an all-eager-Torch implementation. At the benchmark shape,
 Torch 2.13 selects PyTorch FlashAttention rather than cuDNN. Only the MLP axis
 belongs to PR #609.
 
+The formal results below predate this public adapter and used an equivalent
+direct call to `cudnn.gemm.ops.swiglu_mlp`. The adapter itself is validated by
+the focused FLA compatibility suite and a native-route model smoke test.
+
 ## Qwen3.8 proxy result
 
 On a full 148-SM B200 with BF16, batch 4, sequence 2048, and the four-layer
