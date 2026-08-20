@@ -777,23 +777,28 @@ def test_split_kv_causal_other_flavors(flavor):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("splits", [1, 4], ids=lambda s: f"split{s}")
-def test_split_kv_padded_q_trim(splits):
+@pytest.mark.parametrize("flavor", ["d128", "d512"])
+def test_split_kv_padded_q_trim(flavor, splits):
     """Dense padded-Q trim (seq_q_lens) + split.
 
     Q rows at or past the batch's actual length must come back O := 0 (cuDNN
     >= 9.14 convention). Under split that has to hold for EVERY split's partial,
     or the combine mixes live and dead rows -- the trim is applied per split in
     the epilogue, after which the dead row's lse = -inf makes it drop out.
+
     """
     from test_sdpa_fwd_dsl_sm100 import _ref_sdpa_full
 
-    B, H, SQ, SKV = 2, 4, 256, 2048
+    kmod, d_qk, d_v = _F16_FLAVORS[flavor]
+    # SQ spans several CGA tiles (ROWS_PER_CLUSTER = 512 on d128) so the short
+    # batch has both a mid-tile trim AND fully collapsed tiles past its length.
+    B, H, SQ, SKV = 2, 4, 1024, 2048
     kv_lens = torch.tensor([2048, 2048], dtype=torch.int32, device="cuda")
-    q_lens = torch.tensor([256, 137], dtype=torch.int32, device="cuda")  # 2nd trims mid-tile
+    q_lens = torch.tensor([1024, 137], dtype=torch.int32, device="cuda")  # 2nd trims mid-tile
     got, q, k, v, scale = _run_masked(
-        "prefill_d128_f16_sm100.py",
-        128,
-        128,
+        kmod,
+        d_qk,
+        d_v,
         splits,
         B=B,
         H=H,

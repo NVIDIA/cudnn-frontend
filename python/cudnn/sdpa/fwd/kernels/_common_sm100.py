@@ -702,20 +702,27 @@ def make_sdpa_helpers(
         return scalar_seqlen_kv
 
     @cute.jit
-    def _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, scalar_seqlen_q, n_batch):
-        """Per-sequence Q length for the bottom-right causal diagonal.
+    def _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, scalar_seqlen_q, n_batch, seq_q_lens_tensor=None):
+        """Per-batch Q length for the bottom-right causal diagonal.
 
-        THD anchors the BR diagonal at the per-sequence corner
-        (seq_len_q[b], seq_len_kv[b]): the actual Q length is the cu_seqlen_q
-        difference from the packed [kv_lens | cu_q | cu_kv] metadata buffer
-        (same layout _thd_decode / _thd_tma_offsets read). Dense graphs (and
-        every non-BR mask, where seqlen_q only feeds the unused diagonal)
-        keep the scalar S_q, so this folds out unless THD_VARLEN and
-        CAUSAL_BOTTOM_RIGHT are both set."""
+        Bottom-right anchors the diagonal at the per-batch corner
+        (seq_len_q[b], seq_len_kv[b]).  THD reads the actual Q length as the
+        cu_seqlen_q difference from the packed [kv_lens | cu_q | cu_kv] metadata
+        buffer (same layout _thd_decode / _thd_tma_offsets read); dense padded
+        graphs carrying per-batch Q lengths read the SEPARATE (B,)-int32
+        ``seq_q_lens_tensor`` (cuDNN SEQLEN_Q style), clamped to [0, S_q].
+        KV-only padding (and every non-BR mask, where seqlen_q only feeds the
+        unused diagonal) keeps the scalar S_q, so both reads fold out unless
+        CAUSAL_BOTTOM_RIGHT is set together with THD_VARLEN or
+        SEQ_Q_LENS_PRESENT (mutually exclusive by _validate_params).
+        """
         if cutlass.const_expr(int(getattr(CFG, "THD_VARLEN", 0)) == 1 and int(CFG.BOTTOM_RIGHT) == 1):
             cu = cutlass.make_array_view(seq_kv_lens_tensor)
             q0 = n_batch
             return cutlass.Int32(cu[q0 + batch_idx + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + batch_idx])
+        if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1 and int(CFG.BOTTOM_RIGHT) == 1):
+            arr = cutlass.make_array_view(seq_q_lens_tensor)
+            return cute.math.max(cutlass.Int32(0), cute.math.min(cutlass.Int32(arr[batch_idx]), scalar_seqlen_q))
         return scalar_seqlen_q
 
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))

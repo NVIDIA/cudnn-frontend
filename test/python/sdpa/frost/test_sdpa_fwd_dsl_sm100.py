@@ -107,12 +107,16 @@ _DTYPE_IDS = ["fp16", "bf16"]
 _THD_SENTINEL = 2048.0
 
 
-def _ref_sdpa_full(q, k, v, *, scale, is_causal=False, bottom_right=False, band_right=0, swa_window=None, seq_kv_lens=None, sinks=None, return_stats=False):
+def _ref_sdpa_full(
+    q, k, v, *, scale, is_causal=False, bottom_right=False, band_right=0, swa_window=None, seq_q_lens=None, seq_kv_lens=None, sinks=None, return_stats=False
+):
     """fp32 reference matching the SM100 DSL kernel's mask + sink semantics.
-    q/k/v are BHSD; GQA (h_q > h_kv) is handled by expanding K/V. With
-    ``return_stats`` also returns the (B, H_q, S_q) LSE — logsumexp over the
-    masked scores (the sink joins as one extra column; fully-masked rows are
-    -inf without one)."""
+    q/k/v are BHSD; GQA (h_q > h_kv) is handled by expanding K/V. Bottom-right
+    anchors the diagonal at the per-batch (seq_len_q[b], seq_len_kv[b]) corner
+    — the global (S_q, S_kv) when no lengths are given. With ``return_stats``
+    also returns the (B, H_q, S_q) LSE — logsumexp over the masked scores
+    (the sink joins as one extra column; fully-masked rows are -inf without
+    one; rows at/past seq_len_q[b] are -inf even with one)."""
     b, h_q, s_q, _ = q.shape
     _, h_kv, s_kv, _ = v.shape
     dev = q.device
@@ -121,18 +125,17 @@ def _ref_sdpa_full(q, k, v, *, scale, is_causal=False, bottom_right=False, band_
     v_ref = v.repeat_interleave(g, dim=1).float()
     scores = torch.matmul(q.float(), k_ref.transpose(-1, -2)) * scale
 
+    q_lens = seq_q_lens.flatten().to(device=dev, dtype=torch.int64) if seq_q_lens is not None else torch.full((b,), s_q, dtype=torch.int64, device=dev)
+    kv_lens = seq_kv_lens.flatten().to(device=dev, dtype=torch.int64) if seq_kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=dev)
     i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
     j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-    masked = torch.zeros(b, 1, s_q, s_kv, dtype=torch.bool, device=dev)
+    diag = i + (kv_lens - q_lens).view(b, 1, 1, 1) if bottom_right else i
+    dead_q = i >= q_lens.view(b, 1, 1, 1)
+    masked = dead_q | (j >= kv_lens.view(b, 1, 1, 1))
     if is_causal:
-        lim = (i + (s_kv - s_q) if bottom_right else i) + band_right
-        masked = masked | (j > lim)
+        masked = masked | (j > diag + band_right)
     if swa_window is not None:
-        swa_base = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j < swa_base - swa_window)
-    if seq_kv_lens is not None:
-        lens = seq_kv_lens.view(b, 1, 1, 1).to(dev)
-        masked = masked | (j >= lens)
+        masked = masked | (j < diag - swa_window)
     scores = scores.masked_fill(masked, float("-inf"))
 
     if sinks is not None:
@@ -146,6 +149,8 @@ def _ref_sdpa_full(q, k, v, *, scale, is_causal=False, bottom_right=False, band_
     if not return_stats:
         return o.to(q.dtype)
     lse = torch.logsumexp(full_scores, dim=-1)  # fully-masked rows -> -inf (sink-less)
+    # Rows at/past seq_len_q[b] trim to -inf even with a sink.
+    lse = lse.masked_fill(dead_q.squeeze(-1), float("-inf"))
     return o.to(q.dtype), lse
 
 
@@ -164,7 +169,7 @@ def _bhsd(b, h, s, d, dtype, device="cuda"):
     return torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
 
 
-def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, sink=None):
+def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q=None, sink=None):
     """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
     import cudnn
 
@@ -183,9 +188,10 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
         kw["seq_len_kv"] = slk
         kw["use_padding_mask"] = True
         vp[slk] = seq_len_kv
-        # padding_mask requires a seq_len_q companion; the kernel trims only KV, so
-        # Q is full and seq_len_q is accepted but unused.
-        seq_len_q = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
+        # padding_mask requires a seq_len_q companion; when the caller passes
+        # none, synthesize full lengths (KV-only trim, every Q row live).
+        if seq_len_q is None:
+            seq_len_q = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
         slq = g.tensor_like(seq_len_q)
         kw["seq_len_q"] = slq
         vp[slq] = seq_len_q
@@ -354,6 +360,94 @@ def test_dsl_sm100_padded(dtype, d):
     o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(), seq_len_kv=seq_len_kv)
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, seq_kv_lens=seq_len_kv.flatten())
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_graph_api_padded_bottom_right_gqa():
+    """Dense padded graph carrying SHORT per-batch seq_len_q + bottom-right
+    causal + SWA + GQA, served end to end through the graph probe (the
+    conjunction the retired bottom_right_padded_seq_q capability used to
+    decline while the kernels anchored the BR diagonal at the global S_q)."""
+    _require_dsl()
+    d = 128
+    b, h_q, h_kv, s_q, s_kv, W = 2, 8, 2, 128, 256, 47
+    scale = 1.0 / math.sqrt(d)
+    dtype = torch.float16
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    seq_len_q = torch.tensor([93, 51], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    seq_len_kv = torch.tensor([137, 79], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, sliding_window_length=W + 1),
+        seq_len_kv=seq_len_kv,
+        seq_len_q=seq_len_q,
+    )
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, swa_window=W, seq_q_lens=seq_len_q, seq_kv_lens=seq_len_kv)
+    rows = torch.arange(s_q, device="cuda").view(1, 1, s_q, 1)
+    dead = rows >= seq_len_q.view(b, 1, 1, 1)
+    assert o[dead.expand_as(o)].abs().max().item() == 0.0, "trimmed Q rows are not zero"
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama_d128", "mla_d192_d128", "qwen_d256", "dsv4_d512"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_bottom_right_padded_seq_q(d_qk, d_v):
+    """Dense bottom-right causal with per-batch seq_len_q: the diagonal (and
+    the SWA lower bound riding it) must anchor at the per-batch
+    (seq_len_q[b], seq_len_kv[b]) corner, not the global S_q. GQA + LSE;
+    batches one full-length / one trimming mid-tile / one zero-length, S_q
+    spanning several CGA tiles so both the dead-tile collapse and a mid-tile
+    diagonal are hit. Keep seq_len_kv[b] >= seq_len_q[b] — the suite-wide BR
+    convention (no sequence starts with rows that see no keys)."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dtype = torch.float16
+    b, h_q, h_kv, W = 3, 8, 4, 200
+    s_q = s_kv = 1024
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s_q, d_qk, dtype)
+    k = _bhsd(b, h_kv, s_kv, d_qk, dtype)
+    v = _bhsd(b, h_kv, s_kv, d_v, dtype)
+    o = torch.full((b, s_q, h_q, d_v), _THD_SENTINEL, device="cuda", dtype=dtype).transpose(1, 2)
+    lse = torch.full((b, h_q, s_q), _THD_SENTINEL, dtype=torch.float32, device="cuda")
+    seq_q_lens = torch.tensor([1024, 517, 0], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([1024, 800, 640], dtype=torch.int32, device="cuda")
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=W,
+        scale_softmax=scale,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+    )
+    assert api.check_support()
+    api.compile()
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens)
+    torch.cuda.synchronize()
+
+    o_ref, lse_ref = _ref_sdpa_full(
+        q, k, v, scale=scale, is_causal=True, bottom_right=True, swa_window=W, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens, return_stats=True
+    )
+    rows = torch.arange(s_q, device="cuda").view(1, 1, s_q, 1)
+    dead = (rows >= seq_q_lens.view(b, 1, 1, 1)).expand_as(o)
+    assert o[dead].abs().max().item() == 0.0, "trimmed Q rows are not zero"
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
