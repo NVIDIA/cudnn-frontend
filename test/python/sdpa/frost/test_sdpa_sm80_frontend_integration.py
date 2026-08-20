@@ -219,7 +219,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     bufs = {n: torch.randn(dims, dtype=torch.float16, device="cuda") for n in ("q", "k", "v", "do")}
 
     # LSE from a matching fwd run (wrapper path; layout-independent).
-    from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
 
     def phys(t):
         return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)

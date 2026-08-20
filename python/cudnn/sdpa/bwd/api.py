@@ -512,7 +512,9 @@ def sdpa_bwd_wrapper_sm80(
     """SM80 (A100) SDPA backward.
 
     Returns ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...
-    [, dbias_tensor=...])`` (BHSD grads; dBias head-major [., H, SQ, SKV]).
+    [, dbias_tensor=...][, dsink_tensor=...])`` — BHSD grads; dBias
+    head-major [., H, SQ, SKV] when ``bias_tensor`` is given; dSink (H,)
+    fp32 when ``sinks`` is given (stable order: dq, dk, dv, dbias, dsink).
     ALiBi and block_mask are not supported (use the graph API, which routes
     them to the cuDNN backend); bias/dBias remain fully served.
     """

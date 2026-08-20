@@ -586,7 +586,7 @@ def _sm80_spec() -> EngineSpec:
             decode=False,
             # The kernels implement the dense padded-Q trim natively
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
-            # rely on the zero-initialized output (O := 0 / LSE := 0).
+            # are written explicitly by the kernel (O := 0, LSE := -inf).
             dense_seq_q_trim=True,
             lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),

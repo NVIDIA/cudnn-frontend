@@ -2972,10 +2972,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
                 desc.ndim != 4,
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
+            )
+            _shape, _stride = tuple(desc.shape), tuple(desc.stride)
+            self._value_error_if(
+                not dense_layout_ok(_shape, _stride),
+                f"{desc.name} must have the head dim innermost-contiguous (stride 1) and "
+                f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
+                f"strides allowed); got stride {_stride} shape {_shape}",
             )
 
         b, h_qo, s_qo, d_qk = self.q_desc.shape
@@ -3217,10 +3226,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 swa_window=int(self.swa_window_runtime),
                 right_bound=int(self.right_bound_runtime),
                 causal_bottom_right=self.causal_bottom_right,
-                seq_kv_lens=seq_kv_lens.reshape(-1) if seq_kv_lens is not None else None,
-                seq_len_q=seq_q_lens.reshape(-1) if seq_q_lens is not None else None,
+                seq_kv_lens=self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None,
+                seq_len_q=self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None,
                 bias=bias_tensor,
-                sinks=sinks.reshape(-1) if sinks is not None else None,
+                sinks=self._checked_sinks_1d(sinks) if sinks is not None else None,
                 sched=self.sched_token,
                 sched_l2_mib=self.sched_l2_mib,
                 rope_freqs=rope_freqs,
@@ -3344,6 +3353,10 @@ def sdpa_fwd_wrapper_sm80(
     if cum_seqlen_q_tensor is not None:
         if max_s_q is None:
             raise ValueError("THD path requires max_s_q (host int) for the grid")
+        if causal_bottom_right and not (is_causal or window_size[0] >= 0):
+            # Same anchor rule check_support enforces on the dense path: a
+            # bare bottom-right alignment has nothing to align.
+            raise ValueError("SM80 SDPA: causal_bottom_right requires is_causal=True and/or a left sliding-window (window_size_left >= 0).")
         # Reject dense-only features up front: _sm80_thd_forward does not plumb
         # them, and silently computing without a requested feature is worse
         # than an error.
