@@ -33,9 +33,21 @@ class Device:
         return self.type if self.index is None else f"{self.type}:{self.index}"
 
 
+_torch_tensor_cls: Any = None
+
+
 def is_torch_tensor(tensor: Any) -> bool:
-    torch = sys.modules.get("torch")
-    return torch is not None and isinstance(tensor, torch.Tensor)
+    # Called ~40x per grouped-GEMM launch (once per operand per metadata read), so the
+    # sys.modules probe and the .Tensor attribute lookup are worth caching. torch cannot
+    # be un-imported, so the class is stable once resolved; until then this re-probes.
+    global _torch_tensor_cls
+    cls = _torch_tensor_cls
+    if cls is None:
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return False
+        cls = _torch_tensor_cls = torch.Tensor
+    return isinstance(tensor, cls)
 
 
 def is_jax_array(tensor: Any) -> bool:
