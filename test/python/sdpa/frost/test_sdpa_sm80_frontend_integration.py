@@ -304,3 +304,58 @@ def test_bwd_engine_bhsd_contiguous_layout():
     torch.testing.assert_close(dq_buf.float(), q_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dk_buf.float(), k_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dv_buf.float(), v_ref.grad, rtol=3e-2, atol=3e-2)
+
+
+@_SM80
+def test_engine_execute_does_not_allocate():
+    """Issue #514: after the first (JIT + cache-warming) execute, re-executing
+    either SM80 engine must not touch the CUDA caching allocator — every
+    per-execute buffer is carved from the caller's workspace.  Asserted on the
+    allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
+    clone/contiguous on the execute path would advance."""
+    # Forward graph (with stats, so the LSE staging path runs too).
+    g, q, k, v, o, stats = _build_fwd_graph()
+    _native_then_pin(g, _FWD)
+    assert g.get_workspace_size() > 0, "the SM80 fwd executor must report its carved scratch"
+    torch.manual_seed(0)
+    q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
+    o_buf = torch.empty_like(q_buf)
+    stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
+    ws = _ws(g)
+    vp = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}
+
+    # Backward graph on the same geometry.
+    gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = _bshd_stride(B, H, S, D)
+    qb = gb.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    kb = gb.tensor(name="k", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    vb = gb.tensor(name="v", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    ob = gb.tensor(name="o", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT)
+    dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
+    for t in (dq, dk, dv):
+        t.set_output(True).set_data_type(_HALF)
+    _native_then_pin(gb, _BWD)
+    assert gb.get_workspace_size() > 0, "the SM80 bwd executor must report its carved scratch"
+    do_buf = _buf()
+    dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
+    wsb = _ws(gb)
+    vpb = {qb: q_buf, kb: k_buf, vb: v_buf, ob: o_buf, dob: do_buf, statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf}
+
+    # Warm run: kernel JIT, dummy/ALiBi caches, cublas handles, everything.
+    g.execute(vp, ws)
+    gb.execute(vpb, wsb)
+    torch.cuda.synchronize()
+
+    ref_o, ref_dq = o_buf.clone(), dq_buf.clone()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        g.execute(vp, ws)
+        gb.execute(vpb, wsb)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert after == before, f"execute allocated {after - before} times; the SM80 engine paths must carve from the workspace only"
+    # And the carved re-executes still compute the same thing.
+    torch.testing.assert_close(o_buf, ref_o, rtol=0, atol=0)
+    torch.testing.assert_close(dq_buf, ref_dq, rtol=0, atol=0)
