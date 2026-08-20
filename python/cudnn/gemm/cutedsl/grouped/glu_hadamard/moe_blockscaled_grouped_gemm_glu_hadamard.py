@@ -565,7 +565,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
         ``situ_beta1`` and ``situ_beta2`` configure SiTU-GLU:
 
-            out = beta1 * tanh(gate / beta1) * sigmoid(gate)
+            out = prob * beta1 * tanh(gate / beta1) * sigmoid(gate)
                   * beta2 * tanh(up / beta2)
 
         They are ignored unless ``act_func == "situglu"``.

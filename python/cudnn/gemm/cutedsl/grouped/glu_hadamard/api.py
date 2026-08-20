@@ -573,8 +573,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         post_rht_amax_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        situ_beta1: float = 4.0,
-        situ_beta2: float = 25.0,
+        situ_beta1: Optional[float] = None,
+        situ_beta2: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         import torch
@@ -582,10 +582,10 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel has not been compiled")
-        if a_tensor.shape[0] == 0:
-            return
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
+        if situ_beta1 is None:
+            situ_beta1 = self.situ_beta1
+        if situ_beta2 is None:
+            situ_beta2 = self.situ_beta2
         if self.act_func == "situglu":
             self._value_error_if(
                 not math.isfinite(situ_beta1) or situ_beta1 <= 0.0,
@@ -599,6 +599,10 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 float(situ_beta1) != self.situ_beta1,
                 "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
+        if a_tensor.shape[0] == 0:
+            return
+        if current_stream is None:
+            current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
         if hadamard_tensor is None:
             hadamard_tensor = self.hadamard_tensor
         else:
@@ -699,6 +703,11 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         c_dtype = torch.bfloat16
     if d_dtype is None:
         d_dtype = torch.bfloat16
+    if act_func == "situglu":
+        if not math.isfinite(situ_beta1) or situ_beta1 <= 0.0:
+            raise ValueError(f"situ_beta1 must be finite and positive, got {situ_beta1}")
+        if not math.isfinite(situ_beta2) or situ_beta2 <= 0.0:
+            raise ValueError(f"situ_beta2 must be finite and positive, got {situ_beta2}")
 
     valid_m = a_tensor.shape[0]
     is_dense = b_tensor is not None
