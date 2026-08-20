@@ -252,7 +252,10 @@ def _kernel(
 
     acc_empty_count = num_epilogue_warps * 2
     cta_group = 2
-    ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_count = cluster_size // cta_group
+    else:
+        ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
     if warp_idx == 0:
         if cutlass.const_expr(use_acc_overlap):
             if elect_one:
@@ -424,7 +427,39 @@ def _kernel(
                     sSFA_stage = smem_sfa_list[_ai].subview(sfa_smem_bytes * stage)
                     tma_sfa_desc = tma_sfa_descs[_ai]
                     sfa_m_block = coord_m_per_cta // 128
-                    if cutlass.const_expr(multicast_a):
+                    if cutlass.const_expr(a_mcast_slices > 1):
+                        _a_rows = cta_tile_mnk[0] // a_mcast_slices
+                        if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+                            # Preferred-only launch: the slice count IS the group size,
+                            # so every CTA loads exactly its own slice.
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    sA_stage.subview(n_rank * _a_rows * ab_packed_per_row),
+                                    tma_a_desc.get_ptr(),
+                                    (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_l_a),
+                                    ab_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_a,
+                                    group=nvvm.CTAGroup.CTA_2,
+                                )
+                        else:
+                            # Mixed CGA: a fallback cluster has fewer CTAs than the
+                            # preferred one the slice count was baked from, so each
+                            # of them covers that many more slices.
+                            _a_per_cta = a_mcast_slices // cluster_n
+                            for _asl in cutlass.range(_a_per_cta):
+                                _a_idx = n_rank * _a_per_cta + _asl
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_a_idx * _a_rows * ab_packed_per_row),
+                                        tma_a_desc.get_ptr(),
+                                        (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_l_a),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=nvvm.CTAGroup.CTA_2,
+                                    )
+                    elif cutlass.const_expr(multicast_a):
                         if n_rank == 0:
                             if cutlass.const_expr(a_is_m_major):
                                 for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
@@ -486,7 +521,39 @@ def _kernel(
                     tma_b_desc = tma_b_descs[_bj]
                     sSFB_stage = smem_sfb_list[_bj].subview(sfb_smem_bytes * stage)
                     tma_sfb_desc = tma_sfb_descs[_bj]
-                    if cutlass.const_expr(multicast_b):
+                    if cutlass.const_expr(b_mcast_slices > 1):
+                        _b_rows = cta_tile_mnk[1] // b_mcast_slices
+                        if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+                            # Preferred-only launch: the slice count IS the group size,
+                            # so every CTA loads exactly its own slice.
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    sB_stage.subview(pair_m_idx * _b_rows * ab_packed_per_row),
+                                    tma_b_desc.get_ptr(),
+                                    (coord_k, coord_n_per_cta + pair_m_idx * _b_rows, tile_l_b),
+                                    ab_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_b,
+                                    group=nvvm.CTAGroup.CTA_2,
+                                )
+                        else:
+                            # Mixed CGA: a fallback cluster has fewer CTAs than the
+                            # preferred one the slice count was baked from, so each
+                            # of them covers that many more slices.
+                            _b_per_cta = b_mcast_slices // (cluster_m // cta_group)
+                            for _bsl in cutlass.range(_b_per_cta):
+                                _b_idx = pair_m_idx * _b_per_cta + _bsl
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sB_stage.subview(_b_idx * _b_rows * ab_packed_per_row),
+                                        tma_b_desc.get_ptr(),
+                                        (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_l_b),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_b,
+                                        group=nvvm.CTAGroup.CTA_2,
+                                    )
+                    elif cutlass.const_expr(multicast_b):
                         if pair_m_idx == 0:
                             if cutlass.const_expr(b_is_n_major):
                                 for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
@@ -570,7 +637,10 @@ def _kernel(
     a_part = a_arrive_pattern << m_rank
     a_part = a_part | (a_part << 1)
     b_part = b_arrive_pattern << (n_rank * cluster_m)
-    ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+    else:
+        ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         _tcgen05_alloc(
@@ -1114,7 +1184,7 @@ def _host(
                         a_stride_m * ab_dtype.width // 128,
                         a_stride_l * ab_dtype.width // 128,
                     ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
                     swizzle=ab_tma_swizzle,
                     tma_format=ab_tma_format,
                 )
@@ -1168,7 +1238,7 @@ def _host(
                         b_stride_n * ab_dtype.width // 128,
                         b_stride_l * ab_dtype.width // 128,
                     ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1], 1],
+                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
                     swizzle=ab_tma_swizzle,
                     tma_format=ab_tma_format,
                 )

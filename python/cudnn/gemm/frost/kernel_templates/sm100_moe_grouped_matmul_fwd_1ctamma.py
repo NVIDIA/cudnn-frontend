@@ -152,7 +152,10 @@ def _kernel(
 
     a_part_arrive = cutlass.Int16(a_pattern) << m_rank
     b_part_arrive = cutlass.Int16(b_pattern) << (n_rank * cluster_m)
-    ab_empty_arrive_mask = a_part_arrive | b_part_arrive
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+    else:
+        ab_empty_arrive_mask = a_part_arrive | b_part_arrive
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
@@ -202,7 +205,10 @@ def _kernel(
         for _ in range(num_a_operands)
     ]
 
-    ab_empty_count = cluster_m + cluster_n - 1
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_count = cluster_size
+    else:
+        ab_empty_count = cluster_m + cluster_n - 1
     sched_empty_count = 1 + 1 + num_epilogue_warps
     if warp_idx == 0:
         for i in range(ab_stages):

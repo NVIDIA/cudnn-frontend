@@ -180,7 +180,10 @@ def _kernel(
 
     a_part_arrive = cutlass.Int16(a_pattern) << m_rank
     b_part_arrive = cutlass.Int16(b_pattern) << (n_rank * cluster_m)
-    ab_empty_arrive_mask = a_part_arrive | b_part_arrive
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+    else:
+        ab_empty_arrive_mask = a_part_arrive | b_part_arrive
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
@@ -236,7 +239,10 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
-    ab_empty_count = cluster_m + cluster_n - 1
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_count = cluster_size
+    else:
+        ab_empty_count = cluster_m + cluster_n - 1
     num_consumer_warps_per_cta = 7 + num_mainloop_warps
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:

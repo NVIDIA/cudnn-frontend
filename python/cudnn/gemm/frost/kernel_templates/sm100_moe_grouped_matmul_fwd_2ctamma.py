@@ -212,7 +212,10 @@ def _kernel(
 
     acc_empty_count = num_epilogue_warps * 2
     cta_group = 2
-    ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_count = cluster_size // cta_group
+    else:
+        ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
     num_consumer_warps_per_cta = 1 + 1 + num_epilogue_warps
     sched_empty_count = num_consumer_warps_per_cta
     if warp_idx == 0:
@@ -545,7 +548,10 @@ def _kernel(
     a_part = a_arrive_pattern << m_rank
     a_part = a_part | (a_part << 1)
     b_part = b_arrive_pattern << (n_rank * cluster_m)
-    ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
+    if cutlass.const_expr(ab_empty_full_mask):
+        ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+    else:
+        ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         _tcgen05_alloc(
