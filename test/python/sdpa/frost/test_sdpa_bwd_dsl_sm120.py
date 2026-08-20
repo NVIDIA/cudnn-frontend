@@ -171,6 +171,7 @@ def _run_bwd_graph(
     q_tile: int | None = None,
     kv_tile: int | None = None,
     grad_layout: "str | tuple[str, str, str]" = "bshd",
+    grads: "tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None" = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
     sink_gpu: torch.Tensor | None = None,
@@ -187,9 +188,12 @@ def _run_bwd_graph(
     _, h_kv, _, _ = k_gpu.shape
     head_dim_v = v_gpu.shape[3]
     gl = (grad_layout,) * 3 if isinstance(grad_layout, str) else grad_layout
-    dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True, layout=gl[0])
-    dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True, layout=gl[1])
-    dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim_v, dtype, empty=True, layout=gl[2])
+    if grads is not None:
+        dq_gpu, dk_gpu, dv_gpu = grads
+    else:
+        dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True, layout=gl[0])
+        dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True, layout=gl[1])
+        dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim_v, dtype, empty=True, layout=gl[2])
 
     graph = cudnn.pygraph(
         io_data_type=io_dtype,
@@ -885,6 +889,37 @@ def test_sdpa_bwd_dsl_sm120_native_strided_io_mixed_ports():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=8)
+def test_sdpa_bwd_dsl_sm120_envelope_pad_compact_strides():
+    """D=120 over rows of exactly 128, the padded compute width: the gap
+    columns must never be read (NaN poison) nor written (sentinel)."""
+
+    _require_dsl()
+    b, h, s, d = 2, 4, 128, 120
+    scale = 1.0 / math.sqrt(d)
+    dtype = torch.float16
+    q = _bhsd(b, h, s, d, dtype)
+    k = _bhsd(b, h, s, d, dtype)
+    v = _bhsd(b, h, s, d, dtype)
+    do_base = torch.full((b, s, h, d + 8), float("nan"), dtype=dtype, device="cuda")
+    do = do_base.transpose(1, 2)[..., :d]
+    do.copy_(torch.randn(b, h, s, d, dtype=dtype, device="cuda"))
+    o_ref, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, is_causal=True)
+    o_base = torch.full_like(do_base, float("nan"))
+    o = o_base.transpose(1, 2)[..., :d]
+    o.copy_(o_ref)
+    grad_bases = [torch.full((b, s, h, d + 8), 7.0, dtype=dtype, device="cuda") for _ in range(3)]
+    grads = tuple(base.transpose(1, 2)[..., :d] for base in grad_bases)
+    dq, dk, dv, _, _ = _run_bwd_graph(q, k, v, o, do, stats, scale=scale, is_causal=True, grads=grads)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(dq.float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(dk.float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(dv.float(), dv_ref.float(), **tol)
+    for base in grad_bases:
+        assert (base[..., d:] == 7.0).all(), "a writer touched the declared gap columns"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
 def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
     """Non-16-byte-multiple strides decline at build and fall through to the
     backend (Rule 2: never a copy)."""
@@ -1194,10 +1229,10 @@ def test_sdpa_bwd_dsl_sm120_mla_192_128_tails():
 @torch_fork_set_rng(seed=53)
 def test_sdpa_bwd_dsl_sm120_rect_head_dims_graph(head_dim: int, head_dim_v: int, is_causal: bool):
     """Rectangular D_QK > D_V through the graph path: native 128/64, plus
-    enveloped variants. 96/64 and 96/40 compute on the rectangular 128/64
-    kernel sizes (the VO side raises to 64 so both stay multiples of 64);
-    120/72 pads both sides into the SQUARE 128/128 kernel — user-rectangular
-    but kernel-square, covering that envelope combination too."""
+    enveloped variants. 96/64 computes on the rectangular 128/64 kernel
+    sizes; 96/8 lands on 128/32 (the page drops to 32); 120/72 pads both
+    sides into the SQUARE 128/128 kernel — user-rectangular but
+    kernel-square, covering that envelope combination too."""
 
     _run_case(head_dim=head_dim, head_dim_v=head_dim_v, is_causal=is_causal)
 

@@ -1316,7 +1316,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 v_row_stride,
                 d_v,
             )
-            if cutlass.const_expr(d_qk == d_v and not dkv_strided):
+            if cutlass.const_expr(d_qk == d_v and not dkv_strided and dk_ws.shape[3] == d_qk and dv_ws.shape[3] == d_v):
                 chunks_per_row = d_qk // _COPY_ELEMS
                 total = N * chunks_per_row
                 # workspace's head-dim base offset
@@ -1330,7 +1330,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dkws_ptr + w_off)
                         copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dvws_ptr + w_off)
             else:
-                # GQA or dkv_strided
+                # d_qk != d_v, strided, or enveloped
                 k_chunks_per_row = d_qk // _COPY_ELEMS
                 base_k = batch * dk_batch_stride + kv_base * dk_seq_stride + q_head * dk_head_stride
                 for i in cutlass.range_constexpr(N * k_chunks_per_row // 256):
@@ -1449,7 +1449,7 @@ def _dot_do_o_kernel(
     o_batch_stride, o_seq_stride, o_head_stride, _ = o.stride
     do_batch_stride, do_seq_stride, do_head_stride, _ = do.stride
     compact = (SQ * H * d_v, H * d_v, d_v)
-    io_strided = (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+    io_strided = o.shape[3] != d_v or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
     if cutlass.const_expr(io_strided):
         o_base = batch * o_batch_stride + (m_block * M) * o_seq_stride + head * o_head_stride
         do_base = batch * do_batch_stride + (m_block * M) * do_seq_stride + head * do_head_stride
@@ -2057,6 +2057,8 @@ def compile(  # noqa: A001
     fake_dv = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v_orig), dv_strides)
     if lse_strides is not None:
         # f32 scalars -> 4 B alignment
+        # A strided stats view can start at any fp32 element; the compact
+        # branch keeps the historical allocation-backed 16-byte assumption.
         fake_lse = make_fake_tensor(cutlass.Float32, (b, qh, sq), tuple(lse_strides), assumed_align=4)
     else:
         fake_lse = _fake(cutlass.Float32, (b, qh, sq))

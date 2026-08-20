@@ -493,9 +493,11 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         import cutlass
 
         def _native_view(view: torch.Tensor, name: str) -> torch.Tensor:
+            """Rebind the buffer to the compiled strides: execute-time tensors
+            are raw storage laid out as declared at build."""
             self._value_error_if(
                 view.data_ptr() % 16 != 0,
-                f"{name} base address must be 16-byte aligned (TMA global-address requirment)",
+                f"{name} base address must be 16-byte aligned (TMA global-address requirement)",
             )
             strides = self._io_strides.get(name)
             if strides is None:
