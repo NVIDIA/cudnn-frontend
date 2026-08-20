@@ -45,6 +45,15 @@ _MEASURED_BEHIND: frozenset = frozenset()
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
 
+# --- KV split (see choose_split_kv) ---------------------------------------
+# Largest split considered; past this the reduction outgrows the parallelism.
+_SPLIT_KV_MAX = 16
+# A split thinner than this is prologue/epilogue dominated.
+_SPLIT_KV_MIN_TILES = 2
+# What a CTA-tile costs beyond its KV loop (Q load, prologue, epilogue), in
+# units of one KV tile. Empirical: re-measure if the per-tile fixed cost moves.
+_SPLIT_KV_CTA_COST = 21.0
+
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
@@ -87,6 +96,73 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     d_vp = -(-facts.d_v // granule) * granule
     fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(d_qp, d_vp, tile_m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
     return tile_m, (fits[0] if fits else min(caps.tile_ns))
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def choose_split_kv(
+    *,
+    q_tiles: int,
+    heads_q: int,
+    batch: int,
+    kv_tiles: int,
+    sm_count: int,
+    ctas_per_tile: int = 1,
+    max_split: int = _SPLIT_KV_MAX,
+) -> int:
+    """How many KV chunks to cut each Q tile into; 1 = do not split.
+
+    A prefill launch is ``q_tiles * heads_q * batch`` independent tiles, each
+    walking the whole KV loop.  When that product is below the SM count the chip
+    idles however long the loop is; splitting multiplies the tile count by ``s``
+    and divides each tile's KV work by it, then pays one reduction over the
+    partials.
+
+    A CTA holds its tile for the whole loop, so a launch costs whole WAVES.
+    Minimise, over powers of two:
+
+        waves(s) = ceil(base_ctas * s / sm_count)
+        cost(s)  = waves(s) * (ceil(kv_tiles / s) + CTA_COST)
+
+    CTA_COST is what a tile re-pays whatever its loop length, so it sits inside
+    the wave term -- once per CTA-tile, not once per split.
+
+    What falls out: an under-full launch splits until the wave is full; an
+    over-full one with a partial-wave tail splits FINER to smooth it, even past
+    the SM count; an exactly balanced one (base_ctas = k * sm_count) has no tail
+    and never splits.
+
+    Powers of two only, because ``split_kv`` is a TemplateParams field and so a
+    kernel-module cache key -- an unrestricted choice mints a compiled
+    specialization per shape.
+
+    Returns 1 when there is nothing to split or nothing beats not splitting.
+    Bounded by ``max_split``, by ``kv_tiles`` (more splits than tiles would
+    leave some provably empty) and by ``_SPLIT_KV_MIN_TILES``.
+    """
+    if min(q_tiles, heads_q, batch, kv_tiles, sm_count, ctas_per_tile) <= 0:
+        return 1
+    base_ctas = q_tiles * heads_q * batch * ctas_per_tile
+    if kv_tiles <= 1:
+        return 1
+
+    best_split = 1
+    best_cost = float(_ceil_div(base_ctas, sm_count) * (kv_tiles + _SPLIT_KV_CTA_COST))
+    split = 2
+    while split <= min(max_split, kv_tiles):
+        # Every split must stay thick enough to amortise its own prologue and
+        # epilogue. The chunking hands the remainder to the leading splits, so
+        # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
+        if kv_tiles // split < _SPLIT_KV_MIN_TILES:
+            break
+        waves = _ceil_div(base_ctas * split, sm_count)
+        cost = waves * (_ceil_div(kv_tiles, split) + _SPLIT_KV_CTA_COST)
+        if cost < best_cost:
+            best_split, best_cost = split, cost
+        split <<= 1
+    return best_split
 
 
 def _sole(values):

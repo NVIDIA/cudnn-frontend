@@ -29,6 +29,29 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
+from cudnn.sdpa.fwd.config_sm100 import make_cfg_d128, make_cfg_d192, make_cfg_d256, make_cfg_d512
+from cudnn.sdpa.fwd.heuristics import choose_split_kv
+from cudnn._device import device_info
+
+# Flavor (max D_QK, max D_V) -> its make_cfg, for the split decision. The config
+# backstop rejects what a flavor will not honor, which _decide_split_kv treats
+# as "no split", so this only has to be keyed the same way as
+# _SM100_KERNEL_FILES.
+_SM100_MAKE_CFG = {
+    (128, 128): make_cfg_d128,
+    (192, 128): make_cfg_d192,
+    (256, 256): make_cfg_d256,
+    (512, 512): make_cfg_d512,
+}
+
+
+def _split_combine_module():
+    """The KV-split reduction pass; imported lazily like the kernel templates."""
+    from cudnn.sdpa.fwd.kernels import split_combine_sm100
+
+    return split_combine_sm100
+
+
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -36,6 +59,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
     FP8_HEAD_TILE_GRANULE as _SM120_FP8_HEAD_TILE_GRANULE,
     TemplateParams as Sm120TemplateParams,
+    validate_params as _sm120_validate_params,
     smem_bytes as _sm120_smem_bytes,
 )
 
@@ -348,6 +372,7 @@ class SdpaFwdDsl(APIBase):
         # Per-tensor FP8 (sdpa_fp8) vs block-scale MXFP8 (sdpa_mxfp8); both use FP8 Q/K/V.
         self._pertensor = bool(pertensor_fp8)
         self._device_cc = None  # (major, minor); set in check_support
+        self._split_kv = None  # KV-split count; decided lazily, see split_kv
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch).
         self.sched_policy = SCHED_NATURAL if sched_policy is None else int(sched_policy)
@@ -931,26 +956,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self) -> None:
-        self._logger.debug("Entering compile")
-        self._ensure_support_checked()
-        # MXFP8 on cc10.3+ fuses the S_acc row-max into the LDTM (the fp8/f16 kernels
-        # don't read this flag). Auto-set from the device capability so an SM103 run
-        # picks the fused path with no user action.
-        mxfp8 = self._fp8 and not self._pertensor
-        fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
-        sched_policy = self.sched_policy
-        if sched_policy == SCHED_NATURAL and self.window_right is not None:
-            # Causal: balance the triangular load; pick the LPT variant by working set.
-            _, _, s_kv_sched, _ = self.k_desc.shape
-            _, _, _, d_qk_sched = self.q_desc.shape
-            _, _, _, d_v_sched = self.v_desc.shape
-            sched_policy = _causal_sched_policy(
-                s_kv=s_kv_sched,
-                d_qk=d_qk_sched,
-                d_v=d_v_sched,
-                elem_bytes=1 if self._fp8 else 2,
-            )
+    def _template_params(self, sched_policy, fused_ldtm_stat, split_kv: int = 1) -> Sm100TemplateParams:
         lpt_head_group = 1
         if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
             lpt_head_group = 8
@@ -970,7 +976,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
             # selects the equivalent masked-interior lowering.
             template_window_right = self.s_k_max
-        params = Sm100TemplateParams(
+        return Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
@@ -983,8 +989,83 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lpt_head_group=lpt_head_group,
             lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
+            split_kv=split_kv,
             fused_ldtm_stat=fused_ldtm_stat,
         )
+
+    def _sched_policy(self) -> int:
+        sched_policy = self.sched_policy
+        if sched_policy == SCHED_NATURAL and self.window_right is not None:
+            # Causal: balance the triangular load; pick the LPT variant by working set.
+            _, _, s_kv_sched, _ = self.k_desc.shape
+            _, _, _, d_qk_sched = self.q_desc.shape
+            _, _, _, d_v_sched = self.v_desc.shape
+            sched_policy = _causal_sched_policy(s_kv=s_kv_sched, d_qk=d_qk_sched, d_v=d_v_sched, elem_bytes=1 if self._fp8 else 2)
+        return sched_policy
+
+    @property
+    def split_kv(self) -> int:
+        """How many KV chunks this graph's kernel is cut into; 1 = no split.
+
+        Decided from the launch geometry and the device (see
+        ``heuristics.choose_split_kv``), cached because ``compile()`` and
+        ``scratch_workspace_bytes()`` must agree on it.
+        """
+        if self._split_kv is None:
+            self._split_kv = self._decide_split_kv()
+        return self._split_kv
+
+    def _decide_split_kv(self) -> int:
+        """1 unless this is a dense half-precision graph whose flavor threads
+        the knob, the config backstop accepts it, and the heuristic wants it."""
+        self._ensure_support_checked()
+        make_cfg = _SM100_MAKE_CFG.get(self.flavor)
+        if make_cfg is None or self.thd or self.has_sink:
+            return 1
+        # The combine reduces the partials in half precision, and reducing
+        # QUANTIZED partials would lose what the split is meant to be neutral
+        # about, so an FP8 graph splits only when it stores O as bf16/fp16.
+        if self._fp8 and _SM100_DTYPE_QKV_CODE[self.dtype_o] not in (DTYPE_BF16, DTYPE_FP16):
+            return 1
+        sched_policy = self._sched_policy()
+        try:
+            cfg, _ = make_cfg(self._template_params(sched_policy, False, 1))
+        except ValueError:
+            return 1
+        ctas_per_tile = int(getattr(cfg, "CTA_MMA", 1))
+        rows_per_tile = int(getattr(cfg, "TILES_Q", 1)) * int(cfg.TILE_M) * ctas_per_tile
+        dev = getattr(self.q_desc, "device", None)
+        ordinal = getattr(dev, "index", None)
+        try:
+            sm_count = device_info(torch.cuda.current_device() if ordinal is None else ordinal).sm_count
+        except (RuntimeError, ValueError):  # no driver / odd device
+            return 1
+        split = choose_split_kv(
+            q_tiles=-(-self.s_q_max // rows_per_tile),
+            heads_q=self.h_q,
+            batch=self.batch_size,
+            kv_tiles=-(-self.s_k_max // int(cfg.TILE_N)),
+            sm_count=sm_count,
+            ctas_per_tile=ctas_per_tile,
+        )
+        if split <= 1:
+            return 1
+        try:  # the backstop is the authority on what this flavor will accept
+            make_cfg(self._template_params(sched_policy, False, split))
+        except ValueError:
+            return 1
+        return split
+
+    def compile(self) -> None:
+        self._logger.debug("Entering compile")
+        self._ensure_support_checked()
+        # MXFP8 on cc10.3+ fuses the S_acc row-max into the LDTM (the fp8/f16 kernels
+        # don't read this flag). Auto-set from the device capability so an SM103 run
+        # picks the fused path with no user action.
+        mxfp8 = self._fp8 and not self._pertensor
+        fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        sched_policy = self._sched_policy()
+        params = self._template_params(sched_policy, fused_ldtm_stat, self.split_kv)
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -1006,7 +1087,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 kh=self.h_kv,
                 sq=self.s_q_max,
                 skv=self.s_k_max,
-                has_lse=self.lse_desc is not None,
+                # Under a split the per-chunk LSE is the weight the combine
+                # reduces with, so it is compiled in regardless.
+                has_lse=self.lse_desc is not None or self.split_kv > 1,
             )
         else:
             # ENVELOPE: hand the f16/bf16 kernel the ACTUAL head dims so its
@@ -1022,7 +1105,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 skv=self.s_k_max,
                 d_qk=self.head_dim_qk,
                 d_v=self.head_dim_v,
-                has_lse=self.lse_desc is not None,
+                # Under a split the per-chunk LSE is not optional: it is the
+                # weight the combine reduces with, so compile it in even when
+                # the caller asked for no Stats output.
+                has_lse=self.lse_desc is not None or self.split_kv > 1,
             )
         self._logger.debug("compile completed")
 
@@ -1050,11 +1136,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # sequence + 16 spare, the per-sequence O TMA descriptors the
             # builder kernel fills.
             return ws_align((3 * b + 2) * 4) + ws_align((b * 16 + 16) * 8) + (0 if self.has_sink else ws_align(qh * 4))
-        if self._fp8:
+        if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
+        if self.split_kv > 1:
+            # Split-major partials the combine reduces: O is split_kv x the
+            # output, and the per-chunk LSE exists even without a Stats output.
+            n_o = self.split_kv * b * self.s_q_max * qh * self.head_dim_v
+            n_lse = self.split_kv * b * qh * self.s_q_max
+            return ws_align(n_o * self._o_itemsize()) + ws_align(n_lse * 4)
         # Dense padded-Q lens bind directly as their own kernel parameter
         # (no combine buffer since the seq_len_q-as-parameter change) — no scratch.
         return 0
+
+    def _o_itemsize(self) -> int:
+        return 2  # f16 / bf16; the split path is half-precision only
+
+    def _combine_dtype_tag(self) -> str:
+        return "bf16" if _SM100_DTYPE_QKV_CODE[self.dtype_o] == DTYPE_BF16 else "f16"
 
     def execute(
         self,
@@ -1145,6 +1243,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 scale_o,
                 amax_o,
                 current_stream,
+                workspace,
             )
             return
 
@@ -1166,6 +1265,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sf_v,
                 amax_o,
                 current_stream,
+                workspace,
             )
             return
 
@@ -1212,24 +1312,115 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         import cutlass
 
-        self._compiled_kernel(
-            Q,
-            K,
-            V,
-            O_scratch if o_needs_copy_back else O_view,
-            lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max) if lse_tensor is not None else None,
-            sinks_t,
-            seq_kv_t,
-            o_desc_dummy,
-            (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
-            cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(0),
-            seq_q_t,
-            stream=current_stream,
-        )
+        O_target = O_scratch if o_needs_copy_back else O_view
+        lse_out = lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max) if lse_tensor is not None else None
+
+        if self.split_kv > 1:
+            # Two launches: the kernel writes per-chunk partials into scratch,
+            # then split_combine reduces them into the caller's O (and Stats).
+            o_part, lse_part = self._split_partials(workspace, O_target, device, current_stream)
+            self._compiled_kernel(
+                Q,
+                K,
+                V,
+                o_part,
+                lse_part,
+                sinks_t,
+                seq_kv_t,
+                o_desc_dummy,
+                (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(0),
+                seq_q_t,
+                stream=current_stream,
+            )
+            combine = _split_combine_module().compile(
+                b=self.batch_size,
+                h=self.h_q,
+                sq=self.s_q_max,
+                d_v=self.head_dim_v,
+                splits=self.split_kv,
+                dtype_o=self._combine_dtype_tag(),
+                has_lse=lse_out is not None,
+            )
+            combine(
+                o_part,
+                lse_part,
+                O_target,
+                lse_out,
+                None,  # amax_o: half-precision output, nothing to report
+                (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
+        else:
+            self._compiled_kernel(
+                Q,
+                K,
+                V,
+                O_target,
+                lse_out,
+                sinks_t,
+                seq_kv_t,
+                o_desc_dummy,
+                (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(0),
+                seq_q_t,
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
+
+    def _run_split_combine(self, o_part, lse_part, o_out, lse_out, amax_o, stream):
+        """Reduce the split-major partials into the caller's O (and Stats, and
+        the FP8 amax when there is one)."""
+        import cutlass
+
+        _split_combine_module().compile(
+            b=self.batch_size,
+            h=self.h_q,
+            sq=self.s_q_max,
+            d_v=self.head_dim_v,
+            splits=self.split_kv,
+            dtype_o=self._combine_dtype_tag(),
+            has_lse=lse_out is not None,
+            has_amax=amax_o is not None,
+        )(
+            o_part,
+            lse_part,
+            o_out,
+            lse_out,
+            amax_o,
+            (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+            cutlass.Int32(self.split_kv),
+            stream=stream,
+        )
+
+    def _split_partials(self, workspace, o_like, device, current_stream=None):
+        """The split-major (O, LSE) partial buffers, carved from the caller's
+        workspace when there is one and torch-allocated otherwise (standalone
+        use, matching what the rest of this adapter does).
+
+        The allocation happens ON the launch stream: the caching allocator tags
+        a block with the stream it was allocated on, and the kernels that write
+        and read these buffers run on ``current_stream``. Allocating on torch's
+        current stream instead would leave a later free/reuse unordered against
+        those launches."""
+        rows = self.split_kv * self.batch_size
+        o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
+        lse_shape = (rows, self.h_q, self.s_q_max)
+        if workspace is None:
+            with _torch_stream_context(current_stream, device):
+                return (
+                    torch.empty(o_shape, dtype=o_like.dtype, device=device),
+                    torch.empty(lse_shape, dtype=torch.float32, device=device),
+                )
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm100 (KV split)")
+        o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_like.dtype).view(o_shape)
+        lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
+        return o_part, lse_part
 
     def _thd_compile_kwargs(self) -> dict:
         """The THD compile key — PLAN-TIME-ONLY by contract (issue #552).
@@ -1510,6 +1701,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_v,
         amax_o,
         current_stream=None,
+        workspace=None,
     ):
         """MXFP8 execute (dense): FP8 Q/K/V + per-32-block E8M0 SF → half O.
 
@@ -1558,15 +1750,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        O_dst, lse_dst = O, lse
+        if self.split_kv > 1:
+            O_dst, lse_dst = self._split_partials(workspace, O, O.device, current_stream)
         self._compiled_kernel(
             Q,
             K,
             V,
-            O,
+            O_dst,
             sf_q_v,
             sf_k_v,
             sf_v_v,
-            lse,
+            lse_dst,
             amax_o_buf,
             sinks_t,
             seq_kv_t,
@@ -1574,6 +1769,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             cutlass.Float32(scale_softmax_log2),
             stream=current_stream,
         )
+        if self.split_kv > 1:
+            self._run_split_combine(O_dst, lse_dst, O, lse, amax_o_buf, current_stream)
         if o_needs_copy_back:
             O_view.copy_(O)
         self._logger.debug("execute (MXFP8) completed")
@@ -1595,6 +1792,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         scale_o,
         amax_o,
         current_stream=None,
+        workspace=None,
     ):
         """Per-tensor FP8 execute (dense): scalar descales fold into scale_softmax_log2
         (attn·descale_q·descale_k·log2 e) and o_scale_fused (descale_v·scale_o).
@@ -1650,12 +1848,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        O_dst, lse_dst = O, lse
+        if self.split_kv > 1:
+            O_dst, lse_dst = self._split_partials(workspace, O, O.device, current_stream)
         self._compiled_kernel(
             Q,
             K,
             V,
-            O,
-            lse,
+            O_dst,
+            lse_dst,
             sinks_t,
             seq_kv_t,
             (b, h_q, h_kv, sq, skv, 0),
@@ -1668,6 +1869,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf,
             stream=current_stream,
         )
+        if self.split_kv > 1:
+            # Under a split the epilogues stand down from the amax write (each
+            # sees only its own partial, which over-reports); the combine
+            # computes it over the recombined O instead.
+            self._run_split_combine(O_dst, lse_dst, O, lse, amax_o_buf, current_stream)
         if o_needs_copy_back:
             O_view.copy_(O)
         if amax_o is not None:
@@ -1900,6 +2106,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     def _initialize_implementation(self) -> None:
         self.q_tile = _SM120_Q_TILES[0] if self.tile_m is None else self.tile_m
+        self._split_kv = None  # KV-split count; decided lazily, see split_kv
         self.kv_tile = _SM120_KV_TILES[0] if self.tile_n is None else self.tile_n
         self.compute_capability: Optional[tuple[int, int]] = None
         self.head_dim_qk: Optional[int] = None
@@ -2113,6 +2320,92 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
+    def _sched_policy(self) -> int:
+        """The policy compile() will actually use: causal graphs trade NATURAL
+        for an LPT variant, and the split decision has to see the same value."""
+        sched_policy = self.sched_policy
+        if sched_policy == SCHED_NATURAL and self.window_right is not None:
+            _, _, s_kv_sched, _ = self.k_desc.shape
+            _, _, _, d_qk_sched = self.q_desc.shape
+            _, _, _, d_v_sched = self.v_desc.shape
+            sched_policy = _causal_sched_policy(s_kv=s_kv_sched, d_qk=d_qk_sched, d_v=d_v_sched, elem_bytes=1 if self._fp8 else 2)
+        return sched_policy
+
+    @property
+    def split_kv(self) -> int:
+        """How many KV chunks this graph's kernel is cut into; 1 = no split."""
+        if self._split_kv is None:
+            self._split_kv = self._decide_split_kv()
+        return self._split_kv
+
+    def _decide_split_kv(self) -> int:
+        """1 unless this is a dense half-precision graph the config accepts and
+        the heuristic wants split."""
+        self._ensure_support_checked()
+        if self.thd or self._fp8 or self.has_sink:
+            return 1
+        dev = getattr(self.q_desc, "device", None)
+        ordinal = getattr(dev, "index", None)
+        try:
+            sm_count = device_info(torch.cuda.current_device() if ordinal is None else ordinal).sm_count
+        except (RuntimeError, ValueError):  # no driver / odd device
+            return 1
+        split = choose_split_kv(
+            q_tiles=-(-self.s_q_max // self.q_tile),
+            heads_q=self.h_q,
+            batch=self.batch_size,
+            kv_tiles=-(-self.s_k_max // self.kv_tile),
+            sm_count=sm_count,
+            ctas_per_tile=1,  # SM120 runs one CTA per tile; no cluster
+        )
+        if split <= 1:
+            return 1
+        try:  # the backstop is the authority (it also bars LPT / LPT_L2)
+            _sm120_validate_params(
+                Sm120TemplateParams(
+                    dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
+                    dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
+                    # The EFFECTIVE policy, not self.sched_policy: compile()
+                    # swaps NATURAL for an LPT variant on a causal graph, and
+                    # the config bars a split under those. Validating the raw
+                    # value would accept a split compile() then rejects.
+                    sched_policy=self._sched_policy(),
+                    window_left=self.window_left,
+                    window_right=self.window_right,
+                    bottom_right=self.causal_bottom_right,
+                    seq_q_lens_present=self.seq_q_lens_present,
+                    seq_kv_lens_present=self.seq_kv_lens_present,
+                    has_sink=self.has_sink,
+                    thd_varlen=self.thd,
+                    q_tile=self.q_tile,
+                    kv_tile=self.kv_tile,
+                    split_kv=split,
+                )
+            )
+        except ValueError:
+            return 1
+        return split
+
+    def _split_partials(self, workspace, o_like, device, current_stream=None):
+        """Split-major (O, LSE) partials: carved from the caller's workspace
+        when there is one, torch-allocated otherwise.
+
+        Allocated ON the launch stream so the allocator tags the blocks with the
+        stream the kernels actually use (see the SM100 sibling)."""
+        rows = self.split_kv * self.batch_size
+        o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
+        lse_shape = (rows, self.h_q, self.s_q_max)
+        if workspace is None:
+            with _torch_stream_context(current_stream, device):
+                return (
+                    torch.empty(o_shape, dtype=o_like.dtype, device=device),
+                    torch.empty(lse_shape, dtype=torch.float32, device=device),
+                )
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm120 (KV split)")
+        o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_like.dtype).view(o_shape)
+        lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
+        return o_part, lse_part
+
     def compile(self) -> None:
         """Compile the shape-specialized SM120 FROST template."""
 
@@ -2121,18 +2414,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self._compiled_kernel is not None:
             return
 
-        # Causal: balance the triangular load; pick the LPT variant by working set.
-        sched_policy = self.sched_policy
-        if sched_policy == SCHED_NATURAL and self.window_right is not None:
-            _, _, s_kv_sched, _ = self.k_desc.shape
-            _, _, _, d_qk_sched = self.q_desc.shape
-            _, _, _, d_v_sched = self.v_desc.shape
-            sched_policy = _causal_sched_policy(
-                s_kv=s_kv_sched,
-                d_qk=d_qk_sched,
-                d_v=d_v_sched,
-                elem_bytes=1 if self._fp8 else 2,
-            )
+        sched_policy = self._sched_policy()
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
@@ -2146,6 +2428,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             thd_varlen=self.thd,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
+            split_kv=self.split_kv,
         )
         self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
         if self.thd:
@@ -2168,8 +2451,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
             # No sample_lse -> the LSE store is compiled out; execute() then
-            # binds no LSE buffer at all (no dummy, no allocation).
-            has_lse=self.lse_desc is not None,
+            # binds no LSE buffer at all (no dummy, no allocation). Under a
+            # split the per-chunk LSE is the weight the combine reduces with,
+            # so it is compiled in regardless.
+            has_lse=self.lse_desc is not None or self.split_kv > 1,
         )
         self._logger.debug("compile completed")
 
@@ -2290,12 +2575,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         v = self._to_bshd(v_tensor)
         o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
         o = o_scratch if o_needs_copy_back else o_view
+        o_dst, lse_dst = o, lse
+        if self.split_kv > 1:
+            # Two launches: the kernel writes per-chunk partials, then
+            # split_combine reduces them into the caller's O (and Stats).
+            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
         self._compiled_kernel(
             q,
             k,
             v,
-            o,
-            lse,
+            o_dst,
+            lse_dst,
             sinks_t,
             seq_q_lens,
             seq_kv_lens,
@@ -2306,6 +2596,25 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             None,
             current_stream,
         )
+        if self.split_kv > 1:
+            _split_combine_module().compile(
+                b=self.batch_size,
+                h=self.h_q,
+                sq=self.s_q_max,
+                d_v=self.head_dim_v,
+                splits=self.split_kv,
+                dtype_o="bf16" if o.dtype == torch.bfloat16 else "f16",
+                has_lse=lse is not None,
+            )(
+                o_dst,
+                lse_dst,
+                o,
+                lse,
+                None,  # amax_o: half-precision output, nothing to report
+                (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             o_view.copy_(o_scratch)
 
@@ -2708,6 +3017,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
             b = self.batch_size
             return ws_align((3 * b + 2) * 4)
+        if self.split_kv > 1:
+            # Split-major partials the combine reduces: O is split_kv x the
+            # output, and the per-chunk LSE exists even without a Stats output.
+            n_o = self.split_kv * self.batch_size * self.s_q_max * self.h_q * self.head_dim_v
+            n_lse = self.split_kv * self.batch_size * self.h_q * self.s_q_max
+            return ws_align(n_o * 2) + ws_align(n_lse * 4)  # half-precision O
         return 0
 
 

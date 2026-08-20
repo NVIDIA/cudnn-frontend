@@ -85,6 +85,7 @@ class SdpaFwdKnobs:
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
     cga: Optional[int] = None  # cluster size (CTAs cooperating per tile)
+    split_kv: Optional[int] = None  # KV-sequence split count (1 = no split)
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,15 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    # What a REQUESTED split_kv may be -- EMPTY everywhere, including the cells
+    # that do split. The adapters choose the split from the launch geometry and
+    # lower_dsl_prefill does not forward knobs.split_kv, so no request can be
+    # honored: not split_kv=8, and not split_kv=1 either, since "do not split"
+    # is exactly what the lowering would ignore. An empty domain makes any
+    # request ineligible, which is the honest encoding of that. Populate a row
+    # only together with the plumbing (a split_kv adapter argument seeding
+    # _split_kv, and knobs.split_kv forwarded in lower_dsl_prefill).
+    split_kvs: frozenset[int] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -264,6 +274,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.split_kv, capabilities.split_kvs, "split_kv"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
