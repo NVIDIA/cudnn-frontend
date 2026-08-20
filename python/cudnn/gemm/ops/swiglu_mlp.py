@@ -260,9 +260,10 @@ _FROST_DSWIGLU_CACHE = {}
 # default so the fusion saving is captured, and because that saving grows as the
 # workload gets pointwise-heavier (fp8 halves the GEMM and adds quant/scale
 # pointwise; MoE grouped GEMMs are smaller and more memory-bound). Falls back to
-# the pointwise path if FROST cannot serve a shape/arch/thread (e.g. no CUDA context
-# on an autograd worker thread).
+# the pointwise path if FROST explicitly declines a shape, architecture, layout,
+# or optional dependency.
 _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
+_FROST_DECLINE_ERRORS = (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
 def _frost_dswiglu(dout2, Wd, gate, up):
@@ -283,47 +284,91 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a host-
     overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
     it)."""
-    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
-    from cudnn.gemm.frost.tile_config import CATALOG
-
+    operands = (("dout", dout2), ("Wd", Wd), ("gate", gate), ("up", up))
+    if any(t.dim() != 2 for _, t in operands):
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires rank-2 dout/Wd/gate/up operands")
     M, H = dout2.shape
     interm = gate.shape[1]
-    key = (M, H, interm, dout2.dtype, dout2.device.index)
-    e = _FROST_DSWIGLU_CACHE.get(key)
-    if e is None:
-        tn = 256 if interm >= 256 else 128
-        cta_group = 2 if M > 128 else 1
-        cluster_m = 2 if cta_group == 2 else 1
-        cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, cluster_m, 1))
-        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
-        DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
-        # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
-        # arbitrary t/n operand layouts, so no transpose copy is needed.
-        WD = g.tensor(name="Wd", dim=[1, H, interm], stride=[H * interm, interm, 1])
-        G = g.tensor(name="gate_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
-        U = g.tensor(name="up_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
-        dh = g.matmul(A=DY, B=WD, name="dgrad")
-        g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
-        g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler="clc")
-        bd = compiled.binding
-        out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
-        aux_by = {a.get_name(): a for a in bd.aux}
-        e = (compiled, bd, out_by, aux_by)
-        _FROST_DSWIGLU_CACHE[key] = e
-    compiled, bd, out_by, aux_by = e
-    dgate = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
-    dup = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
-    compiled(
-        {
-            bd.a_operands[0]: dout2.unsqueeze(0),
-            bd.b_operands[0]: Wd.unsqueeze(0),  # natural [1,H,I], N-major — no transpose
-            out_by["dup"]: dup,
-            out_by["dgate"]: dgate,
-            aux_by["gate_pre"]: gate.unsqueeze(0),
-            aux_by["up_pre"]: up.unsqueeze(0),
-        }
-    )
+    if Wd.shape != (H, interm) or gate.shape != (M, interm) or up.shape != (M, interm):
+        raise NotImplementedError(
+            "cudnn.gemm.swiglu_mlp: FROST backward operand shapes must be "
+            f"dout[{M},{H}], Wd[{H},I], gate/up[{M},I]; got Wd{tuple(Wd.shape)}, gate{tuple(gate.shape)}, up{tuple(up.shape)}"
+        )
+    device = dout2.device
+    if device.type != "cuda" or any(t.device != device for _, t in operands):
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires all operands on one CUDA device")
+    if any(t.dtype != torch.bfloat16 for _, t in operands):
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires bfloat16 dout/Wd/gate/up operands")
+    bad_strides = [f"{name}{tuple(tensor.stride())}" for name, tensor in operands if tuple(tensor.stride()) != (tensor.shape[1], 1)]
+    if bad_strides:
+        # The graph below deliberately declares dense strides. Do not bind a view
+        # with different strides to that descriptor: square transposes preserve
+        # the shape and otherwise make this mismatch particularly easy to miss.
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires exact row-major strides (cols, 1); " f"got {', '.join(bad_strides)}")
+    if H % 8 or interm % 8:
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward's bf16 TMA operands require " f"H and I to be multiples of 8; got H={H}, I={interm}")
+    # CuTeDSL currently derives its compilation target from visible CUDA
+    # ordinal 0, not from the active context. A same-process heterogeneous-GPU
+    # call must decline instead of compiling for one architecture and launching
+    # that artifact on another; the caller's cuDNN backend path remains valid.
+    if torch.cuda.get_device_capability(device) != torch.cuda.get_device_capability(0):
+        raise NotImplementedError(
+            "cudnn.gemm.swiglu_mlp: FROST backward requires the operand device " "architecture to match visible CUDA device 0's CuTeDSL JIT target"
+        )
+    misaligned = [name for name, tensor in operands if tensor.data_ptr() % 32]
+    if misaligned:
+        # 32 B is the maximum vector width used by this dense bf16 epilogue and
+        # is stronger than the 16 B TMA base-pointer floor. Standard torch
+        # allocations satisfy it; offset views decline rather than reaching a
+        # runtime descriptor/alignment ValueError after JIT.
+        raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires 32-byte-aligned operands; " f"misaligned: {', '.join(misaligned)}")
+
+    # FROST's direct JIT path chooses its compile device from the current CUDA
+    # context, unlike the cuDNN-handle paths above. Keep cache construction,
+    # allocations, and launch under the tensor's device and pass the caller's
+    # PyTorch stream explicitly (None would launch on CUDA stream 0).
+    with torch.cuda.device(device):
+        from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+        from cudnn.gemm.frost.tile_config import CATALOG
+
+        stream = torch.cuda.current_stream(device).cuda_stream
+        key = (M, H, interm, dout2.dtype, device.index)
+        e = _FROST_DSWIGLU_CACHE.get(key)
+        if e is None:
+            tn = 256 if interm >= 256 else 128
+            cta_group = 2 if M > 128 else 1
+            cluster_m = 2 if cta_group == 2 else 1
+            cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, cluster_m, 1))
+            g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
+            DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
+            # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
+            # arbitrary t/n operand layouts, so no transpose copy is needed.
+            WD = g.tensor(name="Wd", dim=[1, H, interm], stride=[H * interm, interm, 1])
+            G = g.tensor(name="gate_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
+            U = g.tensor(name="up_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
+            dh = g.matmul(A=DY, B=WD, name="dgrad")
+            g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
+            g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
+            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler="clc")
+            bd = compiled.binding
+            out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
+            aux_by = {a.get_name(): a for a in bd.aux}
+            e = (compiled, bd, out_by, aux_by)
+            _FROST_DSWIGLU_CACHE[key] = e
+        compiled, bd, out_by, aux_by = e
+        dgate = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
+        dup = torch.empty(1, M, interm, device=device, dtype=dout2.dtype)
+        compiled(
+            {
+                bd.a_operands[0]: dout2.unsqueeze(0),
+                bd.b_operands[0]: Wd.unsqueeze(0),  # natural [1,H,I], N-major — no transpose
+                out_by["dup"]: dup,
+                out_by["dgate"]: dgate,
+                aux_by["gate_pre"]: gate.unsqueeze(0),
+                aux_by["up_pre"]: up.unsqueeze(0),
+            },
+            stream=stream,
+        )
     return dgate.squeeze(0), dup.squeeze(0)
 
 
@@ -374,18 +419,26 @@ class _SwigluMLP(torch.autograd.Function):
     def backward(ctx, dout):
         saved = dict(zip(ctx.saved_names, ctx.saved_tensors))
         grad_mask = ctx.grad_mask
-        dout2 = dout.reshape(-1, ctx.out_features)
+        # Autograd may supply an expanded/zero-stride gradient (for example from
+        # out.sum()). Backend GEMMs and the direct FROST descriptor require a
+        # dense matrix; contiguous() is a no-op for the normal dense case.
+        dout2 = dout.reshape(-1, ctx.out_features).contiguous()
 
         dWd = _mm(dout2.t(), saved["h"]) if grad_mask & _GRAD_WD else None
 
         if grad_mask & _GRAD_FC1:
             Wd, gate, up = (saved[name] for name in ("Wd", "gate", "up"))
+            # Saved-tensor hooks may restore the internally dense preactivations
+            # with a different valid stride. Both the FROST descriptor and the
+            # pointwise fallback declare dense gate/up tensors, so normalize at
+            # this boundary (a no-op for the ordinary path).
+            gate, up = gate.contiguous(), up.contiguous()
             # P1 retains the existing dual-output dSwiGLU whenever either output
             # is needed. It still skips the whole stage for a Wd-only backward.
             if _FROST_BWD:
                 try:
                     dgate, dup = _frost_dswiglu(dout2, Wd, gate, up)
-                except Exception:
+                except _FROST_DECLINE_ERRORS:
                     dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
             else:
                 dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
@@ -422,11 +475,15 @@ def swiglu_mlp(x, Wg, Wu, Wd):
             raise TypeError(f"cudnn.gemm.swiglu_mlp: {name} must be bfloat16, got {t.dtype}")
         if t.device.type != "cuda":
             raise ValueError(f"cudnn.gemm.swiglu_mlp: {name} must be a CUDA tensor, got device {t.device}")
-    H = x.shape[-1]
+    if any(t.device != x.device for t in (Wg, Wu, Wd)):
+        raise ValueError(
+            "cudnn.gemm.swiglu_mlp: x, Wg, Wu, and Wd must be on the same CUDA device; " f"got x={x.device}, Wg={Wg.device}, Wu={Wu.device}, Wd={Wd.device}"
+        )
     if x.dim() < 2 or Wg.dim() != 2 or Wu.dim() != 2 or Wd.dim() != 2:
         raise ValueError(
             f"cudnn.gemm.swiglu_mlp: expected x[...,H] and 2-D Wg/Wu[I,H], Wd[H,I]; got x{tuple(x.shape)} Wg{tuple(Wg.shape)} Wu{tuple(Wu.shape)} Wd{tuple(Wd.shape)}"
         )
+    H = x.shape[-1]
     if Wg.shape != Wu.shape or Wg.shape[1] != H or Wd.shape[0] != H or Wd.shape[1] != Wg.shape[0]:
         raise ValueError(
             f"cudnn.gemm.swiglu_mlp: shape mismatch — x[...,{H}], Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}; "
