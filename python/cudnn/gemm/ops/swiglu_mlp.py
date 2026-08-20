@@ -229,14 +229,13 @@ def _dswiglu(dh, gate, up):
 
 _FROST_DSWIGLU_CACHE = {}
 # ON by default (set CUDNN_GEMM_SWIGLU_FROST_BWD=0 to force the pointwise path). On
-# this dense bf16 shape the FROST fused dgrad+dSwiGLU (one cuTeDSL kernel, dh never
-# materialised to HBM) ties the separate nvjet GEMM + one-kernel pointwise (~1.15ms
-# each, B200 M8192 stage) -- ~1% behind only because its cuTeDSL GEMM trails nvjet.
-# It is the default so it stays exercised and Yanqin can close that GEMM gap, and
-# because the fusion advantage grows as the workload gets pointwise-heavier (fp8
-# halves the GEMM and adds quant/scale pointwise; MoE grouped GEMMs are smaller and
-# more memory-bound). Falls back to the pointwise path if FROST cannot serve a
-# shape/arch/thread (e.g. no CUDA context on an autograd worker thread).
+# this dense bf16 shape the B200-tuned 2-CTA strategy brings the FROST GEMM core to
+# nvjet parity while the fused epilogue avoids materialising ``dh``. It is the
+# default so the fusion saving is captured, and because that saving grows as the
+# workload gets pointwise-heavier (fp8 halves the GEMM and adds quant/scale
+# pointwise; MoE grouped GEMMs are smaller and more memory-bound). Falls back to
+# the pointwise path if FROST cannot serve a shape/arch/thread (e.g. no CUDA context
+# on an autograd worker thread).
 _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
 
 
@@ -251,15 +250,12 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     FROST takes the natural down weight directly (an N-major / I-contiguous B -- no
     transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
     view) and keeps ``dh`` on-chip (no HBM round-trip). This is the DEFAULT backward
-    stage. On this dense bf16 shape it TIES the separate nvjet GEMM + one-kernel
-    pointwise (~1.15ms each, B200 M8192) -- ~1% behind only because its cuTeDSL GEMM
-    trails nvjet, which eats the ``dh`` round-trip it saves; tile autotune does not
-    help (the fixed ``_cfg`` 128x256 is already the best CATALOG tile). Kept the
-    default so it stays exercised and the cuTeDSL GEMM gap can be closed, and because
-    the fusion advantage grows as the workload gets pointwise-heavier (fp8 halves the
-    GEMM and adds quant/scale; MoE grouped GEMMs are smaller, more memory-bound). Not
-    a transpose problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a
-    host-overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
+    stage. The large-M path deliberately pins the B200-tuned
+    M128/N256/Kbytes128, cluster2x1, 2CTAMMA, CLC strategy. The previous geometry-
+    only sweep fixed 1CTAMMA/cluster1x1 and therefore did not cover this execution-
+    strategy win. Small M retains the 1CTAMMA/cluster1x1 strategy. Not a transpose
+    problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a host-
+    overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
     it)."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
@@ -270,7 +266,9 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     e = _FROST_DSWIGLU_CACHE.get(key)
     if e is None:
         tn = 256 if interm >= 256 else 128
-        cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, 1, 1))
+        cta_group = 2 if M > 128 else 1
+        cluster_m = 2 if cta_group == 2 else 1
+        cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, cluster_m, 1))
         g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
         # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
@@ -281,7 +279,7 @@ def _frost_dswiglu(dout2, Wd, gate, up):
         dh = g.matmul(A=DY, B=WD, name="dgrad")
         g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
         g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1, scheduler="clc")
+        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler="clc")
         bd = compiled.binding
         out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
         aux_by = {a.get_name(): a for a in bd.aux}
