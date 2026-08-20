@@ -51,6 +51,9 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Local end-to-end benchmark artifacts
+qwen3.8-factorial-results/
+
 # Translations
 *.mo
 *.pot
