@@ -19,13 +19,18 @@ backward on the Qwen3.5-27B shape); an earlier revision that recomputed gate/up
 paid two extra GEMMs and ran ~1.3x slower on the backward, ~1.17-1.19x on the full
 fwd+bwd step. Saving ``{h, gate, up}`` costs ~3x[M,I] of activation memory, less
 than the ~4x[M,I] torch autograd already keeps. The backward runs the dSwiGLU as
-two cuDNN pointwise kernels. (An opt-in ``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path
-fuses the ``dh = dout @ Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel,
-taking the natural down weight directly, no transpose. That fused stage beats the
-separate GEMM + two pointwise kernels ~1.15-2.64x, but with the pre-activations
-saved the whole backward is GEMM-bound and the fused stage does not move it, so it
-stays off by default.) Numerically matches torch to bf16 noise on the output and
-all four gradients.
+ONE two-output cuDNN pointwise kernel (``dup`` and ``dgate`` from a single graph;
+cuDNN's tensor-ir engine declines multi-output but another engine serves it),
+which reads the inputs once and is ~2x the two single-output kernels it replaces.
+With that and the saved pre-activations, the full fwd+bwd step runs ~0.96-0.98x a
+torch autograd MLP on the Qwen3.5-27B shape (B200). (An opt-in
+``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path fuses the ``dh = dout @ Wd`` dgrad GEMM with
+the dSwiGLU into one FROST kernel, taking the natural down weight directly, no
+transpose. It avoids materialising ``dh`` to HBM but its cuTeDSL GEMM currently
+ties the separate nvjet GEMM + one-kernel pointwise (~1.15ms each, B200 M8192
+stage), so with the backward GEMM-bound it does not move the full step; off by
+default pending FROST GEMM tuning.) Numerically matches torch to bf16 noise on the
+output and all four gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -179,52 +184,46 @@ def _swiglu_act(x, Wg, Wu):
 
 
 def _dswiglu(dh, gate, up):
-    """Fused dSwiGLU: ``dup = dh*silu(gate)``, ``dgate = dh*up*silu'(gate)`` given
-    ``dh,gate,up:[M,I]`` — two single-output cuDNN pointwise kernels (a single
-    graph writing both outputs hits unsupported multi-output fusion)."""
+    """Fused dSwiGLU in ONE cuDNN kernel: ``dup = dh*silu(gate)`` and
+    ``dgate = dh*up*silu'(gate)`` (``silu'(g) = s + silu*(1-s)``, ``s=sigmoid(g)``)
+    as the two outputs of a single multi-output pointwise graph. ``dh,gate,up:[M,I]``
+    are dense and same-shape (elementwise, no broadcast). cuDNN's tensor-ir engine
+    declines multi-output (it logs ``unsupported multi-output fusion``), but another
+    engine serves the graph as one kernel that reads the inputs once -- ~2x the two
+    single-output kernels it replaces, which re-read the inputs and recompute the
+    sigmoid. Returns ``(dgate, dup)``."""
     h, stream = _handle(dh.device)
     M, interm = dh.shape
     key = (M, interm, dh.dtype, dh.device.index, stream)
     e = _DSWIGLU_CACHE.get(key)
     if e is None:
-
-        def build(fn):
-            g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
-            DH = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
-            GATE = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
-            UP = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
-            out = fn(g, DH, GATE, UP)
-            out.set_output(True).set_data_type(_BF16)
-            g.validate()
-            g.build_operation_graph()
-            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            return g, DH, GATE, UP, out
-
-        def dup_fn(g, DH, GATE, UP):
-            return g.mul(a=DH, b=g.mul(a=GATE, b=g.sigmoid(input=GATE)))  # dh*silu(gate)
-
-        def dgate_fn(g, DH, GATE, UP):
-            s = g.sigmoid(input=GATE)
-            silu = g.mul(a=GATE, b=s)
-            silup = g.add(a=s, b=g.sub(a=silu, b=g.mul(a=silu, b=s)))  # silu' = s + silu*(1-s)
-            return g.mul(a=g.mul(a=DH, b=UP), b=silup)
-
-        scratch = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
-        built = {}
-        for name, fn in (("dup", dup_fn), ("dgate", dgate_fn)):
-            g, DH, GATE, UP, out = build(fn)
-            vp = {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), out: scratch.unsqueeze(0)}
-            best, ws = _autotune(g, h, vp)
-            built[name] = (g, DH, GATE, UP, out, best, ws)
-        e = built
+        g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
+        DH = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
+        GATE = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
+        UP = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
+        s = g.sigmoid(input=GATE)
+        silu = g.mul(a=GATE, b=s)
+        dup = g.mul(a=DH, b=silu)  # dh*silu(gate)
+        silup = g.add(a=s, b=g.sub(a=silu, b=g.mul(a=silu, b=s)))  # silu' = s + silu*(1-s)
+        dgate = g.mul(a=g.mul(a=DH, b=UP), b=silup)  # dh*up*silu'
+        dup.set_output(True).set_data_type(_BF16)
+        dgate.set_output(True).set_data_type(_BF16)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        dgb = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
+        dub = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
+        vp = {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), dup: dub.unsqueeze(0), dgate: dgb.unsqueeze(0)}
+        best, ws = _autotune(g, h, vp)
+        e = (g, DH, GATE, UP, dup, dgate, best, ws)
         _DSWIGLU_CACHE[key] = e
-    outs = {}
-    for name in ("dup", "dgate"):
-        g, DH, GATE, UP, out, best, ws = e[name]
-        buf = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
-        g.execute_plan_at_index({DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), out: buf.unsqueeze(0)}, ws, index=best, handle=h)
-        outs[name] = buf
-    return outs["dgate"], outs["dup"]
+    g, DH, GATE, UP, dup, dgate, best, ws = e
+    dgb = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
+    dub = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
+    g.execute_plan_at_index(
+        {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), dup: dub.unsqueeze(0), dgate: dgb.unsqueeze(0)}, ws, index=best, handle=h
+    )
+    return dgb, dub
 
 
 _FROST_DSWIGLU_CACHE = {}
