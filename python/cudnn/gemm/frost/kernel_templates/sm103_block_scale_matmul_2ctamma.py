@@ -519,7 +519,6 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_2,
                                     )
                             else:
-                                # the slice count was baked from, so each covers that many more slices.
                                 _a_per_cta = a_mcast_slices // cluster_n
                                 for _asl in cutlass.range(_a_per_cta):
                                     _a_idx = n_rank * _a_per_cta + _asl
@@ -575,7 +574,6 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_2,
                                     )
                             else:
-                                # the slice count was baked from, so each covers that many more slices.
                                 _b_per_cta = b_mcast_slices // (cluster_m // cta_group)
                                 for _bsl in cutlass.range(_b_per_cta):
                                     _b_idx = pair_m_idx * _b_per_cta + _bsl
