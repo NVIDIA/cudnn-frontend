@@ -2929,9 +2929,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
     Follows the SM100/SM120 adapter lifecycle (check_support → compile →
     execute, caller buffers bound directly) on top of the self-caching SM80
-    kernel modules. SM80-only features (bias, ALiBi, block_mask, RoPE,
-    score stats) arrive as extra optional ``execute`` keywords, exactly as
-    the ``SdpaFwdDsl.execute`` contract permits.
+    kernel modules. SM80-only features (bias, RoPE) arrive as extra optional
+    ``execute`` keywords, exactly as the ``SdpaFwdDsl.execute`` contract
+    permits.  ALiBi, block_mask and the score-stat side outputs are
+    deliberately NOT served: the capability row declines such graphs and the
+    backend takes them.
 
     Known deviations, both pre-existing and shared with the old
     ``SdpafwdSm80`` path rather than introduced here:
@@ -3155,41 +3157,22 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        alibi: bool = False,
-        block_mask: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
-        score_max_tensor: Optional[torch.Tensor] = None,
-        score_sum_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
 
-        # Graph Stats / score declarations arrive as (B, H, S, 1); the kernels
-        # write [B, H, SQ] — rebind the squeezed view (zero-cost, same storage).
+        # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
+        # [B, H, SQ] — rebind the squeezed view (zero-cost, same storage).
         if lse_tensor is not None and lse_tensor.ndim == 4:
             lse_tensor = lse_tensor.squeeze(-1)
-        if score_max_tensor is not None and score_max_tensor.ndim == 4:
-            score_max_tensor = score_max_tensor.squeeze(-1)
-        if score_sum_tensor is not None and score_sum_tensor.ndim == 4:
-            score_sum_tensor = score_sum_tensor.squeeze(-1)
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         kernel = _sm80_kernel_mod(self.flavor)
         device = q_tensor.device
-        return_score_stats = score_max_tensor is not None or score_sum_tensor is not None
 
         with _torch_stream_context(current_stream, device):
-            # ALiBi slopes derive from H alone — cache the device tensor so the
-            # hot path allocates nothing (Hard Rule 1).
-            alibi_slopes = None
-            if alibi:
-                key = ("alibi_slopes", device)
-                alibi_slopes = self._dummy_cache.get(key)
-                if alibi_slopes is None:
-                    alibi_slopes = kernel.default_alibi_slopes(self.h_q).to(device)
-                    self._dummy_cache[key] = alibi_slopes
-
             # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
             # normalizes with one copy — the same grandfathered normalization
             # the SM100 dense path applies (open cleanup, Hard Rule 2).
@@ -3237,25 +3220,16 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 seq_kv_lens=seq_kv_lens.reshape(-1) if seq_kv_lens is not None else None,
                 seq_len_q=seq_q_lens.reshape(-1) if seq_q_lens is not None else None,
                 bias=bias_tensor,
-                alibi_slopes=alibi_slopes,
                 sinks=sinks.reshape(-1) if sinks is not None else None,
-                return_score_stats=return_score_stats,
                 sched=self.sched_token,
                 sched_l2_mib=self.sched_l2_mib,
                 rope_freqs=rope_freqs,
-                block_mask=block_mask,
                 out_o=bind_o,
                 out_lse=bind_lse,
-                out_score_max=score_max_tensor if (return_score_stats and score_max_tensor is not None and score_max_tensor.is_contiguous()) else None,
-                out_score_sum=score_sum_tensor if (return_score_stats and score_sum_tensor is not None and score_sum_tensor.is_contiguous()) else None,
             )
             _accepted = _sm80_inspect.signature(kernel.forward).parameters
             fwd_kwargs = {k: v for k, v in fwd_kwargs.items() if k in _accepted}
-            _res = kernel.forward(Q, K, V, **fwd_kwargs)
-            if return_score_stats:
-                O_buf, LSE_buf, SMAX_buf, SSUM_buf = _res
-            else:
-                O_buf, LSE_buf = _res
+            O_buf, LSE_buf = kernel.forward(Q, K, V, **fwd_kwargs)
 
             # Copy-back only on the fallback paths the binding above skipped.
             if bind_o is None:
@@ -3266,17 +3240,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 o_view.copy_(o_scratch)
             if lse_tensor is not None and bind_lse is None:
                 lse_tensor.copy_(LSE_buf)
-            if return_score_stats:
-                if score_max_tensor is not None and fwd_kwargs.get("out_score_max") is None:
-                    score_max_tensor.copy_(SMAX_buf)
-                if score_sum_tensor is not None and fwd_kwargs.get("out_score_sum") is None:
-                    score_sum_tensor.copy_(SSUM_buf)
         self._logger.debug("execute completed")
 
 
-def _sm80_thd_forward(
-    q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, alibi, sinks, return_score_stats=False
-):
+def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks):
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
     no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Routes straight
     to the kernel's THD path (graph-safe over-provisioned grid), reusing the
@@ -3310,7 +3277,6 @@ def _sm80_thd_forward(
         mask_token, swa = "none", 0
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
     kernel = _sm80_kernel_mod(flavor)
-    alibi_slopes = kernel.default_alibi_slopes(h_q).to(q.device) if alibi else None
     fwd_kwargs = dict(
         scale=scale_softmax,
         return_lse=True,
@@ -3327,21 +3293,13 @@ def _sm80_thd_forward(
         cu_seqlens_k=cu_k,
         max_s_q=int(max_s_q),
         bias=bias_tensor,
-        alibi_slopes=alibi_slopes,
         sinks=sinks,
-        return_score_stats=return_score_stats,
     )
     acc = _sm80_inspect.signature(kernel.forward).parameters
     fwd_kwargs = {kk: vv for kk, vv in fwd_kwargs.items() if kk in acc}
-    _res = kernel.forward(q, k, v, **fwd_kwargs)
-    if return_score_stats:
-        O_buf, LSE_buf, SMAX_buf, SSUM_buf = _res
-    else:
-        O_buf, LSE_buf = _res
+    O_buf, LSE_buf = kernel.forward(q, k, v, **fwd_kwargs)
     if pad_v:
         O_buf = O_buf[..., :d_v].contiguous()
-    if return_score_stats:
-        return TupleDict(o_tensor=O_buf, lse_tensor=LSE_buf, score_max=SMAX_buf, score_sum_exp=SSUM_buf)
     return TupleDict(o_tensor=O_buf, lse_tensor=LSE_buf)
 
 
@@ -3362,21 +3320,19 @@ def sdpa_fwd_wrapper_sm80(
     seq_kv_lens: Optional[torch.Tensor] = None,
     seq_len_q: Optional[torch.Tensor] = None,
     bias_tensor: Optional[torch.Tensor] = None,
-    alibi: bool = False,
     sinks: Optional[torch.Tensor] = None,
     cum_seqlen_q_tensor: Optional[torch.Tensor] = None,
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     max_s_q: Optional[int] = None,
-    return_score_stats: bool = False,
     rope_freqs: Optional[torch.Tensor] = None,
-    block_mask: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """SM80 (A100) SDPA forward.
 
     Returns ``TupleDict(o_tensor=..., lse_tensor=...)`` matching the DSL
     wrappers' contract.  Dense calls route through :class:`SdpaFwdDslSm80`;
     packed THD calls (``cum_seqlen_*``) launch the kernel's varlen path
-    directly.
+    directly.  ALiBi, block_mask and the score-stat side outputs are not
+    supported (use the graph API, which routes them to the cuDNN backend).
     """
     if q_tensor.ndim != 4 or v_tensor.ndim != 4:
         raise ValueError(f"Q and V must be rank-4 BHSD; got Q={q_tensor.ndim}D V={v_tensor.ndim}D")
@@ -3393,7 +3349,6 @@ def sdpa_fwd_wrapper_sm80(
         # than an error.
         for label, present in (
             ("rope_freqs", rope_freqs is not None),
-            ("block_mask", block_mask is not None),
             ("seq_kv_lens", seq_kv_lens is not None),
             ("seq_len_q", seq_len_q is not None),
             ('scheduler != "auto"', scheduler not in (None, "auto")),
@@ -3413,9 +3368,7 @@ def sdpa_fwd_wrapper_sm80(
                 window_size=window_size,
                 causal_bottom_right=causal_bottom_right,
                 bias_tensor=bias_tensor,
-                alibi=alibi,
                 sinks=sinks,
-                return_score_stats=return_score_stats,
             )
 
     b, h_q, s_q, _ = q_tensor.shape
@@ -3429,13 +3382,6 @@ def sdpa_fwd_wrapper_sm80(
         device=q_tensor.device,
     ).transpose(1, 2)
     lse_tensor = _allocate_lse_tensor(q_tensor)
-    # SCORE_MAX / SCORE_SUM share LSE's [B, H, SQ] shape.
-    if return_score_stats:
-        score_max_t = _allocate_lse_tensor(q_tensor)
-        score_sum_t = _allocate_lse_tensor(q_tensor)
-    else:
-        score_max_t = score_sum_t = None
-
     wl, wr = window_size
     if not is_causal and wr >= 0:
         # A right bound has no diagonal to anchor to without is_causal —
@@ -3487,12 +3433,6 @@ def sdpa_fwd_wrapper_sm80(
         scale_softmax=scale_softmax,
         current_stream=current_stream,
         bias_tensor=bias_tensor,
-        alibi=alibi,
-        block_mask=block_mask,
         rope_freqs=rope_freqs,
-        score_max_tensor=score_max_t,
-        score_sum_tensor=score_sum_t,
     )
-    if return_score_stats:
-        return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor, score_max=score_max_t, score_sum_exp=score_sum_t)
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)

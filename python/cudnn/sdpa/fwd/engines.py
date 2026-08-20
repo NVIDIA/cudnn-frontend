@@ -561,7 +561,8 @@ def _sm80_spec() -> EngineSpec:
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
     caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
     gated off (the standalone wrapper's varlen path serves THD); knob domains
-    are empty (no tunables wired)."""
+    are empty (no tunables wired).  ALiBi / block_mask / score-stats graphs are
+    deliberately NOT served — the row declines and the backend takes them."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
@@ -574,10 +575,6 @@ def _sm80_spec() -> EngineSpec:
             d_pad_multiple=1,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
-            alibi=True,
-            block_mask=True,
-            score_max=True,
-            score_sum_exp=True,
             right_band_widening=True,
             causal=True,
             bottom_right=True,
@@ -750,10 +747,12 @@ def lower_dsl_prefill(
     api_scratch_bytes = api.scratch_workspace_bytes()
     total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
 
-    # SM80-only feature operands (bias / block_mask / score stats): the row's
-    # capability gates admitted them, and the adapter's execute() declares the
-    # matching optional keywords — forwarded below only when both hold.
-    _extra_exec_keys = {"bias_tensor", "alibi", "block_mask", "score_max_tensor", "score_sum_tensor"} & set(inspect.signature(type(api).execute).parameters)
+    # SM80-only feature operand (bias): the row's capability gate admitted it,
+    # and the adapter's execute() declares the matching optional keyword —
+    # forwarded below only when both hold. ALiBi / block_mask / score-stats
+    # graphs never reach a FROST row (every capability row declines them, so
+    # the backend serves them).
+    _extra_exec_keys = {"bias_tensor"} & set(inspect.signature(type(api).execute).parameters)
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -767,9 +766,6 @@ def lower_dsl_prefill(
         cu_seq_len_q=facts.cu_seq_q_t,
         cu_seq_len_kv=facts.cu_seq_kv_t,
         bias=facts.bias_t,
-        block_mask=facts.block_mask_t,
-        score_max=facts.score_max_t,
-        score_sum_exp=facts.score_sum_exp_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
@@ -819,8 +815,8 @@ def lower_dsl_prefill(
         # lse_optional (the kernel compiles the LSE store out) — no dummy.
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
-        # bias/block_mask/alibi flow only to adapters declaring the keywords
-        # (the SM80 row) — every other row's mismatch gates them off.
+        # bias flows only to adapters declaring the keyword (the SM80 row);
+        # every other feature operand is gated off by mismatch for all rows.
         feature_ops = ga.resolve_feature_operands(facts, resolved)
         sinks_buf = feature_ops.sinks
         seq_kv_buf = feature_ops.seq_kv_lens
@@ -879,17 +875,9 @@ def lower_dsl_prefill(
                 scale_o=so_buf,
             )
         if _extra_exec_keys:
-            # SM80 feature operands (mismatch admitted them for this row).
+            # SM80 feature operand (mismatch admitted it for this row).
             if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
                 execute_kwargs["bias_tensor"] = feature_ops.bias
-            if feature_ops.alibi and "alibi" in _extra_exec_keys:
-                execute_kwargs["alibi"] = True
-            if feature_ops.block_mask is not None and "block_mask" in _extra_exec_keys:
-                execute_kwargs["block_mask"] = feature_ops.block_mask
-            if binding.score_max is not None and "score_max_tensor" in _extra_exec_keys:
-                execute_kwargs["score_max_tensor"] = resolved.get(id(binding.score_max))
-            if binding.score_sum_exp is not None and "score_sum_tensor" in _extra_exec_keys:
-                execute_kwargs["score_sum_tensor"] = resolved.get(id(binding.score_sum_exp))
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
         api.execute(**execute_kwargs)
