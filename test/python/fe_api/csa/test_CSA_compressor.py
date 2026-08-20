@@ -36,7 +36,8 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     data and a smaller device-side true row count, checked on all four outputs and
     bitwise against a direct call), and the loud error when the first call for a
     configuration would JIT under capture;
-  - ``check_support`` boundaries (validated envelope: CC 10.0; ratio 4 with coff
+  - ``check_support`` boundaries (validated envelope: compute-capability major >= 10;
+    ratio 4 with coff
     {1, 2}, ratio 128 with coff {1, 2} x head_dim {128, 512}; BF16 kv/score, FP32 ape,
     int32 cu_seqlens and int32 flat-offset bounds).
 
@@ -66,11 +67,11 @@ def _import_compressor():
 
 
 def _require_sm100():
-    """Skip the test unless a CC 10.0 (Blackwell) CUDA GPU is available."""
+    """Skip the test unless an SM100-or-newer CUDA GPU is available."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("compute capability 10.0 GPU required")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("compute capability major >= 10 (SM100+) required")
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1065,26 @@ def test_check_support_accepts_envelope_r128(d, coff):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_check_support_accepts_compute_capability_major_10_or_newer(monkeypatch, capability):
+    """The architecture gate admits SM100, SM103, and newer major families."""
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
+    assert api.check_support() is True
+
+
+@pytest.mark.L0
+def test_check_support_rejects_compute_capability_major_below_10(monkeypatch):
+    """The architecture gate still rejects pre-SM100 devices."""
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
+    with pytest.raises(RuntimeError, match="compute capability major >= 10"):
+        api.check_support()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "kwargs,ctor,match",
     [
@@ -1297,8 +1318,8 @@ def test_multi_device_launch():
     compressor = _import_compressor()
     if torch.cuda.device_count() < 2:
         pytest.skip("needs >= 2 visible GPUs")
-    if torch.cuda.get_device_capability(1) != (10, 0):
-        pytest.skip("second GPU is not CC 10.0")
+    if torch.cuda.get_device_capability(1)[0] < 10:
+        pytest.skip("second GPU is below SM100")
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1024], d, ratio, coff, device="cuda:1")
     total = kv.shape[0]
