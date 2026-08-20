@@ -1780,7 +1780,8 @@ class pygraph:
             # A JIT engine talks to the driver directly, which reads the calling
             # THREAD's context stack -- and an autograd backward runs on a worker
             # thread that has none. Once here, so every python engine is covered.
-            ensure_current_context(ctx.stream)
+            # The handle's device decides when the stream is 0: it names no context.
+            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
