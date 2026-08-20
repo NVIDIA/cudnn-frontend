@@ -552,16 +552,17 @@ def _render_tile_constants(
     # cta_tile_k_bytes, and an MN-major tile is MN/group_elems groups of
     # group_elems * cta_tile_k_bytes — both give cta_tile_k_bytes per MN element.
     a_smem_m_step_bytes = (cta_smem_m // cfg.num_mma_m) * cfg.cta_tile_k_bytes
-    if chain.has_moe or chain.mainloop_a_ops or chain.mainloop_b_ops:
-        # The MoE templates patch A's tensormap per routed group and the mainloop
-        # ones stage through a separate LOAD buffer, so neither carries the plain
-        # (MN x K-tile) TMA box the sliced multicast splits. Keep the single
-        # issuer and close the release with a full-cluster ab_empty instead.
-        a_mcast_slices, b_mcast_slices, ab_empty_full_mask = 1, 1, True
-    else:
-        a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(
-            chain.matmul.a_major, chain.matmul.b_major, cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group, cta_smem_m, cta_smem_n
-        )
+    a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(
+        chain.matmul.a_major,
+        chain.matmul.b_major,
+        cfg.cgrp_size_m,
+        cfg.cgrp_size_n,
+        cta_group,
+        cta_smem_m,
+        cta_smem_n,
+        per_cta_a=cta_group == 2 and bool(chain.mainloop_a_ops),
+        per_cta_b=cta_group == 2 and bool(chain.mainloop_b_ops),
+    )
 
     lines = [
         f"# Tile config: {cfg.name}",
@@ -912,7 +913,18 @@ def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
 _SMEM_SWIZZLE_ATOM_ROWS = 8
 
 
-def _mcast_slice_plan(a_major: str, b_major: str, cluster_m: int, cluster_n: int, cta_group: int, cta_smem_m: int, cta_smem_n: int) -> tuple[int, int, bool]:
+def _mcast_slice_plan(
+    a_major: str,
+    b_major: str,
+    cluster_m: int,
+    cluster_n: int,
+    cta_group: int,
+    cta_smem_m: int,
+    cta_smem_n: int,
+    *,
+    per_cta_a: bool = False,
+    per_cta_b: bool = False,
+) -> tuple[int, int, bool]:
     """How the cluster splits each operand's TMA load, CUTLASS-style.
 
     Every CTA of a multicast group loads its own slice and multicasts it to the
@@ -922,13 +934,22 @@ def _mcast_slice_plan(a_major: str, b_major: str, cluster_m: int, cluster_n: int
     be flipped by one peer's credit twice over while the CTA's own MMA is still
     reading the buffer. Returns (a_slices, b_slices, needs_full_empty_mask).
     """
-    a_group = cluster_n
-    b_group = cluster_m // cta_group
+    # A mainloop-fused operand under 2-CTA MMA is loaded per CTA (the follower's
+    # mainloop warp has to know when ITS tile landed), so there is no group to
+    # slice -- and, per the closure test below, nothing it can close either.
+    a_group = 1 if per_cta_a else cluster_n
+    b_group = 1 if per_cta_b else cluster_m // cta_group
     atom = _SMEM_SWIZZLE_ATOM_ROWS
     a_slices = a_group if (a_major == "k" and a_group > 1 and cta_smem_m % (a_group * atom) == 0) else 1
     b_slices = b_group if (b_major == "k" and b_group > 1 and cta_smem_n % (b_group * atom) == 0) else 1
-    a_closed = a_group == 1 or a_slices == a_group
-    b_closed = b_group == 1 or b_slices == b_group
+    # An operand closes the release only if the CLUSTER does not spread it (that
+    # dimension is 1, so the narrow mask is the whole cluster anyway) or every peer
+    # issues its own slice. A per-CTA load couples nothing and closes NOTHING --
+    # reading `a_group` here instead of the cluster dim would call a mainloop-fused
+    # operand closed and leave a two-dimensional cluster on the narrow mask with no
+    # interlock at all.
+    a_closed = cluster_n == 1 or a_slices > 1
+    b_closed = cluster_m // cta_group == 1 or b_slices > 1
     return a_slices, b_slices, not (a_closed and b_closed)
 
 
@@ -1070,11 +1091,10 @@ def _render_block_scale_tile_constants(
 
     cta_m = cfg.cta_tile_m
     cta_n = cfg.cta_tile_n
-    if is_sm103 or chain.has_moe:
+    if is_sm103:
         # sm103 stages one 128-B K chunk per AB stage rather than a whole K-tile,
-        # and the MoE templates patch A's tensormap per routed group, so neither
-        # carries the plain (MN x K-tile) TMA box the sliced multicast splits.
-        # Keep the single issuer and close the release with a full-cluster ab_empty.
+        # so it does not carry the plain (MN x K-tile) TMA box the sliced multicast
+        # splits. Keep the single issuer + full-cluster ab_empty release.
         bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = 1, 1, True
     else:
         bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = _mcast_slice_plan(

@@ -463,21 +463,36 @@ def _kernel(
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
 
                     a_issue = (not multicast_a) or (n_rank == 0)
-                    if a_issue:
+                    if cutlass.const_expr(a_mcast_slices > 1):
+                        # Every CTA of the A multicast group loads its own slice, which is what
+                        # lets the narrow ab_empty release stay correct. MoE has no mixed CGA, so
+                        # that is exactly one slice per CTA.
+                        a_data_issue = True
+                        _a_off = n_rank * (cta_tile_mnk[0] // a_mcast_slices)
+                    else:
+                        a_data_issue = a_issue
+                        _a_off = 0
+                    if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sA_stage,
+                                    sA_stage.subview(_a_off * cta_tile_mnk[2]),
                                     a_desc_tma_ptr_list[_ai],
-                                    (coord_k, coord_m_group, cutlass.Int32(0)),
+                                    (coord_k, coord_m_group + _a_off, cutlass.Int32(0)),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
                                     group=nvvm.CTAGroup.CTA_1,
                                 )
                     b_issue = (not multicast_b) or (m_rank == 0)
-                    if b_issue:
+                    if cutlass.const_expr(b_mcast_slices > 1):
+                        b_data_issue = True
+                        _b_off = m_rank * (cta_tile_mnk[1] // b_mcast_slices)
+                    else:
+                        b_data_issue = b_issue
+                        _b_off = 0
+                    if b_data_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                             if cutlass.const_expr(b_is_n_major):
@@ -499,9 +514,9 @@ def _kernel(
                             else:
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage,
+                                        sB_stage.subview(_b_off * cta_tile_mnk[2]),
                                         tma_b_descs[_bj].get_ptr(),
-                                        (coord_k, coord_n_per_cta, coord_expert),
+                                        (coord_k, coord_n_per_cta + _b_off, coord_expert),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
@@ -869,7 +884,7 @@ def _host(
                     a_stride_m * ab_dtype.width // 128,
                     a_stride_l * ab_dtype.width // 128,
                 ],
-                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                box_dims=[cta_tile_mnk[2], cta_tile_mnk[0] // a_mcast_slices, 1],
                 swizzle=ab_tma_swizzle,
             )
         )
@@ -900,7 +915,7 @@ def _host(
                         b_stride_n * ab_dtype.width // 128,
                         b_stride_l * ab_dtype.width // 128,
                     ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1], 1],
+                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
                     swizzle=ab_tma_swizzle,
                 )
             )

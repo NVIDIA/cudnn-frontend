@@ -50,6 +50,12 @@ _GEOMETRIES = [
     ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 2),  # num_mma_m=2 on the pair
     ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),  # num_mma_m=2
     ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),  # num_mma_m=2 at mma_inst_m=64
+    # Two-dimensional clusters: the ab_empty release mask is a proper subset of
+    # the cluster there, so it is only safe because every CTA of a multicast
+    # group issues its own TMA slice. A one-dimensional cluster degenerates to
+    # the whole cluster and cannot catch a regression in that interlock.
+    ("CONFIG_sm100_128x256x128_128x256x32_cluster2x2", 1),
+    ("CONFIG_sm100_128x256x128_128x256x32_cluster4x2", 2),
 ]
 
 # The plain-e2e test additionally covers N-tiles that are not a multiple of 32
