@@ -825,7 +825,7 @@ def _sdpa_kernel(
         cache=nvvm.LoadCacheModifier.CG,
         swizzle=True,
         valid_rows=kv_valid_rows,
-        valid_cols=valid_cols,
+        valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
         row_base=kv_prologue_row_abs,
     )
     cp_async_commit()
@@ -956,7 +956,7 @@ def _sdpa_kernel(
             swizzle=True,
             cp_size_bytes=cp_size_bytes,
             valid_rows=kv_valid_rows,
-            valid_cols=valid_cols,
+            valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
             row_base=kv_row_base_prev,
         )
         cp_async_commit()  # group: V[i-1]
@@ -1528,19 +1528,17 @@ def _sdpa_kernel(
         gmem_addr = o_gmem + row.to(cutlass.Int64) * row_stride64 + (col_chunk * elems_per_chunk_i32).to(cutlass.Int64)
         # SMEM load is unconditional — sO_buf is sized for the full tile_m ×
         # D_V and any OOB lanes wrote dummy data there.  GMEM STG.128 must
-        # skip OOB (row or col) so we don't touch GMEM past the user tensor.
+        # skip OOB rows so we don't touch GMEM past the user tensor.  Columns
+        # are never trimmed: O is always the compile-time d_v wide (the
+        # adapter pads V up to it, and padded-V columns compute to exact
+        # zero), while d_runtime is the Q/K head dim — trimming on it dropped
+        # the real O columns [D, d_v) whenever a graph declared d_qk < d_v.
         vec = Pointer(smem_addr.data_ptr(), dtype=cutlass.Int32).load(alignment=16, count=4)
-        if cutlass.const_expr(is_even_mn and is_even_k):
+        if cutlass.const_expr(is_even_mn):
             Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
         else:
-            in_bounds = cutlass.Int32(1)
-            if cutlass.const_expr(not is_even_mn):
-                row_abs_i32 = q_row_base_i32 + row
-                in_bounds = in_bounds * cutlass.Int32(row_abs_i32 < sq_store_bound)
-            if cutlass.const_expr(not is_even_k):
-                col_abs_end = (col_chunk + cutlass.Int32(1)) * elems_per_chunk_i32
-                in_bounds = in_bounds * cutlass.Int32(col_abs_end <= d_runtime)
-            if in_bounds != cutlass.Int32(0):
+            row_abs_i32 = q_row_base_i32 + row
+            if row_abs_i32 < sq_store_bound:
                 Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
 
 
@@ -2015,12 +2013,15 @@ def forward(
     scale_log2 = scale * math.log2(math.e)
 
     # Allocate output / LSE sized to the actual (possibly uneven) shapes —
-    # the kernel writes only the valid (row, col) range via STG predication.
-    # Output dim follows V (= d_v), which can differ from Q's d_qk (DSv3).
-    # Caller-bound out_* buffers skip the allocation.  Rows a feature path
-    # never touches (seq_len_q trim, zero-length padded batches, block-masked
-    # rows) rely on zero-init, so zero a bound buffer only when such a path is
-    # active — the plain / causal / SWA dense paths write every valid element.
+    # the kernel writes the full row x d_v range via STG (rows predicated on
+    # sq_store_bound only).  Output dim follows V (= d_v), which can differ
+    # from Q's d_qk (DSv3).  Caller-bound out_* buffers skip the allocation.
+    # The zero-fill below is DEFENSIVE, not load-bearing: the dense epilogue
+    # stores every in-bounds row unconditionally (zero-KV-iteration tiles
+    # route through the store with row_sum=0, trimmed rows are written
+    # explicitly with O=0 / LSE=-inf, and THD never receives bound outputs).
+    # Kept so a bound buffer can never surface uninitialized memory if a
+    # future feature path skips rows.
     _needs_zero_init = (seq_len_q is not None) or (seq_kv_lens is not None)
     if out_o is None:
         out_o = torch.zeros(B, SQ, H, d_v, dtype=Q.dtype, device=Q.device)
