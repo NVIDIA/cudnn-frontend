@@ -13,25 +13,22 @@ the down projection is a separate GEMM (a three-GEMM single graph does not
 compile). That fused kernel also emits the two pre-activations ``gate = x@Wg^T``
 and ``up = x@Wu^T`` (the GEMM accumulators it already computes) as extra outputs,
 so the backward reads them instead of recomputing two GEMMs -- still one kernel,
-the accumulators stored in the epilogue. This keeps the full backward at parity
-with a torch autograd MLP, which likewise saves its activations (~0.99-1.02x
-backward on the Qwen3.5-27B shape); an earlier revision that recomputed gate/up
-paid two extra GEMMs and ran ~1.3x slower on the backward, ~1.17-1.19x on the full
-fwd+bwd step. Saving ``{h, gate, up}`` costs ~3x[M,I] of activation memory, less
-than the ~4x[M,I] torch autograd already keeps. The backward runs the dSwiGLU as
-ONE two-output cuDNN pointwise kernel (``dup`` and ``dgate`` from a single graph;
-cuDNN's tensor-ir engine declines multi-output but another engine serves it),
-which reads the inputs once and is ~2x the two single-output kernels it replaces.
-With that and the saved pre-activations, a balanced B200 run measured the full
-fwd+bwd step at ~1.11x the eager torch autograd MLP on the Qwen3.5-27B shape
-(the exact ratio is workload/runtime dependent). By default the
+the accumulators stored in the epilogue. This matches torch autograd's
+saved-activation policy; an earlier revision that
+recomputed gate/up paid two extra GEMMs and ran ~1.3x slower on the backward,
+~1.17-1.19x on the full fwd+bwd step. Saving ``{h, gate, up}`` costs ~3x[M,I] of
+activation memory, less than the ~4x[M,I] torch autograd already keeps. The
+pointwise fallback computes ``dup`` and ``dgate`` in one two-output graph, reading
+the inputs once and running ~2x faster than two single-output kernels. By default,
 ``dh = dout @ Wd`` dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL)
 kernel that never materialises ``dh`` to HBM (set
 ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate nvjet GEMM + one-kernel
 pointwise, which it falls back to anyway if FROST cannot serve a
 shape/arch/thread). The dense large-M path uses the B200-tuned 2-CTA
 M128/N256/K128, cluster2x1, CLC strategy; its bare GEMM is at nvjet parity and
-the fused epilogue turns the avoided ``dh`` round-trip into a net win.
+the fused epilogue turns the avoided ``dh`` round-trip into a net win. A balanced
+B200 run at M=8192, H=5120, I=17408 measured 1.077x backward and 1.109x full
+fwd+bwd versus eager torch (the exact ratio is workload/runtime dependent).
 Numerically matches torch to bf16 noise on the output and all four gradients.
 
 At the public call boundary the op snapshots GradMode and each input's

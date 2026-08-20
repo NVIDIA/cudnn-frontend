@@ -91,12 +91,13 @@ Fusing the activation into the GEMM is a genuine kernel-time win, not just a lau
 A SwiGLU MLP forward — `gate_gemm + up_gemm + SiLU + mul` — compiles to ONE cuDNN kernel and
 runs 1.05-1.20× a 2-cuBLAS-GEMM + torch-activation baseline (eager and under graph replay,
 every token count). That same kernel also emits its two pre-activations as extra outputs, so
-the backward reads them instead of recomputing two GEMMs — the actual backward win: parity
-with a torch autograd MLP that likewise saves them, where recomputing ran ~1.3× slower. A
-dSwiGLU-as-matmul-epilogue fusion (`matmul(dout,Wd)` fused with the elementwise) is ~2.3× the
-unfused GEMM + elementwise *in isolation*, but with the pre-activations saved the full
-backward is GEMM-bound and does not surface that stage win — so express fusions in one graph,
-but always measure the whole step, not the fused stage alone.
+the backward reads them instead of recomputing two GEMMs. The backward's
+`matmul(dout,Wd) + dSwiGLU` uses a B200-tuned 2-CTA FROST kernel, bringing the bare GEMM to
+nvjet parity and turning the avoided `dh` HBM round-trip into a whole-step win. At
+M=8192, H=5120, I=17408, a balanced run measured 1.077× backward and 1.109× fresh
+forward+backward versus eager torch. The earlier 1-CTA result did not show this because its
+tile sweep held CTA group and cluster shape fixed. Always measure the whole step rather than
+extrapolating from an isolated fused stage.
 
 ### 7. Mixing libraries in a hot eager loop
 Interleaving cuDNN `execute` with cuBLAS/`torch.mm`/other-library calls, op by op, is the
