@@ -94,7 +94,11 @@ def _to_native(
     beta = beta.to(q.dtype) if use_beta_sigmoid_in_kernel else beta.float()
 
     def thd(t):
-        return t.reshape(-1, *t.shape[2:])
+        # FLA's fused QKV short-conv returns one compact [B,T,Q+K+V]
+        # allocation and splits it into strided q/k/v views.  The native GDN
+        # kernels require compact THD inputs, so materialize only when needed;
+        # contiguous() is a no-op for the usual already-compact inputs.
+        return t.reshape(-1, *t.shape[2:]).contiguous()
 
     g2, beta2 = thd(g), thd(beta)
     if g2.shape[-1] != HO or beta2.shape[-1] != HO:
