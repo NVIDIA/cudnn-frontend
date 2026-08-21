@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image transformer-shape proxy and switchable BF16 joint attention.
+"""Qwen-Image transformer-shape proxy with switchable BF16 attention and MLP.
 
 The proxy instantiates Diffusers' real ``QwenImageTransformer2DModel`` class
 with the published hidden/head/FFN dimensions.  It reduces only the repeated
@@ -44,6 +44,16 @@ DIFFUSERS_ANCHOR = {
         "2f7e0154a9db246e95c9ede43edba7db5b130805/"
         "src/diffusers/models/transformers/transformer_qwenimage.py"
     ),
+    "supporting_sources": {
+        "attention": {
+            "path": "src/diffusers/models/attention.py",
+            "source_sha256": "3c61df6cc4832149eb654c1e82220f4a6b91daca13741c957c4e0faff7810adf",
+        },
+        "activations": {
+            "path": "src/diffusers/models/activations.py",
+            "source_sha256": "ab1767e8e44e7d4bf1cb18299ba33654329e2711fa983b1423fc4fe12de2c3ab",
+        },
+    },
 }
 NUMERICAL_RECIPE = {
     "id": "qwen-image-conservative-bf16-v1",
@@ -270,6 +280,151 @@ def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None,
     return select, restore, counters, torch_probe
 
 
+def install_gelu_mlp_dispatch(model, *, counters=None):
+    """Install strict Torch/cuDNN dispatchers for Qwen-Image's two GELU FFNs.
+
+    The treatment is deliberately benchmark-local: it accepts only the pinned
+    Diffusers ``FeedForward`` structure used by this proxy,
+    ``Linear+bias -> GELU(approximate=\"tanh\") -> Dropout(0) -> Linear+bias``.
+    Any hook, parametrization, training state, or structural drift fails closed
+    instead of silently changing model semantics.  Returns
+    ``(select, restore, counters)`` where ``select`` accepts ``\"torch\"`` or
+    ``\"cudnn\"``.
+    """
+    import types
+
+    import torch
+
+    from cudnn.gemm.ops import gelu_mlp
+
+    if counters is None:
+        counters = {}
+    for name in ("torch", "cudnn"):
+        counters.setdefault(name, 0)
+
+    if model.__class__.__module__ != "diffusers.models.transformers.transformer_qwenimage" or model.__class__.__name__ != "QwenImageTransformer2DModel":
+        raise TypeError(f"expected pinned Diffusers QwenImageTransformer2DModel, got {type(model)!r}")
+    if model.training or any(parameter.requires_grad for parameter in model.parameters()):
+        raise NotImplementedError("the Qwen-Image GELU-MLP treatment is inference-only")
+    if getattr(model, "_compiled_call_impl", None) is not None:
+        raise NotImplementedError("torch.compile is outside the Qwen-Image GELU-MLP treatment")
+    if getattr(model, "peft_config", None):
+        raise NotImplementedError("LoRA/PEFT adapters are outside the Qwen-Image GELU-MLP treatment")
+    blocks = getattr(model, "transformer_blocks", None)
+    if not isinstance(blocks, torch.nn.ModuleList) or not blocks:
+        raise TypeError("expected a non-empty Qwen-Image transformer_blocks ModuleList")
+
+    hook_fields = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
+    for module_name, child in model.named_modules():
+        qualified = module_name or "model"
+        if getattr(child, "_compiled_call_impl", None) is not None:
+            raise NotImplementedError(f"torch.compile on {qualified} is outside the Qwen-Image GELU-MLP treatment")
+        if any(getattr(child, field, None) for field in hook_fields):
+            raise NotImplementedError(f"hooks on {qualified} are outside the Qwen-Image GELU-MLP treatment")
+    entries = []
+    for block_index, block in enumerate(blocks):
+        if block.__class__.__module__ != "diffusers.models.transformers.transformer_qwenimage" or block.__class__.__name__ != "QwenImageTransformerBlock":
+            raise TypeError(f"transformer_blocks[{block_index}] is not the pinned QwenImageTransformerBlock: {type(block)!r}")
+        for stream in ("img", "txt"):
+            name = f"transformer_blocks[{block_index}].{stream}_mlp"
+            module = getattr(block, f"{stream}_mlp", None)
+            if module is None or module.__class__.__module__ != "diffusers.models.attention" or module.__class__.__name__ != "FeedForward":
+                raise TypeError(f"{name} is not the pinned Diffusers FeedForward: {type(module)!r}")
+            if module.training:
+                raise NotImplementedError(f"{name} must be in eval mode")
+            if "forward" in module.__dict__:
+                raise NotImplementedError(f"{name} already has an instance-level forward override")
+            net = getattr(module, "net", None)
+            if not isinstance(net, torch.nn.ModuleList) or len(net) != 3:
+                raise TypeError(f"{name}.net must contain exactly activation, dropout, and output projection")
+            activation, dropout, output = net
+            first = getattr(activation, "proj", None)
+            if (
+                activation.__class__.__module__ != "diffusers.models.activations"
+                or activation.__class__.__name__ != "GELU"
+                or getattr(activation, "approximate", None) != "tanh"
+                or type(first) is not torch.nn.Linear
+                or type(dropout) is not torch.nn.Dropout
+                or type(output) is not torch.nn.Linear
+            ):
+                raise TypeError(f"{name} is not Linear -> GELU(tanh) -> Dropout -> Linear")
+            if dropout.p != 0.0 or dropout.inplace:
+                raise NotImplementedError(f"{name} requires non-inplace Dropout(0), got p={dropout.p}, inplace={dropout.inplace}")
+            if first.bias is None or output.bias is None:
+                raise NotImplementedError(f"{name} requires bias on both linear projections")
+            expected_first = (PUBLISHED_SHAPE["ffn"], PUBLISHED_SHAPE["hidden"])
+            expected_second = (PUBLISHED_SHAPE["hidden"], PUBLISHED_SHAPE["ffn"])
+            expected_first_bias = (PUBLISHED_SHAPE["ffn"],)
+            expected_second_bias = (PUBLISHED_SHAPE["hidden"],)
+            if (
+                tuple(first.weight.shape) != expected_first
+                or tuple(first.bias.shape) != expected_first_bias
+                or tuple(output.weight.shape) != expected_second
+                or tuple(output.bias.shape) != expected_second_bias
+            ):
+                raise ValueError(
+                    f"{name} projection shapes changed: got weights {tuple(first.weight.shape)}/{tuple(output.weight.shape)} "
+                    f"and biases {tuple(first.bias.shape)}/{tuple(output.bias.shape)}; expected "
+                    f"{expected_first}/{expected_second} and {expected_first_bias}/{expected_second_bias}"
+                )
+            tensors = (first.weight, first.bias, output.weight, output.bias)
+            if any(tensor.dtype != torch.bfloat16 or tensor.device.type != "cuda" or not tensor.is_contiguous() for tensor in tensors):
+                raise NotImplementedError(f"{name} requires contiguous bf16 CUDA weights and biases")
+            if len({tensor.device for tensor in tensors}) != 1:
+                raise ValueError(f"{name} weights and biases must share one CUDA device")
+            for child_name, child in module.named_modules():
+                qualified = name if not child_name else f"{name}.{child_name}"
+                if child.training:
+                    raise NotImplementedError(f"{qualified} must be in eval mode")
+                if any(getattr(child, field, None) for field in hook_fields):
+                    raise NotImplementedError(f"hooks on {qualified} are outside the benchmark treatment")
+                if torch.nn.utils.parametrize.is_parametrized(child):
+                    raise NotImplementedError(f"parametrizations on {qualified} are outside the benchmark treatment")
+            entries.append((name, module, first, output, module.forward))
+
+    installed = {}
+    for name, module, first, output, original in entries:
+
+        def torch_forward(self, hidden_states, *args, _name=name, _original=original, **kwargs):
+            if args or kwargs:
+                raise NotImplementedError(f"{_name} benchmark dispatcher accepts only the hidden_states argument")
+            counters["torch"] += 1
+            return _original(hidden_states)
+
+        def cudnn_forward(self, hidden_states, *args, _name=name, _first=first, _output=output, **kwargs):
+            if args or kwargs:
+                raise NotImplementedError(f"{_name} benchmark dispatcher accepts only the hidden_states argument")
+            if hidden_states.ndim != 3 or hidden_states.shape[-1] != PUBLISHED_SHAPE["hidden"]:
+                raise ValueError(f"{_name} expected [B,S,{PUBLISHED_SHAPE['hidden']}], got {tuple(hidden_states.shape)}")
+            counters["cudnn"] += 1
+            return gelu_mlp(hidden_states, _first.weight, _first.bias, _output.weight, _output.bias)
+
+        installed[module] = {
+            "original": original,
+            "torch": types.MethodType(torch_forward, module),
+            "cudnn": types.MethodType(cudnn_forward, module),
+        }
+
+    def select(name):
+        if name not in ("torch", "cudnn"):
+            raise ValueError(f"unknown GELU-MLP backend {name!r}")
+        for module, forwards in installed.items():
+            if module.forward not in forwards.values():
+                raise RuntimeError("a Qwen-Image FeedForward was modified after installing the benchmark dispatcher")
+        for module, forwards in installed.items():
+            module.forward = forwards[name]
+
+    def restore():
+        for module, forwards in installed.items():
+            if module.forward in forwards.values():
+                # ``forward`` originally came from the class.  Removing our
+                # instance override restores that exact lookup state and lets
+                # a later benchmark install validate the same model again.
+                module.__dict__.pop("forward", None)
+
+    return select, restore, counters
+
+
 def build_model(torch, qwen_module, device, *, layers):
     torch.manual_seed(0)
     with torch.cuda.device(device):
@@ -318,6 +473,7 @@ def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=MODE_DEFAULTS, default="smoke")
     parser.add_argument("--backend", choices=("torch_reference", "torch_flash", "cudnn"), default="cudnn")
+    parser.add_argument("--mlp-backend", choices=("torch", "cudnn"), default="torch")
     parser.add_argument("--layers", type=int)
     parser.add_argument("--image-tokens", type=int)
     parser.add_argument("--text-tokens", type=int)
@@ -332,15 +488,17 @@ def _main():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
     properties = torch.cuda.get_device_properties(device)
-    if properties.major != 10:
+    if (properties.major, properties.minor) != (10, 0):
         raise RuntimeError(f"Qwen-Image proxy requires SM100, got {properties.name}")
     if cudnn.backend_version() < 92100:
         raise RuntimeError(f"joint d128 SDPA requires a current cuDNN backend, got {cudnn.backend_version()}")
     model = build_model(torch, qwen_module, device, layers=shape["layers"])
     inputs = make_inputs(torch, device, shape)
-    select, restore, counters, probe = install_joint_attention_dispatch(qwen_module, text_tokens=shape["text_tokens"])
+    select_attention, restore_attention, attention_counters, probe = install_joint_attention_dispatch(qwen_module, text_tokens=shape["text_tokens"])
+    select_mlp, restore_mlp, mlp_counters = install_gelu_mlp_dispatch(model)
     try:
-        select(args.backend)
+        select_attention(args.backend)
+        select_mlp(args.mlp_backend)
         samples = []
         with torch.inference_mode():
             for _ in range(2):
@@ -359,16 +517,19 @@ def _main():
             json.dumps(
                 {
                     "backend": args.backend,
+                    "mlp_backend": args.mlp_backend,
                     "p50_ms": statistics.median(samples),
                     "shape": shape,
-                    "calls": counters,
+                    "attention_calls": attention_counters,
+                    "mlp_calls": mlp_counters,
                     "torch_probe": probe,
                 },
                 sort_keys=True,
             )
         )
     finally:
-        restore()
+        restore_mlp()
+        restore_attention()
 
 
 if __name__ == "__main__":
