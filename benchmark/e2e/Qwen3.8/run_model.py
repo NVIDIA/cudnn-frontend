@@ -203,16 +203,11 @@ MODEL_PRESETS = {
 
 
 def _accelerate_mlp():
-    """Route FLA's GatedMLP through cudnn.gemm.ops.swiglu_mlp (bias-free swish MLP:
-    (silu(x@Wg^T) * (x@Wu^T)) @ Wd^T, exactly what the op computes)."""
-    from cudnn.gemm.ops import swiglu_mlp
-    import fla.modules.mlp as fla_mlp
+    """Opt FLA's supported GatedMLP instances into the production cuDNN shim."""
+    import cudnn.fla as cfla
 
-    def _fwd(self, x, **kwargs):
-        return swiglu_mlp(x, self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight)
-
-    fla_mlp.GatedMLP.forward = _fwd
-    print("[e2e] MLP -> cudnn.gemm.ops.swiglu_mlp (PR #609)")
+    cfla.accelerate_fla(verbose=True, targets="gated_mlp")
+    return cfla.mlp_last_path
 
 
 def _accelerate_attn():
@@ -222,7 +217,7 @@ def _accelerate_attn():
     except ImportError:
         print("[e2e] cudnn.fla not installed (PR #596); linear attention stays on FLA")
         return None
-    cfla.accelerate_fla(verbose=True)
+    cfla.accelerate_fla(verbose=True, targets="gated_delta_rule")
     from cudnn.fla.gated_delta_rule import last_path
 
     return last_path
@@ -337,8 +332,7 @@ def main():
         return
 
     attn_path = _accelerate_attn() if args.accelerate_attn else None
-    if args.accelerate_mlp:
-        _accelerate_mlp()
+    mlp_path = _accelerate_mlp() if args.accelerate_mlp else None
 
     ids = torch.randint(0, shape["vocab"], (args.bs, args.seq), device=dev)
 
@@ -346,6 +340,8 @@ def main():
         paths = [f"full-attn SDPA: {args.full_attn_backend}"]
         if attn_path is not None:
             paths.append(f"linear-attn op path: {attn_path()}")
+        if mlp_path is not None:
+            paths.append(f"MLP op path: {mlp_path()}")
         return ", ".join(paths)
 
     profile_and_report(model, ids, extra_path=extra)

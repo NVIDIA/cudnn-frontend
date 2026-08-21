@@ -18,8 +18,8 @@ same 16x factor as the depth, retaining the LM-head/layer FLOP ratio.
 The proxy exposes three independent axes:
 
 - stock FLA versus `cudnn.fla` for linear GDN (`--accelerate_attn`, PR #596);
-- stock FLA `GatedMLP` versus `cudnn.gemm.ops.swiglu_mlp`
-  (`--accelerate_mlp`, PR #609); and
+- stock FLA `GatedMLP` versus the opt-in `cudnn.fla` `gated_mlp` target backed
+  by `cudnn.gemm.ops.swiglu_mlp` (`--accelerate_mlp`, PR #609); and
 - vanilla `torch.nn.functional.scaled_dot_product_attention` versus FE's direct
   cuDNN-backend d256 op (`--full_attn_backend`, develop #335).
 
@@ -27,6 +27,10 @@ The model-level true-vanilla arm means stock FLA GDN + stock FLA MLP + vanilla
 Torch SDPA; it is not an all-eager-Torch implementation. At the benchmark shape,
 Torch 2.13 selects PyTorch FlashAttention rather than cuDNN. Only the MLP axis
 belongs to PR #609.
+
+The formal results below predate this public adapter and used an equivalent
+direct call to `cudnn.gemm.ops.swiglu_mlp`. The adapter itself is validated by
+the focused FLA compatibility suite and a native-route model smoke test.
 
 ## Qwen3.8 proxy result
 
@@ -109,7 +113,9 @@ python benchmark/e2e/Qwen3.8/run_model.py --preset qwen3.5-27b --inspect  # equi
 
 Requires a cuDNN build with the fused GEMM engine and the cuDNN >= 9.23 backend
 d256 SDPA path on an SM100 (Blackwell) device; `flash-linear-attention` provides
-the model. The benchmark rejects the older OSS/CuteDSL d256 SDPA fallback.
+the model. The MLP target requires FLA 0.5.2 and admits its validated plain,
+local, bias-free BF16 `swish` module; unsupported runtime configurations fall
+back to FLA. The benchmark rejects the older OSS/CuteDSL d256 SDPA fallback.
 
 ## Add a model
 
