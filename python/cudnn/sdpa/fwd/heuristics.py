@@ -3,11 +3,28 @@
 
 """How the SDPA-forward family ranks plans for a graph.
 
-``engines/heuristics.rank`` hands over the parsed facts, this family's engine
-ids, and the backend's entries tagged by mode; what :func:`recommend` returns is
-``graph.plans``, position for position. The comparison is here because a cell
-cannot see its siblings and neither side of the FROST/backend split can place
-the other.
+Two layers, deliberately separated:
+
+- :func:`propose` — the PURE core: ``(kind, facts, offered) -> [PlanConfig]``.
+  Backend-blind, graph-blind, import-light. For every offered cell whose
+  capability row admits the facts, the cell's rule emits an ORDERED list of
+  COMPLETE knob assignments (every axis the row declares a domain for carries a
+  concrete value; ``None`` only on undeclared axes), each re-validated through
+  ``mismatch(caps, facts, knobs)`` — a set is honored or never listed. The same
+  engine appears once per surviving set. Standalone callers (wrappers,
+  autotuners) can invoke this directly with a hand-built
+  :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing here touches the
+  backend or a graph object.
+
+- :func:`place` — the interleaver, and the ONLY layer that sees the backend:
+  assembles the caller's mode blocks, decides FROST-vs-backend order
+  (``_MEASURED_BEHIND``), positions the delegating entry, dedups on
+  ``(engine_id, knobs)``, and STRIPS the mode tag — final entries carry
+  ``(engine_id, knobs[, cpp_index])`` only.
+
+``engines/heuristics.rank`` calls :func:`recommend`, which is
+``place`` over ``propose``; what it returns is ``graph.plans``, position for
+position.
 
 Per mode:
 
@@ -20,21 +37,24 @@ Per mode:
 - **B** — answered as A: it asks for a wider search this family has none to
   give.
 
-To add a rule for a cell: write the function (:func:`_sm120_tiles` is the worked
-example), list the cell in ``_TILE_RULE_CELLS``, put the measurement in the
-commit. A cell absent from that set runs its row's sole point per axis, which is
-the honest answer while nobody has timed it.
+To add a rule for a cell: write a generator (:func:`_sm120_tiles` is the worked
+example), register the cell in ``_CELL_TILE_RULES`` (or grow a new axis via the
+five-part checklist in ``engines.py``), put the measurement in the commit. A
+cell with no rule runs its row's sole point per axis, which is the honest
+answer while nobody has timed it.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from dataclasses import replace
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import cudnn
 
 from cudnn.engines.base import PlanConfig
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, mismatch
 
 # Cells timed against the backend's kernel and found SLOWER, so the backend's
 # mode-A entries lead them. Empty: absent means faster OR never timed, and both
@@ -44,6 +64,30 @@ _MEASURED_BEHIND: frozenset = frozenset()
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
+
+# Cap on complete knob sets emitted per engine per kind. The combiner grows
+# Σ|axis runners|, never the cartesian product; this bound keeps the plan list
+# legible and an autotune-ALL pass affordable even as axes accumulate.
+_MAX_SETS_PER_ENGINE = 6
+
+# The causal-balancing budget for the CLC/static LPT_L2 policy on SM100/SM120:
+# LPT_L2's block-cyclic head grouping only pays when ONE head's K+V working set
+# can actually stay L2-resident.
+_SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+# The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
+# template (sched_l2_mib); the adapter owns that table. For POINT ORDERING all
+# that matters here is that SM80's measured primary for causal is LPT_L2.
+
+
+# ---------------------------------------------------------------------------
+# axis generators — each returns an ORDERED candidate list, best first
+# ---------------------------------------------------------------------------
+
+
+def _sole(values):
+    """The only value on an axis, or None where the row declares no domain."""
+    return next(iter(values)) if len(values) == 1 else None
 
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
@@ -89,19 +133,169 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     return tile_m, (fits[0] if fits else min(caps.tile_ns))
 
 
-def _sole(values):
-    """The only value on an axis, or None where the row declares no domain."""
-    return next(iter(values)) if len(values) == 1 else None
+def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[int]]]:
+    """Ordered (tile_m, tile_n) candidates: the rule's best guess first, then
+    the rest of the SMEM-fitting domain for a caller that autotunes. Configs
+    the kernel cannot fit are not runners-up — they would sit in the list only
+    to decline at build."""
+    caps = spec.capabilities
+    if spec.name not in _TILE_RULE_CELLS:
+        # No rule measured for this cell: its capability row has one point per
+        # axis, so there is nothing to choose between anyway.
+        return [(_sole(caps.tile_ms), _sole(caps.tile_ns))]
+    best = _sm120_tiles(caps, facts)
+    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
+    # Same envelope rounding as _sm120_tiles / the adapter's SMEM check.
+    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
+    d_qp = -(-facts.d_qk // granule) * granule
+    d_vp = -(-facts.d_v // granule) * granule
+    domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
+    return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
-def _knobs(caps: Capabilities, tile_m, tile_n) -> SdpaFwdKnobs:
-    """A knob request for one point. A field is None ONLY where the capability
-    row declares no domain for that axis — never "engine, pick for me", which
-    is how the same choice ended up being made here and again in the adapter."""
-    return SdpaFwdKnobs(sched_policy=_sole(caps.sched_policies), tile_m=tile_m, tile_n=tile_n, cga=_sole(caps.cgas))
+def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
+    """Ordered scheduler-policy candidates.
+
+    The PRIMARY reproduces what each adapter's internal derivation historically
+    chose for the graph path, so promoting the decision into the ranked list
+    changes nothing for a caller that builds the first plan; the remaining
+    domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
+    the graph path — the adapters keep a None-input derivation only for
+    standalone wrapper users who bypass ranking.
+    """
+    domain = caps.sched_policies
+    if len(domain) <= 1:
+        return [_sole(domain)]
+    causal_ish = facts.causal or facts.right_band_widening
+    if caps.sm_hi == 80:
+        # SM80's measured choices (see the adapter's flavor table): causal
+        # always groups for L2; pure SWA prefers plain LPT only in the band
+        # where the window walk is long enough to imbalance rows.
+        if causal_ish:
+            primary = SCHED_LPT_L2
+        elif facts.window_left is not None and facts.window_left >= 0:
+            primary = SCHED_LPT if 1024 <= facts.s_kv <= 16384 else SCHED_NATURAL
+        else:
+            primary = SCHED_NATURAL
+    elif causal_ish:
+        # SM100/SM120: balance the triangular load; pick the LPT variant by
+        # whether one head's K+V working set fits the L2 budget.
+        elem = 1 if (facts.is_fp8 or facts.is_mxfp8) else 2
+        one_head_bytes = int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) * elem
+        primary = SCHED_LPT_L2 if one_head_bytes <= _SM100_L2_BUDGET_BYTES else SCHED_LPT
+    else:
+        primary = SCHED_NATURAL
+    order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
+    runners = [p for p in order[primary] if p in domain]
+    # A mask-free graph gains nothing from either LPT remap — the grid is
+    # already balanced — so don't spend autotune slots on them.
+    if not causal_ish and facts.window_left is None:
+        runners = []
+    return [primary if primary in domain else _sole(domain) or SCHED_NATURAL] + runners
 
 
-def _eligible(facts, offered: Dict[str, int]):
+def _split_points(caps: Capabilities, facts) -> List[Optional[int]]:
+    """Ordered split-KV candidates.
+
+    Splitting pays only when the natural grid underfills the machine (the
+    decode/short-prefill regime) and each split still has KV rows to walk.
+    The generator respects the split path's structural limits (dense-only, no
+    sink — mismatch() enforces the same, so an emitted >1 never reaches a
+    kernel that cannot honor it).
+    """
+    domain = caps.split_kvs
+    if len(domain) <= 1:
+        return [_sole(domain)]
+    no_split = 1 if 1 in domain else min(domain)
+    if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+        return [no_split]
+    sm_count = facts.device_sm_count or 0
+    grid = -(-facts.s_q // 128) * facts.h_q * facts.b
+    kv_tiles = -(-facts.s_kv // 128)
+    if sm_count <= 0 or grid >= sm_count or kv_tiles < 2:
+        return [no_split]
+    # Underfilled: offer the smallest split that fills the machine (capped by
+    # the domain and by one KV tile per split) BEHIND the no-split primary.
+    # Deliberately a runner-up until sweeps justify flipping the default: the
+    # first-build behavior stays exactly what this dispatch has always done,
+    # and autotune / select_plan reach the split plan today.
+    want = -(-sm_count // max(grid, 1))
+    usable = [s for s in sorted(domain) if s > 1 and s <= kv_tiles]
+    if not usable:
+        return [no_split]
+    split = next((s for s in usable if s >= want), usable[-1])
+    return [no_split, split]
+
+
+def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
+    """Softmax-precision candidates — sole-point until a kernel serves more."""
+    return [_sole(caps.softmax_precisions)]
+
+
+def _cga_points(caps: Capabilities) -> List[Optional[int]]:
+    """CGA candidates — every row today declares a single honest point."""
+    return [_sole(caps.cgas)]
+
+
+# ---------------------------------------------------------------------------
+# the combiner — complete assignments, Σ growth, never the cartesian product
+# ---------------------------------------------------------------------------
+
+
+def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The cell's ordered COMPLETE knob assignments.
+
+    The baseline takes the best value on every axis; runners-up deviate on ONE
+    axis at a time in impact order (tiles, sched, split) with the other axes
+    held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Axis interactions
+    the kernels cannot serve are the generators'/mismatch's job — nothing here
+    multiplies domains together.
+    """
+    caps = spec.capabilities
+    tiles = _tile_points(spec, facts)
+    scheds = _sched_points(caps, facts)
+    splits = _split_points(caps, facts)
+    base = SdpaFwdKnobs(
+        sched_policy=scheds[0],
+        tile_m=tiles[0][0],
+        tile_n=tiles[0][1],
+        cga=_cga_points(caps)[0],
+        split_kv=splits[0],
+        softmax_precision=_softmax_points(caps)[0],
+    )
+    out = [base]
+    for tile_m, tile_n in tiles[1:]:
+        out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
+    for policy in scheds[1:]:
+        out.append(replace(base, sched_policy=policy))
+    for split in splits[1:]:
+        out.append(replace(base, split_kv=split))
+    seen, unique = set(), []
+    for knobs in out:
+        if knobs not in seen:
+            seen.add(knobs)
+            unique.append(knobs)
+    return unique[:_MAX_SETS_PER_ENGINE]
+
+
+def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
+    """The config expected to build where the tuned choice may not.
+
+    Today this is the smallest tile the row admits with the plain scheduler
+    and no split — the config that asks least of the device, which is the one
+    thing a fallback must be.
+    """
+    return SdpaFwdKnobs(
+        sched_policy=SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies),
+        tile_m=min(caps.tile_ms, default=None),
+        tile_n=min(caps.tile_ns, default=None),
+        cga=_sole(caps.cgas),
+        split_kv=1 if 1 in caps.split_kvs else _sole(caps.split_kvs),
+        softmax_precision=_sole(caps.softmax_precisions),
+    )
+
+
+def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]]:
     """(engine_id, spec) for each offered cell whose capability row admits ``facts``."""
     for spec in ENGINE_SPECS:
         engine_id = offered.get(spec.name)
@@ -109,56 +303,34 @@ def _eligible(facts, offered: Dict[str, int]):
             yield engine_id, spec
 
 
-def _admissible(caps: Capabilities, facts, knobs: SdpaFwdKnobs) -> bool:
-    return mismatch(caps, facts, knobs) is None
+# ---------------------------------------------------------------------------
+# propose — the pure, backend-blind core (also the standalone entry point)
+# ---------------------------------------------------------------------------
 
 
-def _mode_a(facts, offered: Dict[str, int], mode) -> List[PlanConfig]:
-    """Candidates worth timing, best guess first."""
-    out = []
-    for engine_id, spec in _eligible(facts, offered):
-        caps = spec.capabilities
-        if spec.name not in _TILE_RULE_CELLS:
-            # No rule measured for this cell: its capability row has one point
-            # per axis, so there is nothing to choose between anyway.
-            knobs = _knobs(caps, _sole(caps.tile_ms), _sole(caps.tile_ns))
-            if _admissible(caps, facts, knobs):
-                out.append(PlanConfig(engine_id, knobs, mode=mode))
-            continue
-        best = _sm120_tiles(caps, facts)
-        # The guess first, then the rest of the domain as autotune candidates:
-        # the rule's regret is small but not zero, so the runners-up are worth
-        # offering to a caller who measures. Configs the kernel cannot fit are
-        # not runners-up -- they would sit in the list only to decline at build.
-        qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-        # Same envelope rounding as _sm120_tiles / the adapter's SMEM check.
-        granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
-        d_qp = -(-facts.d_qk // granule) * granule
-        d_vp = -(-facts.d_v // granule) * granule
-        domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
-        ordered = sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
-        for tile_m, tile_n in ordered:
-            knobs = _knobs(caps, tile_m, tile_n)
-            if _admissible(caps, facts, knobs):
-                out.append(PlanConfig(engine_id, knobs, mode=mode))
-    return out
+def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+    """Ordered candidate plans for ``facts`` — no backend, no graph, no modes.
 
-
-def _mode_fallback(facts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """Configs expected to build where mode A's choice may not.
-
-    TODO: today this is the smallest tile the row admits — the config that asks
-    least of the device, which is the one thing a fallback must be. Once a cell
-    has features its largest tiles cannot serve, this becomes the handful of
-    configs that between them cover the whole plane, chosen from measurements.
+    ``kind`` is ``"A"`` (candidates worth timing, best guess first) or
+    ``"FALLBACK"`` (least-demanding configs). Every returned entry carries a
+    complete knob assignment validated through ``mismatch(caps, facts, knobs)``
+    — honored-or-never-listed — and NO mode. Standalone callers (wrappers,
+    autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
+    family's ``offered_ids()``, run or time the sets in order.
     """
-    out = []
+    out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
-        knobs = _knobs(caps, min(caps.tile_ms, default=None), min(caps.tile_ns, default=None))
-        if _admissible(caps, facts, knobs):
-            out.append(PlanConfig(engine_id, knobs, mode=cudnn.heur_mode.FALLBACK))
+        sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(caps)]
+        for knobs in sets:
+            if mismatch(caps, facts, knobs) is None:
+                out.append(PlanConfig(engine_id, knobs))
     return out
+
+
+# ---------------------------------------------------------------------------
+# place — the interleaver; the only layer that sees the backend
+# ---------------------------------------------------------------------------
 
 
 def _leads(offered: Dict[str, int], plans: List[PlanConfig]) -> bool:
@@ -167,13 +339,23 @@ def _leads(offered: Dict[str, int], plans: List[PlanConfig]) -> bool:
     return bool(plans) and not all(cfg.engine_id in behind for cfg in plans)
 
 
-def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
-    """The ranked plan list for this graph, mode by mode in the caller's order.
+def _strip(cfg: PlanConfig) -> PlanConfig:
+    """A final-list entry: (engine_id, knobs[, cpp_index]) — the mode tag is
+    assembly bookkeeping and never reaches ``graph.plans``."""
+    if cfg.mode is None and cfg.cpp_index is None:
+        return cfg
+    return PlanConfig(cfg.engine_id, cfg.knobs, cpp_index=cfg.cpp_index)
 
-    Each mode contributes a block and the blocks concatenate, so asking for
-    ``[A, FALLBACK]`` puts every tuned candidate — both sides' — ahead of every
-    fallback. A plan repeated across modes keeps its first position: building
-    the same config twice only costs the caller a JIT compile.
+
+def place(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
+    """Assemble the final ranked list from proposals and the backend's entries,
+    mode block by mode block in the caller's order.
+
+    Asking for ``[A, FALLBACK]`` puts every tuned candidate — both sides' —
+    ahead of every fallback. A plan repeated across blocks keeps its first
+    position. Backend entries arrive tagged with the mode that produced them
+    (plus the untagged delegating entry); the tags steer assembly and are then
+    stripped — final entries carry no mode.
     """
     # An untagged backend entry is the delegating one: OSS candidates C++ holds
     # but never exposes as plans, so it cannot be enumerated. It belongs to no
@@ -186,13 +368,13 @@ def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: L
     out: List[PlanConfig] = []
     for mode in modes:
         if mode == cudnn.heur_mode.OPENSOURCE:
-            out += _mode_a(facts, offered, cudnn.heur_mode.A) + delegating
+            out += propose("A", facts, offered) + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            ours = _mode_a(facts, offered, mode)
+            ours = propose("A", facts, offered)
             theirs = delegating + [c for c in backend_plans if c.mode == mode]
             out += (ours + theirs) if _leads(offered, ours) else (theirs + ours)
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += _mode_fallback(facts, offered) + delegating + [c for c in backend_plans if c.mode == mode]
+            out += propose("FALLBACK", facts, offered) + delegating + [c for c in backend_plans if c.mode == mode]
     # A delegate with no mode asked for it (the backend has engines but exposed
     # no plans) would otherwise be dropped.
     out += delegating
@@ -205,5 +387,10 @@ def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: L
         key = (cfg.engine_id, repr(cfg.knobs))
         if key not in seen:
             seen.add(key)
-            ranked.append(cfg)
+            ranked.append(_strip(cfg))
     return ranked
+
+
+def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
+    """The ranked plan list for this graph: :func:`place` over :func:`propose`."""
+    return place(modes, facts, offered, backend_plans)
