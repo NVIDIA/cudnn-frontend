@@ -9,7 +9,7 @@ mode that produced each — and assembles ``graph.plans``.
 
 Two layers, deliberately separated:
 
-- The FAMILY hook is :func:`propose`-shaped: ``(kind, facts, offered) ->
+- The FAMILY hook is :func:`recommend`-shaped: ``(kind, facts, offered) ->
   [PlanConfig]`` — pure, backend-blind, import-light. It answers one question:
   which of MY engines serve these facts, with which complete knob assignments,
   best first. It never sees the backend, modes, or another family.
@@ -71,11 +71,11 @@ def _strip(cfg: PlanConfig) -> PlanConfig:
     return PlanConfig(cfg.engine_id, cfg.knobs, cpp_index=cfg.cpp_index)
 
 
-def _assemble(modes: List[Any], propose: Callable[[str], List[PlanConfig]], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
+def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
     """The final ranked list: mode block by mode block in the caller's order,
     python proposals leading the backend's entries inside each block.
 
-    ``propose(kind)`` is the family's hook already bound to (facts, offered):
+    ``recommend(kind)`` is the family's hook already bound to (facts, offered):
     ``kind`` is ``"A"`` (candidates worth timing, best first — also the answer
     to B, which asks for a wider search the families have none to give) or
     ``"FALLBACK"`` (the config expected to build where A's choice may not).
@@ -100,11 +100,11 @@ def _assemble(modes: List[Any], propose: Callable[[str], List[PlanConfig]], back
     out: List[PlanConfig] = []
     for mode in modes:
         if mode == cudnn.heur_mode.OPENSOURCE:
-            out += propose("A") + delegating
+            out += recommend("A") + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            out += propose("A") + delegating + [c for c in backend_plans if c.mode == mode]
+            out += recommend("A") + delegating + [c for c in backend_plans if c.mode == mode]
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += propose("FALLBACK") + delegating + [c for c in backend_plans if c.mode == mode]
+            out += recommend("FALLBACK") + delegating + [c for c in backend_plans if c.mode == mode]
     # A delegate with no mode asked for it (the backend has engines but exposed
     # no plans) would otherwise be dropped.
     out += delegating
@@ -128,19 +128,19 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
 
     modes = list(modes) if modes else default_modes()
     family = manifest.family_for(graph)
-    propose = manifest.resolve_heuristics(family) if family is not None else None
-    if propose is None:
+    recommend = manifest.resolve_heuristics(family) if family is not None else None
+    if recommend is None:
         return _unranked(graph, engines, backend_plans)
 
     analyzer = manifest.resolve_analyzer(family)
     facts = graph._facts_for(analyzer) if analyzer is not None else None
     if facts is None:
         # The family claims the graph by node type but its analyzer cannot
-        # express it. Nothing to propose on; the backend serves it.
+        # express it. Nothing to recommend on; the backend serves it.
         return [_strip(c) for c in backend_plans]
 
     offered = {e.name: e.engine_id for e in engines}
-    plans = _assemble(modes, lambda kind: list(propose(kind, facts, offered)), backend_plans)
+    plans = _assemble(modes, lambda kind: list(recommend(kind, facts, offered)), backend_plans)
     own = set(offered.values())
     for cfg in plans:
         from .engine_ids import is_python_engine

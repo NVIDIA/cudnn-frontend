@@ -3,7 +3,7 @@
 
 """The SDPA-forward family's proposals: which cells, with which knob sets.
 
-:func:`propose` is the family's ENTIRE heuristic surface — the PURE core:
+:func:`recommend` is the family's ENTIRE heuristic surface — the PURE core:
 ``(kind, facts, offered) -> [PlanConfig]``. Backend-blind, graph-blind,
 import-light. For every offered cell whose capability row admits the facts,
 the cell's rule emits an ORDERED list of COMPLETE knob assignments (every
@@ -29,7 +29,7 @@ Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
 order. Today that is unambiguous in practice — co-eligible cells are the
 envelope-overlap family, which all lower to the same kernel — and the seam
 for a real ranking, when one is measured, is a score stage here in
-:func:`propose`, not a new layer.
+:func:`recommend`, not a new layer.
 
 To add a rule for a cell: write a generator (:func:`_sm120_tiles` is the
 worked example), register the cell in ``_TILE_RULE_CELLS`` (or grow a new
@@ -263,7 +263,7 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
     """Ordered split-KV candidates for the chosen tile geometry.
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
-    facts-level launch geometry (``tile_m*cga`` rows per tile — the propose
+    facts-level launch geometry (``tile_m*cga`` rows per tile — the recommend
     tier's approximation of the kernel Cfg's exact ``TILES_Q*TILE_M*CTA_MMA``).
     The generator respects the split path's structural limits (dense-only, no
     sink — mismatch() enforces the same, so an emitted >1 never reaches a
@@ -389,11 +389,11 @@ def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]
 
 
 # ---------------------------------------------------------------------------
-# propose — the pure, backend-blind core (also the standalone entry point)
+# recommend — the pure, backend-blind core (also the standalone entry point)
 # ---------------------------------------------------------------------------
 
 
-def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
+def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     """Ordered candidate plans for ``facts`` — no backend, no graph, no modes.
 
     ``kind`` is ``"A"`` (candidates worth timing, best guess first) or

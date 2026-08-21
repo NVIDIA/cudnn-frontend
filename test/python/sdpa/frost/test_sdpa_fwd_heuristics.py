@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SDPA-forward heuristic's propose/place contract.
+"""The SDPA-forward heuristic's recommend contract.
 
-Unit tier (no GPU): propose() emits ordered COMPLETE knob assignments — the
+Unit tier (no GPU): recommend() emits ordered COMPLETE knob assignments — the
 same engine repeated with different sets, every set admissible, no cartesian
 blowup, cross-axis constraints never emitted, mode never on an entry.
 
@@ -22,7 +22,7 @@ import cudnn
 from cudnn.engines.base import PlanConfig
 from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
-from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, propose
+from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 _D128 = "sdpa_fwd_prefill_sm100_d128"
@@ -48,8 +48,8 @@ def _facts(**over):
 
 
 @pytest.mark.L0
-def test_propose_emits_multiple_complete_sets_per_engine():
-    plans = propose("A", _facts(), _OFFERED)
+def test_recommend_emits_multiple_complete_sets_per_engine():
+    plans = recommend("A", _facts(), _OFFERED)
     d128 = [p for p in plans if p.engine_id == 20500]
     assert len(d128) >= 3, "expected sched + split runners behind the primary"
     for p in d128:
@@ -62,32 +62,32 @@ def test_propose_emits_multiple_complete_sets_per_engine():
 
 
 @pytest.mark.L0
-def test_propose_primary_reproduces_the_derived_scheduler():
+def test_recommend_primary_reproduces_the_derived_scheduler():
     # Behavior preservation: the first set carries exactly what the adapter's
     # internal derivation historically chose (causal + small working set ->
     # LPT_L2; mask-free -> NATURAL with no sched runners).
-    causal = propose("A", _facts(), _OFFERED)
+    causal = recommend("A", _facts(), _OFFERED)
     assert causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
-    dense = propose("A", _facts(causal=False), _OFFERED)
+    dense = recommend("A", _facts(causal=False), _OFFERED)
     dense_d128 = [p for p in dense if p.engine_id == 20500]
     assert dense_d128[0].knobs.sched_policy == 0  # SCHED_NATURAL
     assert all(p.knobs.sched_policy == 0 for p in dense_d128), "mask-free graphs gain nothing from LPT runners"
 
 
 @pytest.mark.L0
-def test_propose_split_is_a_runner_up_and_respects_structure():
-    plans = [p for p in propose("A", _facts(), _OFFERED) if p.engine_id == 20500]
+def test_recommend_split_is_a_runner_up_and_respects_structure():
+    plans = [p for p in recommend("A", _facts(), _OFFERED) if p.engine_id == 20500]
     assert plans[0].knobs.split_kv == 1, "no-split stays the default winner until sweeps flip it"
     assert any(p.knobs.split_kv > 1 for p in plans), "underfilled decode-ish grid must offer a split runner"
     for bad in (dict(has_sink=True), dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
-        got = [p for p in propose("A", _facts(**bad), _OFFERED) if p.engine_id == 20500]
+        got = [p for p in recommend("A", _facts(**bad), _OFFERED) if p.engine_id == 20500]
         assert all(p.knobs.split_kv == 1 for p in got), f"split emitted under {bad}"
 
 
 @pytest.mark.L0
-def test_propose_every_set_is_admissible():
+def test_recommend_every_set_is_admissible():
     facts = _facts()
-    for p in propose("A", facts, _OFFERED):
+    for p in recommend("A", facts, _OFFERED):
         spec = next(s for s in engines.ENGINE_SPECS if _OFFERED.get(s.name) == p.engine_id)
         assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
 
@@ -118,7 +118,7 @@ def test_assemble_strips_mode_dedups_and_our_proposals_lead():
 
 @pytest.mark.L0
 def test_fallback_kind_is_least_demanding():
-    for p in propose("FALLBACK", _facts(), _OFFERED):
+    for p in recommend("FALLBACK", _facts(), _OFFERED):
         assert p.knobs.split_kv == 1
         assert p.knobs.sched_policy == 0  # SCHED_NATURAL
 
