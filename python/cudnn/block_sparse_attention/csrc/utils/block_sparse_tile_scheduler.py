@@ -226,9 +226,6 @@ class BlockSparsePersistentTileScheduler:
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
-            # Match blk64 C++ ClcPersistentTileScheduler::consumer_advance:
-            # all warps must converge before consuming the next CLC response.
-            cute.arch.sync_threads()
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)

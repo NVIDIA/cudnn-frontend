@@ -443,6 +443,26 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
 
 
 @pytest.mark.L0
+def test_bsa_attention_forward_sm100_blk64_large_q_auto_scheduler_policy():
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("large-Q scheduler policy is specific to SM100/SM110 blk64")
+
+    _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q_large = torch.empty((1, 40, 131072, 1), device="cuda", dtype=torch.int8)
+    q_small = torch.empty((1, 4, 128, 1), device="cuda", dtype=torch.int8)
+    q2k_block_index = torch.empty((1, 1, 1, 2048), device="cuda", dtype=torch.int32)
+
+    assert interface._sm100_blk64_auto_kv_splits(q_large, q2k_block_index, 2048) == 1
+    assert interface._sm100_blk64_auto_kv_splits(q_small, q2k_block_index, 2048) == 8
+    assert interface.choose_blk64_use_clc(q_large, 256)
+    assert interface.choose_blk64_use_clc(q_large, 2048)
+
+
+@pytest.mark.L0
 def test_bsa_attention_forward_sm120_static_compile_key_tracks_tensor_type():
     _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
