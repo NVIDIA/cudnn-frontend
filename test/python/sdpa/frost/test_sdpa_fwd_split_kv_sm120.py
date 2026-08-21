@@ -139,5 +139,8 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
     with pytest.raises(ValueError, match="split_kv"):
         bad.compile()  # derived LPT + split: the config backstop rejects
 
-    split, got, ref, _, _expected = _sm120_case(8, 1, 512, 8192, causal=True)
+    split, got, ref, _, expected = _sm120_case(8, 1, 512, 8192, causal=True)
+    if expected == 1:
+        pytest.skip("this part is small enough that the causal shape already fills it")
+    assert split == expected > 1, "the causal arm must actually exercise the split"
     assert (got - ref).abs().max().item() <= 2e-2

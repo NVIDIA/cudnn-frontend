@@ -849,8 +849,8 @@ def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True):
     ``lower_dsl_prefill`` forwards a plan's knobs; return (split, O, ref)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("half-precision SM100 prefill requires an SM100-line part")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("half-precision SM100 prefill requires cc10.0 / cc10.3")
     d = 128
     dev = "cuda"
     torch.manual_seed(0)
@@ -930,8 +930,9 @@ def _api_fp8_case(h_q, h_kv, s_q, s_kv, *, mx):
     """FP8 / MXFP8 through the adapter; returns (split, O, O_unsplit, amax)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100-line part required")
+    _cc = torch.cuda.get_device_capability()
+    if _cc not in ((10, 0), (10, 3)) and not (_cc == (10, 7) and not mx):
+        pytest.skip("MXFP8 requires cc10.0 / cc10.3; per-tensor FP8 also runs on cc10.7")
     b, d, dev = 1, 128, "cuda"
 
     def build(force_one):

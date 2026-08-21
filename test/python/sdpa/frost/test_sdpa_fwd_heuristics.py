@@ -166,10 +166,26 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
     """Issue F-2 regression: the split plan is graph-reachable, carves its
     slabs from the caller workspace, and recombines exactly."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
+    # The split value depends on this device's SM count — ask the chooser
+    # rather than hard-coding one that only holds at one part's geometry.
+    from cudnn._device import device_info
+    from cudnn.sdpa.fwd.heuristics import choose_split_kv
+
+    want = choose_split_kv(
+        q_tiles=-(-SQ // 256),
+        heads_q=H,
+        batch=B,
+        kv_tiles=-(-SKV // 128),
+        sm_count=device_info(torch.cuda.current_device()).sm_count,
+        ctas_per_tile=2,
+        max_split=4,
+    )
+    if want == 1:
+        pytest.skip("this part is small enough that the shape already fills it")
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     d128 = [n for n in names if "sm100_d128" in n]
     assert len(d128) >= 3, f"expected knob-suffixed duplicates of the d128 cell: {d128}"
-    split_idx = next(i for i, n in enumerate(names) if "sm100_d128" in n and "split_kv=4" in n)
+    split_idx = next(i for i, n in enumerate(names) if "sm100_d128" in n and f"split_kv={want}" in n)
     g.select_plan(split_idx)
     g.check_support()
     g.build_plans()
@@ -194,7 +210,7 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
 
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
-    assert knobs.split_kv == 4
+    assert knobs.split_kv == want
     g2, handles2, _ = _build_decodeish_graph()
     cfg = g2.create_execution_plan(eng_id, knobs)
     assert cfg is not None

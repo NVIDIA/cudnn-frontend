@@ -286,6 +286,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # request never reaches a kernel that cannot honor it.
             if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
                 return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+                # The lowering would serve this ragged S_kv through the padded
+                # kernel path (synthesized per-batch KV lengths) — the same
+                # path the split cannot ride. Mirror lower_dsl_prefill's
+                # synth_kv_padding predicate so the plan is never listed.
+                return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
             if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
                 # The combine reduces partials in half precision; reducing
                 # QUANTIZED partials would lose what the split must be

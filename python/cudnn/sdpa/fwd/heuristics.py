@@ -54,7 +54,7 @@ import cudnn
 from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, mismatch
 
 # Cells timed against the backend's kernel and found SLOWER, so the backend's
 # mode-A entries lead them. Empty: absent means faster OR never timed, and both
@@ -291,6 +291,10 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
         return [_sole(domain)]
     no_split = 1 if 1 in domain else min(domain)
     if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+        return [no_split]
+    if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+        # This S_kv would be served through the synthesized KV-tail padding,
+        # which the split cannot ride (mismatch declines the same combination).
         return [no_split]
     if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
         # The combine reduces partials in half precision; reducing QUANTIZED
