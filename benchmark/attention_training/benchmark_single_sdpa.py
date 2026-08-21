@@ -67,6 +67,30 @@ def _peak_flops_per_clock_per_sm(dtype_str):
     return _FLOPS_PER_CLOCK_PER_SM.get(props.major, {}).get(dtype_str)
 
 
+def _nvml_handle_for_torch_device(pynvml, cuda_index):
+    """NVML handle for the PHYSICAL device backing torch device ``cuda_index``.
+
+    NVML enumerates physical GPUs and ignores CUDA_VISIBLE_DEVICES, while torch
+    indexes only the visible subset: under ``CUDA_VISIBLE_DEVICES=3`` the
+    benchmark runs on physical GPU 3 but ``torch.cuda.current_device()`` is 0,
+    so indexing NVML with the torch index samples GPU 0's clock. When several
+    single-GPU shards run side by side on a multi-GPU node (each pinned via
+    CUDA_VISIBLE_DEVICES), a shard whose neighbor GPU 0 has gone idle then
+    records the IDLE clock as its "peak", collapsing the SOL ceiling by the
+    idle-vs-boost ratio (>10x on aggressively-downclocking parts).
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        entries = [e.strip() for e in cvd.split(",") if e.strip()]
+        if cuda_index < len(entries):
+            entry = entries[cuda_index]
+            if entry.isdigit():
+                return pynvml.nvmlDeviceGetHandleByIndex(int(entry))
+            # UUID ("GPU-...") or MIG ("MIG-...") form.
+            return pynvml.nvmlDeviceGetHandleByUUID(entry.encode())
+    return pynvml.nvmlDeviceGetHandleByIndex(cuda_index)
+
+
 class _SmClockSampler:
     """Background thread that polls SM clock via NVML at ~1 kHz.
 
@@ -89,7 +113,7 @@ class _SmClockSampler:
 
             pynvml.nvmlInit()
             self._pynvml = pynvml
-            self._handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            self._handle = _nvml_handle_for_torch_device(pynvml, torch.cuda.current_device())
         except Exception:
             self._pynvml = None
             return
