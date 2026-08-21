@@ -1516,12 +1516,11 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         c_smem_layout_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile_c, 1)
         d_smem_layout_one = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
 
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_one)
-        )
+        a_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_one)
+        b_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_one)
+        sfa_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfa_smem_layout_one)
+        sfb_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfb_smem_layout_one)
+        ab_bytes_per_stage = a_bytes_per_stage + b_bytes_per_stage + sfa_bytes_per_stage + sfb_bytes_per_stage
         mbar_helpers_bytes = 1024
 
         # One fp8 scale byte per (1,16) feature block, one row per thread (128 threads).
@@ -1530,19 +1529,24 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # sInfo is in SchedulerStorage, not here, so use 4-int sInfo
         sinfo_bytes = 4 * 4 * num_tile_stage
         c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_one) * num_c_stage
-        d_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_one) * num_d_stage
+        d_main_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_one) * num_d_stage
+        d_bytes = d_main_bytes
 
+        d_bf16_bytes = 0
         if d_quant:
             # sD staging stays bf16 (the RHT/quant warps' source); the gmem-dtype (fp4)
             # staging above becomes the TMA source, and sfd rows are staged per thread.
             bf16_smem_layout_one = sm100_utils.make_smem_layout_epi(cutlass.BFloat16, d_layout, epi_tile, 1)
-            d_bytes += cute.size_in_bytes(cutlass.BFloat16, bf16_smem_layout_one) * num_d_stage
+            d_bf16_bytes = cute.size_in_bytes(cutlass.BFloat16, bf16_smem_layout_one) * num_d_stage
+            d_bytes += d_bf16_bytes
             d_bytes += quant_sf_bytes
 
         rht_bytes = 0
+        rht_main_bytes = 0
         if rht_dtype is not None:
             rht_smem_layout_one = sm100_utils.make_smem_layout_epi(rht_dtype, d_layout, epi_tile, 1)
-            rht_bytes = cute.size_in_bytes(rht_dtype, rht_smem_layout_one) * num_d_stage
+            rht_main_bytes = cute.size_in_bytes(rht_dtype, rht_smem_layout_one) * num_d_stage
+            rht_bytes = rht_main_bytes
         if rht_quant:
             rht_bytes += quant_sf_bytes
 
@@ -1556,6 +1560,43 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         epi_bytes = c_bytes + d_bytes + rht_bytes + bias_bytes
 
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
+
+        # The byte-sum model above ignores the 1024-B alignment padding of the
+        # SharedStorage buffers, so a tight config can produce a struct that
+        # exceeds the sm_107 SMEM cap and CUDA rejects the launch
+        # (CUDA_LAUNCH_INVALID_CONFIG). Mirror the struct layout exactly and shed
+        # A/B stages until it genuinely fits.
+        buffer_align_bytes = 1024
+
+        def round_align(nbytes):
+            return (nbytes + buffer_align_bytes - 1) // buffer_align_bytes * buffer_align_bytes
+
+        def shared_storage_bytes(n_ab):
+            # Exact size of the SharedStorage struct in __call__ for these stage
+            # counts: mbars/scheduler head padded to the first 1024-B-aligned
+            # buffer, one aligned extent per MemRange (the 16-B-aligned sSfd /
+            # sSfRht rows are each followed by a 1024-B-aligned buffer, so they
+            # round up to it), and the sBias tail plus the trailing padding that
+            # rounds the struct itself up to 1024 B.
+            total = mbar_helpers_bytes
+            total += round_align(c_bytes)
+            total += round_align(d_main_bytes if not d_quant else d_bf16_bytes)  # sD
+            if d_quant:
+                total += round_align(d_main_bytes)  # sDq (fp4 TMA staging)
+                total += round_align(quant_sf_bytes)  # sSfd
+            if rht_dtype is not None:
+                total += round_align(rht_main_bytes)  # sRht
+            if rht_quant:
+                total += round_align(quant_sf_bytes)  # sSfRht
+            total += round_align(a_bytes_per_stage * n_ab)
+            total += round_align(b_bytes_per_stage * n_ab)
+            total += round_align(sfa_bytes_per_stage * n_ab)
+            total += round_align(sfb_bytes_per_stage * n_ab)
+            total += round_align(bias_bytes)  # sBias + trailing padding
+            return total
+
+        while num_ab_stage > 1 and shared_storage_bytes(num_ab_stage) > num_smem_capacity // occupancy:
+            num_ab_stage -= 1
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage, num_pingpong_stage
 

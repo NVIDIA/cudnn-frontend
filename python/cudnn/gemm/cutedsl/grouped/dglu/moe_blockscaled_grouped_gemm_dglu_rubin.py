@@ -3908,12 +3908,11 @@ class BlockScaledMoEGroupedGemmDgluKernel:
             1,
         )
 
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
-        )
+        a_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        b_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        sfa_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
+        sfb_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
+        ab_bytes_per_stage = a_bytes_per_stage + b_bytes_per_stage + sfa_bytes_per_stage + sfb_bytes_per_stage
         # Mbar bytes
         mbar_helpers_bytes = 1024
         # Sinfo bytes
@@ -3938,6 +3937,35 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
 
-        total_bytes = occupancy * (ab_bytes_per_stage * num_ab_stage + epi_bytes + sinfo_bytes + mbar_helpers_bytes)
+        # The byte-sum model above ignores the 1024-B alignment padding of the
+        # SharedStorage buffers, so a tight config can produce a struct that
+        # exceeds the sm_107 SMEM cap and CUDA rejects the launch
+        # (CUDA_LAUNCH_INVALID_CONFIG). Mirror the struct layout exactly and shed
+        # A/B stages until it genuinely fits.
+        buffer_align_bytes = 1024
+
+        def round_align(nbytes):
+            return (nbytes + buffer_align_bytes - 1) // buffer_align_bytes * buffer_align_bytes
+
+        d_is_quantized = d_dtype == cutlass.Float8E5M2 or d_dtype == cutlass.Float8E4M3FN
+
+        def shared_storage_bytes(n_ab):
+            # Exact size of the SharedStorage struct in __call__ for these stage
+            # counts: mbars/scheduler head padded to the first 1024-B-aligned
+            # buffer, one aligned extent per MemRange, and the sAmax + 128-B-aligned
+            # sDbias tail plus the trailing padding that rounds the struct itself
+            # up to 1024 B.
+            total = mbar_helpers_bytes
+            total += round_align(c_bytes_per_stage * num_c_stage)
+            total += round_align(d_bytes_per_stage * num_d_stage) * (2 if d_is_quantized else 1)  # sD (+ sD_col)
+            total += round_align(a_bytes_per_stage * n_ab)
+            total += round_align(b_bytes_per_stage * n_ab)
+            total += round_align(sfa_bytes_per_stage * n_ab)
+            total += round_align(sfb_bytes_per_stage * n_ab)
+            total += round_align(dbias_bytes + 128)  # sAmax + sDbias alignment + trailing padding
+            return total
+
+        while num_ab_stage > 1 and shared_storage_bytes(num_ab_stage) > num_smem_capacity // occupancy:
+            num_ab_stage -= 1
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage
