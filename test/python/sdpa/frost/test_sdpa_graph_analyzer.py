@@ -166,7 +166,7 @@ def test_probe_envelope_mixed_dims_pick_covering_flavor():
     assert ordered[0] == engines.engine_name(192, d_v=128)
 
 
-def test_d192_fp8_sink_dtype_gate():
+def test_d192_fp8_sink_dtype_support():
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(192, d_v=128, fp8=True))
 
     def facts(dtype, *, sink):
@@ -187,8 +187,7 @@ def test_d192_fp8_sink_dtype_gate():
 
     assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E4M3, sink=True)) is None
     assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=False)) is None
-    reason = engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=True))
-    assert "sink token with dtype" in reason
+    assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=True)) is None
 
 
 def test_probe_rejects_wrong_device_family(monkeypatch):

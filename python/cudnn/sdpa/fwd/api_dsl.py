@@ -957,6 +957,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
             # selects the equivalent masked-interior lowering.
             template_window_right = self.s_k_max
+        rescale_threshold_log2 = None
+        if self._fp8 and self._pertensor and self.flavor == (192, 128) and self.dtype == torch.float8_e5m2 and self.has_sink:
+            # The native FP8 graph contract accepts this existing override in
+            # natural-exponent score units. D192 tracks maxima in log2 units,
+            # so convert before placing it in the template/module cache key.
+            value = os.environ.get("CUDNN_RESCALE_THRESHOLD")
+            if value:
+                try:
+                    threshold = float(value)
+                except ValueError:
+                    threshold = None
+                if threshold is not None and math.isfinite(threshold):
+                    rescale_threshold_log2 = threshold * math.log2(math.e)
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -969,6 +982,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             sched_policy=sched_policy,
             lpt_head_group=lpt_head_group,
             lpt_q_tiles=lpt_q_tiles,
+            rescale_threshold_log2=rescale_threshold_log2,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
         )
