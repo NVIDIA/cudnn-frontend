@@ -40,8 +40,22 @@ from cuda.bindings import driver as _cuda
 
 # @@INJECT_TILE_CONSTANTS@@
 
+# Rank decomposition below uses shifts and masks instead of runtime integer
+# division.  The catalog satisfies this; keep synthesized configs from silently
+# taking the fast path with a non-power-of-two cluster dimension.
+if any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in cluster_shape_mnk[:2]):
+    raise NotImplementedError(f"{__name__}: cluster M/N dimensions must be powers of two")
+if fallback_cluster_shape_mnk is not None and any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in fallback_cluster_shape_mnk[:2]):
+    raise NotImplementedError(f"{__name__}: fallback cluster M/N dimensions must be powers of two")
 
-CLC_SCHED_STAGES = 2
+# Keep the two launch alternatives as host constants and spell the preferred /
+# fallback operations at each use site. This exposes constant masks and shift
+# alternatives before backend canonicalization.
+_preferred_cluster_m_shift = cluster_shape_mnk[0].bit_length() - 1
+_preferred_cluster_n_shift = cluster_shape_mnk[1].bit_length() - 1
+_fallback_cluster_m_shift = _preferred_cluster_m_shift if fallback_cluster_shape_mnk is None else fallback_cluster_shape_mnk[0].bit_length() - 1
+_fallback_cluster_n_shift = _preferred_cluster_n_shift if fallback_cluster_shape_mnk is None else fallback_cluster_shape_mnk[1].bit_length() - 1
+
 
 # Programmatic Dependent Launch (PDL, sm_90+).
 USE_PDL = True
@@ -136,8 +150,15 @@ def _kernel(
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    m_rank = cta_rank_in_cluster % cluster_m
-    n_rank = cta_rank_in_cluster // cluster_m
+    # Every catalog cluster dimension is a power of two.  Mixed-CGA makes the
+    # divisor runtime-visible, so spelling rank decomposition as div/mod would
+    # otherwise lower to reciprocal-based integer division in every warp.
+    m_rank = cta_rank_in_cluster & (cluster_shape_mnk[0] - 1)
+    n_rank = cta_rank_in_cluster >> _preferred_cluster_m_shift
+    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+            m_rank = cta_rank_in_cluster & (fallback_cluster_shape_mnk[0] - 1)
+            n_rank = cta_rank_in_cluster >> _fallback_cluster_m_shift
 
     is_cluster_leader_cta = cta_rank_in_cluster == 0
 
@@ -151,13 +172,24 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_c_desc.get_ptr())
         # @@TMA_STORE_ONLY:END@@
 
-    swizzle_w = _auto_swizzle_w(m, n, k, gridy // cluster_n)
+    init_raw_m = bidx >> _preferred_cluster_m_shift
+    init_raw_n = bidy >> _preferred_cluster_n_shift
+    init_nt_m = gridx >> _preferred_cluster_m_shift
+    init_nt_n = gridy >> _preferred_cluster_n_shift
+    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+            init_raw_m = bidx >> _fallback_cluster_m_shift
+            init_raw_n = bidy >> _fallback_cluster_n_shift
+            init_nt_m = gridx >> _fallback_cluster_m_shift
+            init_nt_n = gridy >> _fallback_cluster_n_shift
+    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
     init_tile_m, init_tile_n = _l2_swizzle_tile(
-        bidx // cluster_m,
-        bidy // cluster_n,
-        gridx // cluster_m,
-        gridy // cluster_n,
+        init_raw_m,
+        init_raw_n,
+        init_nt_m,
+        init_nt_n,
         swizzle_w,
+        identity=tile_swizzle_n == 1,
     )
     init_tile_l = bidz
 
@@ -340,7 +372,9 @@ def _kernel(
                                     group=nvvm.CTAGroup.CTA_1,
                                 )
                         else:
-                            _a_per_cta = a_mcast_slices // cluster_n
+                            _a_per_cta = a_mcast_slices >> _preferred_cluster_n_shift
+                            if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                                _a_per_cta = a_mcast_slices >> _fallback_cluster_n_shift
                             for _asl in cutlass.range(_a_per_cta):
                                 _a_idx = n_rank * _a_per_cta + _asl
                                 if elect_one:
@@ -428,7 +462,9 @@ def _kernel(
                                     group=nvvm.CTAGroup.CTA_1,
                                 )
                         else:
-                            _b_per_cta = b_mcast_slices // cluster_m
+                            _b_per_cta = b_mcast_slices >> _preferred_cluster_m_shift
+                            if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                                _b_per_cta = b_mcast_slices >> _fallback_cluster_m_shift
                             for _bsl in cutlass.range(_b_per_cta):
                                 _b_idx = m_rank * _b_per_cta + _bsl
                                 if elect_one:
@@ -536,6 +572,26 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         acc_stage = cutlass.Int32(0)
+        # Descriptor metadata and the SMEM allocation base are invariant across
+        # tiles.  Only the encoded stage/K/M start address advances.
+        desc_a_roots = [
+            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                start_address=smem_a_list[i],
+                leading_byte_offset=a_smem_desc_leading_byte_offset,
+                stride_byte_offset=a_smem_desc_stride_byte_offset,
+                layout=ab_smem_swizzle,
+            )
+            for i in range(num_a_operands)
+        ]
+        desc_b_roots = [
+            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                start_address=smem_b_list[j],
+                leading_byte_offset=b_smem_desc_leading_byte_offset,
+                stride_byte_offset=b_smem_desc_stride_byte_offset,
+                layout=ab_smem_swizzle,
+            )
+            for j in range(num_b_operands)
+        ]
         while is_valid != 0:
             acc_stage = tile_iter % acc_stages
             if acc_stage == 0 and tile_iter != 0:
@@ -574,24 +630,14 @@ def _kernel(
 
                 for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                     for g in cutlass.range_constexpr(num_gemms):
-                        sA_stage = smem_a_list[gemm_a_idx[g]].subview(sA_elems * stage)
-                        sB_stage = smem_b_list[gemm_b_idx[g]].subview(sB_elems * stage)
-                        desc_b = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                            start_address=sB_stage,
-                            leading_byte_offset=b_smem_desc_leading_byte_offset,
-                            stride_byte_offset=b_smem_desc_stride_byte_offset,
-                            layout=ab_smem_swizzle,
-                        ).advance_start_address(b_smem_k_step_bytes * k_block_idx)
+                        desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                         for mi in cutlass.range_constexpr(num_mma_m):
                             # The M sub-block offset is a whole SMEM swizzle atom
                             # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
                             # swizzle phase is preserved.
-                            desc_a = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                start_address=sA_stage,
-                                leading_byte_offset=a_smem_desc_leading_byte_offset,
-                                stride_byte_offset=a_smem_desc_stride_byte_offset,
-                                layout=ab_smem_swizzle,
-                            ).advance_start_address(a_smem_m_step_bytes * mi + a_smem_k_step_bytes * k_block_idx)
+                            desc_a = desc_a_roots[gemm_a_idx[g]].advance_start_address(
+                                sA_bytes * stage + a_smem_m_step_bytes * mi + a_smem_k_step_bytes * k_block_idx
+                            )
                             if elect_one:
                                 nvvm.tcgen05_mma(
                                     mma_kind,

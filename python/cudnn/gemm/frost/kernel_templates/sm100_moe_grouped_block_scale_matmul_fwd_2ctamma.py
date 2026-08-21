@@ -759,6 +759,44 @@ def _kernel(
             sfb_dst_ptrs = [
                 [nvvm.make_tmem_ptr(sfb_tmem_bases[j] + m * registers_per_block, cutlass.Float32) for m in range(num_blocks_n)] for j in range(num_b_operands)
             ]
+            # Per-group TMA replacement changes the GMEM source, not these
+            # invariant MMA-side SMEM descriptor roots.
+            desc_a_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_a_list[i],
+                    leading_byte_offset=a_smem_desc_leading_byte_offset,
+                    stride_byte_offset=a_smem_desc_stride_byte_offset,
+                    layout=ab_smem_swizzle,
+                )
+                for i in range(num_a_operands)
+            ]
+            desc_b_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_b_list[j],
+                    leading_byte_offset=b_smem_desc_leading_byte_offset,
+                    stride_byte_offset=b_smem_desc_stride_byte_offset,
+                    layout=ab_smem_swizzle,
+                )
+                for j in range(num_b_operands)
+            ]
+            desc_sfa_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_sfa_list[i],
+                    leading_byte_offset=16,
+                    stride_byte_offset=128,
+                    layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
+                )
+                for i in range(num_a_operands)
+            ]
+            desc_sfb_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_sfb_list[j],
+                    leading_byte_offset=16,
+                    stride_byte_offset=128,
+                    layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
+                )
+                for j in range(num_b_operands)
+            ]
             while is_valid != 0:
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_full_mbar_ptr.subview(sched_stage),
@@ -810,42 +848,10 @@ def _kernel(
                         if stage == 0 and ab_iter != 0:
                             ab_full_phase_bit = ab_full_phase_bit ^ 1
 
-                        desc_a_bases = [
-                            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                start_address=smem_a_list[i].subview(sA_elems * stage),
-                                leading_byte_offset=a_smem_desc_leading_byte_offset,
-                                stride_byte_offset=a_smem_desc_stride_byte_offset,
-                                layout=ab_smem_swizzle,
-                            )
-                            for i in range(num_a_operands)
-                        ]
-                        desc_b_bases = [
-                            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                start_address=smem_b_list[j].subview(sB_elems * stage),
-                                leading_byte_offset=b_smem_desc_leading_byte_offset,
-                                stride_byte_offset=b_smem_desc_stride_byte_offset,
-                                layout=ab_smem_swizzle,
-                            )
-                            for j in range(num_b_operands)
-                        ]
-                        desc_sfa_bases = [
-                            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                start_address=smem_sfa_list[i].subview(sfa_smem_bytes * stage),
-                                leading_byte_offset=16,
-                                stride_byte_offset=128,
-                                layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
-                            )
-                            for i in range(num_a_operands)
-                        ]
-                        desc_sfb_bases = [
-                            cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                start_address=smem_sfb_list[j].subview(sfb_smem_bytes * stage),
-                                leading_byte_offset=16,
-                                stride_byte_offset=128,
-                                layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
-                            )
-                            for j in range(num_b_operands)
-                        ]
+                        desc_a_bases = [desc_a_roots[i].advance_start_address(sA_bytes * stage) for i in range(num_a_operands)]
+                        desc_b_bases = [desc_b_roots[j].advance_start_address(sB_bytes * stage) for j in range(num_b_operands)]
+                        desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_smem_bytes * stage) for i in range(num_a_operands)]
+                        desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_smem_bytes * stage) for j in range(num_b_operands)]
 
                         while not nvvm.mbarrier_try_wait_parity(
                             sf_full_mbar_ptr.subview(stage),
