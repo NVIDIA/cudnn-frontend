@@ -264,3 +264,20 @@ FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
+-------------------------------------------------------------------------------
+10. FlashInfer
+    https://github.com/flashinfer-ai/flashinfer
+
+The benchmark-private SM100 NVFP4 activation quantizer under
+python/cudnn/gemm/ops/csrc/ is derived from FlashInfer's
+include/flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh at commit
+f212ec8230486e3615502b8af75fe7022c60b2f3. The upstream source in turn
+credits NVIDIA TensorRT-LLM's nvfp4SmoothQuantize kernel and quantization
+helpers. The derived source retains its NVIDIA copyright and provenance.
+Local changes are limited to provenance and formatting annotations.
+
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
