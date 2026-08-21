@@ -24,9 +24,8 @@ Full-attention layers use a Torch-SDPA-compatible flash-attn stand-in, so no
 flash-attn install is needed.  The default calls the cuDNN Frontend op directly,
 bypassing the tested Torch 2.13 dispatch guard that does not select cuDNN for
 head-dim 256; ``--full_attn_backend torch`` restores the vanilla dispatcher for
-an exact A/B.  The cuDNN arm requires the cuDNN >= 9.23 backend d256 path and
-explicitly forbids FE's older OSS/CuteDSL d256 fallback.  Requires an SM100
-(Blackwell) device.
+an exact A/B.  The cuDNN arm requires cuDNN backend >= 9.23; after FE #682 the
+public d256 op is backend-graph-only.  Requires an SM100 (Blackwell) device.
 
     python benchmark/e2e/Qwen3.8/run_model.py --accelerate_mlp 1 --accelerate_attn 1
 """
@@ -44,12 +43,12 @@ from _perfshare import pick_sm100, profile_and_report  # noqa: E402
 def _wire_sdpa_attention():
     """Build switchable Torch/cuDNN SDPA adapters for FLA full attention.
 
-    FE #335 routes d256 through the backend graph on cuDNN >= 9.23 and otherwise
-    falls back to Sdpafwd/SdpabwdSm100D256, which are OSS/CuteDSL kernels.  This
-    perf benchmark rejects the latter rather than silently measuring it.  Both
-    adapters receive the same projected/rotated Q/K/V and return the same packed
-    BLHD layout.  Thus QKV/RoPE/O remain common code and are included in module
-    and model timings; only the SDPA core changes across this axis.
+    FE #682 removed the legacy standalone d256 OSS/CuteDSL stacks, so the public
+    op below is backend-graph-only.  cuDNN 9.23 is the first backend release with
+    d256 forward and backward support.  Both adapters receive the same
+    projected/rotated Q/K/V and return the same packed BLHD layout.  Thus
+    QKV/RoPE/O remain common code and are included in module and model timings;
+    only the SDPA core changes across this axis.
     """
     import cudnn
     import cudnn.experimental.ops.sdpa as cudnn_sdpa_module
@@ -68,20 +67,10 @@ def _wire_sdpa_attention():
             "would also replace the intended cuDNN-backend d256 SDPA plan"
         )
 
-    backend_floor = getattr(cudnn_sdpa_module, "_CUDNN_BACKEND_D256_VERSION", None)
-    if backend_floor is None:
-        raise RuntimeError("FE SDPA op lacks the cuDNN-backend d256 bypass from #335; " "refusing to benchmark the OSS/CuteDSL fallback")
+    backend_floor = 92300
     backend_version = cudnn.backend_version()
     if backend_version < backend_floor:
-        raise RuntimeError(f"cuDNN backend {backend_version} < required {backend_floor}; " "refusing to benchmark the OSS/CuteDSL d256 fallback")
-
-    def _forbid_oss_d256(*args, **kwargs):
-        raise RuntimeError("unexpected OSS/CuteDSL d256 SDPA route; this benchmark requires " "the cuDNN backend implementation")
-
-    # Mirror #335's routing test with persistent sentinels: both the forward and
-    # autograd backward must fail instead of silently selecting the OSS kernels.
-    cudnn_sdpa_module.sdpa_fwd_d256 = _forbid_oss_d256
-    cudnn_sdpa_module.sdpa_bwd_d256 = _forbid_oss_d256
+        raise RuntimeError(f"d256 SDPA requires cuDNN backend >= {backend_floor}; got {backend_version}")
     cudnn_sdpa = cudnn_sdpa_module.scaled_dot_product_attention
 
     def _prepare(q, k, v, window_size):
@@ -201,6 +190,24 @@ MODEL_PRESETS = {
     },
 }
 
+# Numerical policy is deliberately data, not another implementation bit. A
+# future FP8/FP4 leaf gets its own runner/record rather than branching throughout
+# this BF16 benchmark.
+NUMERICAL_RECIPE = {
+    "id": "conservative-bf16-v1",
+    "parameter_dtype": "bfloat16",
+    "activation_dtype": "bfloat16",
+    "scope": "forward_backward_no_optimizer",
+    "anchor": {
+        "project": "NVIDIA-NeMo/Megatron-Bridge",
+        "commit": "2e77041c194d106beb7462e226d7ca06b33ea63f",
+        "path": "src/megatron/bridge/training/mixed_precision.py",
+        "symbol": "bf16_mixed",
+        "aligned_scope": "single-GPU BF16 parameter/activation policy only; no distributed or optimizer claim",
+    },
+    "alignment": "upstream_anchored_subset",
+}
+
 
 def _accelerate_mlp():
     """Opt FLA's supported GatedMLP instances into the production cuDNN shim."""
@@ -284,7 +291,7 @@ def main():
         "--accelerate_mlp",
         type=int,
         default=1,
-        help="route the SwiGLU MLP through cuDNN (PR #609)",
+        help="route the SwiGLU MLP through the cudnn.fla shim backed by PR #609",
     )
     ap.add_argument(
         "--accelerate_attn",
