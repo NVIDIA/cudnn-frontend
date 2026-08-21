@@ -21,7 +21,8 @@ import torch
 import cudnn
 from cudnn.engines.base import PlanConfig
 from cudnn.sdpa.fwd import engines
-from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, place, propose, recommend
+from cudnn.engines.heuristics import _assemble
+from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, propose
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 _D128 = "sdpa_fwd_prefill_sm100_d128"
@@ -92,18 +93,27 @@ def test_propose_every_set_is_admissible():
 
 
 @pytest.mark.L0
-def test_place_strips_mode_and_dedups():
-    facts = _facts()
+def test_assemble_strips_mode_dedups_and_our_proposals_lead():
+    """Placement is the SHARED layer's job (engines/heuristics._assemble):
+    proposals lead the backend's entries inside each mode block by standing
+    assumption, the delegating entry never leads an OPENSOURCE block, one
+    config repeated across blocks keeps its first position, and no final
+    entry carries a mode."""
+    ours = [PlanConfig(20500, "set-a"), PlanConfig(20500, "set-b")]
     backend = [
         PlanConfig(-1, None),  # delegating (mode None)
         PlanConfig(7, {"k": 1}, cpp_index=0, mode=cudnn.heur_mode.A),
         PlanConfig(7, {"k": 1}, cpp_index=1, mode=cudnn.heur_mode.FALLBACK),  # same config, later block
     ]
-    final = place([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], facts, _OFFERED, backend)
+    final = _assemble([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK], lambda kind: ours if kind == "A" else [], backend)
     assert all(p.mode is None for p in final), "mode must never reach final entries"
+    assert [p.engine_id for p in final[:2]] == [20500, 20500], "our proposals lead the backend inside the block"
     assert sum(1 for p in final if p.engine_id == 7) == 1, "one backend config repeated across modes must dedup"
     assert next(p for p in final if p.engine_id == 7).cpp_index == 0, "first position wins"
     assert sum(1 for p in final if p.engine_id == -1) == 1
+    # OPENSOURCE: ours + delegating, and never the backend's own entries.
+    oss = _assemble([cudnn.heur_mode.OPENSOURCE], lambda kind: ours, backend)
+    assert [p.engine_id for p in oss] == [20500, 20500, -1]
 
 
 @pytest.mark.L0
@@ -111,14 +121,6 @@ def test_fallback_kind_is_least_demanding():
     for p in propose("FALLBACK", _facts(), _OFFERED):
         assert p.knobs.split_kv == 1
         assert p.knobs.sched_policy == 0  # SCHED_NATURAL
-
-
-@pytest.mark.L0
-def test_recommend_is_place_over_propose():
-    facts = _facts()
-    assert [(p.engine_id, p.knobs) for p in recommend([cudnn.heur_mode.A], facts, _OFFERED, [])] == [
-        (p.engine_id, p.knobs) for p in place([cudnn.heur_mode.A], facts, _OFFERED, [])
-    ]
 
 
 # ---------------------------------------------------------------------------

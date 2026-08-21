@@ -188,7 +188,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100_d192_d128_mxfp8": EngineSlot(10, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
-        heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+        heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -253,7 +253,12 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 
 
 def resolve_heuristics(family: EngineFamily):
-    """The family's plan-ranking callable, or None when it declares none."""
+    """The family's proposal callable, or None when it declares none.
+
+    The contract is ``propose(kind, facts, offered) -> [PlanConfig]`` — pure
+    and backend-blind; placement against the backend's entries happens once
+    for every family in ``engines/heuristics._assemble``.
+    """
     return _resolve(family, family.heuristics, "heuristics")
 
 

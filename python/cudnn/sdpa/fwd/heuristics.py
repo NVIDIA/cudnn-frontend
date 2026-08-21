@@ -1,53 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""How the SDPA-forward family ranks plans for a graph.
+"""The SDPA-forward family's proposals: which cells, with which knob sets.
 
-Two layers, deliberately separated:
+:func:`propose` is the family's ENTIRE heuristic surface — the PURE core:
+``(kind, facts, offered) -> [PlanConfig]``. Backend-blind, graph-blind,
+import-light. For every offered cell whose capability row admits the facts,
+the cell's rule emits an ORDERED list of COMPLETE knob assignments (every
+axis the row declares a domain for carries a concrete value; ``None`` only on
+undeclared axes), each re-validated through ``mismatch(caps, facts, knobs)``
+— a set is honored or never listed. The same engine appears once per
+surviving set. Standalone callers (wrappers, autotuners) invoke this directly
+with a hand-built :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing
+here touches the backend, a graph object, or heuristic modes.
 
-- :func:`propose` — the PURE core: ``(kind, facts, offered) -> [PlanConfig]``.
-  Backend-blind, graph-blind, import-light. For every offered cell whose
-  capability row admits the facts, the cell's rule emits an ORDERED list of
-  COMPLETE knob assignments (every axis the row declares a domain for carries a
-  concrete value; ``None`` only on undeclared axes), each re-validated through
-  ``mismatch(caps, facts, knobs)`` — a set is honored or never listed. The same
-  engine appears once per surviving set. Standalone callers (wrappers,
-  autotuners) can invoke this directly with a hand-built
-  :class:`~cudnn.sdpa.graph_analyzer.SdpaGraphFacts`; nothing here touches the
-  backend or a graph object.
+``kind`` is ``"A"`` (candidates worth timing, best guess first, runners-up
+behind for a caller that autotunes) or ``"FALLBACK"`` (the config expected to
+build where A's choice may not — nothing chosen for speed).
 
-- :func:`place` — the interleaver, and the ONLY layer that sees the backend:
-  assembles the caller's mode blocks, decides FROST-vs-backend order
-  (``_MEASURED_BEHIND``), positions the delegating entry, dedups on
-  ``(engine_id, knobs)``, and STRIPS the mode tag — final entries carry
-  ``(engine_id, knobs[, cpp_index])`` only.
+Everything else about the final list — mode blocks, the backend's entries,
+the delegating entry, dedup, the mode strip — is PLACEMENT, and placement is
+not a family opinion: it lives once in ``engines/heuristics._assemble``,
+under the standing assumption that these proposals lead the backend's entries
+(an OSS engine measured behind the backend gets fixed or pulled, not
+demoted).
 
-``engines/heuristics.rank`` calls :func:`recommend`, which is
-``place`` over ``propose``; what it returns is ``graph.plans``, position for
-position.
+Cross-ENGINE order within a proposal batch is ``ENGINE_SPECS`` declaration
+order. Today that is unambiguous in practice — co-eligible cells are the
+envelope-overlap family, which all lower to the same kernel — and the seam
+for a real ranking, when one is measured, is a score stage here in
+:func:`propose`, not a new layer.
 
-Per mode:
-
-- **A** — candidates worth running, best guess first, runners-up behind it for
-  a caller that autotunes.
-- **FALLBACK** — the config expected to build where mode A's choice may not.
-  Nothing here is chosen for speed.
-- **OPENSOURCE** — mode A without the backend's recommendation, since these
-  cells ARE the open-source implementation.
-- **B** — answered as A: it asks for a wider search this family has none to
-  give.
-
-To add a rule for a cell: write a generator (:func:`_sm120_tiles` is the worked
-example), register the cell in ``_CELL_TILE_RULES`` (or grow a new axis via the
-five-part checklist in ``engines.py``), put the measurement in the commit. A
-cell with no rule runs its row's sole point per axis, which is the honest
-answer while nobody has timed it.
+To add a rule for a cell: write a generator (:func:`_sm120_tiles` is the
+worked example), register the cell in ``_TILE_RULE_CELLS`` (or grow a new
+axis via the five-part checklist in ``engines.py``), put the measurement in
+the commit. A cell with no rule runs its row's sole point per axis, which is
+the honest answer while nobody has timed it.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cudnn
 
@@ -55,12 +49,6 @@ from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, mismatch
-
-# Cells timed against the backend's kernel and found SLOWER, so the backend's
-# mode-A entries lead them. Empty: absent means faster OR never timed, and both
-# keep the order this dispatch has always had. Moving a cell in needs a
-# measurement.
-_MEASURED_BEHIND: frozenset = frozenset()
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
@@ -425,69 +413,7 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# place — the interleaver; the only layer that sees the backend
-# ---------------------------------------------------------------------------
-
-
-def _leads(offered: Dict[str, int], plans: List[PlanConfig]) -> bool:
-    """Whether this family's mode-A plans outrank the backend's. See _MEASURED_BEHIND."""
-    behind = {offered[name] for name in _MEASURED_BEHIND if name in offered}
-    return bool(plans) and not all(cfg.engine_id in behind for cfg in plans)
-
-
-def _strip(cfg: PlanConfig) -> PlanConfig:
-    """A final-list entry: (engine_id, knobs[, cpp_index]) — the mode tag is
-    assembly bookkeeping and never reaches ``graph.plans``."""
-    if cfg.mode is None and cfg.cpp_index is None:
-        return cfg
-    return PlanConfig(cfg.engine_id, cfg.knobs, cpp_index=cfg.cpp_index)
-
-
-def place(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
-    """Assemble the final ranked list from proposals and the backend's entries,
-    mode block by mode block in the caller's order.
-
-    Asking for ``[A, FALLBACK]`` puts every tuned candidate — both sides' —
-    ahead of every fallback. A plan repeated across blocks keeps its first
-    position. Backend entries arrive tagged with the mode that produced them
-    (plus the untagged delegating entry); the tags steer assembly and are then
-    stripped — final entries carry no mode.
-    """
-    # An untagged backend entry is the delegating one: OSS candidates C++ holds
-    # but never exposes as plans, so it cannot be enumerated. It belongs to no
-    # mode, and it is NOT a pure OSS entry -- Graph::build_plans tries the OSS
-    # engine and, if that one declines, falls through to the native
-    # engine_configs already enqueued. So it leads the BACKEND's entries but not
-    # ours: ahead of our OPENSOURCE block it would answer an OSS-coverage
-    # question with a native kernel.
-    delegating = [c for c in backend_plans if c.mode is None]
-    out: List[PlanConfig] = []
-    for mode in modes:
-        if mode == cudnn.heur_mode.OPENSOURCE:
-            out += propose("A", facts, offered) + delegating
-        elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            ours = propose("A", facts, offered)
-            theirs = delegating + [c for c in backend_plans if c.mode == mode]
-            out += (ours + theirs) if _leads(offered, ours) else (theirs + ours)
-        elif mode == cudnn.heur_mode.FALLBACK:
-            out += propose("FALLBACK", facts, offered) + delegating + [c for c in backend_plans if c.mode == mode]
-    # A delegate with no mode asked for it (the backend has engines but exposed
-    # no plans) would otherwise be dropped.
-    out += delegating
-
-    # Identity is (engine, knobs). cpp_index is only WHERE one backend query put
-    # a plan, so keying on it would let [A, A], or one config both modes return,
-    # through as two entries -- and an autotuner would build and time it twice.
-    seen, ranked = set(), []
-    for cfg in out:
-        key = (cfg.engine_id, repr(cfg.knobs))
-        if key not in seen:
-            seen.add(key)
-            ranked.append(_strip(cfg))
-    return ranked
-
-
-def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
-    """The ranked plan list for this graph: :func:`place` over :func:`propose`."""
-    return place(modes, facts, offered, backend_plans)
+# Placement — mode blocks, the backend's entries, the delegating entry, dedup,
+# the mode strip — is NOT this family's business: it happens once for every
+# family in ``engines/heuristics._assemble``, with these proposals leading the
+# backend's entries inside each block by standing assumption.
