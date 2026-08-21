@@ -342,6 +342,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
 
+    if facts.has_bias and capabilities.bias and facts.bias_t is not None:
+        # uniform_dtype covers K/V/O only; the serving adapters compile the
+        # bias load as fp32 or the io dtype, so anything else must decline
+        # HERE, not ValueError at execute.
+        bias_dt = facts.bias_t.get_data_type()
+        if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
+            return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
+
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
 
@@ -714,6 +722,18 @@ def lower_dsl_prefill(
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
         cga=knobs.cga if knobs is not None else None,
+        # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
+        # specializations of that template): forwarded only to adapters whose
+        # constructor declares them — every other row's mismatch gated the
+        # operands off already.
+        **(
+            {
+                "bias_present": facts.bias_t is not None,
+                "bias_fp32": facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT,
+            }
+            if "bias_present" in inspect.signature(_adapter(api_type).__init__).parameters
+            else {}
+        ),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()

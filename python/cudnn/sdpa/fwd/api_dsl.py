@@ -2791,7 +2791,6 @@ def sdpa_fwd_wrapper_dsl_sm120(
 # ``lower_dsl_prefill`` drives all three identically; converting the kernels
 # themselves to TemplateParams form is tracked as follow-up work.
 # =============================================================================
-import inspect as _sm80_inspect
 
 from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 
@@ -2823,22 +2822,6 @@ _SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
 _SM80_D256_FLAVORS = ("qwen",)
-
-_SM80_KERNEL_MOD: dict = {}
-
-
-def _sm80_kernel_mod(flavor: str = ""):
-    """Lazily import + cache the SM80 kernel module for ``flavor``.  qwen
-    (d=256) routes to ``prefill_d256_f16_sm80`` (symmetric K+V prefetch); the
-    rest use ``prefill_f16_sm80``."""
-    key = "d256" if flavor in _SM80_D256_FLAVORS else "f16"
-    if key not in _SM80_KERNEL_MOD:
-        if key == "d256":
-            from .kernels import prefill_d256_f16_sm80 as _mod
-        else:
-            from .kernels import prefill_f16_sm80 as _mod
-        _SM80_KERNEL_MOD[key] = _mod
-    return _SM80_KERNEL_MOD[key]
 
 
 def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
@@ -2903,35 +2886,127 @@ def _sm80_resolve_scheduler(
     raise ValueError(f"SM80 SDPA: scheduler must be 'auto' / 'default' / 'natural' / 'lpt' / 'lpt_l2', got {scheduler!r}")
 
 
+# --- SM80 template loading ---------------------------------------------------
+
+_LOG2E = math.log2(math.e)
+
+_SM80_KERNEL_FILES = {
+    "d256": "prefill_d256_f16_sm80.py",
+    "f16": "prefill_f16_sm80.py",
+}
+
+
+def _sm80_load_kernel_module(flavor: str, params):
+    """One uniquely-named module per (kernel file, TemplateParams) — the same
+    ``frost.template_loader`` mechanism the SM100/SM120 templates use. qwen
+    (d=256) routes to the symmetric-K+V-prefetch file; the rest share the
+    generic kernel."""
+    filename = _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
+    return load_template(path, params, tag=f"sm80_{filename.rsplit('.', 1)[0]}")
+
+
+def _sm80_sched_policy_int(token: str) -> int:
+    return {"default": SCHED_NATURAL, "lpt": SCHED_LPT, "lpt_l2": SCHED_LPT_L2}[token]
+
+
+def _sm80_call(
+    fn,
+    *,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    seq_kv,
+    seq_q,
+    sinks_log2,
+    bias,
+    cu_q,
+    cu_k,
+    rope_cs,
+    n_kv_tiles,
+    scale_log2,
+    sq,
+    skv,
+    d,
+    right_bound,
+    inv_scale,
+    thd_q_tiles,
+    n_batch_logical,
+    stream,
+):
+    """Invoke one compiled SM80 artifact (the traced ``_sdpa_host`` ABI:
+    12 tensors — LSE may be None-specialized — then 9 runtime scalars and the
+    launch stream)."""
+    import cutlass
+    from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
+
+    def from_dlpack(t):
+        # The kernels compile with --enable-tvm-ffi, so host-side conversions
+        # must produce TVM-FFI tensors regardless of the env latch.
+        return _from_dlpack_raw(t, enable_tvm_ffi=True)
+
+    fn(
+        from_dlpack(q),
+        from_dlpack(k),
+        from_dlpack(v),
+        from_dlpack(o),
+        from_dlpack(lse) if lse is not None else None,
+        from_dlpack(seq_kv),
+        from_dlpack(seq_q),
+        from_dlpack(sinks_log2),
+        from_dlpack(bias),
+        from_dlpack(cu_q),
+        from_dlpack(cu_k),
+        from_dlpack(rope_cs),
+        cutlass.Int32(n_kv_tiles),
+        cutlass.Float32(scale_log2),
+        cutlass.Int32(sq),
+        cutlass.Int32(skv),
+        cutlass.Int32(d),
+        cutlass.Int32(right_bound),
+        cutlass.Float32(inv_scale),
+        cutlass.Int32(thd_q_tiles),
+        cutlass.Int32(n_batch_logical),
+        stream,
+    )
+
+
 class SdpaFwdDslSm80(SdpaFwdDsl):
-    """SM80 (A100) SDPA forward via the pre-TemplateParams CuTe-DSL kernels.
+    """SM80 (A100) SDPA forward via the FROST template kernels.
 
-    Follows the SM100/SM120 adapter lifecycle (check_support → compile →
-    execute, caller buffers bound directly) on top of the self-caching SM80
-    kernel modules. SM80-only features (bias, RoPE) arrive as extra optional
-    ``execute`` keywords, exactly as the ``SdpaFwdDsl.execute`` contract
-    permits.  ALiBi, block_mask and the score-stat side outputs are
-    deliberately NOT served: the capability row declines such graphs and the
-    backend takes them.
+    Since the TemplateParams conversion this adapter has the same shape as
+    its SM100/SM120 siblings end to end: ``check_support`` resolves the
+    flavor/mask/scheduler into a plan-time :class:`config_sm80.TemplateParams`,
+    ``compile()`` loads the specialized template module and compiles the
+    per-shape artifact ONCE (THD packed token extents compile dynamic via
+    ``cute.sym_int`` — issue #604's key is gone), and ``execute()`` re-binds
+    caller buffers to the cached artifact (a compile-cache miss at execute is
+    a bug by contract).
 
-    Known deviations, both pre-existing and shared with the old
-    ``SdpafwdSm80`` path rather than introduced here:
+    SM80-only compile axes that have no home in the shared constructor arrive
+    as extra keyword-only arguments (``bias_present`` / ``bias_fp32`` /
+    ``rope_max_s``); the engine lowering forwards them only when the graph
+    declares the operands. ALiBi, block_mask and the score-stat side outputs
+    are deliberately NOT served: the capability row declines such graphs and
+    the backend takes them.
 
-    - dense GQA/MQA is served by expanding K/V heads adapter-side
-      (``repeat_interleave``): the kernels' native dense-GQA path exists but
-      is not yet qualified by the upstream validation harness (see
-      ``graph_analyzer.expand_gqa_heads``). Dropping the expansion once that
-      path is qualified on A100 CI is the tracked cleanup.
-    - a head-dim between flavor points pads V host-side
-      (``d_pad_multiple=1`` in the capability row).
+    Known deviations, pre-existing and tracked rather than introduced here:
+    dense GQA expands K/V heads adapter-side until the kernels' native dense
+    GQA path is qualified (see ``graph_analyzer.expand_gqa_heads``); an
+    off-flavor head dim pads V (and O, via a scratch) host-side; sink logits
+    are rescaled to log2 units with one (H,)-element multiply per execute.
     """
 
-    def __init__(self, *args, scheduler: Optional[str] = None, **kwargs) -> None:
-        # SM80-only scheduler-token override for standalone callers
-        # ("auto"/"default"/"natural"/"lpt"/"lpt_l2"). The graph path never
-        # sets it: the engine row's sched_policy domain is empty, so the
-        # base sched_policy stays NATURAL and maps to "auto" below.
+    def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
+        # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
+        # token override for standalone callers; the graph path leaves it None
+        # and the sched_policy knob (NATURAL default) maps to "auto" below.
         self._scheduler_token = scheduler
+        self._bias_present = bool(bias_present)
+        self._bias_fp32 = bool(bias_fp32)
+        self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
 
     def _initialize_implementation(self) -> None:
@@ -2946,6 +3021,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.mask_token: Optional[str] = None
         self.swa_window_runtime: int = 0
         self.right_bound_runtime: int = 0
+        self._k_mod = None
+        self._params = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -2983,7 +3060,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
 
-        # ---- head-dim envelope ----------------------------------------
         max_d_qk = max(fdqk for fdqk, _ in _SM80_FLAVOR_DIMS.values())
         max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
         self._value_error_if(
@@ -2993,7 +3069,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"Larger heads are not yet ported.",
         )
 
-        # ---- dtype: FP16 or BF16 (both ride one SM80 mma pipeline) ----
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             self._check_dtype(
@@ -3011,17 +3086,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
             self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM80")
 
-        # ---- modes this adapter does not serve -------------------------
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's THD path launches them directly",
+            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
         )
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,
             "SM80 SDPA: window_size_right without is_causal=True has no diagonal to anchor to",
         )
+        self._not_implemented_error_if(
+            self._rope_max_s and (self.seq_kv_lens_present or self.seq_q_lens_present),
+            "SM80 SDPA: RoPE fusion is dense-unpadded-only",
+        )
 
-        # ---- arch -------------------------------------------------------
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 SDPA")
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
@@ -3031,7 +3108,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
         )
 
-        # ---- flavor + tile knobs ---------------------------------------
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
         tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
@@ -3039,26 +3115,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.kernel_num_warps = num_warps_default
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
-            self.kernel_tile_n not in (64, 128),
-            f"SM80 SDPA: tile_n must be 64 or 128; got {self.kernel_tile_n}",
-        )
-        self._value_error_if(
-            self.kernel_tile_m % (self.kernel_num_warps * 16) != 0,
-            f"SM80 SDPA: tile_m ({self.kernel_tile_m}) must be a multiple of " f"num_warps*16 ({self.kernel_num_warps * 16})",
-        )
-        self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",
         )
 
-        # Bottom-right alignment shifts the band to the corner; it must affect
-        # SOMETHING — a causal upper bound and/or a left sliding-window.
         self._value_error_if(
             self.causal_bottom_right and not (self.is_causal or (self.window_size_left is not None and self.window_size_left >= 0)),
             "SM80 SDPA: causal_bottom_right requires is_causal=True and/or a left sliding-window (window_size_left >= 0).",
         )
 
-        # ---- mask token --------------------------------------------------
         swa_left = -1 if self.window_size_left is None else int(self.window_size_left)
         swa_right = 0 if self.window_size_right is None else int(self.window_size_right)
         self.right_bound_runtime = 0
@@ -3073,10 +3138,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self.mask_token = "none"
             self.swa_window_runtime = 0
 
-        # ---- scheduler ---------------------------------------------------
-        # Explicit token (standalone callers) wins; otherwise the sched_policy
-        # knob maps NATURAL → "auto" (the SM80 heuristic decides), LPT/LPT_L2
-        # → their tokens.
         token = self._scheduler_token
         if token is None:
             token = {SCHED_NATURAL: "auto", SCHED_LPT: "lpt", SCHED_LPT_L2: "lpt_l2"}.get(self.sched_policy)
@@ -3095,7 +3156,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             skv=int(s_kv),
         )
 
-        # ---- softmax scale -------------------------------------------
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
@@ -3113,18 +3173,52 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
     # ------------------------------------------------------------------
     def compile(self) -> None:
-        """Mark compiled — the kernel module owns the JIT cache.
+        """Load the TemplateParams-specialized module and compile the artifact.
 
-        The SM80 kernels self-cache one artifact per (shape, feature) key
-        (``_compile_cached``'s lru_cache), so there is no template module to
-        load here; the first ``execute()`` triggers the JIT. On the graph path
-        every key component is plan-time data (dense B/H/S/D from the frozen
-        graph), so the cache key is Rule-4 clean; the THD wrapper path's
-        packed-total keys are the known issue #604 cleanup.
+        Plan-time only (Hard Rule 4): every key component here is graph
+        declaration or capability data; execute()'s call into the module's
+        per-shape lru is a guaranteed hit.
         """
-        self._logger.debug("Entering compile (no-op — kernel self-caches)")
+        self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        self._compiled_kernel = True
+        from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
+
+        self._params = _sm80_cfg.TemplateParams(
+            io_bf16=(self.dtype == torch.bfloat16),
+            d_qk=self.flavor_d_qk,
+            d_v=self.flavor_d_v,
+            tile_m=self.kernel_tile_m,
+            num_warps=self.kernel_num_warps,
+            tile_n=self.kernel_tile_n,
+            is_causal=self.mask_token in ("causal", "causal_swa"),
+            has_swa=self.mask_token in ("swa", "causal_swa"),
+            causal_bottom_right=self.causal_bottom_right,
+            has_seq_kv_lens=self.seq_kv_lens_present,
+            has_seq_q_lens=self.seq_q_lens_present,
+            has_sink=self.has_sink,
+            has_bias=self._bias_present,
+            bias_is_fp32=self._bias_fp32,
+            has_rope=self._rope_max_s > 0,
+            thd_varlen=False,
+            sched_policy=_sm80_sched_policy_int(self.sched_token),
+            sched_l2_mib=self.sched_l2_mib,
+            has_lse=self.lse_desc is not None,
+        )
+        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
+        self._compiled_kernel = self._k_mod.compile(
+            b=self.batch_size,
+            # Dense GQA is served by adapter-side K/V head expansion until the
+            # kernels' native dense-GQA path is qualified (class docstring), so
+            # the artifact is compiled against the EXPANDED head count — the
+            # shapes execute() actually binds.
+            h=self.h_q,
+            h_kv=self.h_q,
+            sq=self.s_q_max,
+            skv=self.s_k_max,
+            d=self.head_dim_qk,
+            swa_window=int(self.swa_window_runtime),
+            rope_max_s=self._rope_max_s,
+        )
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
@@ -3150,15 +3244,23 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        p = self._params
 
-        # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
-        # [B, H, SQ] — rebind the squeezed view (zero-cost, same storage).
+        # Init-time flags are compile-time specializations; execute must match
+        # them exactly, in both directions (Hard Rule 1).
         if lse_tensor is not None and lse_tensor.ndim == 4:
             lse_tensor = lse_tensor.squeeze(-1)
+        self._value_error_if(p.has_lse and lse_tensor is None, "compiled with a Stats output but execute() got no lse_tensor")
+        self._value_error_if(not p.has_lse and lse_tensor is not None, "lse_tensor provided but the plan compiled the LSE store out")
+        self._value_error_if(p.has_bias != (bias_tensor is not None), "bias presence must match the compiled specialization")
+        self._value_error_if((p.has_rope) != (rope_freqs is not None), "rope_freqs presence must match the compiled specialization")
+        self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
+        self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
+        self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
-        kernel = _sm80_kernel_mod(self.flavor)
         device = q_tensor.device
+        launch_stream = self._get_default_stream(current_stream)
 
         with _torch_stream_context(current_stream, device):
             # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
@@ -3169,8 +3271,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             V = self._to_bshd(v_tensor)
             if self.h_kv != self.h_q:
                 # Dense GQA: expand K/V heads until the kernels' native dense
-                # GQA path is qualified (see class docstring).  BSHD head dim
-                # is 2.
+                # GQA path is qualified (see class docstring). BSHD head dim is 2.
                 reps = self.h_q // self.h_kv
                 K = K.repeat_interleave(reps, dim=2)
                 V = V.repeat_interleave(reps, dim=2)
@@ -3179,72 +3280,127 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             if pad_v:
                 V = _sm80_pad_last_dim(V, self.flavor_d_v)
 
-            # Output binding: hand the kernel the caller's BSHD view directly.
-            # A non-BSHD-physical O (dense_flex) binds a contiguous scratch the
-            # kernel writes, copied back below (the SM100 dense path's
-            # grandfathered normalization); only the padded-V envelope case
-            # falls back to kernel-side allocation + slice/copy.
+            # Output binding: the compiled O ABI is (B, SQ, H, flavor_d_v).
+            # Direct-bind the caller's BSHD view when it matches; the padded-V
+            # envelope and dense_flex cases go through a scratch + copy-back
+            # (both pre-existing normalizations).
             o_view, o_needs_copyback, o_scratch = self._to_bshd_writable(o_tensor)
             if pad_v:
-                bind_o = None
+                o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
             elif o_needs_copyback:
-                bind_o = o_scratch
+                o_kernel = o_scratch
             else:
-                bind_o = o_view
-            bind_lse = lse_tensor if (lse_tensor is not None and lse_tensor.is_contiguous()) else None
+                o_kernel = o_view
+            # DEFENSIVE zero-fill, not load-bearing: the dense epilogue stores
+            # every in-bounds row unconditionally; kept so a bound buffer can
+            # never surface uninitialized memory if a future path skips rows.
+            # (The pad_v scratch above is allocated zeroed already.)
+            if (seq_q_lens is not None or seq_kv_lens is not None) and not pad_v:
+                o_kernel.zero_()
+                if lse_tensor is not None:
+                    lse_tensor.zero_()
 
-            fwd_kwargs = dict(
-                scale=scale_val,
-                return_lse=True,
-                tile_m=self.kernel_tile_m,
-                num_warps=self.kernel_num_warps,
-                tile_n=self.kernel_tile_n,
-                d_qk=self.flavor_d_qk,
-                d_v=self.flavor_d_v,
-                mask=self.mask_token,
-                swa_window=int(self.swa_window_runtime),
-                right_bound=int(self.right_bound_runtime),
-                causal_bottom_right=self.causal_bottom_right,
-                seq_kv_lens=self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None,
-                seq_len_q=self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None,
-                bias=bias_tensor,
-                sinks=self._checked_sinks_1d(sinks) if sinks is not None else None,
-                sched=self.sched_token,
-                sched_l2_mib=self.sched_l2_mib,
-                rope_freqs=rope_freqs,
-                out_o=bind_o,
-                out_lse=bind_lse,
+            # Dummies fill compiled-out ABI slots (Rule 1); the kernel never
+            # dereferences them.  Base-class ``_dummy`` (key, device, factory).
+            seq_kv_b = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
             )
-            _accepted = _sm80_inspect.signature(kernel.forward).parameters
-            fwd_kwargs = {k: v for k, v in fwd_kwargs.items() if k in _accepted}
-            O_buf, LSE_buf = kernel.forward(Q, K, V, **fwd_kwargs)
+            seq_q_b = (
+                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                if seq_q_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
+            )
+            if sinks is not None:
+                # log2-unit rescale: one (H,)-element multiply per execute
+                # (pre-existing SM80 contract; the kernels consume log2 units).
+                sinks_b = (self._checked_sinks_1d(sinks) * _LOG2E).contiguous()
+            else:
+                sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            if bias_tensor is not None:
+                self._value_error_if(
+                    bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
+                    f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
+                )
+                self._value_error_if(
+                    tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
+                    f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
+                )
+                bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
+                self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
+            else:
+                bias_dt = q_tensor.dtype
+                bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
+            if rope_freqs is not None:
+                # (cos, sin) table build — wrapper-only fusion (the engine row
+                # never admits RoPE); per-execute by contract, like the caller
+                # passing fresh angle tables.
+                d2 = self.flavor_d_qk // 2
+                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
+                self._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+                self._value_error_if(
+                    rf.shape[0] != self._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({self._rope_max_s})"
+                )
+                angles = rf[:, :d2]
+                rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+            else:
+                rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
 
-            # Copy-back only on the fallback paths the binding above skipped.
-            if bind_o is None:
-                # pad_v: the kernel allocated a flavor-wide O — slice + copy.
-                o_view.copy_(O_buf[..., : self.head_dim_v])
+            _sm80_call(
+                self._compiled_kernel,
+                q=Q,
+                k=K,
+                v=V,
+                o=o_kernel,
+                lse=lse_tensor if p.has_lse else None,
+                seq_kv=seq_kv_b,
+                seq_q=seq_q_b,
+                sinks_log2=sinks_b,
+                bias=bias_b,
+                cu_q=cu_dummy,
+                cu_k=cu_dummy,
+                rope_cs=rope_b,
+                n_kv_tiles=(self.s_k_max + p.tile_n - 1) // p.tile_n,
+                scale_log2=scale_val * _LOG2E,
+                sq=self.s_q_max,
+                skv=self.s_k_max,
+                d=self.head_dim_qk,
+                right_bound=int(self.right_bound_runtime),
+                inv_scale=1.0 / float(scale_val),
+                thd_q_tiles=0,
+                n_batch_logical=1,
+                stream=launch_stream,
+            )
+
+            if pad_v:
+                o_view.copy_(o_kernel[..., : self.head_dim_v])
             elif o_needs_copyback:
-                # dense_flex O: the kernel wrote the contiguous scratch.
                 o_view.copy_(o_scratch)
-            if lse_tensor is not None and bind_lse is None:
-                lse_tensor.copy_(LSE_buf)
         self._logger.debug("execute completed")
 
 
-def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks):
+def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks, current_stream=None):
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
-    no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Routes straight
-    to the kernel's THD path (graph-safe over-provisioned grid), reusing the
-    flavor-pick + d-pad.  Returns packed ``[1, T_q, H, D_v]`` O + LSE."""
+    no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Rides the same
+    TemplateParams-specialized module as the dense path; the packed token
+    extents compile DYNAMIC (``cute.sym_int``), so the compile key is
+    plan-time-only and a new token total re-binds the cached artifact (the
+    old per-total ``lru`` key — issue #604 — is gone).  Returns packed
+    ``[1, T_q, H, D_v]`` O + packed ``[1, H, T_q]`` LSE."""
+    from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
+
+    if bias_tensor is not None:
+        raise NotImplementedError("SM80 SDPA THD does not support bias (varlen has no single [1,H,SQ,SKV] bias shape)")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
+    h_kv = k.shape[2]
+    device = q.device
     flavor = _sm80_pick_flavor(d_qk, d_v)
     fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
-    # Resolve the default scale from the USER's head dim before padding: the
-    # kernel would otherwise derive 1/sqrt(D) from the padded flavor width
-    # (e.g. 1/sqrt(128) for a d=96 llama-flavor call) — silently wrong.
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     if d_qk < fdqk:
@@ -3253,42 +3409,86 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     pad_v = d_v < fdv
     if pad_v:
         v = _sm80_pad_last_dim(v, fdv)
-    # mask token from cuDNN's (is_causal, window_size=(left,right)).
     wl, wr = window_size
-    if is_causal and wl >= 0:
-        mask_token, swa = "causal_swa", wl
-    elif is_causal:
-        mask_token, swa = "causal", 0
-    elif wl >= 0:
-        mask_token, swa = "swa", wl
-    else:
-        mask_token, swa = "none", 0
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
-    kernel = _sm80_kernel_mod(flavor)
-    fwd_kwargs = dict(
-        scale=scale_softmax,
-        return_lse=True,
+
+    n_seqs = int(cu_q.numel()) - 1
+    if n_seqs < 1:
+        raise ValueError("cu_seqlens_q must have >= 2 entries")
+    cu_q_t = cu_q.to(dtype=torch.int32, device=device).contiguous()
+    cu_k_t = cu_k.to(dtype=torch.int32, device=device).contiguous()
+
+    params = _sm80_cfg.TemplateParams(
+        io_bf16=(q.dtype == torch.bfloat16),
+        d_qk=fdqk,
+        d_v=fdv,
         tile_m=tile_m,
         num_warps=num_warps,
         tile_n=tile_n,
-        d_qk=fdqk,
-        d_v=fdv,
-        mask=mask_token,
-        swa_window=int(swa),
-        right_bound=int(right_bound),
+        is_causal=bool(is_causal),
+        has_swa=wl is not None and wl >= 0,
         causal_bottom_right=bool(causal_bottom_right),
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_s_q=int(max_s_q),
-        bias=bias_tensor,
-        sinks=sinks,
+        has_sink=sinks is not None,
+        thd_varlen=True,
+        has_lse=True,
     )
-    acc = _sm80_inspect.signature(kernel.forward).parameters
-    fwd_kwargs = {kk: vv for kk, vv in fwd_kwargs.items() if kk in acc}
-    O_buf, LSE_buf = kernel.forward(q, k, v, **fwd_kwargs)
+    mod = _sm80_load_kernel_module(flavor, params)
+    # Off-flavor d_qk was HOST-PADDED to fdqk above, so the compiled fakes and
+    # the runtime d must both be the padded width: the kernel derives its Q/K
+    # row strides from d_runtime (Q_ROW_STRIDE_E = H * d_runtime), and the
+    # zero columns are exact for the QK dot products.  (Same contract as the
+    # pre-template forward(), which read d_runtime off the padded shape.)
+    fn = mod.compile(
+        b=1,
+        h=h_q,
+        h_kv=h_kv,
+        sq=0,
+        skv=0,
+        d=int(fdqk),
+        swa_window=int(max(0, wl)) if wl is not None and wl >= 0 else 0,
+        n_batch_logical=n_seqs,
+    )
+
+    t_q = q.shape[1]
+    o_buf = torch.zeros(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
+    lse_buf = torch.zeros(1, h_q, t_q, dtype=torch.float32, device=device)
+    sinks_b = (
+        (sinks.to(dtype=torch.float32, device=device).reshape(h_q) * _LOG2E).contiguous()
+        if sinks is not None
+        else torch.ones(1, dtype=torch.float32, device=device)
+    )
+    dummy_i32 = torch.ones(1, dtype=torch.int32, device=device)
+    dummy_f32 = torch.ones(1, dtype=torch.float32, device=device)
+    dummy_io = torch.ones(1, dtype=q.dtype, device=device)
+
+    _sm80_call(
+        fn,
+        q=q,
+        k=k,
+        v=v,
+        o=o_buf,
+        lse=lse_buf,
+        seq_kv=dummy_i32,
+        seq_q=dummy_i32,
+        sinks_log2=sinks_b,
+        bias=dummy_io,
+        cu_q=cu_q_t,
+        cu_k=cu_k_t,
+        rope_cs=dummy_f32,
+        n_kv_tiles=(int(k.shape[1]) + tile_n - 1) // tile_n,
+        scale_log2=float(scale_softmax) * _LOG2E,
+        sq=int(t_q),
+        skv=int(k.shape[1]),
+        d=int(fdqk),
+        right_bound=int(right_bound),
+        inv_scale=1.0 / float(scale_softmax),
+        thd_q_tiles=(int(max_s_q) + tile_m - 1) // tile_m,
+        n_batch_logical=n_seqs,
+        stream=current_stream if current_stream is not None else cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    )
     if pad_v:
-        O_buf = O_buf[..., :d_v].contiguous()
-    return TupleDict(o_tensor=O_buf, lse_tensor=LSE_buf)
+        o_buf = o_buf[..., :d_v].contiguous()
+    return TupleDict(o_tensor=o_buf, lse_tensor=lse_buf)
 
 
 _sm80_wrapper_cache: dict = {}
@@ -3318,8 +3518,8 @@ def sdpa_fwd_wrapper_sm80(
 
     Returns ``TupleDict(o_tensor=..., lse_tensor=...)`` matching the DSL
     wrappers' contract.  Dense calls route through :class:`SdpaFwdDslSm80`;
-    packed THD calls (``cum_seqlen_*``) launch the kernel's varlen path
-    directly.  ALiBi, block_mask and the score-stat side outputs are not
+    packed THD calls (``cum_seqlen_*``) ride the same template with dynamic
+    token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
     """
     if q_tensor.ndim != 4 or v_tensor.ndim != 4:
@@ -3327,18 +3527,11 @@ def sdpa_fwd_wrapper_sm80(
     if scale_output not in (None, 1.0):
         raise NotImplementedError(f"SM80 SDPA: scale_output != 1.0 is not supported yet (got {scale_output})")
 
-    # THD / varlen: q/k/v are PACKED [1, T, H, D] (BSHD) + cu_seqlens.  Handled
-    # by a dedicated path that skips the dense BHSD transpose + dense O alloc.
     if cum_seqlen_q_tensor is not None:
         if max_s_q is None:
             raise ValueError("THD path requires max_s_q (host int) for the grid")
         if causal_bottom_right and not (is_causal or window_size[0] >= 0):
-            # Same anchor rule check_support enforces on the dense path: a
-            # bare bottom-right alignment has nothing to align.
             raise ValueError("SM80 SDPA: causal_bottom_right requires is_causal=True and/or a left sliding-window (window_size_left >= 0).")
-        # Reject dense-only features up front: _sm80_thd_forward does not plumb
-        # them, and silently computing without a requested feature is worse
-        # than an error.
         for label, present in (
             ("rope_freqs", rope_freqs is not None),
             ("seq_kv_lens", seq_kv_lens is not None),
@@ -3361,24 +3554,22 @@ def sdpa_fwd_wrapper_sm80(
                 causal_bottom_right=causal_bottom_right,
                 bias_tensor=bias_tensor,
                 sinks=sinks,
+                current_stream=current_stream,
             )
 
     b, h_q, s_q, _ = q_tensor.shape
     d_v = v_tensor.shape[-1]
-    # O takes Q's leading shape but V's head dim — supports dsv3-style
-    # D_QK != D_V.  Allocate as contiguous (B, S, H, D) then transpose to the
-    # (B, H, S, D) BSHD-physical view the adapter binds without copies.
     o_tensor = torch.empty(
         (b, s_q, h_q, d_v),
         dtype=q_tensor.dtype,
         device=q_tensor.device,
     ).transpose(1, 2)
     lse_tensor = _allocate_lse_tensor(q_tensor)
+
     wl, wr = window_size
     if not is_causal and wr >= 0:
-        # A right bound has no diagonal to anchor to without is_causal —
-        # reject rather than silently pick a mask (matches the THD path).
         raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
+    rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
     cache_key = (
         q_tensor.shape,
         k_tensor.shape,
@@ -3391,6 +3582,10 @@ def sdpa_fwd_wrapper_sm80(
         bool(causal_bottom_right),
         seq_kv_lens is not None,
         seq_len_q is not None,
+        sinks is not None,
+        bias_tensor is not None,
+        (bias_tensor.dtype if bias_tensor is not None else None),
+        rope_max_s,
         q_tensor.device,
     )
     api = _sm80_wrapper_cache.get(cache_key)
@@ -3408,7 +3603,11 @@ def sdpa_fwd_wrapper_sm80(
             scale_softmax=scale_softmax,
             seq_kv_lens_present=seq_kv_lens is not None,
             seq_q_lens_present=seq_len_q is not None,
+            has_sink=sinks is not None,
             scheduler=scheduler,
+            bias_present=bias_tensor is not None,
+            bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
+            rope_max_s=rope_max_s,
         )
         api.check_support()
         api.compile()
