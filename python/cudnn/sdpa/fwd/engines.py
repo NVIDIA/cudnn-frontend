@@ -1008,9 +1008,6 @@ ENGINE_SPECS = (
         192,
         d_v=128,
         dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
-        # The D192 E5M2 sink path has a distinct FP8 online-softmax rounding
-        # trajectory that exceeds the frontend tolerance on sparse CI seeds.
-        sink_dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
     ),
     _sm120_spec(),
     _sm120_fp8_spec(),

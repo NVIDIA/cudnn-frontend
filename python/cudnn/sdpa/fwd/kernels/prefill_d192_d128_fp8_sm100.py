@@ -178,6 +178,10 @@ def _exp2_emulated_scalar(x):
     return value
 
 
+_E5_SINK = CFG.HAS_SINK and CFG.DTYPE_QKV == 1
+_E5_SINK_WIDE_OUTPUT = _E5_SINK and CFG.DTYPE_O >= 2
+
+
 # Storage dtype + MMA kind dispatch keyed off CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 0:
     STORAGE_DTYPE = cutlass.Float8E4M3FN
@@ -228,7 +232,6 @@ elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
-
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     Bars,
@@ -616,6 +619,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sinks_tensor=sinks_tensor,
             sStats_raw=sStats_raw,
             bars=bars,
             score_bars=score_bars,
@@ -637,6 +641,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sinks_tensor=sinks_tensor,
             sStats_raw=sStats_raw,
             bars=bars,
             score_bars=score_bars,
@@ -1396,6 +1401,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
+    is_first_real_kv,
     tmem_base,
     sStats_raw,
     bars,
@@ -1428,7 +1434,7 @@ def _softmax_kv_body(
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     NEG_INF = cutlass.Float32(-3.4028235e38)
-    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD * (1.4426950408889634 if _E5_SINK else 1.0))
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
@@ -1461,6 +1467,7 @@ def _softmax_kv_body(
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
+                mask_value=float("-inf") if _E5_SINK else -3.4028235e38,
                 window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
@@ -1503,6 +1510,8 @@ def _softmax_kv_body(
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
+    if cutlass.const_expr(_E5_SINK_WIDE_OUTPUT):
+        update_cond = update_cond | (is_first_real_kv & (current_max > total_max))
     total_max = cutlass.Float32(
         arith.select(
             update_cond.ir_value(),
@@ -1584,6 +1593,7 @@ def _softmax_warp_group(
     scale_log2: cutlass.Float32,
     tmem_ptr_i32,
     sQ,
+    sinks_tensor,
     sStats_raw,
     bars,
     score_bars,
@@ -1632,6 +1642,8 @@ def _softmax_warp_group(
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+    if cutlass.const_expr(_E5_SINK):
+        sinks_arr = cutlass.make_array_view(sinks_tensor)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1644,6 +1656,13 @@ def _softmax_warp_group(
             (cutlass.Float32(0.0), cutlass.Float32(0.0)),
             cutlass.Float32,
         )
+        if cutlass.const_expr(_E5_SINK):
+            sink_log2 = cutlass.Float32(sinks_arr[head_idx]) * cutlass.Float32(1.4426950408889634)
+            total_max = sink_log2
+            total_sum = cutlass.Vector.from_elements(
+                (cutlass.Float32(1.0), cutlass.Float32(0.0)),
+                cutlass.Float32,
+            )
         q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
         q_abs = q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg
         # Bootstrap stat_empty wait lifts wait off per-iter critical path so
@@ -1664,6 +1683,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1688,6 +1708,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1711,6 +1732,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1734,6 +1756,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1909,14 +1932,19 @@ def _correction_warp_group(
             bars.mb_stat_empty[qs].arrive()
             # Preserve the persistent-tile phase protocol used by the MMA
             # prologue; stats now live in SMEM rather than the S accumulator.
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(not _E5_SINK):
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             beta = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(_E5_SINK):
+                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                beta = cute.arch.rcp_approx(cute.math.max(total_sum, cutlass.Float32(1e-30)))
+                inv_sum = o_scale_fused * beta
+            elif cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
@@ -1984,6 +2012,8 @@ def _correction_warp_group(
                         num=O_CHUNK,
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    if cutlass.const_expr(_E5_SINK and chunk_idx == N_CHUNKS_O - 1):
+                        bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                     o_scaled = o_chunk * inv_sum
 
                     for _i in cutlass.range_constexpr(O_CHUNK):
@@ -2051,6 +2081,9 @@ def _correction_warp_group(
                     o_half2, alignment=64, swizzle=_O_SMEM_SWIZZLE
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+
+                if cutlass.const_expr(_E5_SINK):
+                    bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 o_scaled3 = o_chunk3 * inv_sum
                 o_half3 = o_scaled3.to(OUT_STORAGE_DTYPE)
