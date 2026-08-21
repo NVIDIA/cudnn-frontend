@@ -24,12 +24,12 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
-def _load(rubin):
+def _load(rubin, **params):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
     return _load_sm100_kernel_module(
         (128, 128),
-        TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT),
+        TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, **params),
         fp8=True,
         pertensor=True,
         rubin=rubin,
@@ -56,3 +56,16 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_advertises_only_d128():
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+
+
+@pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
+def test_fp8_thd_leg_loads(rubin):
+    """The write_thd_meta THD leg (issue #552) is baked into BOTH fp8 d128
+    siblings: a THD specialization template-loads with the flag folded in and
+    exports the envelope tile constant the adapter's plan-time grid derives
+    from. End-to-end THD numerics ride test_sdpa_fwd_fp8_sm100.py on whichever
+    SM10x part is present (Rubin included) through the same adapter."""
+    mod = _load(rubin=rubin, thd_varlen=True, seq_kv_lens_present=True)
+    assert mod.CFG.THD_VARLEN == 1
+    assert mod.CFG.SEQ_KV_LENS_PRESENT == 1  # THD overloads the metadata buffer
+    assert mod.CGA_TILE_M == mod.CFG.TILES_Q * mod.CFG.TILE_M * mod.CFG.CTA_MMA

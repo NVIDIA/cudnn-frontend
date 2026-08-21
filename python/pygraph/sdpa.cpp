@@ -661,9 +661,31 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     py::object const& generate_stats,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                     bool const unfuse_fma,
-                    cudnn_frontend::AttentionImplementation_t const& implementation) {
+                    cudnn_frontend::AttentionImplementation_t const& implementation,
+                    bool const use_padding_mask,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
     auto attributes =
         cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
+
+    // Padding mask (per-batch valid lengths, or their (B+1,) cu prefix-sum
+    // form). Also the length carrier for THD/ragged graphs (ragged offsets
+    // are set on the tensors themselves).
+    attributes.set_padding_mask(use_padding_mask);
+    if (seq_len_q) {
+        attributes.set_seq_len_q(seq_len_q);
+    }
+    if (seq_len_kv) {
+        attributes.set_seq_len_kv(seq_len_kv);
+    }
+    if (cu_seq_len_q) {
+        attributes.set_cu_seq_len_q(cu_seq_len_q);
+    }
+    if (cu_seq_len_kv) {
+        attributes.set_cu_seq_len_kv(cu_seq_len_kv);
+    }
 
     // Handle causal mask settings
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
@@ -1348,6 +1370,11 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("sink_token", nullptr),
           py::arg_v("unfuse_fma", false),
           py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
+          py::arg_v("use_padding_mask", false),
+          py::arg_v("seq_len_q", nullptr),
+          py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           R"pbdoc(
                 Perform MXFP8 (Microscaling FP8) scaled dot product attention.
 
@@ -1388,6 +1415,11 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Shape is (1, h_q, 1, 1), type is float32. Default is None.
                     unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
                     implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
+                    use_padding_mask (Optional[bool]): Whether per-batch valid lengths mask the attention. Default is False.
+                    seq_len_q (Optional[cudnn_tensor]): The per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask and for THD/ragged inputs. Default is None.
+                    seq_len_kv (Optional[cudnn_tensor]): The per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask and for THD/ragged inputs. Default is None.
+                    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of Q, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_q; pair with a KV-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
+                    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of K/V, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_kv; pair with a Q-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
 
                 Returns:
                     o (cudnn_tensor): The output data.
