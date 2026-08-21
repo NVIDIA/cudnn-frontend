@@ -36,7 +36,7 @@ from benchmark_utils import (
 )
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
@@ -301,12 +301,12 @@ def main() -> int:
         if spec is None:
             print(f"  {label:66s} UNKNOWN (not a sweepable MoE block-scale swiglu strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph_swiglu(S, N, K, E, combo)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue
         try:

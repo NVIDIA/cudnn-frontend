@@ -26,7 +26,7 @@ from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 from benchmark_utils import add_sweep_args, ceil_div, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms, to_blocked
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
@@ -236,12 +236,12 @@ def main() -> int:
         if spec is None:
             print(f"  {name:62s} UNKNOWN (not a sweepable block-scale strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {name} ...", flush=True)
         try:
             g, h = _graph(B, M, N, K)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError) as e:
             print(f"  {name:62s} SKIP: {str(e)[:42]}")
             continue

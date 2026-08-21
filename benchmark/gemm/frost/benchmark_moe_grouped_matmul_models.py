@@ -415,7 +415,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
         if sel is None:
             print(f"  {label:64s} UNKNOWN (not a sweepable MoE dual-GEMM strategy)", flush=True)
             continue
-        cfg, cta_group, sched = sel
+        cfg, cta_group = sel
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:

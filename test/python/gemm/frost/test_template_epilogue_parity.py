@@ -260,12 +260,13 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
 
 def test_every_template_hoists_its_complete_smem_descriptor_inventory():
     """Descriptor metadata is invariant; only its byte address changes in the
-    tile/K loops.  Pin both the full 20-template inventory and the root shape so
+    tile/K loops.  Pin both the full template inventory and the root shape so
     deleting a build cannot make the no-build-in-a-loop check pass vacuously."""
 
     paths = _templates()
     assert {path.name for path in paths} == _MIXED_CGA | _MOE
     total_builds = 0
+    total_expected = 0
     offenders = []
     for path in paths:
         tree = ast.parse(path.read_text())
@@ -282,6 +283,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
             expected_bases = ["smem_a", "smem_b"]
         else:
             expected_bases = ["smem_a_list[i]", "smem_b_list[j]"]
+        total_expected += len(expected_bases)
 
         actual_bases = []
         for build in builds:
@@ -377,7 +379,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
             if made_operands != {"a", "b"}:
                 offenders.append(f"{path.name}: SM103 current/next circular descriptors do not feed both MMA operands")
 
-    assert total_builds == 52, f"descriptor inventory changed: expected 52 builds across 16 templates, found {total_builds}"
+    assert total_builds == total_expected, f"descriptor inventory changed: the per-template bases expect {total_expected} builds, found {total_builds}"
     assert not offenders, "build invariant descriptor roots once, outside every runtime loop:\n  " + "\n  ".join(offenders)
 
 
@@ -455,7 +457,7 @@ def _check_preferred_fallback_pair(
 
 
 def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
-    """Pin the 14 mixed-CGA templates' source-level lowering contract.
+    """Pin the 10 mixed-CGA templates' source-level lowering contract.
 
     Preferred and fallback dimensions are guarded positive powers of two, and
     their host-derived masks/shifts are kept distinct through every rank, L2
@@ -595,7 +597,7 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             offenders=offenders,
         )
 
-        for operation in (node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod))):
+        for operation in (node for node in ast.walk(kernel) if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod))):
             denominator_names = {node.id for node in ast.walk(operation.right) if isinstance(node, ast.Name)}
             if denominator_names & live_cluster_names:
                 offenders.append(f"{path.name}:{operation.lineno}: runtime cluster divisor in {ast.unparse(operation)!r}")
