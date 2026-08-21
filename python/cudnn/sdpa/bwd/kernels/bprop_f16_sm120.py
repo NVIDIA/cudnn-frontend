@@ -18,13 +18,19 @@ fp32 workspace and finalized by a small convert kernel.
 
 Constraints:
 * Supported input dtypes: Float16 and BFloat16 (output dtype matches)
-* Head dimension must be one of 32, 64, 128, 192, or 256; the adapter
-  serves any other multiple of 8 up to 256 by zero-padding D.
+* Head dimension must be one of 32, 64, 128, 192, or 256; any other
+  multiple of 8 up to 256 computes on the next of those sizes with the TMA
+  envelope zero-filling the pad columns in place, so every multiple of 8 serves
+  without staging copies.
 * GQA/MQA: H_q must be a multiple of H_kv
 * No dropout/alibi/softcap
 * Optional causal (top-left or bottom-right), right-band-widened causal
   (window_size_right), sliding-window masks and padding masks.
-* LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
+* LSE input is the natural-log forward stats, fp32 (B, H, SQ); any
+  non-broadcast layout
+* io tensors may declare any dense layout whose head dim is
+  innermost-contiguous and whose batch/seq/head strides are 16-byte
+  multiples (TMA's global-stride rule)
 
 One backward call is three kernel launches through the per-shape
 ``compile()`` cache at the bottom of this module: ``dot`` (delta =
@@ -42,14 +48,14 @@ import cutlass
 import cutlass.utils
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.bwd.config_sm120 import TemplateParams, validate_params
+from cudnn.sdpa.bwd.config_sm120 import SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
@@ -489,11 +495,22 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.seq_q_lens_present = bool(seq_q_lens_present)
         # sink LSE is finite on padded rows; trim them explicitly (LSE := +inf, P = 0)
         self.trim_q_rows = bool(sink_present) and self.seq_q_lens_present
-        self.d_qk = head_dim_qk
-        self.d_v = int(head_dim_v) or head_dim_qk
+        # Use padded head dim for compute
+        self.d_qk_orig = int(head_dim_qk)
+        self.d_v_orig = int(head_dim_v) or int(head_dim_qk)
+        for orig, tag in ((self.d_qk_orig, "d_qk"), (self.d_v_orig, "d_v")):
+            if orig % 8 or orig <= 0:
+                raise ValueError(f"{tag} must be a positive multiple of 8; got {orig}")
+        pads = padded_head_dims(self.d_qk_orig, self.d_v_orig)
+        if pads is None:
+            raise ValueError(f"head dims must be <= {max(SUPPORTED_HEAD_DIMS)}; got d_qk={self.d_qk_orig}, d_v={self.d_v_orig}")
+        self.d_qk, self.d_v = pads
+        head_dim_qk = self.d_qk
         # current MLA requires both to be multiples of 64 so one smem swizzle serves every tile.
         if self.d_v != head_dim_qk and (head_dim_qk % 64 or self.d_v % 64):
             raise ValueError(f"unequal head dims must both be multiples of 64; got d_qk={head_dim_qk}, d_v={self.d_v}")
+        self.qk_envelope = self.d_qk_orig != self.d_qk
+        self.v_envelope = self.d_v_orig != self.d_v
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim_qk]
         if q_tile:
@@ -646,6 +663,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             seqlen_q = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(SQ)))
 
         lse_ptr = lse.iterator.raw_ptr()
+        lse_batch_stride, lse_head_stride, lse_seq_stride = lse.stride
+        lse_strided = (lse_batch_stride, lse_head_stride, lse_seq_stride) != (HQ * SQ, SQ, 1)
         dd_ptr = delta.iterator.raw_ptr()
         dqa_ptr = dq_accum.iterator.raw_ptr()
         dkws_ptr = dk_ws.iterator.raw_ptr()
@@ -713,7 +732,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         prims.barrier_cta_sync(0)
 
         kv_head = q_head // GROUP
-        lse_base = (batch * HQ + q_head) * SQ
+        if cutlass.const_expr(lse_strided):
+            lse_base = batch * lse_batch_stride + q_head * lse_head_stride
+        else:
+            lse_base = (batch * HQ + q_head) * SQ
         dd_base = (batch * HQ + q_head) * SQ_R
         if cutlass.const_expr(self.deterministic):
             det_sem = dqsem_ptr + (batch * HQ + q_head) * ((SQ + M - 1) // M)
@@ -812,7 +834,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     r_abs = m_block * M + r_loc
                     if cutlass.const_expr(PARTIAL_Q):
                         r_cl = cute.math.min(r_abs, SQ - 1)
-                        val = (lse_ptr + lse_base + r_cl).load()
+                        if cutlass.const_expr(lse_strided):
+                            val = (lse_ptr + lse_base + r_cl * lse_seq_stride).load()
+                        else:
+                            val = (lse_ptr + lse_base + r_cl).load()
                         inf = cutlass.Float32(float("inf"))
                         # branchless (r_abs < SQ) ? 1 : 0 via arith.select
                         ok32 = cutlass.Int32(
@@ -824,6 +849,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         )
                         if ok32 == 0:
                             val = inf
+                    elif cutlass.const_expr(lse_strided):
+                        val = (lse_ptr + lse_base + r_abs * lse_seq_stride).load()
                     else:
                         val = (lse_ptr + lse_base + r_abs).load()
                     if cutlass.const_expr(FLIP_MASKED_LSE):
@@ -1156,7 +1183,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         for rep in cutlass.range_constexpr(SDP_REPS):
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
-                                val = (lse_ptr + lse_base + nq0 + r_loc).load()
+                                if cutlass.const_expr(lse_strided):
+                                    val = (lse_ptr + lse_base + (nq0 + r_loc) * lse_seq_stride).load()
+                                else:
+                                    val = (lse_ptr + lse_base + nq0 + r_loc).load()
                                 if cutlass.const_expr(FLIP_MASKED_LSE):
                                     # A fully masked row has LSE = -inf, which can produce
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
@@ -1200,7 +1230,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         for rep in cutlass.range_constexpr(SDP_REPS):
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
-                                val = (lse_ptr + lse_base + nq0 + r_loc).load()
+                                if cutlass.const_expr(lse_strided):
+                                    val = (lse_ptr + lse_base + (nq0 + r_loc) * lse_seq_stride).load()
+                                else:
+                                    val = (lse_ptr + lse_base + nq0 + r_loc).load()
                                 if cutlass.const_expr(FLIP_MASKED_LSE):
                                     # A fully masked row has LSE = -inf, which can produce
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
@@ -1272,7 +1305,18 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             # smem -> gmem. dk_ws/dv_ws rows are HQ-headed: dk/dv themselves
             # when MHA (HQ == HKV and q_head == kv_head), one slot per q head
             # under GQA — the same addressing covers both.
-            if cutlass.const_expr(d_qk == d_v):
+            dk_batch_stride, dk_seq_stride, dk_head_stride, _ = dk_ws.stride
+            dv_batch_stride, dv_seq_stride, dv_head_stride, _ = dv_ws.stride
+            dkv_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (SKV * qk_row_stride, qk_row_stride, d_qk) or (
+                dv_batch_stride,
+                dv_seq_stride,
+                dv_head_stride,
+            ) != (
+                SKV * v_row_stride,
+                v_row_stride,
+                d_v,
+            )
+            if cutlass.const_expr(d_qk == d_v and not dkv_strided and dk_ws.shape[3] == d_qk and dv_ws.shape[3] == d_v):
                 chunks_per_row = d_qk // _COPY_ELEMS
                 total = N * chunks_per_row
                 # workspace's head-dim base offset
@@ -1286,27 +1330,32 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dkws_ptr + w_off)
                         copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dvws_ptr + w_off)
             else:
-                # Unequal head dims: dK rows are D_QK-wide and dV rows
-                # D_V-wide, so the chunk->(row, col) maps differ per side.
+                # d_qk != d_v, strided, or enveloped
                 k_chunks_per_row = d_qk // _COPY_ELEMS
-                whd_base_k = (batch * SKV + kv_base) * qk_row_stride + q_head * d_qk
+                base_k = batch * dk_batch_stride + kv_base * dk_seq_stride + q_head * dk_head_stride
                 for i in cutlass.range_constexpr(N * k_chunks_per_row // 256):
                     chunk = i * 256 + math_tidx
                     row = chunk // k_chunks_per_row
                     col = (chunk % k_chunks_per_row) * _COPY_ELEMS
                     if (not cutlass.const_expr(PARTIAL_KV)) or (kv_base + row < SKV):
-                        w_off = whd_base_k + row * qk_row_stride + col
-                        copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dkws_ptr + w_off)
+                        if cutlass.const_expr(self.qk_envelope):
+                            # dK is only d_qk_orig wide; the pad columns are zero anyway.
+                            if col < self.d_qk_orig:
+                                copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dkws_ptr + base_k + row * dk_seq_stride + col)
+                        else:
+                            copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dkws_ptr + base_k + row * dk_seq_stride + col)
                 v_chunks_per_row = d_v // _COPY_ELEMS
-                whd_base_v = (batch * SKV + kv_base) * v_row_stride + q_head * d_v
+                base_v = batch * dv_batch_stride + kv_base * dv_seq_stride + q_head * dv_head_stride
                 for i in cutlass.range_constexpr(N * v_chunks_per_row // 256):
                     chunk = i * 256 + math_tidx
                     row = chunk // v_chunks_per_row
                     col = (chunk % v_chunks_per_row) * _COPY_ELEMS
                     if (not cutlass.const_expr(PARTIAL_KV)) or (kv_base + row < SKV):
-                        w_off = whd_base_v + row * v_row_stride + col
-                        copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dvws_ptr + w_off)
-
+                        if cutlass.const_expr(self.v_envelope):
+                            if col < self.d_v_orig:
+                                copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dvws_ptr + base_v + row * dv_seq_stride + col)
+                        else:
+                            copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dvws_ptr + base_v + row * dv_seq_stride + col)
         else:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
@@ -1390,7 +1439,6 @@ def _dot_do_o_kernel(
     SQ = o.shape[1]
     H = o.shape[2]
     SQ_R = ((SQ + 127) // 128) * 128
-    row_stride = H * d_v
     M = q_tile
 
     o_ptr = o.iterator.raw_ptr()
@@ -1398,27 +1446,53 @@ def _dot_do_o_kernel(
     dd_ptr = delta.iterator.raw_ptr()
     dqa_ptr = dq_accum.iterator.raw_ptr()
 
-    base = ((batch * SQ + m_block * M) * H + head) * d_v
+    o_batch_stride, o_seq_stride, o_head_stride, _ = o.stride
+    do_batch_stride, do_seq_stride, do_head_stride, _ = do.stride
+    compact = (SQ * H * d_v, H * d_v, d_v)
+    io_strided = o.shape[3] != d_v or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
+    if cutlass.const_expr(io_strided):
+        o_base = batch * o_batch_stride + (m_block * M) * o_seq_stride + head * o_head_stride
+        do_base = batch * do_batch_stride + (m_block * M) * do_seq_stride + head * do_head_stride
+    else:
+        row_stride = H * d_v
+        base = ((batch * SQ + m_block * M) * H + head) * d_v
     dd_base = (batch * H + head) * SQ_R + m_block * M
     q_left = SQ - m_block * M
 
-    tpr = page // _COPY_ELEMS
-    rows_per_pass = 256 // tpr
-    col0 = (tidx % tpr) * _COPY_ELEMS
-    row0 = tidx // tpr
+    threads_per_row = page // _COPY_ELEMS
+    rows_per_pass = 256 // threads_per_row
+    col0 = (tidx % threads_per_row) * _COPY_ELEMS
+    row0 = tidx // threads_per_row
     n_pages = d_v // page
     for rp in cutlass.range_constexpr(M // rows_per_pass):
         row = row0 + rp * rows_per_pass
         acc = cutlass.Float32(0.0)
         if row < q_left:
-            g_off = base + row * row_stride + col0
-            for pg in cutlass.range_constexpr(n_pages):
-                ov = (o_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
-                dov = (do_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
-                for kk in cutlass.range_constexpr(_COPY_ELEMS):
-                    acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
-        # Allreduce over the tpr threads sharing the row (lane-contiguous).
-        n_sh = 3 if cutlass.const_expr(tpr == 8) else 2
+            if cutlass.const_expr(io_strided):
+                o_off = o_base + row * o_seq_stride + col0
+                do_off = do_base + row * do_seq_stride + col0
+                for pg in cutlass.range_constexpr(n_pages):
+                    if cutlass.const_expr(o.shape[3] != d_v):
+                        # Envelope: rows are only o.shape[3] wide
+                        if col0 + pg * page < o.shape[3]:
+                            ov = (o_ptr + o_off + pg * page).load(count=_COPY_ELEMS)
+                            dov = (do_ptr + do_off + pg * page).load(count=_COPY_ELEMS)
+                            for kk in cutlass.range_constexpr(_COPY_ELEMS):
+                                acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
+                    else:
+                        ov = (o_ptr + o_off + pg * page).load(count=_COPY_ELEMS)
+                        dov = (do_ptr + do_off + pg * page).load(count=_COPY_ELEMS)
+                        for kk in cutlass.range_constexpr(_COPY_ELEMS):
+                            acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
+            else:
+                g_off = base + row * row_stride + col0
+                for pg in cutlass.range_constexpr(n_pages):
+                    ov = (o_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
+                    dov = (do_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
+                    for kk in cutlass.range_constexpr(_COPY_ELEMS):
+                        acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
+        # Allreduce over the threads sharing the row (lane-contiguous).
+        n_sh = 3 if cutlass.const_expr(threads_per_row == 8) else 2
         for sh in cutlass.range_constexpr(n_sh):
             acc = acc + prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
@@ -1427,16 +1501,16 @@ def _dot_do_o_kernel(
                 mask_and_clamp=0x1F,
                 kind=prims.Shfl.BFLY,
             )
-        if tidx % tpr == 0:
+        if tidx % threads_per_row == 0:
             (dd_ptr + dd_base + row).store(acc)
 
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_wait()
 
-    zrows = 32 if cutlass.const_expr(page == 32) else 16
-    ztpr = 256 // zrows
-    zr0 = tidx // ztpr
-    zc0 = (tidx % ztpr) * 4
+    zero_rows_per_pass = 32 if cutlass.const_expr(d_qk == 32) else 16
+    zero_threads_per_row = 256 // zero_rows_per_pass
+    zero_row0 = tidx // zero_threads_per_row
+    zero_col0 = (tidx % zero_threads_per_row) * 4
     zero4 = cutlass.Vector.from_elements(
         (
             cutlass.Float32(0.0),
@@ -1447,9 +1521,9 @@ def _dot_do_o_kernel(
         cutlass.Float32,
     )
     dqa_base = ((batch * SQ_R + m_block * M) * H + head) * d_qk
-    for im in cutlass.range_constexpr(M // zrows):
-        for jn in cutlass.range_constexpr(d_qk // (ztpr * 4)):
-            addr = dqa_base + (zr0 + im * zrows) * (H * d_qk) + zc0 + jn * ztpr * 4
+    for im in cutlass.range_constexpr(M // zero_rows_per_pass):
+        for jn in cutlass.range_constexpr(d_qk // (zero_threads_per_row * 4)):
+            addr = dqa_base + (zero_row0 + im * zero_rows_per_pass) * (H * d_qk) + zero_col0 + jn * zero_threads_per_row * 4
             (dqa_ptr + addr).store(zero4, alignment=16)
 
     if cutlass.const_expr(deterministic):
@@ -1552,18 +1626,26 @@ def _convert_dq_kernel(
     prims.barrier_cta_sync(0)
 
     q_left = SQ - m_block * M
-    row_stride = H * d_qk
-    g_base = ((batch * SQ + m_block * M) * H + head) * d_qk
+    dq_batch_stride, dq_seq_stride, dq_head_stride, _ = dq.stride
+    g_base = batch * dq_batch_stride + (m_block * M) * dq_seq_stride + head * dq_head_stride
     chunks_per_row = d_qk // _COPY_ELEMS
     for i in cutlass.range_constexpr(M * chunks_per_row // 256):
         chunk = i * 256 + tidx
         row = chunk // chunks_per_row
         col = (chunk % chunks_per_row) * _COPY_ELEMS
         if row < q_left:
-            copy16_smem_to_gmem(
-                tile_ptr(sdQ, row, col, page=page, rows=M),
-                dq_ptr + g_base + row * row_stride + col,
-            )
+            if cutlass.const_expr(dq.shape[3] != d_qk):
+                # Envelope: dQ is only dq.shape[3] wide (pad columns are zero).
+                if col < dq.shape[3]:
+                    copy16_smem_to_gmem(
+                        tile_ptr(sdQ, row, col, page=page, rows=M),
+                        dq_ptr + g_base + row * dq_seq_stride + col,
+                    )
+            else:
+                copy16_smem_to_gmem(
+                    tile_ptr(sdQ, row, col, page=page, rows=M),
+                    dq_ptr + g_base + row * dq_seq_stride + col,
+                )
 
 
 @cute.jit
@@ -1604,6 +1686,11 @@ def _reduce_group_vec(
     d: cutlass.Constexpr[int],
     group: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    out_batch_stride: cutlass.Constexpr[int] = 0,
+    out_seq_stride: cutlass.Constexpr[int] = 0,
+    out_head_stride: cutlass.Constexpr[int] = 0,
+    out_strided: cutlass.Constexpr[bool] = False,
+    skv: cutlass.Constexpr[int] = 0,
 ):
     """Sum one 16 B output vector over the group's q-head partials (fp32,
     fixed order -> deterministic) and store it in the io dtype."""
@@ -1622,7 +1709,68 @@ def _reduce_group_vec(
         for e in cutlass.range_constexpr(VEC):
             acc[e] = acc[e] + w[e].to(cutlass.Float32)
     vec = cutlass.Vector.from_elements(tuple(acc[e].to(io_dtype) for e in range(VEC)), io_dtype)
-    (out_ptr + pos).store(vec, alignment=16)
+    if cutlass.const_expr(out_strided):
+        s_row = bs % skv
+        b_idx = bs // skv
+        (out_ptr + b_idx * out_batch_stride + s_row * out_seq_stride + kh * out_head_stride + col).store(vec, alignment=16)
+    else:
+        (out_ptr + pos).store(vec, alignment=16)
+
+
+@cute.jit
+def _reduce_group_vec_guarded(
+    ws_ptr,
+    out_ptr,
+    idx,
+    hkv,
+    hq,
+    *,
+    d: cutlass.Constexpr[int],
+    d_out: cutlass.Constexpr[int],
+    group: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    out_batch_stride: cutlass.Constexpr[int],
+    out_seq_stride: cutlass.Constexpr[int],
+    out_head_stride: cutlass.Constexpr[int],
+    out_strided: cutlass.Constexpr[bool],
+    skv: cutlass.Constexpr[int],
+):
+    """_reduce_group_vec, skipping the pad-column vectors when the output is
+    narrower than the padded ws rows (envelope: those columns are zero and
+    the user tensor has no room for them)."""
+    if cutlass.const_expr(d_out != d):
+        if (idx * 8) % d < d_out:
+            _reduce_group_vec(
+                ws_ptr,
+                out_ptr,
+                idx,
+                hkv,
+                hq,
+                d=d,
+                group=group,
+                io_dtype=io_dtype,
+                out_batch_stride=out_batch_stride,
+                out_seq_stride=out_seq_stride,
+                out_head_stride=out_head_stride,
+                out_strided=out_strided,
+                skv=skv,
+            )
+    else:
+        _reduce_group_vec(
+            ws_ptr,
+            out_ptr,
+            idx,
+            hkv,
+            hq,
+            d=d,
+            group=group,
+            io_dtype=io_dtype,
+            out_batch_stride=out_batch_stride,
+            out_seq_stride=out_seq_stride,
+            out_head_stride=out_head_stride,
+            out_strided=out_strided,
+            skv=skv,
+        )
 
 
 @cute.kernel
@@ -1652,22 +1800,86 @@ def _dkv_reduce_kernel(
     dvws_ptr = dv_ws.iterator.raw_ptr()
     dk_ptr = dk.iterator.raw_ptr()
     dv_ptr = dv.iterator.raw_ptr()
+    dk_batch_stride, dk_seq_stride, dk_head_stride, _ = dk.stride
+    dv_batch_stride, dv_seq_stride, dv_head_stride, _ = dv.stride
+    dk_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (SKV * HKV * d_qk, HKV * d_qk, d_qk)
+    dv_strided = (dv_batch_stride, dv_seq_stride, dv_head_stride) != (SKV * HKV * d_v, HKV * d_v, d_v)
     gidx = bidx * 256 + tidx  # host launch 256 threads
     if cutlass.const_expr(d_qk == d_v):
         OUT_VECS = B * SKV * HKV * d_qk // VEC
         if gidx < OUT_VECS:
-            _reduce_group_vec(dkws_ptr, dk_ptr, gidx, HKV, HQ, d=d_qk, group=group, io_dtype=io_dtype)
-            _reduce_group_vec(dvws_ptr, dv_ptr, gidx, HKV, HQ, d=d_qk, group=group, io_dtype=io_dtype)
+            _reduce_group_vec_guarded(
+                dkws_ptr,
+                dk_ptr,
+                gidx,
+                HKV,
+                HQ,
+                d=d_qk,
+                d_out=dk.shape[3],
+                group=group,
+                io_dtype=io_dtype,
+                out_batch_stride=dk_batch_stride,
+                out_seq_stride=dk_seq_stride,
+                out_head_stride=dk_head_stride,
+                out_strided=dk_strided,
+                skv=SKV,
+            )
+            _reduce_group_vec_guarded(
+                dvws_ptr,
+                dv_ptr,
+                gidx,
+                HKV,
+                HQ,
+                d=d_qk,
+                d_out=dv.shape[3],
+                group=group,
+                io_dtype=io_dtype,
+                out_batch_stride=dv_batch_stride,
+                out_seq_stride=dv_seq_stride,
+                out_head_stride=dv_head_stride,
+                out_strided=dv_strided,
+                skv=SKV,
+            )
     else:
         # Unequal head dims: dK and dV vectors index different row widths, so
         # the flat thread range covers dK's vectors first, then dV's.
         K_VECS = B * SKV * HKV * d_qk // VEC
         V_VECS = B * SKV * HKV * d_v // VEC
         if gidx < K_VECS:
-            _reduce_group_vec(dkws_ptr, dk_ptr, gidx, HKV, HQ, d=d_qk, group=group, io_dtype=io_dtype)
+            _reduce_group_vec_guarded(
+                dkws_ptr,
+                dk_ptr,
+                gidx,
+                HKV,
+                HQ,
+                d=d_qk,
+                d_out=dk.shape[3],
+                group=group,
+                io_dtype=io_dtype,
+                out_batch_stride=dk_batch_stride,
+                out_seq_stride=dk_seq_stride,
+                out_head_stride=dk_head_stride,
+                out_strided=dk_strided,
+                skv=SKV,
+            )
         else:
             if gidx < K_VECS + V_VECS:
-                _reduce_group_vec(dvws_ptr, dv_ptr, gidx - K_VECS, HKV, HQ, d=d_v, group=group, io_dtype=io_dtype)
+                _reduce_group_vec_guarded(
+                    dvws_ptr,
+                    dv_ptr,
+                    gidx - K_VECS,
+                    HKV,
+                    HQ,
+                    d=d_v,
+                    d_out=dv.shape[3],
+                    group=group,
+                    io_dtype=io_dtype,
+                    out_batch_stride=dv_batch_stride,
+                    out_seq_stride=dv_seq_stride,
+                    out_head_stride=dv_head_stride,
+                    out_strided=dv_strided,
+                    skv=SKV,
+                )
 
 
 @cute.jit
@@ -1717,6 +1929,7 @@ def _dsink_kernel(
     HQ = lse.shape[1]
     SQ = lse.shape[2]
     SQ_R = delta.shape[2]
+    lse_batch_stride, lse_head_stride, lse_seq_stride = lse.stride
     lse_ptr = lse.iterator.raw_ptr()
     delta_ptr = delta.iterator.raw_ptr()
     s_val = (sink.iterator.raw_ptr() + head).load()
@@ -1725,14 +1938,14 @@ def _dsink_kernel(
     batch = cutlass.Int32(0)
     # batch loop
     while batch < B:
-        lse_base = (batch * HQ + head) * SQ
+        lse_base = batch * lse_batch_stride + head * lse_head_stride
         delta_base = (batch * HQ + head) * SQ_R
         q_bound = SQ
         if cutlass.const_expr(seq_q_lens is not None):
             q_bound = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(SQ)))
         q = cutlass.Int32(tidx)
         while q < q_bound:
-            lv = (lse_ptr + lse_base + q).load()
+            lv = (lse_ptr + lse_base + q * lse_seq_stride).load()
             # Padded / trimmed rows carry LSE = -inf: skip them, exp(sink + inf) * 0 = NaN
             if lv > -inf and lv < inf:
                 dd = (delta_ptr + delta_base + q).load()
@@ -1779,15 +1992,27 @@ def compile(  # noqa: A001
     d_qk: int = 128,
     d_v: int = 0,  # the V/O/dO/dV head dim (0 = ``d_qk``; unequal dims serve MLA).
     kvh: int = 0,  # the KV head count for GQA/MQA (0 = ``qh``, plain MHA).
+    lse_strides: "tuple[int, int, int] | None" = None,  # non-contiguous LSE (B, H, S) strides; None = contiguous
+    # Non-compact io ports: declared BSHD (batch, seq, head) element strides; None = compact BSHD.
+    q_strides: "tuple[int, int, int] | None" = None,
+    k_strides: "tuple[int, int, int] | None" = None,
+    v_strides: "tuple[int, int, int] | None" = None,
+    o_strides: "tuple[int, int, int] | None" = None,
+    do_strides: "tuple[int, int, int] | None" = None,
+    dq_strides: "tuple[int, int, int] | None" = None,
+    dk_strides: "tuple[int, int, int] | None" = None,
+    dv_strides: "tuple[int, int, int] | None" = None,
 ) -> SimpleNamespace:
-    """Compile and cache the backward chain for one compact BSHD shape
-    (dot, main, cvt, plus the group-reduce kernel when GQA).
+    """Compile and cache the backward chain for one BSHD shape (dot, main,
+    cvt, plus the group-reduce kernel when GQA). Non-compact ports carry
+    their declared strides as compile-time constants.
     """
 
     kvh = int(kvh) or int(qh)
     d_v = int(d_v) or int(d_qk)
     if qh % kvh:
         raise ValueError(f"GQA requires qh to be a multiple of kvh; got qh={qh}, kvh={kvh}")
+    has_gqa = kvh != qh
     bwd = SM120FusedMultiHeadAttentionFP16Backward(
         in_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.is_causal,
@@ -1804,25 +2029,39 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         sink_present=PARAMS.sink_present,
     )
+    d_qk_orig, d_v_orig = bwd.d_qk_orig, bwd.d_v_orig
+    d_qk, d_v = bwd.d_qk, bwd.d_v
     sq_r = ceil_div(sq, 128) * 128
 
-    def _fake(dtype, shape):
-        return make_fake_compact_tensor(
-            dtype,
-            shape,
-            stride_order=tuple(range(len(shape) - 1, -1, -1)),
-            assumed_align=16,
-        )
+    def _fake(dtype, shape, strides=None):
+        """Compact fake, or one carrying a port's declared (batch, seq, head)
+        strides (the TMA descriptors and pointer math then address that
+        layout natively)."""
+        if strides is None:
+            return make_fake_compact_tensor(
+                dtype,
+                shape,
+                stride_order=tuple(range(len(shape) - 1, -1, -1)),
+                assumed_align=16,
+            )
+        batch_stride, seq_stride, head_stride = strides
+        return make_fake_tensor(dtype, shape, (batch_stride, seq_stride, head_stride, 1), assumed_align=16)
 
-    fake_q = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk))
-    fake_k = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk))
-    fake_v = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v))
-    fake_o = _fake(STORAGE_DTYPE, (b, sq, qh, d_v))
-    fake_do = _fake(STORAGE_DTYPE, (b, sq, qh, d_v))
-    fake_dq = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk))
-    fake_dk = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk))
-    fake_dv = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v))
-    fake_lse = _fake(cutlass.Float32, (b, qh, sq))
+    fake_q = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk_orig), q_strides)
+    fake_k = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk_orig), k_strides)
+    fake_v = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v_orig), v_strides)
+    fake_o = _fake(STORAGE_DTYPE, (b, sq, qh, d_v_orig), o_strides)
+    fake_do = _fake(STORAGE_DTYPE, (b, sq, qh, d_v_orig), do_strides)
+    fake_dq = _fake(STORAGE_DTYPE, (b, sq, qh, d_qk_orig), dq_strides)
+    fake_dk = _fake(STORAGE_DTYPE, (b, skv, kvh, d_qk_orig), dk_strides)
+    fake_dv = _fake(STORAGE_DTYPE, (b, skv, kvh, d_v_orig), dv_strides)
+    if lse_strides is not None:
+        # f32 scalars -> 4 B alignment
+        # A strided stats view can start at any fp32 element; the compact
+        # branch keeps the historical allocation-backed 16-byte assumption.
+        fake_lse = make_fake_tensor(cutlass.Float32, (b, qh, sq), tuple(lse_strides), assumed_align=4)
+    else:
+        fake_lse = _fake(cutlass.Float32, (b, qh, sq))
     fake_delta = _fake(cutlass.Float32, (b, qh, sq_r))
     fake_dq_accum = _fake(cutlass.Float32, (b * sq_r * qh * d_qk,))
     # Sized for the smallest legal q-tile (32) so one formula covers every
@@ -1830,9 +2069,8 @@ def compile(  # noqa: A001
     fake_dq_sem = _fake(cutlass.Int32, (b * qh * ceil_div(sq, 32),))
     # Main-kernel dK/dV destinations, always HQ-headed: alias dk/d_v for MHA
     # (qh == kvh); per-q-head partials summed by _dkv_reduce_kernel for GQA.
-    has_gqa = kvh != qh
-    fake_dk_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_qk))
-    fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_v))
+    fake_dk_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_qk)) if has_gqa else fake_dk
+    fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_v)) if has_gqa else fake_dv
     fake_seq_q_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_q_lens_present else None
     fake_seq_kv_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_kv_lens_present else None
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)

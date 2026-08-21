@@ -38,9 +38,9 @@ class TemplateParams:
     """Per-graph parameters that change the traced SM120 backward kernel.
 
     Tensor geometry deliberately stays out of this record. Scalar dimensions
-    are inputs to the template module's per-shape ``compile()`` cache, while
-    strides follow the fixed compact-BSHD kernel contract. This frozen record
-    identifies the import-time specialization shared by all compatible shapes.
+    are inputs to the template module's per-shape ``compile()`` cache. This
+    frozen record identifies the import-time specialization shared by all
+    compatible shapes.
     """
 
     dtype_qkv: int = DTYPE_FP16

@@ -1187,7 +1187,7 @@ def test_bwd_probe_rejects_dbias(monkeypatch):
 
 def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
     # Same dense_flex envelope as the forward rows: any B/H/S order with the
-    # head dim innermost; the adapter stages to compact BSHD.
+    # head dim innermost; the declared strides are served natively.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     bhsd_contig = (H * S * _BWD_D, S * _BWD_D, _BWD_D, 1)
     assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
@@ -1196,10 +1196,10 @@ def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(grad_strides=s_innermost))
 
 
-def test_bwd_probe_rejects_strided_stats(monkeypatch):
+def test_bwd_probe_accepts_strided_stats(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    # A padded stats stride has no zero-copy (B, H, S) reshape.
-    assert not _bwd_eligible(_mk_bwd_graph(stats_stride=(2 * H * S, 2 * S, 2, 1)))
+    # Padded stats strides bind natively (baked into the compiled kernel).
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(stats_stride=(2 * H * S, 2 * S, 2, 1)))
 
 
 def test_bwd_knob_domains(monkeypatch):
