@@ -728,6 +728,18 @@ def lower_dsl_prefill(
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
         cga=knobs.cga if knobs is not None else None,
+        # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
+        # specializations of that template): forwarded only to adapters whose
+        # constructor declares them — every other row's mismatch gated the
+        # operands off already.
+        **(
+            {
+                "bias_present": facts.bias_t is not None,
+                "bias_fp32": facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT,
+            }
+            if "bias_present" in inspect.signature(_adapter(api_type).__init__).parameters
+            else {}
+        ),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
