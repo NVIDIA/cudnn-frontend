@@ -100,19 +100,27 @@ def hadamard_rmem_colwise_fwht(rmem_bf16, d_buffer, tidx, sRht):
 
 
 @cute.jit
-def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht, sSf, sf_row_base, sf_dtype):
+def hadamard_rmem_colwise_fwht_quant(
+    rmem_bf16,
+    d_buffer,
+    tidx,
+    norm_const,
+    sRht,
+    sSf,
+    sf_row_base,
+    sf_dtype,
+    gRht=None,
+    seg16=None,
+    pitch16=None,
+    feat0=None,
+    tok16=None,
+    row_blocks=None,
+    gSf=None,
+):
     """Colwise FWHT + NVFP4 quantization from the load_colwise_pairs_bf16 registers,
-    stored at the SAME (token, feature) coords the input was read from (the staging
-    is f-major like every other output; packed nibbles pair ADJACENT FEATURES of one
-    token, so each token row is one 1-byte store). Quantization blocks follow the
-    transform: one (16, 1) token-block scale per feature, staged in the sSf smem
-    rows (sf_row_base + feature, token_block); the kernel stores each thread's whole
-    contiguous scale row once per tile."""
-    token_block = tidx // HADAMARD_SIZE
-    feat_pair = tidx % HADAMARD_SIZE
-    token_base = token_block * HADAMARD_SIZE
-    feature = 2 * feat_pair
-
+    stored transposed: packed nibbles pair adjacent tokens of one feature. The
+    default target stages into sRht for a transposed TMA store; with gRht set,
+    stores go directly into a flat per-expert ragged output buffer."""
     n_vals = 2 * HADAMARD_SIZE
     tCompute = cute.make_rmem_tensor((n_vals,), cutlass.Float32)
     for i in cutlass.range_constexpr(n_vals):
@@ -123,6 +131,53 @@ def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht
     # Orthonormal scale, rounded through bf16 (== the bf16 output values).
     for i in cutlass.range_constexpr(n_vals):
         tCompute[i] = (tCompute[i] * cutlass.Float32(0.25)).to(cutlass.BFloat16).to(cutlass.Float32)
+
+    _nvfp4_quant_colwise_transposed(
+        tCompute,
+        d_buffer,
+        tidx,
+        norm_const,
+        sRht,
+        sSf,
+        sf_row_base,
+        sf_dtype,
+        gRht,
+        seg16,
+        pitch16,
+        feat0,
+        tok16,
+        row_blocks,
+        gSf,
+    )
+
+
+@cute.jit
+def _nvfp4_quant_colwise_transposed(
+    tCompute,
+    d_buffer,
+    tidx,
+    norm_const,
+    sRht,
+    sSf,
+    sf_row_base,
+    sf_dtype,
+    gRht=None,
+    seg16=None,
+    pitch16=None,
+    feat0=None,
+    tok16=None,
+    row_blocks=None,
+    gSf=None,
+):
+    """Colwise NVFP4 quantization of two 16-token feature columns.
+
+    Data bytes are stored in transposed order, so each feature's 16 transformed
+    token values are one contiguous 8-byte vector. ``gRht``/``gSf`` enable direct
+    flat per-expert stores for data and per-expert swizzled scale segments.
+    """
+    token_block = tidx // HADAMARD_SIZE
+    feat_pair = tidx % HADAMARD_SIZE
+    feature = 2 * feat_pair
 
     # group_rht_cast's exact (fast_math=0) op sequence — NOT the flashinfer one:
     # gem = ge * (1/6) is pre-folded, and the encode scale is computed with EXACT
@@ -149,8 +204,24 @@ def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht
     tCrSFC_f8x4.store(pv_f32x4.load().to(sf_dtype))
     tCrSFC_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
     tCrSFC_f32x4.store(tCrSFC_f8x4.load().to(cutlass.Float32))
+    if cutlass.const_expr(gSf is not None):
+        gSf = cute.recast_tensor(gSf, sf_dtype)
     for c in cutlass.range_constexpr(2):
-        sSf[(sf_row_base + feature + c, token_block)] = tCrSFC_f8x4[c]
+        if cutlass.const_expr(gSf is not None):
+            row = feat0 + sf_row_base + feature + c
+            col = tok16 + token_block
+            col_blocks = pitch16 // 4
+            sf_idx = (
+                seg16
+                + (row % 32) * 4 * row_blocks * 4 * col_blocks
+                + ((row // 32) % 4) * row_blocks * 4 * col_blocks
+                + (row // 128) * 4 * col_blocks
+                + (col % 4) * col_blocks
+                + (col // 4)
+            )
+            gSf[sf_idx] = tCrSFC_f8x4[c]
+        else:
+            sSf[(sf_row_base + feature + c, token_block)] = tCrSFC_f8x4[c]
 
     fp32_max = cutlass.Float32(3.40282346638528859812e38)
     acc_scale_min0 = fmin(cutlass.Float32(1.0) / (tCrSFC_f32x4[0] * gd), fp32_max, nan=True)
@@ -161,15 +232,24 @@ def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht
             (acc_scale_min0, acc_scale_min1),
         )
 
-    tRS_rC = cute.make_rmem_tensor(tCompute.shape, cutlass.Float4E2M1FN)
-    tRS_rC.store(tCompute.load().to(cutlass.Float4E2M1FN))
-    src_pairs = cute.zipped_divide(tRS_rC, (2,))
-    sRht_pairs = cute.zipped_divide(cute.slice_(sRht, (None, None, d_buffer)), (1, 2))
-    for i in cutlass.range_constexpr(HADAMARD_SIZE):
-        cute.autovec_copy(
-            cute.slice_(src_pairs, ((None,), i)),
-            cute.slice_(sRht_pairs, ((None, None), (token_base + i, feat_pair))),
-        )
+    tCol = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float32)
+    tCol_fp4 = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float4E2M1FN)
+    if cutlass.const_expr(gRht is not None):
+        gRht_cols = cute.zipped_divide(gRht, (HADAMARD_SIZE,))
+    else:
+        sRht_cols = cute.zipped_divide(cute.slice_(sRht, (None, None, d_buffer)), (HADAMARD_SIZE, 1))
+    for c in cutlass.range_constexpr(2):
+        for i in cutlass.range_constexpr(HADAMARD_SIZE):
+            tCol[i] = tCompute[2 * i + c]
+        tCol_fp4.store(tCol.load().to(cutlass.Float4E2M1FN))
+        if cutlass.const_expr(gRht is not None):
+            col = seg16 + (feat0 + sf_row_base + feature + c) * pitch16 + tok16 + token_block
+            cute.autovec_copy(tCol_fp4, cute.slice_(gRht_cols, ((None,), col)))
+        else:
+            cute.autovec_copy(
+                tCol_fp4,
+                cute.slice_(sRht_cols, ((None, None), (token_block, feature + c))),
+            )
 
 
 @cute.jit
