@@ -66,9 +66,9 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+    def __init__(self, graph, config=None, cta_group=2, force_stg_epi=False):
         self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+        kw = dict(cta_group=cta_group, force_stg_epi=force_stg_epi)
         if config is not None:
             kw["config"] = config
         self._compiled = jit_from_cudnn_graph(graph, **kw)
@@ -82,21 +82,21 @@ class Plan:
         return self._compiled(variant_pack)
 
 
-LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
 
 
 def resolve(legacy_name):
-    """Legacy config-name (with _Nctamma/_static, kept as readable test IDs) ->
-    (pure-geometry config, cta_group, scheduler)."""
+    """Legacy config-name (with _Nctamma, kept as readable test IDs) ->
+    (pure-geometry config, cta_group)."""
     m = LEGACY_RE.match(legacy_name)
     assert m, legacy_name
-    return by_name(m.group(1)), int(m.group(2)), "static" if m.group(3) else "clc"
+    return by_name(m.group(1)), int(m.group(2))
 
 
 def kw(legacy_name):
     """resolve() packaged as jit/Plan kwargs."""
-    config, cta_group, scheduler = resolve(legacy_name)
-    return dict(config=config, cta_group=cta_group, scheduler=scheduler)
+    config, cta_group = resolve(legacy_name)
+    return dict(config=config, cta_group=cta_group)
 
 
 # --- variant packs ----------------------------------------------------------

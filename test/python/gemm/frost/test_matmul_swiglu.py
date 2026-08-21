@@ -32,12 +32,10 @@ _CFG_N256_C2 = next(
     c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 2 and c.cgrp_size_n == 1
 )
 
-# Every multi-GEMM-capable plain-matmul strategy: (label, cta_group, scheduler, config).
+# Every multi-GEMM-capable plain-matmul strategy: (label, cta_group, config).
 _STRATEGIES = [
-    ("1ctamma-clc", 1, "clc", _CFG_N256),
-    ("1ctamma-static", 1, "static", _CFG_N256),
-    ("2ctamma-clc", 2, "clc", _CFG_N256_C2),
-    ("2ctamma-static", 2, "static", _CFG_N256_C2),
+    ("1ctamma", 1, _CFG_N256),
+    ("2ctamma", 2, _CFG_N256_C2),
 ]
 
 
@@ -77,7 +75,7 @@ def _reference(a, b0, b1, scale, out_dt):
     return out.to(_TORCH_DT[out_dt])
 
 
-def _run(B, M, N, K, in_dt, out_dt, cfg, *, seed=0, cta_group=1, scheduler="clc"):
+def _run(B, M, N, K, in_dt, out_dt, cfg, *, seed=0, cta_group=1):
     torch.manual_seed(seed)
     a = torch.randn(B, M, K, device="cuda", dtype=_TORCH_DT[in_dt]) * 0.4
     b0 = torch.randn(B, N, K, device="cuda", dtype=_TORCH_DT[in_dt]) * 0.4
@@ -88,7 +86,6 @@ def _run(B, M, N, K, in_dt, out_dt, cfg, *, seed=0, cta_group=1, scheduler="clc"
         _build_swiglu(B, M, N, K, in_dt, out_dt),
         config=cfg,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale))
     torch.cuda.synchronize()
@@ -117,9 +114,9 @@ def _nonpacked_inputs(B, M, N, K, in_dt, out_dt, mode):
     return a, b0, b1, out_store[:, :, :N], scale
 
 
-@pytest.mark.parametrize("label,cta_group,scheduler,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
-def test_swiglu_all_templates(label, cta_group, scheduler, cfg) -> None:
-    """SwiGLU on every multi-GEMM template: 1ctamma / 2ctamma × clc / static."""
+@pytest.mark.parametrize("label,cta_group,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
+def test_swiglu_all_templates(label, cta_group, cfg) -> None:
+    """SwiGLU on every multi-GEMM template: 1ctamma / 2ctamma."""
     out, ref = _run(
         512,
         256,
@@ -129,7 +126,6 @@ def test_swiglu_all_templates(label, cta_group, scheduler, cfg) -> None:
         "bf16",
         cfg,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-1)
 
@@ -160,15 +156,15 @@ def test_swiglu_batched() -> None:
 
 
 @pytest.mark.parametrize(
-    "label,cta_group,scheduler,cfg,mode",
+    "label,cta_group,cfg,mode",
     [
-        ("1ctamma-clc-padded", 1, "clc", _CFG_N256, "padded"),
-        ("2ctamma-clc-padded", 2, "clc", _CFG_N256_C2, "padded"),
-        ("1ctamma-static-zero", 1, "static", _CFG_N256, "zero_stride"),
-        ("2ctamma-static-padded", 2, "static", _CFG_N256_C2, "padded"),
+        ("1ctamma-padded", 1, _CFG_N256, "padded"),
+        ("2ctamma-padded", 2, _CFG_N256_C2, "padded"),
+        ("1ctamma-zero", 1, _CFG_N256, "zero_stride"),
+        ("2ctamma-zero", 2, _CFG_N256_C2, "zero_stride"),
     ],
 )
-def test_swiglu_nonpacked_tensors(label, cta_group, scheduler, cfg, mode) -> None:
+def test_swiglu_nonpacked_tensors(label, cta_group, cfg, mode) -> None:
     B, M, N, K = 1, 256, 256, 128
     a, b0, b1, out, scale = _nonpacked_inputs(B, M, N, K, "bf16", "bf16", mode)
     assert not a.is_contiguous() or not b0.is_contiguous() or not b1.is_contiguous()
@@ -177,15 +173,14 @@ def test_swiglu_nonpacked_tensors(label, cta_group, scheduler, cfg, mode) -> Non
         _build_swiglu(B, M, N, K, "bf16", "bf16"),
         config=cfg,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale))
     torch.cuda.synchronize()
     torch.testing.assert_close(out, _reference(a, b0, b1, scale, "bf16"), rtol=2e-2, atol=2e-1)
 
 
-@pytest.mark.parametrize("label,cta_group,scheduler,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
-def test_swiglu_quant_epilogue(label, cta_group, scheduler, cfg):
+@pytest.mark.parametrize("label,cta_group,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
+def test_swiglu_quant_epilogue(label, cta_group, cfg):
     """Terminal block_scale_quantize on the dual-GEMM SwiGLU chain: the fused
     result is re-quantized to FP8 E4M3 + per-32-block E8M0 scale (two outputs)."""
     B, M, N, K = 1, 256, 256, 512
@@ -201,7 +196,6 @@ def test_swiglu_quant_epilogue(label, cta_group, scheduler, cfg):
         _build_swiglu(B, M, N, K, "bf16", "bf16", quant_block=qblock),
         config=cfg,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     assert compiled.chain.quants
     assert compiled.chain.output_dtype == "fp8_e4m3"

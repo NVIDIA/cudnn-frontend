@@ -291,21 +291,6 @@ def _run_reduction(
             128,
             512,
         ),
-        # 1ctamma static (no CLC, 1 tile/CTA).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
         # 2ctamma CLC (2-CTA MMA pair, cluster2x1; cta_n=128 → 2×128+SF fits 512).
         (
             "nvfp4",
@@ -326,21 +311,6 @@ def _run_reduction(
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        # 2ctamma static (no CLC, 1 tile/pair).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),
@@ -427,13 +397,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
         ),
         (
             "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
             256,
             128,
@@ -443,13 +406,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),

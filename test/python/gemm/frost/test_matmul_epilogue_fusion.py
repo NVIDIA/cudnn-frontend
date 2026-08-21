@@ -807,10 +807,10 @@ def _run_case(
     out_major: str = "n",
 ) -> None:
     """Common run/check body: build graph, JIT, launch, compare to torch."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     g, aux_names = _build_graph(M, N, K, in_dt, out_dt, chain, a_major, b_major, out_major)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -867,10 +867,10 @@ def _run_batched_case(
     config_name: str,
     case: BatchedFusionCase,
 ) -> None:
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     g, aux_names = _build_batched_graph(batch, M, N, K, in_dt, out_dt, case.chain, batched_aux=case.batched_aux)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -916,10 +916,10 @@ def _run_batched_case(
 
 def _run_rank3_broadcast_case(case: Rank3BroadcastCase) -> None:
     batch, M, N, K = _DEFAULT_BATCHED_SHAPE
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g, aux_names = _build_rank3_broadcast_graph(batch, M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, case)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -953,10 +953,10 @@ def _run_rank3_broadcast_case(case: Rank3BroadcastCase) -> None:
 
 def _run_epilogue_dtype_case(aux_dtype: str, out_dtype: str) -> None:
     M, N, K = 128, 128, 128
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = _build_epilogue_dtype_graph(M, N, K, aux_dtype, out_dtype)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -982,10 +982,10 @@ def _run_epilogue_dtype_case(aux_dtype: str, out_dtype: str) -> None:
 
 def _run_mixed_dtype_broadcast_case(case: MixedDtypeBroadcastCase) -> None:
     batch, M, N, K = _DEFAULT_BATCHED_SHAPE
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = _build_mixed_dtype_broadcast_graph(batch, M, N, K, case)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1064,7 +1064,7 @@ def test_fusion_m_major(chain: Chain) -> None:
 def test_rank1_per_col_fusion() -> None:
     """Rank-1 [N] aux broadcasts across M and must index with col_j."""
     M, N, K = _DEFAULT_SHAPE
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1077,7 +1077,7 @@ def test_rank1_per_col_fusion() -> None:
     cur = g.bias(input=cur, bias=bias, name="b")
     cur.set_output(True)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     a, b, c = _mkdata(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     bias_runtime = (torch.arange(N, dtype=torch.int32) % 5 - 2).to(dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1091,7 +1091,7 @@ def test_rank1_per_col_fusion() -> None:
 def test_rank1_scalar_fusion() -> None:
     """Rank-1 [1] aux broadcasts across all output elements."""
     M, N, K = _DEFAULT_SHAPE
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1104,7 +1104,7 @@ def test_rank1_scalar_fusion() -> None:
     cur = g.add(a=cur, b=scale, name="add")
     cur.set_output(True)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     a, b, c = _mkdata(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     scale_runtime = torch.tensor([2], dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1118,7 +1118,7 @@ def test_rank1_scalar_fusion() -> None:
 def test_batched_rank1_per_col_fusion() -> None:
     """Rank-1 [N] aux broadcasts across batch and M for rank-3 matmul output."""
     batch, M, N, K = _DEFAULT_BATCHED_SHAPE
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1131,7 +1131,7 @@ def test_batched_rank1_per_col_fusion() -> None:
     cur = g.bias(input=cur, bias=bias, name="b")
     cur.set_output(True)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     a, b, c = _mkbatched_data(batch, M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     bias_runtime = (torch.arange(N, dtype=torch.int32) % 5 - 2).to(dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1169,10 +1169,10 @@ def test_nonpacked_epilogue_aux_and_output(
 ) -> None:
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     g, aux_names = _build_nonpacked_epilogue_graph(batch, M, N, K, in_dt, out_dt, aux_bcast)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(
@@ -1217,9 +1217,9 @@ def test_zero_stride_epilogue_aux_broadcast(
 ) -> None:
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     g, aux_names = _build_zero_stride_aux_epilogue_graph(batch, M, N, K, in_dt, out_dt)
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
 
     a, b, c = _mkbatched_nonpacked_data(batch, M, N, K, in_dt, out_dt, seed=0)
     aux = _mkaux_zero_stride_per_elem(batch, M, N, in_dt, seed=13)
@@ -1281,10 +1281,10 @@ def test_epilogue_output_dtypes(out_dtype: str) -> None:
 
 def test_epilogue_uint8_output_preserves_values_above_int8_positive_range() -> None:
     M, N, K = 128, 128, 128
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = _build_epilogue_dtype_graph(M, N, K, "fp32", "uint8")
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1303,7 +1303,7 @@ def test_epilogue_uint8_output_preserves_values_above_int8_positive_range() -> N
 
 def test_epilogue_int32_compute_type() -> None:
     M, N, K = 128, 128, 128
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1326,7 +1326,7 @@ def test_epilogue_int32_compute_type() -> None:
     )
     cur.set_output(True).set_data_type(cudnn.data_type.INT32)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1357,7 +1357,7 @@ def test_epilogue_int32_compute_type() -> None:
 )
 def test_additional_unary_epilogue_ops(op: str) -> None:
     M, N, K = 128, 128, 128
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1369,7 +1369,7 @@ def test_additional_unary_epilogue_ops(op: str) -> None:
     cur = _apply_unary(g, op, cur, "new_unary")
     cur.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1397,7 +1397,7 @@ def test_additional_binary_epilogue_ops(
     bcast: Bcast,
 ) -> None:
     M, N, K = 128, 128, 128
-    cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
+    cfg, cta_group = _resolve(_DEFAULT_CONFIG)
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[_DEFAULT_IN_DT],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -1414,7 +1414,7 @@ def test_additional_binary_epilogue_ops(
         cur = _apply_binary(g, op, aux, cur, "new_binary")
     cur.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     try:
-        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -2206,7 +2206,7 @@ def test_m_major_op_tap() -> None:
     Y.set_output(True)
 
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
-    plan = _plan(g, config=cfg, cta_group=2, scheduler="clc")
+    plan = _plan(g, config=cfg, cta_group=2)
 
     a, b = _mkdata_bf16(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
@@ -2245,7 +2245,7 @@ def test_m_major_extra_output() -> None:
     Y.set_output(True)
 
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
-    plan = _plan(g, config=cfg, cta_group=2, scheduler="clc")
+    plan = _plan(g, config=cfg, cta_group=2)
     assert plan.chain.output_specs[0].major == "n" and plan.chain.output_specs[1].major == "m"
 
     a, b = _mkdata_bf16(M, N, K)

@@ -5,7 +5,7 @@
 
 A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
 MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
-``static_sched`` / ``ab_stages`` — those are execution strategy chosen by the
+``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
 Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>``.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -133,7 +133,7 @@ def smem_max_ab_stages(
 class TileConfig:
     """One pure-geometry tile config. Dtype- AND execution-independent.
 
-    NOT here (template strategy, not geometry): cta_group, static_sched,
+    NOT here (template strategy, not geometry): cta_group,
     ab_stages — those, plus K-in-elements, the SMEM tile, and the hardware MMA
     shape, are derived per (dtype, cta_group) at render time.
 
@@ -239,7 +239,7 @@ class TileConfig:
     @property
     def name(self) -> str:
         """Canonical identifier ``CONFIG_<pipeline>_<geometry_name>`` — pure geometry
-        (cta_group/static/ab_stages are the template's, not in the name)."""
+        (cta_group/ab_stages are the template's, not in the name)."""
         return f"CONFIG_{self.pipeline}_{self.geometry_name}"
 
     @property
@@ -387,7 +387,7 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 
 
 # ---------------------------------------------------------------------------
-# Catalog — pure-geometry enumeration. cta_group / static / mainloop are NOT
+# Catalog — pure-geometry enumeration. cta_group / mainloop are NOT
 # enumerated here; the registry expands each geometry across accepting templates.
 # Axes: M ∈ _M_AXES (the UTCMMA instruction M and how many of them the CTA tile
 # spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
@@ -637,13 +637,12 @@ def select_config(
     block_scale: bool = False,
     b_n_major: bool = False,
     b_elem_bytes: int = 2,
-    supports_static: bool = False,
     sm_count: int | None = None,
-) -> tuple[TileConfig, int, str]:
-    """Pick (TileConfig, cta_group, scheduler) from problem geometry.
+) -> tuple[TileConfig, int]:
+    """Pick (TileConfig, cta_group) from problem geometry.
 
-    One selection path for every graph type frost supports. The tile, the cluster and
-    the scheduler are each chosen by an analytic score over (M, N, K, tile geometry,
+    One selection path for every graph type frost supports. The tile and the cluster
+    are each chosen by an analytic score over (M, N, K, tile geometry,
     SM count) -- integer ceil-divisions plus one sqrt, no measured timings and no fitted
     coefficients. The support constraints that used to sit around the old N-bucket rule
     (multi-GEMM N-tile budget, block-scale 128-multiples, N-major swizzle groups) are
@@ -661,7 +660,7 @@ def select_config(
 
     cta_m = 128
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
-    # 1ctamma CLC template (see compiler._check_multi_gemm), so it stays at 1.
+    # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
     cta_group = 1 if x > 1 else (2 if M > cta_m else 1)
 
     # --- tile ---------------------------------------------------------------
@@ -710,16 +709,8 @@ def select_config(
         pool = [(2, 1)] if cta_group == 2 else [(1, 1)]
     cgrp_m, cgrp_n = max(pool, key=lambda g: _cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm))
 
-    # --- scheduler ----------------------------------------------------------
-    # Previously always "clc". The static scheduler wins for plain matmul above one
-    # M-tile; block-scaled graphs stay on "clc", where the two are within noise of each
-    # other and clc measured slightly better. `supports_static` is False unless the
-    # caller has confirmed a static template exists for this graph type -- mainloop
-    # fusion, MoE and multi-GEMM have none and would fail template lookup.
-    scheduler = "static" if (supports_static and x == 1 and M > 128 and not block_scale) else "clc"
-
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x{_MMA_INST_K_BYTES}_cluster{cgrp_m}x{cgrp_n}"
-    return by_name(name), cta_group, scheduler
+    return by_name(name), cta_group
 
 
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:

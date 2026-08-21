@@ -49,8 +49,8 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
-    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    _, cta_group = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -109,13 +109,13 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
 
 
 def _build_spec_map():
-    """Label -> (geometry cfg, cta_group, scheduler) for every MoE-block-scale
+    """Label -> (geometry cfg, cta_group) for every MoE-block-scale
     strategy. Enumerated from an nvfp4 graph (template set is combo-independent)."""
     chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -315,7 +315,7 @@ def main() -> int:
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            tok = kernel_match_token(cfg, spec[1], spec[2])
+            tok = kernel_match_token(cfg, spec[1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))

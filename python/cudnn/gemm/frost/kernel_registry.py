@@ -5,7 +5,7 @@
 
 Whether a kernel runs depends on: gpu arch · kernel template · tile config
 (geometry) · graph type · mma type · other graph info. Tile configs are PURE
-GEOMETRY; the template supplies execution strategy (cta_group, static_sched,
+GEOMETRY; the template supplies execution strategy (cta_group,
 pipeline, graph type, mainloop), so one geometry runs on several templates.
 
 :meth:`KernelTemplate.accepts` funnels cheapest-first:
@@ -75,12 +75,6 @@ def classify_graph_type(chain: FusionChain) -> GraphType:
     if chain.has_moe:
         return GraphType.MOE
     return GraphType.MATMUL
-
-
-# Scheduler axis (template strategy, supplied at compile/traversal time)
-CLC = "clc"
-STATIC = "static"
-SCHEDULERS: tuple[str, ...] = (CLC, STATIC)
 
 
 # Dimension 2: mma type × arch (graph-type-level, config/template independent).
@@ -254,19 +248,18 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     return None
 
 
-# Kernel template — owns the execution-strategy axes (cta_group / static / pipeline)
+# Kernel template — owns the execution-strategy axes (cta_group / pipeline)
 
 
 @dataclass(frozen=True)
 class KernelTemplate:
     """One kernel template. Carries the execution-strategy axes the pure-geometry
-    config does NOT (pipeline, cta_group, static_sched, graph_type, mainloop).
+    config does NOT (pipeline, cta_group, graph_type, mainloop).
     ``accepts`` runs the funnel using ``self.cta_group`` for cta_group gates."""
 
     file: str  # template filename under kernel_templates/
     pipeline: str  # pipeline family from the filename; pairs with config_<pipeline>
     cta_group: int  # 1 or 2 (1-CTA vs 2-CTA MMA)
-    static_sched: bool  # no-CLC static scheduler
     graph_type: GraphType  # the single graph type this template supports
     mainloop: bool  # mainloop-fusion variant (transform A/B before MMA)
     # Multi-GEMM support (templates without it reject multi-GEMM chains).
@@ -281,10 +274,6 @@ class KernelTemplate:
             GraphType.BLOCK_SCALE_MATMUL,
             GraphType.MOE_BLOCK_SCALE,
         )
-
-    @property
-    def scheduler(self) -> str:
-        return STATIC if self.static_sched else CLC
 
     # stage 0: active-GPU SM ranges (from the template's pipeline-family prefix)
 
@@ -423,14 +412,13 @@ class MainloopKernelTemplate(KernelTemplate):
 
 
 # Registry — one entry per template file (20 today). A geometry config expands
-# across these via `candidates`. cta_group / static_sched / mainloop live HERE.
+# across these via `candidates`. cta_group / mainloop live HERE.
 
 
 def _mm(
     file: str,
     *,
     cta_group: int,
-    static: bool,
     mainloop: bool = False,
     graph_type: GraphType = GraphType.MATMUL,
     supports_multi_gemm: bool = True,
@@ -446,7 +434,6 @@ def _mm(
         file=file,
         pipeline=pipeline,
         cta_group=cta_group,
-        static_sched=static,
         graph_type=graph_type,
         mainloop=mainloop,
         supports_multi_gemm=supports_multi_gemm,
@@ -456,41 +443,17 @@ def _mm(
 
 TEMPLATES: tuple[KernelTemplate, ...] = (
     # plain matmul
-    _mm("sm100_matmul_1ctamma.py", cta_group=1, static=False),
-    _mm(
-        "sm100_matmul_1ctamma_static.py",
-        cta_group=1,
-        static=True,
-    ),
-    _mm("sm100_matmul_2ctamma.py", cta_group=2, static=False),
-    _mm(
-        "sm100_matmul_2ctamma_static.py",
-        cta_group=2,
-        static=True,
-    ),
+    _mm("sm100_matmul_1ctamma.py", cta_group=1),
+    _mm("sm100_matmul_2ctamma.py", cta_group=2),
     # block-scaled matmul
     _mm(
         "sm100_block_scale_matmul_1ctamma.py",
         cta_group=1,
-        static=False,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    _mm(
-        "sm100_block_scale_matmul_1ctamma_static.py",
-        cta_group=1,
-        static=True,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     _mm(
         "sm100_block_scale_matmul_2ctamma.py",
         cta_group=2,
-        static=False,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    _mm(
-        "sm100_block_scale_matmul_2ctamma_static.py",
-        cta_group=2,
-        static=True,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     # sm103 block-scaled matmul: fp4-only (nvfp4/mxfp4), K=48B UTCOMMA
@@ -503,7 +466,6 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     _mm(
         "sm103_block_scale_matmul_1ctamma.py",
         cta_group=1,
-        static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         supports_multi_mma_m=False,
@@ -511,7 +473,6 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     _mm(
         "sm103_block_scale_matmul_2ctamma.py",
         cta_group=2,
-        static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         supports_multi_mma_m=False,
@@ -519,58 +480,49 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     _mm(
         "sm107_block_scale_matmul_1ctamma.py",
         cta_group=1,
-        static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     _mm(
         "sm107_block_scale_matmul_2ctamma.py",
         cta_group=2,
-        static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
-    # mainloop-fusion matmul (CLC only — no static / block-scale variant yet)
+    # mainloop-fusion matmul (no block-scale variant yet)
     # The mainloop templates have no per-GEMM operand indexing (no gemm_a_idx /
     # gemm_b_idx in the MMA warp), so a second GEMM's accumulator would never be
     # written. The analyzer also only detects mainloop at len(matmuls) == 1.
-    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, static=False, mainloop=True, supports_multi_gemm=False),
-    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, static=False, mainloop=True, supports_multi_gemm=False),
-    # MoE grouped matmul fwd (own grouped persistent scheduler; static_sched
-    # irrelevant, registered False so default scheduler="clc" selects).
+    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, mainloop=True, supports_multi_gemm=False),
+    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, mainloop=True, supports_multi_gemm=False),
+    # MoE grouped matmul fwd (own grouped persistent scheduler).
     _mm(
         "sm100_moe_grouped_matmul_fwd_1ctamma.py",
         cta_group=1,
-        static=False,
         graph_type=GraphType.MOE,
     ),
     _mm(
         "sm100_moe_grouped_matmul_fwd_2ctamma.py",
         cta_group=2,
-        static=False,
         graph_type=GraphType.MOE,
     ),
     # MoE grouped matmul with block-scaled (FP4/FP8 + SF) inputs.
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
         cta_group=1,
-        static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
         cta_group=2,
-        static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
         "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
         cta_group=1,
-        static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
         "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
         cta_group=2,
-        static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
 )
@@ -598,14 +550,11 @@ def select_template(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = CLC,
 ) -> KernelTemplate:
     """The single template that renders (chain, config) under the requested
-    execution strategy (``cta_group`` / ``scheduler``; mainloop + graph_type
-    derived from the chain). Capability gates are NOT applied — this renders
-    even unsupported configs for deliberate single-point probing."""
-    if scheduler not in SCHEDULERS:
-        raise ValueError(f"scheduler must be one of {SCHEDULERS}; got {scheduler!r}")
+    execution strategy (``cta_group``; mainloop + graph_type derived from the
+    chain). Capability gates are NOT applied — this renders even unsupported
+    configs for deliberate single-point probing."""
     gt = classify_graph_type(chain)
     matches = [
         t
@@ -614,7 +563,6 @@ def select_template(
         and t.graph_type is gt
         and t.mainloop == chain.has_mainloop_fusion
         and t.cta_group == cta_group
-        and t.static_sched == (scheduler == STATIC)
     ]
     if len(matches) == 1:
         return matches[0]
@@ -622,8 +570,8 @@ def select_template(
         raise ValueError(
             f"no kernel template for graph_type={gt.value}, "
             f"mainloop={chain.has_mainloop_fusion}, cta_group={cta_group}, "
-            f"scheduler={scheduler}, pipeline={config.pipeline}. "
-            "E.g. mainloop fusion has no static or block-scale template variant yet."
+            f"pipeline={config.pipeline}. "
+            "E.g. mainloop fusion has no block-scale template variant yet."
         )
     raise ValueError(f"ambiguous template match (registry bug): {[t.file for t in matches]}")
 
@@ -631,7 +579,7 @@ def select_template(
 def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:
     """Traversal-mode candidate set for ``chain`` via the funnel. Each accepted
     (template, geometry) is a JIT-able point; one geometry expands across the
-    templates that accept it ({1,2}ctamma × {clc,static}, etc.)."""
+    templates that accept it ({1,2}ctamma, etc.)."""
     gt = classify_graph_type(chain)
     tmpls = [t for t in TEMPLATES if t.graph_type is gt]  # stage 1
     if not tmpls:

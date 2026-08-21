@@ -148,7 +148,6 @@ def _compile(case: str, batch: int, m: int, n: int, k: int) -> tuple[int, float]
         graph,
         config=by_name(_CONFIG),
         cta_group=2,
-        scheduler="clc",
     )
     return start, (time.perf_counter_ns() - start) / 1e6
 
@@ -334,7 +333,7 @@ def main() -> None:
         print(f"Shape: groups={batch}, tokens/group={m}, N={n}, K={k}")
     else:
         print(f"Shape: B={batch}, M={m}, N={n}, K={k}")
-    print(f"Config: {_CONFIG}, cta_group=2, scheduler=clc")
+    print(f"Config: {_CONFIG}, cta_group=2")
     count = args.warmup + args.iters
 
     timings = _measure(args.case, batch, m, n, k, count, verbose=args.verbose)

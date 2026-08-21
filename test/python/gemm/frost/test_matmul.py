@@ -107,23 +107,18 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_64x64x64_64x64x32_cluster2x2_1ctamma",  # cta1 both multicasts, K_BYTES=64
     "CONFIG_sm100_128x128x64_128x128x32_cluster4x2_2ctamma",  # cta2 big cluster, K_BYTES=64
     "CONFIG_sm100_64x64x64_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128, K_BYTES=64
-    "CONFIG_sm100_128x64x128_128x64x32_cluster1x4_1ctamma_static",  # static scheduler (cta1)
-    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",  # static scheduler (cta2)
     # N not a multiple of 32 (pow2 epilogue subtile spans + tile-clamped vsize).
     "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma",  # minimum N
     "CONFIG_sm100_128x40x128_128x40x32_cluster1x1_1ctamma",  # 32+8 tail span
     "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
     "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
-    "CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma_static",  # static cta2, 16-col tail
     # CTA tiles split across num_mma_m MMA instructions along M. Split is just
     # another geometry axis, so it rides the same dtype x layout x shape matrix;
     # the invariants it has to hold are pinned by the unit tests at the end.
     "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
     "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # num_mma_m=2, acc_stages drops to 1
     "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # num_mma_m=2 at mma_inst_m=64 (packed drain)
-    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",  # static scheduler
     "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # on the pair (cuBLAS geometry)
-    "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma_static",  # at mma_inst_m=64 (2x2 DP drain)
     "CONFIG_sm100_256x128x128_128x128x32_cluster2x2_1ctamma",  # split + both multicasts
     "CONFIG_sm100_256x256x64_128x256x32_cluster2x1_1ctamma",  # split + K_BYTES=64
     # Split at mma_inst_m=64 on the pair drains N/2 per M block, so an N whose
@@ -178,8 +173,6 @@ _NONCANONICAL_LAYOUTS: tuple[tuple[str, str], ...] = tuple(p for p in _INPUT_LAY
 _NONPACKED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-    "CONFIG_sm100_128x64x128_128x64x32_cluster1x4_1ctamma_static",
-    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
 )
 _NONPACKED_LAYOUTS: tuple[tuple[str, str], ...] = (
     ("k", "k"),
@@ -609,12 +602,12 @@ def _cached_outcome(entry):
     return entry
 
 
-def _plan_or_skip(cache, key, build_graph, cfg, cta_group, scheduler):
+def _plan_or_skip(cache, key, build_graph, cfg, cta_group):
     """JIT the anchor graph; the engine's clean "unsupported" rejections —
     NotImplementedError from the compiler gates, or the registry's "no kernel
     template" — SKIP, any other compile error FAILS."""
     try:
-        compiled = _plan(build_graph(), config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(build_graph(), config=cfg, cta_group=cta_group)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         if isinstance(e, NotImplementedError) or (isinstance(e, ValueError) and "no kernel template" in str(e)):
@@ -660,11 +653,10 @@ def _get_compiled(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
-    scheduler: str = "clc",
     out_major: str = "n",
 ):
     """Return the cached compiled kernel, building it on first miss."""
-    key = (cfg.name, in_dt, out_dt, a_major, b_major, cta_group, scheduler, out_major)
+    key = (cfg.name, in_dt, out_dt, a_major, b_major, cta_group, out_major)
     if key in cache:
         return _cached_outcome(cache[key])
 
@@ -681,7 +673,6 @@ def _get_compiled(
         lambda: _build_graph(*anchor, in_dt, out_dt, a_major, b_major, out_major),
         cfg,
         cta_group,
-        scheduler,
     )
 
 
@@ -714,7 +705,6 @@ def _get_batched_compiled(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
-    scheduler: str = "clc",
     out_major: str = "n",
 ):
     """Return the cached rank-3 compiled kernel for this graph batch."""
@@ -727,7 +717,6 @@ def _get_batched_compiled(
         a_major,
         b_major,
         cta_group,
-        scheduler,
         out_major,
     )
     if key in cache:
@@ -745,7 +734,6 @@ def _get_batched_compiled(
         lambda: _build_batched_graph(batch, *anchor, in_dt, out_dt, a_major, b_major, out_major),
         cfg,
         cta_group,
-        scheduler,
     )
 
 
@@ -778,7 +766,6 @@ def _get_batch_broadcast_compiled(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
-    scheduler: str = "clc",
 ):
     """Return the cached rank-3 compiled kernel for a batch-broadcast graph."""
     key = (
@@ -791,7 +778,6 @@ def _get_batch_broadcast_compiled(
         a_major,
         b_major,
         cta_group,
-        scheduler,
     )
     if key in cache:
         return _cached_outcome(cache[key])
@@ -808,7 +794,6 @@ def _get_batch_broadcast_compiled(
         lambda: _build_batch_broadcast_graph(batch, *anchor, in_dt, out_dt, broadcast_side, a_major, b_major),
         cfg,
         cta_group,
-        scheduler,
     )
 
 
@@ -831,12 +816,12 @@ def test_matmul(
     shape: tuple[int, int, int],
 ) -> None:
     """One (config, dtype-pair, shape); incompatible combos SKIP, else bit-tight."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, *shape, in_dt, out_dt, cta_group=cta_group)
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt, cta_group=cta_group, scheduler=scheduler)
+    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt, cta_group=cta_group)
 
     M, N, K = shape
     a, b, c = _mkdata(M, N, K, in_dt, out_dt)
@@ -866,7 +851,7 @@ def test_matmul(
 def test_dense_block_scale_quant_epilogue() -> None:
     """Plain dense GEMM can use terminal block_scale_quantize epilogue."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     M = N = K = 128
     block_size = 32
     g = _build_block_quant_graph(M, N, K, block_size)
@@ -874,7 +859,6 @@ def test_dense_block_scale_quant_epilogue() -> None:
         g,
         config=cfg,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     assert not compiled.block_scale
     assert compiled.chain.quants
@@ -953,7 +937,7 @@ def _f8_row_scale_addr(M: int, N: int, block_size: int) -> torch.Tensor:
 )
 def test_dense_col_block_scale_quant(config_name) -> None:
     """M-axis (col) quant: warp-redux amax, compact (B, M/32, N) scale."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     M, N, K = 256, 128, 128
     block_size = 32
     g = cudnn.pygraph(
@@ -970,7 +954,7 @@ def test_dense_col_block_scale_quant(config_name) -> None:
     QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert compiled.chain.quants[0].axis == 1
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -992,7 +976,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
     """COL block quantize with an E5M3 scale. This path keeps the scale in a
     per-lane register (`_scale_mine_*`) before storing, so it exercises the
     zero-init + assignment + store of the byte carrier that row quant does not."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
@@ -1004,7 +988,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
     QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E5M3)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert compiled.chain.quants[0].axis == 1 and compiled.chain.quants[0].scale_dtype == "fp8_e5m3"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1023,7 +1007,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
 def test_dense_row_col_dual_quant_f8_reorder() -> None:
     """The cutedsl dual-output pattern: one producer -> row quant + col quant,
     both with F8_128x4 scale reordering."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     bs = 32
     g = cudnn.pygraph(
@@ -1048,7 +1032,7 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
     QSc.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
 
@@ -1141,10 +1125,10 @@ def _fp4_dual_graph(M, N, K, fp4_axis, fp4_bs, fp4_scale_dt):
 @pytest.mark.parametrize("fp4_axis", [-1, 1], ids=["row", "col"])
 def test_dense_mxfp4_quant_output(fp4_axis) -> None:
     """mxfp4 (fp4 data + e8m0 SF, block32) quant tap beside an fp8 row quant."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = _fp4_dual_graph(M, N, K, fp4_axis, 32, cudnn.data_type.FP8_E8M0)
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     chain = compiled.chain
     assert chain.output_specs[0].dtype == "fp4_e2m1" and chain.output_specs[1].dtype == "fp8_e4m3"
 
@@ -1171,7 +1155,7 @@ def test_dense_nvfp4_quant_output() -> None:
     """nvfp4 (fp4 data + e4m3 SF, block16) quant tap; slot0 = bf16 pre-quant tap
     (vsize 16). Dequantized-value tolerance (rcp_approx of a non-pow2 e4m3
     scale is inexact vs the torch reference)."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     bs = 16
     g = cudnn.pygraph(
@@ -1189,7 +1173,7 @@ def test_dense_nvfp4_quant_output() -> None:
     QS4.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
@@ -1211,7 +1195,7 @@ def test_dense_nvfp4_quant_output() -> None:
 @pytest.mark.parametrize("fp4_axis,bs,scale_dt", [(-1, 16, "e4m3"), (-1, 32, "e8m0"), (1, 32, "e8m0")], ids=["nvfp4-row", "mxfp4-row", "mxfp4-col"])
 def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
     """fp4 quant data as the ONLY output (slot 0): Phase C codegen-emitted store."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1232,7 +1216,7 @@ def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
         QS4.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
     QS4.set_output(True).set_data_type(scale_cudnn)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert compiled.chain.output_specs[0].dtype == "fp4_e2m1"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1268,7 +1252,7 @@ def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
 def test_dense_col_block16_quant(config_name) -> None:
     """block16 col quant: half-warp redux; the cta_tile_m=64 1-CTA packed
     layout (16 active rows per warp = exactly one block) is supported."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1284,7 +1268,7 @@ def test_dense_col_block16_quant(config_name) -> None:
     QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
     qs = torch.zeros(1, M // bs, N, dtype=torch.float8_e8m0fnu, device="cuda")
@@ -1300,7 +1284,7 @@ def test_dense_col_block16_quant(config_name) -> None:
 
 def test_dense_block16_fp8_quant() -> None:
     """block_size=16 row quant with fp8 data (vsize pinned to the block)."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1316,7 +1300,7 @@ def test_dense_block16_fp8_quant() -> None:
     QS.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
     qs = torch.empty(1, M, N // bs, dtype=torch.float8_e8m0fnu, device="cuda")
@@ -1334,7 +1318,7 @@ def test_dense_mixed_block_quants() -> None:
     """Two quants with DIFFERENT block sizes in one graph: nvfp4 row block16 +
     fp8 row block32 (vsize = max block; the small block quantizes per
     sub-chunk), plus a col16 alongside a row32 variant."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1358,7 +1342,7 @@ def test_dense_mixed_block_quants() -> None:
     QSc.set_dim([1, M // 16, N]).set_stride([M // 16 * N, N, 1])
     QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert sorted(q.block_size for q in compiled.chain.quants) == [16, 16, 32]
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1407,16 +1391,16 @@ def test_dense_col_quant_rejections() -> None:
         QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
         return g
 
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     with pytest.raises(ValueError, match="divisible by block_size"):
-        _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg, cta_group=cta_group, scheduler=scheduler)
+        _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg, cta_group=cta_group)
     with pytest.raises(NotImplementedError, match="block_size 32"):
-        _plan(_col_graph(256, 128, 128, 8), config=cfg, cta_group=cta_group, scheduler=scheduler)
+        _plan(_col_graph(256, 128, 128, 8), config=cfg, cta_group=cta_group)
 
 
 def test_dense_block_scale_quant_with_dense_tap() -> None:
     """Quant data rides slot 0 while the pre-quant producer is also tapped."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1433,7 +1417,7 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     specs = compiled.chain.output_specs
     assert len(specs) == 2 and specs[0].quant_idx is None and specs[1].quant_idx == 0
     assert [o.source for o in compiled.chain.outputs] == ["op_0", "quant_0", "quant_scale_0"]
@@ -1459,7 +1443,7 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
 def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
     """The chunk stays pinned to the quant block even when the widest dense
     output is 4 bytes: 32 elements x 4 B = 128 B, split into four 32 B stores."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1475,7 +1459,7 @@ def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == block_size * 4
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1497,7 +1481,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
     32-lane block group: a narrower one has the upper lanes store a scale they
     never computed, to columns past the chunk (and past the scale tensor on the
     last chunk of a row block)."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K, bs = 256, 128, 128, 32
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1514,7 +1498,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
     QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == bs * 2
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1538,7 +1522,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
 
 def test_dense_dual_block_scale_quant() -> None:
     """Two quant nodes fan out from one producer (e4m3 + e5m2 data)."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1557,7 +1541,7 @@ def test_dense_dual_block_scale_quant() -> None:
     Q2.set_output(True).set_data_type(cudnn.data_type.FP8_E5M2)
     QS2.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     chain = compiled.chain
     assert len(chain.quants) == 2
     assert [o.source for o in chain.outputs] == ["quant_0", "quant_1", "quant_scale_0", "quant_scale_1"]
@@ -1582,7 +1566,7 @@ def test_dense_dual_block_scale_quant() -> None:
 
 def test_dense_amax_only_no_dense_output() -> None:
     """Reduction-only graph: pointwise chain + AMAX, no dense output at all."""
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1597,7 +1581,7 @@ def test_dense_amax_only_no_dense_output() -> None:
     amax.set_dim([1, 1, 1]).set_stride([1, 1, 1])
     amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert not compiled.chain.output_specs
     assert [o.source for o in compiled.chain.outputs] == ["reduction_0"]
 
@@ -1637,7 +1621,7 @@ def test_input_layout_matmul(
 ) -> None:
     """A M-major / B N-major inputs over the full (config, dtype, shape) matrix."""
     M, N, K = shape
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
     if not ok:
         pytest.skip(reason)
@@ -1650,7 +1634,6 @@ def test_input_layout_matmul(
         a_major,
         b_major,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     a, b, c = _mkdata(M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
@@ -1695,7 +1678,7 @@ def test_nonpacked_batched_matmul(
 ) -> None:
     """Padded A/B/C views exercise dynamic strides in TMA descriptors and stores."""
     batch, M, N, K = 2, 256, 256, 256
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
     if not ok:
         pytest.skip(reason)
@@ -1709,7 +1692,6 @@ def test_nonpacked_batched_matmul(
         a_major,
         b_major,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     a, b, c = _mkbatched_nonpacked_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     assert not a.is_contiguous() and not b.is_contiguous() and not c.is_contiguous()
@@ -1741,7 +1723,7 @@ def test_zero_stride_broadcast_input_matmul(
 ) -> None:
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, "k", "k", cta_group)
     if not ok:
         pytest.skip(reason)
@@ -1755,7 +1737,6 @@ def test_zero_stride_broadcast_input_matmul(
         "k",
         "k",
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     a, b, c = _mkbatched_zero_stride_input_data(batch, M, N, K, in_dt, out_dt)
     assert a.stride() == (0, 0, 1)
@@ -1793,7 +1774,7 @@ def test_batched_matmul(
 ) -> None:
     """Rank-3 matmul keeps batch as the native L mode and maps it to grid.z."""
     batch, M, N, K = shape
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group)
     if not ok:
         pytest.skip(reason)
@@ -1805,7 +1786,6 @@ def test_batched_matmul(
         out_dt,
         batch,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
 
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt)
@@ -1841,7 +1821,7 @@ def test_input_layout_batched_matmul(
 ) -> None:
     """Rank-3 layout coverage keeps batch native while varying A/B major mode."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
@@ -1857,7 +1837,6 @@ def test_input_layout_batched_matmul(
         a_major,
         b_major,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
@@ -1893,7 +1872,7 @@ def test_batch_broadcast_matmul(
 ) -> None:
     """Rank-3 matmul with one input broadcast across the output batch."""
     batch, M, N, K = shape
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group)
     if not ok:
         pytest.skip(reason)
@@ -1906,7 +1885,6 @@ def test_batch_broadcast_matmul(
         batch,
         broadcast_side,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
 
     a, b, c = _mkbatch_broadcast_data(batch, M, N, K, in_dt, out_dt, broadcast_side)
@@ -1945,7 +1923,7 @@ def test_input_layout_batch_broadcast_matmul(
 ) -> None:
     """Input-layout coverage when one operand is broadcast across batch."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     batch, M, N, K = 3, 256, 256, 256
     in_dt = out_dt = "bf16"
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
@@ -1962,7 +1940,6 @@ def test_input_layout_batch_broadcast_matmul(
         a_major,
         b_major,
         cta_group=cta_group,
-        scheduler=scheduler,
     )
     a, b, c = _mkbatch_broadcast_data(
         batch,
@@ -2002,7 +1979,7 @@ _FP8_MIXED_CONFIGS = [
 @pytest.mark.parametrize("config_name", _FP8_MIXED_CONFIGS, ids=[_config_id(n) for n in _FP8_MIXED_CONFIGS])
 def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     """A and B each an arbitrary FP8 variant -> FP16 out, bit-exact vs fp32."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     M = N = K = 256
 
     g = cudnn.pygraph(
@@ -2026,7 +2003,7 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn.data_type.HALF)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert compiled.chain.matmul.a_dtype == a_dt
     assert compiled.chain.matmul.b_dtype == b_dt
 
@@ -2048,9 +2025,7 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
 
 _INT8_CONFIGS = [
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
-    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
 ]
 
 
@@ -2071,7 +2046,7 @@ _INT8_OUT_DTYPES = {
 def test_int8_matmul(config_name: str, out_dt: str) -> None:
     """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
     rounded integer reference (values small enough that the rounding is exact)."""
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     M = N = K = 256
     cudnn_dt, torch_dt, vmax = _INT8_OUT_DTYPES[out_dt]
 
@@ -2086,7 +2061,7 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn_dt)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group)
     assert compiled.chain.matmul.accum_dtype == "int32"
     assert compiled.chain.output_dtype == out_dt
 
@@ -2132,7 +2107,7 @@ def test_m_major_output_batched(
     the TMA-store and STG m-major store paths."""
     batch = 3
     M, N, K = shape
-    cfg, cta_group, scheduler = _resolve(config_name)
+    cfg, cta_group = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group, out_major="m")
     if not ok:
         pytest.skip(reason)
@@ -2143,7 +2118,6 @@ def test_m_major_output_batched(
         out_dt,
         batch,
         cta_group=cta_group,
-        scheduler=scheduler,
         out_major="m",
     )
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, out_major="m")
@@ -2175,8 +2149,8 @@ def _mm_plan(b_major: str):
     B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, b_major))
     C = g.matmul(A=A, B=B, name="mm")
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
-    return _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler), M, N, K
+    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    return _plan(g, config=cfg, cta_group=cta_group), M, N, K
 
 
 def test_operand_k_mismatch_rejected():

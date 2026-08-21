@@ -28,7 +28,7 @@ from benchmark_utils import add_sweep_args, group_offsets, report_pool, resolve_
 
 def _build_plan(g, cfg, cta_group, sched):
     """JIT-compile the graph with a forced tile config → callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -167,7 +167,7 @@ def _fused_launch(plan, handles, dset, fto):
 
 
 def _build_spec_map():
-    """Label -> (cfg, cta_group, scheduler) for multi-GEMM-capable MoE strategies.
+    """Label -> (cfg, cta_group) for multi-GEMM-capable MoE strategies.
     Dual-GEMM TMEM fits two accumulators only for cta_tile_n<=256 (2*256<=512);
     cta_tile_m=128."""
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
@@ -175,8 +175,8 @@ def _build_spec_map():
     for t, cfg in _registry_candidates(chain):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 

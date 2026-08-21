@@ -23,23 +23,19 @@ _MARKER = re.compile(r"^[ \t]*# *@@EPILOGUE_(SETUP|DRAIN):(BEGIN|END)@@[ \t]*$")
 # its group is declared here.
 _PLAIN_1 = [
     "sm100_matmul_1ctamma.py",
-    "sm100_matmul_1ctamma_static.py",
     "sm100_matmul_mainloop_1ctamma.py",
 ]
 _PLAIN_2 = [
     "sm100_matmul_2ctamma.py",
-    "sm100_matmul_2ctamma_static.py",
     "sm100_matmul_mainloop_2ctamma.py",
 ]
 _BS_1 = [
     "sm100_block_scale_matmul_1ctamma.py",
-    "sm100_block_scale_matmul_1ctamma_static.py",
     "sm103_block_scale_matmul_1ctamma.py",
     "sm107_block_scale_matmul_1ctamma.py",
 ]
 _BS_2 = [
     "sm100_block_scale_matmul_2ctamma.py",
-    "sm100_block_scale_matmul_2ctamma_static.py",
     "sm103_block_scale_matmul_2ctamma.py",
     "sm107_block_scale_matmul_2ctamma.py",
 ]
@@ -251,7 +247,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        expected_count = 1 if "_static" in path.name else 4 if path.name.startswith("sm103_") else 3
+        expected_count = 4 if path.name.startswith("sm103_") else 3
         if len(calls) != expected_count:
             offenders.append(f"{path.name}: expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:
@@ -381,7 +377,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
             if made_operands != {"a", "b"}:
                 offenders.append(f"{path.name}: SM103 current/next circular descriptors do not feed both MMA operands")
 
-    assert total_builds == 64, f"descriptor inventory changed: expected 64 builds across 20 templates, found {total_builds}"
+    assert total_builds == 52, f"descriptor inventory changed: expected 52 builds across 16 templates, found {total_builds}"
     assert not offenders, "build invariant descriptor roots once, outside every runtime loop:\n  " + "\n  ".join(offenders)
 
 
