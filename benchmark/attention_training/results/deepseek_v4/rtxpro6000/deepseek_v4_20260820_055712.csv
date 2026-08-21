@@ -1,9 +1,0 @@
-config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
-deepseek_v4,dsv4_flash,cudnn,bfloat16,top_left,2,16384,16384,64,1,512,512,fwd,False,9.450,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,455.000
-deepseek_v4,dsv4_flash,cudnn,bfloat16,top_left,2,8192,8192,64,1,512,512,fwd,False,4.714,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
-deepseek_v4,dsv4_flash,cudnn,bfloat16,top_left,2,4096,4096,64,1,512,512,fwd,False,2.348,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
-deepseek_v4,dsv4_flash,cudnn,bfloat16,top_left,2,2048,2048,64,1,512,512,fwd,False,1.197,56.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
-deepseek_v4,dsv4_pro,cudnn,bfloat16,top_left,2,16384,16384,128,1,512,512,fwd,False,18.845,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,456.000
-deepseek_v4,dsv4_pro,cudnn,bfloat16,top_left,2,8192,8192,128,1,512,512,fwd,False,9.393,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
-deepseek_v4,dsv4_pro,cudnn,bfloat16,top_left,2,4096,4096,128,1,512,512,fwd,False,4.670,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
-deepseek_v4,dsv4_pro,cudnn,bfloat16,top_left,2,2048,2048,128,1,512,512,fwd,False,2.309,58.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,452.000
