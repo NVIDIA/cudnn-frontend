@@ -349,6 +349,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
 
+    if facts.has_bias and capabilities.bias and facts.bias_t is not None:
+        # uniform_dtype covers K/V/O only; the serving adapters compile the
+        # bias load as fp32 or the io dtype, so anything else must decline
+        # HERE, not ValueError at execute.
+        bias_dt = facts.bias_t.get_data_type()
+        if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
+            return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
+
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
 

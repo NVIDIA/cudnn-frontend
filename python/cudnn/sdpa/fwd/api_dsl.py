@@ -3245,15 +3245,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     def scratch_workspace_bytes(self) -> int:
         return 0
 
-    def _dummy(self, name: str, device, dtype=None, fill=1):
-        """One-time cached 1-elem dummy for a compiled-out ABI slot (Rule 1)."""
-        key = (name, device)
-        t = self._dummy_cache.get(key)
-        if t is None:
-            t = torch.full((1,), fill, dtype=dtype or torch.int32, device=device)
-            self._dummy_cache[key] = t
-        return t
-
     # ------------------------------------------------------------------
     def execute(
         self,
@@ -3290,6 +3281,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         device = q_tensor.device
+        launch_stream = self._get_default_stream(current_stream)
 
         with _torch_stream_context(current_stream, device):
             # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
@@ -3329,14 +3321,24 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 if lse_tensor is not None:
                     lse_tensor.zero_()
 
-            seq_kv_b = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else self._dummy("seq_kv", device)
-            seq_q_b = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else self._dummy("seq_q", device)
+            # Dummies fill compiled-out ABI slots (Rule 1); the kernel never
+            # dereferences them.  Base-class ``_dummy`` (key, device, factory).
+            seq_kv_b = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
+            )
+            seq_q_b = (
+                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                if seq_q_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
+            )
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
                 # (pre-existing SM80 contract; the kernels consume log2 units).
                 sinks_b = (self._checked_sinks_1d(sinks) * _LOG2E).contiguous()
             else:
-                sinks_b = self._dummy("sinks", device, dtype=torch.float32)
+                sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             if bias_tensor is not None:
                 self._value_error_if(
                     bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
@@ -3349,7 +3351,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
                 self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
             else:
-                bias_b = self._dummy("bias", device, dtype=q_tensor.dtype)
+                bias_dt = q_tensor.dtype
+                bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
             if rope_freqs is not None:
                 # (cos, sin) table build — wrapper-only fusion (the engine row
                 # never admits RoPE); per-execute by contract, like the caller
@@ -3363,8 +3366,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 angles = rf[:, :d2]
                 rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
             else:
-                rope_b = self._dummy("rope", device, dtype=torch.float32)
-            cu_dummy = self._dummy("cu", device)
+                rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
 
             _sm80_call(
                 self._compiled_kernel,
@@ -3389,7 +3392,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 inv_scale=1.0 / float(scale_val),
                 thd_q_tiles=0,
                 n_batch_logical=1,
-                stream=cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+                stream=launch_stream,
             )
 
             if pad_v:
@@ -3399,7 +3402,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("execute completed")
 
 
-def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks):
+def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks, current_stream=None):
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
     no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Rides the same
     TemplateParams-specialized module as the dense path; the packed token
@@ -3451,13 +3454,18 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         has_lse=True,
     )
     mod = _sm80_load_kernel_module(flavor, params)
+    # Off-flavor d_qk was HOST-PADDED to fdqk above, so the compiled fakes and
+    # the runtime d must both be the padded width: the kernel derives its Q/K
+    # row strides from d_runtime (Q_ROW_STRIDE_E = H * d_runtime), and the
+    # zero columns are exact for the QK dot products.  (Same contract as the
+    # pre-template forward(), which read d_runtime off the padded shape.)
     fn = mod.compile(
         b=1,
         h=h_q,
         h_kv=h_kv,
         sq=0,
         skv=0,
-        d=int(min(d_qk, fdqk)) if d_qk >= fdqk else int(d_qk),
+        d=int(fdqk),
         swa_window=int(max(0, wl)) if wl is not None and wl >= 0 else 0,
         n_batch_logical=n_seqs,
     )
@@ -3492,12 +3500,12 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         scale_log2=float(scale_softmax) * _LOG2E,
         sq=int(t_q),
         skv=int(k.shape[1]),
-        d=int(d_qk),
+        d=int(fdqk),
         right_bound=int(right_bound),
         inv_scale=1.0 / float(scale_softmax),
         thd_q_tiles=(int(max_s_q) + tile_m - 1) // tile_m,
         n_batch_logical=n_seqs,
-        stream=cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        stream=current_stream if current_stream is not None else cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
     )
     if pad_v:
         o_buf = o_buf[..., :d_v].contiguous()
@@ -3567,6 +3575,7 @@ def sdpa_fwd_wrapper_sm80(
                 causal_bottom_right=causal_bottom_right,
                 bias_tensor=bias_tensor,
                 sinks=sinks,
+                current_stream=current_stream,
             )
 
     b, h_q, s_q, _ = q_tensor.shape

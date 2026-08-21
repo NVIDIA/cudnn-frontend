@@ -197,7 +197,47 @@ def test_sdpa_fwd_sm80_check_support_rejections():
         api.check_support()
 
 
-@pytest.mark.L0
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_sm80_thd_off_flavor_head_dim():
+    """Off-flavor THD head dim (d=96 rides the llama d=128 envelope): Q/K are
+    host-padded to the flavor width, and the kernel derives its Q/K row
+    strides from the runtime ``d`` — so the launch must pass the PADDED
+    width, or every row past the first reads the wrong address."""
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+
+    H, D = 4, 96
+    lens = [80, 33]
+    t = sum(lens)
+    cu = torch.tensor([0, lens[0], t], dtype=torch.int32, device="cuda")
+    q = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    v = torch.randn(1, t, H, D, dtype=torch.float16, device="cuda")
+    scale = 1.0 / math.sqrt(D)
+    out = sdpa_fwd_wrapper_sm80(
+        q,
+        k,
+        v,
+        is_causal=True,
+        scale_softmax=scale,
+        cum_seqlen_q_tensor=cu,
+        cum_seqlen_k_tensor=cu,
+        max_s_q=max(lens),
+    )
+    o = out["o_tensor"]
+    for b0, b1 in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        o_ref = _ref_sdpa(
+            q[0, b0:b1].permute(1, 0, 2)[None],
+            k[0, b0:b1].permute(1, 0, 2)[None],
+            v[0, b0:b1].permute(1, 0, 2)[None],
+            is_causal=True,
+            window_size=(-1, -1),
+            scale=scale,
+        )
+        torch.testing.assert_close(o[0, b0:b1].permute(1, 0, 2)[None], o_ref, rtol=1e-2, atol=4e-3)
+
+
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_sm80_thd_compile_key_plan_time_only():
     """Issue #604 regression: the packed THD token totals are RUNTIME values,
