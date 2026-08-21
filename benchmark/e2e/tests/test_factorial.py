@@ -87,6 +87,19 @@ class FactorialStatisticsTest(unittest.TestCase):
                 "rounds": 8,
                 "repeats": 1,
                 "mode_overrides": {},
+                "numerical_recipe": {
+                    "id": "conservative-bf16-v1",
+                    "parameter_dtype": "bfloat16",
+                    "activation_dtype": "bfloat16",
+                    "scope": "forward_backward_no_optimizer",
+                    "anchor": {
+                        "project": "NVIDIA-NeMo/Megatron-Bridge",
+                        "commit": "2e77041c194d106beb7462e226d7ca06b33ea63f",
+                        "path": "src/megatron/bridge/training/mixed_precision.py",
+                        "symbol": "bf16_mixed",
+                    },
+                    "alignment": "upstream_anchored_subset",
+                },
                 "variants": variants,
                 "provenance": {
                     "git": {"commit": "deadbeef", "dirty": False},
@@ -143,6 +156,9 @@ class FactorialStatisticsTest(unittest.TestCase):
         changed = copy.deepcopy(first)
         changed["shape"]["layers"] = 8
         self.assertNotEqual(config_fingerprint(first), config_fingerprint(changed))
+        recipe_changed = copy.deepcopy(first)
+        recipe_changed["numerical_recipe"] = {"id": "future-low-precision-v1"}
+        self.assertNotEqual(config_fingerprint(first), config_fingerprint(recipe_changed))
         with self.assertRaises(ValueError):
             config_fingerprint({"invalid": float("nan")})
 
@@ -152,6 +168,8 @@ class FactorialStatisticsTest(unittest.TestCase):
         self.assertIn("Comparability fingerprint: `comparable`", report)
         self.assertIn("Build/provenance fingerprint: `build123`", report)
         self.assertIn("## Factorial attribution", report)
+        self.assertIn("Numerical recipe: `conservative-bf16-v1`", report)
+        self.assertIn("NVIDIA-NeMo/Megatron-Bridge@2e77041c", report)
         self.assertIn("benchmark/e2e/Qwen3.8/run_matrix.py", report)
         self.assertIn("provenance only", report)
 

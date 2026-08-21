@@ -113,7 +113,8 @@ ROUTE_CONTRACT = {
     },
     "cudnn_full_attention": {
         "adapter": "FE direct cuDNN-backend d256 SDPA",
-        "oss_cutedsl_d256_forbidden": True,
+        "route": "backend graph only after FE #682",
+        "minimum_cudnn_backend": 92300,
     },
     "gdn": {
         "baseline": "stock FLA",
@@ -392,16 +393,11 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
 
     if not hasattr(qwen, "_set_full_attention_backend"):
         raise RuntimeError(f"{RUN_MODEL} lacks _set_full_attention_backend")
-    for sentinel_name in ("sdpa_fwd_d256", "sdpa_bwd_d256"):
-        sentinel = getattr(sdpamod, sentinel_name, None)
-        if sentinel is None or getattr(sentinel, "__name__", "") != "_forbid_oss_d256":
-            raise RuntimeError(f"run_model did not install the expected OSS d256 sentinel for {sentinel_name}")
-    supports_backend_d256 = getattr(sdpamod, "_cudnn_backend_supports_d256", None)
-    backend_floor = getattr(sdpamod, "_CUDNN_BACKEND_D256_VERSION", None)
-    if supports_backend_d256 is None or backend_floor is None:
-        raise RuntimeError("FE SDPA op lacks the cuDNN-backend d256 route check")
-    if cudnn.backend_version() < backend_floor or not supports_backend_d256():
-        raise RuntimeError("d256 FE arm must route through the cuDNN backend; got backend " f"version {cudnn.backend_version()}, required {backend_floor}")
+    backend_floor = 92300
+    if cudnn.backend_version() < backend_floor:
+        raise RuntimeError("d256 FE arm requires cuDNN backend " f">= {backend_floor}; got {cudnn.backend_version()}")
+    if any(hasattr(sdpamod, name) for name in ("sdpa_fwd_d256", "sdpa_bwd_d256")):
+        raise RuntimeError("loaded FE SDPA module predates #682 and still exposes the legacy standalone d256 stacks")
 
     from cudnn.gemm.ops import swiglu_mlp as public_swiglu_mlp
 
@@ -412,6 +408,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     frost_compiler_module = importlib.import_module("cudnn.gemm.frost.compiler")
     frost_tile_config_module = importlib.import_module("cudnn.gemm.frost.tile_config")
     frost_kernel_registry_module = importlib.import_module("cudnn.gemm.frost.kernel_registry")
+    gated_mlp_adapter_module = importlib.import_module("cudnn.fla.gated_mlp")
     shape = _resolve_shape(args, qwen)
     mode_overrides = _mode_overrides(args, qwen, shape)
 
@@ -423,16 +420,6 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     if not linear_layers:
         raise RuntimeError("the three-axis benchmark requires at least one GDN layer")
     ids = torch.randint(0, shape["vocab"], (args.bs, args.seq), device=device)
-
-    original_mlp_forward = fla_mlp.GatedMLP.forward
-
-    def cudnn_mlp_forward(self, x, **kwargs):
-        return opmod.swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.up_proj.weight,
-            self.down_proj.weight,
-        )
 
     qwen._set_full_attention_backend("torch")
     torch_attn_adapter = fla_attn.flash_attn_func
@@ -555,10 +542,14 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     gdnmod.gated_delta_net = counted_native_gdn
 
     def select(variant):
-        cfla.restore_fla()
+        cfla.restore_fla(targets=("gated_delta_rule", "gated_mlp"))
+        selected_fla_targets = []
         if variant.gdn:
-            cfla.accelerate_fla(verbose=False)
-        fla_mlp.GatedMLP.forward = cudnn_mlp_forward if variant.mlp else original_mlp_forward
+            selected_fla_targets.append("gated_delta_rule")
+        if variant.mlp:
+            selected_fla_targets.append("gated_mlp")
+        if selected_fla_targets:
+            cfla.accelerate_fla(verbose=False, targets=selected_fla_targets)
         attention_backend = "cudnn" if variant.attn else "torch"
         qwen._set_full_attention_backend(attention_backend)
         # Keep run_model's selector authoritative, then add symmetric telemetry.
@@ -587,6 +578,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         "frost_mainloop_template_2ctamma": _source_record(frost_template_dir / "sm100_matmul_mainloop_2ctamma.py"),
         "cudnn_fla": _source_record(cfla.__file__),
         "cudnn_fla_gdn_adapter": _source_record(gdnmod.__file__),
+        "cudnn_fla_gated_mlp_adapter": _source_record(gated_mlp_adapter_module.__file__),
         "native_gdn": _source_record(native_gdn_module.__file__),
         "sdpa": _source_record(sdpamod.__file__),
         "cudnn_init": _source_record(cudnn.__file__),
@@ -597,11 +589,11 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     provenance = {
         "git": _git_provenance(),
         "sources": sources,
-        "oss_d256_sentinels": {name: getattr(getattr(sdpamod, name), "__name__", "") for name in ("sdpa_fwd_d256", "sdpa_bwd_d256")},
+        "d256_route_contract": "FE public backend graph only; legacy standalone stacks absent after #682",
     }
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     config = {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": args.mode,
         "timing_role": "validation_only" if args.mode == "smoke" else "formal_performance",
         "performance_claim_eligible": args.mode == "formal",
@@ -631,6 +623,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         "williams_orders": orders,
         "route_contract": ROUTE_CONTRACT,
         "measurement_contract": MEASUREMENT_CONTRACT,
+        "numerical_recipe": dict(qwen.NUMERICAL_RECIPE),
         "provenance": provenance,
     }
     comparability_inputs = {
@@ -664,6 +657,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
             "williams_orders",
             "route_contract",
             "measurement_contract",
+            "numerical_recipe",
         )
     }
     build_inputs = {
@@ -721,8 +715,13 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         gdn_path = gdnmod.last_path() if variant.gdn else "off"
         if variant.gdn and gdn_path != "native":
             raise RuntimeError(f"{variant.name}: expected native GDN, got {gdn_path}")
+        mlp_path = cfla.mlp_last_path() if variant.mlp else "off"
+        if cfla.is_accelerated("gated_mlp") != variant.mlp:
+            raise RuntimeError(f"{variant.name}: gated_mlp registry state does not match the selected arm")
+        if variant.mlp and mlp_path != "native":
+            raise RuntimeError(f"{variant.name}: expected native MLP, got {mlp_path}")
         print(
-            f"WARM {variant.name} gdn_path={gdn_path} native_gdn_delta={observed_native_gdn} "
+            f"WARM {variant.name} gdn_path={gdn_path} mlp_path={mlp_path} native_gdn_delta={observed_native_gdn} "
             f"full_attn={attention_backend} frost_delta={frost_calls - before_frost}"
         )
 
@@ -883,6 +882,8 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         "native_gdn_calls": native_gdn_calls,
         "expected_native_gdn_calls": expected_native_gdn_calls,
         "last_gdn_path": gdnmod.last_path(),
+        "last_mlp_path": cfla.mlp_last_path(),
+        "uses_public_gated_mlp_adapter": True,
         "full_attention_calls": attn_calls,
         "expected_full_attention_calls_each": expected_attn_calls,
         "torch_sdpa_probe": torch_sdpa_probe,
@@ -891,7 +892,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     }
     completed_utc = _utc_now()
     metadata = {
-        "schema_version": 2,
+        "schema_version": 3,
         "started_utc": started_utc,
         "completed_utc": completed_utc,
         "arguments": _serializable_args(args),
@@ -937,9 +938,9 @@ def main():
 
     device = _pick_device(args.mode)
     with torch.cuda.device(device):
-        # Load under the selected device context. The sibling model installs
-        # persistent sentinels that reject FE's older OSS/CuteDSL d256 fallback
-        # and exposes the canonical backend selector.
+        # Load under the selected device context. After FE #682 the public d256
+        # operator is backend-graph-only; the sibling exposes the canonical
+        # Torch-versus-FE selector used by this matrix.
         qwen = _load_run_model()
         properties = torch.cuda.get_device_properties(device)
         if args.mode == "formal" and (properties.name != "NVIDIA B200" or properties.multi_processor_count != 148):

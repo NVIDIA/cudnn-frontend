@@ -405,6 +405,11 @@ def render_markdown(metadata, *, raw_json_link, raw_json_sha256):
 
     mode_overrides = config.get("mode_overrides", {})
     override_text = json.dumps(mode_overrides, sort_keys=True) if mode_overrides else "none"
+    recipe_anchor = config["numerical_recipe"].get("anchor")
+    if recipe_anchor is None:
+        recipe_anchor_text = "none (local policy)"
+    else:
+        recipe_anchor_text = f"{recipe_anchor['project']}@{recipe_anchor['commit']}:" f"{recipe_anchor['path']}::{recipe_anchor['symbol']}"
     lines.extend(
         [
             "",
@@ -415,6 +420,10 @@ def render_markdown(metadata, *, raw_json_link, raw_json_sha256):
             f"CUDA driver/runtime `{config['cuda_driver']}/{config['cuda_runtime']}`, cuDNN FE `{config['cudnn_frontend']}`, "
             f"cuDNN backend `{config['cudnn_backend']}`, FLA `{config['fla']}`",
             f"- Model: `{config['preset']}`, shape `{json.dumps(config['resolved_shape'], sort_keys=True)}`, attention layers `{config['attn_layers']}`",
+            f"- Numerical recipe: `{config['numerical_recipe']['id']}`; parameters/activations "
+            f"`{config['numerical_recipe']['parameter_dtype']}`/`{config['numerical_recipe']['activation_dtype']}`; "
+            f"scope `{config['numerical_recipe']['scope']}`; alignment `{config['numerical_recipe']['alignment']}`",
+            f"- Numerical anchor: `{recipe_anchor_text}`",
             f"- Input/timing: batch `{config['bs']}`, sequence `{config['seq']}`, warmup `{config['warmup']}`, "
             f"batches `{config['rounds']}`, repeats `{config['repeats']}`",
             f"- Mode overrides: `{override_text}`",
