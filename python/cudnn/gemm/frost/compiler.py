@@ -1573,13 +1573,12 @@ def _render_template(
     snippets: EpilogueSnippets,
     config: TileConfig,
     cta_group: int,
-    scheduler: str,
 ) -> str:
     # Template selected by the kernel registry from the pure-geometry config +
-    # execution strategy (cta_group/scheduler); mainloop/graph_type from chain.
+    # execution strategy (cta_group); mainloop/graph_type from chain.
     from .kernel_registry import select_template
 
-    tmpl = select_template(chain, config, cta_group, scheduler)
+    tmpl = select_template(chain, config, cta_group)
     fallback_cluster = _mixed_cga_fallback(config, cta_group, tmpl.file)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
@@ -1741,7 +1740,6 @@ def _render_block_scale_template(
     snippets: EpilogueSnippets,
     config: TileConfig,
     cta_group: int,
-    scheduler: str,
     fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
@@ -1749,7 +1747,7 @@ def _render_block_scale_template(
     template (not injected). Epilogue aux/tap markers still work."""
     from .kernel_registry import select_template
 
-    tmpl = select_template(chain, config, cta_group, scheduler)
+    tmpl = select_template(chain, config, cta_group)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
@@ -2935,7 +2933,6 @@ def probe_supported(
     config: TileConfig = DEFAULT_CONFIG,
     *,
     cta_group: int = 2,
-    scheduler: str = "clc",
 ) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. This is
@@ -2966,17 +2963,17 @@ def probe_supported(
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
 
-        tmpl = select_template(chain, config, cta_group, scheduler)
+        tmpl = select_template(chain, config, cta_group)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
                 f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
                 f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
-                f"scheduler={scheduler!r} → {tmpl.file}."
+                f"→ {tmpl.file}."
             )
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -2988,7 +2985,6 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
     *,
     cta_group: int = 2,
-    scheduler: str = "clc",
     force_stg_epi: bool = False,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
@@ -2999,7 +2995,7 @@ def jit_from_cudnn_graph(
     `graph` is a ``cudnn.pygraph`` built after ``import cudnn.gemm.frost`` (the
     import installs the op-recording hook). `config` is a PURE-GEOMETRY tile from
     `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
-    ``scheduler`` ∈ {"clc", "static"} pick the template (mainloop auto-detected).
+    picks the template (mainloop auto-detected).
     ``force_stg_epi=True`` skips the TMA-store path even when its gate accepts.
 
     Mixed CGA needs no argument and no caller change: where the GPU and the
@@ -3017,33 +3013,33 @@ def jit_from_cudnn_graph(
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
-        return _jit_moe_block_scale(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_moe_block_scale(chain, config, cta_group, binding=binding)
     # Block-scale is gated independently (own per-side case table).
     if chain.has_block_scale:
-        return _jit_block_scale(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_block_scale(chain, config, cta_group, binding=binding)
     # MoE grouped matmul: own template (grouped persistent scheduler + per-group
     # A TMA descriptor replacement).
     if chain.has_moe:
-        return _jit_moe(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_moe(chain, config, cta_group, binding=binding)
     # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
     # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
 
-        tmpl = select_template(chain, config, cta_group, scheduler)
+        tmpl = select_template(chain, config, cta_group)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
                 f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
                 f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
-                f"scheduler={scheduler!r} → {tmpl.file}. Use cta_group=1, scheduler='clc'."
+                f"→ {tmpl.file}. Use cta_group=1."
             )
     # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
     # special-case combos]) gate, then the template family's active-GPU gate.
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3064,7 +3060,7 @@ def jit_from_cudnn_graph(
             output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
             use_tma_store=use_tma,
         )
-        src = _render_template(chain, snippets, config, cta_group, scheduler)
+        src = _render_template(chain, snippets, config, cta_group)
     finally:
         _FORCE_STG_EPI = prev_force
     mod = _import_kernel(src)
@@ -3440,7 +3436,6 @@ def _jit_moe(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeGemm:
@@ -3458,7 +3453,7 @@ def _jit_moe(
         )
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3477,7 +3472,7 @@ def _jit_moe(
             output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
             use_tma_store=use_tma,
         )
-        src = _render_template(chain, snippets, config, cta_group, scheduler)
+        src = _render_template(chain, snippets, config, cta_group)
     finally:
         _FORCE_STG_EPI = prev_force
     mod = _import_kernel(src)
@@ -3501,7 +3496,6 @@ def _jit_block_scale(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledFusedGemm:
@@ -3528,11 +3522,9 @@ def _jit_block_scale(
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
     from .kernel_registry import select_template
 
-    _tmpl = select_template(chain, config, cta_group, scheduler)
+    _tmpl = select_template(chain, config, cta_group)
     if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
-        raise NotImplementedError(
-            f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}, scheduler={scheduler!r})."
-        )
+        raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}).")
     _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
@@ -3547,7 +3539,7 @@ def _jit_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=use_tma,
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=fallback_cluster)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=fallback_cluster)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
@@ -3844,7 +3836,6 @@ def _jit_moe_block_scale(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeBlockScaleGemm:
@@ -3873,7 +3864,7 @@ def _jit_moe_block_scale(
                 raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
     _check_input_alignment(chain)
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
-    _tmpl = select_template(chain, config, cta_group, scheduler)
+    _tmpl = select_template(chain, config, cta_group)
     _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
@@ -3886,7 +3877,7 @@ def _jit_moe_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=(not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group),
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
+    src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n

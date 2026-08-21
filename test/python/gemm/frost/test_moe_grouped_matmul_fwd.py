@@ -525,13 +525,13 @@ def test_select_config_lifts_the_n_tile_for_n_major_b() -> None:
     must not hand back a per-CTA N tile smaller than one group."""
     from cudnn.gemm.frost.tile_config import select_config
 
-    cfg_k, cta_group_k, _ = select_config(64, 32, 1)
+    cfg_k, cta_group_k = select_config(64, 32, 1)
     assert (cfg_k.cta_tile_n, cta_group_k) == (32, 1)
 
-    cfg_n, cta_group_n, _ = select_config(64, 32, 1, b_n_major=True)
+    cfg_n, cta_group_n = select_config(64, 32, 1, b_n_major=True)
     assert (cfg_n.cta_tile_n, cta_group_n) == (64, 1)
 
-    cfg_2, cta_group_2, _ = select_config(256, 32, 1, b_n_major=True)
+    cfg_2, cta_group_2 = select_config(256, 32, 1, b_n_major=True)
     assert (cfg_2.cta_tile_n, cta_group_2) == (128, 2)
 
 
@@ -575,7 +575,7 @@ def test_moe_grouped_matmul_fwd_rejects_m_major_token() -> None:
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
     with pytest.raises(NotImplementedError, match="K-major token"):
-        jit_from_cudnn_graph(g, config=by_name(_CFG), cta_group=2, scheduler="clc")
+        jit_from_cudnn_graph(g, config=by_name(_CFG), cta_group=2)
 
 
 @requires_sm100
@@ -910,7 +910,7 @@ def test_moe_int8(cta_group):
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     cfg_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if cta_group == 1 else "CONFIG_sm100_128x128x128_128x128x32_cluster2x1"
-    compiled = jit_from_cudnn_graph(g, config=by_name(cfg_name), cta_group=cta_group, scheduler="clc")
+    compiled = jit_from_cudnn_graph(g, config=by_name(cfg_name), cta_group=cta_group)
     assert compiled.chain.matmul.accum_dtype == "int32"
 
     torch.manual_seed(0)

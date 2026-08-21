@@ -586,6 +586,26 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
+            # Per-group TMA replacement changes the GMEM source, not these
+            # invariant MMA-side SMEM descriptor roots.
+            desc_a_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_a_list[i],
+                    leading_byte_offset=a_smem_desc_leading_byte_offset,
+                    stride_byte_offset=a_smem_desc_stride_byte_offset,
+                    layout=ab_smem_swizzle,
+                )
+                for i in range(num_a_operands)
+            ]
+            desc_b_roots = [
+                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_b_list[j],
+                    leading_byte_offset=b_smem_desc_leading_byte_offset,
+                    stride_byte_offset=b_smem_desc_stride_byte_offset,
+                    layout=ab_smem_swizzle,
+                )
+                for j in range(num_b_operands)
+            ]
             while is_valid != 0:
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_full_mbar_ptr.subview(sched_stage),
@@ -643,20 +663,8 @@ def _kernel(
 
                         for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                             for g in cutlass.range_constexpr(num_gemms):
-                                sA_stage = smem_a_list[gemm_a_idx[g]].subview(sA_elems * stage)
-                                sB_stage = smem_b_list[gemm_b_idx[g]].subview(sB_elems * stage)
-                                desc_a_k = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                    start_address=sA_stage,
-                                    leading_byte_offset=a_smem_desc_leading_byte_offset,
-                                    stride_byte_offset=a_smem_desc_stride_byte_offset,
-                                    layout=ab_smem_swizzle,
-                                ).advance_start_address(a_smem_k_step_bytes * k_block_idx)
-                                desc_b = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                    start_address=sB_stage,
-                                    leading_byte_offset=b_smem_desc_leading_byte_offset,
-                                    stride_byte_offset=b_smem_desc_stride_byte_offset,
-                                    layout=ab_smem_swizzle,
-                                ).advance_start_address(b_smem_k_step_bytes * k_block_idx)
+                                desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
+                                desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                                 for mi in cutlass.range_constexpr(num_mma_m):
                                     # The M sub-block offset is a whole SMEM swizzle atom, so the
                                     # descriptor's swizzle phase is preserved. B is shared.

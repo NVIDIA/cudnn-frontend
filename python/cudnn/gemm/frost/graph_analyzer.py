@@ -573,12 +573,7 @@ def build_gemm_plan(graph: cudnn.pygraph):
         tile_m = (chain.matmul.M + groups - 1) // groups
     from .dtypes import DTYPE_BYTES
 
-    # Only plain (non-mainloop-fusion, non-MoE) matmul has a static-scheduler template;
-    # asking for "static" anywhere else fails template lookup outright. Selection itself
-    # is one path for every graph type -- this flag only gates the scheduler.
-    supports_static = chain.moe is None and not chain.has_mainloop_fusion
-
-    config, cta_group, scheduler = select_config(
+    config, cta_group = select_config(
         tile_m,
         chain.matmul.N,
         chain.num_gemms,
@@ -586,10 +581,9 @@ def build_gemm_plan(graph: cudnn.pygraph):
         block_scale=chain.has_block_scale,
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
-        supports_static=supports_static,
     )
     config = as_pipeline(config, preferred_pipeline(chain))
-    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
 
 
 # Analyzer

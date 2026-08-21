@@ -562,13 +562,6 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             512,
         ),
         (
-            "nvfp4",
-            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            512,
-        ),
-        (
             "mxfp4",
             "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
             256,
@@ -579,13 +572,6 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
         (
             "nvfp4",
             "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma",
-            256,
-            256,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_static",
             256,
             256,
             512,
@@ -685,50 +671,6 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             512,
             512,
         ),  # mx + A+B pair
-        # Static scheduler (no CLC) — cta_n=128 acc_stages=2, cta_n=256 acc-overlap.
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            128,
-            128,
-            256,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            512,
-        ),  # acc-overlap
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            256,
-        ),
-        # 2-CTA pair static (no CLC, 1 tile/pair). cta_n=128 non-overlap + cta_n=256 overlap.
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
-            128,
-            512,
-        ),  # non-overlap
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),  # acc-overlap
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),  # mx + overlap
     ],
 )
 def test_block_scale_matmul_numerics(combo, config_name, M, N, K):
@@ -907,22 +849,8 @@ def test_block_scale_matmul_quant_epilogue_fp4_input_global_scale_padded_f8_scal
             256,
         ),
         (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            512,
-        ),
-        (
             "mxfp8",
             "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-            256,
-            256,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
             256,
             256,
             512,
@@ -930,7 +858,7 @@ def test_block_scale_matmul_quant_epilogue_fp4_input_global_scale_padded_f8_scal
     ],
 )
 def test_block_scale_matmul_m_major(combo, config_name, M, N, K):
-    """M-major block-scale output across dynamic/static 1-CTA and 2-CTA."""
+    """M-major block-scale output across 1-CTA and 2-CTA."""
     _run_bs_numeric(combo, config_name, M, N, K, out_major="m")
 
 
@@ -940,11 +868,6 @@ def test_block_scale_matmul_m_major(combo, config_name, M, N, K):
     [
         ("nvfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma", "padded"),
         ("nvfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", "padded"),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            "zero_stride",
-        ),
     ],
 )
 def test_block_scale_matmul_nonpacked_tensors(combo, config_name, mode):
@@ -1045,38 +968,6 @@ def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
 
 @_GPU
 @pytest.mark.parametrize(
-    "config_name,M,N,K",
-    [
-        (
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            128,
-            128,
-            256,
-        ),
-        (
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),
-    ],
-)
-def test_block_scale_matmul_reduction_static_templates(config_name, M, N, K):
-    _run_bs_reduction_numeric(
-        "nvfp4",
-        config_name,
-        M,
-        N,
-        K,
-        cudnn.reduction_mode.ADD,
-        red_dims=[1, 1, 1],
-        red_stride=None,
-        ref_dims=(0, 1, 2),
-    )
-
-
-@_GPU
-@pytest.mark.parametrize(
     "mode,red_dims,red_stride,ref_dims",
     [
         (cudnn.reduction_mode.ADD, [1, 1, 256], [0, 0, 2], (0, 1)),
@@ -1120,7 +1011,6 @@ def test_block_scale_matmul_reduction_rejects_int32():
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_1ctamma",  # M-OOB with cgrp_m > 1
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma",  # N tile/cluster > N
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # 2-CTA pair + acc-overlap
-        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",  # static scheduler + OOB
     ],
 )
 def test_nvfp4_oob_shape(config_name):
@@ -1300,7 +1190,7 @@ requires_sm103 = pytest.mark.skipif(
 
 
 def _sm103_kw(config_name, cta_group=1):
-    return dict(config=by_name(config_name), cta_group=cta_group, scheduler="clc")
+    return dict(config=by_name(config_name), cta_group=cta_group)
 
 
 @pytest.fixture
@@ -1391,14 +1281,14 @@ def _bs_chain(combo="nvfp4", M=256, N=256, K=1536):
 
 def test_select_template_dispatches_on_config_arch():
     chain = analyze(_bs_chain())
-    t103 = select_template(chain, by_name(_CFG_128), cta_group=1, scheduler="clc")
+    t103 = select_template(chain, by_name(_CFG_128), cta_group=1)
     assert t103.file == "sm103_block_scale_matmul_1ctamma.py"
     from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
 
     assert PIPELINE_ARCH_RANGES[t103.pipeline] == ((103, 110),)
-    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), cta_group=1, scheduler="clc")
+    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), cta_group=1)
     assert t100.file == "sm100_block_scale_matmul_1ctamma.py"
-    t103_2 = select_template(chain, by_name(_CFG_128), cta_group=2, scheduler="clc")
+    t103_2 = select_template(chain, by_name(_CFG_128), cta_group=2)
     assert t103_2.file == "sm103_block_scale_matmul_2ctamma.py"
     # Pairing is by config CLASS (from the template's filename arch token):
     # a base TileConfig posing as sm103 matches no template.
@@ -1414,10 +1304,7 @@ def test_select_template_dispatches_on_config_arch():
         mma_inst_k_bytes=48,
     )
     with pytest.raises(ValueError, match="no kernel template"):
-        select_template(chain, imposter, cta_group=1, scheduler="clc")
-    # No sm103 static variants yet.
-    with pytest.raises(ValueError, match="no kernel template"):
-        select_template(chain, by_name(_CFG_128), cta_group=1, scheduler="static")
+        select_template(chain, imposter, cta_group=1)
 
 
 def test_sm103_template_rejects_mxfp8(_pretend_sm103):
@@ -1646,7 +1533,7 @@ def test_auto_config_is_accepted_by_the_registry(M, N):
 
     chain = analyze(_build_nvfp4_graph(M, N, 512))
     assert chain.has_block_scale
-    cfg, _cta_group, _sched = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
     cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
@@ -1732,7 +1619,7 @@ def _pretend_sm107(monkeypatch):
 
 
 def _sm107_kw(config_name, cta_group=1):
-    return dict(config=by_name(config_name), cta_group=cta_group, scheduler="clc")
+    return dict(config=by_name(config_name), cta_group=cta_group)
 
 
 def test_catalog_has_sm107_geometries():
@@ -1775,12 +1662,12 @@ def test_sm107_template_selection_and_arch_gate(_pretend_sm107):
     chain = analyze(_bs_chain())
     for cta_group, want in ((1, "sm107_block_scale_matmul_1ctamma.py"), (2, "sm107_block_scale_matmul_2ctamma.py")):
         cfg = by_name(_SM107_128 if cta_group == 1 else "CONFIG_sm107_128x128x128_128x128x64_cluster2x1")
-        tmpl = select_template(chain, cfg, cta_group=cta_group, scheduler="clc")
+        tmpl = select_template(chain, cfg, cta_group=cta_group)
         assert tmpl.file == want
         assert tmpl.accepts(chain, cfg) is None
     # An sm100 config still pairs with the sm100 templates on the same GPU.
     sm100_cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    assert select_template(chain, sm100_cfg, cta_group=1, scheduler="clc").file == "sm100_block_scale_matmul_1ctamma.py"
+    assert select_template(chain, sm100_cfg, cta_group=1).file == "sm100_block_scale_matmul_1ctamma.py"
 
 
 def test_sm107_templates_reject_older_blackwell(monkeypatch):
@@ -2160,7 +2047,7 @@ def test_fp4_all_scale_block_corners_numerics(config_name, sf_dt, sf_name, block
         sfb = torch.randint(1, 4, (N, sf_k), device=dev).to(torch.float8_e4m3fn)
 
     g = _build_nvfp4_graph(M, N, K, block_size=block_size, sf_dt=sf_dt, a_dt=cudnn.data_type.FP4_E2M1)
-    compiled = _plan(g, config=by_name(config_name), cta_group=1, scheduler="clc")
+    compiled = _plan(g, config=by_name(config_name), cta_group=1)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (sf_name, block_size)
 
     c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
@@ -2275,7 +2162,7 @@ def _run_e5m3_numeric(config_name, cta_group, block_size, M=256, N=256, K=512):
     sfa, sfb = _rand_e5m3((M, sf_k), dev), _rand_e5m3((N, sf_k), dev)
 
     g = _e5m3_graph(M, N, K, block_size)
-    compiled = _plan(g, config=by_name(config_name), cta_group=cta_group, scheduler="clc")
+    compiled = _plan(g, config=by_name(config_name), cta_group=cta_group)
     assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == ("fp8_e5m3", block_size)
 
     # The SF blob is read by base pointer and to_blocked() ceil-pads to whole

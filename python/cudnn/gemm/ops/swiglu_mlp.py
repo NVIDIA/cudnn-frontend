@@ -349,7 +349,7 @@ def _frost_dswiglu(dout2, Wd, gate, up):
             dh = g.matmul(A=DY, B=WD, name="dgrad")
             g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
             g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler="clc")
+            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
             bd = compiled.binding
             out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
             aux_by = {a.get_name(): a for a in bd.aux}

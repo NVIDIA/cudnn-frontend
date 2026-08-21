@@ -36,9 +36,9 @@ from benchmark_utils import (
 )
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -229,15 +229,15 @@ def _unfused_launch(tok, w0, w1, out, S, N, K, E):
 
 
 def _build_spec_map():
-    """Label -> (geometry cfg, cta_group, scheduler) for multi-GEMM MoE
+    """Label -> (geometry cfg, cta_group) for multi-GEMM MoE
     block-scale strategies. Dual TMEM fits two accs + SF only at cta_tile_n<=128."""
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
         if cfg.pipeline not in ("sm100", "sm107") or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -301,12 +301,12 @@ def main() -> int:
         if spec is None:
             print(f"  {label:66s} UNKNOWN (not a sweepable MoE block-scale swiglu strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph_swiglu(S, N, K, E, combo)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue
         try:
