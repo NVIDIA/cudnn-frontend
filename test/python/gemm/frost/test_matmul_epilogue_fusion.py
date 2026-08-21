@@ -2526,16 +2526,21 @@ def _pw_aux_order(compiled, aux_bufs):
     return order
 
 
+def _prod_dim1(s):
+    """Product along dim 1 on the CPU -- torch's device-side `prod` NVRTC-JITs its kernel."""
+    return s.cpu().prod(dim=1, keepdim=True).to(s.device)
+
+
 _RED_CASES = {
     "avg_full": (cudnn.reduction_mode.AVG, (1, 1, 1), lambda s: s.mean().view(1, 1, 1), 0.0),
     "avg_row": (cudnn.reduction_mode.AVG, (1, _PW_M, 1), lambda s: s.mean(dim=1, keepdim=True).view(1, _PW_M, 1), 0.0),
     "avg_col": (cudnn.reduction_mode.AVG, (1, 1, _PW_N), lambda s: s.mean(dim=0, keepdim=True).view(1, 1, _PW_N), 0.0),
     "norm1_row": (cudnn.reduction_mode.NORM1, (1, _PW_M, 1), lambda s: s.abs().sum(dim=1, keepdim=True).view(1, _PW_M, 1), 0.0),
-    "mul_row": (cudnn.reduction_mode.MUL, (1, _PW_M, 1), lambda s: s.prod(dim=1, keepdim=True).view(1, _PW_M, 1), 1.0),
+    "mul_row": (cudnn.reduction_mode.MUL, (1, _PW_M, 1), lambda s: _prod_dim1(s).view(1, _PW_M, 1), 1.0),
     "mul_no_zeros_row": (
         cudnn.reduction_mode.MUL_NO_ZEROS,
         (1, _PW_M, 1),
-        lambda s: torch.where(s == 0, torch.ones_like(s), s).prod(dim=1, keepdim=True).view(1, _PW_M, 1),
+        lambda s: _prod_dim1(torch.where(s == 0, torch.ones_like(s), s)).view(1, _PW_M, 1),
         1.0,
     ),
 }

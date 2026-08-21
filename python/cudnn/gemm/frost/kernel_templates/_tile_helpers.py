@@ -34,12 +34,14 @@ def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
     return log_m, log_n
 
 
-def epi_subtile_spans(cols):
-    """Power-of-two column spans the epilogue drains a tile in (host-side)."""
+def epi_subtile_spans(cols, epi_n=32):
+    """Power-of-two column spans the epilogue drains a tile in (host-side).
+    Starts at ``epi_n`` and halves to fit the remainder, so any 8-multiple N is
+    covered whatever the widest span is."""
     spans = []
     off = 0
     while off < cols:
-        w = 32
+        w = epi_n
         while w > cols - off:
             w //= 2
         spans.append((off, w))

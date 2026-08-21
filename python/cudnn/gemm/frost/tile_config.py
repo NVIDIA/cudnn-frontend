@@ -40,13 +40,17 @@ def _sm_smem_budget_bytes(device=None) -> int:
     return _sm_smem_budget_bytes_of(resolve_device(device))
 
 
-# Per-CTA SMEM held back off the top when sizing the ab/acc pipeline, keyed by
-# the kernel template's pipeline: the CLC ring, smem barriers, the TMEM base-address
+# Per-CTA SMEM held back off the top when sizing the ab pipeline: the scheduler ring,
+# every smem barrier, the TMEM base address and — on the MoE templates — the per-CTA TMA
+# tensormap scratch. The ab pipeline itself only counts the operand tensors, so these
+# fragments are budgeted once here instead of being modelled stage by stage.
 _SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048}
+_SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096, "sm107": 4096}
 
 
-def _sm_smem_ab_budget_bytes(pipeline: str, device=None) -> int:
-    return _sm_smem_budget_bytes(device) - _pipeline_fact(_SMEM_FIXED_RESERVE_BY_PIPELINE, pipeline, "SMEM fixed reserve")
+def _sm_smem_ab_budget_bytes(pipeline: str, device=None, *, moe: bool = False) -> int:
+    table = _SMEM_FIXED_RESERVE_MOE_BY_PIPELINE if moe else _SMEM_FIXED_RESERVE_BY_PIPELINE
+    return _sm_smem_budget_bytes(device) - _pipeline_fact(table, pipeline, "SMEM fixed reserve")
 
 
 _L2_RETENTION_DIVISOR = 3
@@ -106,16 +110,15 @@ def smem_max_ab_stages(
     cta_tile_k_bytes: int,
     *,
     cta_group: int = 1,
-    acc_stages: int = 2,
     extra_smem_bytes: int = 0,
     extra_per_stage_bytes: int = 0,
     pipeline: str,
+    moe: bool = False,
     device=None,
 ) -> int:
     smem_b_n = cta_tile_n // cta_group
-    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes + 2 * 8
-    fixed = 2 * acc_stages * 8 + 8
-    avail = _sm_smem_ab_budget_bytes(pipeline, device) - fixed - extra_smem_bytes
+    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes
+    avail = _sm_smem_ab_budget_bytes(pipeline, device, moe=moe) - extra_smem_bytes
     if avail < per_stage:
         raise ValueError(
             f"tile ({cta_tile_m},{cta_tile_n},K={cta_tile_k_bytes}B) "
@@ -307,6 +310,7 @@ class TileConfig:
         *,
         extra_smem_bytes: int = 0,
         extra_per_stage_bytes: int = 0,
+        moe: bool = False,
     ) -> int:
         """Largest SMEM pipeline depth under ``cta_group`` (2-CTA MMA halves B's
         SMEM N, so it fits more stages)."""
@@ -315,10 +319,10 @@ class TileConfig:
             self.cta_tile_n,
             self.cta_tile_k_bytes,
             cta_group=cta_group,
-            acc_stages=self.acc_stages,
             extra_smem_bytes=extra_smem_bytes,
             extra_per_stage_bytes=extra_per_stage_bytes,
             pipeline=self.pipeline,
+            moe=moe,
         )
 
     # -- multicast model -----------------------------------------------------

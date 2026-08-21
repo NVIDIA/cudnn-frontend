@@ -552,6 +552,17 @@ def _render_tile_constants(
     # cta_tile_k_bytes, and an MN-major tile is MN/group_elems groups of
     # group_elems * cta_tile_k_bytes — both give cta_tile_k_bytes per MN element.
     a_smem_m_step_bytes = (cta_smem_m // cfg.num_mma_m) * cfg.cta_tile_k_bytes
+    a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(
+        chain.matmul.a_major,
+        chain.matmul.b_major,
+        cfg.cgrp_size_m,
+        cfg.cgrp_size_n,
+        cta_group,
+        cta_smem_m,
+        cta_smem_n,
+        per_cta_a=cta_group == 2 and bool(chain.mainloop_a_ops),
+        per_cta_b=cta_group == 2 and bool(chain.mainloop_b_ops),
+    )
 
     lines = [
         f"# Tile config: {cfg.name}",
@@ -560,7 +571,7 @@ def _render_tile_constants(
         # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
         # 2-CTA MMA), NOT the logical per-CTA tile from TileConfig.
         f"cta_tile_mnk = {cfg.cta_smem_tile_mnk(elem_bytes, cta_group)}",
-        f"epi_tile_mn = {cfg.epi_tile_mn}",
+        f"epi_tile_mn = {(cfg.epi_tile_mn[0], _epi_n(cfg, cta_group, out_dt))}",
         f"threads_per_cta = {cfg.threads_per_cta}",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
         f"matmul_batch = {chain.matmul.batch}",
@@ -570,9 +581,12 @@ def _render_tile_constants(
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
-        f"ab_stages = {cfg.max_ab_stages(cta_group)}",
+        f"ab_stages = {cfg.max_ab_stages(cta_group, moe=chain.has_moe)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b(cta_group)}",
+        f"a_mcast_slices = {a_mcast_slices}",
+        f"b_mcast_slices = {b_mcast_slices}",
+        f"ab_empty_full_mask = {ab_empty_full_mask}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
         f"ab_smem_swizzle_bytes = {smem_swizzle_bytes}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
@@ -606,6 +620,7 @@ def _render_tile_constants(
         f"cd_fake_n_div = {2 if out_dt == 'fp4_e2m1' else 1}",
         # M-major TMA-store C-descriptor inner-M box = 128 B swizzle span / elem_bytes.
         f"cd_mmajor_atom_m = {128 // DTYPE_BYTES[out_dt]}",
+        *_epi_swizzle_lines(cfg, cta_group, out_dt),
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     # (acc_stages is emitted below, once the TMEM budget is known.)
@@ -648,9 +663,8 @@ def _render_tile_constants(
 
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
         smem_n = cfg.cta_tile_n // cta_group
-        per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes + 2 * 8
-        fixed = 2 * acc_stages * 8 + 8
-        avail = _sm_smem_ab_budget_bytes(cfg.pipeline) - fixed
+        per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes
+        avail = _sm_smem_ab_budget_bytes(cfg.pipeline, moe=chain.has_moe)
         ab_stages_mg = min(avail // per_stage, _AB_STAGES_CAP)
         if ab_stages_mg < 1:
             raise NotImplementedError(
@@ -710,7 +724,7 @@ def _render_tile_constants(
     # Final ab_stages override: account for the TMA-D SMEM buffer (fixed, when
     # TMA-store is active) AND a mixed-input mainloop's narrow LOAD buffer
     # (per-stage). Otherwise leave the plain max.
-    smem_d_bytes = _smem_d_bytes(cfg, chain) if use_tma else 0
+    smem_d_bytes = _smem_d_bytes(cfg, chain, cta_group) if use_tma else 0
     cast_extra_per_stage = 0
     if chain.has_mainloop_fusion and (chain.mainloop_a_cast or chain.mainloop_b_cast):
         smem_n = cfg.cta_tile_n // cta_group
@@ -724,6 +738,7 @@ def _render_tile_constants(
             cta_group,
             extra_smem_bytes=smem_d_bytes,
             extra_per_stage_bytes=cast_extra_per_stage,
+            moe=chain.has_moe,
         )
         lines.append(f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage")
     lines.extend(_quant_device_imports(chain))
@@ -893,6 +908,32 @@ def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
     return max_active_clusters(cfg.cgrp_size_m * cfg.cgrp_size_n, device)
 
 
+_SMEM_SWIZZLE_ATOM_ROWS = 8
+
+
+def _mcast_slice_plan(
+    a_major: str,
+    b_major: str,
+    cluster_m: int,
+    cluster_n: int,
+    cta_group: int,
+    cta_smem_m: int,
+    cta_smem_n: int,
+    *,
+    per_cta_a: bool = False,
+    per_cta_b: bool = False,
+) -> tuple[int, int, bool]:
+    """(a_slices, b_slices, needs_full_empty_mask) for the cluster's TMA multicast."""
+    a_group = 1 if per_cta_a else cluster_n
+    b_group = 1 if per_cta_b else cluster_m // cta_group
+    atom = _SMEM_SWIZZLE_ATOM_ROWS
+    a_slices = a_group if (a_major == "k" and a_group > 1 and cta_smem_m % (a_group * atom) == 0) else 1
+    b_slices = b_group if (b_major == "k" and b_group > 1 and cta_smem_n % (b_group * atom) == 0) else 1
+    a_closed = cluster_n == 1 or a_slices > 1
+    b_closed = cluster_m // cta_group == 1 or b_slices > 1
+    return a_slices, b_slices, not (a_closed and b_closed)
+
+
 def _cluster_mcast_patterns(cluster_m: int, cluster_n: int, cta_group: int) -> tuple[int, int]:
     """(A, B) multicast bit patterns for a cluster shape, at CTA rank 0.
 
@@ -1031,6 +1072,9 @@ def _render_block_scale_tile_constants(
 
     cta_m = cfg.cta_tile_m
     cta_n = cfg.cta_tile_n
+    bs_a_mcast_slices, bs_b_mcast_slices, bs_ab_empty_full_mask = _mcast_slice_plan(
+        chain.matmul.a_major, chain.matmul.b_major, cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group, cta_m, cta_n // cta_group
+    )
     # MMA K-instruction width (sm100 → 32 bytes): fp4 → 64 elems, fp8 → 32.
     mma_inst_k_bytes = cfg.mma_inst_k_bytes
     mma_inst_k_elems = mma_inst_k_bytes * 8 // data_elem_bits
@@ -1081,24 +1125,38 @@ def _render_block_scale_tile_constants(
     sf_k4 = sf_k // 4  # 4 SF-K per utccp atom
     nb_m = cta_m // 128
     nb_n = cta_n // 128
+    mma_nb_m = cfg.mma_inst_m // 128
+    mma_nb_n = cfg.mma_inst_n // 128
+    sfa_nb_m = mma_nb_m * cfg.num_mma_m
 
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
     scales_per_inst = mma_inst_k_elems // bs.block_size
     word_scales = max(_REGISTERS_PER_ATOM, scales_per_inst)  # cols per block-word
     word_atoms = -(-word_scales // _REGISTERS_PER_ATOM)  # atoms copied per word (ceil: a partial atom still costs one)
     insts_per_word = max(_REGISTERS_PER_ATOM // scales_per_inst, 1)
-    num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
-    # One SF word per 128-row / 128-column block, packed back to back. SFB must
-    # stay contiguous (one instruction's SFB read extent grows with n_dim, so a
-    # single scale_b reads every N block as one span); SFA blocks each get their
-    # own scale_a at the same stride.
-    sfa_tmem_cols = nb_m * _REGISTERS_PER_BLOCK
-    sfb_tmem_cols = nb_n * _REGISTERS_PER_BLOCK  # fixed SF word width (SFB)
     if is_sm103:
+        # A whole K-tile of SF is TMEM-resident, so a region is sf_k wide.
         num_sf_words = sf_k4
-        sfa_tmem_cols = nb_m * sf_k
-        sfb_tmem_cols = nb_n * sf_k
+        sfa_tmem_cols = sfa_nb_m * sf_k
+        sfb_tmem_cols = mma_nb_n * sf_k
+    else:
+        # One SF word per 128-row / 128-column block, packed back to back and
+        # refreshed per word. SFB must stay contiguous (one instruction's SFB read
+        # extent grows with n_dim, so a single scale_b reads every N block as one
+        # span); SFA is one block per M sub-block, so its M instructions stay
+        # independent.
+        num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
+        if num_sf_words * insts_per_word != num_kblocks:
+            raise NotImplementedError(
+                f"block-scale {cfg.name!r}: {num_sf_words} SF word(s) x {insts_per_word} "
+                f"instruction(s) per word covers {num_sf_words * insts_per_word} K-blocks, "
+                f"but the K-tile has {num_kblocks}. The MMA would read scale bytes that were "
+                f"never staged, or skip the trailing K-blocks. Reachable only if the "
+                f"cta_tile_k_bytes == 128 requirement is relaxed."
+            )
+        sfa_tmem_cols = sfa_nb_m * _REGISTERS_PER_BLOCK
+        sfb_tmem_cols = mma_nb_n * _REGISTERS_PER_BLOCK
     # utccp SMEM-source offsets (16-byte units). One 128×4 atom = 512 B = 32;
     # consecutive K-atoms 1 atom apart; each M/N-block of 128 rows is sf_k4 atoms
     # further along the SF SMEM tile.
@@ -1121,9 +1179,6 @@ def _render_block_scale_tile_constants(
     # double-TMEM pipelining at a single mbar.
     total_tmem = _tmem_cols_for_arch()
 
-    def _align16(x: int) -> int:
-        return (x + 15) & ~15
-
     # --- TMEM acc-stage + overlap (per-GEMM budget; arch- & count-agnostic) ---
     # SF = one fixed word PER DISTINCT OPERAND (shared A → one SFA word).
     # Each GEMM's acc gets its OWN region; the 2 tile-stage buffers overlap
@@ -1144,7 +1199,29 @@ def _render_block_scale_tile_constants(
     acc_cols_per_stage = num_mma_m * epi_cols_per_mma_m
     na, nb = chain.num_a_operands, chain.num_b_operands
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
-    per_gemm = (total_tmem - sf_total_cols) // num_gemms
+    # Columns each instruction reads from its scale base -- ISA opUTCHMMA,
+    # "Load A/B scale factors" (sf{a,b}_tmem_cols).
+    if is_sm103:
+        # The resident K-tile means the scale pointer advances per k-block, so a
+        # read window can reach past the operand's own region.
+        sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
+        wide_vec = bs.block_size == 16
+        sfb_extra = 4 if cta_n <= 128 else 8
+        sfa_off = [scales_per_inst * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks)]
+        sfb_off = [scales_per_inst * j // 4 * 4 * mma_nb_n for j in range(num_kblocks)]
+        extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
+        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
+        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
+        sf_reserved_cols = max(
+            sf_total_cols,
+            (na - 1) * sfa_tmem_cols + max(off + cols for off, cols in sfa_spans),
+            na * sfa_tmem_cols + (nb - 1) * sfb_tmem_cols + max(off + cols for off, cols in sfb_spans),
+        )
+    else:
+        # Every SF word is re-utccp'd into the same columns and the scale base is fixed,
+        # so an instruction reads exactly its own operand's region.
+        sf_reserved_cols = sf_total_cols
+    per_gemm = (total_tmem - sf_reserved_cols) // num_gemms
     if per_gemm < acc_cols_per_stage:
         raise NotImplementedError(
             f"block-scale {cfg.name!r}: per-GEMM TMEM budget {per_gemm} < one acc "
@@ -1156,12 +1233,10 @@ def _render_block_scale_tile_constants(
         acc_stages = 2  # full per-GEMM double-buffer
     else:
         acc_stages = 1
-        # the overlap drain order assumes one contiguous M block per stage
-        if num_mma_m == 1:
-            gran = 32  # epilogue TMEM-load drain unit (cols)
-            ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
-            if ov < acc_cols_per_stage:  # else no room → plain 1-stage
-                acc_overlap_cols = ov
+        gran = _epi_n(cfg, cta_group, chain.output_dtype)  # epilogue TMEM-load drain unit (cols)
+        ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
+        if ov < acc_cols_per_stage:  # else no room -> plain 1-stage
+            acc_overlap_cols = ov
     use_acc_overlap = acc_overlap_cols > 0
     # within-GEMM per-stage stride + per-GEMM region size:
     acc_stage_stride = (acc_cols_per_stage - acc_overlap_cols) if use_acc_overlap else acc_cols_per_stage
@@ -1171,10 +1246,10 @@ def _render_block_scale_tile_constants(
         acc_gemm_stride = 2 * acc_cols_per_stage - acc_overlap_cols
     else:
         acc_gemm_stride = acc_cols_per_stage
-    acc_overlap_subtiles = acc_overlap_cols // 32
+    acc_overlap_subtiles = acc_overlap_cols // _epi_n(cfg, cta_group, chain.output_dtype)
     acc_region_cols = acc_cols_per_stage  # per-stage stride WITHIN a GEMM
 
-    sf_region_base = _align16(num_gemms * acc_gemm_stride)
+    sf_region_base = num_gemms * acc_gemm_stride
     # Per-distinct-operand SF word col bases (single-GEMM → length-1 lists).
     sfa_col_bases = [sf_region_base + i * sfa_tmem_cols for i in range(na)]
     sfb_col_bases = [sf_region_base + na * sfa_tmem_cols + j * sfb_tmem_cols for j in range(nb)]
@@ -1188,51 +1263,28 @@ def _render_block_scale_tile_constants(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
         )
 
-    mma_m = cfg.mma_inst_m * cta_group
-    half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
-    omma_k = mma_inst_k_elems if is_fp4 else 0
-    sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
-    sfb_extra = 4 if cta_n <= 128 else 8
-    sfa_off = [scales_per_inst * j // 4 * 4 * nb_m for j in range(num_kblocks)]
-    sfb_off = [scales_per_inst * j // 4 * 4 * nb_n for j in range(num_kblocks)]
-    if omma_k in (96, 128):
-        # 96 -> 3X (block 32) / 6X (block 16); 128 -> 4X (block 32) / 8X (block 16).
-        wide_vec = bs.block_size == 16  # the 6X / 8X arm
-        if omma_k == 128:  # extra-enhanced: the extra term is 8X-only
-            extra = [sfb_extra if wide_vec else 0] * num_kblocks
-        else:  # enhanced: 6X, or 3X with sfb_id >= 2
-            extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
-        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and omma_k == 96 and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
-        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
-    else:
-        sfa_spans = [(0, 2 if half_m else 4)]
-        sfb_spans = [(0, 2 * ((cta_n + 127) // 128) if half_m else 2 * ((cta_n + 63) // 64))]
-    for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
-        _end = max(b + off + cols for b in _bases for off, cols in _spans)
-        if _end > num_tmem_alloc_cols:
-            raise NotImplementedError(
-                f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
-                f"column {_end} but only {num_tmem_alloc_cols} are allocated"
-                + ("; an SFB overrun is NOT reported by the hardware, so this check is the only guard" if _label == "SFB" else "")
-            )
+    if is_sm103:
+        for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
+            _end = max(b + off + cols for b in _bases for off, cols in _spans)
+            if _end > num_tmem_alloc_cols:
+                raise NotImplementedError(
+                    f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
+                    f"column {_end} but only {num_tmem_alloc_cols} are allocated (the MMA "
+                    f"would fault OOR_ADDR)"
+                )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
-    # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 2 mbar.
-    per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes) + 2 * 8
     from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
 
-    fixed = 2 * acc_stages * 8 + 8
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
-    if use_tma_store_epi:
-        fixed += _smem_d_bytes(cfg, chain)
-    ab_stages = max(1, min((_sm_smem_ab_budget_bytes(cfg.pipeline) - fixed) // per_stage, _AB_STAGES_CAP))
+    ab_budget = _sm_smem_ab_budget_bytes(cfg.pipeline, moe=chain.has_moe) - (_smem_d_bytes(cfg, chain, cta_group) if use_tma_store_epi else 0)
     if is_sm103:
         # CUTLASS-style sm103 pipeline: an AB stage is ONE 128-B-K chunk (a
         # third of the 384-B K-tile), and SF rides its OWN ring (own warp,
         # own mbars) at 12-SF-per-row group granularity — 4 groups per K-tile
         # at VS16, 2 at VS32 (both 12 SFs/row). Data-only AB stages + a fixed
-        # SF ring replace the combined per-K-tile stage above.
+        # SF ring, instead of one combined per-K-tile stage.
         sf_stages = 6
         a_chunk_bytes = cta_m * 128
         b_chunk_bytes = (cta_n // cta_group) * 128
@@ -1240,13 +1292,17 @@ def _render_block_scale_tile_constants(
         # SFB is loaded FULL per CTA (the pair MMA reads each CTA's own TMEM
         # SFB across the whole pair-N range) — same convention as sm100.
         sfb_group_bytes = cta_n * 12
-        sf_ring_bytes = sf_stages * (na * sfa_group_bytes + nb * sfb_group_bytes + 2 * 8)
-        per_ab_stage = na * a_chunk_bytes + nb * b_chunk_bytes + 2 * 8
-        ab_stages = min((_sm_smem_ab_budget_bytes(cfg.pipeline) - fixed - sf_ring_bytes) // per_ab_stage, _AB_STAGES_CAP)
+        sf_ring_bytes = sf_stages * (na * sfa_group_bytes + nb * sfb_group_bytes)
+        per_ab_stage = na * a_chunk_bytes + nb * b_chunk_bytes
+        ab_stages = min((ab_budget - sf_ring_bytes) // per_ab_stage, _AB_STAGES_CAP)
         if ab_stages < 3:
             raise NotImplementedError(
                 f"block-scale {cfg.name!r}: only {ab_stages} 128-B AB chunk " f"stages fit in SMEM — the sm103 pipeline needs >= 3 (one " f"K-tile in flight)"
             )
+    else:
+        # One stage covers a whole K-tile: packed data + SF per DISTINCT operand.
+        per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes)
+        ab_stages = max(1, min(ab_budget // per_stage, _AB_STAGES_CAP))
 
     out_dt = chain.output_dtype
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)
@@ -1278,7 +1334,7 @@ def _render_block_scale_tile_constants(
         f"cgrp_tile_mnk = ({cta_m * cfg.cgrp_size_m}, {cta_n * cfg.cgrp_size_n}, {cta_k_elems})",
         f"cgrp_tile_m = {cta_m * cfg.cgrp_size_m}",
         f"cgrp_tile_n = {cta_n * cfg.cgrp_size_n}",
-        f"epi_tile_mn = {cfg.epi_tile_mn}",
+        f"epi_tile_mn = {(cfg.epi_tile_mn[0], _epi_n(cfg, cta_group, out_dt))}",
         f"threads_per_cta = 256",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
         f"matmul_a_batch = {chain.matmul.a_batch}",
@@ -1311,6 +1367,9 @@ def _render_block_scale_tile_constants(
         # plain load when the runtime pattern names a single peer.
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b(cta_group)}",
+        f"a_mcast_slices = {bs_a_mcast_slices}",
+        f"b_mcast_slices = {bs_b_mcast_slices}",
+        f"ab_empty_full_mask = {bs_ab_empty_full_mask}",
         "",
         f"# packed data SMEM",
         # ab_dtype is the width BOTH operands are sized by (sA/sB bytes, B's TMA
@@ -1357,6 +1416,7 @@ def _render_block_scale_tile_constants(
         f"cd_fake_n_div = {2 if out_dt == 'fp4_e2m1' else 1}",
         # M-major TMA-store C-descriptor inner-M box = 128 B swizzle span / elem_bytes.
         f"cd_mmajor_atom_m = {128 // DTYPE_BYTES[out_dt]}",
+        *_epi_swizzle_lines(cfg, cta_group, out_dt),
         "",
         f"# block-scale MMA",
         f"mma_block_scale_kind = nvvm.MMABlockScaleKind.{bs.mma_block_scale_kind}",
@@ -1382,6 +1442,7 @@ def _render_block_scale_tile_constants(
         f"num_blocks_n = {nb_n}",
         f"registers_per_block = {_REGISTERS_PER_BLOCK}",
         f"epi_cols_per_mma_m = {epi_cols_per_mma_m}",
+        f"mma_c_dtype = {DTYPE_TO_CUTLASS[chain.matmul.accum_dtype]}",
         # Byte step from one MMA M sub-block to the next inside the SMEM tile.
         # sm103 stages ONE 128-B K chunk per AB stage, not the whole K-tile, so
         # its per-M-row width is the chunk's, not cta_tile_k_bytes.
@@ -1423,8 +1484,8 @@ def _render_block_scale_tile_constants(
             f"mma_next_chunk_by_j = {tuple((kstep * j + kstep - 1) // 128 for j in range(num_kblocks))}",
             f"mma_phase16_by_j = {tuple((kstep * j) % 128 // 16 for j in range(num_kblocks))}",
             f"sf_id_by_j = {tuple(spi * j % 4 for j in range(num_kblocks))}",
-            f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_m for j in range(num_kblocks))}",
-            f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_n for j in range(num_kblocks))}",
+            f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks))}",
+            f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * mma_nb_n for j in range(num_kblocks))}",
         ]
     if is_sm107:
         # SM 10.7 block-scale MMA: K = 64 bytes per instruction (2x sm100), so
@@ -2650,12 +2711,45 @@ def _check_input_alignment(chain: FusionChain) -> None:
 _EPI_SMEM_STAGES = 2
 
 
-def _smem_d_bytes(cfg, chain) -> int:
-    """SMEM-D buffer bytes for the TMA-store epilogue: `_EPI_SMEM_STAGES` slots
-    of one epilogue subtile (`epi_tile_mn` = one MMA-M block × 32) + a 16-byte
-    alignment pad. With num_mma_m > 1 the M blocks reuse the same slots."""
-    elem_bytes = DTYPE_BYTES[chain.output_dtype]
-    return _EPI_SMEM_STAGES * cfg.epi_tile_mn[0] * cfg.epi_tile_mn[1] * elem_bytes + 16
+_EPI_SWIZZLE_BY_ROW_BYTES = {32: (1, "s32b"), 64: (2, "s64b"), 128: (3, "s128b")}
+_EPI_ROW_BYTES_MAX = 128  # widest TMA store swizzle
+_EPI_N_BASE = 32  # drain width when the epilogue is already hidden behind the MMA
+_EPI_N_MAX = 64  # per-lane fp32 registers the drain can hold
+
+
+def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
+    cols = _epi_tile_cols(cfg, cta_group)
+    cap = _EPI_N_BASE
+    if cfg.num_mma_m > 1 and 2 * cfg.num_mma_m * cols > _tmem_cols_for_arch():
+        cap = _EPI_N_MAX
+    n = min(_EPI_ROW_BYTES_MAX // DTYPE_BYTES[out_dt], cap, cols)
+    return 1 << (n.bit_length() - 1)
+
+
+def _epi_swizzle_lines(cfg, cta_group: int, out_dt: str) -> list[str]:
+    epi_n = _epi_n(cfg, cta_group, out_dt)
+    row_bytes = epi_n * DTYPE_BYTES[out_dt]
+    if row_bytes not in _EPI_SWIZZLE_BY_ROW_BYTES:
+        raise NotImplementedError(
+            f"{cfg.name!r}: epilogue subtile row is {row_bytes} bytes "
+            f"(epi_n={epi_n} x {DTYPE_BYTES[out_dt]}B {out_dt}); "
+            f"the TMA store swizzle only spans {sorted(_EPI_SWIZZLE_BY_ROW_BYTES)}"
+        )
+    b, tma = _EPI_SWIZZLE_BY_ROW_BYTES[row_bytes]
+    return [
+        f"epi_n = {epi_n}",
+        f"epi_smem_swizzle = cutlass.Swizzle({b}, 4, 3)",
+        f"epi_tma_swizzle = _tma.TensorMapSwizzle.{tma}",
+    ]
+
+
+def _smem_d_bytes(cfg, chain, cta_group: int) -> int:
+    """SMEM-D buffer bytes for the TMA-store epilogue: `_EPI_SMEM_STAGES` slots of
+    one epilogue subtile (one MMA-M block x epi_n) + a 16-byte alignment pad. With
+    num_mma_m > 1 the M blocks reuse the same slots. epi_n MUST be the same value
+    the kernel renders, or the reserve under-counts and the launch is rejected."""
+    out_dt = chain.output_dtype
+    return _EPI_SMEM_STAGES * cfg.epi_tile_mn[0] * _epi_n(cfg, cta_group, out_dt) * DTYPE_BYTES[out_dt] + 16
 
 
 def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
@@ -2666,7 +2760,7 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
       SMEM source aligned to the descriptor swizzle (else undeclarable).
     - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
       wired (an M=64 MMA block drains through the packed lane<16 layout).
-    - out dtype ∈ {bf16, fp16}: matches the hard-coded s64b 32-col swizzle.
+    - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
     - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
     """
     if chain.has_moe:
@@ -2698,10 +2792,11 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
         return False
     if chain.output_dtype not in ("bf16", "fp16"):
         return False
-    # Fixed 32-col subtile: an N-tile that is not a whole number of subtiles
-    # would TMA-store a 32-wide box past the tile edge into the neighbouring
-    # tile (TMA clamps only at the GLOBAL extent) — fall back to STG.
-    if cfg.cta_tile_n % 32 != 0:
+    # An N-tile that is not a whole number of subtiles would TMA-store an
+    # epi_n-wide box past the tile edge into the neighbouring tile (TMA clamps
+    # only at the GLOBAL extent) — fall back to STG. The N-major arm's span walk
+    # would halve to fit, but the M-major arm drains a fixed epi_n.
+    if _epi_tile_cols(cfg, cta_group) % _epi_n(cfg, cta_group, chain.output_dtype) != 0:
         return False
     # Under cta_group=2 each CTA holds cta_tile_n//2 cols, so cta_tile_n<64
     # (per-CTA n<32) would split a subtile across CTAs — unsupported by the

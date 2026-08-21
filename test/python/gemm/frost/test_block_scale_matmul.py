@@ -1293,10 +1293,9 @@ _CFG_128 = "CONFIG_sm103_128x128x384_128x128x48_cluster1x1"
 _CFG_256 = "CONFIG_sm103_128x256x384_128x256x48_cluster1x1"
 
 # The kernel compiles on any Blackwell-family GPU (the K=96 mode is an idesc
-# bit, not a mnemonic); it RUNS only on sm103.
 requires_sm103 = pytest.mark.skipif(
-    _SM != 103,
-    reason="sm103 block-scale kernels run only on an SM 103 GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not (103 <= _SM < 110),
+    reason="sm103 block-scale kernels run only on 103 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -1931,16 +1930,16 @@ def test_render_sm107_tile_constants(_pretend_sm107, combo, cta_n, omma, k_mode,
     assert got["idesc_a_dtype"] == idesc_dtype
 
 
-@pytest.mark.parametrize("pipeline,mma_k,runs_on_512", [("sm100", 32, True), ("sm107", 64, False)])
-def test_tmem_columns_follow_the_arch_not_the_pipeline(pipeline, mma_k, runs_on_512, monkeypatch):
+@pytest.mark.parametrize("pipeline,mma_k", [("sm100", 32), ("sm107", 64)])
+def test_tmem_columns_follow_the_arch_not_the_pipeline(pipeline, mma_k, monkeypatch):
     """TMEM size is a property of the GPU, so an sm100-pipeline kernel gets SM
     10.7's 576 columns just like an sm107 one — and past 512 the alloc has to
     ask for the exclusive mode. The extra columns are what lets a 256-wide N
     tile double-buffer its accumulator instead of overlapping the two.
 
-    Only the sm100 config is checked on a 512-column part: PIPELINE_ARCH_RANGES
-    confines sm107 kernels to 107..109, which always have 576, and this tile's
-    SFB span needs 520 of them."""
+    The 512-column arm is hypothetical for sm107 (PIPELINE_ARCH_RANGES confines
+    those kernels to 107..109, which always have 576), but both pipelines size
+    the SF region the same way, so both render the overlap fallback."""
     chain = analyze(_bs_chain())
     cfg = by_name(f"CONFIG_{pipeline}_128x256x128_128x256x{mma_k}_cluster1x1")
 
@@ -1954,10 +1953,6 @@ def test_tmem_columns_follow_the_arch_not_the_pipeline(pipeline, mma_k, runs_on_
     assert got["acc_stages"] == "2" and got["use_acc_overlap"] == "False"
 
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    if not runs_on_512:
-        with pytest.raises(NotImplementedError, match="TMEM span reaches column 520"):
-            render()
-        return
     got = render()
     assert got["num_tmem_alloc_cols"] == "512" and got["tmem_alloc_exclusive"] == "False"
     assert got["acc_stages"] == "1" and got["use_acc_overlap"] == "True"
