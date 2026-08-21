@@ -178,6 +178,10 @@ def _exp2_emulated_scalar(x):
     return value
 
 
+_E5_SINK = CFG.HAS_SINK and CFG.DTYPE_QKV == 1
+_E5_SINK_WIDE_OUTPUT = _E5_SINK and CFG.DTYPE_O >= 2
+
+
 # Storage dtype + MMA kind dispatch keyed off CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 0:
     STORAGE_DTYPE = cutlass.Float8E4M3FN
@@ -228,9 +232,6 @@ elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
-
-_E5_SINK = CFG.HAS_SINK and CFG.DTYPE_QKV == 1
-
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     Bars,
@@ -1400,6 +1401,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
+    is_first_real_kv,
     tmem_base,
     sStats_raw,
     bars,
@@ -1432,7 +1434,7 @@ def _softmax_kv_body(
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     NEG_INF = cutlass.Float32(-3.4028235e38)
-    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD * (1.4426950408889634 if _E5_SINK else 1.0))
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
@@ -1465,6 +1467,7 @@ def _softmax_kv_body(
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
+                mask_value=float("-inf") if _E5_SINK else -3.4028235e38,
                 window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
@@ -1507,6 +1510,8 @@ def _softmax_kv_body(
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
+    if cutlass.const_expr(_E5_SINK_WIDE_OUTPUT):
+        update_cond = update_cond | (is_first_real_kv & (current_max > total_max))
     total_max = cutlass.Float32(
         arith.select(
             update_cond.ir_value(),
@@ -1678,6 +1683,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1702,6 +1708,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1725,6 +1732,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1748,6 +1756,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,

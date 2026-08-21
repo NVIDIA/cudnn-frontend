@@ -93,10 +93,6 @@ class TemplateParams:
     # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
-    # Optional backend rescale-threshold override, converted to the log2 score
-    # domain used by the kernels. None preserves each flavor's tuned default.
-    # This participates in the frozen module-cache key by design.
-    rescale_threshold_log2: Optional[float] = None
     thd_varlen: bool = False
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
@@ -868,7 +864,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         CTA_MMA=params.cta_mma,
         V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
-        RESCALE_THRESHOLD=(params.rescale_threshold_log2 if params.rescale_threshold_log2 is not None else rescale_threshold(params.dtype_qkv)),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
