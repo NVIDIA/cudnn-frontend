@@ -271,6 +271,40 @@ def test_bsa_fp8_sm100_auto_split_uses_workspace_fallback(monkeypatch):
 
 
 @pytest.mark.L0
+def test_bsa_fp8_quantized_inputs_require_fully_contiguous_bhsd():
+    _require_sm100_fp8()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+
+    batch, heads, seqlen, head_dim = 1, 4, 64, 128
+
+    def make_padded_fp8():
+        storage = torch.empty((batch, heads, seqlen, head_dim + 1), device="cuda", dtype=torch.float8_e4m3fn)
+        return storage[..., :head_dim]
+
+    q = make_padded_fp8()
+    k = make_padded_fp8()
+    v = make_padded_fp8()
+    assert all(tensor.stride(-1) == 1 and not tensor.is_contiguous() for tensor in (q, k, v))
+
+    q_scale = torch.empty((batch, heads, seqlen), device="cuda", dtype=torch.float32)
+    k_scale = torch.empty((batch, heads, seqlen // 16), device="cuda", dtype=torch.float32)
+    v_scale = torch.empty((heads, head_dim), device="cuda", dtype=torch.float32)
+    q2k = torch.zeros((batch, heads, 1, 1), device="cuda", dtype=torch.int32)
+
+    with pytest.raises(AssertionError, match="fully contiguous BHSD"):
+        interface._bsa_fp8_blk64_fwd_quantized(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_scale,
+            q2k,
+            1,
+        )
+
+
+@pytest.mark.L0
 def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
     _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")

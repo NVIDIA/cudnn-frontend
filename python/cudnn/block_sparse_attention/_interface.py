@@ -1394,6 +1394,8 @@ def bsa_attn_fwd_blk64_cutedsl(
         block_sizes,
         q2k_block_nums,
     )
+    if is_sage_fp8:
+        assert q_bhsd.is_contiguous() and k_bhsd.is_contiguous() and v_bhsd.is_contiguous(), "Sage FP8 requires fully contiguous BHSD Q/K/V tensors"
     use_exact_kv_layout = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
 
     if softmax_scale is None:
