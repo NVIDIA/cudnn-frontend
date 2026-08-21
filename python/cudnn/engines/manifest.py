@@ -253,7 +253,12 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 
 
 def resolve_heuristics(family: EngineFamily):
-    """The family's plan-ranking callable, or None when it declares none."""
+    """The family's proposal callable, or None when it declares none.
+
+    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]`` — pure
+    and backend-blind; placement against the backend's entries happens once
+    for every family in ``engines/heuristics._assemble``.
+    """
     return _resolve(family, family.heuristics, "heuristics")
 
 

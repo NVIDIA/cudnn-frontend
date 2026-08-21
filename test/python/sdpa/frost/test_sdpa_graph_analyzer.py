@@ -562,9 +562,19 @@ def test_knob_request_within_domain_keeps_engine_eligible():
 
 
 def test_knob_request_outside_domain_rejects_engine():
-    # No engine advertises LPT scheduling yet: honored or ineligible, never degraded.
+    # A value no row's domain contains: honored or ineligible, never degraded.
     g = _mk_eligible_graph()
-    assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
+    # softmax_precision is a framework axis with no serving kernel yet: any
+    # explicit request declines everywhere.
+    assert not _eligible(g, engines.SdpaFwdKnobs(softmax_precision=1))
+
+
+def test_knob_request_lpt_sched_is_in_domain():
+    # The SM100 rows advertise all three scheduler policies (the static/CLC
+    # remap serves them); an explicit LPT request stays eligible.
+    g = _mk_eligible_graph()
+    assert engines.engine_name(512) in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
 
 
 def test_knob_request_unsupported_tile_rejects_engine():
@@ -974,7 +984,15 @@ def test_sm120_knob_domains(monkeypatch):
     g = _mk_sm120_graph(use_causal_mask=True)
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(cga=2))
-    assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    # All three scheduler policies are in the SM120 domain (static-grid
+    # remap); a value outside the vocabulary still declines.
+    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
+    # split_kv: the SM120 row serves {1, 2, 4} (inline chunking + the shared
+    # combine); a value outside the domain still declines.
+    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=1))
+    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=4))
+    assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
 
 
 # ---------------------------------------------------------------------------

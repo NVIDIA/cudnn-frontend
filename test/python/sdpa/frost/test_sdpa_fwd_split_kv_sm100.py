@@ -821,3 +821,178 @@ def test_split_kv_padded_q_trim(flavor, splits):
     assert got[dead.expand_as(got)].abs().max().item() == 0.0, "trimmed Q rows are not zero"
     live = ~dead
     assert (got - ref)[live.expand_as(got)].abs().max().item() <= 2e-2
+
+
+# --- the adapter honors the heuristic's split knob ---------------------------
+
+
+def _expected_split(b, h_q, s_q, s_kv, *, rows_per_tile=512, ctas_per_tile=2, kv_tile=128):
+    """What the chooser asks for on THIS device, so the tests assert the knob
+    route delivers it rather than hard-coding a split that only holds at one
+    SM count."""
+    from cudnn._device import device_info
+    from cudnn.sdpa.fwd.heuristics import choose_split_kv
+
+    return choose_split_kv(
+        q_tiles=-(-s_q // rows_per_tile),
+        heads_q=h_q,
+        batch=b,
+        kv_tiles=-(-s_kv // kv_tile),
+        sm_count=device_info(torch.cuda.current_device()).sm_count,
+        ctas_per_tile=ctas_per_tile,
+    )
+
+
+def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True):
+    """Drive SdpaFwdDslSm100 the way the graph path does — the chooser's value
+    arrives as the explicit ``split_kv`` constructor knob, exactly as
+    ``lower_dsl_prefill`` forwards a plan's knobs; return (split, O, ref)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("half-precision SM100 prefill requires cc10.0 / cc10.3")
+    d = 128
+    dev = "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(b, h_q, s_q, d, device=dev, dtype=torch.float16)  # BHSD samples
+    k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
+    v = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
+    o = torch.zeros_like(q)
+    lse = torch.zeros(b, h_q, s_q, device=dev, dtype=torch.float32) if with_lse else None
+
+    split_knob = _expected_split(b, h_q, s_q, s_kv)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, split_kv=split_knob)
+    assert api.check_support()
+    split = api.split_kv
+    assert split == split_knob, "the knob is honored verbatim, never re-derived"
+    ws_bytes = api.scratch_workspace_bytes()
+    api.compile()
+    ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if (workspace and ws_bytes) else None
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=ws)
+    torch.cuda.synchronize()
+
+    qb, kb, vb = q.float(), k.float(), v.float()
+    if h_q != h_kv:
+        kb = kb.repeat_interleave(h_q // h_kv, dim=1)
+        vb = vb.repeat_interleave(h_q // h_kv, dim=1)
+    p = torch.softmax(torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d), dim=-1)
+    return split, o.float(), torch.matmul(p, vb), ws_bytes
+
+
+@pytest.mark.L0
+def test_api_splits_a_decode_shape_and_is_correct():
+    """8 heads over a long KV run cannot fill the part: the chooser wants a
+    split, the knob delivers it, the adapter sizes its own workspace and still
+    matches fp32. S_kv is the smallest that still splits -- the fp32 reference
+    is O(h * s_q * s_kv) and this is L0."""
+    split, got, ref, ws_bytes = _api_case(1, 8, 1, 512, 16384)
+    assert split == _expected_split(1, 8, 512, 16384) > 1
+    assert ws_bytes > 0, "a split needs the split-major O/LSE partials in workspace"
+    assert (got - ref).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+def test_api_does_not_split_a_full_chip():
+    """A launch that fills the machine is left alone. The expectation comes from
+    the chooser on THIS device: whether 2048x16 fills it depends on the SM count,
+    so hard-coding split==1 would fail on a smaller SM100 part for a device
+    reason rather than a policy one."""
+    want = _expected_split(1, 16, 2048, 8192)
+    split, got, ref, ws_bytes = _api_case(1, 16, 16, 2048, 8192)
+    assert split == want
+    assert (ws_bytes > 0) == (split > 1), "workspace is needed exactly when we split"
+    assert (got - ref).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
+def test_api_split_with_and_without_workspace(workspace):
+    """With a workspace the partials are carved from it; without one they are
+    torch-allocated (standalone use). Same answer either way."""
+    split, got, ref, _ = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
+    assert split > 1
+    assert (got - ref).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+def test_api_split_writes_the_recombined_lse():
+    """A Stats output under a split comes from the combine, not from any one
+    chunk: the per-chunk LSE is compiled in even when the caller wants none."""
+    split, got, ref, _ = _api_case(1, 8, 1, 512, 16384, with_lse=True)
+    assert split > 1
+    assert (got - ref).abs().max().item() <= 2e-2
+
+
+# --- the adapter splits the FP8 family too ----------------------------------
+
+
+def _api_fp8_case(h_q, h_kv, s_q, s_kv, *, mx):
+    """FP8 / MXFP8 through the adapter; returns (split, O, O_unsplit, amax)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _cc = torch.cuda.get_device_capability()
+    if _cc not in ((10, 0), (10, 3)) and not (_cc == (10, 7) and not mx):
+        pytest.skip("MXFP8 requires cc10.0 / cc10.3; per-tensor FP8 also runs on cc10.7")
+    b, d, dev = 1, 128, "cuda"
+
+    def build(force_one):
+        torch.manual_seed(0)
+        if mx:
+            from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+            def qz(shape):
+                r = torch.randn(*shape, device=dev) * 0.5
+                a, _adq, aswz, *_ = quantize_to_mxfp8(r, shape[0], shape[1], shape[2], shape[3])
+                return a.reshape(*shape), aswz
+
+            q, sf_q = qz((b, h_q, s_q, d))
+            k, sf_k = qz((b, h_kv, s_kv, d))
+            v, sf_v = qz((b, h_kv, s_kv, d))
+            extra = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
+            kw = {}
+        else:
+            mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
+            q, k, v = mk(b, h_q, s_q, d), mk(b, h_kv, s_kv, d), mk(b, h_kv, s_kv, d)
+            one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
+            extra = dict(descale_q=one(), descale_k=one(), descale_v=one(), scale_o=one())
+            kw = dict(pertensor_fp8=True)
+
+        o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=torch.float16)  # HALF out
+        amax = torch.zeros(1, dtype=torch.float32, device=dev)
+        split_knob = 1 if force_one else _expected_split(b, h_q, s_q, s_kv)
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=torch.float16, split_kv=split_knob, **kw)
+        assert api.check_support()
+        split = api.split_kv
+        ws_bytes = api.scratch_workspace_bytes()
+        api.compile()
+        ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if ws_bytes else None
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, amax_o=amax, workspace=ws, **extra)
+        torch.cuda.synchronize()
+        return split, o.float().clone(), amax.item()
+
+    _, o_one, _ = build(True)
+    split, o_split, amax = build(False)
+    return split, o_split, o_one, amax
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mx", [False, True], ids=["fp8", "mxfp8"])
+def test_api_splits_the_fp8_family(mx):
+    """A decode-shaped FP8 graph with a half output splits, and the split is
+    numerically neutral against the same graph forced to split_kv=1."""
+    split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=mx)
+    assert split > 1
+    assert (got - unsplit).abs().max().item() <= 5e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mx", [False, True], ids=["fp8", "mxfp8"])
+def test_api_fp8_amax_describes_the_recombined_output(mx):
+    """The per-split epilogues stand down under a split; amax_o has to come
+    from the combine, over the RECOMBINED O. Maxing the partials instead
+    over-reports, so compare against the output the caller receives."""
+    split, got, _unsplit, amax = _api_fp8_case(8, 1, 512, 16384, mx=mx)
+    assert split > 1
+    true_amax = got.abs().max().item()
+    assert amax >= true_amax * 0.99, f"amax {amax} under-reports |O| {true_amax}"
+    assert amax <= true_amax * 1.01, f"amax {amax} over-reports |O| {true_amax} — taken over partials?"

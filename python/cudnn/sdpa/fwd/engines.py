@@ -33,7 +33,7 @@ from typing import Any, Callable, Optional
 
 import cudnn
 
-from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
@@ -87,6 +87,14 @@ class SdpaFwdKnobs:
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
     cga: Optional[int] = None  # cluster size (CTAs cooperating per tile)
+    # KV-split count: each Q tile's KV range cut into this many chunks, each
+    # run by its own CTA, recombined by the split_combine pass. 1 = off.
+    split_kv: Optional[int] = None
+    # Softmax accumulation precision as a cudnn.data_type value. Framework
+    # axis: no forward kernel declares a domain yet, so any explicit request
+    # declines; the first kernel that grows an f16-softmax arm lights it up
+    # by declaring {FLOAT, HALF} on its row.
+    softmax_precision: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +229,12 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    # Split-KV domain. {1} = the axis exists but only "off" is served; rows
+    # whose kernels wire the split path AND whose adapter launches the combine
+    # widen this (the SM100 f16 rows today).
+    split_kvs: frozenset[int] = frozenset({1})
+    # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
+    softmax_precisions: frozenset[int] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -260,9 +274,29 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.split_kv, capabilities.split_kvs, "split_kv"),
+            (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
+        if knobs.split_kv is not None and knobs.split_kv > 1:
+            # Facts x knobs: the split path is structurally dense-only (the
+            # per-split LSE is the combine weight; the THD/sink/padded paths
+            # do not produce per-split partials). Declined HERE so a split
+            # request never reaches a kernel that cannot honor it.
+            if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
+                return "split_kv > 1 serves dense, unpadded, sink-free graphs only"
+            if capabilities.skv_tail_via_padding and facts.s_kv % (capabilities.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
+                # The lowering would serve this ragged S_kv through the padded
+                # kernel path (synthesized per-batch KV lengths) — the same
+                # path the split cannot ride. Mirror lower_dsl_prefill's
+                # synth_kv_padding predicate so the plan is never listed.
+                return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
+            if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+                # The combine reduces partials in half precision; reducing
+                # QUANTIZED partials would lose what the split must be
+                # numerically neutral about.
+                return "split_kv > 1 on a quantized graph requires a bf16/fp16 O"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -443,10 +477,14 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
             # scale-factor paths are validated against relaxed layouts.
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # All four f16 flavor kernels wire SplitHelpers, and the adapter
+            # carves the partial slabs + launches split_combine_sm100 when
+            # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
+            split_kvs=frozenset({1, 2, 4}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -487,10 +525,13 @@ def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             lse_optional=True,
             thd=thd,
             cu_seq_len=thd,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # Only the d128 mxfp8 kernel wires SplitHelpers; the split path
+            # also needs a half-precision O (mismatch's facts x knobs gate).
+            split_kvs=frozenset({1, 2, 4}) if d == 128 else frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -554,10 +595,15 @@ def _sm100_fp8_spec(
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # Only the d128 fp8 kernel wires SplitHelpers (the d192x128 file
+            # forks its own scheduler and has no split path). Split partials
+            # reduce in half precision, so mismatch()'s facts x knobs gate
+            # additionally requires a bf16/fp16 O on the quantized rows.
+            split_kvs=frozenset({1, 2, 4}) if d == 128 else frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -599,7 +645,10 @@ def _sm80_spec() -> EngineSpec:
             lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
-            sched_policies=frozenset(),
+            # The static-grid remap serves all three policies (the template's
+            # sched_policy field); the adapter maps the explicit int to its
+            # kernel token and derives only when the knob is None.
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
@@ -637,7 +686,12 @@ def _sm120_spec() -> EngineSpec:
             skv_tile=0,
             cu_seq_len=True,
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking + the shared split_combine pass
+            # (the combine is one block per row — arch-agnostic). The config
+            # backstop bars a split under the LPT remaps, so the heuristic's
+            # split sets ride SCHED_NATURAL.
+            split_kvs=frozenset({1, 2, 4}),
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
@@ -735,6 +789,8 @@ def lower_dsl_prefill(
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
         cga=knobs.cga if knobs is not None else None,
+        split_kv=knobs.split_kv if knobs is not None else None,
+        softmax_precision=knobs.softmax_precision if knobs is not None else None,
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
         # specializations of that template): forwarded only to adapters whose
         # constructor declares them — every other row's mismatch gated the
@@ -1000,7 +1056,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             # by the shared adapter (one gather copy in, one scatter copy
             # back for O; zero-copy when already BSHD-physical).
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
