@@ -855,15 +855,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.causal_bottom_right and not self.is_causal,
             "SM100 DSL SDPA: causal_bottom_right requires is_causal=True",
         )
-        # Backstop for the engines.bottom_right_padded_seq_q gate: with dense
-        # per-batch Q lengths the kernel's BR diagonal (anchored at the global
-        # S_q) is wrong for any batch with seq_len_q[b] < S_q.
-        self._value_error_if(
-            self.causal_bottom_right and self.seq_q_lens_present,
-            "SM100 DSL SDPA: causal_bottom_right with per-batch seq_len_q is not "
-            "supported (kernel anchors the BR diagonal at the global S_q, not "
-            "seq_len_q[b])",
-        )
         if self.thd:
             self.seq_kv_lens_present = True
         self._not_implemented_error_if(
@@ -891,18 +882,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.seq_q_lens_present and self._fp8,
             "seq_q_lens_present (dense padded-Q LSE trim) is not plumbed for the FP8/MXFP8 kernels",
-        )
-        # Dense BR + per-batch Q lengths: the kernels anchor the bottom-right
-        # diagonal with the GLOBAL S_q (compute_kv_loop_bounds: causal_diag =
-        # seq_kv_len - seqlen_q with the scalar S_q), but cuDNN semantics
-        # anchor it at the per-batch (seq_len_q[b], seq_len_kv[b]) corner —
-        # batches with seq_len_q[b] < S_q get over-masked. KV-only padding is
-        # exact (actual Q length == S_q), so only this combination is gated.
-        self._value_error_if(
-            self.causal_bottom_right and self.seq_q_lens_present,
-            "SM100 DSL SDPA: causal_bottom_right with per-batch seq_len_q (dense "
-            "padded-Q trim) is not supported — the kernel anchors the BR diagonal "
-            "at the global S_q, not seq_len_q[b]/seq_len_kv[b]",
         )
         # KV-tail correctness: the kernel zero-fills the last KV tile via TMA
         # OOB but only *masks* those columns on the padded / causal paths. A

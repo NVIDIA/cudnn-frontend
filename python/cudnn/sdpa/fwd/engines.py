@@ -142,13 +142,6 @@ class Capabilities:
 
     causal: bool = False
     bottom_right: bool = False
-    # Kernel gap (pre-existing): for a DENSE padded graph the BR diagonal is
-    # computed as seq_len_kv[b] - GLOBAL S_q, but cuDNN semantics for a dense
-    # padded graph carrying per-batch seq_len_q anchor it at
-    # (seq_len_q[b], seq_len_kv[b]) — any batch with seq_len_q[b] < S_q gets a
-    # wrongly shifted diagonal (extra zeroed rows at the top). KV-only padding
-    # (no seq_len_q tensor) is unaffected: there the actual Q length IS S_q.
-    bottom_right_padded_seq_q: bool = False
     swa: bool = False
     padded: bool = False
     sink: bool = False
@@ -375,11 +368,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
-        if facts.padded and not facts.thd and facts.seq_q_t is not None and not capabilities.bottom_right_padded_seq_q:
-            return (
-                "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
-                "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
-            )
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
@@ -577,7 +565,6 @@ def _sm80_spec() -> EngineSpec:
             right_band_widening=True,
             causal=True,
             bottom_right=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
             padded=True,
             sink=True,
@@ -612,7 +599,6 @@ def _sm120_spec() -> EngineSpec:
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
             right_band_widening=True,
             padded=True,
@@ -966,7 +952,6 @@ def _sm120_fp8_spec() -> EngineSpec:
             is_fp8=True,
             causal=True,
             bottom_right=True,
-            bottom_right_padded_seq_q=True,
             swa=True,
             right_band_widening=True,
             padded=True,

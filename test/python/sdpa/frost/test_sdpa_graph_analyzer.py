@@ -276,9 +276,11 @@ def test_probe_rejects_non_int32_seq_len():
     assert not _eligible(g)
 
 
-def test_probe_rejects_bottom_right_with_padded_seq_len_q():
-    # Kernel gap (pre-existing): the BR diagonal is anchored at the global S_q,
-    # so dense padding with per-batch seq_len_q would shift it wrongly.
+def test_probe_accepts_bottom_right_with_padded_seq_len_q():
+    # The kernels anchor the BR diagonal at the per-batch
+    # (seq_len_q[b], seq_len_kv[b]) corner, so dense padding with per-batch
+    # seq_len_q is served (it used to be gated while the diagonal was anchored
+    # at the global S_q).
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
@@ -296,7 +298,7 @@ def test_probe_rejects_bottom_right_with_padded_seq_len_q():
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert not _eligible(g)
+    assert engines.engine_name(512) in _eligible(g)
 
 
 def test_probe_rejects_seq_len_q_without_padding_mask():
