@@ -105,7 +105,6 @@ from .moe_kernel_helpers import (
     can_implement,
 )
 
-
 # Valid launch-config space for THIS kernel (the wrapper's autotune candidates;
 # can_implement still prunes per problem). cta shape == mma_tiler_mn; Rubin
 # extends the set with the (512, 256) B-reuse tile.
@@ -170,8 +169,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         if use_2cta_instrs and mma_tiler_mn[0] == 512:
             from .moe_kernel_helpers import (
                 is_valid_dtypes_and_scale_factor_vec_size,
-                is_valid_layouts, is_valid_tensor_alignment,
+                is_valid_layouts,
+                is_valid_tensor_alignment,
             )
+
             if not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, acc_dtype, d_dtype):
                 return False
             if not is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major):
@@ -228,7 +229,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # B-reuse: mma tiler M = 2x the MMA instruction M (2CTA M-split, B held
         # in the tcgen05 collector buffer across the two A halves).
         mma_inst_m = 256 if use_2cta_instrs else 128
-        enable_breuse = (mma_tiler_mn[0] // mma_inst_m == 2)
+        enable_breuse = mma_tiler_mn[0] // mma_inst_m == 2
         if enable_breuse:
             if mma_tiler_mn[0] % self.FIX_PAD_SIZE != 0:
                 raise ValueError(
@@ -360,11 +361,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # K dim of the MMA instruction shape on Rubin sm107:
         #  - SM107MmaMXF4NVF4Op (FP4 x FP4) requires K=128
         #  - SM107BlockScaledMmaMXF8F6F4Op (FP8 or mixed) requires K=64
-        mma_inst_k = (
-            128
-            if (self.a_dtype.width == 4 and self.b_dtype.width == 4)
-            else 64
-        )
+        mma_inst_k = 128 if (self.a_dtype.width == 4 and self.b_dtype.width == 4) else 64
         mma_inst_shape_mnk = (*self.mma_inst_shape_mn, mma_inst_k)
         mma_inst_shape_mnk_sfb = (*self.mma_inst_shape_mn_sfb, mma_inst_k)
 
@@ -542,9 +539,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # second acc stage and is incompatible with the split accumulator.
         if self.enable_breuse:
             self.num_acc_stage = 1
-        self.overlapping_accum = (
-            self.num_acc_stage == 1 and self.mma_tiler[1] == 256 and not self.enable_breuse
-        )
+        self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256 and not self.enable_breuse
 
         sf_atom_mn = 32
         sf_pack_factor = 32 // self.sf_vec_size
@@ -776,17 +771,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # after num_tile_stage tiles).
         self.run_rht = self.generate_rht or self.d_quant
         if cutlass.const_expr(not self.run_rht):
-            self.threads_wo_sched = (
-                self.threads_per_cta
-                - self.threads_per_warp
-                - self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-            )
+            self.threads_wo_sched = self.threads_per_cta - self.threads_per_warp - self.threads_per_warp * len(self.epilog_rht_store_warp_id)
         if cutlass.const_expr(self.d_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
             raise ValueError(f"d dtype must be BFloat16 or Float4E2M1FN, got {self.d_dtype}")
         if cutlass.const_expr(self.d_quant != self.generate_sfd):
             raise ValueError("NVFP4 d and sfd must be passed together")
-        if cutlass.const_expr(self.generate_rht
-                              and self.rht_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
+        if cutlass.const_expr(self.generate_rht and self.rht_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
             raise ValueError(f"rht dtype must be BFloat16 or Float4E2M1FN, got {self.rht_dtype}")
         if cutlass.const_expr(self.rht_quant != self.generate_sfrht):
             raise ValueError("NVFP4 rht and sfrht must be passed together")
@@ -836,11 +826,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.num_d_stage,
         )
 
-        mma_inst_k = (
-            128
-            if (self.a_dtype.width == 4 and self.b_dtype.width == 4)
-            else 64
-        )
+        mma_inst_k = 128 if (self.a_dtype.width == 4 and self.b_dtype.width == 4) else 64
         mma_inst_shape_mnk = (*self.mma_inst_shape_mn, mma_inst_k)
         permutation_mnk = self._get_mma_permutation_mnk(mma_inst_shape_mnk)
         tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
@@ -873,10 +859,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         tiled_mma_breuse = None
         if cutlass.const_expr(self.enable_breuse):
             tiled_mma_bkeep = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype, self.b_dtype,
-                self.a_major_mode, self.b_major_mode,
-                self.sf_dtype, self.sf_vec_size,
-                self.cta_group, mma_inst_shape_mnk,
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                self.cta_group,
+                mma_inst_shape_mnk,
                 a_collector_op=CollectorOp.DISCARD,
                 b_collector_op=CollectorOp.FILL,
                 atom_layout_mnk=(1, 1, 1),
@@ -885,10 +875,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             tiled_mma_bkeep.set(tcgen05.Field.NEGATE_A, False)
             tiled_mma_bkeep.set(tcgen05.Field.NEGATE_B, False)
             tiled_mma_breuse = sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype, self.b_dtype,
-                self.a_major_mode, self.b_major_mode,
-                self.sf_dtype, self.sf_vec_size,
-                self.cta_group, mma_inst_shape_mnk,
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                self.cta_group,
+                mma_inst_shape_mnk,
                 a_collector_op=CollectorOp.DISCARD,
                 b_collector_op=CollectorOp.LASTUSE,
                 atom_layout_mnk=(1, 1, 1),
@@ -1083,8 +1077,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sSfd: cute.struct.Align[
                     cute.struct.MemRange[
                         self.sf_dtype,
-                        self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-                        * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
+                        self.threads_per_warp * len(self.epilog_rht_store_warp_id) * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
                     ],
                     16,
                 ]
@@ -1101,8 +1094,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sSfRht: cute.struct.Align[
                     cute.struct.MemRange[
                         self.sf_dtype,
-                        self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-                        * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
+                        self.threads_per_warp * len(self.epilog_rht_store_warp_id) * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
                     ],
                     16,
                 ]
@@ -1217,19 +1209,13 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         def _append_mn_broadcast_mode(smem_layout: cute.Layout):
             mn_dim = cute.get(smem_layout, mode=[0, 0])
             mn_dim = cute.append(mn_dim, cute.make_layout((4), stride=(0)))
-            layout = cute.append(
-                cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1])
-            )
-            layout = cute.append(
-                cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1])
-            )
+            layout = cute.append(cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1]))
+            layout = cute.append(cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1]))
             layout = cute.append(layout, cute.get(smem_layout, mode=[2]))
             layout = cute.append(layout, cute.get(smem_layout, mode=[3]))
             return layout
 
-        tCsSF_compact_bcast = cute.make_tensor(
-            tCsSF_compact.iterator, _append_mn_broadcast_mode(tCsSF_compact.layout)
-        )
+        tCsSF_compact_bcast = cute.make_tensor(tCsSF_compact.iterator, _append_mn_broadcast_mode(tCsSF_compact.layout))
         tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact_bcast)
         tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
         tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
@@ -2086,11 +2072,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state_next)
 
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            if cutlass.const_expr(
-                                self.enable_breuse
-                                and cute.size(tCtAcc.layout, mode=[1]) == 2
-                                and cute.size(tCtAcc.layout, mode=[2]) == 1
-                            ):
+                            if cutlass.const_expr(self.enable_breuse and cute.size(tCtAcc.layout, mode=[1]) == 2 and cute.size(tCtAcc.layout, mode=[2]) == 1):
                                 tCtAcc_bkeep = tCtAcc[(None, 0, 0)]
                                 tCtAcc_breuse = tCtAcc[(None, 1, 0)]
                                 a_kblk_crd_keep = (None, 0, kblock_idx, ab_consumer_state.index)
@@ -2101,14 +2083,22 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 sfb_kblk_crd = (None, 0, kblock_idx)
                                 # Bkeep: accumulate A_upper x B (keeps B in reuse buffer)
                                 tiled_mma_bkeep.set(tcgen05.Field.ACCUMULATE, k_tile != 0 or kblock_idx != 0)
-                                cute.gemm(tiled_mma_bkeep, tCtAcc_bkeep,
+                                cute.gemm(
+                                    tiled_mma_bkeep,
+                                    tCtAcc_bkeep,
                                     [tCrA[a_kblk_crd_keep], tCtSFA[sfa_kblk_crd_keep]],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]], tCtAcc_bkeep)
+                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    tCtAcc_bkeep,
+                                )
                                 # Breuse: accumulate A_lower x B (reuses B)
                                 tiled_mma_breuse.set(tcgen05.Field.ACCUMULATE, k_tile != 0 or kblock_idx != 0)
-                                cute.gemm(tiled_mma_breuse, tCtAcc_breuse,
+                                cute.gemm(
+                                    tiled_mma_breuse,
+                                    tCtAcc_breuse,
                                     [tCrA[a_kblk_crd_reuse], tCtSFA[sfa_kblk_crd_reuse]],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]], tCtAcc_breuse)
+                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    tCtAcc_breuse,
+                                )
                             else:
                                 kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
                                 sf_kblock_coord = (None, None, kblock_idx)
@@ -2245,9 +2235,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     tTR_tAcc_base_br,
                     _tTR_rAcc_gate_br,
                     _tTR_rAcc_up_br,
-                ) = self.epilog_tmem_copy_and_partition(
-                    epi_tidx, tCtAcc_base, tCgD_shape, epi_tile, use_2cta_instrs, m_half=1
-                )
+                ) = self.epilog_tmem_copy_and_partition(epi_tidx, tCtAcc_base, tCgD_shape, epi_tile, use_2cta_instrs, m_half=1)
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc_gate.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(tiled_copy_t2r, tTR_rC, epi_tidx, sC)
@@ -2352,10 +2340,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     gC_epi_bk = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], self.epi_tile_c)
                     gC_epi_br = cute.flat_divide(tCgC[((None, None), 1, 0, None, None, None)], self.epi_tile_c)
                     sC_for_tma = cute.group_modes(sC, 0, 2)
-                    bSG_sC, bSG_gC_partitioned_bk = cpasync.tma_partition(
-                        tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_bk, 0, 2))
-                    _, bSG_gC_partitioned_br = cpasync.tma_partition(
-                        tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_br, 0, 2))
+                    bSG_sC, bSG_gC_partitioned_bk = cpasync.tma_partition(tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_bk, 0, 2))
+                    _, bSG_gC_partitioned_br = cpasync.tma_partition(tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_br, 0, 2))
                 else:
                     _, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, self.epi_tile_c, sC)
 
@@ -2371,10 +2357,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         gD_epi_bk = cute.flat_divide(tCgD[((None, None), 0, 0, None, None, None)], epi_tile)
                         gD_epi_br = cute.flat_divide(tCgD[((None, None), 1, 0, None, None, None)], epi_tile)
                         sD_for_tma = cute.group_modes(sD, 0, 2)
-                        bSG_sD, bSG_gD_partitioned_bk = cpasync.tma_partition(
-                            tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_bk, 0, 2))
-                        _, bSG_gD_partitioned_br = cpasync.tma_partition(
-                            tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_br, 0, 2))
+                        bSG_sD, bSG_gD_partitioned_bk = cpasync.tma_partition(tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_bk, 0, 2))
+                        _, bSG_gD_partitioned_br = cpasync.tma_partition(tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_br, 0, 2))
                     else:
                         _, bSG_sD, bSG_gD_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgD, epi_tile, sD)
 
@@ -2446,128 +2430,118 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     _bSG_gD_h = bSG_gD
 
                 for _m_half in _breuse_halves:
-                  if self.enable_breuse:
-                    _tTR_tAcc_base_h = tTR_tAcc_base if _m_half == 0 else tTR_tAcc_base_br
-                    _mProb_h = mProb_bk if _m_half == 0 else mProb_br
-                    _bSG_gC_h = bSG_gC_bk if _m_half == 0 else bSG_gC_br
-                    if cutlass.const_expr(not self.d_quant):
-                        _bSG_gD_h = bSG_gD_bk if _m_half == 0 else bSG_gD_br
-                  else:
-                    _tTR_tAcc_base_h = tTR_tAcc_base
-                    _mProb_h = mProb
-                    _bSG_gC_h = bSG_gC
-                    if cutlass.const_expr(not self.d_quant):
-                        _bSG_gD_h = bSG_gD
-
-                  # Set tensor memory buffer for current tile
-                  # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE)
-                  tTR_tAcc = _tTR_tAcc_base_h[(None, None, None, None, None, acc_stage_index)]
-                  tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-
-                  #
-                  # Store accumulator to global memory in subtiles
-                  #
-                  subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                  subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
-                  for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
-                    real_subtile_idx = subtile_idx if cutlass.const_expr(self.act_func == "srelu") else subtile_idx // 2
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if reverse_subtile:
-                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
-
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
-                    if cutlass.const_expr(self.act_func == "srelu"):
-                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                    if self.enable_breuse:
+                        _tTR_tAcc_base_h = tTR_tAcc_base if _m_half == 0 else tTR_tAcc_base_br
+                        _mProb_h = mProb_bk if _m_half == 0 else mProb_br
+                        _bSG_gC_h = bSG_gC_bk if _m_half == 0 else bSG_gC_br
+                        if cutlass.const_expr(not self.d_quant):
+                            _bSG_gD_h = bSG_gD_bk if _m_half == 0 else bSG_gD_br
                     else:
-                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
-                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
+                        _tTR_tAcc_base_h = tTR_tAcc_base
+                        _mProb_h = mProb
+                        _bSG_gC_h = bSG_gC
+                        if cutlass.const_expr(not self.d_quant):
+                            _bSG_gD_h = bSG_gD
 
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
-                    if cutlass.const_expr(self.act_func != "srelu"):
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
-
-                    #
-                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
-                    #
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
-                            cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
-                            acc_consumer_state.advance()
+                    # Set tensor memory buffer for current tile
+                    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE)
+                    tTR_tAcc = _tTR_tAcc_base_h[(None, None, None, None, None, acc_stage_index)]
+                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
                     #
-                    # Apply alpha (+ bias when enabled)
+                    # Store accumulator to global memory in subtiles
                     #
-                    if cutlass.const_expr(self.enable_bias):
+                    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                    subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                    for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
+                        real_subtile_idx = subtile_idx if cutlass.const_expr(self.act_func == "srelu") else subtile_idx // 2
+                        if cutlass.const_expr(self.overlapping_accum):
+                            if reverse_subtile:
+                                real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
+
+                        #
+                        # Load accumulator from tensor memory buffer to register
+                        #
                         if cutlass.const_expr(self.act_func == "srelu"):
-                            sBias_sub = sBias_subtiles[(None, real_subtile_idx)]
-                            cute.copy(bias_s2r_atom, sBias_sub, tTR_rBias_gate)
+                            tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx)]
                         else:
-                            sBias_pair = sBias_subtiles[(None, real_subtile_idx)]
-                            sBias_sub = cute.flat_divide(sBias_pair, cute.make_layout(self.epi_tile[1]))
-                            cute.copy(bias_s2r_atom, sBias_sub[(None, 0)], tTR_rBias_gate)
-                        bias_vec_gate = tTR_rBias_gate.load()
+                            tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                            tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
+
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
                         if cutlass.const_expr(self.act_func != "srelu"):
-                            cute.copy(bias_s2r_atom, sBias_sub[(None, 1)], tTR_rBias_up)
-                            bias_vec_up = tTR_rBias_up.load()
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
 
-                        if cutlass.const_expr(self.vectorized_f32):
-                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
-                                bias_gate_f32_0 = bias_vec_gate[i].to(cutlass.Float32)
-                                bias_gate_f32_1 = bias_vec_gate[i + 1].to(cutlass.Float32)
-                                tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.fma_packed_f32x2(
-                                    (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
-                                    (bias_gate_f32_0, bias_gate_f32_1),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
-                                if cutlass.const_expr(self.act_func != "srelu"):
-                                    bias_up_f32_0 = bias_vec_up[i].to(cutlass.Float32)
-                                    bias_up_f32_1 = bias_vec_up[i + 1].to(cutlass.Float32)
-                                    tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.fma_packed_f32x2(
-                                        (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                        #
+                        # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
+                        #
+                        if cutlass.const_expr(self.overlapping_accum):
+                            if subtile_idx == self.iter_acc_early_release_in_epilogue:
+                                cute.arch.fence_view_async_tmem_load()
+                                with cute.arch.elect_one():
+                                    acc_pipeline.consumer_release(acc_consumer_state)
+                                acc_consumer_state.advance()
+
+                        #
+                        # Apply alpha (+ bias when enabled)
+                        #
+                        if cutlass.const_expr(self.enable_bias):
+                            if cutlass.const_expr(self.act_func == "srelu"):
+                                sBias_sub = sBias_subtiles[(None, real_subtile_idx)]
+                                cute.copy(bias_s2r_atom, sBias_sub, tTR_rBias_gate)
+                            else:
+                                sBias_pair = sBias_subtiles[(None, real_subtile_idx)]
+                                sBias_sub = cute.flat_divide(sBias_pair, cute.make_layout(self.epi_tile[1]))
+                                cute.copy(bias_s2r_atom, sBias_sub[(None, 0)], tTR_rBias_gate)
+                            bias_vec_gate = tTR_rBias_gate.load()
+                            if cutlass.const_expr(self.act_func != "srelu"):
+                                cute.copy(bias_s2r_atom, sBias_sub[(None, 1)], tTR_rBias_up)
+                                bias_vec_up = tTR_rBias_up.load()
+
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
+                                    bias_gate_f32_0 = bias_vec_gate[i].to(cutlass.Float32)
+                                    bias_gate_f32_1 = bias_vec_gate[i + 1].to(cutlass.Float32)
+                                    tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.fma_packed_f32x2(
+                                        (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
                                         (
                                             cutlass.Float32(alpha_val),
                                             cutlass.Float32(alpha_val),
                                         ),
-                                        (bias_up_f32_0, bias_up_f32_1),
+                                        (bias_gate_f32_0, bias_gate_f32_1),
                                         rnd="rn",
                                         ftz=False,
                                     )
-                        else:
-                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
-                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val) + bias_vec_gate[i].to(cutlass.Float32)
-                                if cutlass.const_expr(self.act_func != "srelu"):
-                                    tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
+                                    if cutlass.const_expr(self.act_func != "srelu"):
+                                        bias_up_f32_0 = bias_vec_up[i].to(cutlass.Float32)
+                                        bias_up_f32_1 = bias_vec_up[i + 1].to(cutlass.Float32)
+                                        tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.fma_packed_f32x2(
+                                            (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                                            (
+                                                cutlass.Float32(alpha_val),
+                                                cutlass.Float32(alpha_val),
+                                            ),
+                                            (bias_up_f32_0, bias_up_f32_1),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
+                                    tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val) + bias_vec_gate[i].to(cutlass.Float32)
+                                    if cutlass.const_expr(self.act_func != "srelu"):
+                                        tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
 
-                        last_bias_subtile = subtile_cnt - 1 if cutlass.const_expr(self.act_func == "srelu") else subtile_cnt - 2
-                        # Release once per WORK TILE (the wait precedes the m-half
-                        # loop): only the LAST half may release under B-reuse.
-                        if subtile_idx == last_bias_subtile and _m_half == _breuse_halves[-1]:
-                            bias_pipeline.consumer_release(bias_consumer_state)
-                            bias_consumer_state.advance()
-                    else:
-                        if cutlass.const_expr(self.vectorized_f32):
-                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
-                                tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.mul_packed_f32x2(
-                                    (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
-                                if cutlass.const_expr(self.act_func != "srelu"):
-                                    tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.mul_packed_f32x2(
-                                        (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                            last_bias_subtile = subtile_cnt - 1 if cutlass.const_expr(self.act_func == "srelu") else subtile_cnt - 2
+                            # Release once per WORK TILE (the wait precedes the m-half
+                            # loop): only the LAST half may release under B-reuse.
+                            if subtile_idx == last_bias_subtile and _m_half == _breuse_halves[-1]:
+                                bias_pipeline.consumer_release(bias_consumer_state)
+                                bias_consumer_state.advance()
+                        else:
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
+                                    tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
                                         (
                                             cutlass.Float32(alpha_val),
                                             cutlass.Float32(alpha_val),
@@ -2575,126 +2549,136 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                         rnd="rn",
                                         ftz=False,
                                     )
-                        else:
-                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
-                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val)
-                                if cutlass.const_expr(self.act_func != "srelu"):
-                                    tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val)
+                                    if cutlass.const_expr(self.act_func != "srelu"):
+                                        tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.mul_packed_f32x2(
+                                            (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
+                                            (
+                                                cutlass.Float32(alpha_val),
+                                                cutlass.Float32(alpha_val),
+                                            ),
+                                            rnd="rn",
+                                            ftz=False,
+                                        )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
+                                    tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val)
+                                    if cutlass.const_expr(self.act_func != "srelu"):
+                                        tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val)
 
-                    #
-                    # Store pre-activation output to C tensor for residual/backward.
-                    #
-                    if cutlass.const_expr(self.act_func == "srelu"):
-                        self.store_c_unary(
-                            tiled_copy_r2s,
-                            tma_atom_c,
-                            warp_idx,
-                            tTR_rAcc_gate,
-                            tRS_rC,
-                            tRS_sC,
-                            _bSG_gC_h,
-                            bSG_sC,
-                            c_pipeline,
-                            num_prev_subtiles,
-                            real_subtile_idx,
-                        )
-                    else:
-                        self.store_c(
-                            tiled_copy_r2s,
-                            tma_atom_c,
-                            warp_idx,
-                            tTR_rAcc_gate,
-                            tTR_rAcc_up,
-                            tRS_rC,
-                            tRS_sC,
-                            _bSG_gC_h,
-                            bSG_sC,
-                            c_pipeline,
-                            num_prev_subtiles,
-                            real_subtile_idx,
-                        )
-                    num_prev_subtiles = num_prev_subtiles + 1
-
-                    #
-                    # GeGLU clamp before C store
-                    #
-                    if cutlass.const_expr((self.act_func == "geglu" or self.act_func == "swiglu") and self.glu_limit is not None):
-                        geglu_max_val = cutlass.Float32(self.glu_limit)
-                        geglu_min_val = cutlass.Float32(-self.glu_limit)
-                        for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                            tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], geglu_max_val)
-                            tTR_rAcc_gate[i] = fmax(tTR_rAcc_gate[i], geglu_min_val)
-                            tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], geglu_max_val)
-                            tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
-
-                    acc_vec_gate = tTR_rAcc_gate.load()
-
-                    #
-                    # Compute activation.
-                    #
-                    tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.act_func == "srelu"):
-                        self.srelu_act(tCompute, acc_vec_gate, _mProb_h)
-                    elif cutlass.const_expr(self.act_func == "geglu"):
-                        acc_vec_up = tTR_rAcc_up.load()
-                        self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
-                    elif cutlass.const_expr(self.act_func == "swiglu"):
-                        acc_vec_up = tTR_rAcc_up.load()
-                        self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
-
-                    #
-                    # Store post-activation output to D staging (bf16 under NVFP4 D —
-                    # the RHT warps quantize it and issue the fp4 TMA store).
-                    #
-                    acc_vec = tiled_copy_r2s_d.retile(tCompute).load()
-                    tRS_rD.store(acc_vec.to(self.d_smem_dtype))
-                    d_buffer = num_prev_d_subtiles % self.num_d_stage
-                    # The sD stage is guarded by the pingpong pipeline: acquire
-                    # BEFORE writing (the RHT warps consumer_release the slot right
-                    # after their sD register loads, up to num_d_stage subtiles
-                    # behind). Replaces the old per-subtile ACT<->RHT lockstep
-                    # barrier — the mbarrier phase bit makes the early release safe
-                    # (the named-barrier arrive() variant raced its release drain).
-                    if cutlass.const_expr(self.run_rht):
-                        pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
-                    cute.copy(
-                        tiled_copy_r2s_d,
-                        tRS_rD,
-                        tRS_sD[(None, None, None, d_buffer)],
-                    )
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    self.epilog_sync_barrier_group0.arrive_and_wait()
-                    if cutlass.const_expr(not self.d_quant):
-                        if warp_idx == self.epilog_act_warp_id[0]:
-                            cute.copy(
-                                tma_atom_d,
-                                bSG_sD[(None, d_buffer)],
-                                _bSG_gD_h[(None, real_subtile_idx)],
+                        #
+                        # Store pre-activation output to C tensor for residual/backward.
+                        #
+                        if cutlass.const_expr(self.act_func == "srelu"):
+                            self.store_c_unary(
+                                tiled_copy_r2s,
+                                tma_atom_c,
+                                warp_idx,
+                                tTR_rAcc_gate,
+                                tRS_rC,
+                                tRS_sC,
+                                _bSG_gC_h,
+                                bSG_sC,
+                                c_pipeline,
+                                num_prev_subtiles,
+                                real_subtile_idx,
                             )
-                            d_pipeline.producer_commit()
+                        else:
+                            self.store_c(
+                                tiled_copy_r2s,
+                                tma_atom_c,
+                                warp_idx,
+                                tTR_rAcc_gate,
+                                tTR_rAcc_up,
+                                tRS_rC,
+                                tRS_sC,
+                                _bSG_gC_h,
+                                bSG_sC,
+                                c_pipeline,
+                                num_prev_subtiles,
+                                real_subtile_idx,
+                            )
+                        num_prev_subtiles = num_prev_subtiles + 1
 
-                    #
-                    # Signal the RHT epilogue warps that the post-activation D tile is in SMEM.
-                    # (The matching producer_acquire moved BEFORE the sD write above.)
-                    #
-                    if cutlass.const_expr(self.run_rht):
-                        pingpong_pipeline.producer_commit(pingpong_act_producer_state)
-                        pingpong_act_producer_state.advance()
+                        #
+                        # GeGLU clamp before C store
+                        #
+                        if cutlass.const_expr((self.act_func == "geglu" or self.act_func == "swiglu") and self.glu_limit is not None):
+                            geglu_max_val = cutlass.Float32(self.glu_limit)
+                            geglu_min_val = cutlass.Float32(-self.glu_limit)
+                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
+                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], geglu_max_val)
+                                tTR_rAcc_gate[i] = fmax(tTR_rAcc_gate[i], geglu_min_val)
+                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], geglu_max_val)
+                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
 
-                    num_prev_d_subtiles = num_prev_d_subtiles + 1
+                        acc_vec_gate = tTR_rAcc_gate.load()
 
-                    #
-                    # Delayed TMA store acquire + group sync (always enabled)
-                    #
-                    if cutlass.const_expr(self.delay_tma_store_acquire_sync):
-                        if warp_idx == self.epilog_act_warp_id[0]:
-                            if cutlass.const_expr(not self.d_quant):
-                                d_pipeline.producer_acquire()
-                            c_pipeline.producer_acquire()
+                        #
+                        # Compute activation.
+                        #
+                        tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
+                        if cutlass.const_expr(self.act_func == "srelu"):
+                            self.srelu_act(tCompute, acc_vec_gate, _mProb_h)
+                        elif cutlass.const_expr(self.act_func == "geglu"):
+                            acc_vec_up = tTR_rAcc_up.load()
+                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
+                        elif cutlass.const_expr(self.act_func == "swiglu"):
+                            acc_vec_up = tTR_rAcc_up.load()
+                            self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
+
+                        #
+                        # Store post-activation output to D staging (bf16 under NVFP4 D —
+                        # the RHT warps quantize it and issue the fp4 TMA store).
+                        #
+                        acc_vec = tiled_copy_r2s_d.retile(tCompute).load()
+                        tRS_rD.store(acc_vec.to(self.d_smem_dtype))
+                        d_buffer = num_prev_d_subtiles % self.num_d_stage
+                        # The sD stage is guarded by the pingpong pipeline: acquire
+                        # BEFORE writing (the RHT warps consumer_release the slot right
+                        # after their sD register loads, up to num_d_stage subtiles
+                        # behind). Replaces the old per-subtile ACT<->RHT lockstep
+                        # barrier — the mbarrier phase bit makes the early release safe
+                        # (the named-barrier arrive() variant raced its release drain).
+                        if cutlass.const_expr(self.run_rht):
+                            pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
+                        cute.copy(
+                            tiled_copy_r2s_d,
+                            tRS_rD,
+                            tRS_sD[(None, None, None, d_buffer)],
+                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier_group0.arrive_and_wait()
+                        if cutlass.const_expr(not self.d_quant):
+                            if warp_idx == self.epilog_act_warp_id[0]:
+                                cute.copy(
+                                    tma_atom_d,
+                                    bSG_sD[(None, d_buffer)],
+                                    _bSG_gD_h[(None, real_subtile_idx)],
+                                )
+                                d_pipeline.producer_commit()
 
-                    # (No per-subtile ACT<->RHT barrier: sD reuse is fully ordered
-                    # by the pingpong producer_acquire above.)
+                        #
+                        # Signal the RHT epilogue warps that the post-activation D tile is in SMEM.
+                        # (The matching producer_acquire moved BEFORE the sD write above.)
+                        #
+                        if cutlass.const_expr(self.run_rht):
+                            pingpong_pipeline.producer_commit(pingpong_act_producer_state)
+                            pingpong_act_producer_state.advance()
+
+                        num_prev_d_subtiles = num_prev_d_subtiles + 1
+
+                        #
+                        # Delayed TMA store acquire + group sync (always enabled)
+                        #
+                        if cutlass.const_expr(self.delay_tma_store_acquire_sync):
+                            if warp_idx == self.epilog_act_warp_id[0]:
+                                if cutlass.const_expr(not self.d_quant):
+                                    d_pipeline.producer_acquire()
+                                c_pipeline.producer_acquire()
+                            self.epilog_sync_barrier_group0.arrive_and_wait()
+
+                        # (No per-subtile ACT<->RHT barrier: sD reuse is fully ordered
+                        # by the pingpong producer_acquire above.)
 
                 #
                 # (No tile-end ACT<->RHT barrier either: the RHT warps touch no
@@ -2824,9 +2808,11 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         gRht_epi_br = cute.flat_divide(tCgRht[((None, None), 1, 0, None, None, None)], epi_tile)
                         sRht_for_tma = cute.group_modes(sRht, 0, 2)
                         bSG_sRht, bSG_gRht_partitioned_bk = cpasync.tma_partition(
-                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_bk, 0, 2))
+                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_bk, 0, 2)
+                        )
                         _, bSG_gRht_partitioned_br = cpasync.tma_partition(
-                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_br, 0, 2))
+                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_br, 0, 2)
+                        )
                         bSG_gRht_bk = bSG_gRht_partitioned_bk[(None, None, None, *mma_tile_coord_mnl)]
                         bSG_gRht_bk = cute.group_modes(bSG_gRht_bk, 1, cute.rank(bSG_gRht_bk))
                         bSG_gRht_br = bSG_gRht_partitioned_br[(None, None, None, *mma_tile_coord_mnl)]
@@ -2841,8 +2827,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
                     # Expert token offset for the colwise (f, m/16) scale grid's
                     # tile index (offsets are 256-aligned, divisions exact).
-                    rht_t_off, _rht_t_cnt = compute_expert_token_range(
-                        padded_offsets, epi_work_tile_info.expert_idx)
+                    rht_t_off, _rht_t_cnt = compute_expert_token_range(padded_offsets, epi_work_tile_info.expert_idx)
 
                 #
                 # NVFP4 D: per-expert fp4 D gmem tensor + TMA partition (mirrors ACT's D setup).
@@ -2857,9 +2842,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         gDq_epi_br = cute.flat_divide(tCgDq[((None, None), 1, 0, None, None, None)], epi_tile)
                         sDq_for_tma = cute.group_modes(sDq, 0, 2)
                         bSG_sDq, bSG_gDq_partitioned_bk = cpasync.tma_partition(
-                            tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_bk, 0, 2))
-                        _, bSG_gDq_partitioned_br = cpasync.tma_partition(
-                            tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_br, 0, 2))
+                            tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_bk, 0, 2)
+                        )
+                        _, bSG_gDq_partitioned_br = cpasync.tma_partition(tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_br, 0, 2))
                         bSG_gDq_bk = bSG_gDq_partitioned_bk[(None, None, None, *mma_tile_coord_mnl)]
                         bSG_gDq_bk = cute.group_modes(bSG_gDq_bk, 1, cute.rank(bSG_gDq_bk))
                         bSG_gDq_br = bSG_gDq_partitioned_br[(None, None, None, *mma_tile_coord_mnl)]
@@ -2902,155 +2887,150 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     _sf_row_h = sf_row
 
                 for _m_half in _breuse_halves:
-                  if self.enable_breuse:
-                    if cutlass.const_expr(self.generate_rht):
-                        _bSG_gRht_h = bSG_gRht_bk if _m_half == 0 else bSG_gRht_br
-                    if cutlass.const_expr(self.d_quant):
-                        _bSG_gDq_h = bSG_gDq_bk if _m_half == 0 else bSG_gDq_br
-                    if cutlass.const_expr(self.rht_quant or self.d_quant):
-                        _sf_row_h = sf_row + _m_half * (self.cta_tile_shape_mnk[0] // 2)
-                  else:
-                    if cutlass.const_expr(self.generate_rht):
-                        _bSG_gRht_h = bSG_gRht
-                    if cutlass.const_expr(self.d_quant):
-                        _bSG_gDq_h = bSG_gDq
-                    if cutlass.const_expr(self.rht_quant or self.d_quant):
-                        _sf_row_h = sf_row
-
-                  #
-                  # Consume D subtiles from SMEM
-                  #
-                  subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
-                  subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
-                  for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
-                    #
-                    # Wait for ACT warps to finish writing the post-activation D tile to SMEM.
-                    #
-                    pingpong_pipeline.consumer_wait(pingpong_rht_consumer_state)
-
-                    if cutlass.const_expr(self.run_rht):
-                        d_buffer = num_prev_d_subtiles % self.num_d_stage
-                        # Subtile-column reversal (overlapping_accum): computed BEFORE
-                        # the FWHT/quant calls — scale bytes and TMA'd data must land
-                        # in the same reversed gmem feature columns as ACT's D store.
-                        real_subtile_idx = subtile_idx // 2
-                        if cutlass.const_expr(self.overlapping_accum):
-                            if rht_reverse:
-                                real_subtile_idx = (
-                                    self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
-                                    - 1 - real_subtile_idx
-                                )
-                        #
-                        # Load this subtile's sD values to registers, then release
-                        # the pingpong slot IMMEDIATELY: the ACT producers' acquire
-                        # (before their sD write) is the only reuse gate, so the
-                        # whole FWHT/quant/store chain below overlaps the ACT warps'
-                        # next subtiles (up to num_d_stage ahead). The mbarrier
-                        # phase bit makes this early release sound — the old
-                        # named-barrier arrive() variant raced its release drain
-                        # (~1/300 hangs on sm100 silicon).
-                        #
+                    if self.enable_breuse:
                         if cutlass.const_expr(self.generate_rht):
-                            if cutlass.const_expr(self.rht_rowwise):
-                                rht_ld = load_row_bf16(sD, d_buffer, epi_tidx)
-                            else:
-                                rht_ld = load_colwise_pairs_bf16(sD, d_buffer, epi_tidx)
+                            _bSG_gRht_h = bSG_gRht_bk if _m_half == 0 else bSG_gRht_br
                         if cutlass.const_expr(self.d_quant):
-                            dq_ld = load_row_bf16(sD, d_buffer, epi_tidx)
-                        pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
-                        pingpong_rht_consumer_state.advance()
-                        # RHT output: write the transform (x0.25) to sRht. rht_rowwise
-                        # picks the transform axis (16-feature blocks per token vs
-                        # 16-token blocks per feature); NVFP4 quantization is inferred
-                        # from the sRht dtype inside the FWHT device functions.
+                            _bSG_gDq_h = bSG_gDq_bk if _m_half == 0 else bSG_gDq_br
+                        if cutlass.const_expr(self.rht_quant or self.d_quant):
+                            _sf_row_h = sf_row + _m_half * (self.cta_tile_shape_mnk[0] // 2)
+                    else:
                         if cutlass.const_expr(self.generate_rht):
-                            if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
-                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht,
-                                                           rht_norm_const, sSfRht, real_subtile_idx, self.sf_dtype)
-                            elif cutlass.const_expr(self.rht_quant):
-                                hadamard_rmem_colwise_fwht_quant(
-                                    rht_ld, d_buffer, epi_tidx, rht_norm_const,
-                                    sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.sf_dtype)
-                            elif cutlass.const_expr(self.rht_rowwise):
-                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, 1.0, None, 0, self.sf_dtype)
-                            else:
-                                hadamard_rmem_colwise_fwht(rht_ld, d_buffer, epi_tidx, sRht)
-                        # NVFP4 D: quantize the bf16 register rows into sDq + sSfd.
+                            _bSG_gRht_h = bSG_gRht
                         if cutlass.const_expr(self.d_quant):
-                            nvfp4_quant_rmem_row(dq_ld, d_buffer, epi_tidx, sDq,
-                                                 norm_const, sSfd, real_subtile_idx, self.sf_dtype)
+                            _bSG_gDq_h = bSG_gDq
+                        if cutlass.const_expr(self.rht_quant or self.d_quant):
+                            _sf_row_h = sf_row
+
+                    #
+                    # Consume D subtiles from SMEM
+                    #
+                    subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
+                    subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                    for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
                         #
-                        # TMA-store the produced epi-tiles to gmem (mirrors ACT's D
-                        # store, including the overlapping_accum subtile-column reversal).
+                        # Wait for ACT warps to finish writing the post-activation D tile to SMEM.
                         #
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier_group1.arrive_and_wait()
-                        if warp_idx == self.epilog_rht_store_warp_id[0]:
+                        pingpong_pipeline.consumer_wait(pingpong_rht_consumer_state)
+
+                        if cutlass.const_expr(self.run_rht):
+                            d_buffer = num_prev_d_subtiles % self.num_d_stage
+                            # Subtile-column reversal (overlapping_accum): computed BEFORE
+                            # the FWHT/quant calls — scale bytes and TMA'd data must land
+                            # in the same reversed gmem feature columns as ACT's D store.
+                            real_subtile_idx = subtile_idx // 2
+                            if cutlass.const_expr(self.overlapping_accum):
+                                if rht_reverse:
+                                    real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
+                            #
+                            # Load this subtile's sD values to registers, then release
+                            # the pingpong slot IMMEDIATELY: the ACT producers' acquire
+                            # (before their sD write) is the only reuse gate, so the
+                            # whole FWHT/quant/store chain below overlaps the ACT warps'
+                            # next subtiles (up to num_d_stage ahead). The mbarrier
+                            # phase bit makes this early release sound — the old
+                            # named-barrier arrive() variant raced its release drain
+                            # (~1/300 hangs on sm100 silicon).
+                            #
                             if cutlass.const_expr(self.generate_rht):
-                                cute.copy(
-                                    tma_atom_rht,
-                                    bSG_sRht[(None, d_buffer)],
-                                    _bSG_gRht_h[(None, real_subtile_idx)],
-                                )
-                                rht_pipeline.producer_commit()
-                                rht_pipeline.producer_acquire()
+                                if cutlass.const_expr(self.rht_rowwise):
+                                    rht_ld = load_row_bf16(sD, d_buffer, epi_tidx)
+                                else:
+                                    rht_ld = load_colwise_pairs_bf16(sD, d_buffer, epi_tidx)
                             if cutlass.const_expr(self.d_quant):
-                                cute.copy(
-                                    tma_atom_d,
-                                    bSG_sDq[(None, d_buffer)],
-                                    _bSG_gDq_h[(None, real_subtile_idx)],
-                                )
-                                dq_pipeline.producer_commit()
-                                dq_pipeline.producer_acquire()
+                                dq_ld = load_row_bf16(sD, d_buffer, epi_tidx)
+                            pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
+                            pingpong_rht_consumer_state.advance()
+                            # RHT output: write the transform (x0.25) to sRht. rht_rowwise
+                            # picks the transform axis (16-feature blocks per token vs
+                            # 16-token blocks per feature); NVFP4 quantization is inferred
+                            # from the sRht dtype inside the FWHT device functions.
+                            if cutlass.const_expr(self.generate_rht):
+                                if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
+                                    hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, rht_norm_const, sSfRht, real_subtile_idx, self.sf_dtype)
+                                elif cutlass.const_expr(self.rht_quant):
+                                    hadamard_rmem_colwise_fwht_quant(
+                                        rht_ld, d_buffer, epi_tidx, rht_norm_const, sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.sf_dtype
+                                    )
+                                elif cutlass.const_expr(self.rht_rowwise):
+                                    hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, 1.0, None, 0, self.sf_dtype)
+                                else:
+                                    hadamard_rmem_colwise_fwht(rht_ld, d_buffer, epi_tidx, sRht)
+                            # NVFP4 D: quantize the bf16 register rows into sDq + sSfd.
+                            if cutlass.const_expr(self.d_quant):
+                                nvfp4_quant_rmem_row(dq_ld, d_buffer, epi_tidx, sDq, norm_const, sSfd, real_subtile_idx, self.sf_dtype)
+                            #
+                            # TMA-store the produced epi-tiles to gmem (mirrors ACT's D
+                            # store, including the overlapping_accum subtile-column reversal).
+                            #
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.epilog_sync_barrier_group1.arrive_and_wait()
+                            if warp_idx == self.epilog_rht_store_warp_id[0]:
+                                if cutlass.const_expr(self.generate_rht):
+                                    cute.copy(
+                                        tma_atom_rht,
+                                        bSG_sRht[(None, d_buffer)],
+                                        _bSG_gRht_h[(None, real_subtile_idx)],
+                                    )
+                                    rht_pipeline.producer_commit()
+                                    rht_pipeline.producer_acquire()
+                                if cutlass.const_expr(self.d_quant):
+                                    cute.copy(
+                                        tma_atom_d,
+                                        bSG_sDq[(None, d_buffer)],
+                                        _bSG_gDq_h[(None, real_subtile_idx)],
+                                    )
+                                    dq_pipeline.producer_commit()
+                                    dq_pipeline.producer_acquire()
+                            self.epilog_sync_barrier_group1.arrive_and_wait()
+
+                        # (Pingpong slot already released right after the sD register
+                        # loads above.)
+                        num_prev_d_subtiles = num_prev_d_subtiles + 1
+
+                    #
+                    # NVFP4: one contiguous 8-byte scale-row store per thread PER
+                    # M-HALF pass (still inside the m-half loop: half 1 reuses the
+                    # sSfRht/sSfd smem staging, so each half must drain it first).
+                    # Rowwise: the thread wrote all its own smem slots (no barrier
+                    # needed). Colwise: rows were filled ACROSS warps — the group1
+                    # barrier at the end of the subtile loop already ordered those
+                    # writes.
+                    #
+                    _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
+                    if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
+                        self.store_swizzled_sf_row(
+                            mSfRht_mnl,
+                            epi_ext.token_offset + _sf_row_h,
+                            mma_tile_coord_mnl[1] * _num_sf,
+                            sSfRht,
+                            epi_tidx,
+                        )
+                    if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
+                        # (f, m) scale domain: thread <-> feature-in-tile; columns are
+                        # 16-token scale blocks, stored in the same swizzled SF atom layout.
+                        sf_feat_row = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1] + epi_tidx
+                        self.store_swizzled_sf_row(
+                            mSfRht_mnl,
+                            sf_feat_row,
+                            (rht_t_off + _sf_row_h - epi_tidx) // HADAMARD_SIZE,
+                            sSfRht,
+                            epi_tidx,
+                        )
+                    if cutlass.const_expr(self.d_quant):
+                        self.store_swizzled_sf_row(
+                            mSfd_mnl,
+                            epi_ext.token_offset + _sf_row_h,
+                            mma_tile_coord_mnl[1] * _num_sf,
+                            sSfd,
+                            epi_tidx,
+                        )
+
+                    # Under breuse the next M-half rewrites the sSfRht/sSfd staging
+                    # that the (cross-warp for colwise) reads above consume — order
+                    # the halves. Compiled out for non-breuse.
+                    if cutlass.const_expr(self.enable_breuse and (self.rht_quant or self.d_quant)):
                         self.epilog_sync_barrier_group1.arrive_and_wait()
-
-                    # (Pingpong slot already released right after the sD register
-                    # loads above.)
-                    num_prev_d_subtiles = num_prev_d_subtiles + 1
-
-                  #
-                  # NVFP4: one contiguous 8-byte scale-row store per thread PER
-                  # M-HALF pass (still inside the m-half loop: half 1 reuses the
-                  # sSfRht/sSfd smem staging, so each half must drain it first).
-                  # Rowwise: the thread wrote all its own smem slots (no barrier
-                  # needed). Colwise: rows were filled ACROSS warps — the group1
-                  # barrier at the end of the subtile loop already ordered those
-                  # writes.
-                  #
-                  _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
-                  if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
-                      self.store_swizzled_sf_row(
-                          mSfRht_mnl,
-                          epi_ext.token_offset + _sf_row_h,
-                          mma_tile_coord_mnl[1] * _num_sf,
-                          sSfRht,
-                          epi_tidx,
-                      )
-                  if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
-                      # (f, m) scale domain: thread <-> feature-in-tile; columns are
-                      # 16-token scale blocks, stored in the same swizzled SF atom layout.
-                      sf_feat_row = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1] + epi_tidx
-                      self.store_swizzled_sf_row(
-                          mSfRht_mnl,
-                          sf_feat_row,
-                          (rht_t_off + _sf_row_h - epi_tidx) // HADAMARD_SIZE,
-                          sSfRht,
-                          epi_tidx,
-                      )
-                  if cutlass.const_expr(self.d_quant):
-                      self.store_swizzled_sf_row(
-                          mSfd_mnl,
-                          epi_ext.token_offset + _sf_row_h,
-                          mma_tile_coord_mnl[1] * _num_sf,
-                          sSfd,
-                          epi_tidx,
-                      )
-
-                  # Under breuse the next M-half rewrites the sSfRht/sSfd staging
-                  # that the (cross-warp for colwise) reads above consume — order
-                  # the halves. Compiled out for non-breuse.
-                  if cutlass.const_expr(self.enable_breuse and (self.rht_quant or self.d_quant)):
-                      self.epilog_sync_barrier_group1.arrive_and_wait()
 
                 #
                 # (No tile-end ACT<->RHT barrier: sD reuse is pingpong-guarded.)

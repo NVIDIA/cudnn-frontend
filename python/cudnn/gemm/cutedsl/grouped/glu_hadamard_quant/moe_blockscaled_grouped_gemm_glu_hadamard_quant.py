@@ -641,23 +641,16 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # after num_tile_stage tiles).
         self.run_rht = self.generate_rht or self.d_quant
         if cutlass.const_expr(not self.run_rht):
-            self.threads_wo_sched = (
-                self.threads_per_cta
-                - self.threads_per_warp
-                - self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-            )
+            self.threads_wo_sched = self.threads_per_cta - self.threads_per_warp - self.threads_per_warp * len(self.epilog_rht_store_warp_id)
         if cutlass.const_expr(self.d_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
             raise ValueError(f"d dtype must be BFloat16 or Float4E2M1FN, got {self.d_dtype}")
         if cutlass.const_expr(self.d_quant != self.generate_sfd):
             raise ValueError("NVFP4 d and sfd must be passed together")
-        if cutlass.const_expr(self.generate_rht
-                              and self.rht_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
+        if cutlass.const_expr(self.generate_rht and self.rht_dtype not in (cutlass.BFloat16, cutlass.Float4E2M1FN)):
             raise ValueError(f"rht dtype must be BFloat16 or Float4E2M1FN, got {self.rht_dtype}")
         if cutlass.const_expr(self.rht_quant != self.generate_sfrht):
             raise ValueError("NVFP4 rht and sfrht must be passed together")
-        sf_storage_dtype = (
-            cutlass.Float8E4M3FN if self.sf_dtype == cutlass.FloatNV8E5M3FNU else self.sf_dtype
-        )
+        sf_storage_dtype = cutlass.Float8E4M3FN if self.sf_dtype == cutlass.FloatNV8E5M3FNU else self.sf_dtype
         if cutlass.const_expr(self.generate_sfd and sfd.element_type != sf_storage_dtype):
             raise ValueError("sfd element type must match scale-factor storage dtype")
         if cutlass.const_expr(self.generate_sfrht and sfrht.element_type != sf_storage_dtype):
@@ -909,8 +902,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sSfd: cute.struct.Align[
                     cute.struct.MemRange[
                         self.sf_dtype,
-                        self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-                        * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
+                        self.threads_per_warp * len(self.epilog_rht_store_warp_id) * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
                     ],
                     16,
                 ]
@@ -927,8 +919,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sSfRht: cute.struct.Align[
                     cute.struct.MemRange[
                         self.sf_dtype,
-                        self.threads_per_warp * len(self.epilog_rht_store_warp_id)
-                        * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
+                        self.threads_per_warp * len(self.epilog_rht_store_warp_id) * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
                     ],
                     16,
                 ]
@@ -2510,8 +2501,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
                     # Expert token offset for the colwise (f, m) scale grid's
                     # tile index (offsets are 256-aligned, divisions exact).
-                    rht_t_off, _rht_t_cnt = compute_expert_token_range(
-                        padded_offsets, epi_work_tile_info.expert_idx)
+                    rht_t_off, _rht_t_cnt = compute_expert_token_range(padded_offsets, epi_work_tile_info.expert_idx)
 
                 #
                 # NVFP4 D: per-expert fp4 D gmem tensor + TMA partition (mirrors ACT's D setup).
@@ -2555,10 +2545,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         real_subtile_idx = subtile_idx // 2
                         if cutlass.const_expr(self.overlapping_accum):
                             if rht_reverse:
-                                real_subtile_idx = (
-                                    self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
-                                    - 1 - real_subtile_idx
-                                )
+                                real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n_required - 1 - real_subtile_idx
                         #
                         # Load this subtile's sD values to registers, then ARRIVE the
                         # lockstep barrier immediately: the ACT warps' arrive_and_wait
@@ -2580,20 +2567,18 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         # from the sRht dtype inside the FWHT device functions.
                         if cutlass.const_expr(self.generate_rht):
                             if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
-                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht,
-                                                           rht_norm_const, sSfRht, real_subtile_idx, self.sf_dtype)
+                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, rht_norm_const, sSfRht, real_subtile_idx, self.sf_dtype)
                             elif cutlass.const_expr(self.rht_quant):
                                 hadamard_rmem_colwise_fwht_quant(
-                                    rht_ld, d_buffer, epi_tidx, rht_norm_const,
-                                    sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.sf_dtype)
+                                    rht_ld, d_buffer, epi_tidx, rht_norm_const, sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.sf_dtype
+                                )
                             elif cutlass.const_expr(self.rht_rowwise):
                                 hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, 1.0, None, 0, self.sf_dtype)
                             else:
                                 hadamard_rmem_colwise_fwht(rht_ld, d_buffer, epi_tidx, sRht)
                         # NVFP4 D: quantize the bf16 register rows into sDq + sSfd.
                         if cutlass.const_expr(self.d_quant):
-                            nvfp4_quant_rmem_row(dq_ld, d_buffer, epi_tidx, sDq,
-                                                 norm_const, sSfd, real_subtile_idx, self.sf_dtype)
+                            nvfp4_quant_rmem_row(dq_ld, d_buffer, epi_tidx, sDq, norm_const, sSfd, real_subtile_idx, self.sf_dtype)
                         #
                         # TMA-store the produced epi-tiles to gmem (mirrors ACT's D
                         # store, including the overlapping_accum subtile-column reversal).

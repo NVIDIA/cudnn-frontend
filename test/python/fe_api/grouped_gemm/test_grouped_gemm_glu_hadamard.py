@@ -55,7 +55,7 @@ def _apply_transpose_hadamard(d_ref: torch.Tensor, aligned_group_m_list) -> torc
     return out.unsqueeze(-1)
 
 
-def _run_grouped_gemm_glu_ref(inputs: Dict, act_func: str) -> Dict:
+def _run_grouped_gemm_glu_ref(inputs: Dict, act_func: str, situ_beta1: float = 4.0, situ_beta2: float = 25.0) -> Dict:
     n, _, l = inputs["b_ref"].shape
     n_out = n // 2
     valid_m = inputs["valid_m"]
@@ -102,6 +102,8 @@ def _run_grouped_gemm_glu_ref(inputs: Dict, act_func: str) -> Dict:
         ref_gate = torch.clamp(ref_gate, max=7.0)
         ref_up = torch.clamp(ref_up, min=-7.0, max=7.0)
         ref_after_glu = (ref_up + 1.0) * ref_gate * torch.sigmoid(1.702 * ref_gate)
+    elif act_func == "situglu":
+        ref_after_glu = situ_beta1 * torch.tanh(ref_gate / situ_beta1) * torch.sigmoid(ref_gate) * situ_beta2 * torch.tanh(ref_up / situ_beta2)
     else:
         raise ValueError(f"Unsupported act_func {act_func}")
 
@@ -109,8 +111,16 @@ def _run_grouped_gemm_glu_ref(inputs: Dict, act_func: str) -> Dict:
     return {"c_ref": ref.clone(), "d_ref": ref_after_glu}
 
 
-def _check_reference(inputs: Dict, outputs: Dict, cfg: Dict, *, act_func: str) -> None:
-    ref_tensors = _run_grouped_gemm_glu_ref(inputs, act_func)
+def _check_reference(
+    inputs: Dict,
+    outputs: Dict,
+    cfg: Dict,
+    *,
+    act_func: str,
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
+) -> None:
+    ref_tensors = _run_grouped_gemm_glu_ref(inputs, act_func, situ_beta1, situ_beta2)
 
     torch.testing.assert_close(
         outputs["c_tensor"][: inputs["valid_m"]].cpu().float(),
@@ -171,7 +181,20 @@ def _allocate_outputs(inputs: Dict, cfg: Dict) -> Dict:
     }
 
 
-def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="swiglu", enable_bias=False):
+def _run_compile_execute(
+    request,
+    *,
+    ab_dtype,
+    sf_dtype,
+    sf_vec_size,
+    act_func="swiglu",
+    enable_bias=False,
+    situ_beta1=4.0,
+    situ_beta2=25.0,
+    execute_empty_input=False,
+    execute_situ_beta1=None,
+    execute_situ_beta2=None,
+):
     cfg = _make_cfg(request, ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size, enable_bias=enable_bias)
     inputs = allocate_grouped_gemm_input_tensors(
         n=cfg["n"],
@@ -209,11 +232,13 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         vector_f32=cfg["vector_f32"],
         m_aligned=cfg["m_aligned"],
         act_func=act_func,
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
     )
     api.check_support()
     api.compile()
     api.execute(
-        a_tensor=inputs["a_tensor"],
+        a_tensor=inputs["a_tensor"][:0] if execute_empty_input else inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
         c_tensor=outputs["c_tensor"],
         d_tensor=outputs["d_tensor"],
@@ -225,12 +250,35 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         amax_tensor=outputs["amax_tensor"],
         post_rht_amax_tensor=outputs["post_rht_amax_tensor"],
         bias_tensor=inputs["bias_tensor"],
+        situ_beta1=execute_situ_beta1,
+        situ_beta2=execute_situ_beta2,
     )
 
-    _check_reference(inputs, outputs, cfg, act_func=act_func)
+    if execute_empty_input:
+        return
+    reference_situ_beta1 = situ_beta1 if execute_situ_beta1 is None else execute_situ_beta1
+    reference_situ_beta2 = situ_beta2 if execute_situ_beta2 is None else execute_situ_beta2
+    _check_reference(
+        inputs,
+        outputs,
+        cfg,
+        act_func=act_func,
+        situ_beta1=reference_situ_beta1,
+        situ_beta2=reference_situ_beta2,
+    )
 
 
-def _run_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="swiglu", enable_bias=False):
+def _run_wrapper(
+    request,
+    *,
+    ab_dtype,
+    sf_dtype,
+    sf_vec_size,
+    act_func="swiglu",
+    enable_bias=False,
+    situ_beta1=4.0,
+    situ_beta2=25.0,
+):
     cfg = _make_cfg(request, ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size, enable_bias=enable_bias)
     inputs = allocate_grouped_gemm_input_tensors(
         n=cfg["n"],
@@ -266,9 +314,11 @@ def _run_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="swiglu",
         vector_f32=cfg["vector_f32"],
         m_aligned=cfg["m_aligned"],
         act_func=act_func,
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
     )
 
-    _check_reference(inputs, outputs, cfg, act_func=act_func)
+    _check_reference(inputs, outputs, cfg, act_func=act_func, situ_beta1=situ_beta1, situ_beta2=situ_beta2)
 
 
 def _run_discrete_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="swiglu"):
@@ -340,6 +390,128 @@ def test_grouped_gemm_glu_hadamard_wrapper_fp4(request, ab_dtype, sf_dtype, sf_v
         sf_vec_size=sf_vec_size,
         act_func=act_func,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(("situ_beta1", "situ_beta2"), [(4.0, 25.0), (2.0, 8.0)])
+def test_grouped_gemm_glu_hadamard_wrapper_situglu_fp4(request, situ_beta1, situ_beta2):
+    _run_wrapper(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+        act_func="situglu",
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_execute_uses_compiled_situglu_betas(request):
+    # Construct and compile for non-default beta values, then intentionally omit
+    # them from execute(). The launch must inherit the values stored by the API
+    # object so both the compile-time beta1 specialization and runtime beta2
+    # scalar match the numerical reference.
+    _run_compile_execute(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+        act_func="situglu",
+        situ_beta1=2.0,
+        situ_beta2=8.0,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_execute_uses_runtime_situglu_beta2(request):
+    # beta2 is a runtime scalar, so execute() may override the value stored by
+    # the compiled API object. Verify both the launch and numerical reference
+    # use the explicit execution-time value.
+    _run_compile_execute(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+        act_func="situglu",
+        execute_situ_beta2=8.0,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("execute_situ_beta1", "execute_situ_beta2", "match"),
+    [(0.0, None, "situ_beta1"), (None, float("nan"), "situ_beta2")],
+)
+def test_grouped_gemm_glu_hadamard_execute_empty_input_validates_situglu_betas(
+    request,
+    execute_situ_beta1,
+    execute_situ_beta2,
+    match,
+):
+    with pytest.raises(ValueError, match=match):
+        _run_compile_execute(
+            request,
+            ab_dtype=torch.float4_e2m1fn_x2,
+            sf_dtype=torch.float8_e8m0fnu,
+            sf_vec_size=16,
+            act_func="situglu",
+            execute_empty_input=True,
+            execute_situ_beta1=execute_situ_beta1,
+            execute_situ_beta2=execute_situ_beta2,
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("situ_beta1", "situ_beta2", "match"),
+    [(0.0, 25.0, "situ_beta1"), (4.0, float("nan"), "situ_beta2")],
+)
+def test_grouped_gemm_glu_hadamard_empty_input_validates_situglu_betas(
+    request,
+    situ_beta1,
+    situ_beta2,
+    match,
+):
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+
+    cfg = _make_cfg(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+    )
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+        enable_bias=False,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        grouped_gemm_glu_hadamard_wrapper_sm100(
+            a_tensor=inputs["a_tensor"][:0],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"][:0],
+            act_func="situglu",
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
+        )
 
 
 @pytest.mark.L0
@@ -430,4 +602,71 @@ def test_grouped_gemm_glu_hadamard_wrapper_cache_dynamic_m_smoke(request, monkey
 
     assert compile_count["value"] == 1
     assert len(grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects) == 1
+    grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_wrapper_cache_specializes_situ_beta1_only(request, monkeypatch):
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as grouped_gemm_glu_hadamard_api
+
+    grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()
+
+    compile_count = {"value": 0}
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+        return None
+
+    monkeypatch.setattr(grouped_gemm_glu_hadamard_api.GroupedGemmGluHadamardSm100, "compile", counted_compile)
+    monkeypatch.setattr(grouped_gemm_glu_hadamard_api.GroupedGemmGluHadamardSm100, "check_support", lambda self: True)
+    monkeypatch.setattr(grouped_gemm_glu_hadamard_api.GroupedGemmGluHadamardSm100, "execute", lambda self, **kwargs: None)
+
+    cfg = _make_cfg(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=16,
+    )
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+        enable_bias=False,
+    )
+
+    for situ_beta1, situ_beta2 in ((4.0, 25.0), (4.0, 8.0), (2.0, 25.0), (4.0, 25.0)):
+        grouped_gemm_glu_hadamard_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            act_func="situglu",
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
+        )
+
+    # beta1 changes the generated activation code and therefore creates a new
+    # compiled API. beta2 is a runtime FP32 scalar and reuses the beta1=4 API.
+    assert compile_count["value"] == 2
+    assert len(grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects) == 2
     grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()

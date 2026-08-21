@@ -41,7 +41,16 @@ def cp_async_bulk_shared_cluster_shared_cta(dst_mem, src_mem, mbar, size, *, pre
 
 
 @cute.jit
-def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask=None, acquire: cutlass.Constexpr[bool] = True):
+def tma_load_tile(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    *,
+    cta_group: int = 1,
+    mcast_mask=None,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
     num_iters = smem_tile.tma_loads_per_tile
     granu_elems = smem_tile.tma_granu_elems
     sub_stride = smem_tile.tma_subtile_stride_elems
@@ -70,6 +79,7 @@ def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask
                     tma_desc_ptr,
                     coords,
                     mbar,
+                    l2_cache_hint=l2_cache_hint,
                 )
             else:
                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -80,6 +90,7 @@ def tma_load_tile(smem_tile, gmem_slice, mbar, *, cta_group: int = 1, mcast_mask
                     [],
                     multicast_mask=mcast_mask,
                     group=nvvm.CTAGroup.CTA_2,
+                    l2_cache_hint=l2_cache_hint,
                 )
 
 

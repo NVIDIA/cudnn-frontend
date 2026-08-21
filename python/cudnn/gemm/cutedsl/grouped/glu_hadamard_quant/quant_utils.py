@@ -73,20 +73,16 @@ def _nvfp4_quant_row(tCompute, d_buffer, token, sOut, norm_const, sSf, sf_pair, 
         )
     # blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:2856-2873
     for vi in cutlass.range_constexpr(0, num_vecs, 2):
-        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
-            cute.arch.mul_packed_f32x2(
-                (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
-                (
-                    get_dtype_rcp_limits(cutlass.Float4E2M1FN),
-                    get_dtype_rcp_limits(cutlass.Float4E2M1FN),
-                ),
-            )
+        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
+            (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+            (
+                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
+                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
+            ),
         )
-        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
-            cute.arch.mul_packed_f32x2(
-                (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
-                (norm_const, norm_const),
-            )
+        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
+            (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+            (norm_const, norm_const),
         )
 
     # blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:2887

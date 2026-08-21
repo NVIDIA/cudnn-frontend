@@ -61,6 +61,36 @@ def test_importing_cudnn_pulls_no_framework():
 
 
 @pytest.mark.L0
+def test_importing_cudnn_ops_pulls_no_framework():
+    _assert_absent(_imported_by("import cudnn\nimport cudnn.ops"), "import cudnn.ops")
+
+
+@pytest.mark.L0
+def test_ops_symbol_reports_install_hint_without_torch():
+    probe = """
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import cudnn.ops
+try:
+    cudnn.ops.fft_causal_conv1d
+except ImportError as error:
+    assert "pip install nvidia-cudnn-frontend[cutedsl]" in str(error)
+else:
+    raise AssertionError("lazy symbol access unexpectedly succeeded without torch")
+"""
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
 def test_describing_a_graph_pulls_no_framework():
     """Build and validate an SDPA graph through the graph API alone."""
     _assert_absent(

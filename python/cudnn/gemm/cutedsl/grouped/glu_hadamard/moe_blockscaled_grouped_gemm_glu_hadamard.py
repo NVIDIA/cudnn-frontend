@@ -145,6 +145,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         enable_bias: bool = False,
         use_tmem_post_rht_amax: bool = False,
     ):
@@ -234,7 +235,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         self.num_epilog_warps = len(self.epilog_act_warp_id)  # = 4
 
         self.act_func = act_func
-        if act_func not in ["swiglu", "geglu", "srelu"]:
+        self.situ_beta1 = float(situ_beta1)
+        if act_func not in ["swiglu", "geglu", "situglu", "srelu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
     def _setup_attributes(self):
@@ -552,12 +554,21 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         linear_offset: cutlass.Float32 = 0.0,
+        situ_beta1: cutlass.Float32 = 4.0,
+        situ_beta2: cutlass.Float32 = 25.0,
     ):
         """Execute the MoE GEMM + GLU + Hadamard kernel.
 
         Dense mode: ``b`` and ``sfb`` are 3-D cute.Tensor (N, K, L).
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses.
+
+        ``situ_beta1`` and ``situ_beta2`` configure SiTU-GLU:
+
+            out = prob * beta1 * tanh(gate / beta1) * sigmoid(gate)
+                  * beta2 * tanh(up / beta2)
+
+        They are ignored unless ``act_func == "situglu"``.
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
@@ -865,6 +876,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
             self.sched_params,
             epilogue_op,
             linear_offset,
+            situ_beta1,
+            situ_beta2,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1094,6 +1107,23 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                 tCompute[i] = tCompute[i] * mProb
 
     @cute.jit
+    def situglu_act(self, tCompute, acc_vec_up, acc_vec_gate, mProb, beta1, beta2):
+        beta1_rcp = cutlass.Float32(1.0 / self.situ_beta1)
+        beta2_rcp = cute.arch.rcp_approx(beta2)
+        beta_product = beta1 * beta2
+        for i in cutlass.range_constexpr(cute.size(tCompute)):
+            gate = acc_vec_gate[i]
+            up = acc_vec_up[i]
+            gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
+            up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
+            if cutlass.const_expr(self.situ_beta1 == 4.0):
+                # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
+                sigmoid = cutlass.Float32(0.5) + gate_tanh * cute.arch.rcp_approx(cutlass.Float32(1.0) + gate_tanh * gate_tanh)
+            else:
+                sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            tCompute[i] = beta_product * gate_tanh * sigmoid * up_tanh * mProb
+
+    @cute.jit
     def srelu_act(self, tCompute, acc_vec, mProb):
         acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
         if cutlass.const_expr(self.vectorized_f32):
@@ -1265,6 +1295,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
         linear_offset: cutlass.Float32 = 0.0,
+        situ_beta1: cutlass.Float32 = 4.0,
+        situ_beta2: cutlass.Float32 = 25.0,
     ):
         """GPU device kernel: MoE persistent GEMM + GLU + Hadamard (pingpong epilogue)."""
         warp_idx = cute.arch.warp_idx()
@@ -2208,6 +2240,9 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                     elif cutlass.const_expr(self.act_func == "swiglu"):
                         acc_vec_up = tTR_rAcc_up.load()
                         self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
+                    elif cutlass.const_expr(self.act_func == "situglu"):
+                        acc_vec_up = tTR_rAcc_up.load()
+                        self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
 
                     if cutlass.const_expr(self.generate_amax):
                         thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)

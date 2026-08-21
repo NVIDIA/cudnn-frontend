@@ -16,6 +16,7 @@ import pytest
 
 from frost_test_utils import requires_dsl
 
+from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -50,3 +51,8 @@ def test_sm100_module_unchanged():
     assert (mod.CFG.TILE_K_HW_BMM1, mod.CFG.TILE_K_HW_BMM2) == (32, 32)
     assert mod.CFG.STAGES_KV == 4
     assert mod.NUM_KPHASES_PV == 4
+
+
+def test_sm107_per_tensor_fp8_advertises_only_d128():
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
+    assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))

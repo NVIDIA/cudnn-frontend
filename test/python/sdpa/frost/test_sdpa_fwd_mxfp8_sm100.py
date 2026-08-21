@@ -4,7 +4,7 @@
 """End-to-end tests for the FROST SM100 DSL block-scale MXFP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_mxfp8`` (FP8 E4M3/E5M2 Q/K/V + per-32-block E8M0 scale factors)
-routed to the ``sdpa_fwd_prefill_sm100_d128_mxfp8`` engine, and validates the output
+routed to the native D128/D128 or D192/D128 MXFP8 engine, and validates the output
 against an fp32-dequant reference. Inputs are quantized with the torch-only
 MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py`` (TE-equivalent semantics
 — the same layout cuDNN's own mxfp8 path uses), so the scale-factor tensors
@@ -89,26 +89,25 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(torch.softmax(scores, dim=-1), v_e)
 
 
-def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stats=True):
+def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stats=True, d_qk=128, d_v=128):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
     Returns (O_frost [B,H,S,D] on device, O_ref fp32 [B,H,S,D])."""
     import cudnn
 
     dev = "cuda"
-    D = 128
     fp8 = _FP8[in_key]
-    Qf = torch.randn(B, H_q, S, D, device=dev) * 0.5
-    Kf = torch.randn(B, H_kv, S, D, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S, D, device=dev) * 0.5
-    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H_q, S, D, fp8, columnwise=False)
-    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H_kv, S, D, fp8, columnwise=False)
-    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H_kv, S, D, fp8, columnwise=True)
+    Qf = torch.randn(B, H_q, S, d_qk, device=dev) * 0.5
+    Kf = torch.randn(B, H_kv, S, d_qk, device=dev) * 0.5
+    Vf = torch.randn(B, H_kv, S, d_v, device=dev) * 0.5
+    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H_q, S, d_qk, fp8, columnwise=False)
+    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H_kv, S, d_qk, fp8, columnwise=False)
+    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H_kv, S, d_v, fp8, columnwise=True)
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S, H_q, D, device=dev, dtype=out_dt).transpose(1, 2)
+    Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = torch.empty(B, H_q, S, 1, device=dev, dtype=torch.float32)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     sfq_g = sfq.view(torch.uint8).reshape(B, H_q, sqp, dsc)
@@ -149,7 +148,7 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stat
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, mxfp8=True))
+    _select_engine(g, engine_name(d_qk, d_v=d_v, mxfp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -183,13 +182,15 @@ def _ref_from_sdpa(sdpa_kwargs):
     return out
 
 
-def _check(O, O_ref, out_dt, in_key=None):
+def _check(O, O_ref, out_dt, in_key=None, d_qk=128):
     """Compare frost output to fp32 ref; for FP8 output, gauge against the fp8-quant floor.
 
     E5M2 inputs (2-bit mantissa) are noisier than E4M3 (3-bit), so the half-output
     tolerance is widened for them.
     """
-    atol_half = 7e-2 if in_key == "e5m2" else 5e-2
+    # D192 accumulates 50% more QK products than D128. Keep the existing D128
+    # threshold unchanged while allowing the measured E5M2 accumulation floor.
+    atol_half = 8e-2 if in_key == "e5m2" and d_qk > 128 else 7e-2 if in_key == "e5m2" else 5e-2
     diff = (O.float() - O_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (O_ref - O_ref.to(out_dt).float()).abs().max().item()
@@ -237,6 +238,95 @@ def test_mxfp8_masks(in_key, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128(in_key, mask):
+    """Native D192/D128 path, including the grouped-LPT scheduler geometry."""
+    d_qk, d_v = 192, 128
+    O, O_ref, _ = _run(
+        2,
+        16,
+        16,
+        256,
+        in_key,
+        torch.bfloat16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, torch.bfloat16, in_key, d_qk=d_qk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_output_dtypes(out_key):
+    """D192/D128 E4M3 input to each supported output dtype."""
+    d_qk, d_v = 192, 128
+    O, O_ref, amax = _run(
+        1,
+        8,
+        8,
+        256,
+        "e4m3",
+        _OUT[out_key],
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, _OUT[out_key], "e4m3", d_qk=d_qk)
+    amax_value = amax.item()
+    amax_ref = O_ref.abs().max().item()
+    assert abs(amax_value - amax_ref) <= 0.03, f"amax {amax_value:.4f} vs ref {amax_ref:.4f}"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_gqa_sink():
+    """D192/D128 GQA with an attention sink exercises head sharing."""
+    d_qk, d_v = 192, 128
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    O, O_ref, _ = _run(
+        1,
+        8,
+        2,
+        256,
+        "e5m2",
+        torch.float16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        sink=sink,
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, torch.float16, "e5m2", d_qk=d_qk)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_stats_less():
+    """D192/D128 supports compiling out the optional stats output."""
+    d_qk, d_v = 192, 128
+    O, O_ref, _ = _run(
+        1,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.bfloat16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        stats=False,
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, torch.bfloat16, "e4m3", d_qk=d_qk)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -272,36 +362,47 @@ def test_mxfp8_gqa(in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_bottom_right_rectangular():
+def test_mxfp8_bottom_right_rectangular(d_qk, d_v):
     """Bottom-right causal with S_q != S_kv (the case where it differs from top-left)."""
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d_qk)
     # S must be a multiple of TILE_N (128) for the non-padded path; use S_q=128, S_kv=256.
     import cudnn  # noqa: F401
 
-    O, O_ref, _ = _run_rect(2, 8, 128, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
-    _check(O, O_ref, torch.float16, "e4m3")
+    O, O_ref, _ = _run_rect(
+        2,
+        8,
+        128,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, torch.float16, "e4m3", d_qk=d_qk)
 
 
-def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs):
+def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, d_v=128):
     """_run variant allowing S_q != S_kv (bottom-right causal)."""
     import cudnn
 
     dev = "cuda"
-    D = 128
     fp8 = _FP8[in_key]
-    Qf = torch.randn(B, H, S_q, D, device=dev) * 0.5
-    Kf = torch.randn(B, H, S_kv, D, device=dev) * 0.5
-    Vf = torch.randn(B, H, S_kv, D, device=dev) * 0.5
-    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H, S_q, D, fp8, columnwise=False)
-    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H, S_kv, D, fp8, columnwise=False)
-    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H, S_kv, D, fp8, columnwise=True)
+    Qf = torch.randn(B, H, S_q, d_qk, device=dev) * 0.5
+    Kf = torch.randn(B, H, S_kv, d_qk, device=dev) * 0.5
+    Vf = torch.randn(B, H, S_kv, d_v, device=dev) * 0.5
+    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H, S_q, d_qk, fp8, columnwise=False)
+    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H, S_kv, d_qk, fp8, columnwise=False)
+    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H, S_kv, d_v, fp8, columnwise=True)
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H, D, device=dev, dtype=out_dt).transpose(1, 2)
+    Ob = torch.empty(B, S_q, H, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = torch.empty(B, H, S_q, 1, device=dev, dtype=torch.float32)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     g = cudnn.pygraph(
@@ -329,7 +430,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, mxfp8=True))
+    _select_engine(g, engine_name(d_qk, d_v=d_v, mxfp8=True))
     g.check_support()
     g.build_plans()
     g.execute(

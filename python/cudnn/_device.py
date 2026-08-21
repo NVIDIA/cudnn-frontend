@@ -59,38 +59,76 @@ def _device_handle(device: int):
     return _ck(*drv.cuDeviceGet(device))
 
 
-def ensure_current_context(stream=None) -> None:
-    """Bind a driver context to the calling thread when none is bound.
+@functools.lru_cache(maxsize=1)
+def _default_streams() -> frozenset:
+    """Handles that name no context: ``cuStreamGetCtx`` answers for the calling
+    thread's current context on all of them."""
+    drv = _driver()
+    if drv is None:
+        return frozenset({0})
+    return frozenset({0, int(drv.CU_STREAM_LEGACY), int(drv.CU_STREAM_PER_THREAD)})
 
-    JIT engines talk to the driver directly, which reads the calling THREAD's
-    context stack — and an autograd backward runs on a worker thread where
-    ``cudaSetDevice`` has only moved the runtime's thread-local slot. Prefer
-    the stream's context, else retain the runtime-current device's primary one
-    (the retain ref is held for the process lifetime, like the primary context
-    itself). Best-effort: a context this cannot establish fails at the launch,
-    with the launch's own diagnostics."""
+
+@functools.lru_cache(maxsize=None)
+def _primary_context(device: int):
+    """The retained primary context for ``device``, or ``None``. Once per
+    ordinal: a retain per execute would grow the usage count without bound."""
+    drv = _driver()
+    if drv is None:
+        return None
+    err, handle = drv.cuDeviceGet(device)
+    if int(err) != 0:
+        return None
+    err, primary = drv.cuDevicePrimaryCtxRetain(handle)
+    return primary if int(err) == 0 else None
+
+
+def _runtime_device():
+    """Ordinal the CUDA *runtime* holds current on this thread, or ``None``.
+    The driver cannot see that slot."""
     try:
-        drv = _driver()
-        if drv is None:
-            return
-        err, cur = drv.cuCtxGetCurrent()
-        if int(err) == 0 and int(cur) != 0:
-            return
-        if stream:
-            err, sctx = drv.cuStreamGetCtx(int(stream))
-            if int(err) == 0:
-                drv.cuCtxSetCurrent(sctx)
-                return
         import cuda.bindings.runtime as rt
+    except ImportError:
+        return None
 
-        err, device = rt.cudaGetDevice()
-        if int(err) != 0:
+    err, device = rt.cudaGetDevice()
+    return int(device) if int(err) == 0 else None
+
+
+def ensure_current_context(stream=None, device=None) -> None:
+    """Bind the context this work runs in to the calling thread.
+
+    A driver-API launch reads the calling thread's context stack; an autograd
+    backward runs on a worker whose stack is empty. A real stream names the
+    right context; the default-stream handles name none, so ``device`` decides
+    there. With no ``device``, a bound context is authoritative and only a cold
+    thread is given one (``frost.device.ambient_device``'s rung order).
+    Best-effort: what this cannot establish fails at the launch."""
+    drv = _driver()
+    if drv is None:
+        return
+    err, cur = drv.cuCtxGetCurrent()
+    cur = int(cur) if int(err) == 0 else 0
+    stream = 0 if stream is None else int(stream)
+    if stream not in _default_streams():
+        err, stream_ctx = drv.cuStreamGetCtx(stream)
+        if int(err) == 0 and int(stream_ctx) != 0:
+            if int(stream_ctx) != cur:
+                drv.cuCtxSetCurrent(stream_ctx)
             return
-        err, pctx = drv.cuDevicePrimaryCtxRetain(_device_handle(int(device)))
-        if int(err) == 0:
-            drv.cuCtxSetCurrent(pctx)
-    except Exception:  # noqa: BLE001
-        pass
+    if device is None:
+        if cur:
+            return
+        device = _runtime_device()
+        if device is None:
+            return
+    elif cur:
+        err, cur_device = drv.cuCtxGetDevice()
+        if int(err) == 0 and int(cur_device) == int(device):
+            return
+    primary = _primary_context(int(device))
+    if primary is not None:
+        drv.cuCtxSetCurrent(primary)
 
 
 class DeviceInfo:

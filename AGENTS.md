@@ -45,6 +45,7 @@ Python (editable; compiles the pybind11 extension via CMake):
 ```bash
 pip install -e .              # core graph API only
 pip install -e ".[cutedsl]"   # + OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
+pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
 pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
 ```

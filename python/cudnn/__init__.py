@@ -52,6 +52,11 @@ for _optional_symbol in [
     "causal_conv1d_nwh_backward",
     "b2b_causal_conv1d_forward",
     "b2b_causal_conv1d_backward",
+    "fft_causal_conv1d_forward",
+    "fft_causal_conv1d_backward",
+    "long_fft_causal_conv1d_get_buffer_sizes",
+    "long_fft_causal_conv1d_forward",
+    "long_fft_causal_conv1d_backward",
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
@@ -134,7 +139,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.27.0"
+__version__ = "1.28.0"
 
 
 def _tensor(

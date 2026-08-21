@@ -1454,6 +1454,17 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        // The driver-API engines read the calling THREAD's context stack, and a
+        // thread that has done no CUDA work yet (a PyTorch autograd worker) has
+        // none. All roads reach here, so every execute is covered; the steady
+        // state is one cuCtxGetCurrent, and the stream query only runs when a
+        // context actually has to be established.
+        if (!detail::has_current_context()) {
+            cudaStream_t stream = nullptr;
+            detail::get_stream(handle, &stream);
+            detail::ensure_current_context(stream);
+        }
+
         // Lazy init: prepare template if not done (e.g. deserialized graphs, build_plan_at_index)
         if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());

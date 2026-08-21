@@ -40,6 +40,7 @@ def _get_rubin_kernel():
 
     return RubinBlockScaledMoEGroupedGemmGluHadamardQuantKernel
 
+
 # The GLU + Hadamard + quant fusion is block-scaled only: its mandatory
 # scale-factor inputs use an MMA-interleaved 6-D layout with no row-major
 # equivalent, so they are not expressible as JAX arrays and the API stays
