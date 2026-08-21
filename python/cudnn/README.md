@@ -47,8 +47,10 @@ python/cudnn/gemm/
 └── reference/                                    # pure-PyTorch correctness engine
 ```
 
-Every public GEMM symbol is re-exported at the top level (`cudnn.<symbol>`), which
-is the supported entry point — the directory layout is an implementation detail.
+Backend-independent PyTorch operation contracts are available from
+`cudnn.gemm.ops` and re-exported from `cudnn.gemm`. For example,
+`cudnn.gemm.ops.gelu_mlp` implements the biased tanh-GELU feed-forward block;
+see [GELU MLP](../../docs/operations/GeluMLP.md).
 
 ## 
 

@@ -11,13 +11,14 @@ Layout::
     cudnn.gemm.ops                               backend-independent op contracts
     cudnn.gemm.reference                         pure-PyTorch correctness engine
 
-Every public symbol is also re-exported at the top level (``cudnn.<symbol>``),
-which is the supported entry point for users.
+Operation symbols are re-exported from ``cudnn.gemm``; their defining
+``cudnn.gemm.ops`` namespace remains supported as well.
 """
 
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "gelu_mlp": ("cudnn.gemm.ops", "gelu_mlp"),
     "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),
     "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),
 }
