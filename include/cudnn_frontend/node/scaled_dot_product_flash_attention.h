@@ -446,6 +446,13 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
 
+            // Stats is always computed and stored in FP32, regardless of the io data type.
+            // Default an unset data type here instead of fill_from_context, which would
+            // wrongly assign the io data type.
+            if (stats->get_data_type() == DataType_t::NOT_SET) {
+                stats->set_data_type(DataType_t::FLOAT);
+            }
+
             if (stats_dim.empty()) {
                 // Fill properties of virtual tensors
                 auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
@@ -498,11 +505,22 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
 
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
+
+        // Stats is always computed and stored in FP32. A narrower declared type makes the kernel
+        // write FP32 values past the end of the user's buffer (silent corruption / IMA), so
+        // reject it loudly here. An unset data type is allowed: shape inference defaults it to
+        // FP32 (see infer_properties_node) rather than letting fill_from_context assign the io
+        // data type.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_stats && stats_out->second->get_data_type() != DataType_t::FLOAT &&
+                                           stats_out->second->get_data_type() != DataType_t::NOT_SET,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The Stats output of sdpa must be an FP32 tensor.");
+
         // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
         // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
         // is not rejected.
-        auto const& stats_out = attributes.outputs.find(output_names::Stats);
-        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
         if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
             auto const& stats_dim           = stats_out->second->get_dim();
             auto const& stats_stride        = stats_out->second->get_stride();
