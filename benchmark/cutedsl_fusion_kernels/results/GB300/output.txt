@@ -8,9 +8,9 @@ nvidia-cutlass-dsl: 4.4.1
 
 summary:
 activation   cudnn_ms      te_ms   te/cudnn
-swiglu          1.323      1.627      1.23x
-dswiglu         0.745      1.542      2.07x
-srelu           0.674      0.881      1.31x
-dsrelu          0.691      1.196      1.73x
-geglu           1.324      1.641      1.24x
-dgeglu          0.743      1.647      2.22x
+swiglu          1.329      1.742      1.31x
+dswiglu         0.738      1.535      2.08x
+srelu           0.669      0.894      1.34x
+dsrelu          0.681      1.159      1.70x
+geglu           1.340      1.649      1.23x
+dgeglu          0.738      1.636      2.22x
