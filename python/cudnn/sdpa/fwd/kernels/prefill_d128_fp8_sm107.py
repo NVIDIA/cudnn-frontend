@@ -2289,8 +2289,18 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
 ) -> Callable:
     """Compile with ALL dims concrete — pins TMA strides at compile time.
+
+    ``d_qk``/``d_v`` <= the d128 tile serve the dense ENVELOPE: the TMA
+    descriptors carry the ACTUAL extents while the tile box stays the
+    compile-time D, so loads past them hardware zero-fill (exact in FP8 —
+    S/softmax/P·V are bit-identical to the unpadded problem) and O stores
+    past ``d_v`` are OOB-clipped. Head dims like the ViT d=72-in-80 contract
+    run without caller-side re-padding. THD serves native tile dims only
+    (the packed compile key carries no head-dim entries).
 
     THD/varlen: q/k/v/o/lse PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
     LOGICAL batch (sequence count) driving n_batch / metadata + O-desc sizes.
@@ -2302,6 +2312,14 @@ def compile(  # noqa: A001
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
     at all; the amax_o atomicMax write is independent and unchanged."""
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError(f"fp8 d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
+        # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
+        # the binding TMA 16-byte global-stride constraint.
+        raise ValueError(f"fp8 d128 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
+    if CFG.THD_VARLEN and (d_qk != CFG.TILE_K or d_v != CFG.TILE_O):
+        raise ValueError("THD/varlen serves native tile dims only (the packed compile key carries no head-dim entries); leave d_qk/d_v at the defaults")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and a
@@ -2311,25 +2329,25 @@ def compile(  # noqa: A001
         skv = cute.sym_int(divisibility=1)
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_K),
+        (_fake_batch, sq, qh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_K),
+        (_fake_batch, skv, kh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_O),
+        (_fake_batch, skv, kh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_O),
+        (_fake_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )

@@ -225,9 +225,11 @@ def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     the tile box stays the compile-time D, so loads past d_qk / d_v hardware
     zero-fill (adding exact zero terms to every QK^T dot product — S, softmax
     and P·V are bit-identical to the unpadded problem) and O stores past d_v
-    are OOB-clipped. FP8/MXFP8 uses exact native shapes (gated in
-    check_support); alignment (d % 8, the TMA 16-byte global-stride rule at
-    2 bytes/elem) is also gated in check_support / engines.mismatch.
+    are OOB-clipped. Per-tensor FP8 serves the same envelope under its d128
+    tile (dense only, d % 16 at 1 byte/elem); d192 FP8 and MXFP8 use exact
+    native shapes. All of it is gated in check_support / engines.mismatch,
+    including the f16 alignment rule (d % 8, the TMA 16-byte global-stride
+    rule at 2 bytes/elem).
     """
     for flavor in _SM100_FLAVORS:
         fdqk, fdv = flavor
@@ -855,13 +857,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
-        # FP8 paths use exact native shapes. SM100 supports d128/d128 and
-        # d192/d128; Rubin currently supports only per-tensor FP8 d128.
+        # FP8 native shapes: SM100 serves d128/d128 and d192/d128; Rubin
+        # currently serves only per-tensor FP8 d128. Per-tensor FP8 ALSO
+        # serves the dense d<=128 ENVELOPE under the d128 tile (TMA
+        # zero-padding, like the f16 flavors — exact in FP8, and the descales
+        # are scalars, so the envelope is arch-independent): head dims must be
+        # multiples of 16 (TMA 16-byte global-stride rule at 1 byte/elem).
+        # THD stays native-shape (the packed THD compile key carries no
+        # head-dim entries — engines.thd_d_envelope) and MXFP8 stays exact
+        # (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
+        _fp8_envelope_ok = self._pertensor and not self.thd and max(int(d_qk), int(d_v)) <= 128 and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
         self._value_error_if(
-            self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
-            f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires an exact native shape in {sorted(fp8_shapes)} "
-            f"(no envelope padding); got (D_QK={d_qk}, D_V={d_v})",
+            self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
+            f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
+            + (" or the dense d128 envelope (D_QK/D_V <= 128, multiples of 16)" if self._pertensor else " (no envelope padding)")
+            + f"; got (D_QK={d_qk}, D_V={d_v})",
         )
         # Envelope alignment gate: the TMA descriptors are built from the
         # actual tensor extents, and cuTensorMapEncodeTiled requires every
@@ -1081,14 +1092,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # entries (see _thd_compile_kwargs).
             self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
         elif self._fp8:
-            # FP8/MXFP8 kernels use exact native shapes (gated in check_support);
-            # their compile() has no envelope head-dim parameters. has_lse=False
-            # (no Stats output) compiles the LSE store out — no dummy buffer at
-            # any level (the amax_o atomicMax write is independent). A split
-            # REQUIRES the in-kernel LSE: the per-split LSE is the combine
-            # weight (the kernel skips its own amax write under a split; the
-            # combine reports the amax of the RECOMBINED O instead).
-            self._compiled_kernel = self._k_mod.compile(
+            # has_lse=False (no Stats output) compiles the LSE store out — no
+            # dummy buffer at any level (the amax_o atomicMax write is
+            # independent). A split REQUIRES the in-kernel LSE: the per-split
+            # LSE is the combine weight (the kernel skips its own amax write
+            # under a split; the combine reports the amax of the RECOMBINED O
+            # instead).
+            fp8_kwargs = dict(
                 b=self.batch_size,
                 qh=self.h_q,
                 kh=self.h_kv,
@@ -1096,6 +1106,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 skv=self.s_k_max,
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
             )
+            if self._pertensor and self.flavor == (128, 128):
+                # ENVELOPE (per-tensor d128 only): hand the kernel the ACTUAL
+                # head dims so its TMA descriptors carry the real extents
+                # (loads past them zero-fill — exact in FP8; O stores past d_v
+                # clip). The d192/d128 and MXFP8 kernels are exact-native
+                # (gated in check_support) and take no head-dim parameters.
+                fp8_kwargs.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
+            self._compiled_kernel = self._k_mod.compile(**fp8_kwargs)
         else:
             # ENVELOPE: hand the f16/bf16 kernel the ACTUAL head dims so its
             # TMA descriptors carry the real extents (loads past them

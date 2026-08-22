@@ -4,7 +4,8 @@
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the exact d128/d128 or d192/d128 engine, and validates O against an fp32-dequant
+the d128/d128 engine (which also serves the dense d<=128 head-dim ENVELOPE via TMA
+zero-padding) or the exact d192/d128 engine, and validates O against an fp32-dequant
 reference. ``Amax_O`` is produced in-kernel (atomicMax over the pre-cast fp32 values)
 and checked.
 
@@ -101,6 +102,7 @@ def _run(
     sync_debug=False,
     d_qk=128,
     d_v=128,
+    engine_shape=None,
 ):
     import cudnn
 
@@ -163,7 +165,12 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d_qk, arch=_D128_ARCH if (d_qk, d_v) == (128, 128) else "sm100", d_v=d_v, fp8=True))
+    # engine_shape pins a row other than the graph's own dims — the d128 rows
+    # serve smaller head dims through their dense ENVELOPE (zero-padding).
+    # The arch pick rides the ENGINE dims: an enveloped d80 graph pins the
+    # d128 row of the device's arch line (sm100 or sm107).
+    e_qk, e_v = engine_shape if engine_shape is not None else (d_qk, d_v)
+    _select_engine(g, engine_name(e_qk, arch=_D128_ARCH if (e_qk, e_v) == (128, 128) else "sm100", d_v=e_v, fp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -317,6 +324,57 @@ def test_fp8_d192_d128_zero_length_kv():
         d_v=128,
     )
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("dims", [(80, 80), (96, 64)], ids=["d80", "d96_d64"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope(dims, mask):
+    """Per-tensor FP8 serves the dense d<=128 head-dim ENVELOPE on the d128
+    row (TMA zero-padding — exact in FP8, arch-independent since the descales
+    are scalars): the ViT d=72-in-80 contract's landing zone. Head dims must
+    be multiples of 16 (TMA 16-byte global-stride rule at 1 byte/elem)."""
+    d_qk, d_v = dims
+    scale = 1.0 / math.sqrt(d_qk)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        4,
+        4,
+        384,
+        384,
+        "e4m3",
+        torch.bfloat16,
+        scale=scale,
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d_qk,
+        d_v=d_v,
+        engine_shape=(128, 128),
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope_padded():
+    """The envelope composed with the KV padding mask — the ViT production
+    shape (non-causal, seqlen padded up to a tile multiple, d=80)."""
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        4,
+        4,
+        384,
+        384,
+        "e4m3",
+        torch.bfloat16,
+        scale=1.0 / math.sqrt(72),
+        sdpa_kwargs={},
+        seq_lens_kv=[384, 250],
+        d_qk=80,
+        d_v=80,
+        engine_shape=(128, 128),
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0

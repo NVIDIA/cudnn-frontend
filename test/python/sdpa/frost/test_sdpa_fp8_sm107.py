@@ -270,3 +270,62 @@ def test_fp8_softmax_f16_e2e():
         assert err <= 0.1 * ref.abs().max().item(), f"{precision}: max err {err} vs fp32 reference"
     xerr = (outs[_c.data_type.HALF] - outs[_c.data_type.FLOAT]).abs().max().item()
     assert xerr <= 0.05 * ref.abs().max().item(), f"HALF-vs-FLOAT softmax divergence {xerr}"
+
+
+def test_fp8_d128_rows_serve_dense_envelope():
+    """BOTH d128/d128 per-tensor FP8 rows (sm100 and sm107) serve the dense
+    d<=128 head-dim ENVELOPE (TMA zero-padding — exact in FP8; d % 16 at
+    1 byte/elem, and arch-independent since the descales are scalars). THD
+    stays native-tile (the packed THD compile key carries no head-dim
+    entries) and the d192/d128 and MXFP8 rows stay exact-native."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    for arch in ("sm100", "sm107"):
+        row = caps[engines.engine_name(128, arch=arch, fp8=True)]
+        assert row.d_envelope, arch
+        assert row.d_pad_multiple == 16, arch
+        assert not row.thd_d_envelope, arch
+    assert not caps[engines.engine_name(192, d_v=128, fp8=True)].d_envelope
+    assert not caps[engines.engine_name(128, mxfp8=True)].d_envelope
+
+
+def _fp8_facts(**kw):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    base = dict(
+        b=2,
+        h_q=4,
+        h_kv=4,
+        s_q=384,
+        s_kv=384,
+        d_qk=80,
+        d_v=80,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        device_cc=(10, 0),
+    )
+    base.update(kw)
+    return ga.SdpaGraphFacts(**base)
+
+
+def test_fp8_envelope_mismatch_rules():
+    """Honest eligibility for the fp8 envelope: mismatch() admits dense d80 on
+    the d128 rows of both arch lines, enforces d % 16, and keeps THD
+    native-tile — no plan may enter the ranked list only to die at build in
+    the adapter."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(128, fp8=True)]
+    assert engines.mismatch(sm100, _fp8_facts()) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
+    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
+    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
+    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
+    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
+    assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))

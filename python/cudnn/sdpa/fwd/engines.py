@@ -125,8 +125,14 @@ class Capabilities:
     d_envelope: bool = False
     # Alignment rule for envelope rows: graph head dims must be multiples of
     # this. 8 = the TMA 16-byte global-stride rule at 2 bytes/elem (SM100 DSL
-    # rows). 1 = no constraint (the SM80 lowering pads host-side).
+    # rows). 16 = the same rule at 1 byte/elem (per-tensor FP8). 1 = no
+    # constraint (the SM80 lowering pads host-side).
     d_pad_multiple: int = 8
+    # Whether the THD (ragged) leg serves the same head-dim envelope. The
+    # per-tensor FP8 row sets False: its packed THD compile key carries no
+    # head-dim entries (native-tile contract), so the envelope is dense-only
+    # there and THD graphs must match the native dims exactly.
+    thd_d_envelope: bool = True
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
@@ -329,6 +335,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return (
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
                 f"global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
+        if facts.thd and not capabilities.thd_d_envelope and (facts.d_qk not in capabilities.d_qk or facts.d_v not in capabilities.d_v):
+            return (
+                f"THD (ragged) rides the packed native-tile leg on this engine (D_QK in "
+                f"{sorted(capabilities.d_qk)} / D_V in {sorted(capabilities.d_v)}); the head-dim envelope is dense-only"
             )
     elif facts.d_qk not in capabilities.d_qk or facts.d_v not in capabilities.d_v:
         return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
@@ -553,7 +564,14 @@ def _sm100_fp8_spec(
     sink_dtypes: Optional[frozenset] = None,
     arch: str = "sm100",
 ) -> EngineSpec:
-    """Exact-shape per-tensor FP8 engine with scalar descales.
+    """Per-tensor FP8 engine with scalar descales.
+
+    The d128/d128 cell serves the dense ``d <= 128`` ENVELOPE (TMA
+    zero-padding, like the f16 flavors — exact in FP8, and the descales are
+    scalars so no per-column plumbing is affected); head dims must be
+    multiples of 16 (the TMA 16-byte global-stride rule at 1 byte/elem).
+    d192/d128 stays exact-native, and THD keeps native dims on both cells
+    (the packed THD compile key carries no head-dim entries).
 
     One row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
     "sm107" = Rubin line 107-119), because the two lowerings genuinely
@@ -600,6 +618,9 @@ def _sm100_fp8_spec(
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d_v}),
+            d_envelope=(d, d_v) == (128, 128),
+            d_pad_multiple=16,
+            thd_d_envelope=False,
             dtypes=dtypes,
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
