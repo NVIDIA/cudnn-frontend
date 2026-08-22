@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -69,6 +71,37 @@ assert QK_ROPE == FEATCELL, "the rope occupies exactly one feature cell; QK_ROPE
 assert HALF == QK_ROPE // 2, "HALF must be QK_ROPE // 2"
 assert TILE_M % BLOCK == 0, "TILE_M must be a whole number of MXFP8 blocks"
 assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COLBLK x N_FEATCELL"
+
+# ---- Debug instrumentation (off by default) ----
+# When on, the epilogue also writes its two intermediates to GMEM so the fused result can be
+# bisected against the unfused GEMM -> RoPE -> quantize chain:
+#   DbgGemm  bf16 [tokens, NUM_HEADS, HEAD_DIM]  post-GEMM, post-bf16-stage, pre-RoPE
+#   DbgRope  fp32 [tokens, NUM_HEADS, HEAD_DIM]  post-RoPE, pre-quantize.  BF16-valued, but
+#            dumped as fp32 so it can also be scored against an exact reference.
+# Guarded with const_expr, so nothing is emitted at all when the flag is off; the buffers are
+# then 1-element placeholders.
+DBG = int(os.environ.get("NVTE_FUSED_Q_UPROJ_DEBUG", "0")) > 0
+
+# ---- RoPE arithmetic ----
+# The unfused path applies RoPE with Megatron's Triton rotary_fwd_q_kernel.  Its element type
+# is BF16, but the arithmetic is not: Triton widens to fp32 registers, contracts one product
+# into an fma, and rounds to BF16 only where a value is materialized.  Scored against an exact
+# fp64 evaluation over 5.0e7 elements, that kernel is exactly
+#
+#   left  = bf16( x1*cos_l - bf16(x2*sin_l) )     (x1*cos_l stays fp32 inside the fma)
+#   right = bf16( bf16(x2*cos_r) + x1*sin_r )     (x1*sin_r stays fp32 inside the fma)
+#
+# so the epilogue below reproduces that form, product for product and rounding for rounding.
+# Two nearby alternatives were measured and both diverge from Triton: keeping everything in
+# fp32 and rounding once at the store misses on 3.6e6 of those elements, and doing genuine
+# all-BF16 multiplies and adds misses on 3.8e6.  Matching the fma contraction is what makes
+# the fused and unfused queries agree bit for bit.
+
+
+@cute.jit
+def _to_bf16_f32(v):
+    """Round an fp32 value through BF16 and back, matching the unfused RoPE's storage."""
+    return v.to(cutlass.BFloat16).to(cutlass.Float32)
 
 
 @cute.struct
@@ -202,6 +235,8 @@ def gemm_proj_rope_mxfp8_kernel(
     mSrow: cute.Tensor,
     mQcol: cute.Tensor,
     mScol: cute.Tensor,
+    mDbgGemm: cute.Tensor,
+    mDbgRope: cute.Tensor,
     epi_tile: cute.Tile,
     cta_layout_vmnk: cute.Layout,
     tile_sched_params: utils.PersistentTileSchedulerParams,
@@ -436,6 +471,13 @@ def gemm_proj_rope_mxfp8_kernel(
             b = fc * 2 + (lane // HALFW)  # 32-feature row-block 0..5
             col_amax0 = cutlass.Float32(0.0)
             col_amax1 = cutlass.Float32(0.0)
+            if cutlass.const_expr(DBG):
+                # P1: raw GEMM tile straight out of sACC, before any rope. The (f0, f1) pairs
+                # over 12 warps x 32 lanes x 32 tokens tile TILE_M x HEAD_DIM exactly once, so
+                # this dumps every column in natural (nope | interleaved-rope) order.
+                for r in cutlass.range_constexpr(BLOCK):
+                    mDbgGemm[token_base + tok0 + r, head, f0] = sACC[tok0 + r, f0]
+                    mDbgGemm[token_base + tok0 + r, head, f1] = sACC[tok0 + r, f1]
             # TE weight layout: NOPE at features 0..127, ROPE at features 128..191 (last cell)
             is_rope = fc == (N_FEATCELL - 1)
             if is_rope:
@@ -463,8 +505,14 @@ def gemm_proj_rope_mxfp8_kernel(
                         s0 = ts[0].to(cutlass.Float32)
                         c1 = tc[1].to(cutlass.Float32)
                         s1 = ts[1].to(cutlass.Float32)
-                        ps0, ps1 = cute.arch.mul_packed_f32x2((p0, p1), (s0, s1))
-                        v0, v1 = cute.arch.fma_packed_f32x2((q0, q1), (c0, c1), (ps0, ps1))
+                        # Triton emits bf16( bf16(q*c) + p*s ): q*c is materialized, p*s
+                        # is the multiply the compiler folds into the fma.
+                        qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
+                        qc0 = _to_bf16_f32(qc0)
+                        qc1 = _to_bf16_f32(qc1)
+                        v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
+                        v0 = _to_bf16_f32(v0)
+                        v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -482,9 +530,14 @@ def gemm_proj_rope_mxfp8_kernel(
                         s0 = ts[0].to(cutlass.Float32)
                         c1 = tc[1].to(cutlass.Float32)
                         s1 = ts[1].to(cutlass.Float32)
-                        pc0, pc1 = cute.arch.mul_packed_f32x2((p0, p1), (c0, c1))
+                        # Triton emits bf16( p*c - bf16(q*s) ): q*s is materialized, p*c
+                        # is the multiply the compiler folds into the fma.
                         qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
-                        v0, v1 = cute.arch.fma_packed_f32x2((qs0, qs1), (cutlass.Float32(-1.0), cutlass.Float32(-1.0)), (pc0, pc1))
+                        qs0 = _to_bf16_f32(qs0)
+                        qs1 = _to_bf16_f32(qs1)
+                        v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
+                        v0 = _to_bf16_f32(v0)
+                        v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -497,6 +550,12 @@ def gemm_proj_rope_mxfp8_kernel(
                     buf1[r] = v1
                     col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
                     col_amax1 = cute.arch.fmax(col_amax1, cute.arch.fmax(v1, -v1))
+            if cutlass.const_expr(DBG):
+                # P2: post-rope values, still fp32, before amax/quantize. buf0/buf1 map to the
+                # output features f0/f1 in both the rope and non-rope branches.
+                for r in cutlass.range_constexpr(BLOCK):
+                    mDbgRope[token_base + tok0 + r, head, f0] = buf0[r]
+                    mDbgRope[token_base + tok0 + r, head, f1] = buf1[r]
             invc0, sbc0, invc1, sbc1 = _e8m0_pair(col_amax0, col_amax1)
             scol_row = m_idx * COLBLK + cb
             mScol[scol_row, head, f0] = cutlass.Uint8(sbc0)
@@ -566,6 +625,8 @@ def gemm_proj_rope_mxfp8_host(
     mSrow: cute.Tensor,
     mQcol: cute.Tensor,
     mScol: cute.Tensor,
+    mDbgGemm: cute.Tensor,
+    mDbgRope: cute.Tensor,
     grid_m: cutlass.Constexpr,
     num_heads: cutlass.Constexpr,
     max_active_clusters: cutlass.Constexpr,
@@ -634,6 +695,8 @@ def gemm_proj_rope_mxfp8_host(
         mSrow,
         mQcol,
         mScol,
+        mDbgGemm,
+        mDbgRope,
         epi_tile,
         cta_layout_vmnk,
         tile_sched_params,

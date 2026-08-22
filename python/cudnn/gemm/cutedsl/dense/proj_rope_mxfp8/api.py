@@ -25,6 +25,7 @@ from .gemm_proj_rope_mxfp8_bf16in import (
 from .gemm_proj_rope_mxfp8_mxfp8in import (
     gemm_proj_rope_mxfp8_host as _mxfp8in_host,
     _as_e8m0 as _mxfp8_as_e8m0,
+    DBG as _MXFP8IN_DBG,
 )
 
 from cuda.bindings import driver as cuda
@@ -289,6 +290,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         sample_out_scales_row: torch.Tensor,
         sample_out_fp8_col: torch.Tensor,
         sample_out_scales_col: torch.Tensor,
+        sample_dbg_gemm: torch.Tensor,
+        sample_dbg_rope: torch.Tensor,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -322,6 +325,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             sample_out_scales_row,
             sample_out_fp8_col,
             sample_out_scales_col,
+            sample_dbg_gemm,
+            sample_dbg_rope,
         )
         self._logger.debug(f"__init__ completed: x_code {self.x_code_desc.shape}, w_code {self.w_code_desc.shape}")
 
@@ -431,7 +436,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             swizzle_size = v
         return grid_m, t2r_x8, swizzle_size
 
-    def _to_cute_tensors(self, x_code, x_scale, w_code, w_scale, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col):
+    def _to_cute_tensors(self, x_code, x_scale, w_code, w_scale, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, dbg_gemm, dbg_rope):
         """Compile-time sample conversion."""
         mA = from_dlpack(_maybe_detach(x_code), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mSFA = _mxfp8_as_e8m0(x_scale)
@@ -443,7 +448,9 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         mSrow = from_dlpack(out_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mQcol = from_dlpack(out_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         mScol = from_dlpack(out_scales_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        return mA, mSFA, mB, mSFB, mCos, mSin, mQrow, mSrow, mQcol, mScol
+        mDbgGemm = from_dlpack(dbg_gemm, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        mDbgRope = from_dlpack(dbg_rope, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        return mA, mSFA, mB, mSFB, mCos, mSin, mQrow, mSrow, mQcol, mScol, mDbgGemm, mDbgRope
 
     def compile(self) -> None:
         self._logger.debug("Entering compile")
@@ -482,6 +489,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         out_scales_row,
         out_fp8_col,
         out_scales_col,
+        dbg_gemm,
+        dbg_rope,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         if current_stream is None:
@@ -506,6 +515,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             out_scales_row,
             out_fp8_col,
             out_scales_col,
+            dbg_gemm,
+            dbg_rope,
             current_stream,
         )
 
@@ -644,6 +655,18 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
             wc, ws = w, w_scale
         else:
             wc, ws = w.T.contiguous(), w_scale.T.contiguous()
+
+        # Debug intermediates (NVTE_FUSED_Q_UPROJ_DEBUG). Off by default, in which case the
+        # kernel body never references these and 1-element placeholders suffice.
+        import torch as _torch
+
+        if _MXFP8IN_DBG:
+            dbg_gemm = _torch.empty(tokens, num_heads, HEAD_DIM, dtype=_torch.bfloat16, device=device)
+            dbg_rope = _torch.empty(tokens, num_heads, HEAD_DIM, dtype=_torch.float32, device=device)
+        else:
+            dbg_gemm = _torch.empty(1, 1, 1, dtype=_torch.bfloat16, device=device)
+            dbg_rope = _torch.empty(1, 1, 1, dtype=_torch.float32, device=device)
+
         key = (get_shape(x), get_shape(wc), get_device(x))
         obj = _mxfp8in_obj_cache.get(key)
         if obj is None:
@@ -658,6 +681,8 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
                 sample_out_scales_row=out_scales_row,
                 sample_out_fp8_col=out_fp8_col,
                 sample_out_scales_col=out_scales_col,
+                sample_dbg_gemm=dbg_gemm,
+                sample_dbg_rope=dbg_rope,
             )
             assert obj.check_support()
             obj.compile()
@@ -673,15 +698,21 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
             out_scales_row,
             out_fp8_col,
             out_scales_col,
+            dbg_gemm,
+            dbg_rope,
             current_stream=stream,
         )
 
     else:
         raise AssertionError(f"unsupported input dtype {x.dtype}; expected bfloat16 (BF16 GEMM) or float8_e4m3fn (MXFP8 GEMM)")
 
-    return TupleDict(
+    outputs = dict(
         out_fp8_row=out_fp8_row,
         out_scales_row=out_scales_row,
         out_fp8_col=out_fp8_col,
         out_scales_col=out_scales_col,
     )
+    if _MXFP8IN_DBG and x_cutlass_dtype is cutlass.Float8E4M3FN:
+        outputs["dbg_gemm"] = dbg_gemm
+        outputs["dbg_rope"] = dbg_rope
+    return TupleDict(**outputs)
