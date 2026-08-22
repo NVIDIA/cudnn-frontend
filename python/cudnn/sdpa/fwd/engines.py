@@ -235,6 +235,10 @@ class Capabilities:
     split_kvs: frozenset[int] = frozenset({1})
     # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
     softmax_precisions: frozenset[int] = frozenset()
+    # softmax_precision=HALF notch (knob x arch): the SM set (major*10+minor)
+    # on which this row's lowering carries the f16x2 exponent arm. FLOAT needs
+    # no notch — it is the pipeline every serving row already runs.
+    softmax_half_sms: frozenset[int] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -301,6 +305,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    if knobs is not None and knobs.softmax_precision == cudnn.data_type.HALF and sm not in capabilities.softmax_half_sms:
+        # Notch (knob x arch): the f16x2 exponent arm exists only where the
+        # row declares it; numerics-changing, so honored exactly or declined.
+        honored = ", ".join(f"SM{x}" for x in sorted(capabilities.softmax_half_sms)) or "no device"
+        return f"softmax_precision=HALF is honored on {honored} by this engine; current device is SM{sm}"
     installed, version = cutedsl_state()
     if not installed:
         # Said HERE, not when lowering imports the adapter: a decline at build
@@ -599,6 +608,12 @@ def _sm100_fp8_spec(
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # f16x2-softmax arm: lives in the d128 SM107 sibling kernel (MUFU
+            # EX2.F16x2 exists below cc10.7 but only that file carries the
+            # path; the d192x128 fp8 file has no arm). FLOAT is the f32
+            # pipeline the serving row already runs.
+            softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if d == 128 else frozenset(),
+            softmax_half_sms=frozenset({107}) if d == 128 else frozenset(),
             # Only the d128 fp8 kernel wires SplitHelpers (the d192x128 file
             # forks its own scheduler and has no split path). Split partials
             # reduce in half precision, so mismatch()'s facts x knobs gate

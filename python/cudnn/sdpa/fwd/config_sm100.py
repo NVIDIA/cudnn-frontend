@@ -113,6 +113,12 @@ class TemplateParams:
     # lacks it and uses the manual load + software reduction. Auto-set from the device
     # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
     fused_ldtm_stat: bool = False
+    # softmax_precision knob = cudnn.data_type.HALF: exponent + P-cast run as
+    # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
+    # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
+    # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
+    # so f16 range is exact where it matters and P quantizes to FP8 either way.
+    softmax_f16: bool = False
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -133,6 +139,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     if fp8 and flavor not in ("d128", "d192"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128 and d192")
+    if k.softmax_f16 and not fp8:
+        raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")

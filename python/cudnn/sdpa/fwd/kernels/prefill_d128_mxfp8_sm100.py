@@ -46,6 +46,8 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+if PARAMS.softmax_f16:
+    raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
 Cfg = type(CFG)
 # LDTM.STAT — fused `tcgen05.ld.red.f32.max` (S_acc load + row-max in one op) — is a
 # cc10.3+ capability; cc10.0 lacks it and uses the manual tcgen05_ld + software
