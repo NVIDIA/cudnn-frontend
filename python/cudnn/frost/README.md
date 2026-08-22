@@ -687,17 +687,18 @@ sdpa_bwd_sm100_d128                 (future)
   one row serves several compute capabilities. The row's `Capabilities.arches`
   set is the source of truth for exactly which; the name never enumerates
   minors.
-- Head dimensions are omitted when one engine accepts a domain of dimensions,
-  as the SM120 prefill engine does. `Capabilities.d_qk` and `d_v` are the
-  source of truth for that domain.
-- Geometry-specific engines use `d<dqk>` and append `x<dv>` only when the two
-  head dimensions differ.
+- Head dimensions never appear in engine names: one engine per
+  arch x dtype family accepts a DOMAIN of dimensions and its lowering picks
+  the kernel flavor (the smallest native shape covering the graph).
+  `Capabilities.d_shapes` (native flavor shapes) plus `d_pad_multiple`
+  (envelope alignment; 0 = exact shapes only) are the source of truth for
+  that domain.
 - No version counters. If a genuinely distinct second engine ever serves the
   same cell, give it a descriptive variant suffix (e.g. `_cga4`), not a number.
 - Names are for humans; `engine_id` is for machines. Pin by index
   (`select_plan`) or replay by id -- never by parsing a name.
-- `cudnn.sdpa.fwd.engines.engine_name(d)` computes geometry-specific names;
-  omit `d` for dimension-agnostic engines.
+- `cudnn.sdpa.fwd.engines.engine_name(arch=..., fp8=..., mxfp8=...)` computes
+  the family names (test/user convenience).
 
 
 ## Kernel templates and TemplateParams

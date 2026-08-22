@@ -33,11 +33,11 @@ from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = [requires_blackwell, requires_dsl]
 
-# The per-tensor FP8 rows are split per arch line (sm100 = pre-Rubin
-# Blackwell 100-106, sm107 = the Rubin line): pin the row that serves the
-# device under test. d192/d128 exists on the sm100 row only.
+# ONE per-tensor FP8 engine per arch line (sm100 = pre-Rubin Blackwell
+# 100-106, sm107 = the Rubin line): pin the engine that serves the device
+# under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="d192/d128 per-tensor FP8 has no Rubin kernel (the sm107 row serves d128 only)")
+_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -102,7 +102,6 @@ def _run(
     sync_debug=False,
     d_qk=128,
     d_v=128,
-    engine_shape=None,
 ):
     import cudnn
 
@@ -165,12 +164,9 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    # engine_shape pins a row other than the graph's own dims — the d128 rows
-    # serve smaller head dims through their dense ENVELOPE (zero-padding).
-    # The arch pick rides the ENGINE dims: an enveloped d80 graph pins the
-    # d128 row of the device's arch line (sm100 or sm107).
-    e_qk, e_v = engine_shape if engine_shape is not None else (d_qk, d_v)
-    _select_engine(g, engine_name(e_qk, arch=_D128_ARCH if (e_qk, e_v) == (128, 128) else "sm100", d_v=e_v, fp8=True))
+    # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
+    # and the head-dim envelope) happens inside the lowering.
+    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -349,7 +345,28 @@ def test_fp8_head_dim_envelope(dims, mask):
         sdpa_kwargs=_MASKS[mask],
         d_qk=d_qk,
         d_v=d_v,
-        engine_shape=(128, 128),
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope_d192_flavor():
+    """The d192xd128 flavor serves its envelope too: (160, 96) rides the
+    (192, 128) kernel with TMA zero-padding on both sides."""
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        4,
+        4,
+        384,
+        384,
+        "e4m3",
+        torch.bfloat16,
+        scale=1.0 / math.sqrt(160),
+        sdpa_kwargs={},
+        d_qk=160,
+        d_v=96,
     )
     _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
 
@@ -372,7 +389,6 @@ def test_fp8_head_dim_envelope_padded():
         seq_lens_kv=[384, 250],
         d_qk=80,
         d_v=80,
-        engine_shape=(128, 128),
     )
     _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
 
@@ -569,7 +585,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, arch=_D128_ARCH, fp8=True))
+    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})

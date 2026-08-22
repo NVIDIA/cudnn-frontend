@@ -2257,33 +2257,55 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, has_lse: bool = True) -> Callable:  # noqa: A001
+def compile(  # noqa: A001
+    b: int = 1,
+    qh: int = 1,
+    kh: int = 1,
+    sq: int = 256,
+    skv: int = 128,
+    has_lse: bool = True,
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+) -> Callable:
     """Compile with ALL dims concrete — pins TMA strides at compile time.
+
+    ``d_qk``/``d_v`` <= the native (192, 128) tile serve the dense ENVELOPE:
+    the TMA descriptors carry the ACTUAL extents while the tile box stays the
+    compile-time D, so loads past them hardware zero-fill (exact in FP8 —
+    S/softmax/P·V are bit-identical to the unpadded problem, including the
+    statically-offset second Q/K chunk) and O stores past ``d_v`` are
+    OOB-clipped.
 
     ``has_lse=False`` specializes the LSE argument to ``None`` and removes
     the Stats store while retaining the independent amax writes."""
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError(f"fp8 d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
+        # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
+        # the binding TMA 16-byte global-stride constraint.
+        raise ValueError(f"fp8 d192 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
     _fake_batch = b
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_K),
+        (_fake_batch, sq, qh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_K),
+        (_fake_batch, skv, kh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_O),
+        (_fake_batch, skv, kh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_O),
+        (_fake_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )

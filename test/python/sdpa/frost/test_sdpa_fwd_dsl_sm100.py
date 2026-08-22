@@ -12,12 +12,12 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-pytestmark = requires_blackwell
+pytestmark = requires_pre_rubin_blackwell
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -81,7 +81,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(d))
+    _select_engine(graph, engine_name())
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -206,7 +206,7 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(q_gpu.shape[-1], d_v=d_v))
+    _select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -638,7 +638,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d))
+    _select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -728,7 +728,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d))
+    _select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -898,7 +898,7 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d))
+    _select_engine(g, engine_name())
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu

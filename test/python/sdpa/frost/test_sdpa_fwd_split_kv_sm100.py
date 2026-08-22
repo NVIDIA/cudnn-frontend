@@ -18,9 +18,9 @@ import os
 import pytest
 import torch
 
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
-pytestmark = [requires_blackwell, requires_dsl]
+pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 D = 128
 TILE_N = 128

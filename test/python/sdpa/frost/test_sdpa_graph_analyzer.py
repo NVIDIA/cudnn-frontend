@@ -77,7 +77,8 @@ def test_engines_registered():
     (row,) = [r for r in MANIFEST if r.factory == "FrostSdpaFwdEngines"]
     assert is_python_engine(row.engine_id)
     assert row.id_end - row.engine_id >= len(engines.ENGINE_SPECS)
-    assert engines.engine_name(512) == "sdpa_fwd_prefill_sm100_d512"
+    assert engines.engine_name() == "sdpa_fwd_prefill_sm100"
+    assert engines.engine_name(arch="sm107", fp8=True) == "sdpa_fwd_prefill_sm107_fp8"
 
 
 def test_single_sdpa_node_found():
@@ -99,7 +100,7 @@ def test_probe_accepts_dsv4_causal():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, dims, strides)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_accepts_bf16():
@@ -115,7 +116,7 @@ def test_probe_accepts_bf16():
     v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.BFLOAT16, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides, dtype=cudnn.data_type.BFLOAT16)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_rejects_uncoverable_head_dim():
@@ -144,9 +145,9 @@ def test_probe_envelope_covers_small_head_dim():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
     elig = _eligible(g)
-    assert {engines.engine_name(128), engines.engine_name(256), engines.engine_name(512)} <= elig
+    assert engines.engine_name() in elig
     ordered = [s.name for s in engines.ENGINE_SPECS if s.name in elig]
-    assert ordered[0] == engines.engine_name(128)
+    assert ordered[0] == engines.engine_name()
 
 
 def test_probe_envelope_mixed_dims_pick_covering_flavor():
@@ -160,14 +161,13 @@ def test_probe_envelope_mixed_dims_pick_covering_flavor():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1))
     elig = _eligible(g)
-    assert engines.engine_name(128) not in elig
-    assert {engines.engine_name(192, d_v=128), engines.engine_name(256), engines.engine_name(512)} <= elig
+    assert engines.engine_name() in elig
     ordered = [s.name for s in engines.ENGINE_SPECS if s.name in elig]
-    assert ordered[0] == engines.engine_name(192, d_v=128)
+    assert ordered[0] == engines.engine_name()
 
 
 def test_d192_fp8_sink_dtype_support():
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(192, d_v=128, fp8=True))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
 
     def facts(dtype, *, sink):
         return ga.SdpaGraphFacts(
@@ -252,7 +252,7 @@ def test_probe_accepts_seq_len_q_with_padding_mask():
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_rejects_non_int32_seq_len():
@@ -297,7 +297,7 @@ def test_probe_accepts_bottom_right_with_padded_seq_len_q():
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_rejects_seq_len_q_without_padding_mask():
@@ -340,7 +340,7 @@ def _mk_thd_qkvo(g, *, mask_kwargs, d: int = D):
 def test_probe_accepts_thd_top_left_causal():
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask=True))
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_accepts_thd_bottom_right():
@@ -348,7 +348,7 @@ def test_probe_accepts_thd_bottom_right():
     # own (seq_len_q[b], seq_len_kv[b]) via the cu_seqlen metadata.
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask_bottom_right=True))
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_accepts_thd_stats():
@@ -385,7 +385,7 @@ def test_probe_accepts_thd_stats():
     stats.set_data_type(cudnn.data_type.FLOAT)
     stats_ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="stats_ro")
     stats.set_ragged_offset(stats_ro)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_accepts_right_band_widening():
@@ -395,7 +395,7 @@ def test_probe_accepts_right_band_widening():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=16)
     _finish_output(o, dims, strides)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
     facts = ga.analyze(g)
     assert facts.right_band_widening and facts.right_bound == 16 and not facts.causal
 
@@ -487,7 +487,7 @@ def test_resolve_padding_mask_with_seq_len_kv():
     _finish_output(o, dims, strides)
     cfg = _facts(g)
     assert cfg.padded is True
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_resolve_generate_stats():
@@ -533,7 +533,7 @@ def test_probe_accepts_ragged_skv_via_synth_padding():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_probe_accepts_ragged_skv_with_top_left_causal():
@@ -545,7 +545,7 @@ def test_probe_accepts_ragged_skv_with_top_left_causal():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def _mk_eligible_graph():
@@ -558,7 +558,7 @@ def _mk_eligible_graph():
 
 def test_knob_request_within_domain_keeps_engine_eligible():
     g = _mk_eligible_graph()
-    assert engines.engine_name(512) in _eligible(g, engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2))
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2))
 
 
 def test_knob_request_outside_domain_rejects_engine():
@@ -575,7 +575,7 @@ def test_knob_request_lpt_sched_is_in_domain():
     # The SM100 rows advertise all three scheduler policies (the static/CLC
     # remap serves them); an explicit LPT request stays eligible.
     g = _mk_eligible_graph()
-    assert engines.engine_name(512) in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
 
 
 def test_knob_request_unsupported_tile_rejects_engine():
@@ -596,7 +596,7 @@ def test_knob_request_wrong_vocabulary_rejects_engine():
 
 def test_knob_request_none_fields_are_no_preference():
     g = _mk_eligible_graph()
-    assert engines.engine_name(512) in _eligible(g, engines.SdpaFwdKnobs())
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs())
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +677,7 @@ def test_probe_rejects_requested_amax_s():
             amx_s.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
         return gg
 
-    fp8_name = engines.engine_name(128, fp8=True)
+    fp8_name = engines.engine_name(fp8=True)
     assert fp8_name in _eligible(build(request_amax_s=False))
     assert fp8_name not in _eligible(build(request_amax_s=True))
 
@@ -689,7 +689,7 @@ def test_probe_accepts_bottom_right_with_swa():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask_bottom_right=True, sliding_window_length=64)
     _finish_output(o, dims, strides)
-    assert engines.engine_name(512) in _eligible(g)
+    assert engines.engine_name() in _eligible(g)
 
 
 def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
@@ -893,7 +893,7 @@ def test_probe_accepts_thd_cu_seq_len():
     """THD with the (B+1,) cu_seq_len prefix-sum form (cuDNN 9.24+) is served:
     the lowering derives per-batch lengths host-side from its inherent tolist
     round-trip."""
-    assert engines.engine_name(512) in _eligible(_mk_thd_cu_graph())
+    assert engines.engine_name() in _eligible(_mk_thd_cu_graph())
 
 
 def test_probe_rejects_thd_cu_plus_seq_len():

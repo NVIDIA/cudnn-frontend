@@ -67,14 +67,15 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(128, fp8=True)]
-    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
-    d192 = caps[engines.engine_name(192, d_v=128, fp8=True)]
+    sm100 = caps[engines.engine_name(fp8=True)]
+    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    assert (d192.sm_lo, d192.sm_hi) == (100, 106)  # no Rubin d192 kernel
+    # Kernel flavors are row DATA: Rubin has no d192 sibling.
+    assert sm100.d_shapes == frozenset({(128, 128), (192, 128)})
+    assert sm107.d_shapes == frozenset({(128, 128)})
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -113,8 +114,8 @@ def test_softmax_half_declines_by_row_domain():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(128, fp8=True)]
-    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    sm100 = caps[engines.engine_name(fp8=True)]
+    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
 
     assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
@@ -184,17 +185,14 @@ def test_softmax_points_never_propose_half():
         sm_lo=100,
         sm_hi=119,
         phase="prefill",
-        d_qk=frozenset({128}),
-        d_v=frozenset({128}),
+        d_shapes=frozenset({(128, 128)}),
         softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF}),
     )
     assert _softmax_points(lit) == [_c.data_type.FLOAT]
-    dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}))
+    dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}))
     assert _softmax_points(dark) == [None]
     # A HALF-only row must still not get HALF auto-proposed (numerics-changing).
-    half_only = Capabilities(
-        sm_lo=100, sm_hi=119, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}), softmax_precisions=frozenset({_c.data_type.HALF})
-    )
+    half_only = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.HALF}))
     assert _softmax_points(half_only) == [None]
 
 
@@ -272,22 +270,20 @@ def test_fp8_softmax_f16_e2e():
     assert xerr <= 0.05 * ref.abs().max().item(), f"HALF-vs-FLOAT softmax divergence {xerr}"
 
 
-def test_fp8_d128_rows_serve_dense_envelope():
-    """BOTH d128/d128 per-tensor FP8 rows (sm100 and sm107) serve the dense
-    d<=128 head-dim ENVELOPE (TMA zero-padding — exact in FP8; d % 16 at
-    1 byte/elem, and arch-independent since the descales are scalars). THD
-    stays native-tile (the packed THD compile key carries no head-dim
-    entries) and the d192/d128 and MXFP8 rows stay exact-native."""
+def test_fp8_rows_serve_dense_envelope():
+    """BOTH per-tensor FP8 rows (sm100 and sm107) serve the dense head-dim
+    ENVELOPE of their kernel flavors (TMA zero-padding — exact in FP8;
+    d % 16 at 1 byte/elem, and arch-independent since the descales are
+    scalars). THD stays native-tile (the packed THD compile key carries no
+    head-dim entries) and MXFP8 stays exact-native (d_pad_multiple=0)."""
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     for arch in ("sm100", "sm107"):
-        row = caps[engines.engine_name(128, arch=arch, fp8=True)]
-        assert row.d_envelope, arch
+        row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-        assert not row.thd_d_envelope, arch
-    assert not caps[engines.engine_name(192, d_v=128, fp8=True)].d_envelope
-    assert not caps[engines.engine_name(128, mxfp8=True)].d_envelope
+        assert row.thd_d_shapes == frozenset({(128, 128)}), arch
+    assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 
 def _fp8_facts(**kw):
@@ -319,13 +315,20 @@ def test_fp8_envelope_mismatch_rules():
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(128, fp8=True)]
+    sm100 = caps[engines.engine_name(fp8=True)]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
+    # The d192xd128 flavor serves its envelope too (kernel takes d_qk/d_v).
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=96)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
-    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
-    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    # THD at the d192 native shape is dense-only (thd_d_shapes = {(128, 128)}).
+    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True))
+    # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case)
+    # but has no d192 flavor at all.
+    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
