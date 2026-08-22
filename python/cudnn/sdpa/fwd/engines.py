@@ -282,7 +282,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
             if value is not None and value not in domain:
-                return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
+                # key=int: knob domains mix plain ints with cudnn.data_type
+                # members (softmax_precision), and the pybind enum defines no
+                # ordering of its own.
+                return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
         if knobs.split_kv is not None and knobs.split_kv > 1:
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths

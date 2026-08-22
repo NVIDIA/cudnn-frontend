@@ -1008,7 +1008,6 @@ def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
     return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
 
 
-
 @cute.jit
 def _mma_warp_quiet(tmem_ptr_i32, bars):
     """Non-leader CTA's MMA-warp body under cga2: alloc + named-bar arrive +
