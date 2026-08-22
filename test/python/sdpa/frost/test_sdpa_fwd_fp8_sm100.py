@@ -354,21 +354,34 @@ def test_fp8_head_dim_envelope(dims, mask):
 @torch_fork_set_rng(seed=0)
 def test_fp8_head_dim_envelope_d192_flavor():
     """The d192xd128 flavor serves its envelope too: (160, 96) rides the
-    (192, 128) kernel with TMA zero-padding on both sides."""
-    out, o_ref, a_o, a_o_ref = _run(
-        2,
-        4,
-        4,
-        384,
-        384,
-        "e4m3",
-        torch.bfloat16,
-        scale=1.0 / math.sqrt(160),
-        sdpa_kwargs={},
-        d_qk=160,
-        d_v=96,
-    )
-    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
+    (192, 128) kernel with TMA zero-padding on both sides.
+
+    Direct adapter API: the pygraph ``sdpa_fp8`` node validator still bounds
+    the GRAPH route at d_qk <= 128 (%16) / exact (192, 128) — a pre-FE-OSS
+    shape whitelist in the C++ frontend — so this region of the envelope is
+    reachable through the standalone API only until that validation is
+    relaxed to describe rather than judge."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, S, d_qk, d_v = 2, 4, 384, 160, 96
+    dev = "cuda"
+    Q8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    K8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    V8 = (torch.randn(B, H, S, d_v, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    out = torch.empty(B, H, S, d_v, device=dev, dtype=torch.bfloat16)
+    lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(d_qk)
+
+    api = SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=scale, pertensor_fp8=True)
+    assert api.check_support()
+    api.compile()
+    api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
+    torch.cuda.synchronize()
+
+    o_ref = torch.softmax(Q8.float() @ K8.float().transpose(-1, -2) * scale, dim=-1) @ V8.float()
+    err = (out.float() - o_ref).abs().max().item()
+    assert err <= 5e-2 + 0.05 * o_ref.abs().max().item(), f"(160,96) envelope mismatch: max err {err}"
+    assert not torch.isnan(out.float()).any()
 
 
 @pytest.mark.L0
