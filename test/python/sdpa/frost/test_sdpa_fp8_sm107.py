@@ -58,6 +58,72 @@ def test_sm107_per_tensor_fp8_advertises_only_d128():
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
 
+def test_per_tensor_fp8_rows_split_per_arch_line():
+    """The per-tensor FP8 rows are split at the Rubin boundary — each row
+    declares exactly what its own lowering carries, with no knob x arch
+    notches: HALF softmax and the missing split/LPT paths are row DATA."""
+    import cudnn as _c
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(128, fp8=True)]
+    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    d192 = caps[engines.engine_name(192, d_v=128, fp8=True)]
+
+    # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
+    assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (d192.sm_lo, d192.sm_hi) == (100, 106)  # no Rubin d192 kernel
+
+    # The f16x2 exponent arm is Rubin-row data, not a notch.
+    assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
+    assert sm107.softmax_precisions == frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
+
+    # The SM107 sibling has no split path and no LPT remap yet (issue #653).
+    assert sm107.split_kvs == frozenset({1})
+    assert sm100.split_kvs == frozenset({1, 2, 4})
+    assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
+
+    # Both d128 cells carry the write_thd_meta THD leg.
+    assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
+
+
+def test_softmax_half_declines_by_row_domain():
+    """A HALF request on the sm100 row declines through the generic knob
+    domain gate; the sm107 row admits it. Pure — facts pin the device."""
+    import cudnn as _c
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+
+    def facts(cc):
+        return ga.SdpaGraphFacts(
+            b=1,
+            h_q=4,
+            h_kv=4,
+            s_q=256,
+            s_kv=256,
+            d_qk=128,
+            d_v=128,
+            dtype=_c.data_type.FP8_E4M3,
+            dtype_o=_c.data_type.BFLOAT16,
+            is_fp8=True,
+            device_cc=cc,
+        )
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(128, fp8=True)]
+    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
+
+    assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
+    assert engines.mismatch(sm107, facts((10, 7)), half) is None
+    # And the rows keep their arch lanes regardless of the knob.
+    assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
+    assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
+
+
 @pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
 def test_fp8_thd_leg_loads(rubin):
     """The write_thd_meta THD leg (issue #552) is baked into BOTH fp8 d128

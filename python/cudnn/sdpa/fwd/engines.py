@@ -90,10 +90,11 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
-    # Softmax accumulation precision as a cudnn.data_type value. Framework
-    # axis: no forward kernel declares a domain yet, so any explicit request
-    # declines; the first kernel that grows an f16-softmax arm lights it up
-    # by declaring {FLOAT, HALF} on its row.
+    # Softmax accumulation precision as a cudnn.data_type value. Served rows
+    # declare their domain: the per-tensor FP8 d128 rows serve FLOAT, and the
+    # sm107 (Rubin) row additionally HALF — its kernel's f16x2 exponent arm.
+    # HALF is numerics-changing, so it is honored on explicit request only,
+    # never auto-proposed (see heuristics._softmax_points).
     softmax_precision: Optional[int] = None
 
 
@@ -234,11 +235,11 @@ class Capabilities:
     # widen this (the SM100 f16 rows today).
     split_kvs: frozenset[int] = frozenset({1})
     # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
+    # Arch-dependent membership (the f16x2 exponent arm exists only in the
+    # SM107 sibling kernel) is expressed by SPLITTING the row per arch line —
+    # each row declares exactly what its own lowering carries — not by a
+    # knob x arch notch here.
     softmax_precisions: frozenset[int] = frozenset()
-    # softmax_precision=HALF notch (knob x arch): the SM set (major*10+minor)
-    # on which this row's lowering carries the f16x2 exponent arm. FLOAT needs
-    # no notch — it is the pipeline every serving row already runs.
-    softmax_half_sms: frozenset[int] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -308,11 +309,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
-    if knobs is not None and knobs.softmax_precision == cudnn.data_type.HALF and sm not in capabilities.softmax_half_sms:
-        # Notch (knob x arch): the f16x2 exponent arm exists only where the
-        # row declares it; numerics-changing, so honored exactly or declined.
-        honored = ", ".join(f"SM{x}" for x in sorted(capabilities.softmax_half_sms)) or "no device"
-        return f"softmax_precision=HALF is honored on {honored} by this engine; current device is SM{sm}"
     installed, version = cutedsl_state()
     if not installed:
         # Said HERE, not when lowering imports the adapter: a decline at build
@@ -555,8 +551,26 @@ def _sm100_fp8_spec(
     *,
     dtypes: Optional[frozenset] = None,
     sink_dtypes: Optional[frozenset] = None,
+    arch: str = "sm100",
 ) -> EngineSpec:
     """Exact-shape per-tensor FP8 engine with scalar descales.
+
+    One row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
+    "sm107" = Rubin line 107-119), because the two lowerings genuinely
+    diverge and a shared row could only describe their union with knob x arch
+    notches. Each row declares exactly what its own kernel carries:
+
+    - softmax_precisions: the f16x2 exponent arm lives only in the SM107
+      sibling kernel, so only that row admits HALF.
+    - split_kvs: only the SM100 d128 kernel wires SplitHelpers; the SM107
+      sibling has no split path yet.
+    - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
+      sibling (issue #653); {NATURAL} keeps requests honest AND routes the
+      graph path around the un-ported derivation (place() hands the adapter
+      an explicit policy from this domain).
+    - d192/d128 exists only on the sm100 row (no Rubin d192 kernel), so a
+      Rubin d192 graph is now ineligible at probe time instead of a late
+      build error.
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
@@ -571,13 +585,18 @@ def _sm100_fp8_spec(
     d_v = d if d_v is None else d_v
     suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
     thd = (d, d_v) == (128, 128)
+    rubin_row = arch == "sm107"
+    assert not (rubin_row and (d, d_v) != (128, 128)), "Rubin serves only per-tensor FP8 d128"
     if dtypes is None:
         dtypes = frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_{suffix}_fp8",
+        name=f"sdpa_fwd_prefill_{arch}_{suffix}_fp8",
         capabilities=Capabilities(
-            sm_lo=_BLACKWELL[0],
-            sm_hi=_BLACKWELL[1],
+            # Ranges, not the parts that exist today (see sm_lo above): the
+            # split point is the Rubin line — 100-106 runs the SM100 module,
+            # 107-119 the SM107 sibling.
+            sm_lo=107 if rubin_row else _BLACKWELL[0],
+            sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d_v}),
@@ -607,21 +626,24 @@ def _sm100_fp8_spec(
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # LPT/LPT_L2 remap is not yet ported to the SM107 sibling (issue
+            # #653) — its row serves NATURAL only until the port lands.
+            sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
-            # f16x2-softmax arm: lives in the d128 SM107 sibling kernel (MUFU
-            # EX2.F16x2 exists below cc10.7 but only that file carries the
-            # path; the d192x128 fp8 file has no arm). FLOAT is the f32
-            # pipeline the serving row already runs.
-            softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if d == 128 else frozenset(),
-            softmax_half_sms=frozenset({107}) if d == 128 else frozenset(),
-            # Only the d128 fp8 kernel wires SplitHelpers (the d192x128 file
-            # forks its own scheduler and has no split path). Split partials
-            # reduce in half precision, so mismatch()'s facts x knobs gate
-            # additionally requires a bf16/fp16 O on the quantized rows.
-            split_kvs=frozenset({1, 2, 4}) if d == 128 else frozenset({1}),
+            # f16x2-softmax arm: only the SM107 sibling kernel carries the
+            # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
+            # it). FLOAT is the f32 pipeline every serving row already runs.
+            softmax_precisions=(
+                frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else (frozenset({cudnn.data_type.FLOAT}) if d == 128 else frozenset())
+            ),
+            # Only the SM100 d128 fp8 kernel wires SplitHelpers (the SM107
+            # sibling has no split path yet; the d192x128 file forks its own
+            # scheduler and has none either). Split partials reduce in half
+            # precision, so mismatch()'s facts x knobs gate additionally
+            # requires a bf16/fp16 O on the quantized rows.
+            split_kvs=frozenset({1, 2, 4}) if (d == 128 and not rubin_row) else frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -1091,6 +1113,7 @@ ENGINE_SPECS = (
     _sm100_mxfp8_spec(128),
     _sm100_mxfp8_spec(192, d_v=128),
     _sm100_fp8_spec(128),
+    _sm100_fp8_spec(128, arch="sm107"),
     _sm100_fp8_spec(
         192,
         d_v=128,

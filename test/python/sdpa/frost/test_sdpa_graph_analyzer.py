@@ -565,7 +565,8 @@ def test_knob_request_outside_domain_rejects_engine():
     # A value no row's domain contains: honored or ineligible, never degraded.
     g = _mk_eligible_graph()
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # softmax_precision is a framework axis with no serving kernel yet: any
+    # softmax_precision=1 is cudnn.data_type.DOUBLE — in no row's domain (the
+    # fp8 rows serve FLOAT, and the sm107 row additionally HALF), so an
     # explicit request declines everywhere.
     assert not _eligible(g, engines.SdpaFwdKnobs(softmax_precision=1))
 

@@ -903,7 +903,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         # The f16x2 exponent arm is numerics-changing and lives in the SM107
         # sibling kernel only — honored exactly or declined (mirrors the
-        # engine row's softmax_half_sms notch).
+        # split engine rows: only sdpa_fwd_prefill_sm107_d128_fp8 declares
+        # HALF in its softmax_precisions domain).
         self._value_error_if(
             self.softmax_precision == _cudnn_dtype.HALF and self._device_cc != (10, 7),
             "softmax_precision=HALF is served for per-tensor FP8 on cc10.7 only (FLOAT is the default everywhere)",

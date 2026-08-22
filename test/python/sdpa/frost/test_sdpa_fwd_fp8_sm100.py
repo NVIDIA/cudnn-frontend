@@ -25,12 +25,18 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import _SM, requires_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = [requires_blackwell, requires_dsl]
+
+# The per-tensor FP8 rows are split per arch line (sm100 = pre-Rubin
+# Blackwell 100-106, sm107 = the Rubin line): pin the row that serves the
+# device under test. d192/d128 exists on the sm100 row only.
+_D128_ARCH = "sm107" if _SM == 107 else "sm100"
+_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="d192/d128 per-tensor FP8 has no Rubin kernel (the sm107 row serves d128 only)")
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -157,7 +163,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d_qk, d_v=d_v, fp8=True))
+    _select_engine(g, engine_name(d_qk, arch=_D128_ARCH if (d_qk, d_v) == (128, 128) else "sm100", d_v=d_v, fp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -243,6 +249,7 @@ def test_fp8_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
+@_skip_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
@@ -266,6 +273,7 @@ def test_fp8_d192_d128_output_dtypes(in_key, out_key):
     _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
+@_skip_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
 @torch_fork_set_rng(seed=0)
@@ -288,6 +296,7 @@ def test_fp8_d192_d128_masks(mask):
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
+@_skip_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_zero_length_kv():
@@ -502,7 +511,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, fp8=True))
+    _select_engine(g, engine_name(128, arch=_D128_ARCH, fp8=True))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})

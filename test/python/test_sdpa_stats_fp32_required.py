@@ -68,9 +68,7 @@ def _build_sdpa_with_stats(io_dtype, stats_dtype):
 def test_non_fp32_stats_rejected(io_dtype, stats_dtype):
     """An explicitly non-FP32 Stats output is rejected at validate(), before
     any kernel can write FP32 rows past the end of an undersized buffer."""
-    with pytest.raises(
-        cudnn.cudnnGraphNotSupportedError, match="Stats output of sdpa must be an FP32"
-    ):
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Stats output of sdpa must be an FP32"):
         _build_sdpa_with_stats(io_dtype, stats_dtype)
 
 
