@@ -1854,6 +1854,13 @@ def _render_block_scale_template(
     moe_host_ma_pass = ",\n".join([f"a_{i}" for i in range(na)] + [f"_a_stride_sets[{i}][0]" for i in range(na)])
     if moe_host_ma_pass:
         moe_host_ma_pass += ","
+    moe_kernel_msfa_params = ",\n".join(f"mSFA_{i}: cute.Tensor" for i in range(na))
+    if moe_kernel_msfa_params:
+        moe_kernel_msfa_params += ","
+    moe_msfa_list = "mSFA_list = [" + ", ".join(f"mSFA_{i}" for i in range(na)) + "]"
+    moe_host_msfa_pass = ",\n".join(f"_sfa_operands[{i}]" for i in range(na))
+    if moe_host_msfa_pass:
+        moe_host_msfa_pass += ","
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -1907,6 +1914,9 @@ def _render_block_scale_template(
                 "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
                 "INJECT_MOE_MA_LIST": moe_ma_list,
                 "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
+                "INJECT_MOE_KERNEL_MSFA_PARAMS": moe_kernel_msfa_params,
+                "INJECT_MOE_MSFA_LIST": moe_msfa_list,
+                "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
             }
         )
 
@@ -2759,12 +2769,9 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
       wired (an M=64 MMA block drains through the packed lane<16 layout).
     - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
-    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
+    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store),
+      and not MoE: the six MoE templates carry only the N-major TMA store.
     """
-    if chain.has_moe:
-        # MoE scatters output rows by routed group; the TMA-store path writes
-        # contiguous tiles with no group offset → STG-only.
-        return False
     if chain.is_multi_gemm:
         # No multi-accumulator hook in the TMA-store path → STG only.
         return False
@@ -2802,6 +2809,8 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     if cta_group == 2 and cfg.cta_tile_n < 64:
         return False
     if chain.out_major == "m":
+        if chain.has_moe:
+            return False
         m_align = 16 // DTYPE_BYTES[chain.output_dtype]
         return chain.matmul.M % m_align == 0
     return True
@@ -3211,18 +3220,22 @@ class CompiledMoeGemm:
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
     # clamped); drives the runtime output/aux alignment requirements.
     vec_bytes_epi: "int | None" = None
+    # Tensormap slots each CTA patches: one per distinct A operand, plus the
+    # output descriptor when the TMA-store epilogue is on (re-dimensioned per
+    # routed group so the hardware clips the ragged tail).
+    _desc_slots_per_cta: int = 0
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
     def workspace_bytes(self) -> int:
-        """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
-        distinct A operand. The persistent grid is shape-independent, so this is
+        """Per-CTA tensormap scratch: one 128-byte slot per CTA per patched
+        descriptor. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self.chain.num_a_operands * _MOE_DESC_SLOT_BYTES
+        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
-        """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
-        aligned). ``n_slots`` = grid_ctas * num_a_operands. Carved from the
+        """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
+        aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
@@ -3297,8 +3310,8 @@ class CompiledMoeGemm:
             (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
-        # A-descriptor workspace: one 128-byte tensormap slot per CTA.
-        workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
+        # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3418,8 +3431,8 @@ class CompiledMoeGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        # Workspace: one 128-B A descriptor per distinct A operand per CTA.
-        workspace = self._make_workspace(self._grid_ctas * na, workspace)
+        # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3459,22 +3472,16 @@ def _jit_moe(
     _check_dtype_config_compat(chain, config, cta_group)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
-    global _FORCE_STG_EPI
-    prev_force = _FORCE_STG_EPI
-    _FORCE_STG_EPI = True  # MoE epilogue is STG-only
-    try:
-        vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-        _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
-        use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
-        snippets = generate(
-            chain,
-            vec_bytes_epi=vec_bytes_epi,
-            output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-            use_tma_store=use_tma,
-        )
-        src = _render_template(chain, snippets, config, cta_group)
-    finally:
-        _FORCE_STG_EPI = prev_force
+    vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
+    _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
+    use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
+    snippets = generate(
+        chain,
+        vec_bytes_epi=vec_bytes_epi,
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+        use_tma_store=use_tma,
+    )
+    src = _render_template(chain, snippets, config, cta_group)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n
@@ -3489,6 +3496,7 @@ def _jit_moe(
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
         vec_bytes_epi=vec_bytes_epi,
+        _desc_slots_per_cta=chain.num_a_operands + (1 if use_tma else 0),
     )
 
 
@@ -3587,6 +3595,10 @@ class CompiledMoeBlockScaleGemm:
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
     # clamped); drives the runtime output/aux alignment requirements.
     vec_bytes_epi: "int | None" = None
+    # Tensormap slots each CTA patches: one per distinct A operand, one per SFA
+    # (its base carries start_sf_block_m and its m extent bounds the group), plus
+    # the output descriptor when the TMA-store epilogue re-dimensions it per group.
+    _desc_slots_per_cta: int = 0
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
@@ -3594,7 +3606,7 @@ class CompiledMoeBlockScaleGemm:
         """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
         distinct A operand. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self.chain.num_a_operands * _MOE_DESC_SLOT_BYTES
+        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
@@ -3682,7 +3694,7 @@ class CompiledMoeBlockScaleGemm:
         ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
-        workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3817,7 +3829,7 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        workspace = self._make_workspace(self._grid_ctas * na, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3870,12 +3882,13 @@ def _jit_moe_block_scale(
         raise NotImplementedError(_arch_reason)
     _compute_output_vec_bytes(chain)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
+    use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
     _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
     snippets = generate(
         chain,
         vec_bytes_epi=vec_bytes_epi,
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        use_tma_store=(not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group),
+        use_tma_store=use_tma,
     )
     src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
@@ -3891,4 +3904,5 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=vec_bytes_epi,
+        _desc_slots_per_cta=chain.num_a_operands * 2 + (1 if use_tma else 0),
     )
