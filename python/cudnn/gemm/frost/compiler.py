@@ -2769,7 +2769,8 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
       wired (an M=64 MMA block drains through the packed lane<16 layout).
     - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
-    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
+    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store),
+      and not MoE: the six MoE templates carry only the N-major TMA store.
     """
     if chain.is_multi_gemm:
         # No multi-accumulator hook in the TMA-store path → STG only.
@@ -2808,6 +2809,8 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     if cta_group == 2 and cfg.cta_tile_n < 64:
         return False
     if chain.out_major == "m":
+        if chain.has_moe:
+            return False
         m_align = 16 // DTYPE_BYTES[chain.output_dtype]
         return chain.matmul.M % m_align == 0
     return True
@@ -3592,8 +3595,9 @@ class CompiledMoeBlockScaleGemm:
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
     # clamped); drives the runtime output/aux alignment requirements.
     vec_bytes_epi: "int | None" = None
-    # Tensormap slots each CTA patches: one per distinct A operand, plus the
-    # output descriptor when the TMA-store epilogue re-dimensions it per group.
+    # Tensormap slots each CTA patches: one per distinct A operand, one per SFA
+    # (its base carries start_sf_block_m and its m extent bounds the group), plus
+    # the output descriptor when the TMA-store epilogue re-dimensions it per group.
     _desc_slots_per_cta: int = 0
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
