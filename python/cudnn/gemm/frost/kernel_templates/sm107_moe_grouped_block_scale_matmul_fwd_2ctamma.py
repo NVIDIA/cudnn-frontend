@@ -1160,6 +1160,7 @@ def _kernel(
                 if warp_idx == 0:
                     if group_end != previous_group_end:
                         previous_group_end = group_end
+                        nvvm.cp_async_bulk_wait_group(0, read=True)
                         _fence_tensormap_acquire(d_desc_tma_ptr)
                         if elect_one:
                             _replace_tensormap_global_dim_1(tma_c_desc_smem, group_end)
