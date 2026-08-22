@@ -58,6 +58,72 @@ def test_sm107_per_tensor_fp8_advertises_only_d128():
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
 
+def test_per_tensor_fp8_rows_split_per_arch_line():
+    """The per-tensor FP8 rows are split at the Rubin boundary — each row
+    declares exactly what its own lowering carries, with no knob x arch
+    notches: HALF softmax and the missing split/LPT paths are row DATA."""
+    import cudnn as _c
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(128, fp8=True)]
+    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    d192 = caps[engines.engine_name(192, d_v=128, fp8=True)]
+
+    # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
+    assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
+    assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
+    assert (d192.sm_lo, d192.sm_hi) == (100, 106)  # no Rubin d192 kernel
+
+    # The f16x2 exponent arm is Rubin-row data, not a notch.
+    assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
+    assert sm107.softmax_precisions == frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
+
+    # The SM107 sibling has no split path and no LPT remap yet (issue #653).
+    assert sm107.split_kvs == frozenset({1})
+    assert sm100.split_kvs == frozenset({1, 2, 4})
+    assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
+
+    # Both d128 cells carry the write_thd_meta THD leg.
+    assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
+
+
+def test_softmax_half_declines_by_row_domain():
+    """A HALF request on the sm100 row declines through the generic knob
+    domain gate; the sm107 row admits it. Pure — facts pin the device."""
+    import cudnn as _c
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+
+    def facts(cc):
+        return ga.SdpaGraphFacts(
+            b=1,
+            h_q=4,
+            h_kv=4,
+            s_q=256,
+            s_kv=256,
+            d_qk=128,
+            d_v=128,
+            dtype=_c.data_type.FP8_E4M3,
+            dtype_o=_c.data_type.BFLOAT16,
+            is_fp8=True,
+            device_cc=cc,
+        )
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(128, fp8=True)]
+    sm107 = caps[engines.engine_name(128, arch="sm107", fp8=True)]
+    half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
+
+    assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
+    assert engines.mismatch(sm107, facts((10, 7)), half) is None
+    # And the rows keep their arch lanes regardless of the knob.
+    assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
+    assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
+
+
 @pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
 def test_fp8_thd_leg_loads(rubin):
     """The write_thd_meta THD leg (issue #552) is baked into BOTH fp8 d128
@@ -69,3 +135,138 @@ def test_fp8_thd_leg_loads(rubin):
     assert mod.CFG.THD_VARLEN == 1
     assert mod.CFG.SEQ_KV_LENS_PRESENT == 1  # THD overloads the metadata buffer
     assert mod.CGA_TILE_M == mod.CFG.TILES_Q * mod.CFG.TILE_M * mod.CFG.CTA_MMA
+
+
+def test_softmax_f16_module_derivation():
+    """softmax_precision=HALF folds to the SM107 sibling's f16x2 exponent
+    path (SOFTMAX_F16=1); the SM100 module refuses the flag outright."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    mod = _load_sm100_kernel_module(
+        (128, 128),
+        TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, softmax_f16=True),
+        fp8=True,
+        pertensor=True,
+        rubin=True,
+    )
+    assert "sm107" in mod.__name__
+    assert mod.SOFTMAX_F16 == 1
+    # Default stays the f32 exponent chain.
+    assert _load(rubin=True).SOFTMAX_F16 == 0
+    with pytest.raises(ValueError, match="softmax_f16"):
+        _load_sm100_kernel_module(
+            (128, 128),
+            TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, softmax_f16=True),
+            fp8=True,
+            pertensor=True,
+            rubin=False,
+        )
+
+
+def test_softmax_f16_rejects_half_inputs():
+    """Config-validator backstop: f16/bf16 inputs never run the f16x2
+    softmax (their softmax is the f32 pipeline already)."""
+    from cudnn.sdpa.fwd.config_sm100 import make_cfg_d128
+
+    _FP16 = 3
+    with pytest.raises(ValueError, match="softmax_f16"):
+        make_cfg_d128(TemplateParams(dtype_qkv=_FP16, softmax_f16=True))
+
+
+def test_softmax_points_never_propose_half():
+    """propose() fills the axis with FLOAT where the row serves it — HALF is
+    numerics-changing and reachable by explicit request only."""
+    import cudnn as _c
+    from cudnn.sdpa.fwd.engines import Capabilities
+    from cudnn.sdpa.fwd.heuristics import _softmax_points
+
+    lit = Capabilities(
+        sm_lo=100,
+        sm_hi=119,
+        phase="prefill",
+        d_qk=frozenset({128}),
+        d_v=frozenset({128}),
+        softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF}),
+    )
+    assert _softmax_points(lit) == [_c.data_type.FLOAT]
+    dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}))
+    assert _softmax_points(dark) == [None]
+    # A HALF-only row must still not get HALF auto-proposed (numerics-changing).
+    half_only = Capabilities(
+        sm_lo=100, sm_hi=119, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}), softmax_precisions=frozenset({_c.data_type.HALF})
+    )
+    assert _softmax_points(half_only) == [None]
+
+
+@requires_dsl
+def test_softmax_precision_knob_gate():
+    """Vocabulary and arch gate: unknown dtypes raise; HALF is declined
+    everywhere except per-tensor FP8 on cc10.7; FLOAT is accepted on the
+    per-tensor FP8 path (it is the pipeline that path already runs)."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("needs an fp8-admitted SM10x part")
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, S, D = 1, 1, 256, 128
+    dev = "cuda"
+    q8 = torch.zeros(B, H, S, D, device=dev, dtype=torch.float8_e4m3fn)
+    o = torch.empty(B, H, S, D, device=dev, dtype=torch.bfloat16)
+    lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
+
+    def mk(precision):
+        return SdpaFwdDslSm100(
+            sample_q=q8, sample_k=q8, sample_v=q8, sample_o=o, sample_lse=lse, scale_softmax=0.1, pertensor_fp8=True, softmax_precision=precision
+        )
+
+    with pytest.raises(ValueError, match="softmax_precision"):
+        mk(_c.data_type.BFLOAT16).check_support()
+
+    assert mk(_c.data_type.FLOAT).check_support()  # the pipeline this path runs
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        assert mk(_c.data_type.HALF).check_support()
+    else:
+        with pytest.raises(ValueError, match="HALF"):
+            mk(_c.data_type.HALF).check_support()
+
+
+@requires_dsl
+def test_fp8_softmax_f16_e2e():
+    """Rubin e2e: the f16x2 exponent path against the FLOAT run of the same
+    problem — same kernel family, same quantized-P contract, so the two
+    agree to fp8-quantization noise."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("softmax_precision=HALF serves cc10.7 only")
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(0)
+    B, H, S, D = 2, 4, 512, 128
+    dev = "cuda"
+    Q8, K8, V8 = ((torch.randn(B, H, S, D, device=dev) * 0.5).to(torch.float8_e4m3fn) for _ in range(3))
+    lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
+    outs = {}
+    for precision in (_c.data_type.FLOAT, _c.data_type.HALF):
+        out = torch.empty(B, H, S, D, device=dev, dtype=torch.bfloat16)
+        api = SdpaFwdDslSm100(
+            sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=D**-0.5, pertensor_fp8=True, softmax_precision=precision
+        )
+        assert api.check_support()
+        api.compile()
+        api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
+        torch.cuda.synchronize()
+        outs[precision] = out.float()
+
+    ref = torch.softmax(Q8.float() @ K8.float().transpose(-1, -2) * D**-0.5, dim=-1) @ V8.float()
+    for precision, out in outs.items():
+        err = (out - ref).abs().max().item()
+        assert err <= 0.1 * ref.abs().max().item(), f"{precision}: max err {err} vs fp32 reference"
+    xerr = (outs[_c.data_type.HALF] - outs[_c.data_type.FLOAT]).abs().max().item()
+    assert xerr <= 0.05 * ref.abs().max().item(), f"HALF-vs-FLOAT softmax divergence {xerr}"

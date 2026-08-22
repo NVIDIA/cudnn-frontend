@@ -315,3 +315,58 @@ def sigmoid_f16x2(logit_pair: cutlass.Int32, input_dtype: cutlass.Constexpr):
     value0 = cute.math.tanh(logit_vec_f32[0] * half, approx=True) * half + half
     value1 = cute.math.tanh(logit_vec_f32[1] * half, approx=True) * half + half
     return value0, value1
+
+
+@cute.jit
+def ex2_f16x2(pair: cutlass.Int32, *, dtype=cutlass.Float16) -> cutlass.Int32:
+    """Packed-pair ``exp2`` in ONE MUFU op: ``ex2.approx.f16x2`` (fp16) or
+    ``ex2.approx.ftz.bf16x2`` (bf16).
+
+    PTX/target contract (ISA 9.4, 9.7.4.10):
+
+    - ``.f16x2``: PTX ISA 7.0, sm_75+. Max relative error 2^-9.9; subnormal
+      inputs are supported.
+    - ``.ftz.bf16x2``: PTX ISA 7.8, sm_90+. Max relative error 2^-7; ``ftz``
+      is mandatory for bf16 — subnormal inputs and results flush to
+      sign-preserving zero (so +/-subnormal -> +1.0; -Inf -> +0.0;
+      NaN -> NaN).
+    """
+    if cutlass.const_expr(dtype != cutlass.Float16 and dtype != cutlass.BFloat16):
+        raise TypeError(f"ex2_f16x2: dtype must be Float16 or BFloat16, got {dtype}")
+    op = "ex2.approx.f16x2" if cutlass.const_expr(dtype == cutlass.Float16) else "ex2.approx.ftz.bf16x2"
+    return inline_ptx(
+        f"{op} $0, $1;",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[pair],
+    )
+
+
+@cute.jit
+def f16x2x2_to_fp8_word(lo_pair: cutlass.Int32, hi_pair: cutlass.Int32, dtype_tag: cutlass.Constexpr, *, dtype=cutlass.Float16) -> cutlass.Int32:
+    """Two packed half-pair words (elems 0..3 in order) into one 4-byte FP8 word.
+
+    ``cvt.rn.satfinite.{e4m3,e5m2}x2.{f16x2,bf16x2}`` converts a packed pair
+    directly (no f32 round-trip): byte 0 = fp8(lo of lo_pair) ... byte 3 =
+    fp8(hi of hi_pair), matching :func:`fp32_to_fp8_pack`'s element order.
+    ``satfinite`` semantics: NaN converts to NaN in the destination format;
+    |x| > MAX_NORM saturates to sign-preserved MAX_NORM (448 e4m3 / 57344
+    e5m2) — never Inf.
+
+    PTX/target contract (ISA 9.4, 9.7.10.24):
+
+    - ``.f16x2`` source: PTX ISA 7.8, sm_90+ (sm_89 from ISA 8.1).
+    - ``.bf16x2`` source: PTX ISA 9.1, family-specific targets only
+      (sm_100f/sm_110f/sm_120f or higher in family) — a CUDA 13.1+
+      toolchain floor.
+    """
+    if cutlass.const_expr(dtype != cutlass.Float16 and dtype != cutlass.BFloat16):
+        raise TypeError(f"f16x2x2_to_fp8_word: dtype must be Float16 or BFloat16, got {dtype}")
+    if cutlass.const_expr(dtype_tag != "e4m3" and dtype_tag != "e5m2"):
+        raise ValueError(f"f16x2x2_to_fp8_word: dtype_tag must be 'e4m3' or 'e5m2', got {dtype_tag}")
+    src = "f16x2" if cutlass.const_expr(dtype == cutlass.Float16) else "bf16x2"
+    dst = "e4m3x2" if cutlass.const_expr(dtype_tag == "e4m3") else "e5m2x2"
+    return inline_ptx(
+        f"{{ .reg .b16 lo, hi; cvt.rn.satfinite.{dst}.{src} lo, $1; cvt.rn.satfinite.{dst}.{src} hi, $2; mov.b32 $0, {{lo, hi}}; }}",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[lo_pair, hi_pair],
+    )

@@ -309,8 +309,19 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
 
 
 def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
-    """Softmax-precision candidates — sole-point until a kernel serves more."""
-    return [_sole(caps.softmax_precisions)]
+    """Softmax-precision candidates.
+
+    FLOAT when the row serves it, else the row's sole point. HALF is NEVER
+    proposed: it changes numerics (f16x2 exponent), so it is reachable only
+    by explicit request — auto-proposing it is the CUDNN_SOFTMAX_PRECISION
+    environment-knob failure mode this vocabulary exists to avoid. Flipping the
+    Rubin-FP8 default to HALF is a separate, evidence-carrying change.
+    """
+    if cudnn.data_type.FLOAT in caps.softmax_precisions:
+        return [cudnn.data_type.FLOAT]
+    sole = _sole(caps.softmax_precisions)
+    # A HALF-only row still never gets HALF proposed — same numerics rule.
+    return [None if sole == cudnn.data_type.HALF else sole]
 
 
 def _cga_points(caps: Capabilities) -> List[Optional[int]]:

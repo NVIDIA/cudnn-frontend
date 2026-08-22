@@ -134,6 +134,9 @@ from cudnn.frost.tile_dsl.pointwise import (
     tmem_load_max_reduction_x64,
     vec_scale_pair,
     fp32_to_fp8_pack,
+    fp32_to_fp16,
+    ex2_f16x2,
+    f16x2x2_to_fp8_word,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts, mma_ts_step
@@ -973,6 +976,37 @@ STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
+# softmax_precision knob (cudnn.data_type.HALF): the exponent runs as MUFU
+# EX2.F16x2 pairs (two exp2 per MUFU op) and P casts straight from f16x2 to
+# the FP8 pair format — no f32 round-trip. Exp args are bounded by
+# RESCALE_THRESHOLD + P_CAST_LOG2_SCALE (= 8, so P <= 2^8 = 256): f16 range
+# is exact there and the satfinite cast never clips (256 < 448 e4m3).
+# Per-tensor FP8 on this sibling only; requested via the softmax_precision
+# knob, default stays the f32 chain.
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+_FP8_TAG_P = "e4m3" if CFG.DTYPE_QKV == 0 else "e5m2"
+
+
+@cute.jit
+def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
+    """SOFTMAX_F16 tail for one ``n``-elem chunk of biased exp-args (f32).
+
+    f32 pairs pack to f16x2 (CVT), the exponent runs as MUFU EX2.F16x2, and P
+    casts straight from f16x2 to the FP8 pair format. Returns the ``n // 4``
+    packed FP8 words in :func:`fp32_to_fp8_pack`'s byte order. No RF row-sum
+    on any path here — Sigma rides the ones-MMA over the packed P, so the
+    quantized-P self-consistency of the f32 path carries over unchanged.
+    Args below f16 range saturate to -inf -> exp2 -> 0, identical to the f32
+    path's underflow. MUFU f16 max relative error is 2^-9.9 (PTX ISA
+    9.7.4.10) — an order below the e4m3 cast noise P absorbs on the next
+    instruction, so the exponent precision never surfaces in O.
+    """
+    elems = [chunk_S[i] for i in range(n)]
+    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
+    p_pairs = [ex2_f16x2(w) for w in pairs]
+    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
+    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
+
 
 @cute.jit
 def _mma_warp_quiet(tmem_ptr_i32, bars):
@@ -1459,29 +1493,48 @@ def _softmax_kv_body(
     reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
-    # No RF row-sum: the denominator accumulates in the Sigma TMEM columns
-    # via the ones-MMA (P is read straight from TMEM by the MMA pipe).
-    chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
-    nvvm.tcgen05_st(
-        "32x32b",
-        nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32),
-        chunk_P_0_fp8,
-    )
+    # No RF row-sum on either path: the denominator accumulates in the Sigma
+    # TMEM columns via the ones-MMA (P is read straight from TMEM by the pipe).
+    if cutlass.const_expr(SOFTMAX_F16):
+        p_words_0 = _f16_exp_chunk(chunk_S_0)
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(p_addr_base, cutlass.Int32),
+            p_words_0,
+        )
+    else:
+        chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+        chunk_P_0_fp8 = chunk_P_0.to(STORAGE_DTYPE)
+        nvvm.tcgen05_st(
+            "32x32b",
+            nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32),
+            chunk_P_0_fp8,
+        )
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        chunk_P_1_fp8 = cute.math.exp2(chunk_S_1, fastmath=True).to(STORAGE_DTYPE)
-        nvvm.tcgen05_st(
-            "32x32b",
-            nvvm.make_tmem_ptr(
-                p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK),
-                cutlass.Float32,
-            ),
-            chunk_P_1_fp8,
-        )
+        if cutlass.const_expr(SOFTMAX_F16):
+            p_words_1 = _f16_exp_chunk(chunk_S_1)
+            nvvm.tcgen05_st(
+                "32x32b",
+                nvvm.make_tmem_ptr(
+                    p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK),
+                    cutlass.Int32,
+                ),
+                p_words_1,
+            )
+        else:
+            chunk_P_1_fp8 = cute.math.exp2(chunk_S_1, fastmath=True).to(STORAGE_DTYPE)
+            nvvm.tcgen05_st(
+                "32x32b",
+                nvvm.make_tmem_ptr(
+                    p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK),
+                    cutlass.Float32,
+                ),
+                chunk_P_1_fp8,
+            )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 

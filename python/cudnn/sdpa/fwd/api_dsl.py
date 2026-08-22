@@ -888,9 +888,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
+        # softmax_precision values are cudnn.data_type (the knob vocabulary
+        # fixed by #692); imported locally — this file otherwise speaks torch
+        # dtypes and frost constants only.
+        from cudnn import data_type as _cudnn_dtype
+
         self._value_error_if(
-            self.softmax_precision is not None,
-            "SM100 DSL SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
+            self.softmax_precision is not None and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
+            "softmax_precision is served on the d128 per-tensor FP8 path only (other flavors run the f32 pipeline)",
+        )
+        self._value_error_if(
+            self.softmax_precision is not None and self.softmax_precision not in (_cudnn_dtype.FLOAT, _cudnn_dtype.HALF),
+            f"softmax_precision must be cudnn.data_type.FLOAT or HALF; got {self.softmax_precision}",
+        )
+        # The f16x2 exponent arm is numerics-changing and lives in the SM107
+        # sibling kernel only — honored exactly or declined (mirrors the
+        # split engine rows: only sdpa_fwd_prefill_sm107_d128_fp8 declares
+        # HALF in its softmax_precisions domain).
+        self._value_error_if(
+            self.softmax_precision == _cudnn_dtype.HALF and self._device_cc != (10, 7),
+            "softmax_precision=HALF is served for per-tensor FP8 on cc10.7 only (FLOAT is the default everywhere)",
         )
         if self.split_kv > 1:
             # Split-KV: partials weighted by the per-split LSE, recombined by
@@ -1034,6 +1051,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
             # selects the equivalent masked-interior lowering.
             template_window_right = self.s_k_max
+        from cudnn import data_type as _cudnn_dtype
+
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -1048,6 +1067,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
+            softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             split_kv=self.split_kv,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
