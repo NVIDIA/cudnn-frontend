@@ -1854,6 +1854,13 @@ def _render_block_scale_template(
     moe_host_ma_pass = ",\n".join([f"a_{i}" for i in range(na)] + [f"_a_stride_sets[{i}][0]" for i in range(na)])
     if moe_host_ma_pass:
         moe_host_ma_pass += ","
+    moe_kernel_msfa_params = ",\n".join(f"mSFA_{i}: cute.Tensor" for i in range(na))
+    if moe_kernel_msfa_params:
+        moe_kernel_msfa_params += ","
+    moe_msfa_list = "mSFA_list = [" + ", ".join(f"mSFA_{i}" for i in range(na)) + "]"
+    moe_host_msfa_pass = ",\n".join(f"_sfa_operands[{i}]" for i in range(na))
+    if moe_host_msfa_pass:
+        moe_host_msfa_pass += ","
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -1907,6 +1914,9 @@ def _render_block_scale_template(
                 "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
                 "INJECT_MOE_MA_LIST": moe_ma_list,
                 "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
+                "INJECT_MOE_KERNEL_MSFA_PARAMS": moe_kernel_msfa_params,
+                "INJECT_MOE_MSFA_LIST": moe_msfa_list,
+                "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
             }
         )
 
@@ -3890,5 +3900,5 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=vec_bytes_epi,
-        _desc_slots_per_cta=chain.num_a_operands + (1 if use_tma else 0),
+        _desc_slots_per_cta=chain.num_a_operands * 2 + (1 if use_tma else 0),
     )

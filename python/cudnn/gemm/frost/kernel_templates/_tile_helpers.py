@@ -80,6 +80,16 @@ def replace_tensormap_global_dim_1(desc_ptr, new_dim) -> None:
 
 
 @cute.jit
+def replace_tensormap_global_dim_2(desc_ptr, new_dim) -> None:
+    nvvm.tensormap_replace(
+        nvvm.TensormapField.GLOBAL_DIM,
+        desc_ptr,
+        new_value=cutlass.Int32(new_dim),
+        ord=2,
+    )
+
+
+@cute.jit
 def replace_tensormap_global_address(desc_ptr, new_address) -> None:
     nvvm.tensormap_replace(
         nvvm.TensormapField.GLOBAL_ADDRESS,

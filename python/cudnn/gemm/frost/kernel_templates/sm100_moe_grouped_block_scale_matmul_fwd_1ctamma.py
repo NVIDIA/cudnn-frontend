@@ -27,6 +27,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     moe_swizzle_tile as _moe_swizzle_tile,
     replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
+    replace_tensormap_global_dim_2 as _replace_tensormap_global_dim_2,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
     tcgen05_mma_block_scale as _tcgen05_mma_block_scale,
@@ -46,7 +47,7 @@ from cuda.bindings import driver as _cuda
 
 # Tensormap workspace slots per CTA: the A operands, plus the output descriptor
 # when the TMA-store epilogue re-dimensions it per routed group.
-moe_desc_slots = num_a_operands + (1 if use_tma_store_epi else 0)
+moe_desc_slots = num_a_operands * 2 + (1 if use_tma_store_epi else 0)
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
     raise NotImplementedError(f"{__name__}: acc overlap reverses subtiles by index, which needs a uniform drain width")
@@ -107,6 +108,7 @@ def _kernel(
     a_tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_MOE_KERNEL_MA_PARAMS@@
+    # @@INJECT_MOE_KERNEL_MSFA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
@@ -116,6 +118,7 @@ def _kernel(
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
     # @@INJECT_MOE_MA_LIST@@
+    # @@INJECT_MOE_MSFA_LIST@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_TMA_C_LISTS@@
     tma_c_desc = tma_c_descs[0]
@@ -203,6 +206,15 @@ def _kernel(
     sched_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     sched_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     tma_a_desc_smem_list = [
+        cutlass.Array(
+            cutlass.Int64,
+            TENSOR_MAP_QWORDS,
+            space=cutlass.AddressSpace.smem,
+            alignment=128,
+        )
+        for _ in range(num_a_operands)
+    ]
+    tma_sfa_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
             TENSOR_MAP_QWORDS,
@@ -557,10 +569,24 @@ def _kernel(
             )
             for _ai in range(num_a_operands)
         ]
+        sfa_desc_base_list = [
+            a_tma_workspace.iterator.raw_ptr() + (block_linear * moe_desc_slots + num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)
+        ]
+        sfa_desc_tma_ptr_list = [
+            cute.make_ptr(
+                cutlass.Int64,
+                sfa_desc_base_list[_ai].toint(),
+                mem_space=cute.AddressSpace.generic,
+            )
+            for _ai in range(num_a_operands)
+        ]
+        sfa_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
         if elect_one:
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
+            for _ai in cutlass.range_constexpr(num_a_operands):
+                _copy_tensormap_to_workspace(tma_sfa_descs[_ai].get_ptr(), tma_sfa_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
 
         while is_valid != 0:
@@ -588,7 +614,7 @@ def _kernel(
             if is_valid != 0:
                 coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
-                sfa_m_block = start_sf_block_m + coord_m_group // 128
+                sfa_m_block = coord_m_group // 128
                 sfb_n_block = coord_n_per_cta // 128
 
                 if group_begin != previous_group_begin:
@@ -603,6 +629,18 @@ def _kernel(
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         if lane < TENSOR_MAP_QWORDS:
                             (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        _fence_tensormap_release()
+                    for _ai in cutlass.range_constexpr(num_a_operands):
+                        _fence_tensormap_acquire(sfa_desc_tma_ptr_list[_ai])
+                    for _ai in cutlass.range_constexpr(num_a_operands):
+                        if elect_one:
+                            sfa_base = mSFA_list[_ai].iterator.raw_ptr().toint() + start_sf_block_m * sfa_block_bytes
+                            _replace_tensormap_global_address(tma_sfa_desc_smem_list[_ai], sfa_base)
+                            _replace_tensormap_global_dim_2(tma_sfa_desc_smem_list[_ai], cute.ceil_div(group_end - group_begin, 128))
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        if lane < TENSOR_MAP_QWORDS:
+                            (sfa_desc_base_list[_ai] + lane).store((tma_sfa_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
 
@@ -643,7 +681,7 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
-                                    tma_sfa_descs[_ai].get_ptr(),
+                                    sfa_desc_tma_ptr_list[_ai],
                                     (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
                                     sf_full_mbar_ptr.subview(stage),
                                     [],
@@ -1002,7 +1040,7 @@ def _kernel(
         # The routed output is a single (1, S, N) tensor, so the batch coord is fixed.
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
-        d_desc_base = a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands) * TENSOR_MAP_QWORDS
+        d_desc_base = a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands * 2) * TENSOR_MAP_QWORDS
         d_desc_tma_ptr = cute.make_ptr(
             cutlass.Int64,
             d_desc_base.toint(),
@@ -1349,6 +1387,7 @@ def _host(
         a_tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_MOE_HOST_MA_PASS@@
+        # @@INJECT_MOE_HOST_MSFA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
