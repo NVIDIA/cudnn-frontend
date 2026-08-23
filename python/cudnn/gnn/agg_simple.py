@@ -8,6 +8,8 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
+from ._dtypes import TORCH_DTYPE_TO_CUDNN, TORCH_INDEX_DTYPE_TO_CUDNN
+from ._utils import require_backend_symbols, tensor_pointer, validate_csc_graph
 from .graph import CscGraph
 
 # Torch custom-op implementation
@@ -17,17 +19,6 @@ _AGGREGATION_TO_INT: Dict[str, int] = {
     "mean": 1,
     "max": 2,
     "min": 3,
-}
-
-_TORCH_DTYPE_TO_CUDNN: Dict[torch.dtype, int] = {
-    torch.float32: 0,  # CUDNN_DATA_FLOAT
-    torch.float16: 2,  # CUDNN_DATA_HALF
-    torch.bfloat16: 9,  # CUDNN_DATA_BFLOAT16
-}
-
-_TORCH_INDEX_DTYPE_TO_CUDNN: Dict[torch.dtype, int] = {
-    torch.int32: 4,  # CUDNN_DATA_INT32
-    torch.int64: 10,  # CUDNN_DATA_INT64
 }
 
 
@@ -43,40 +34,9 @@ def _validate_graph(
     map_csc_to_coo: Optional[Tensor],
     num_src_nodes: int,
 ) -> Tuple[int, int]:
-    if offsets.ndim != 1:
-        raise ValueError(f"offsets must be rank 1, got shape {tuple(offsets.shape)}")
-    if indices.ndim != 1:
-        raise ValueError(f"indices must be rank 1, got shape {tuple(indices.shape)}")
-    if offsets.numel() == 0:
-        raise ValueError("offsets must contain at least one element")
-    if offsets.dtype not in _TORCH_INDEX_DTYPE_TO_CUDNN:
-        raise TypeError(f"offsets must have dtype int32 or int64, got {offsets.dtype}")
-    if indices.dtype != offsets.dtype:
-        raise TypeError(f"indices dtype {indices.dtype} must match offsets dtype {offsets.dtype}")
-    if not offsets.is_cuda or not indices.is_cuda:
-        raise ValueError(f"offsets and indices must be CUDA tensors, got {offsets.device} and {indices.device}")
-    if offsets.device != indices.device:
-        raise ValueError(f"offsets and indices must be on the same device, got {offsets.device} and {indices.device}")
-    if not isinstance(num_src_nodes, int):
-        raise TypeError(f"num_src_nodes must be an int, got {type(num_src_nodes).__name__}")
-    if num_src_nodes <= 0:
-        raise ValueError(f"num_src_nodes must be positive, got {num_src_nodes}")
-
-    num_dst_nodes = offsets.numel() - 1
-    num_edges = indices.numel()
-    if num_dst_nodes == 0 and num_edges != 0:
-        raise ValueError("a graph with zero destination nodes cannot contain edges")
+    num_dst_nodes, num_edges = validate_csc_graph(offsets, indices, map_csc_to_coo, num_src_nodes)
     if num_dst_nodes > 0 and num_edges == 0:
         raise ValueError("cuDNN AggSimple does not yet support a nonempty destination set with zero edges")
-
-    if map_csc_to_coo is not None:
-        if map_csc_to_coo.ndim != 1 or map_csc_to_coo.numel() != num_edges:
-            raise ValueError(f"map_csc_to_coo must have shape ({num_edges},), got {tuple(map_csc_to_coo.shape)}")
-        if map_csc_to_coo.dtype != offsets.dtype:
-            raise TypeError(f"map_csc_to_coo dtype {map_csc_to_coo.dtype} must match offsets dtype {offsets.dtype}")
-        if map_csc_to_coo.device != offsets.device:
-            raise ValueError(f"map_csc_to_coo must be on {offsets.device}, got {map_csc_to_coo.device}")
-
     return num_dst_nodes, num_edges
 
 
@@ -94,7 +54,7 @@ def _validate_features(
 
     feature_tensors = [tensor for tensor in (node_features, edge_features, concat_features) if tensor is not None]
     dtype = feature_tensors[0].dtype
-    if dtype not in _TORCH_DTYPE_TO_CUDNN:
+    if dtype not in TORCH_DTYPE_TO_CUDNN:
         raise TypeError(f"feature tensors must have dtype float32, float16, or bfloat16, got {dtype}")
 
     for tensor in feature_tensors:
@@ -149,18 +109,8 @@ def _validate_inputs(
     return num_dst_nodes, num_edges, dtype, node_feat_dim, edge_feat_dim, concat_feat_dim
 
 
-def _pointer(tensor: Optional[Tensor]) -> int:
-    return 0 if tensor is None else tensor.data_ptr()
-
-
 def _require_backend() -> None:
-    import cudnn
-
-    if not hasattr(cudnn, "gnn_agg_simple_forward") or not hasattr(cudnn, "gnn_agg_simple_backward"):
-        raise RuntimeError(
-            "cudnnGnnAggSimpleForward/Backward are unavailable. Build cudnn-frontend against headers containing the GNN API "
-            "on a supported platform."
-        )
+    require_backend_symbols("gnn_agg_simple_forward", "gnn_agg_simple_backward")
 
 
 def forward(
@@ -201,20 +151,20 @@ def forward(
             torch.cuda.current_stream(offsets.device).cuda_stream,
             offsets.data_ptr(),
             indices.data_ptr(),
-            _pointer(map_csc_to_coo),
+            tensor_pointer(map_csc_to_coo),
             num_src_nodes,
             num_dst_nodes,
             num_edges,
-            _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
-            _pointer(node_features),
-            _pointer(edge_features),
-            _pointer(concat_features),
+            TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
+            tensor_pointer(node_features),
+            tensor_pointer(edge_features),
+            tensor_pointer(concat_features),
             output.data_ptr(),
             out_positions.data_ptr() if out_positions.numel() else 0,
             node_feat_dim,
             edge_feat_dim,
             concat_feat_dim,
-            _TORCH_DTYPE_TO_CUDNN[dtype],
+            TORCH_DTYPE_TO_CUDNN[dtype],
             _AGGREGATION_TO_INT[aggr],
         )
     return output, out_positions
@@ -237,7 +187,7 @@ def backward(
     expected_shape = (num_dst_nodes, node_feat_dim + edge_feat_dim + concat_feat_dim)
     if tuple(grad_output.shape) != expected_shape:
         raise ValueError(f"grad_output must have shape {expected_shape}, got {tuple(grad_output.shape)}")
-    if grad_output.dtype not in _TORCH_DTYPE_TO_CUDNN or not grad_output.is_cuda:
+    if grad_output.dtype not in TORCH_DTYPE_TO_CUDNN or not grad_output.is_cuda:
         raise TypeError(f"grad_output must be a CUDA float32, float16, or bfloat16 tensor, got {grad_output.dtype}")
     if grad_output.device != offsets.device:
         raise ValueError(f"grad_output must be on {offsets.device}, got {grad_output.device}")
@@ -277,11 +227,11 @@ def backward(
             torch.cuda.current_stream(offsets.device).cuda_stream,
             offsets.data_ptr(),
             indices.data_ptr(),
-            _pointer(map_csc_to_coo),
+            tensor_pointer(map_csc_to_coo),
             num_src_nodes,
             num_dst_nodes,
             num_edges,
-            _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
+            TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
             grad_output.data_ptr(),
             out_positions.data_ptr() if out_positions.numel() else 0,
             grad_node.data_ptr() if node_feat_dim else 0,
@@ -290,7 +240,7 @@ def backward(
             node_feat_dim,
             edge_feat_dim,
             concat_feat_dim,
-            _TORCH_DTYPE_TO_CUDNN[grad_output.dtype],
+            TORCH_DTYPE_TO_CUDNN[grad_output.dtype],
             _AGGREGATION_TO_INT[aggr],
         )
     return grad_node, grad_edge, grad_concat
