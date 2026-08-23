@@ -40,7 +40,6 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
-    "is_gnn_agg_simple_available",
 ]
 
 for symbol_name in symbols_to_import:

@@ -12,10 +12,8 @@ from cudnn.gnn import CscGraph, agg_simple
 
 
 def _require_gnn_agg_simple() -> None:
-    if not hasattr(cudnn, "gnn_agg_simple_forward"):
-        pytest.skip("cudnn-frontend was built without cudnnGnnAggSimple declarations")
-    if not cudnn.is_gnn_agg_simple_available():
-        pytest.skip("the loaded cuDNN library does not export cudnnGnnAggSimple forward and backward")
+    if not hasattr(cudnn, "gnn_agg_simple_forward") or not hasattr(cudnn, "gnn_agg_simple_backward"):
+        pytest.skip("cudnn-frontend was built without cudnnGnnAggSimple support")
 
 
 @pytest.fixture

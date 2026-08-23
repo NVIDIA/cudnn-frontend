@@ -156,10 +156,10 @@ def _pointer(tensor: Optional[Tensor]) -> int:
 def _require_backend() -> None:
     import cudnn
 
-    if not hasattr(cudnn, "gnn_agg_simple_forward") or not cudnn.is_gnn_agg_simple_available():
+    if not hasattr(cudnn, "gnn_agg_simple_forward") or not hasattr(cudnn, "gnn_agg_simple_backward"):
         raise RuntimeError(
             "cudnnGnnAggSimpleForward/Backward are unavailable. Build cudnn-frontend against headers containing the GNN API "
-            "and load a cuDNN library exporting both symbols."
+            "on a supported platform."
         )
 
 

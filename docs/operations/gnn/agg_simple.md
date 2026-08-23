@@ -94,13 +94,9 @@ accumulation is nondeterministic. Higher-order gradients are not supported.
 ### cuDNN backend
 
 The bindings are compiled only when the selected cuDNN headers declare both
-AggSimple APIs, and they additionally verify that the loaded cuDNN library
-exports both symbols at runtime:
-
-```python
-import cudnn
-print(cudnn.is_gnn_agg_simple_available())
-```
+AggSimple APIs and the target platform supports cuDNN GNN. As with other
+optional backend components, the backend entry points are resolved when the
+operation is called.
 
 The current backend requires SM 8.0 or newer. A graph with zero destination
 nodes is handled by the Python wrapper. A graph with destination nodes but no
