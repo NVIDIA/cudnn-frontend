@@ -4,7 +4,8 @@
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the exact d128/d128 or d192/d128 engine, and validates O against an fp32-dequant
+the d128/d128 engine (which also serves the dense d<=128 head-dim ENVELOPE via TMA
+zero-padding) or the exact d192/d128 engine, and validates O against an fp32-dequant
 reference. ``Amax_O`` is produced in-kernel (atomicMax over the pre-cast fp32 values)
 and checked.
 
@@ -32,11 +33,11 @@ from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = [requires_blackwell, requires_dsl]
 
-# The per-tensor FP8 rows are split per arch line (sm100 = pre-Rubin
-# Blackwell 100-106, sm107 = the Rubin line): pin the row that serves the
-# device under test. d192/d128 exists on the sm100 row only.
+# ONE per-tensor FP8 engine per arch line (sm100 = pre-Rubin Blackwell
+# 100-106, sm107 = the Rubin line): pin the engine that serves the device
+# under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="d192/d128 per-tensor FP8 has no Rubin kernel (the sm107 row serves d128 only)")
+_skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -163,7 +164,9 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d_qk, arch=_D128_ARCH if (d_qk, d_v) == (128, 128) else "sm100", d_v=d_v, fp8=True))
+    # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
+    # and the head-dim envelope) happens inside the lowering.
+    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -317,6 +320,90 @@ def test_fp8_d192_d128_zero_length_kv():
         d_v=128,
     )
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("dims", [(80, 80), (96, 64)], ids=["d80", "d96_d64"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope(dims, mask):
+    """Per-tensor FP8 serves the dense d<=128 head-dim ENVELOPE on the d128
+    row (TMA zero-padding — exact in FP8, arch-independent since the descales
+    are scalars): the ViT d=72-in-80 contract's landing zone. Head dims must
+    be multiples of 16 (TMA 16-byte global-stride rule at 1 byte/elem)."""
+    d_qk, d_v = dims
+    scale = 1.0 / math.sqrt(d_qk)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        4,
+        4,
+        384,
+        384,
+        "e4m3",
+        torch.bfloat16,
+        scale=scale,
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope_d192_flavor():
+    """The d192xd128 flavor serves its envelope too: (160, 96) rides the
+    (192, 128) kernel with TMA zero-padding on both sides.
+
+    Direct adapter API: the pygraph ``sdpa_fp8`` node validator still bounds
+    the GRAPH route at d_qk <= 128 (%16) / exact (192, 128) — a pre-FE-OSS
+    shape whitelist in the C++ frontend — so this region of the envelope is
+    reachable through the standalone API only until that validation is
+    relaxed to describe rather than judge."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, S, d_qk, d_v = 2, 4, 384, 160, 96
+    dev = "cuda"
+    Q8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    K8 = (torch.randn(B, H, S, d_qk, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    V8 = (torch.randn(B, H, S, d_v, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    out = torch.empty(B, H, S, d_v, device=dev, dtype=torch.bfloat16)
+    lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(d_qk)
+
+    api = SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=scale, pertensor_fp8=True)
+    assert api.check_support()
+    api.compile()
+    api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
+    torch.cuda.synchronize()
+
+    o_ref = torch.softmax(Q8.float() @ K8.float().transpose(-1, -2) * scale, dim=-1) @ V8.float()
+    err = (out.float() - o_ref).abs().max().item()
+    assert err <= 5e-2 + 0.05 * o_ref.abs().max().item(), f"(160,96) envelope mismatch: max err {err}"
+    assert not torch.isnan(out.float()).any()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_head_dim_envelope_padded():
+    """The envelope composed with the KV padding mask — the ViT production
+    shape (non-causal, seqlen padded up to a tile multiple, d=80)."""
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        4,
+        4,
+        384,
+        384,
+        "e4m3",
+        torch.bfloat16,
+        scale=1.0 / math.sqrt(72),
+        sdpa_kwargs={},
+        seq_lens_kv=[384, 250],
+        d_qk=80,
+        d_v=80,
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -511,7 +598,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, arch=_D128_ARCH, fp8=True))
+    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})

@@ -25,8 +25,8 @@ from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
-_D128 = "sdpa_fwd_prefill_sm100_d128"
-_OFFERED = {_D128: 20500, "sdpa_fwd_prefill_sm100_d256": 20501}
+_F16 = "sdpa_fwd_prefill_sm100"
+_OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
 
 
 def _facts(**over):
@@ -50,15 +50,15 @@ def _facts(**over):
 @pytest.mark.L0
 def test_recommend_emits_multiple_complete_sets_per_engine():
     plans = recommend("A", _facts(), _OFFERED)
-    d128 = [p for p in plans if p.engine_id == 20500]
-    assert len(d128) >= 3, "expected sched + split runners behind the primary"
-    for p in d128:
+    f16 = [p for p in plans if p.engine_id == 20500]
+    assert len(f16) >= 3, "expected sched + split runners behind the primary"
+    for p in f16:
         k = p.knobs
         # Complete assignment: every axis the row declares carries a value.
         assert None not in (k.sched_policy, k.tile_m, k.tile_n, k.cga, k.split_kv)
         assert p.mode is None and p.cpp_index is None
-    assert len({p.knobs for p in d128}) == len(d128), "duplicate knob sets emitted"
-    assert len(d128) <= _MAX_SETS_PER_ENGINE
+    assert len({p.knobs for p in f16}) == len(f16), "duplicate knob sets emitted"
+    assert len(f16) <= _MAX_SETS_PER_ENGINE
 
 
 @pytest.mark.L0
@@ -69,9 +69,9 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
     causal = recommend("A", _facts(), _OFFERED)
     assert causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
     dense = recommend("A", _facts(causal=False), _OFFERED)
-    dense_d128 = [p for p in dense if p.engine_id == 20500]
-    assert dense_d128[0].knobs.sched_policy == 0  # SCHED_NATURAL
-    assert all(p.knobs.sched_policy == 0 for p in dense_d128), "mask-free graphs gain nothing from LPT runners"
+    dense_f16 = [p for p in dense if p.engine_id == 20500]
+    assert dense_f16[0].knobs.sched_policy == 0  # SCHED_NATURAL
+    assert all(p.knobs.sched_policy == 0 for p in dense_f16), "mask-free graphs gain nothing from LPT runners"
 
 
 @pytest.mark.L0
@@ -129,10 +129,12 @@ def test_fallback_kind_is_least_demanding():
 
 
 def _is_sm100() -> bool:
+    # Pre-Rubin only: the executable tier drives the f16 family, which has no
+    # Rubin lowering (Rubin serves per-tensor FP8 only).
     if not torch.cuda.is_available():
         return False
-    major, _ = torch.cuda.get_device_capability(0)
-    return major == 10
+    major, minor = torch.cuda.get_device_capability(0)
+    return major == 10 and minor <= 6
 
 
 def _dsl_available() -> bool:
@@ -185,9 +187,9 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
     if want == 1:
         pytest.skip("this part is small enough that the shape already fills it")
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    d128 = [n for n in names if "sm100_d128" in n]
-    assert len(d128) >= 3, f"expected knob-suffixed duplicates of the d128 cell: {d128}"
-    split_idx = next(i for i, n in enumerate(names) if "sm100_d128" in n and f"split_kv={want}" in n)
+    f16 = [n for n in names if n.split("[")[0] == "sdpa_fwd_prefill_sm100"]
+    assert len(f16) >= 3, f"expected knob-suffixed duplicates of the f16 family engine: {f16}"
+    split_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and f"split_kv={want}" in n)
     g.select_plan(split_idx)
     g.check_support()
     g.build_plans()
@@ -225,7 +227,7 @@ def test_runner_up_sched_plan_builds_and_matches_the_winner():
     that set and executes correctly — honored, not silently degraded."""
     g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    nat_idx = next(i for i, n in enumerate(names) if "sm100_d128" in n and "sched_policy=0" in n and "split_kv=1" in n)
+    nat_idx = next(i for i, n in enumerate(names) if n.split("[")[0] == "sdpa_fwd_prefill_sm100" and "sched_policy=0" in n and "split_kv=1" in n)
     g.select_plan(nat_idx)
     g.check_support()
     g.build_plans()

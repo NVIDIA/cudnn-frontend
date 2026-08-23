@@ -30,7 +30,7 @@ import torch
 
 import cudnn
 from cudnn.engines import is_python_engine
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
 pytestmark = [pytest.mark.L0]
 
@@ -88,7 +88,7 @@ def _build(d):
     return g, vp, ws, o_buf
 
 
-@requires_blackwell
+@requires_pre_rubin_blackwell
 @requires_dsl
 @pytest.mark.parametrize("d", [256, 512])
 def test_execute_reads_no_device_memory_to_the_host(monkeypatch, d):
@@ -126,7 +126,7 @@ def test_execute_reads_no_device_memory_to_the_host(monkeypatch, d):
     assert not caught
 
 
-@requires_blackwell
+@requires_pre_rubin_blackwell
 @requires_dsl
 def test_execute_without_a_handle_is_cuda_graph_capturable():
     """The no-handle path, which is the one that resolves the stream itself.

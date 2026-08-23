@@ -23,9 +23,9 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
-pytestmark = requires_blackwell
+pytestmark = requires_pre_rubin_blackwell
 
 # ~0.5-1 s of spin: long enough that an unordered kernel launch on the
 # default stream reliably overtakes the side-stream mutation.

@@ -200,7 +200,7 @@ def test_split_request_outside_the_domain_makes_the_engine_ineligible(requested)
     """The default row serves only split_kv=1 ("off"): a split request on a row
     whose lowering has no split path is honored-or-ineligible, never silently
     dropped."""
-    caps = Capabilities(sm_lo=100, sm_hi=100, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}))
+    caps = Capabilities(sm_lo=100, sm_hi=100, phase="prefill", d_shapes=frozenset({(128, 128)}))
     assert caps.split_kvs == frozenset({1})
     why = mismatch(caps, _facts(), SdpaFwdKnobs(split_kv=requested))
     assert why is not None and "split_kv" in why
@@ -209,7 +209,7 @@ def test_split_request_outside_the_domain_makes_the_engine_ineligible(requested)
 def test_no_split_and_explicit_one_leave_the_engine_eligible():
     """No preference passes; so does an EXPLICIT split_kv=1 — "do not split"
     is a real point on the axis, not an ignored request."""
-    caps = Capabilities(sm_lo=100, sm_hi=100, phase="prefill", d_qk=frozenset({128}), d_v=frozenset({128}))
+    caps = Capabilities(sm_lo=100, sm_hi=100, phase="prefill", d_shapes=frozenset({(128, 128)}))
     for knobs in (SdpaFwdKnobs(split_kv=None), SdpaFwdKnobs(split_kv=1)):
         why = mismatch(caps, _facts(), knobs) or ""
         assert "split_kv" not in why
@@ -232,8 +232,7 @@ def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
         sm_lo=100,
         sm_hi=100,
         phase="prefill",
-        d_qk=frozenset({128}),
-        d_v=frozenset({128}),
+        d_shapes=frozenset({(128, 128)}),
         skv_tail_via_padding=True,
         split_kvs=frozenset({1, 2, 4}),
     )
@@ -255,11 +254,8 @@ def test_split_domains_match_the_wired_lowerings():
 
     advertising = {sp.name for sp in ENGINE_SPECS if sp.capabilities.split_kvs != frozenset({1})}
     assert advertising == {
-        "sdpa_fwd_prefill_sm100_d128",
-        "sdpa_fwd_prefill_sm100_d256",
-        "sdpa_fwd_prefill_sm100_d512",
-        "sdpa_fwd_prefill_sm100_d192_d128",
-        "sdpa_fwd_prefill_sm100_d128_mxfp8",
-        "sdpa_fwd_prefill_sm100_d128_fp8",
+        "sdpa_fwd_prefill_sm100",
+        "sdpa_fwd_prefill_sm100_mxfp8",
+        "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm120",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"

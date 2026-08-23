@@ -32,12 +32,12 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-pytestmark = [requires_blackwell, requires_dsl]
+pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -167,7 +167,7 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stat
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d_qk, d_v=d_v, mxfp8=True))
+    _select_engine(g, engine_name(mxfp8=True))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -449,7 +449,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(d_qk, d_v=d_v, mxfp8=True))
+    _select_engine(g, engine_name(mxfp8=True))
     g.check_support()
     g.build_plans()
     g.execute(
@@ -670,7 +670,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, mxfp8=True))
+    _select_engine(g, engine_name(mxfp8=True))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})
