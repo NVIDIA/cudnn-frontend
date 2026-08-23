@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, MAX_EPI_CHUNK_ELEMS, _output_align_reqs, allowed_store_vsize, dense_output_layout, tensor_alignment
+from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _output_align_reqs, allowed_store_vsize, dense_output_layout, tensor_alignment
 from .fusion_ir import (
     BlockQuantizeSpec,
     Dtype,
@@ -74,22 +74,22 @@ def _index_term(var: str, stride: int) -> str:
     return f"{var} * {stride}"
 
 
-def _aux_index_expr(aux: TensorRef) -> str:
+def _aux_index_expr(aux: TensorRef, *, row_var: str = "row", col_var: str = "col_j") -> str:
     """Linear element offset for the current epilogue location. Extent-1
     dims are broadcast and don't contribute to the offset."""
     if len(aux.dim) == 1:
-        axes = ((aux.dim[0], aux.stride[0], "col_j"),)
+        axes = ((aux.dim[0], aux.stride[0], col_var),)
     elif len(aux.dim) == 2:
         axes = (
-            (aux.dim[0], aux.stride[0], "row"),
-            (aux.dim[1], aux.stride[1], "col_j"),
+            (aux.dim[0], aux.stride[0], row_var),
+            (aux.dim[1], aux.stride[1], col_var),
         )
     elif len(aux.dim) == 3:
         lead_var = "group_idx" if aux.grouped_by_moe else "tile_l"
         axes = (
             (aux.dim[0], aux.stride[0], lead_var),
-            (aux.dim[1], aux.stride[1], "row"),
-            (aux.dim[2], aux.stride[2], "col_j"),
+            (aux.dim[1], aux.stride[1], row_var),
+            (aux.dim[2], aux.stride[2], col_var),
         )
     else:
         raise ValueError(f"unsupported aux rank {len(aux.dim)} for {aux.name!r}")
@@ -98,7 +98,47 @@ def _aux_index_expr(aux: TensorRef) -> str:
     return " + ".join(terms) if terms else "0"
 
 
-def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str) -> str:
+def _aux_reads_row(aux: TensorRef) -> bool:
+    return len(aux.dim) >= 2 and aux.dim[-2] != 1
+
+
+def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
+    """The TMA arm hands the snippet a SUBTILE base with neither an N nor an M
+    bound -- the store is clipped by the descriptor's global extent, so nothing
+    downstream needs one, but a `per_col` / `per_elem` LDG at `col_j + k` is a
+    real read past the aux allocation (N=144, cta_tile_n=128, epi_n=32: the
+    subtile at col=224 reads columns 224..255, and at row M-1 that is 80
+    elements past a `per_elem` tensor's end). Take the whole-chunk vector load
+    when the window is inside both extents -- the case on every subtile but the
+    last -- and otherwise read element-wise at a CLAMPED coordinate: the lanes
+    past the extent land on the last valid element, whose value is never stored."""
+    lines: list[str] = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode not in ("per_col", "per_elem"):
+            continue
+        n, ptr = aux.name, _aux_ptr_var(aux.name)
+        lines.append(f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})")
+        lines.append(f"_auxv_{n} = _auxt_{n}.load().to_vector()")
+        cond = ["col_j + vsize <= N"]
+        if _aux_reads_row(aux):
+            cond.append("row < M")
+        lines.append(f"if {' & '.join(f'({c})' for c in cond)}:")
+        lines.append(f"    _auxv_{n} = ({ptr} + {_aux_index_expr(aux)}).load(count=vsize, alignment=ALIGN_AUX_{n})")
+        lines.append("else:")
+        row_var = f"_auxr_{n}"
+        if _aux_reads_row(aux):
+            lines.append(f"    {row_var} = cute.math.min(cutlass.Int32(row), cutlass.Int32(M) - 1)")
+        else:
+            row_var = "row"
+        lines.append("    for _auxk in cutlass.range_constexpr(vsize):")
+        lines.append(f"        _auxc_{n} = cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32(N) - 1)")
+        idx = _aux_index_expr(aux, row_var=row_var, col_var=f"_auxc_{n}")
+        lines.append(f"        _auxt_{n}[_auxk] = ({ptr} + {idx}).load()")
+        lines.append(f"    _auxv_{n} = _auxt_{n}.load().to_vector()")
+    return lines
+
+
+def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False) -> str:
     """Expression yielding aux value(s) as a length-`vsize` vector in the op's
     compute dtype, matching ``like_var``'s dtype."""
     idx = _aux_index_expr(aux)
@@ -109,11 +149,9 @@ def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str) -> str:
     if aux.bcast_mode == "per_row":
         # per-row scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
-    if aux.bcast_mode == "per_col":
-        # vector load of vsize elements from aux_ptr[col_j]
-        return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=ALIGN_AUX_{aux.name}).to({cast})"
-    if aux.bcast_mode == "per_elem":
-        # vector load of vsize elements from aux_ptr[row*N + col_j]
+    if aux.bcast_mode in ("per_col", "per_elem"):
+        if bounded:
+            return f"_auxv_{aux.name}.to({cast})"
         return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=ALIGN_AUX_{aux.name}).to({cast})"
     raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
@@ -371,7 +409,7 @@ def _emit_op(
             return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
         gl += [f"_gi{idx}[{k}] = cutlass.Float32(col_j + {k})" for k in range(vsize)]
-        gl.append(f"{new} = _gi{idx}.load()")
+        gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
     if op.op == "binary_select":
@@ -546,19 +584,23 @@ def _dense_store_offset(i: int, is_fp4: bool, batch: int) -> str:
     return f"(tile_l * out_stride_l_{i} + {base})" if batch > 1 else f"({base})"
 
 
-def _emit_mmajor_scatter(tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int) -> list[str]:
+def _emit_mmajor_scatter(tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int, vsize: int, *, row_bound: str | None = None) -> list[str]:
     """Per-element scatter for an M-major (or arbitrarily strided) dense
     output: vsize scalar stores through the output's own runtime strides."""
     tap_var = f"_tap_{tap_idx}"
     l_term = f"tile_l * out_stride_l_{i} + " if batch > 1 else ""
     lines = [f"{tap_var} = {_store_cast_expr(source_var, dtype)}"]
-    for e in range(32):
-        lines.append(f"if cutlass.const_expr({e} < vsize):")
-        lines.append(
-            f"    (gC_tap_{tap_idx}_ptr + {l_term}row * out_stride_m_{i} + "
+    for e in range(vsize):
+        store = (
+            f"(gC_tap_{tap_idx}_ptr + {l_term}row * out_stride_m_{i} + "
             f"(col_j + {e}) * out_stride_n_{i}).store({tap_var}[{e} : {e} + 1], "
             f"alignment={DTYPE_BYTES[dtype]})"
         )
+        if row_bound is not None:
+            lines.append(f"if (row < {row_bound}) & (col_j + {e} < N):")
+            lines.append(f"    {store}")
+        else:
+            lines.append(store)
     return lines
 
 
@@ -581,7 +623,17 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
 
 
 def _emit_tap_store(
-    tap_idx: int, source_var: str, tap_dtype: Dtype, chain: FusionChain, dim, stride, vsize: int, offset_expr: str = "linear_idx", spec_idx: int = 0
+    tap_idx: int,
+    source_var: str,
+    tap_dtype: Dtype,
+    chain: FusionChain,
+    dim,
+    stride,
+    vsize: int,
+    offset_expr: str = "linear_idx",
+    spec_idx: int = 0,
+    *,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Store one tap vector. M-major TMA taps scatter the 16x256b fragment;
     all other paths store ``offset_expr`` in ``_tap_store_elems``-wide chunks (a
@@ -600,13 +652,20 @@ def _emit_tap_store(
         f"{tap_var}[_tr_{tap_idx} : _tr_{tap_idx} + 1], alignment=VEC_BYTES_TAP_{tap_idx})",
         f"else:",
     ]
-    if store_elems >= vsize:
-        lines.append(f"    (gC_tap_{tap_idx}_ptr + {offset_expr}).store({tap_var}, alignment=VEC_BYTES_TAP_{tap_idx})")
-    else:
-        for _s in range(0, vsize, store_elems):
-            lines.append(
-                f"    (gC_tap_{tap_idx}_ptr + {offset_expr} + {_s}).store(" f"{tap_var}[{_s} : {_s + store_elems}], alignment=VEC_BYTES_TAP_{tap_idx})"
-            )
+    # The STG arm sits inside `row < M` / `col_j + vsize <= N`; the TMA arm has
+    # neither -- its store is clipped by the descriptor's global extent instead.
+    # `_tap_store_elems` divides both N and `col_j`, so a sub-chunk is wholly
+    # inside N or wholly outside: the whole-chunk predicate loses no column.
+    for _s in range(0, vsize, store_elems) if store_elems < vsize else (None,):
+        span = f"{tap_var}" if _s is None else f"{tap_var}[{_s} : {_s + store_elems}]"
+        off = f"{offset_expr}" if _s is None else f"{offset_expr} + {_s}"
+        width = vsize if _s is None else store_elems
+        store = f"(gC_tap_{tap_idx}_ptr + {off}).store({span}, alignment=VEC_BYTES_TAP_{tap_idx})"
+        if row_bound is not None:
+            lines.append(f"    if (row < {row_bound}) & (col_j + {(_s or 0) + width} <= N):")
+            lines.append(f"        {store}")
+        else:
+            lines.append(f"    {store}")
     return lines
 
 
@@ -627,6 +686,7 @@ def _emit_reduction_local_combine(
     red_idx: int,
     red: ReductionSpec,
     src: str,
+    vsize: int,
 ) -> tuple[list[str], str]:
     """Combine the vector's elements into one register value so a single
     atomic per vector covers the whole chunk (valid only when every element
@@ -655,22 +715,21 @@ def _emit_reduction_local_combine(
 
     lines = [f"{acc} = {init}"]
     start = 0 if combine in ("add", "mul") else 1
-    for i in range(start, 32):
-        lines.append(f"if cutlass.const_expr({i} < vsize):")
+    for i in range(start, vsize):
         if combine == "add":
-            lines.append(f"    {acc} = {acc} + {elem(i)}")
+            lines.append(f"{acc} = {acc} + {elem(i)}")
         elif combine == "mul":
             if red.mode == "mul_no_zeros":
-                lines.append(f"    if {src}[{i}] != cutlass.Float32(0.0):")
-                lines.append(f"        {acc} = {acc} * {src}[{i}]")
-            else:
+                lines.append(f"if {src}[{i}] != cutlass.Float32(0.0):")
                 lines.append(f"    {acc} = {acc} * {src}[{i}]")
+            else:
+                lines.append(f"{acc} = {acc} * {src}[{i}]")
         elif is_int:
             op = ">" if combine == "max" else "<"
-            lines.append(f"    if {elem(i)} {op} {acc}:")
-            lines.append(f"        {acc} = {elem(i)}")
+            lines.append(f"if {elem(i)} {op} {acc}:")
+            lines.append(f"    {acc} = {elem(i)}")
         else:
-            lines.append(f"    {acc} = cute.math.{combine}({acc}, {elem(i)})")
+            lines.append(f"{acc} = cute.math.{combine}({acc}, {elem(i)})")
     return lines, acc
 
 
@@ -680,6 +739,7 @@ def _emit_reduction_atomic(
     red: ReductionSpec,
     source_var: str,
     matmul: "MatmulSpec",
+    vsize: int,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
@@ -696,7 +756,7 @@ def _emit_reduction_atomic(
             count = n_factor * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
             lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / count})")
     if red.dim[2] == 1:
-        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src)
+        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
         offset = _reduction_output_offset_expr(red_idx, red, "0")
         ptr = f"gC_tap_{tap_idx}_ptr + {offset}"
@@ -739,9 +799,7 @@ def _emit_reduction_atomic(
             val = f"{acc} * _red_{red_idx}_inv" if red.mode == "avg" else acc
             lines.append(f'nvvm.atomicrmw("add", {ptr}, {val}, mem_order="relaxed", syncscope="gpu")')
         return lines
-    for i in range(32):
-        # const_expr(i < vsize) keeps emitted code valid for every vsize, no dynamic index
-        lines.append(f"if cutlass.const_expr({i} < vsize):")
+    for i in range(vsize):
         val = f"{src}[{i}]"
         offset = _reduction_output_offset_expr(red_idx, red, str(i))
         ptr = f"gC_tap_{tap_idx}_ptr + {offset}"
@@ -756,26 +814,26 @@ def _emit_reduction_atomic(
                 op = red.mode
             else:
                 raise AssertionError(f"unhandled int32 reduction mode {red.mode!r}")
-            lines.append(f'    nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "amax":
-            lines.append(f"    cute.arch.atomic_fmax({ptr}, " f'cute.math.abs({val}), sign_bit=False, sem="relaxed", scope="gpu")')
+            lines.append(f"cute.arch.atomic_fmax({ptr}, " f'cute.math.abs({val}), sign_bit=False, sem="relaxed", scope="gpu")')
             continue
         if red.mode == "norm1":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, cute.math.abs({val}), mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, cute.math.abs({val}), mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "norm2":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, {val} * {val}, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, {val} * {val}, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "avg":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, {val} * _red_{red_idx}_inv, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, {val} * _red_{red_idx}_inv, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode in ("mul", "mul_no_zeros"):
             t = f"_red_{red_idx}_{i}"
-            pad = "    "
+            pad = ""
             if red.mode == "mul_no_zeros":
-                lines.append(f"    if {val} != cutlass.Float32(0.0):")
-                pad = "        "
+                lines.append(f"if {val} != cutlass.Float32(0.0):")
+                pad = "    "
             lines.extend(
                 [
                     f"{pad}{t}_mo = (({ptr})).load().bitcast(cutlass.Int32)",
@@ -791,24 +849,24 @@ def _emit_reduction_atomic(
             )
             continue
         if red.mode == "max":
-            lines.append(f'    cute.arch.atomic_fmax({ptr}, {val}, sem="relaxed", scope="gpu")')
+            lines.append(f'cute.arch.atomic_fmax({ptr}, {val}, sem="relaxed", scope="gpu")')
             continue
         if red.mode == "min":
             bits = f"_red_{red_idx}_{i}_bits"
             lines.extend(
                 [
-                    f"    {bits} = ({val}).bitcast(cutlass.Int32)",
-                    f"    if {bits} < cutlass.Int32(0):",
-                    f"        cute.arch.atomic_max({ptr}, cutlass.Uint32({bits}), " f'sem="relaxed", scope="gpu")',
-                    "    else:",
-                    f"        cute.arch.atomic_min({ptr}, {bits}, " f'sem="relaxed", scope="gpu")',
+                    f"{bits} = ({val}).bitcast(cutlass.Int32)",
+                    f"if {bits} < cutlass.Int32(0):",
+                    f"    cute.arch.atomic_max({ptr}, cutlass.Uint32({bits}), " f'sem="relaxed", scope="gpu")',
+                    "else:",
+                    f"    cute.arch.atomic_min({ptr}, {bits}, " f'sem="relaxed", scope="gpu")',
                 ]
             )
             continue
         else:
             assert red.mode == "add"
             op = "add"
-        lines.append(f'    nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
+        lines.append(f'nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
     return lines
 
 
@@ -1162,27 +1220,17 @@ def generate(
     *,
     vec_bytes_epi: int = 32,
     output_elem_bytes: int = 2,
-    use_tma_store: bool = False,
+    tma_slots: "frozenset[int]" = frozenset(),
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
     vsize = vec_bytes_epi // output_elem_bytes
-    if vsize > MAX_EPI_CHUNK_ELEMS:
-        raise NotImplementedError(
-            f"epilogue chunk of {vsize} elements exceeds the {MAX_EPI_CHUNK_ELEMS}-element "
-            f"drain subtile (vec_bytes_epi={vec_bytes_epi}, output_elem_bytes={output_elem_bytes})"
-        )
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
     for aux in chain.aux_tensors:
-        if aux.grouped_by_moe and aux.bcast_mode == "per_col" and aux.stride[0] % vsize != 0:
-            raise NotImplementedError(
-                f"per-group per-col aux {aux.name!r}: group stride {aux.stride[0]} must be "
-                f"a multiple of the epilogue chunk ({vsize} elements) for aligned vector loads"
-            )
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
         if aux.bcast_mode == "scalar":
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
@@ -1193,7 +1241,16 @@ def generate(
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # epilogue snippet (interleaves op chain with tap stores)
-    body_lines: list[str] = []
+    on_tma_arm = 0 in tma_slots
+    # The template binds `vec_f32_<g>` in the STG arm only, where the chunk is a
+    # slice of the subtile. The TMA arm takes the whole subtile, and when it is
+    # rendered the STG arm is deleted outright -- so emit the bindings here
+    # rather than adding a second template marker to all 8 parity groups.
+    tma_vec_bindings = [f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)] if on_tma_arm else []
+    # The TMA arm carries no row bound of its own; reuse the one its STG
+    # sibling applies -- the routed group's end on MoE, the problem M elsewhere.
+    store_row_bound = ("group_end" if chain.has_moe else "M") if on_tma_arm else None
+    body_lines: list[str] = tma_vec_bindings + (_bounded_aux_prelude(chain) if on_tma_arm else [])
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
     result_var: dict[int, str] = {}
@@ -1218,7 +1275,7 @@ def generate(
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
-            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32')}")
+            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm)}")
             round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
             body_lines.extend(round_lines)
             result_var[i] = cur
@@ -1227,7 +1284,7 @@ def generate(
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var) for aux in chain.aux_tensors}
+        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
@@ -1244,22 +1301,27 @@ def generate(
         body_lines.extend(round_lines)
         result_var[i] = cur
 
-    # Dense outputs, uniform in slot order. STG mode: every dense output rides
-    # a tap slot (dense spec i -> tap i; the template has no C output). TMA
-    # mode: spec 0 binds the template's ``vec_out`` (the TMA staging consumes
-    # it), specs 1.. -> taps i-1. A quant-carrying spec emits the
-    # block-quantize (quantized vector + scale byte) in place of a plain cast.
+    # Dense outputs, uniform in slot order. The store MODE is per slot: a slot
+    # in ``tma_slots`` binds the template's ``vec_out`` (the TMA staging consumes
+    # it) and occupies the trailing TMA-C parameter; every other output rides a
+    # tap slot. `_tap_of` is the ONE place that numbering is decided -- the tap
+    # index, the reduction index and the quant-scale index all read it, so they
+    # cannot drift apart. A quant-carrying spec emits the block-quantize
+    # (quantized vector + scale byte) in place of a plain cast.
     specs = chain.output_specs
     quant_batch_expr = "0" if chain.has_moe else "tile_l"
-    dense_tap_shift = -1 if use_tma_store else 0
-    n_dense_taps = max(len(specs) + dense_tap_shift, 0)
+    _tap_of: dict[int, int] = {}
+    for _oi in range(len(chain.outputs)):
+        if _oi not in tma_slots:
+            _tap_of[_oi] = len(_tap_of)
+    n_dense_taps = sum(1 for si in range(len(specs)) if si not in tma_slots)
 
     def _scale_tap_idx(qi: int) -> int:
-        return n_dense_taps + len(chain.reductions) + qi
+        return _tap_of[len(specs) + len(chain.reductions) + qi]
 
     for si, spec in enumerate(specs):
         src = _parent_value(spec.source_ref)
-        if use_tma_store and si == 0:
+        if si in tma_slots:
             if spec.quant_idx is not None:
                 body_lines.extend(
                     _emit_block_quant(
@@ -1277,9 +1339,9 @@ def generate(
             else:
                 body_lines.append(f"vec_out = {_store_cast_expr(src, spec.dtype)}")
             continue
-        tap_idx = si + dense_tap_shift
+        tap_idx = _tap_of[si]
         if spec.major == "m":
-            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch))
+            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_bound=store_row_bound))
             continue
         offset_expr = _dense_store_offset(si, spec.dtype == "fp4_e2m1", chain.matmul.batch)
         if spec.quant_idx is not None:
@@ -1303,11 +1365,11 @@ def generate(
             else:
                 body_lines.append(f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment=VEC_BYTES_TAP_{tap_idx})")
         else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si))
+            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_bound=store_row_bound))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
-        body_lines.extend(_emit_reduction_atomic(n_dense_taps + red_idx, red_idx, red, red_source, chain.matmul))
+        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize))
 
     epilogue = "\n".join(body_lines)
 
@@ -1315,17 +1377,16 @@ def generate(
     kernel_params = [f"{aux.name}: cute.Tensor" for aux in chain.aux_tensors]
     host_args = [aux.name for aux in chain.aux_tensors]
 
-    # tap plumbing (STG: every output; TMA: all but the first)
-    # STG mode: the tap list IS the full output list (dense, reductions,
-    # scales). TMA mode: outputs[0] rides the template's C params instead.
-    taps = list(chain.outputs) if not use_tma_store else chain.taps
+    # tap plumbing: every output that is NOT on the TMA-C surface, in tap order.
+    _slot_of = {t: o for o, t in _tap_of.items()}
+    taps = [chain.outputs[_slot_of[i]] for i in range(len(_tap_of))]
     tap_kernel_params = [f"mC_tap_{i}: cute.Tensor" for i in range(len(taps))]
     tap_host_params = [f"c_tap_{i}: cute.Tensor" for i in range(len(taps))]
     tap_host_pass = [f"c_tap_{i}" for i in range(len(taps))]
     tap_compile_fakes: list[str] = []
     # Per-slot true store alignment (matches _alignment_reject's contract); 16 is
     # a false claim for reduction / quant-scale / M-major taps.
-    _out_reqs = _output_align_reqs(chain, use_tma_store, vec_bytes=vec_bytes_epi)
+    _out_reqs = _output_align_reqs(chain, tma_slots, vec_bytes=vec_bytes_epi)
     for i, tap in enumerate(taps):
         # Byte-carrier taps: packed FP4 data, and an E5M3 scale (the DSL has no
         # E5M3 float type, and a raw_ptr store to a Uint8 tensor is rejected —
@@ -1337,9 +1398,9 @@ def generate(
         # contract is stride_n == 1 on an N-major DENSE tap (_dense_store_offset).
         # M-major dense scatters, and reductions / quant scales index purely by
         # runtime strides (and legitimately carry stride 0 for broadcast modes).
-        # Tap i is output slot i - dense_tap_shift; a slot outside chain.outputs
-        # would silently wrap the _out_reqs lookup.
-        _si = i - dense_tap_shift
+        # Tap i is output slot _slot_of[i]; a slot outside chain.outputs would
+        # silently wrap the _out_reqs lookup.
+        _si = _slot_of[i]
         assert 0 <= _si < len(_out_reqs), f"tap {i} maps to output slot {_si}, outside chain.outputs ({len(_out_reqs)})"
         _n_major_dense = (not tap.is_reduction) and (not tap.is_quant_scale) and _si < len(specs) and specs[_si].major == "n"
         _stride = "(cute.sym_int64(), 1, cute.sym_int64())" if _n_major_dense else "(cute.sym_int64(), cute.sym_int64(), cute.sym_int64())"

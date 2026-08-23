@@ -331,7 +331,7 @@ def _kernel(
     # @@INJECT_TAP_PTRS@@
 
     VEC_BYTES = vec_bytes_epi
-    vsize = (VEC_BYTES * 8) // cd_dtype.width
+    vsize = epi_chunk_elems
 
     M = m
     N = n
@@ -1230,7 +1230,7 @@ def _kernel(
 
                         # @@INJECT_EPILOGUE@@
 
-                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=epi_smem_swizzle)
+                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=epi_smem_row_bytes, swizzle=epi_smem_swizzle)
 
                         cute.arch.fence_view_async_shared()
                         nvvm.barrier_cta_sync(

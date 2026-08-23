@@ -12,7 +12,10 @@ Runs as a script too (forwards argv to pytest on this file).
 
 from __future__ import annotations
 
+import inspect
+import pathlib
 import sys
+import textwrap
 from dataclasses import dataclass
 from typing import Callable
 
@@ -32,6 +35,8 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
+from cudnn.gemm.frost import compiler, epilogue_codegen
+from cudnn.gemm.frost.epilogue_codegen import generate
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
@@ -2268,6 +2273,71 @@ if __name__ == "__main__":
 
 
 # --- full cuDNN pointwise-mode coverage (new ops, 2026-07-20) ---------------
+
+
+@pytest.mark.parametrize("mode,dims", (("per_col", [1, 1, 128]), ("per_elem", [1, 128, 128])))
+def test_coordinate_reading_aux_is_clamped_on_the_tma_arm(mode: str, dims: list[int]) -> None:
+    """The TMA arm hands the snippet a subtile base with no N or M bound, so a
+    `per_col` / `per_elem` LDG at `col_j + k` reads past the aux allocation.
+    The clamped fallback keeps every address inside both extents; the STG arm
+    already carries `col_j + vsize <= N` and must stay byte-identical."""
+    M = N = K = 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    stride = [dims[1] * dims[2], dims[2], 1]
+    x = g.tensor(name="x", dim=dims, stride=stride, data_type=cudnn.data_type.FLOAT)
+    g.mul(a=C, b=x, name="w").set_output(True)
+    chain = analyze(g)
+
+    stg = generate(chain, tma_slots=frozenset()).epilogue
+    tma = generate(chain, tma_slots=frozenset({0})).epilogue
+
+    assert "_auxv_x" not in stg, "the STG arm's own predicate already bounds the read — no fallback wanted"
+    assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in stg
+
+    assert "cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32(N) - 1)" in tma
+    assert ("cute.math.min(cutlass.Int32(row), cutlass.Int32(M) - 1)" in tma) == (mode == "per_elem")
+    # The whole-chunk load is still the fast path; the clamp is the tail only.
+    assert "if (col_j + vsize <= N)" in tma
+    assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in tma
+
+
+def test_tma_staged_values_reach_the_store_as_vectors() -> None:
+    """`store_swizzled` picks its path by sniffing whether the value's `.shape`
+    is a tuple: a `cutlass.Vector` reports `(N,)` and gets the per-16-byte-granule
+    scatter the SMEM swizzle needs, while `cute.make_rmem_tensor(N, ...).load()`
+    is a `TensorSSA` whose `.shape` is the bare int `N` -- taken for a scalar,
+    XORed once on the row base and written CONTIGUOUSLY, so each row's tail
+    spills into the next. Every emitter that can reach the TMA arm must hand on
+    a Vector; the ones that cannot must stay behind the gate that says so."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    gate = "".join(
+        textwrap.dedent(inspect.getsource(fn)) for fn in (compiler._use_tma_store_epi, compiler._tma_store_n_major_ok, compiler._tma_store_m_major_ok)
+    )
+
+    sites = src.count("cute.make_rmem_tensor(")
+    converted = src.count(".load().to_vector()")
+    assert sites == 4, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+        f"converts with .load().to_vector() or its feature stays gated off the TMA arm — "
+        f"decide which, then update this test."
+    )
+    assert converted == 3, f"expected exactly 3 converted rmem loads, found {converted}"
+
+    # The two unconverted sites are the row/col block-quantize emitters.
+    assert src.count("_out = cute.make_rmem_tensor(") == 2
+    assert "if chain.quants:" in gate, (
+        "the block-quantize emitters build their result in an rmem tensor and hand it on as a "
+        "TensorSSA; they are only safe because quant graphs never take the TMA arm. Relaxing "
+        "that gate requires converting them first."
+    )
+
 
 _PW_M, _PW_N, _PW_K = 128, 128, 128
 

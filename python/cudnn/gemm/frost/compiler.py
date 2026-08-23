@@ -41,6 +41,8 @@ def _as_custream(stream):
 
 from .dtypes import (
     DTYPE_BITS,
+    _TMA_SLOTS_0,
+    tma_slots_of,
     DTYPE_BYTES,
     DTYPE_TO_CUTLASS,
     DTYPE_TO_MMA_KIND,
@@ -234,7 +236,7 @@ def _aux_call_block(aux_tensors: list[TensorRef], prefix: str = "") -> str:
 
 
 def _tma_c_plumbing(chain: FusionChain) -> dict[str, str]:
-    n_out = len(chain.output_specs)
+    n_out = len(_TMA_SLOTS_0)
     return {
         "INJECT_KERNEL_TMA_C_PARAMS": ",\n".join(f"tma_c_desc_{i}: cutlass.GridConstant[_tma.TensorMap]" for i in range(n_out)) + ",",
         "INJECT_TMA_C_LISTS": "tma_c_descs = [" + ", ".join(f"tma_c_desc_{i}" for i in range(n_out)) + "]",
@@ -458,6 +460,20 @@ def _epi_vec_bytes(chain: FusionChain, config: TileConfig, cta_group: int) -> in
     return _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config, cta_group))
 
 
+def _epi_chunk_elems(chain: FusionChain, config: TileConfig, cta_group: int, use_tma_store: bool) -> int:
+    if not use_tma_store:
+        return _epi_vec_bytes(chain, config, cta_group) // DTYPE_BYTES[chain.output_dtype]
+    epi_n = _epi_n(config, cta_group, chain.output_dtype)
+    # The M-major arm transposes, so its `tcgen05_ld(SHAPE_16X256B, num=epi_n // 8)`
+    # hands a lane 4*num = epi_n/2 elements and the stmatrix ledger consumes exactly
+    # that (`range(epi_n // 16)` x 4 Int32). The N-major arm hands the whole subtile.
+    return epi_n // 2 if chain.out_major == "m" else epi_n
+
+
+def _epi_chunk_bytes(chain: FusionChain, config: TileConfig, cta_group: int, use_tma_store: bool) -> int:
+    return _epi_chunk_elems(chain, config, cta_group, use_tma_store) * DTYPE_BYTES[chain.output_dtype]
+
+
 def _mainloop_chain_zero_preserving(ops) -> bool:
     """True iff applying this mainloop op chain to 0 provably yields 0.
 
@@ -656,21 +672,18 @@ def _render_tile_constants(
             )
         acc_stages = min(cfg.acc_stages, 2 if 2 * acc_region_cols <= total_tmem else 1)
     lines.append(f"acc_stages = {acc_stages}  # {acc_region_cols} acc cols/stage")
+    # Multi-GEMM holds one SMEM buffer per DISTINCT operand, not the single A+B
+    # `smem_max_ab_stages` assumes. Carry that as a per-stage surcharge so the
+    # ONE override below decides ab_stages -- computing it here would be silently
+    # clobbered by that override, which sizes a single A+B (SMEM overflow at
+    # launch once multi-GEMM can also take the TMA-store epilogue).
+    mg_extra_per_stage = 0
     if chain.is_multi_gemm:
-        # ab_stages: one SMEM buffer per DISTINCT operand (num_a A + num_b B per
-        # stage), not the single A+B that smem_max_ab_stages assumes.
-        from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
-
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
         smem_n = cfg.cta_tile_n // cta_group
-        per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes
-        avail = _sm_smem_ab_budget_bytes(cfg.pipeline, moe=chain.has_moe)
-        ab_stages_mg = min(avail // per_stage, _AB_STAGES_CAP)
-        if ab_stages_mg < 1:
-            raise NotImplementedError(
-                f"multi-GEMM: {chain.num_a_operands} A + {chain.num_b_operands} B " f"operand tiles per stage exceed SMEM budget at this geometry"
-            )
-        lines.append(f"ab_stages = {ab_stages_mg}  # multi-GEMM: {chain.num_a_operands}A+{chain.num_b_operands}B per stage")
+        base_mn = cfg.cta_tile_m + smem_n
+        mg_mn = chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n
+        mg_extra_per_stage = (mg_mn - base_mn) * cfg.cta_tile_k_bytes
     # MoE grouped matmul: grouped persistent scheduler launches a FIXED cluster
     # count (≈ NUM_SMS / cluster_size); host grid and kernel stride share it.
     if chain.has_moe:
@@ -721,6 +734,7 @@ def _render_tile_constants(
     # (fallback). See _use_tma_store_epi() for gating.
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, cfg, vec_bytes_epi, cta_group)
     lines.append(f"use_tma_store_epi = {use_tma}")
+    lines.append(f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma)}")
     # Final ab_stages override: account for the TMA-D SMEM buffer (fixed, when
     # TMA-store is active) AND a mixed-input mainloop's narrow LOAD buffer
     # (per-stage). Otherwise leave the plain max.
@@ -733,14 +747,23 @@ def _render_tile_constants(
             cast_extra_per_stage += cfg.cta_tile_m * k_elems * DTYPE_BYTES[chain.mainloop_a_load_dtype]
         if chain.mainloop_b_cast:
             cast_extra_per_stage += smem_n * k_elems * DTYPE_BYTES[chain.mainloop_b_load_dtype]
-    if smem_d_bytes > 0 or cast_extra_per_stage > 0:
-        new_ab = cfg.max_ab_stages(
-            cta_group,
-            extra_smem_bytes=smem_d_bytes,
-            extra_per_stage_bytes=cast_extra_per_stage,
-            moe=chain.has_moe,
+    if smem_d_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
+        try:
+            new_ab = cfg.max_ab_stages(
+                cta_group,
+                extra_smem_bytes=smem_d_bytes,
+                extra_per_stage_bytes=cast_extra_per_stage + mg_extra_per_stage,
+                moe=chain.has_moe,
+            )
+        except ValueError as exc:
+            if chain.is_multi_gemm:
+                raise NotImplementedError(
+                    f"multi-GEMM: {chain.num_a_operands} A + {chain.num_b_operands} B " f"operand tiles per stage exceed SMEM budget at this geometry"
+                ) from exc
+            raise
+        lines.append(
+            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage" f" + multi-GEMM {mg_extra_per_stage}B/stage"
         )
-        lines.append(f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage")
     lines.extend(_quant_device_imports(chain))
     lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     return "\n".join(lines)
@@ -1412,6 +1435,7 @@ def _render_block_scale_tile_constants(
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"frost_compile_options = {_frost_compile_options()!r}",
         f"use_tma_store_epi = {use_tma_store_epi}",
+        f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma_store_epi)}",
         f"cd_out_is_m_major = {chain.out_major == 'm'}",
         f"cd_fake_n_div = {2 if out_dt == 'fp4_e2m1' else 1}",
         # M-major TMA-store C-descriptor inner-M box = 128 B swizzle span / elem_bytes.
@@ -1631,7 +1655,7 @@ def _render_template(
     compile_aux_fakes = _aux_fake_block(
         aux_tensors,
         dynamic_strides=True,
-        align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi),
+        align_reqs=_aux_align_reqs(chain, vec_bytes=_epi_chunk_bytes(chain, config, cta_group, use_tma)),
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_tile_constants(config, chain, cta_group, use_tma, fallback_cluster=fallback_cluster)
@@ -1758,7 +1782,9 @@ def _render_block_scale_template(
     kernel_aux_params = _aux_signature_block(aux_tensors)
     host_aux_params = _aux_signature_block(aux_tensors)
     host_aux_pass = _aux_call_block(aux_tensors)
-    compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi))
+    compile_aux_fakes = _aux_fake_block(
+        aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=_epi_chunk_bytes(chain, config, cta_group, use_tma))
+    )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, cta_group, use_tma_store_epi=use_tma, fallback_cluster=fallback_cluster)
     if snippets.tap_constants:
@@ -2719,7 +2745,24 @@ def _check_input_alignment(chain: FusionChain) -> None:
 _EPI_SMEM_STAGES = 2
 
 
-_EPI_SWIZZLE_BY_ROW_BYTES = {32: (1, "s32b"), 64: (2, "s64b"), 128: (3, "s128b")}
+# A 16-byte staging row needs no swizzle: the XOR exists to spread a WIDE row
+# across the banks, and at 16 B/thread an STS.128 warp already covers all 32
+# banks conflict-free per phase. `Swizzle(0, ...)` has a zero-width mask, so
+# `store_swizzled` degenerates to a plain store and the descriptor declares
+# `none`, which is the one mode the DSL exempts from the box-width check.
+_EPI_SWIZZLE_BY_ROW_BYTES = {16: (0, "none"), 32: (1, "s32b"), 64: (2, "s64b"), 128: (3, "s128b")}
+
+# The N-major arm stages with `store_swizzled`, an XOR on SMEM BYTE addresses,
+# and hands the C descriptor an element type -- both are a function of the
+# element WIDTH, not of the dtype. Sub-byte output is the one exception: the
+# descriptor is byte-typed there, so its n and the store coordinate would have
+# to be the PACKED ones (`cd_fake_n_div`), which the host arm does not do.
+# The M-major arm transposes with `stmatrix.m8n8`, which moves a b16 payload
+# and has no b32 form in PTX -- that one IS a dtype-width lock at exactly 16.
+_TMA_STORE_MIN_OUT_BITS = 8
+_TMA_STORE_M_MAJOR_OUT_BITS = 16
+_TMA_STORE_M_MAJOR_MIN_EPI_N = 16
+
 _EPI_ROW_BYTES_MAX = 128  # widest TMA store swizzle
 _EPI_N_BASE = 32  # drain width when the epilogue is already hidden behind the MMA
 _EPI_N_MAX = 64  # per-lane fp32 registers the drain can hold
@@ -2734,18 +2777,21 @@ def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
     return 1 << (n.bit_length() - 1)
 
 
+def _epi_swizzle_ok(cfg, cta_group: int, out_dt: str) -> bool:
+    """Does the TMA-store staging row have a swizzle? A subtile row outside
+    {32,64,128} bytes has none, which makes the tmastg SMEM stage inexpressible
+    -- a store-stage predicate, so it declines the TMA arm rather than the whole
+    render (the STG arm never touches the swizzle)."""
+    return _epi_n(cfg, cta_group, out_dt) * DTYPE_BYTES[out_dt] in _EPI_SWIZZLE_BY_ROW_BYTES
+
+
 def _epi_swizzle_lines(cfg, cta_group: int, out_dt: str) -> list[str]:
     epi_n = _epi_n(cfg, cta_group, out_dt)
     row_bytes = epi_n * DTYPE_BYTES[out_dt]
-    if row_bytes not in _EPI_SWIZZLE_BY_ROW_BYTES:
-        raise NotImplementedError(
-            f"{cfg.name!r}: epilogue subtile row is {row_bytes} bytes "
-            f"(epi_n={epi_n} x {DTYPE_BYTES[out_dt]}B {out_dt}); "
-            f"the TMA store swizzle only spans {sorted(_EPI_SWIZZLE_BY_ROW_BYTES)}"
-        )
-    b, tma = _EPI_SWIZZLE_BY_ROW_BYTES[row_bytes]
+    b, tma = _EPI_SWIZZLE_BY_ROW_BYTES.get(row_bytes, _EPI_SWIZZLE_BY_ROW_BYTES[min(_EPI_SWIZZLE_BY_ROW_BYTES)])
     return [
         f"epi_n = {epi_n}",
+        f"epi_smem_row_bytes = {row_bytes}",
         f"epi_smem_swizzle = cutlass.Swizzle({b}, 4, 3)",
         f"epi_tma_swizzle = _tma.TensorMapSwizzle.{tma}",
     ]
@@ -2760,60 +2806,107 @@ def _smem_d_bytes(cfg, chain, cta_group: int) -> int:
     return _EPI_SMEM_STAGES * cfg.epi_tile_mn[0] * _epi_n(cfg, cta_group, out_dt) * DTYPE_BYTES[out_dt] + 16
 
 
-def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
-    """Gate for the TMA-store epilogue path. Requires:
-    - single tensor output (no aux): aux ops load at STG vsize, misaligned
-      with the full t2r_inst_repx vector the TMA path stages to SMEM.
-    - N-major output row stride ≥ 16 bytes: cp.async.bulk.tensor needs the
-      SMEM source aligned to the descriptor swizzle (else undeclarable).
-    - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
-      wired (an M=64 MMA block drains through the packed lane<16 layout).
-    - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
-    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store),
-      and not MoE: the six MoE templates carry only the N-major TMA store.
-    """
-    if chain.is_multi_gemm:
-        # No multi-accumulator hook in the TMA-store path → STG only.
-        return False
-    if chain.aux_tensors:
-        return False
-    if any(op.op == "gen_index" for op in chain.ops):
-        # gen_index emits an iota at the STG vsize; the TMA path stages full
-        # t2r_inst_repx vectors.
-        return False
-    if len(chain.output_specs) > 1:
-        # Extra dense outputs store in the per-vector inner loop; the TMA path
-        # stages full t2r_inst_repx subtiles with no tap hook.
-        return False
-    if chain.reductions:
-        # Reduction taps are per-element atomic updates from the STG epilogue.
-        return False
-    if chain.quants:
-        # Quant scales are per-vector side outputs from the STG epilogue.
-        return False
-    if chain.out_major == "n" and vec_bytes_epi < 16:
-        return False
+def _tma_store_geometry_ok(chain, cfg, cta_group: int) -> bool:
+    """The store rules that hold on BOTH arms -- pure geometry and output width,
+    nothing about the chain's shape."""
+    # Only the 128-rows-per-MMA-block thread->row layout is wired; an M=64 MMA
+    # block drains through the packed lane<16 layout.
     if cfg.mma_inst_m != 128:
         return False
-    if chain.output_dtype not in ("bf16", "fp16"):
+    # WIDTH, not dtype: store_swizzled and the descriptor are width-functions.
+    if DTYPE_BITS[chain.output_dtype] < _TMA_STORE_MIN_OUT_BITS:
+        return False
+    # The SMEM staging row must be a width the swizzle table can express.
+    if not _epi_swizzle_ok(cfg, cta_group, chain.output_dtype):
         return False
     # An N-tile that is not a whole number of subtiles would TMA-store an
     # epi_n-wide box past the tile edge into the neighbouring tile (TMA clamps
-    # only at the GLOBAL extent) — fall back to STG. The N-major arm's span walk
-    # would halve to fit, but the M-major arm drains a fixed epi_n.
+    # only at the GLOBAL extent).
     if _epi_tile_cols(cfg, cta_group) % _epi_n(cfg, cta_group, chain.output_dtype) != 0:
         return False
-    # Under cta_group=2 each CTA holds cta_tile_n//2 cols, so cta_tile_n<64
-    # (per-CTA n<32) would split a subtile across CTAs — unsupported by the
-    # TMA path, fall back to STG.
-    if cta_group == 2 and cfg.cta_tile_n < 64:
+    return True
+
+
+def _tma_store_n_major_ok(chain, cfg, cta_group: int, vec_bytes_epi: int) -> bool:
+    """What still keeps an N-major graph off the TMA-store arm.
+
+    One of these is a real store rule; the other two are unfinished work, and
+        both need the same missing piece -- a per-element mask INSIDE the trailing
+        chunk. The arm exists precisely to serve a tile that overhangs N, and a
+        chunk-granular guard would silently drop the valid prefix of a straddling
+        subtile (a missed atomic / a missing scale byte, not a fault). Taps escape
+        that because `_tap_store_elems` divides both N and `col_j`."""
+    # REAL: the C descriptor encodes its global row stride in 16-BYTE units, so a
+    # row that is not a whole number of them is silently misaddressed (N=255 bf16:
+    # 510 // 16 = 31 -> rows read at 496 bytes). `_epi_vec_bytes` is the output's
+    # own row alignment clamped to the subtile spans, and the clamp never binds
+    # here -- `_tma_store_geometry_ok` already forces a >= 16-byte staging row that
+    # divides the N-tile. Measured: 0 over-rejections over 5400 (config, cta_group)
+    # pairs x 5 values of N. The SMEM side is `_epi_swizzle_ok`, not this.
+    if vec_bytes_epi < 16:
+        return False
+    # TODO(gate 5): reductions are atomic RMWs -- one folded per chunk when N is
+    # the reduced axis, one per element otherwise. A clamp is inadmissible for a
+    # read-modify-write, so they wait for the in-chunk mask.
+    if chain.reductions:
+        return False
+    # TODO(gate 6): the quant VALUE transform is already arm-correct, but the
+    # scale store is a per-chunk side effect, and a straddling chunk's amax would
+    # fold in columns past N -- so even the surviving columns' scale is wrong.
+    # Also needs `.to_vector()` on the two block-quant emitters first.
+    if chain.quants:
+        return False
+    return True
+
+
+def _tma_store_m_major_ok(chain, cfg, cta_group: int) -> bool:
+    """The M-major arm is `tcgen05.ld 16x256b -> stmatrix.trans -> utmastg`. It
+    re-reads TMEM itself, runs the snippet TWICE under `for _h in range(2)`, and
+    `row` / `col_j` are the subtile base rather than the coordinates of the
+    fragment a lane holds -- so everything coordinate-reading or side-effecting
+    is out by construction, not pending."""
+    # stmatrix.m8n8 has no b32 payload form.
+    if DTYPE_BITS[chain.output_dtype] != _TMA_STORE_M_MAJOR_OUT_BITS:
+        return False
+    # The transpose ledger is `for _blk in range(epi_n // 16)` over 4-register
+    # stmatrix tiles, so a narrower drain emits ZERO stores and the output keeps
+    # whatever the buffer held -- silent, not a fault.
+    if _epi_n(cfg, cta_group, chain.output_dtype) < _TMA_STORE_M_MAJOR_MIN_EPI_N:
+        return False
+    # The six MoE templates carry only the N-major TMA store.
+    if chain.has_moe:
+        return False
+    # This arm skips the pre-split accumulator load, so there is no `vec_f32_<g>`
+    # to bind for the extra GEMMs.
+    if chain.is_multi_gemm:
+        return False
+    # Coordinate-reading pointwise inputs and side effects: wrong coordinates,
+    # and the double pass would fire each side effect twice.
+    if any(a.bcast_mode != "scalar" for a in chain.aux_tensors):
+        return False
+    if any(op.op == "gen_index" for op in chain.ops):
+        return False
+    if len(chain.output_specs) > 1 or chain.reductions or chain.quants:
+        return False
+    # 16x256b TMEM-load + stmatrix.trans + tma_store all move 16-byte units of M.
+    return chain.matmul.M % (16 // DTYPE_BYTES[chain.output_dtype]) == 0
+
+
+def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
+    """Gate for the TMA-store epilogue path: the geometry rules both arms share,
+    then the arm's own. Split by output major because the two arms have almost
+    nothing in common past the staging buffer -- see the two helpers."""
+    if not chain.output_specs:
+        # A reduction/amax-only chain has no dense output to bind the TMA-C
+        # slot, and `chain.output_dtype` / `out_major` then answer for a slot
+        # that does not exist -- it would report slot 0 and bind reduction_0 to
+        # the C descriptor. Do not rely on the reduction/quant rules for this.
+        return False
+    if not _tma_store_geometry_ok(chain, cfg, cta_group):
         return False
     if chain.out_major == "m":
-        if chain.has_moe:
-            return False
-        m_align = 16 // DTYPE_BYTES[chain.output_dtype]
-        return chain.matmul.M % m_align == 0
-    return True
+        return _tma_store_m_major_ok(chain, cfg, cta_group)
+    return _tma_store_n_major_ok(chain, cfg, cta_group, vec_bytes_epi)
 
 
 def _check_block_quant_supported(
@@ -2937,19 +3030,137 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
+def plan_config(chain: FusionChain) -> "tuple[TileConfig, int]":
+    from .kernel_registry import preferred_pipeline
+    from .tile_config import as_pipeline, select_config
+
+    tile_m = chain.matmul.M
+    if chain.moe is not None:
+        tile_m = (chain.matmul.M + chain.moe.num_groups - 1) // chain.moe.num_groups
+    config, cta_group = select_config(
+        tile_m,
+        chain.matmul.N,
+        chain.num_gemms,
+        K=chain.matmul.K,
+        block_scale=chain.has_block_scale,
+        b_n_major=chain.matmul.b_major == "n",
+        b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
+    )
+    return as_pipeline(config, preferred_pipeline(chain)), cta_group
+
+
+def _precheck_plain(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    from .kernel_registry import select_template
+
+    _check_supported(chain, config)
+    _arch_reason = select_template(chain, config, cta_group).active_reject(config)
+    if _arch_reason is not None:
+        raise NotImplementedError(_arch_reason)
+    _check_dtype_config_compat(chain, config, cta_group)
+    _check_input_alignment(chain)
+    _compute_output_vec_bytes(chain)
+    _check_block_quant_supported(chain, _epi_vec_bytes(chain, config, cta_group), config, cta_group)
+
+
+def _precheck_moe(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    from .kernel_registry import GraphType, mma_arch_reject, select_template
+
+    reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
+    if reason is not None:
+        raise NotImplementedError(reason)
+    if chain.matmul.a_major != "k":
+        raise NotImplementedError(
+            "MoE grouped matmul supports only K-major token: the per-group A "
+            "descriptor patch walks the token rows by their M stride "
+            f"(got token {chain.matmul.a_major}-major)"
+        )
+    _arch_reason = select_template(chain, config, cta_group).active_reject(config)
+    if _arch_reason is not None:
+        raise NotImplementedError(_arch_reason)
+    _check_dtype_config_compat(chain, config, cta_group)
+    _check_input_alignment(chain)
+    _compute_output_vec_bytes(chain)
+    _check_block_quant_supported(chain, _epi_vec_bytes(chain, config, cta_group), config, cta_group)
+
+
+def _precheck_block_scale(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    from .kernel_registry import select_template
+
+    _check_block_scale_supported(chain, config.pipeline)
+    _check_input_alignment(chain)
+    _epi_pipelines = ("sm100", "sm107")
+    if chain.reductions:
+        if config.pipeline not in _epi_pipelines:
+            raise NotImplementedError(f"block-scale reduction is not supported on {config.pipeline} templates")
+        for red in chain.reductions:
+            if red.compute_dtype != "fp32" or red.dtype != "fp32":
+                raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
+    if chain.quants and config.pipeline not in _epi_pipelines:
+        raise NotImplementedError(f"block-scale quant epilogue is not supported on {config.pipeline} " "templates (not yet validated on sm103)")
+    _tmpl = select_template(chain, config, cta_group)
+    if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
+        raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}).")
+    _arch_reason = _tmpl.active_reject(config)
+    if _arch_reason is not None:
+        raise NotImplementedError(_arch_reason)
+    _compute_output_vec_bytes(chain)
+    _check_block_quant_supported(chain, _epi_vec_bytes(chain, config, cta_group), config, cta_group)
+
+
+def _precheck_moe_block_scale(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    from .kernel_registry import GraphType, mma_arch_reject, select_template
+
+    reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
+    if reason is not None:
+        raise NotImplementedError(reason)
+    if chain.matmul.a_major != "k":
+        raise NotImplementedError(
+            "MoE block-scale matmul supports only K-major token: the per-group A "
+            "descriptor patch walks the token rows by their M stride "
+            f"(got token {chain.matmul.a_major}-major)"
+        )
+    if chain.reductions:
+        for red in chain.reductions:
+            if red.compute_dtype != "fp32" or red.dtype != "fp32":
+                raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
+    _check_input_alignment(chain)
+    _arch_reason = select_template(chain, config, cta_group).active_reject(config)
+    if _arch_reason is not None:
+        raise NotImplementedError(_arch_reason)
+    _compute_output_vec_bytes(chain)
+    _check_block_quant_supported(chain, _epi_vec_bytes(chain, config, cta_group), config, cta_group)
+
+
+def precheck_path(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    """Every gate the matching ``_jit_*`` path runs before it renders anything.
+    ``probe_supported`` calls this so a graph the build will decline is never
+    reported eligible -- otherwise the engine is listed, ``build_plans`` drops
+    it, native cuDNN serves the graph and no test fails."""
+    if chain.has_moe and chain.has_block_scale:
+        _precheck_moe_block_scale(chain, config, cta_group)
+    elif chain.has_block_scale:
+        _precheck_block_scale(chain, config, cta_group)
+    elif chain.has_moe:
+        _precheck_moe(chain, config, cta_group)
+    else:
+        _precheck_plain(chain, config, cta_group)
+
+
 def probe_supported(
     graph: cudnn.pygraph,
-    config: TileConfig = DEFAULT_CONFIG,
+    config: "TileConfig | None" = None,
     *,
-    cta_group: int = 2,
+    cta_group: "int | None" = None,
 ) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. This is
     ``FrostGemmEngine.check_support`` (see ``cudnn/gemm/frost/engine.py``), so it
     runs for every candidate graph and must stay cheap.
 
-    Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
-    successful analysis is treated as eligible (full validation at compile)."""
+    With no explicit config it probes the (config, cta_group) ``build_gemm_plan``
+    will pick, and runs the same gate prefix that path runs -- probe and build
+    must agree or an ineligible graph is listed, dropped at build, and silently
+    served by native cuDNN."""
     # frost is written in the cutedsl these kernels compile through; below its
     # floor the engine cannot build (same gate the linear-attention engines
     # apply). Decline early so a too-old wheel falls back to the backend instead
@@ -2967,9 +3178,11 @@ def probe_supported(
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
-    if chain.has_moe or chain.has_block_scale:
-        return  # specialized paths validate at compile
-    if chain.is_multi_gemm:
+    if config is None or cta_group is None:
+        _cfg, _cg = plan_config(chain)
+        config = _cfg if config is None else config
+        cta_group = _cg if cta_group is None else cta_group
+    if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from .kernel_registry import select_template
 
         tmpl = select_template(chain, config, cta_group)
@@ -2979,14 +3192,7 @@ def probe_supported(
                 f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
                 f"→ {tmpl.file}."
             )
-    _check_supported(chain, config)
-    from .kernel_registry import select_template as _sel_tmpl
-
-    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
-    if _arch_reason is not None:
-        raise NotImplementedError(_arch_reason)
-    _check_dtype_config_compat(chain, config, cta_group)
-    _check_input_alignment(chain)
+    precheck_path(chain, config, cta_group)
 
 
 def jit_from_cudnn_graph(
@@ -3019,17 +3225,23 @@ def jit_from_cudnn_graph(
         raise NotImplementedError(_dtype_reason)
     _check_cta_group_geometry(config, cta_group)
     _check_mma_n_dim(chain, config, cta_group)
-    # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
-    # check BEFORE the single-feature gates.
-    if chain.has_moe and chain.has_block_scale:
-        return _jit_moe_block_scale(chain, config, cta_group, binding=binding)
-    # Block-scale is gated independently (own per-side case table).
-    if chain.has_block_scale:
-        return _jit_block_scale(chain, config, cta_group, binding=binding)
-    # MoE grouped matmul: own template (grouped persistent scheduler + per-group
-    # A TMA descriptor replacement).
-    if chain.has_moe:
-        return _jit_moe(chain, config, cta_group, binding=binding)
+    global _FORCE_STG_EPI
+    prev_force = _FORCE_STG_EPI
+    _FORCE_STG_EPI = force_stg_epi
+    try:
+        # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
+        # check BEFORE the single-feature gates.
+        if chain.has_moe and chain.has_block_scale:
+            return _jit_moe_block_scale(chain, config, cta_group, binding=binding)
+        # Block-scale is gated independently (own per-side case table).
+        if chain.has_block_scale:
+            return _jit_block_scale(chain, config, cta_group, binding=binding)
+        # MoE grouped matmul: own template (grouped persistent scheduler + per-group
+        # A TMA descriptor replacement).
+        if chain.has_moe:
+            return _jit_moe(chain, config, cta_group, binding=binding)
+    finally:
+        _FORCE_STG_EPI = prev_force
     # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
     # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
@@ -3045,29 +3257,17 @@ def jit_from_cudnn_graph(
             )
     # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
     # special-case combos]) gate, then the template family's active-GPU gate.
-    _check_supported(chain, config)
-    from .kernel_registry import select_template as _sel_tmpl
-
-    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
-    if _arch_reason is not None:
-        raise NotImplementedError(_arch_reason)
-    _check_dtype_config_compat(chain, config, cta_group)
-    _check_input_alignment(chain)
-    # Eager: also raises if output alignment < 4 bytes (PTX st.b32 floor), so
-    # callers see the rejection at JIT time.
-    _compute_output_vec_bytes(chain)
-    global _FORCE_STG_EPI
+    _precheck_plain(chain, config, cta_group)
     prev_force = _FORCE_STG_EPI
     _FORCE_STG_EPI = force_stg_epi
     try:
         vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-        _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
         use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
         snippets = generate(
             chain,
-            vec_bytes_epi=vec_bytes_epi,
+            vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
             output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-            use_tma_store=use_tma,
+            tma_slots=tma_slots_of(use_tma),
         )
         src = _render_template(chain, snippets, config, cta_group)
     finally:
@@ -3083,7 +3283,7 @@ def jit_from_cudnn_graph(
         _launchable=mod.compile(),  # one-shot cute.compile (lru_cached in mod)
         binding=binding,
         use_tma_store=use_tma,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
     )
 
 
@@ -3224,6 +3424,7 @@ class CompiledMoeGemm:
     # output descriptor when the TMA-store epilogue is on (re-dimensioned per
     # routed group so the hardware clips the ragged tail).
     _desc_slots_per_cta: int = 0
+    use_tma_store: bool = False
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
@@ -3318,13 +3519,13 @@ class CompiledMoeGemm:
             workspace,
             a,
             b,
-            *cs,
+            *_moe_launch_tail(cs, use_tma_store=self.use_tma_store),
             stream=_as_custream(stream),
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, snk = _resolve_moe_variant_pack(self, variant_pack)
-        _out_reqs = _output_align_reqs(self.chain, False, vec_bytes=self.vec_bytes_epi)
+        _out_reqs = _output_align_reqs(self.chain, tma_slots_of(self.use_tma_store), vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         _named = (
             [("token", x, 16, "ptr") for x in a_bufs]
@@ -3439,10 +3640,21 @@ class CompiledMoeGemm:
             workspace,
             *a_wrapped,
             *b_wrapped,
-            *cs,
-            *aux,
+            *_moe_launch_tail(cs, aux, use_tma_store=self.use_tma_store),
             stream=_as_custream(stream),
         )
+
+
+def _moe_launch_tail(cs, aux=(), *, use_tma_store: bool) -> tuple:
+    """Outputs + auxes in the host signature's order -- TAP, AUX, then the
+    trailing TMA-C slot. Under STG every dense output rides a tap slot; under
+    TMA-store slot 0 binds the TMA-only parameter and so goes LAST. MoE has no
+    recipe (``_check_executable`` returns early for it), so this is the only
+    place that order is written down."""
+    cs = list(cs)
+    if use_tma_store and cs:
+        return (*cs[1:], *aux, cs[0])
+    return (*cs, *aux)
 
 
 def _jit_moe(
@@ -3453,33 +3665,14 @@ def _jit_moe(
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeGemm:
     """JIT path for a MoE grouped matmul forward pass (mode=NONE)."""
-    from .kernel_registry import GraphType, mma_arch_reject
-
-    reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
-    if reason is not None:
-        raise NotImplementedError(reason)
-    if chain.matmul.a_major != "k":
-        raise NotImplementedError(
-            "MoE grouped matmul supports only K-major token: the per-group A "
-            "descriptor patch walks the token rows by their M stride "
-            f"(got token {chain.matmul.a_major}-major)"
-        )
-    from .kernel_registry import select_template as _sel_tmpl
-
-    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
-    if _arch_reason is not None:
-        raise NotImplementedError(_arch_reason)
-    _check_dtype_config_compat(chain, config, cta_group)
-    _check_input_alignment(chain)
-    _compute_output_vec_bytes(chain)
+    _precheck_moe(chain, config, cta_group)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
     snippets = generate(
         chain,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        use_tma_store=use_tma,
+        tma_slots=tma_slots_of(use_tma),
     )
     src = _render_template(chain, snippets, config, cta_group)
     mod = _import_kernel(src)
@@ -3495,8 +3688,9 @@ def _jit_moe(
         _grid_ctas=grid_ctas,
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
         _desc_slots_per_cta=chain.num_a_operands + (1 if use_tma else 0),
+        use_tma_store=use_tma,
     )
 
 
@@ -3514,38 +3708,17 @@ def _jit_block_scale(
     tile-constant renderer (``validate_block_scale_config``)."""
     # Exact per-side match against the supported cases (+ arch); subsumes the
     # both-sided requirement (single-sided matches no case).
-    _check_block_scale_supported(chain, config.pipeline)
-    _check_input_alignment(chain)
-    # The sm107 templates carry the sm100 epilogue verbatim, so reductions and
-    # the quant epilogue ride it unchanged; sm103's own pipeline does not.
-    _epi_pipelines = ("sm100", "sm107")
-    if chain.reductions:
-        if config.pipeline not in _epi_pipelines:
-            raise NotImplementedError(f"block-scale reduction is not supported on {config.pipeline} templates")
-        for red in chain.reductions:
-            if red.compute_dtype != "fp32" or red.dtype != "fp32":
-                raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
-    if chain.quants and config.pipeline not in _epi_pipelines:
-        raise NotImplementedError(f"block-scale quant epilogue is not supported on {config.pipeline} " "templates (not yet validated on sm103)")
-    # Per-template active-GPU SM gate (no-op when no GPU is visible).
     from .kernel_registry import select_template
 
-    _tmpl = select_template(chain, config, cta_group)
-    if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
-        raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}).")
-    _arch_reason = _tmpl.active_reject(config)
-    if _arch_reason is not None:
-        raise NotImplementedError(_arch_reason)
-    fallback_cluster = _mixed_cga_fallback(config, cta_group, _tmpl.file)
-    _compute_output_vec_bytes(chain)  # eager: rejects bad output alignment
+    _precheck_block_scale(chain, config, cta_group)
+    fallback_cluster = _mixed_cga_fallback(config, cta_group, select_template(chain, config, cta_group).file)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
     snippets = generate(
         chain,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        use_tma_store=use_tma,
+        tma_slots=tma_slots_of(use_tma),
     )
     src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=fallback_cluster)
     mod = _import_kernel(src)
@@ -3560,7 +3733,7 @@ def _jit_block_scale(
         use_tma_store=use_tma,
         block_scale=True,
         binding=binding,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
     )
 
 
@@ -3599,6 +3772,7 @@ class CompiledMoeBlockScaleGemm:
     # (its base carries start_sf_block_m and its m extent bounds the group), plus
     # the output descriptor when the TMA-store epilogue re-dimensions it per group.
     _desc_slots_per_cta: int = 0
+    use_tma_store: bool = False
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
@@ -3703,13 +3877,13 @@ class CompiledMoeBlockScaleGemm:
             b,
             msfa,
             msfb,
-            *cs,
+            *_moe_launch_tail(cs, use_tma_store=self.use_tma_store),
             stream=_as_custream(stream),
         )
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, snk = _resolve_moe_variant_pack(self, variant_pack)
-        _out_reqs = _output_align_reqs(self.chain, False, vec_bytes=self.vec_bytes_epi)
+        _out_reqs = _output_align_reqs(self.chain, tma_slots_of(self.use_tma_store), vec_bytes=self.vec_bytes_epi)
         _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
         _named = (
             [("token", x, 16, "ptr") for x in a_bufs]
@@ -3838,8 +4012,7 @@ class CompiledMoeBlockScaleGemm:
             *b_wrapped,
             *sfa_wrapped,
             *sfb_wrapped,
-            *cs,
-            *aux,
+            *_moe_launch_tail(cs, aux, use_tma_store=self.use_tma_store),
             stream=_as_custream(stream),
         )
 
@@ -3861,34 +4034,15 @@ def _jit_moe_block_scale(
         select_template,
     )
 
-    reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
-    if reason is not None:
-        raise NotImplementedError(reason)
-    if chain.matmul.a_major != "k":
-        raise NotImplementedError(
-            "MoE block-scale matmul supports only K-major token: the per-group A "
-            "descriptor patch walks the token rows by their M stride "
-            f"(got token {chain.matmul.a_major}-major)"
-        )
-    if chain.reductions:
-        for red in chain.reductions:
-            if red.compute_dtype != "fp32" or red.dtype != "fp32":
-                raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
-    _check_input_alignment(chain)
-    # Per-template active-GPU SM gate (no-op when no GPU is visible).
+    _precheck_moe_block_scale(chain, config, cta_group)
     _tmpl = select_template(chain, config, cta_group)
-    _arch_reason = _tmpl.active_reject(config)
-    if _arch_reason is not None:
-        raise NotImplementedError(_arch_reason)
-    _compute_output_vec_bytes(chain)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
-    _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
     snippets = generate(
         chain,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        use_tma_store=use_tma,
+        tma_slots=tma_slots_of(use_tma),
     )
     src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
@@ -3903,6 +4057,7 @@ def _jit_moe_block_scale(
         _launchable=mod.compile(),
         _grid_ctas=grid_ctas,
         binding=binding,
-        vec_bytes_epi=vec_bytes_epi,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, cta_group, use_tma),
         _desc_slots_per_cta=chain.num_a_operands * 2 + (1 if use_tma else 0),
+        use_tma_store=use_tma,
     )
