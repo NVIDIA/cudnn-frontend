@@ -123,6 +123,13 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `attn_sink`: `(H,)` FP32
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
+
+On SM100, the public backward entry point automatically selects the tuned
+kernel from `q.shape[1:3]`: H16 with `head_dim=576` uses the dedicated M128
+sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
+use the generic M64 pipeline. No backend or tile-size argument is required.
+SM90 continues to use its Hopper-specific implementation.
+
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
 

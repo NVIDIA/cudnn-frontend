@@ -52,6 +52,30 @@ def _allocate(cfg, has_topk_length: bool):
     return q, kv, attn_sink, topk_idxs, topk_length
 
 
+@pytest.mark.parametrize(
+    "num_heads,head_dim,expected_backend,expected_block_tile",
+    [
+        (16, 576, "h16_m128", 128),
+        (16, 512, "generic_m64", 64),
+        (32, 576, "generic_m64", 64),
+        (64, 576, "generic_m64", 64),
+    ],
+)
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
+    num_heads,
+    head_dim,
+    expected_backend,
+    expected_block_tile,
+):
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    assert _select_sm100_backend(num_heads, head_dim) == (expected_backend, expected_block_tile)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_attention_backward_params
@@ -220,6 +244,7 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
     "head_dim,num_heads,topk_length_values",
     [
         pytest.param(512, 64, (-3, 0, 1, 63, 64, 65, 128), id="d512-mixed"),
+        pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
         pytest.param(576, 32, None, id="d576-all-empty"),
     ],
 )
@@ -238,7 +263,8 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
 
     device = torch.device("cuda")
     s_q = len(topk_length_values) if topk_length_values is not None else 2
-    s_kv, topk = 256, 128
+    is_h16 = head_dim == 576 and num_heads == 16
+    s_kv, topk = (640, 513) if is_h16 else (256, 128)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -246,10 +272,10 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     base_topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
 
-    # The D512 mixed case covers defensive negative handling and both sides of
-    # the 64-row tile boundary. The all-empty cases make every expected
-    # gradient exactly zero; D576/H32 additionally covers the feature tail and
-    # a partial 64-head CTA.
+    # D512 covers defensive negative handling around the 64-row tile boundary.
+    # D576/H16 covers both sides of the dedicated kernel's 128-row boundary and
+    # its final feature/top-k tails. The all-empty cases make every expected
+    # gradient exactly zero; D576/H32 also covers a partial 64-head CTA.
     topk_length_cases = [torch.zeros(s_q, dtype=torch.int32, device=device)]
     if topk_length_values is not None:
         topk_length_cases.insert(0, torch.tensor(topk_length_values, dtype=torch.int32, device=device))
@@ -324,6 +350,68 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
         if torch.all(empty_rows):
             assert torch.equal(dkv, torch.zeros_like(dkv))
             assert torch.equal(d_sink, torch.zeros_like(d_sink))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=434)
+def test_DSA_sparse_attention_backward_sm100_h16_partial_max_topk():
+    """H16 M128 handles a maximum top-k ending in a partial sparse tile."""
+    if not torch.cuda.is_available():
+        pytest.skip("SM100 GPU required")
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("H16 M128 regression test targets the SM100 kernel")
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 2, 640, 16
+    head_dim, topk = 576, 513
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    torch.cuda.synchronize()
+
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        softmax_scale=softmax_scale,
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.L0
@@ -578,8 +666,9 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("head_dim,num_heads", [(512, 64), (576, 16)])
 @torch_fork_set_rng(seed=16)
-def test_DSA_sparse_attention_backward_fp16_sm100_numerics():
+def test_DSA_sparse_attention_backward_fp16_sm100_numerics(head_dim, num_heads):
     """SM100 must compile FP16 inputs with FP16 MMA/storage semantics."""
     try:
         from cudnn import DSA
@@ -588,8 +677,7 @@ def test_DSA_sparse_attention_backward_fp16_sm100_numerics():
 
     _require_sm100()
     device = torch.device("cuda")
-    s_q, s_kv, num_heads = 4, 128, 64
-    head_dim, topk = 512, 64
+    s_q, s_kv, topk = 4, 128, 64
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.float16, device=device)
