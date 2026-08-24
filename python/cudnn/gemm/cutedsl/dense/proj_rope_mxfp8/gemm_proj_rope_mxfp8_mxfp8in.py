@@ -83,25 +83,74 @@ assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COL
 DBG = int(os.environ.get("NVTE_FUSED_Q_UPROJ_DEBUG", "0")) > 0
 
 # ---- RoPE arithmetic ----
-# The unfused path applies RoPE with Megatron's Triton rotary_fwd_q_kernel.  Its element type
-# is BF16, but the arithmetic is not: Triton widens to fp32 registers, contracts one product
-# into an fma, and rounds to BF16 only where a value is materialized.  Scored against an exact
-# fp64 evaluation over 5.0e7 elements, that kernel is exactly
+# The unfused path applies RoPE with Megatron's Triton rotary_fwd_q_kernel.  Reading the PTX
+# that kernel compiles to (scripts/rope_ptx.py) it contains no fp32 instruction at all: per
+# output element it emits one mul.bf16, one neg.bf16, and one fma.rn.bf16.  So Triton computes
 #
-#   left  = bf16( x1*cos_l - bf16(x2*sin_l) )     (x1*cos_l stays fp32 inside the fma)
-#   right = bf16( bf16(x2*cos_r) + x1*sin_r )     (x1*sin_r stays fp32 inside the fma)
+#   left  = fma.rn.bf16( x1, cos_l, -mul.bf16(x2, sin_l) )
+#   right = fma.rn.bf16( x1, sin_r,  mul.bf16(x2, cos_r) )
 #
-# so the epilogue below reproduces that form, product for product and rounding for rounding.
-# Two nearby alternatives were measured and both diverge from Triton: keeping everything in
-# fp32 and rounding once at the store misses on 3.6e6 of those elements, and doing genuine
-# all-BF16 multiplies and adds misses on 3.8e6.  Matching the fma contraction is what makes
-# the fused and unfused queries agree bit for bit.
+# where the fma forms its product exactly and rounds the sum exactly once.
+#
+# Two evaluations of that expression are implemented below and selected by
+# NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA:
+#
+#   0 (default): reproduce the *shape* -- which product is materialized, which is folded into
+#     the fma -- but evaluate in fp32 with packed-f32x2 ops and narrow at the end.  That is a
+#     double rounding: when the fp32 result lands exactly on a BF16 midpoint, the second
+#     rounding breaks a tie that a single rounding would never have seen, and the result is one
+#     ULP off the correctly rounded value.  Measured at 1 element in 1e8 (README T21).
+#
+#   1: emit the same bf16 instructions Triton does, via inline PTX.  Single rounding, so it is
+#     both correctly rounded and bit-identical to the unfused path.  Costs the packed-f32x2
+#     throughput on the rope cell (1 of 3 feature cells).
+#
+# Both agree on all but ~1e-8 of elements; the flag exists to measure that difference and the
+# cost of closing it.
+ROPE_BF16_FMA = int(os.environ.get("NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA", "0")) > 0
+
+if DBG or ROPE_BF16_FMA:
+    print(f"[proj_rope_mxfp8] DBG={DBG} ROPE_BF16_FMA={ROPE_BF16_FMA}", flush=True)
 
 
 @cute.jit
 def _to_bf16_f32(v):
     """Round an fp32 value through BF16 and back, matching the unfused RoPE's storage."""
     return v.to(cutlass.BFloat16).to(cutlass.Float32)
+
+
+# ---- Native BF16 scalar ops ----
+# cute.arch exposes packed-f32x2 arithmetic but no bf16 arithmetic, so these go through inline
+# PTX.  The mnemonics are exactly the ones rotary_fwd_q_kernel compiles to (scripts/rope_ptx.py).
+# fma.rn.bf16 is the load-bearing one: it forms its product exactly and rounds the sum once,
+# which is what an fp32 fma followed by a narrow cannot reproduce.
+
+
+@cute.jit
+def _mul_bf16(a, b):
+    return cute.arch.inline_ptx(
+        "mul.bf16 {$w0}, {$r0}, {$r1};",
+        write_only_types=[cutlass.BFloat16],
+        read_only_args=[a, b],
+    )
+
+
+@cute.jit
+def _fma_bf16(a, b, c):
+    return cute.arch.inline_ptx(
+        "fma.rn.bf16 {$w0}, {$r0}, {$r1}, {$r2};",
+        write_only_types=[cutlass.BFloat16],
+        read_only_args=[a, b, c],
+    )
+
+
+@cute.jit
+def _neg_bf16(a):
+    return cute.arch.inline_ptx(
+        "neg.bf16 {$w0}, {$r0};",
+        write_only_types=[cutlass.BFloat16],
+        read_only_args=[a],
+    )
 
 
 @cute.struct
@@ -493,51 +542,73 @@ def gemm_proj_rope_mxfp8_kernel(
                 cos_base = mCos[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 sin_base = mSin[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 if is_second_half:
-                    # lanes 16..31: v = p*s + q*c
+                    # lanes 16..31: v = p*s + q*c.  Triton materializes q*c and folds p*s
+                    # into the fma.
                     for r in cutlass.range_constexpr(BLOCK):
-                        p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
-                        q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
-                        p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
-                        q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
-                        c0 = tc[0].to(cutlass.Float32)
-                        s0 = ts[0].to(cutlass.Float32)
-                        c1 = tc[1].to(cutlass.Float32)
-                        s1 = ts[1].to(cutlass.Float32)
-                        # Triton emits bf16( bf16(q*c) + p*s ): q*c is materialized, p*s
-                        # is the multiply the compiler folds into the fma.
-                        qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
-                        qc0 = _to_bf16_f32(qc0)
-                        qc1 = _to_bf16_f32(qc1)
-                        v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
-                        v0 = _to_bf16_f32(v0)
-                        v1 = _to_bf16_f32(v1)
+                        if cutlass.const_expr(ROPE_BF16_FMA):
+                            v0 = _fma_bf16(
+                                sACC[tok0 + r, pcol0],
+                                ts[0],
+                                _mul_bf16(sACC[tok0 + r, pcol0 + 1], tc[0]),
+                            ).to(cutlass.Float32)
+                            v1 = _fma_bf16(
+                                sACC[tok0 + r, pcol1],
+                                ts[1],
+                                _mul_bf16(sACC[tok0 + r, pcol1 + 1], tc[1]),
+                            ).to(cutlass.Float32)
+                        else:
+                            p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
+                            q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
+                            p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
+                            q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
+                            c0 = tc[0].to(cutlass.Float32)
+                            s0 = ts[0].to(cutlass.Float32)
+                            c1 = tc[1].to(cutlass.Float32)
+                            s1 = ts[1].to(cutlass.Float32)
+                            qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
+                            qc0 = _to_bf16_f32(qc0)
+                            qc1 = _to_bf16_f32(qc1)
+                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
+                            v0 = _to_bf16_f32(v0)
+                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
                         col_amax1 = cute.arch.fmax(col_amax1, cute.arch.fmax(v1, -v1))
                 else:
-                    # lanes 0..15: v = p*c - q*s
+                    # lanes 0..15: v = p*c - q*s.  Triton materializes q*s, negates it, and
+                    # folds p*c into the fma.
                     for r in cutlass.range_constexpr(BLOCK):
-                        p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
-                        q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
-                        p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
-                        q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
-                        c0 = tc[0].to(cutlass.Float32)
-                        s0 = ts[0].to(cutlass.Float32)
-                        c1 = tc[1].to(cutlass.Float32)
-                        s1 = ts[1].to(cutlass.Float32)
-                        # Triton emits bf16( p*c - bf16(q*s) ): q*s is materialized, p*c
-                        # is the multiply the compiler folds into the fma.
-                        qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
-                        qs0 = _to_bf16_f32(qs0)
-                        qs1 = _to_bf16_f32(qs1)
-                        v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
-                        v0 = _to_bf16_f32(v0)
-                        v1 = _to_bf16_f32(v1)
+                        if cutlass.const_expr(ROPE_BF16_FMA):
+                            v0 = _fma_bf16(
+                                sACC[tok0 + r, pcol0],
+                                tc[0],
+                                _neg_bf16(_mul_bf16(sACC[tok0 + r, pcol0 + 1], ts[0])),
+                            ).to(cutlass.Float32)
+                            v1 = _fma_bf16(
+                                sACC[tok0 + r, pcol1],
+                                tc[1],
+                                _neg_bf16(_mul_bf16(sACC[tok0 + r, pcol1 + 1], ts[1])),
+                            ).to(cutlass.Float32)
+                        else:
+                            p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
+                            q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
+                            p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
+                            q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
+                            c0 = tc[0].to(cutlass.Float32)
+                            s0 = ts[0].to(cutlass.Float32)
+                            c1 = tc[1].to(cutlass.Float32)
+                            s1 = ts[1].to(cutlass.Float32)
+                            qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
+                            qs0 = _to_bf16_f32(qs0)
+                            qs1 = _to_bf16_f32(qs1)
+                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
+                            v0 = _to_bf16_f32(v0)
+                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
