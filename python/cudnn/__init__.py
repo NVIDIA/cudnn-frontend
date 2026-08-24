@@ -52,6 +52,9 @@ for _optional_symbol in [
     "causal_conv1d_nwh_backward",
     "b2b_causal_conv1d_forward",
     "b2b_causal_conv1d_backward",
+    "gnn_agg_op",
+    "gnn_agg_simple_forward",
+    "gnn_agg_simple_backward",
     "fft_causal_conv1d_forward",
     "fft_causal_conv1d_backward",
     "long_fft_causal_conv1d_get_buffer_sizes",
@@ -278,6 +281,9 @@ _EAGER_PUBLIC_NAMES = (
             "causal_conv1d_nwh_backward",
             "b2b_causal_conv1d_forward",
             "b2b_causal_conv1d_backward",
+            "gnn_agg_op",
+            "gnn_agg_simple_forward",
+            "gnn_agg_simple_backward",
         )
         if symbol in globals()
     ),
@@ -302,6 +308,7 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "gnn": (".gnn", None),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
