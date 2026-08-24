@@ -599,6 +599,54 @@ def test_knob_request_none_fields_are_no_preference():
     assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs())
 
 
+def _mk_gqa_graph(h_q, h_kv, d=128):
+    """Causal GQA graph (BSHD-physical strides) for the pack_gqa knob tests."""
+    g = _mk_graph()
+    dims_q, strides_q = (B, h_q, S, d), (S * h_q * d, d, h_q * d, 1)
+    dims_kv, strides_kv = (B, h_kv, S, d), (S * h_kv * d, d, h_kv * d, 1)
+    q = g.tensor(dim=dims_q, stride=strides_q, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims_kv, stride=strides_kv, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims_kv, stride=strides_kv, data_type=DTYPE, name="v")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
+    _finish_output(o, dims_q, strides_q)
+    return g
+
+
+def test_knob_request_pack_gqa_eligible_on_gqa():
+    # The f16 SM100 rows declare pack_gqas={False, True}; a dense GQA graph
+    # with a power-of-2 group admits the packed request.
+    g = _mk_gqa_graph(8, 2)
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_on_mha_is_identity():
+    # MHA: G == 1 compiles the identity (bit-exact unpacked fold), so an
+    # explicit pack_gqa=True is honorable and the engine stays eligible.
+    g = _mk_eligible_graph()
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
+    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    g = _mk_gqa_graph(6, 2)
+    assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_false_always_eligible():
+    # Running unpacked is trivially honorable — on MHA graphs too.
+    assert engines.engine_name() in _eligible(_mk_eligible_graph(), engines.SdpaFwdKnobs(pack_gqa=False))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(8, 2), engines.SdpaFwdKnobs(pack_gqa=False))
+
+
+def test_knob_request_pack_gqa_outside_domain_rejects_row():
+    # The mxfp8/SM80 rows keep the default {False} domain, so an explicit
+    # packed request must never make them eligible; the packable set is
+    # pinned exactly by test_pack_gqa_capability_domains.
+    g = _mk_gqa_graph(8, 2)
+    eligible = _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert eligible <= {s.name for s in engines.ENGINE_SPECS if True in s.capabilities.pack_gqas}, eligible
+
+
 # ---------------------------------------------------------------------------
 # SM120 engine row (sdpa_fwd_prefill_sm120) — same probes under a faked
 # SM120/SM121 device. Executable coverage lives in test_sdpa_fwd_dsl_sm120.py.
