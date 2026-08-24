@@ -623,8 +623,8 @@ def order_body(
     whole-sequence item per (batch, head) from ``cu_seqlens`` directly —
     the no-cuts table.  Thread 0 also zeroes every ``scheduler_counter`` cell
     (the main kernels' ticket rings, dirty on exit).
-    Runs on the standalone :func:`order_kernel` CTA, or fused into a main
-    kernel's CTA 0 prologue.  Internally CTA-wide-barriers; every thread of
+    Runs fused into each main kernel's single-CTA prologue launch.
+    Internally CTA-wide-barriers; every thread of
     the calling CTA must reach it."""
     capacity = cutlass.const_expr(n_threads * order_elements)
     if cutlass.const_expr(has_scheduler):
@@ -886,21 +886,18 @@ def build_split_table(
     ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` per element;
     scalar (GDN) ``-exp(a_log[h]) * softplus(g + dt_bias[h])`` per head.
 
-    With ``split=False`` the scan and walk never launch: the order kernel
-    alone synthesizes the no-cuts table — the uncut whole-sequence item per
-    (batch, head), LPT-sorted by sequence length — and ``ideal_chunks`` /
-    ``chunk_scratch`` / ``item_scratch`` / the gate contents are unused.
-    Batch-invariant mode and coarse checkpoint cadences (cuts may not cross
-    a checkpoint period) take this path.
+    ``split=False`` is rejected: the no-cuts table (the uncut whole-sequence
+    item per (batch, head), LPT-sorted) is synthesized by each main kernel's
+    own prologue (``order_gen``), so batch-invariant mode and coarse
+    checkpoint cadences (cuts may not cross a checkpoint period) never
+    involve this function.
 
     ``work_items`` and ``item_scratch`` are ``(max_items,
-    WORK_ITEM_FIELDS)`` int32 with ``max_items >= max_work_items(...)``
-    (``>= n_tiles`` rows and no ``item_scratch`` with ``split=False``);
+    WORK_ITEM_FIELDS)`` int32 with ``max_items >= max_work_items(...)``;
     ``work_count`` is ``(1,)`` int32.  Every cell of ``scheduler_counter`` when
     passed — the main kernels' int32 ticket rings, ``(2,)`` per kernel
     launch that consumes this table, dirty on exit — is zeroed by the
-    order kernel, which runs in both modes; the count is zeroed by the
-    scan (split) or written by the order kernel (non-split).
+    order phase; the count is zeroed by the scan.
     ``chunk_scratch`` is ``(>= chunk_scratch_rows(total_tokens,
     B, b_t), HO)`` fp32 (contents managed here).  Runs entirely on device
     — no host synchronization."""
@@ -919,37 +916,23 @@ def build_split_table(
     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
-    if split:
-        if ideal_chunks is None or chunk_scratch is None or item_scratch is None:
-            raise ValueError("split=True requires ideal_chunks, chunk_scratch, and item_scratch")
-        if gate_channels and gate_channels % WARP_SIZE != 0:
-            raise ValueError(f"per-channel gate dim must be a multiple of {WARP_SIZE}, got {gate_channels}")
-        if gate_channels and gate_channels % 128 == 0 and data_ptr(gate) % 16 != 0:
-            raise ValueError("per-channel gate base must be 16-byte aligned (vectorized scan loads)")
-        n_walk_ctas = batch_size * n_heads_out
-        need_rows = chunk_scratch_rows(gate.shape[0], batch_size, b_t)
-        n_scan_ctas = -(-need_rows // (SCAN_WARPS * SCAN_ROWS_PER_WARP))
-        if len(chunk_scratch.shape) != 2 or chunk_scratch.shape[0] < need_rows or chunk_scratch.shape[1] != n_heads_out:
-            raise ValueError(f"chunk_scratch must be (>= {need_rows}, {n_heads_out}) fp32, got {tuple(chunk_scratch.shape)}")
-        if tuple(item_scratch.shape) != tuple(work_items.shape) or work_items.shape[1] != WORK_ITEM_FIELDS:
-            raise ValueError(
-                f"item_scratch must match work_items (max_items, {WORK_ITEM_FIELDS}) int32, got {tuple(item_scratch.shape)} vs {tuple(work_items.shape)}"
-            )
-    else:
-        if work_items.shape[0] < n_tiles or work_items.shape[1] != WORK_ITEM_FIELDS:
-            raise ValueError(f"work_items must be (>= {n_tiles}, {WORK_ITEM_FIELDS}) int32, got {tuple(work_items.shape)}")
-        log_gate = False
-        safe_gate = False
-        gate_channels = 0
-        a_log = None
-        dt_bias = None
-        gate_scale_log2 = 0.0
-        gate = None
-        chunk_scratch = None
-        item_scratch = None
-        ideal_chunks = 0
-        n_scan_ctas = 0
-        n_walk_ctas = 0
+    if not split:
+        raise ValueError("split=False has no host-side stage: each main kernel's prologue synthesizes the no-cuts table (order_gen)")
+    if ideal_chunks is None or chunk_scratch is None or item_scratch is None:
+        raise ValueError("split=True requires ideal_chunks, chunk_scratch, and item_scratch")
+    if gate_channels and gate_channels % WARP_SIZE != 0:
+        raise ValueError(f"per-channel gate dim must be a multiple of {WARP_SIZE}, got {gate_channels}")
+    if gate_channels and gate_channels % 128 == 0 and data_ptr(gate) % 16 != 0:
+        raise ValueError("per-channel gate base must be 16-byte aligned (vectorized scan loads)")
+    n_walk_ctas = batch_size * n_heads_out
+    need_rows = chunk_scratch_rows(gate.shape[0], batch_size, b_t)
+    n_scan_ctas = -(-need_rows // (SCAN_WARPS * SCAN_ROWS_PER_WARP))
+    if len(chunk_scratch.shape) != 2 or chunk_scratch.shape[0] < need_rows or chunk_scratch.shape[1] != n_heads_out:
+        raise ValueError(f"chunk_scratch must be (>= {need_rows}, {n_heads_out}) fp32, got {tuple(chunk_scratch.shape)}")
+    if tuple(item_scratch.shape) != tuple(work_items.shape) or work_items.shape[1] != WORK_ITEM_FIELDS:
+        raise ValueError(
+            f"item_scratch must match work_items (max_items, {WORK_ITEM_FIELDS}) int32, got {tuple(item_scratch.shape)} vs {tuple(work_items.shape)}"
+        )
     overhead_chunks = max(1, OVERHEAD_TOKENS // b_t)
     cu_stream = cuda.CUstream(int(stream))
 

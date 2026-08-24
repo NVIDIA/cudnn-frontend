@@ -284,7 +284,9 @@ def make_gdn_bars(cfg) -> GdnBwdBars:
         mb_dm_acc_ready=MBarrier(alloc(1), stages=1, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_dm_acc_done=MBarrier(alloc(1), stages=1, init_count=CG0_THREADS, producer=Producer.THREAD),
         mb_dk_state_path_acc_ready=MBarrier(alloc(1), stages=1, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_dstate_input_ready=MBarrier(alloc(cfg.tmem_dstate_input_stages), stages=cfg.tmem_dstate_input_stages, init_count=CG2_THREADS, producer=Producer.THREAD),
+        mb_dstate_input_ready=MBarrier(
+            alloc(cfg.tmem_dstate_input_stages), stages=cfg.tmem_dstate_input_stages, init_count=CG2_THREADS, producer=Producer.THREAD
+        ),
         mb_dstate_input_done=MBarrier(
             alloc(cfg.tmem_dstate_input_stages), stages=cfg.tmem_dstate_input_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT
         ),
@@ -408,7 +410,7 @@ def blockwise_diagonal_8x8_to_16x16(cfg, base, raw_base, d_idx, lane_idx):
     d_inv_frag = nvvm.ldmatrix(base + off_d_inv, 1, nvvm.MMALayout.ROW)
     c_frag = nvvm.ldmatrix(raw_base + off_c, 1, nvvm.MMALayout.COL)
 
-    # ---- T ---------------------------------------------------------------------------
+    # ---- T = -(D^-1 @ C) -------------------------------------------------------------
     c_regs = cutlass.Array(cutlass.Float32, 4, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(4):
         c_regs[i] = cutlass.Float32(0.0)
@@ -417,7 +419,7 @@ def blockwise_diagonal_8x8_to_16x16(cfg, base, raw_base, d_idx, lane_idx):
         c_regs[i] = -c_regs[i]
     a_pack = [fp32_to_fp16(c_regs[2 * j], c_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(2)]
 
-    # ---- C ---------------------------------------------------------------------------
+    # ---- C = T @ A^-1 ----------------------------------------------------------------
     a_inv_frag = nvvm.ldmatrix(base + off_a_inv, 1, nvvm.MMALayout.COL)
     o_regs = cutlass.Array(cutlass.Float32, 4, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(4):
@@ -443,7 +445,7 @@ def blockwise_diagonal_16x16_to_32x32(cfg, base, raw_base, d_idx, lane_idx):
     d_inv_frags = list(nvvm.ldmatrix(base + off_d_inv, 4, nvvm.MMALayout.ROW))
     c_frags = list(nvvm.ldmatrix(raw_base + off_c, 4, nvvm.MMALayout.COL))
 
-    # ---- T ---------------------------------------------------------------------------
+    # ---- T = -(D^-1 @ C) -------------------------------------------------------------
     c_regs = cutlass.Array(cutlass.Float32, 8, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(8):
         c_regs[i] = cutlass.Float32(0.0)
@@ -452,7 +454,7 @@ def blockwise_diagonal_16x16_to_32x32(cfg, base, raw_base, d_idx, lane_idx):
         c_regs[i] = -c_regs[i]
     a_pack = [fp32_to_fp16(c_regs[2 * j], c_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(4)]
 
-    # ---- C ---------------------------------------------------------------------------
+    # ---- C = T @ A^-1 ----------------------------------------------------------------
     a_inv_frags = list(nvvm.ldmatrix(base + off_a_inv, 4, nvvm.MMALayout.COL))
     o_regs = cutlass.Array(cutlass.Float32, 8, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(8):
@@ -480,7 +482,7 @@ def blockwise_diagonal_32x32_to_64x64(cfg, base, raw_base, warp_id, lane_idx):
         row_c = 32 + (vs // 2) * 16 + lane_row
         c_frags += list(nvvm.ldmatrix(raw_base + row_c * BT + swizzle_xor_128b(row_c, (vs % 2) * 16 + lane_col), 4, nvvm.MMALayout.COL))
 
-    # ---- T ---------------------------------------------------------------------------
+    # ---- T = -(D^-1 @ C) -------------------------------------------------------------
     c_regs = cutlass.Array(cutlass.Float32, 16, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range_constexpr(16):
         c_regs[i] = cutlass.Float32(0.0)
@@ -490,7 +492,7 @@ def blockwise_diagonal_32x32_to_64x64(cfg, base, raw_base, warp_id, lane_idx):
         c_regs[i] = -c_regs[i]
     a_pack = [fp32_to_fp16(c_regs[2 * j], c_regs[2 * j + 1], dtype=cfg.io_dtype) for j in range(8)]
 
-    # ---- C ---------------------------------------------------------------------------
+    # ---- C = T @ A^-1 ----------------------------------------------------------------
     a_inv_frags = []
     for vs in cutlass.range_constexpr(4):
         row_a_inv = (vs // 2) * 16 + lane_row
@@ -681,7 +683,7 @@ def gate_beta_warp(
         write_end_token = batch_start + write_end * cfg.b_t
         write_end_token = write_end_token if write_end_token < batch_end else batch_end
 
-        # ---- prefetch ----------------------------------------------------------------
+        # ---- prefetch: the FIRST backward chunk's Gate/Beta --------------------------
         if num_item_chunks > 0:
             chunk_offset = batch_start + (compute_end - 1) * cfg.b_t
             gGate = cute.domain_offset((chunk_offset,), mGate[None, head_idx])
@@ -690,7 +692,7 @@ def gate_beta_warp(
             gate_index = advance(gate_index, cfg.smem_gate_stages)
             pos_valid = [(chunk_offset + lane_idx + col * cfg.threads_per_warp) < batch_end for col in range(n_cols)]
 
-            # ---- Gate load -----------------------------------------------------------
+            # ---- Gate load: GMEM -> SMEM (OOB neutral: 1.0 -> log2 = 0.0) ------------
             oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
             gate_vals = [gGate[lane_idx + col * cfg.threads_per_warp] if pos_valid[col] else oob_neutral for col in range(n_cols)]
 
@@ -733,7 +735,7 @@ def gate_beta_warp(
 
             bars.mb_gate_ready[gate_idx].arrive()
 
-            # ---- Beta load -----------------------------------------------------------
+            # ---- Beta load: GMEM -> SMEM (per-element cp.async) ----------------------
             beta_idx = beta_index.idx
             beta_index = advance(beta_index, cfg.smem_beta_stages)
             if cutlass.const_expr(cfg.beta_sigmoid):
@@ -826,7 +828,7 @@ def gate_beta_warp(
                         nvvm.cp_async_shared_global(dst, src, 4, nvvm.LoadCacheModifier.CA, cp_size=cp_size)
                     nvvm.cp_async_mbarrier_arrive(bars.mb_beta_ready[beta_idx].smem_ptr, noinc=True)
 
-            # ---- writeback -----------------------------------------------------------
+            # ---- dGate/dBeta store: SMEM -> GMEM (in place) --------------------------
             st_offset = batch_start + (compute_end - 1 - rev_idx) * cfg.b_t
             gDgate = cute.domain_offset((st_offset,), mDgate[None, head_idx])
             gDbeta = cute.domain_offset((st_offset,), mDbeta[None, head_idx])
@@ -1241,7 +1243,7 @@ def tcgen05_mma_warp(
     dq_acc_ptr = nvvm.make_tmem_ptr(tmem_dstate_input_col, cutlass.Float32)
     dvdk_acc_ptr = nvvm.make_tmem_ptr(tmem_dvdk_acc_col, cutlass.Float32)
 
-    # ---- warp-top descriptors --------------------------------------------------------
+    # ---- warp-top descriptors (1-stage tiles are loop-constant; K advances) ----------
     d_q0 = sQ[0].desc()
     d_k0 = sK[0].desc()
     d_k_trans0 = sK_trans[0].desc()
@@ -1271,12 +1273,12 @@ def tcgen05_mma_warp(
         )
         num_item_chunks = compute_end - write_start
 
-        # ---- chunks NT-2 .. 0 --------------------------------------------------------
+        # ---- chunks NT-2 .. 0 (backward): full body ----------------------------------
         for rev_idx in cutlass.range(num_item_chunks):
             chunk_idx = compute_end - 1 - rev_idx
             have_dstate = cutlass.Boolean(True) if cutlass.const_expr(cfg.use_dstate_in) else rev_idx > 0
 
-            # ---- KK ------------------------------------------------------------------
+            # ---- KK = K(S) @ K^T -----------------------------------------------------
             k_idx = k_index.idx
             bars.mb_k_ready[k_idx].wait(k_index.phase)
             k_index = advance(k_index, cfg.smem_k_stages)
@@ -1293,7 +1295,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_kk_acc_ready[0].arrive(cta_group=1)
 
-            # ---- QK ------------------------------------------------------------------
+            # ---- QK = Q(S) @ K^T -----------------------------------------------------
             q_idx = q_index.idx
             bars.mb_q_ready[q_idx].wait(q_index.phase)
             q_index = advance(q_index, cfg.smem_q_stages)
@@ -1310,7 +1312,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_a_acc_ready[0].arrive(cta_group=1)
 
-            # ---- k_state -------------------------------------------------------------
+            # ---- k state = state^T(S) @ K^T ------------------------------------------
             state_idx = state_index.idx
             if chunk_idx >= FIRST_STATE_CHUNK:
                 bars.mb_state_ready[state_idx].wait(state_index.phase)
@@ -1328,7 +1330,7 @@ def tcgen05_mma_warp(
                 if elect_one:
                     bars.mb_k_state_acc_ready[0].arrive(cta_group=1)
 
-            # ---- dV inter ------------------------------------------------------------
+            # ---- dV inter = dstate^T(T) @ K ------------------------------------------
             dstate_input_idx = dstate_input_index.idx
             if have_dstate:
                 bars.mb_dstate_input_ready[dstate_input_idx].wait(dstate_input_index.phase)
@@ -1352,7 +1354,7 @@ def tcgen05_mma_warp(
                     bars.mb_du_scale_acc_ready[0].arrive(cta_group=1)
                     bars.mb_dstate_input_done[dstate_input_idx].arrive(cta_group=1)
 
-            # ---- dQ inter ------------------------------------------------------------
+            # ---- dQ inter = state(S) @ dO^T ------------------------------------------
             do_idx = do_index.idx
             bars.mb_do_ready[do_idx].wait(do_index.phase)
             do_index = advance(do_index, cfg.smem_do_stages)
@@ -1371,7 +1373,7 @@ def tcgen05_mma_warp(
                 if elect_one:
                     bars.mb_dq_acc_scale_ready[0].arrive(cta_group=1)
 
-            # ---- dU intra ------------------------------------------------------------
+            # ---- dU intra += dO^T(S) @ A ---------------------------------------------
             du_a_idx = a_index.idx
             bars.mb_a_ready[du_a_idx].wait(a_index.phase)
             a_index = advance(a_index, cfg.smem_a_stages)
@@ -1391,7 +1393,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_du_total_acc_ready[0].arrive(cta_group=1)
 
-            # ---- dstate update -------------------------------------------------------
+            # ---- dstate Q-term += dO'^T(T) @ Q ---------------------------------------
             bars.mb_do_prime_input_ready[0].wait(do_prime_input_ready.phase)
             do_prime_input_ready = advance(do_prime_input_ready, 1)
             dstate_idx = dstate_acc_index.idx
@@ -1410,7 +1412,7 @@ def tcgen05_mma_warp(
                         cutlass.Boolean(True) if cutlass.const_expr(i + k > 0) else have_dstate,
                     )
 
-            # ---- U^T recompute -------------------------------------------------------
+            # ---- U^T recompute = Y^T(T) @ T^T ----------------------------------------
             tinv_idx = tinv_index.idx
             bars.mb_t_inv_ready[tinv_idx].wait(tinv_index.phase)
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
@@ -1433,7 +1435,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_u_acc_ready[0].arrive(cta_group=1)
 
-            # ---- dY ------------------------------------------------------------------
+            # ---- dY = dU^T(T) @ T ----------------------------------------------------
             bars.mb_du_input_ready[0].wait(du_input_ready.phase)
             du_input_ready = advance(du_input_ready, 1)
 
@@ -1451,7 +1453,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_dy_acc_ready[0].arrive(cta_group=1)
 
-            # ---- dK_inter ------------------------------------------------------------
+            # ---- dK inter = dstate entry(S) @ U^T ------------------------------------
             bars.mb_u_ready[0].wait(u_index.phase)
             u_index = advance(u_index, 1)
             if have_dstate:
@@ -1470,7 +1472,7 @@ def tcgen05_mma_warp(
                 if elect_one:
                     bars.mb_dk_scale_acc_ready[0].arrive(cta_group=1)
 
-            # ---- dA_eff --------------------------------------------------------------
+            # ---- dA eff = dO(S) @ U^T ------------------------------------------------
             desc_do_da = d_do0
             desc_u_da = d_v0
             mma_ss(
@@ -1484,7 +1486,7 @@ def tcgen05_mma_warp(
                 bars.mb_da_acc_ready[0].arrive(cta_group=1)
                 bars.mb_do_mma_done[do_idx].arrive(cta_group=1)
 
-            # ---- dM core -------------------------------------------------------------
+            # ---- dM core = dY(S) @ U^T -----------------------------------------------
             dv_ready_idx = dv_ready_index.idx
             bars.mb_dv_tmastg_ready[dv_ready_idx].wait(dv_ready_index.phase)
             dv_ready_index = advance(dv_ready_index, cfg.smem_dv_stages)
@@ -1502,7 +1504,7 @@ def tcgen05_mma_warp(
                 bars.mb_dm_acc_ready[0].arrive(cta_group=1)
                 bars.mb_v_mma_done[v_idx].arrive(cta_group=1)
 
-            # ---- dstate update-term --------------------------------------------------
+            # ---- dstate K-term += dY'^T(T) @ K ---------------------------------------
             bars.mb_dyp_input_ready[0].wait(dyp_input_ready.phase)
             dyp_input_ready = advance(dyp_input_ready, 1)
 
@@ -1520,7 +1522,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_dstate_acc_ready[dstate_idx].arrive(cta_group=1)
 
-            # ---- dK attn -------------------------------------------------------------
+            # ---- dK attn += Q^T(S) @ dA ----------------------------------------------
             if have_dstate:
                 bars.mb_dk_scale_acc_done[0].wait(dk_scale_index.phase)
                 dk_scale_index = advance(dk_scale_index, 1)
@@ -1540,7 +1542,7 @@ def tcgen05_mma_warp(
                 bars.mb_dk_attn_acc_ready[0].arrive(cta_group=1)
                 bars.mb_q_mma_done[q_idx].arrive(cta_group=1)
 
-            # ---- dQ attn -------------------------------------------------------------
+            # ---- dQ attn += K^T(S) @ dA ----------------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
                 bars.mb_dq_acc_scale_done[0].wait(dq_scale_index.phase)
                 dq_scale_index = advance(dq_scale_index, 1)
@@ -1569,7 +1571,7 @@ def tcgen05_mma_warp(
                 bars.mb_dq_acc_total_ready[0].arrive(cta_group=1)
                 bars.mb_a_done[du_a_idx].arrive(cta_group=1)
 
-            # ---- dK state-path -------------------------------------------------------
+            # ---- dK state-path = state(S) @ dY^T -------------------------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
                 desc_state_spath = d_state_trans0
                 desc_dy_spath = d_dv0
@@ -1586,7 +1588,7 @@ def tcgen05_mma_warp(
             if elect_one:
                 bars.mb_sdv_done[0].arrive(cta_group=1)
 
-            # ---- dK dM-terms ---------------------------------------------------------
+            # ---- dK dM-terms += K^T(S) @ dM^T + K^T(S) @ dM --------------------------
             bars.mb_dm_acc_done[0].wait(dm_index.phase)
             dm_index = advance(dm_index, 1)
             bars.mb_dk_attn_acc_done[0].wait(dk_attn_index.phase)
@@ -1800,7 +1802,9 @@ def tmaldg_warp(
                 checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
                 tma_load_tile(sCheckpoint_tma[state_idx], checkpoint_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
 
-        next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one)
+        next_tile, scheduler_state = scheduler_publish_next(
+            cfg, bars, sScheduler, mScheduler, scheduler_state, tile_idx, num_ctas, tail_base, tail_row, elect_one
+        )
         tile_idx = next_tile
 
     for _ in range(cfg.smem_q_stages):
@@ -1948,7 +1952,7 @@ def compute0_warp_group(
                 chunk_row = warp_id * 16 + lane_idx // 4 + ((k // 2) % 2) * 8
                 gBeta.append(sBeta[chunk_row, 0, beta_idx])
 
-            # ---- KK epi --------------------------------------------------------------
+            # ---- KK epilogue: M kk[i,j] = W kk[i,j] * T strict[i,j] * Beta[i] --------
             tinv_idx = tinv_index.idx
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
             bars.mb_kk_acc_ready[0].wait(cg0_kk_ready.phase)
@@ -1971,7 +1975,7 @@ def compute0_warp_group(
             if chunk_idx < compute_end - FIRST_STATE_CHUNK:
                 bars.mb_kk_acc_done[0].arrive()
 
-            # ---- A epi ---------------------------------------------------------------
+            # ---- A epilogue: A[i,j] = W qk[i,j] * T[i,j] * scale ---------------------
             a_idx = a_index.idx
             a_phase = a_index.phase
             a_index = advance(a_index, cfg.smem_a_stages)
@@ -2027,7 +2031,7 @@ def compute0_warp_group(
                 thread_count=cfg.inverse_barrier_threads,
             )
 
-            # ---- Beta column-scaling in place ----------------------------------------
+            # ---- Beta column-scaling in place: T^-1[i,j] *= Beta[j] ------------------
             beta_col = []
             for k in cutlass.range_constexpr(num_vals):
                 beta_col.append(sBeta[(lane_idx % 4) * 2 + ((k // 4) * 8 + k % 2), 0, beta_idx])
@@ -2055,8 +2059,7 @@ def compute0_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_t_inv_ready[tinv_idx].arrive()
 
-
-            # ---- dGate_last state dot dstate term ------------------------------------
+            # ---- dGate last state dot dstate term ------------------------------------
             if chunk_idx + DSTATE_IN0 >= 1:
                 bars.mb_dstate_smem_ready[0].wait(cg0_dstate_smem_ready.phase)
                 cg0_dstate_smem_ready = advance(cg0_dstate_smem_ready, 1)
@@ -2132,7 +2135,7 @@ def compute0_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dm_acc_done[0].arrive()
 
-            # ---- dBeta/dGate M-terms -------------------------------------------------
+            # ---- dBeta/dGate M-terms: E = dM core ⊙ M kk(sKK, strict-masked) ---------
             kk_frag = []
             for c in cutlass.range_constexpr(ACC_N_FRAGS):
                 kk_frag += list(
@@ -2321,7 +2324,7 @@ def compute1_warp_group(
         )
         num_item_chunks = compute_end - write_start
 
-        # ---- chunks NT-1 .. 0 --------------------------------------------------------
+        # ---- chunks NT-1 .. 0 (backward) ---------------------------------------------
         for rev_idx in cutlass.range(num_item_chunks):
             chunk_idx = compute_end - 1 - rev_idx
             have_dstate = cutlass.Boolean(True) if cutlass.const_expr(cfg.use_dstate_in) else rev_idx > 0
@@ -2340,7 +2343,7 @@ def compute1_warp_group(
                     cumprod_fp32.append(sCumprod[(lane_idx % 4) * 2 + g * 8 + b, 0, gate_idx])
             cumprod_vals = [cumprod_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
 
-            # ---- dstate rescale ------------------------------------------------------
+            # ---- dstate rescale: dstate *= this chunk's cumprod ----------------------
             if have_dstate:
                 bars.mb_dstate_smem_ready[0].wait(cg1_dstate_smem_index.phase)
                 cg1_dstate_smem_index = advance(cg1_dstate_smem_index, 1)
@@ -2408,7 +2411,7 @@ def compute1_warp_group(
                         do_words_raw.append(do_raw[i])
                 do_raw_frag.append(do_words_raw)
 
-            # ---- Y staging -----------------------------------------------------------
+            # ---- Y stage: Y = V - cumprod * k state -> TMEM f16 ----------------------
             if chunk_idx >= FIRST_STATE_CHUNK:
                 bars.mb_k_state_acc_ready[0].wait(cg1_k_state_ready.phase)
                 cg1_k_state_ready = advance(cg1_k_state_ready, 1)
@@ -2472,7 +2475,7 @@ def compute1_warp_group(
                 nvvm.tcgen05_wait("store")
                 bars.mb_du_scale_acc_done[0].arrive()
 
-            # ---- dO' restage ---------------------------------------------------------
+            # ---- dO' stage: dO * cumprod * scale -> shared input TMEM ----------------
             bars.mb_cg2_chunk_ready[0].wait(cg1_cg2_chunk_index.phase)
             cg1_cg2_chunk_index = advance(cg1_cg2_chunk_index, 1)
             for half in cutlass.range_constexpr(2):
@@ -2490,7 +2493,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_do_prime_input_ready[0].arrive()
 
-            # ---- dU restage ----------------------------------------------------------
+            # ---- dU stage: dV acc -> TMEM f16 A operand ------------------------------
             bars.mb_du_total_acc_ready[0].wait(cg1_du_total_ready.phase)
             cg1_du_total_ready = advance(cg1_du_total_ready, 1)
             for half in cutlass.range_constexpr(2):
@@ -2523,7 +2526,7 @@ def compute1_warp_group(
                 nvvm.tcgen05_wait("store")
                 bars.mb_dq_acc_scale_done[0].arrive()
 
-            # ---- U readout -----------------------------------------------------------
+            # ---- U read: TMEM -> sU --------------------------------------------------
             bars.mb_u_acc_ready[0].wait(cg1_u_ready.phase)
             cg1_u_ready = advance(cg1_u_ready, 1)
             u_regs = []
@@ -2559,7 +2562,7 @@ def compute1_warp_group(
                 )
                 dy_regs.append([dy_vec[k] for k in range(32)])
 
-            # ---- dY' -----------------------------------------------------------------
+            # ---- dY' = -cumprod * dY -> f16 shared input -----------------------------
             neg_one = cutlass.Float32(-1.0)
             cumprod_neg_vals = [cumprod_vals[k] * neg_one for k in range(32)]
             for half in cutlass.range_constexpr(2):
@@ -2576,7 +2579,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_dyp_input_ready[0].arrive()
 
-            # ---- dV staging ----------------------------------------------------------
+            # ---- dV stage: dV = dY -> sdV --------------------------------------------
             dv_stg_idx = dv_index.idx
             bars.mb_dv_tmastg_done[dv_stg_idx].wait(dv_index.phase)
             dv_index = advance(dv_index, cfg.smem_dv_stages)
@@ -2603,7 +2606,7 @@ def compute1_warp_group(
             dq_index = advance(dq_index, cfg.smem_dq_stages)
             sred = sred_base + dq_stg_idx * (dq_stage_elements // 2)
 
-            # ---- dBeta/dGate V-terms -------------------------------------------------
+            # ---- dBeta/dGate V-terms: dBeta += rowsum(dV ⊙ Y) / Beta -----------------
             gsum = cutlass.Float32(0.0)
             part_y = [None] * 16
             for half in cutlass.range_constexpr(2):
@@ -2678,7 +2681,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_q_cg1_done[0].arrive()
 
-            # ---- dQ final read -------------------------------------------------------
+            # ---- dQ final read -> sdQ ------------------------------------------------
             bars.mb_dq_acc_total_ready[0].wait(dq_total_ready_index.phase)
             dq_total_ready_index = advance(dq_total_ready_index, 1)
             dq_regs = []
@@ -2695,7 +2698,7 @@ def compute1_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dq_tmastg_ready[dq_stg_idx].arrive()
 
-            # ---- dQ dot --------------------------------------------------------------
+            # ---- dQ dot (part q) -----------------------------------------------------
             part_q = [None] * 16
             for half in cutlass.range_constexpr(2):
                 for block in cutlass.range_constexpr(4):
@@ -2822,7 +2825,7 @@ def compute2_warp_group(
         )
         num_item_chunks = compute_end - write_start
 
-        # ---- d_final_state prologue --------------------------------------------------
+        # ---- dstate seed prologue ----------------------------------------------------
         if cutlass.const_expr(cfg.use_dstate_in):
             if num_item_chunks > 0:
                 gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
@@ -2881,7 +2884,6 @@ def compute2_warp_group(
             decay_scale_vals = [decay_scale_fp32[(k // 4) * 2 + (k % 2)] for k in range(num_vals)]
             bars.mb_cg2_chunk_ready[0].arrive()
 
-
             # ---- dK inter rescale ----------------------------------------------------
             cg2_k_idx = cg2_k_index.idx
             cg2_k_index = advance(cg2_k_index, cfg.smem_k_stages)
@@ -2915,7 +2917,7 @@ def compute2_warp_group(
                 for off in [1, 2, 4, 8, 16]:
                     k_dot_dk_inter += nvvm.shfl_sync(0xFFFFFFFF, k_dot_dk_inter, off, 31, kind=nvvm.Shfl.BFLY)
 
-            # ---- dK attn read --------------------------------------------------------
+            # ---- dK attn read: TMEM -> registers -------------------------------------
             bars.mb_dk_attn_acc_ready[0].wait(cg2_dk_attn_ready.phase)
             cg2_dk_attn_ready = advance(cg2_dk_attn_ready, 1)
             dks_regs = []
@@ -2929,7 +2931,7 @@ def compute2_warp_group(
             nvvm.tcgen05_wait("load")
             bars.mb_dk_attn_acc_done[0].arrive()
 
-            # ---- dK staging slot -----------------------------------------------------
+            # ---- dK stage slot -------------------------------------------------------
             dk_stg_idx = dk_index.idx
             bars.mb_dk_tmastg_done[dk_stg_idx].wait(dk_index.phase)
             dk_index = advance(dk_index, cfg.smem_dk_stages)
@@ -2981,7 +2983,7 @@ def compute2_warp_group(
                 nvvm.tcgen05_wait("store")
                 bars.mb_dstate_input_ready[dstate_input_idx].arrive()
 
-            # ---- dstate prep ---------------------------------------------------------
+            # ---- dstate prep: TMEM -> SMEM -------------------------------------------
             if abs_chunk >= write_start + 1:
                 bars.mb_state_dot_dstate_done[0].wait(cg2_state_dot_dstate_index.phase)
                 cg2_state_dot_dstate_index = advance(cg2_state_dot_dstate_index, 1)
@@ -3077,7 +3079,7 @@ def compute2_warp_group(
             bars.mb_dk_tmastg_ready[dk_stg_idx].arrive()
             bars.mb_gate_done[gate_idx].arrive()
 
-        # ---- dstate drain ------------------------------------------------------------
+        # ---- dstate store: with an initial state this is its gradient ----------------
         if num_item_chunks > 0:
             dstate_idx = dstate_acc_index.idx
             bars.mb_dstate_acc_ready[dstate_idx].wait(dstate_acc_index.phase)
@@ -3443,7 +3445,7 @@ def host(
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = h_q if h_q >= h_v else h_v
 
-    # ---- SMEM sizing -----------------------------------------------------------------
+    # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bpe = cfg.io_dtype.width // 8
     q_tile_elements = cfg.b_t * cfg.d_k
     k_tile_elements = cfg.b_t * cfg.d_k
@@ -3970,7 +3972,7 @@ def kernel(
         beta_smem_layout_staged,
     )
 
-    # ---- mbarrier init ---------------------------------------------------------------
+    # ---- mbarrier init (all threads) -------------------------------------------------
     for s in range(cfg.scheduler_stages):
         bars.mb_scheduler_ready[s].init()
         bars.mb_scheduler_done[s].init()
@@ -4257,7 +4259,7 @@ class GdnBwdCfg:
     safe_gate: bool = False
     beta_sigmoid: bool = False
 
-    # ---- fixed constants stamped from CFG by build_cfg -------------------------------
+    # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
     d_k: int = CFG.D_K
     d_v: int = CFG.D_V
@@ -4278,7 +4280,7 @@ class GdnBwdCfg:
     dynamic_scheduling: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
-    # ---- named barrier slots ---------------------------------------------------------
+    # ---- named barrier slots (ids 1-6; 0 is the CTA-wide sync) -----------------------
     tmem_lifecycle_barrier_id: int = 1
     tmem_user_threads: int = 0
     inverse_barrier_id: int = 2
@@ -4318,7 +4320,7 @@ class GdnBwdCfg:
     tmem_y_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
 
-    # ---- stamped by host at trace time -----------------------------------------------
+    # ---- stamped by host at trace time (shape-derived) -------------------------------
     q_cosize: int = 0
     k_cosize: int = 0
     v_cosize: int = 0
@@ -4589,7 +4591,9 @@ def chunk_gdn_bwd_sm100(
     B = cu_seqlens.shape[0] - 1
     is_GQA = HQ >= HV
     if work_items is None or work_count is None:
-        raise ValueError("work_items/work_count are required (the split-table stage builds them for every launch)")
+        raise ValueError(
+            "work_items/work_count are required (built by the split-table stage, or by an order-generating prologue when work_item_scratch is None)"
+        )
     io_dtype = get_dtype(q.dtype)
     for name, hh in (("HQ", HQ), ("HK", HK), ("HV", HV)):
         if HO % hh != 0:
