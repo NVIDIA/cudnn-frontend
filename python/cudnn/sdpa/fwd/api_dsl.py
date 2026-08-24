@@ -148,6 +148,11 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
 # reverse-row LPT.
 _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
 
+# SM count per device for the persistent THD grid. A device property cannot
+# change under a live process, and the query costs ~7 us on the execute hot
+# path, so resolve it once per device.
+_THD_CTAS_CACHE: dict = {}
+
 
 def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int:
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
@@ -3212,12 +3217,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         under-launching only costs parallelism. One CTA per SM matches the
         kernel's ``min_blocks_per_mp``.
         """
-        forced = int(os.environ.get("FROST_THD_CTAS", "0"))
-        if forced > 0:
-            return forced
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        per_sm = int(os.environ.get("FROST_THD_CTAS_PER_SM", "1"))
-        return max(1, sms * max(1, per_sm))
+        key = getattr(device, "index", device)
+        n = _THD_CTAS_CACHE.get(key)
+        if n is None:
+            forced = int(os.environ.get("FROST_THD_CTAS", "0"))
+            if forced > 0:
+                n = forced
+            else:
+                sms = torch.cuda.get_device_properties(device).multi_processor_count
+                per_sm = int(os.environ.get("FROST_THD_CTAS_PER_SM", "1"))
+                n = max(1, sms * max(1, per_sm))
+            _THD_CTAS_CACHE[key] = n
+        return n
 
     def scratch_workspace_bytes(self) -> int:
         if self.thd:
