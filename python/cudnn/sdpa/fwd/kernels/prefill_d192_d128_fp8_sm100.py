@@ -2003,8 +2003,7 @@ def _correction_warp_group(
             if _row_valid:
                 if cutlass.const_expr(lse_tensor is not None):
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, row_head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, row_head_idx, q_row_global] = lse_val
 
             # amax_o is defined over the fp32 pre-cast output.
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
@@ -2292,6 +2291,7 @@ def compile(  # noqa: A001
     sq: int = 256,
     skv: int = 128,
     has_lse: bool = True,
+    lse_stride: Optional[tuple[int, int, int]] = None,
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
 ) -> Callable:
@@ -2337,16 +2337,17 @@ def compile(  # noqa: A001
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse = (
-        cute.runtime.make_fake_compact_tensor(
+    if not has_lse:
+        fake_lse = None
+    elif lse_stride is not None:
+        fake_lse = cute.runtime.make_fake_tensor(cutlass.Float32, (_fake_batch, qh, sq), lse_stride, assumed_align=4)
+    else:
+        fake_lse = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
             (_fake_batch, qh, sq),
             stride_order=(2, 1, 0),
             assumed_align=16,
         )
-        if has_lse
-        else None
-    )
     # Always part of the ABI; unread when CFG.HAS_SINK == 0 (compile-time fold).
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

@@ -24,6 +24,7 @@ Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -31,13 +32,22 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
 _E4M3_MAX = 448.0
 _E5M2_MAX = 57344.0
 _FP8_MAX = {torch.float8_e4m3fn: _E4M3_MAX, torch.float8_e5m2: _E5M2_MAX}
+
+
+class _RunResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+    stats: torch.Tensor
+    reference_stats: torch.Tensor
 
 
 def _quant(x, dtype=torch.float8_e4m3fn):
@@ -106,6 +116,7 @@ def _run(
     so_val=1.0,
     layout="bshd",
     sinks=None,
+    stats_layout="contiguous",
 ):
     import cudnn
 
@@ -140,7 +151,7 @@ def _run(
         Ob = torch.zeros(B, H_q, S_q + 24, D_v, device=dev, dtype=o_dtype)[:, :, :S_q, :]
     else:
         raise ValueError(f"unknown layout {layout!r}")
-    lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
+    lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -191,7 +202,7 @@ def _run(
         torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
     }[o_dtype]
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(o_cudnn)
-    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -218,7 +229,7 @@ def _run(
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)
     # O carries Scale_O; Amax_O is the pre-scale amax (the kernel divides it
     # back out), so both compare against the unscaled reference.
-    return Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref
+    return _RunResult(Ob.float() / so_val, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -401,6 +412,21 @@ def test_fp8_sm120_dense_flex_layout(layout):
     scale = 1.0 / math.sqrt(128)
     res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), layout=layout)
     _check(*res)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_fp8_sm120_strided_stats():
+    """Dense LSE is written directly through a permuted, gapped layout."""
+
+    scale = 1.0 / math.sqrt(128)
+    kwargs = dict(B=2, H_q=4, H_kv=2, S_q=128, S_kv=128, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.manual_seed(59)
+    contiguous = _run(**kwargs)
+    torch.manual_seed(59)
+    strided = _run(**kwargs, stats_layout="strided")
+    _check(*strided)
+    torch.testing.assert_close(strided.stats, contiguous.stats, atol=0, rtol=0)
 
 
 @pytest.mark.L0

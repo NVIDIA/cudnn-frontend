@@ -1446,8 +1446,7 @@ class SM120FusedMultiHeadAttentionForward:
                             if lse_q_idx >= seqlen_q:
                                 lse_out = -cutlass.Float32.inf
                             if lse_q_idx < q.shape[1]:
-                                lse_row = lse_arr[batch_idx, _lse_head, :]
-                                lse_row[lse_q_idx] = lse_out
+                                lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
 
             prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
@@ -1684,8 +1683,6 @@ class SM120FusedMultiHeadAttentionForward:
             else:
                 if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
                     raise ValueError("LSE must have shape (B, H, Sq)")
-                if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
-                    raise ValueError("LSE must be compact row-major")
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
@@ -1797,6 +1794,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1813,7 +1811,8 @@ def compile(  # noqa: A001
 
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
-    at all instead of a dummy.
+    at all instead of a dummy. Dense ``lse_stride`` carries the caller's
+    declared ``(B, H, Sq)`` element strides into the compiled tensor.
 
     THD LSE is token-major ``(T, H)`` by default; ``lse_head_major=True``
     switches to head-major ``(H, lse_head_stride)`` (FlashAttention's
@@ -1842,6 +1841,8 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
+    if has_lse and lse_stride is not None and PARAMS.thd_varlen:
+        raise ValueError("dense LSE strides are not valid for THD")
     fake_batch = 1 if PARAMS.thd_varlen else b
     if PARAMS.thd_varlen:
         # Dynamic packed token totals: one symbol per ragged group (Q/O share
@@ -1873,16 +1874,22 @@ def compile(  # noqa: A001
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (((qh, lse_head_stride) if lse_head_major else (sq, qh)) if PARAMS.thd_varlen else (fake_batch, qh, sq)),
-            stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
-            assumed_align=4,
+    fake_lse_shape = ((qh, lse_head_stride) if lse_head_major else (sq, qh)) if PARAMS.thd_varlen else (fake_batch, qh, sq)
+    if not has_lse:
+        # No Stats output: the LSE argument is None-specialized and the store
+        # is compiled out entirely — no dummy buffer exists at any level.
+        fake_lse = None
+    else:
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, fake_lse_shape, lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                fake_lse_shape,
+                stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
+                assumed_align=4,
+            )
         )
-        if has_lse
-        else None
-    )
     fake_sinks = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
