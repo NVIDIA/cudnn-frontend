@@ -10,62 +10,62 @@ timing mode: CUDA graph replay
 activation: swiglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=8192, fused C input N=None, activation output N=4096
-fused cuDNN avg: 1.329 ms
-unfused TE avg:  1.742 ms
-speedup vs TE:   1.31x
-fused samples:   [1.208, 1.276, 1.365, 1.4, 1.397]
-TE samples:      [1.769, 1.734, 1.78, 1.677, 1.75]
+fused cuDNN avg: 1.364 ms
+unfused TE avg:  1.681 ms
+speedup vs TE:   1.23x
+fused samples:   [1.232, 1.315, 1.395, 1.439, 1.437]
+TE samples:      [1.789, 1.68, 1.688, 1.595, 1.65]
 
 activation: dswiglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=8192, activation output N=8192
-fused cuDNN avg: 0.738 ms
-unfused TE avg:  1.535 ms
-speedup vs TE:   2.08x
-fused samples:   [0.705, 0.712, 0.713, 0.762, 0.8]
-TE samples:      [1.877, 1.49, 1.446, 1.435, 1.429]
+fused cuDNN avg: 0.760 ms
+unfused TE avg:  1.549 ms
+speedup vs TE:   2.04x
+fused samples:   [0.721, 0.721, 0.735, 0.806, 0.818]
+TE samples:      [1.882, 1.513, 1.459, 1.447, 1.445]
 
 activation: srelu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=None, activation output N=4096
-fused cuDNN avg: 0.669 ms
-unfused TE avg:  0.894 ms
-speedup vs TE:   1.34x
-fused samples:   [0.644, 0.642, 0.662, 0.691, 0.705]
-TE samples:      [0.964, 0.955, 0.854, 0.849, 0.849]
+fused cuDNN avg: 0.687 ms
+unfused TE avg:  0.892 ms
+speedup vs TE:   1.30x
+fused samples:   [0.661, 0.66, 0.664, 0.705, 0.744]
+TE samples:      [0.952, 0.889, 0.885, 0.869, 0.867]
 
 activation: dsrelu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=4096, activation output N=4096
-fused cuDNN avg: 0.681 ms
-unfused TE avg:  1.159 ms
-speedup vs TE:   1.70x
-fused samples:   [0.649, 0.648, 0.691, 0.696, 0.723]
-TE samples:      [1.386, 1.159, 1.097, 1.083, 1.071]
+fused cuDNN avg: 0.698 ms
+unfused TE avg:  1.170 ms
+speedup vs TE:   1.68x
+fused samples:   [0.664, 0.674, 0.683, 0.707, 0.762]
+TE samples:      [1.367, 1.18, 1.118, 1.095, 1.091]
 
 activation: geglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=8192, fused C input N=None, activation output N=4096
-fused cuDNN avg: 1.340 ms
-unfused TE avg:  1.649 ms
-speedup vs TE:   1.23x
-fused samples:   [1.21, 1.302, 1.373, 1.412, 1.404]
-TE samples:      [1.779, 1.679, 1.607, 1.578, 1.603]
+fused cuDNN avg: 1.361 ms
+unfused TE avg:  1.695 ms
+speedup vs TE:   1.24x
+fused samples:   [1.24, 1.322, 1.359, 1.443, 1.443]
+TE samples:      [1.864, 1.708, 1.636, 1.633, 1.633]
 
 activation: dgeglu
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 fused GEMM N=4096, fused C input N=8192, activation output N=8192
-fused cuDNN avg: 0.738 ms
-unfused TE avg:  1.636 ms
-speedup vs TE:   2.22x
-fused samples:   [0.709, 0.715, 0.716, 0.753, 0.799]
-TE samples:      [1.955, 1.605, 1.549, 1.54, 1.531]
+fused cuDNN avg: 0.767 ms
+unfused TE avg:  1.669 ms
+speedup vs TE:   2.18x
+fused samples:   [0.725, 0.734, 0.772, 0.778, 0.827]
+TE samples:      [2.125, 1.577, 1.552, 1.545, 1.546]
 
 summary:
 activation   cudnn_ms      te_ms   te/cudnn
-swiglu          1.329      1.742      1.31x
-dswiglu         0.738      1.535      2.08x
-srelu           0.669      0.894      1.34x
-dsrelu          0.681      1.159      1.70x
-geglu           1.340      1.649      1.23x
-dgeglu          0.738      1.636      2.22x
+swiglu          1.364      1.681      1.23x
+dswiglu         0.760      1.549      2.04x
+srelu           0.687      0.892      1.30x
+dsrelu          0.698      1.170      1.68x
+geglu           1.361      1.695      1.24x
+dgeglu          0.767      1.669      2.18x
