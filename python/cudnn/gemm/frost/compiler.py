@@ -451,11 +451,24 @@ def _epi_tile_cols(config: TileConfig, cta_group: int) -> int:
     return cols
 
 
+# Widest epilogue chunk in ELEMENTS per pipeline family. The tcgen05 drains
+# take the global cap; sm120's transposed-STG epilogue stores at most the
+# 8-column fragment row run each compute warp owns (template: 8 % _STG_V == 0).
+_EPI_CHUNK_ELEMS_BY_PIPELINE = {
+    "sm100": MAX_EPI_CHUNK_ELEMS,
+    "sm103": MAX_EPI_CHUNK_ELEMS,
+    "sm107": MAX_EPI_CHUNK_ELEMS,
+    "sm120": 8,
+}
+
+
 def _epi_vec_bytes(chain: FusionChain, config: TileConfig, cta_group: int) -> int:
     """The epilogue chunk width the kernel is rendered with: the chain-derived
     width additionally clamped so it divides every power-of-2 subtile span of
-    this config's N-tile (see ``_compute_output_vec_bytes``)."""
-    return _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config, cta_group))
+    this config's N-tile (see ``_compute_output_vec_bytes``), capped at the
+    pipeline's widest store run (:data:`_EPI_CHUNK_ELEMS_BY_PIPELINE`)."""
+    vec = _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config, cta_group))
+    return min(vec, _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline] * DTYPE_BYTES[chain.output_dtype])
 
 
 def _mainloop_chain_zero_preserving(ops) -> bool:
@@ -2724,6 +2737,10 @@ _EPI_ROW_BYTES_MAX = 128  # widest TMA store swizzle
 _EPI_N_BASE = 32  # drain width when the epilogue is already hidden behind the MMA
 _EPI_N_MAX = 64  # per-lane fp32 registers the drain can hold
 
+# Families whose templates the compiler renders with the TMA-store epilogue;
+# the sm120 warp kernel always takes its transposed-STG path.
+_TMA_STORE_EPI_PIPELINES = ("sm100", "sm103", "sm107")
+
 
 def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
     cols = _epi_tile_cols(cfg, cta_group)
@@ -2771,7 +2788,10 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
     - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store),
       and not MoE: the six MoE templates carry only the N-major TMA store.
+    - a :data:`_TMA_STORE_EPI_PIPELINES` family: sm120 renders transposed-STG only.
     """
+    if cfg.pipeline not in _TMA_STORE_EPI_PIPELINES:
+        return False
     if chain.is_multi_gemm:
         # No multi-accumulator hook in the TMA-store path → STG only.
         return False
@@ -2969,6 +2989,13 @@ def probe_supported(
     _check_executable(chain)
     if chain.has_moe or chain.has_block_scale:
         return  # specialized paths validate at compile
+    if config is DEFAULT_CONFIG:
+        # The default probe geometry is an sm100 config; when the auto path
+        # would build another family (the active GPU is outside sm100's SM
+        # range, e.g. SM 12.x), probe that family and its execution strategy.
+        from .kernel_registry import preferred_strategy
+
+        config, cta_group = preferred_strategy(chain, config, cta_group)
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
 
@@ -2982,7 +3009,7 @@ def probe_supported(
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3044,11 +3071,12 @@ def jit_from_cudnn_graph(
                 f"→ {tmpl.file}. Use cta_group=1."
             )
     # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
-    # special-case combos]) gate, then the template family's active-GPU gate.
+    # special-case combos]) gate, then the template family's active-GPU gate
+    # and its chain-level scope (e.g. the sm120 TN/N-major-output contract).
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)

@@ -563,8 +563,8 @@ def build_gemm_plan(graph: cudnn.pygraph):
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import jit_from_cudnn_graph
-    from .kernel_registry import preferred_pipeline
-    from .tile_config import as_pipeline, select_config
+    from .kernel_registry import preferred_strategy
+    from .tile_config import select_config
 
     chain = analyze(graph)
     tile_m = chain.matmul.M
@@ -582,7 +582,7 @@ def build_gemm_plan(graph: cudnn.pygraph):
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
     )
-    config = as_pipeline(config, preferred_pipeline(chain))
+    config, cta_group = preferred_strategy(chain, config, cta_group)
     return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
 
 

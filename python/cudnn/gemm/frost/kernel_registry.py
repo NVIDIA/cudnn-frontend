@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
-from .tile_config import CATALOG, TileConfig, config_class_for_pipeline
+from .tile_config import CATALOG, TileConfig, as_pipeline, config_class_for_pipeline
 
 
 def _pipeline_from_file(template_file: str) -> str:
@@ -46,6 +46,7 @@ PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm100": ((100, 120),),
     "sm103": ((103, 110),),
     "sm107": ((107, 110),),
+    "sm120": ((100, 130),),
 }
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
@@ -197,6 +198,13 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
     },
     "sm107": {
         GraphType.BLOCK_SCALE_MATMUL: _BLOCK_SCALE_CASES,
+    },
+    # sm120 carries ONLY the graph types it has templates for. No block-scale
+    # row until an sm120 block-scale template lands: a row here without its
+    # MMA_GPU_ARCH_SPECIAL_CASES narrowing would accept descriptor-less combos
+    # (see test_gpu_gated_cases_are_narrowed_everywhere).
+    "sm120": {
+        GraphType.MATMUL: _MATMUL_CASES,
     },
 }
 
@@ -386,11 +394,15 @@ class KernelTemplate:
             )
         return None
 
-    def active_reject(self, config: TileConfig) -> str | None:
+    def active_reject(self, config: TileConfig, chain: FusionChain | None = None) -> str | None:
         """The gates a JIT path applies once it has picked this template: the
         active GPU's SM range, then capabilities a pure-geometry config can ask
-        for that this template does not implement."""
-        return self.arch_active_reject() or self.multi_mma_m_reject(config)
+        for that this template does not implement, and — when the caller passes
+        the ``chain`` — the template-specific scope (:meth:`_extra_reject`)."""
+        reason = self.arch_active_reject() or self.multi_mma_m_reject(config)
+        if reason is None and chain is not None:
+            reason = self._extra_reject(chain, config)
+        return reason
 
     def candidate_configs(self, chain: FusionChain) -> tuple[TileConfig, ...]:
         """Catalog geometries this template accepts for ``chain`` — by
@@ -411,6 +423,33 @@ class MainloopKernelTemplate(KernelTemplate):
         return None
 
 
+class Sm120KernelTemplate(KernelTemplate):
+    """The sm120 warp-MMA template. Its v1 scope is enforced by render-time
+    asserts in the template source; encoding it here lets the funnel (and the
+    jit paths, via ``active_reject``) reject cleanly instead of faulting
+    mid-render: TN GEMM (K-major A and B), N-major non-fp4 output, and an
+    epilogue that stores whole (n, n+1) accumulator pairs."""
+
+    def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        mm = chain.matmul
+        if mm.a_major != "k" or mm.b_major != "k":
+            return f"{self.file} supports only K-major A and B (TN GEMM); " f"got A {mm.a_major}-major, B {mm.b_major}-major"
+        if chain.out_major != "n":
+            return f"{self.file} supports only an N-major output"
+        if chain.output_dtype == "fp4_e2m1":
+            return f"{self.file} does not support fp4 output"
+        from . import compiler as C
+        from .dtypes import DTYPE_BYTES
+
+        try:
+            vec = C._epi_vec_bytes(chain, config, self.cta_group)
+        except ValueError as e:
+            return str(e)
+        if vec < 2 * DTYPE_BYTES[chain.output_dtype]:
+            return f"{self.file} stores whole (n, n+1) accumulator pairs; the output " f"layout admits only {vec}-byte epilogue chunks"
+        return None
+
+
 # Registry — one entry per template file (20 today). A geometry config expands
 # across these via `candidates`. cta_group / mainloop live HERE.
 
@@ -423,13 +462,14 @@ def _mm(
     graph_type: GraphType = GraphType.MATMUL,
     supports_multi_gemm: bool = True,
     supports_multi_mma_m: bool = True,
+    template_cls: "type[KernelTemplate] | None" = None,
 ) -> KernelTemplate:
     pipeline = _pipeline_from_file(file)
     if pipeline not in PIPELINE_ARCH_RANGES:
         raise KeyError(
             f"template {file!r}: pipeline family {pipeline!r} has no SM-range entry in " f"PIPELINE_ARCH_RANGES — add one when introducing a new family"
         )
-    cls = MainloopKernelTemplate if mainloop else KernelTemplate
+    cls = template_cls or (MainloopKernelTemplate if mainloop else KernelTemplate)
     return cls(
         file=file,
         pipeline=pipeline,
@@ -525,13 +565,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=2,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
+    # sm120 (consumer Blackwell) warp-MMA matmul: no clusters, CLC persistent
+    # scheduler, single-GEMM only (no per-GEMM operand indexing in the compute
+    # warps). The v1 scope gates (TN, N-major output) live on Sm120KernelTemplate.
+    _mm(
+        "sm120_matmul.py",
+        cta_group=1,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
 )
 
 
 # Pipeline families the AUTO path (``tile_config.select_config``) may build
 # with, best first. sm103 is deliberately absent: its 384-byte K-tile is outside
 # select_config's geometry ladder, so it stays an explicit-config pipeline.
-_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm107", "sm100")
+# sm120 is last: it serves the GPUs (SM 12.x) the tcgen05 families cannot, and
+# never outranks them where both run.
+_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm107", "sm100", "sm120")
 
 
 def preferred_pipeline(chain: FusionChain) -> str:
@@ -544,6 +595,18 @@ def preferred_pipeline(chain: FusionChain) -> str:
         if any(t.pipeline == pipeline and t.graph_type is gt and t.arch_active_reject() is None for t in TEMPLATES):
             return pipeline
     return _AUTO_PIPELINE_ORDER[-1]
+
+
+def preferred_strategy(chain: FusionChain, config: TileConfig, cta_group: int) -> tuple[TileConfig, int]:
+    """Re-target an auto pick at the family :func:`preferred_pipeline` chooses:
+    the geometry crosses via ``as_pipeline``, and ``cta_group`` survives only
+    if the family has a template for it (else the smallest it does have —
+    sm120 is warp-scoped MMA, 1-CTA only)."""
+    pipeline = preferred_pipeline(chain)
+    if pipeline == config.pipeline:
+        return config, cta_group
+    groups = {t.cta_group for t in TEMPLATES if t.pipeline == pipeline}
+    return as_pipeline(config, pipeline), cta_group if cta_group in groups else min(groups)
 
 
 def select_template(
