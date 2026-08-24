@@ -28,6 +28,14 @@ requires_blackwell = pytest.mark.skipif(
     _SM is None or not (100 <= _SM <= 119),
     reason="needs an SM100-line GPU (100 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+# Pre-Rubin gate for the suites whose lowerings do not exist on the Rubin
+# line (f16/bf16 and MXFP8 SM100 paths; Rubin serves per-tensor FP8 only) —
+# these must SKIP on cc10.7 so the Rubin CI lane can run the whole frost
+# directory (the lane's FROST_TEST_PATHS note asks exactly for this).
+requires_pre_rubin_blackwell = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 106),
+    reason="needs a pre-Rubin SM100-line GPU (100 <= SM <= 106; no f16/MXFP8 Rubin lowering), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),

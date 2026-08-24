@@ -25,9 +25,9 @@ from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 from benchmark_utils import add_sweep_args, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_mg(handles, gemm_pairs, outs, *aux):
@@ -130,7 +130,7 @@ def _unfused_launch(a, b0, b1, scale, out):
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every multi-GEMM-
+    """Legacy label -> (geometry cfg, cta_group) for every multi-GEMM-
     capable sm100 matmul strategy. Multi-GEMM TMEM fits num_gemms accumulators
     only for cta_tile_n<=256 (2*256<=512); cta_tile_m=128."""
     chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16")[0])
@@ -138,8 +138,8 @@ def _build_spec_map():
     for t, cfg in _registry_candidates(chain):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cgrp_size_n != 1 or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -196,7 +196,7 @@ def main() -> int:
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS + pointwise':52s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    # --- candidate (config, cta_group, scheduler) strategies ---
+    # --- candidate (config, cta_group) strategies ---
     config_names = select_configs(args.configs, _SPEC_MAP)
 
     best = None
@@ -205,12 +205,12 @@ def main() -> int:
         if spec is None:
             print(f"  {label:62s} UNKNOWN (not a sweepable swiglu strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph_swiglu(B, M, N, K, in_dt, out_dt)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue  # geometry/strategy can't run this shape/dtype — skip
         try:

@@ -776,7 +776,7 @@ def test_auto_config_is_accepted_by_the_registry(S, N):
 
     chain = analyze(_build_graph(8, S, N, 512, 8))
     assert chain.has_block_scale and chain.has_moe
-    cfg, _cta_group, _sched = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
     cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
@@ -802,11 +802,11 @@ def test_sm107_template_selection_and_arch_gate(monkeypatch) -> None:
         (2, _SM107_CFG, "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py"),
     ):
         cfg = by_name(cfg_name)
-        tmpl = select_template(chain, cfg, cta_group=cta_group, scheduler="clc")
+        tmpl = select_template(chain, cfg, cta_group=cta_group)
         assert tmpl.file == want
         assert tmpl.accepts(chain, cfg) is None
     # An sm100 config still pairs with the sm100 grouped templates on the same GPU.
-    assert select_template(chain, by_name(_CFG), cta_group=2, scheduler="clc").file == "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    assert select_template(chain, by_name(_CFG), cta_group=2).file == "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
     # ... and the sm107 templates are gated off older Blackwell.
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
     tmpl = next(t for t in TEMPLATES if t.file == "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py")

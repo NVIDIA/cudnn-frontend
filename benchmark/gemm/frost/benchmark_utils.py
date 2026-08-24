@@ -3,8 +3,8 @@
 
 """Helpers shared by the gemm/frost benchmark scripts.
 
-Each script builds its own `spec_map` (label -> (geometry cfg, cta_group,
-scheduler)) from the registry funnel and its own graph / data, but the way they
+Each script builds its own `spec_map` (label -> (geometry cfg, cta_group))
+from the registry funnel and its own graph / data, but the way they
 select configs, rotate buffers, time launches and read an nsys report is the
 same everywhere. That part lives here.
 """
@@ -29,11 +29,11 @@ from cudnn.gemm.frost.tile_config import by_name as _by_name
 
 # Config selection
 
-LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
 
 
 def spec_for(label, spec_map):
-    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+    """(geometry cfg, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
     geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
@@ -48,7 +48,7 @@ def spec_for(label, spec_map):
         cfg = _by_name(m.group(1))
     except (KeyError, NotImplementedError):
         return None
-    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
+    return cfg, int(m.group(2))
 
 
 def select_configs(arg, spec_map):
@@ -214,14 +214,12 @@ def time_ms(timed_fn: Callable, warmup_fn: Callable | None = None, *, warmup: in
 # nsys mode
 
 
-def kernel_match_token(cfg, cta_group: int, scheduler: str = "clc") -> str:
+def kernel_match_token(cfg, cta_group: int) -> str:
     """The substring the demangled symbol carries. `compiler` names the kernel
-    `<template_file_stem>_<geometry_name>`, so a static config reads
-    `..._1ctamma_static_128x256x128_...` — the scheduler sits BETWEEN the
-    cta_group token and the geometry and has to be part of the match.
+    `<template_file_stem>_<geometry_name>`, so it reads `..._1ctamma_128x256x128_...`.
     The --configs LABEL is not usable here at all: it spells the pipeline before
     the geometry and the cta_group after it, so it is never a substring."""
-    return f"{cta_group}ctamma{'_static' if scheduler == 'static' else ''}_{cfg.geometry_name}"
+    return f"{cta_group}ctamma_{cfg.geometry_name}"
 
 
 def parse_nsys_stats(text: str) -> dict[str, float]:

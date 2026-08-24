@@ -540,12 +540,11 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
         d_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
 
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
-        )
+        a_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        b_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        sfa_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
+        sfb_bytes_per_stage = cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
+        ab_bytes_per_stage = a_bytes_per_stage + b_bytes_per_stage + sfa_bytes_per_stage + sfb_bytes_per_stage
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
@@ -566,14 +565,47 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
 
         d_stage_bytes = d_bytes_per_stage * (2 if generate_sfd else 1)
-        # Reserve headroom: the aligned SharedStorage struct consumes ~1.5 KB more than this
-        # byte sum (the sC/sD/sD_col MemRanges are 1024-B aligned, adding padding). Without it
+        # Reserve headroom: the aligned SharedStorage struct consumes more than this
+        # byte sum (the large MemRanges are 1024-B aligned, adding padding). Without it
         # the extra D stage can push tight tiles (e.g. 256x256, which already packs 9 A/B stages)
         # past the sm_107 SMEM cap and fail the launch config. 512x256 keeps its extra stage.
         smem_headroom = 1536
-        leftover = num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes) - ab_bytes_per_stage * num_ab_stage - smem_headroom
-        if leftover > 0:
-            num_d_stage += leftover // d_stage_bytes
+        smem_budget = num_smem_capacity // occupancy
+        base_d_stage = num_d_stage
+
+        def expanded_d_stage(n_ab):
+            leftover = smem_budget - (mbar_helpers_bytes + epi_bytes + sinfo_bytes) - ab_bytes_per_stage * n_ab - smem_headroom
+            return base_d_stage + (leftover // d_stage_bytes if leftover > 0 else 0)
+
+        buffer_align_bytes = 1024
+
+        def round_align(nbytes):
+            return (nbytes + buffer_align_bytes - 1) // buffer_align_bytes * buffer_align_bytes
+
+        def shared_storage_bytes(n_ab, n_d):
+            # Exact size of the SharedStorage struct in __call__ for these stage
+            # counts: mbars/scheduler head padded to the first 1024-B-aligned
+            # buffer, one aligned extent per MemRange, and sBias/sAmax plus the
+            # trailing padding that rounds the struct itself up to 1024 B.
+            total = mbar_helpers_bytes
+            total += round_align(c_bytes_per_stage * num_c_stage)
+            total += round_align(d_bytes_per_stage * n_d) * (2 if generate_sfd else 1)
+            total += round_align(a_bytes_per_stage * n_ab)
+            total += round_align(b_bytes_per_stage * n_ab)
+            total += round_align(sfa_bytes_per_stage * n_ab)
+            total += round_align(sfb_bytes_per_stage * n_ab)
+            total += round_align(bias_bytes + 4 * 4)  # sBias + sAmax (4 epilog warps)
+            return total
+
+        num_d_stage = expanded_d_stage(num_ab_stage)
+        # The byte-sum estimate above ignores the per-buffer alignment padding, so a
+        # tight config (fp8 256x256: 9 A/B stages with only 480 B of modeled slack)
+        # can produce a struct that exceeds the sm_107 SMEM cap by the padding bytes
+        # and CUDA rejects the launch (CUDA_LAUNCH_INVALID_CONFIG). Shed A/B stages
+        # until the exact struct fits.
+        while num_ab_stage > 1 and shared_storage_bytes(num_ab_stage, num_d_stage) > smem_budget:
+            num_ab_stage -= 1
+            num_d_stage = expanded_d_stage(num_ab_stage)
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage
 

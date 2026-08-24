@@ -40,7 +40,7 @@ from benchmark_utils import (
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for block-scale
+    """Legacy label -> (geometry cfg, cta_group) for block-scale
     strategies (geometry must satisfy the SF 128x4 swizzle; K-tile bytes are
     arch-keyed: 128 on sm100, 384 on sm103)."""
     m = {}
@@ -48,13 +48,10 @@ def _build_spec_map():
         kb_want = 384 if cfg.pipeline == "sm103" else 128
         if cfg.mma_inst_m % 128 or cfg.mma_inst_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
-        # Only sm100 has static-scheduler variants; sm103 / sm107 are CLC-only.
-        scheds = (("clc", ""), ("static", "_static")) if cfg.pipeline == "sm100" else (("clc", ""),)
         for cg in (1, 2):
             if cg == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_m == 64):
                 continue
-            for sched, tok in scheds:
-                m[f"{cfg.name}_{cg}ctamma{tok}"] = (cfg, cg, sched)
+            m[f"{cfg.name}_{cg}ctamma"] = (cfg, cg)
     return m
 
 
@@ -69,8 +66,8 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
-    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    _, cta_group = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 # Combo table (input dtype family + scale dtype + block size)
@@ -391,7 +388,7 @@ def main() -> int:
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            tok = kernel_match_token(cfg, spec[1], spec[2])
+            tok = kernel_match_token(cfg, spec[1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))

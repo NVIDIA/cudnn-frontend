@@ -188,6 +188,51 @@ def test_parity_fused_layer_path(dtype):
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad)
 
 
+def test_parity_fused_layer_path_with_packed_qkv_views():
+    """FLA's fused short-conv splits one packed output into non-compact Q/K/V
+    views.  The shim must compact those views before entering native GDN while
+    preserving gradients back to the packed allocation."""
+    B, T, H, HV, K, V = 1, 256, 16, 48, 128, 128
+    widths = (H * K, H * K, HV * V)
+    gen = torch.Generator(device="cuda").manual_seed(4)
+
+    packed = torch.randn(B, T, sum(widths), generator=gen, device="cuda", dtype=torch.bfloat16)
+    graw = torch.randn(B, T, HV, generator=gen, device="cuda", dtype=torch.bfloat16)
+    braw = torch.randn(B, T, HV, generator=gen, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.log(torch.empty(HV, device="cuda").uniform_(0.1, 16, generator=gen))
+    dt_bias = torch.randn(HV, generator=gen, device="cuda")
+
+    def leaves():
+        p = packed.detach().clone().requires_grad_(True)
+        q, k, v = p.split(widths, dim=-1)
+        lv = {
+            "packed": p,
+            "q": q.reshape(B, T, H, K),
+            "k": k.reshape(B, T, H, K),
+            "v": v.reshape(B, T, HV, V),
+            "graw": graw.detach().clone().requires_grad_(True),
+            "braw": braw.detach().clone().requires_grad_(True),
+            "A_log": A_log.detach().clone().requires_grad_(True),
+            "dt_bias": dt_bias.detach().clone().requires_grad_(True),
+        }
+        assert not lv["q"].is_contiguous()
+        assert not lv["k"].is_contiguous()
+        assert not lv["v"].is_contiguous()
+        return lv
+
+    lv_fla, lv_cud = leaves(), leaves()
+    o_fla = _run_fused(chunk_gated_delta_rule, lv_fla)
+    o_cud = _run_fused(shim, lv_cud)
+    assert last_path() == "native", f"expected cuDNN native path, got {last_path()}"
+
+    do = torch.randn_like(o_fla)
+    o_fla.backward(do)
+    o_cud.backward(do)
+    assert _relL2(o_cud, o_fla) <= C_SLACK * FLOOR
+    for n in ("packed", "graw", "braw", "A_log", "dt_bias"):
+        assert _relL2(lv_cud[n].grad, lv_fla[n].grad) <= C_SLACK * FLOOR, n
+
+
 kda_ops = pytest.importorskip("fla.ops.kda")
 chunk_kda = kda_ops.chunk_kda
 from cudnn.fla.kda import make_chunk_kda, last_path as kda_last_path

@@ -381,6 +381,9 @@ class Graph : public ICudnn, public INode {
         if (attributes.generate_stats == true) {
             sdpa_outputs.Stats = attributes.outputs[SDPA_attributes::output_names::Stats] =
                 output_tensor(attributes.name + "::Stats");
+            // Stats is always computed and stored in FP32; setting it at creation keeps
+            // fill_from_context from assigning the (possibly narrower) io data type.
+            sdpa_outputs.Stats->set_data_type(DataType_t::FLOAT);
         }
 
         // Dropout mask dump (created conditionally based on dropout parameters)

@@ -225,9 +225,11 @@ def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     the tile box stays the compile-time D, so loads past d_qk / d_v hardware
     zero-fill (adding exact zero terms to every QK^T dot product — S, softmax
     and P·V are bit-identical to the unpadded problem) and O stores past d_v
-    are OOB-clipped. FP8/MXFP8 uses exact native shapes (gated in
-    check_support); alignment (d % 8, the TMA 16-byte global-stride rule at
-    2 bytes/elem) is also gated in check_support / engines.mismatch.
+    are OOB-clipped. Per-tensor FP8 serves the same envelope under its d128
+    tile (dense only, d % 16 at 1 byte/elem); d192 FP8 and MXFP8 use exact
+    native shapes. All of it is gated in check_support / engines.mismatch,
+    including the f16 alignment rule (d % 8, the TMA 16-byte global-stride
+    rule at 2 bytes/elem).
     """
     for flavor in _SM100_FLAVORS:
         fdqk, fdv = flavor
@@ -297,6 +299,8 @@ class SdpaFwdDsl(APIBase):
         tile_m: Optional[int] = None,
         tile_n: Optional[int] = None,
         cga: Optional[int] = None,
+        split_kv: Optional[int] = None,
+        softmax_precision: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -357,11 +361,20 @@ class SdpaFwdDsl(APIBase):
         self._pertensor = bool(pertensor_fp8)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
-        # Capabilities domain by the probe (engines.mismatch).
-        self.sched_policy = SCHED_NATURAL if sched_policy is None else int(sched_policy)
+        # Capabilities domain by the probe (engines.mismatch). None means the
+        # caller stated NO preference: the graph path always arrives with an
+        # explicit value (the heuristic emits complete assignments), so a None
+        # here is the standalone-wrapper tier, where compile() derives the
+        # policy itself. An explicit value — including NATURAL — is honored
+        # verbatim, never re-derived.
+        self.sched_policy = None if sched_policy is None else int(sched_policy)
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
         self.cga = None if cga is None else int(cga)
+        self.split_kv = 1 if split_kv is None else int(split_kv)
+        # Framework axis: no forward kernel serves a softmax-precision choice
+        # yet, so anything non-None is rejected in check_support.
+        self.softmax_precision = softmax_precision
 
         self.batch_size: Optional[int] = None
         self.s_q_max: Optional[int] = None
@@ -642,6 +655,41 @@ class SdpaFwdDsl(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Return the per-execution scratch requirement for this implementation."""
 
+    # -- KV-split shared helpers (SM100 + SM120 dense split paths) -----------
+
+    def _o_itemsize(self) -> int:
+        return 2  # f16 / bf16; the split path is half-precision-O only
+
+    def _combine_dtype_tag(self) -> str:
+        # The combine reduces INTO the O dtype: the graph's dtype_o on the
+        # quantized rows (half-gated by check_support), Q's dtype elsewhere.
+        o_dtype = self.dtype_o if (self._fp8 and self.dtype_o is not None) else self.dtype
+        return "bf16" if o_dtype == torch.bfloat16 else "f16"
+
+    def _split_partials(self, workspace, o_like, device, current_stream=None):
+        """The split-major (O, LSE) partial buffers, carved from the caller's
+        workspace when there is one and torch-allocated otherwise (standalone
+        use, matching what the rest of this adapter does).
+
+        The allocation happens ON the launch stream: the caching allocator tags
+        a block with the stream it was allocated on, and the kernels that write
+        and read these buffers run on ``current_stream``. Allocating on torch's
+        current stream instead would leave a later free/reuse unordered against
+        those launches."""
+        rows = self.split_kv * self.batch_size
+        o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
+        lse_shape = (rows, self.h_q, self.s_q_max)
+        if workspace is None:
+            with _torch_stream_context(current_stream, device):
+                return (
+                    torch.empty(o_shape, dtype=o_like.dtype, device=device),
+                    torch.empty(lse_shape, dtype=torch.float32, device=device),
+                )
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), f"{type(self).__name__} (KV split)")
+        o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_like.dtype).view(o_shape)
+        lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
+        return o_part, lse_part
+
     @abstractmethod
     def execute(
         self,
@@ -722,7 +770,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 )
 
         if self.thd:
-            self._thd_check_strides_native()
+            if self.q_desc.dtype in _SM100_FP8_DTYPES:
+                # FP8/MXFP8 THD serves only the packed contract (their
+                # compile() builds compact fakes); the f16 kernels address
+                # declared strides natively.
+                self._thd_check_strides_packed()
+            else:
+                self._thd_check_strides_native()
 
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -803,13 +857,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
-        # FP8 paths use exact native shapes. SM100 supports d128/d128 and
-        # d192/d128; Rubin currently supports only per-tensor FP8 d128.
+        # FP8 flavor shapes: SM100 serves d128/d128 and d192/d128; Rubin
+        # currently serves only per-tensor FP8 d128. Per-tensor FP8 serves
+        # the dense ENVELOPE of every flavor it has (TMA zero-padding, like
+        # the f16 flavors — exact in FP8, and the descales are scalars, so
+        # the envelope is arch-independent): head dims componentwise <= a
+        # flavor shape and multiples of 16 (TMA 16-byte global-stride rule
+        # at 1 byte/elem). THD stays native-shape (the packed THD compile
+        # key carries no head-dim entries — engines.thd_d_shapes) and MXFP8
+        # stays exact (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
+        _fp8_envelope_ok = (
+            self._pertensor and not self.thd and any(int(d_qk) <= sq and int(d_v) <= sv for sq, sv in fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
+        )
         self._value_error_if(
-            self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
-            f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires an exact native shape in {sorted(fp8_shapes)} "
-            f"(no envelope padding); got (D_QK={d_qk}, D_V={d_v})",
+            self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
+            f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
+            + (" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16)" if self._pertensor else " (no envelope padding)")
+            + f"; got (D_QK={d_qk}, D_V={d_v})",
         )
         # Envelope alignment gate: the TMA descriptors are built from the
         # actual tensor extents, and cuTensorMapEncodeTiled requires every
@@ -824,8 +889,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self.flavor = _pick_flavor(d_qk, d_v)
         self._value_error_if(
-            self.sched_policy != SCHED_NATURAL,
-            f"SM100 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
+            self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
+            f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
         )
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
@@ -835,6 +900,42 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._value_error_if(
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
+            )
+        # softmax_precision values are cudnn.data_type (the knob vocabulary
+        # fixed by #692); imported locally — this file otherwise speaks torch
+        # dtypes and frost constants only.
+        from cudnn import data_type as _cudnn_dtype
+
+        self._value_error_if(
+            self.softmax_precision is not None and not (self._fp8 and self._pertensor),
+            "softmax_precision is served on the per-tensor FP8 path only (other families run the f32 pipeline)",
+        )
+        self._value_error_if(
+            self.softmax_precision is not None and self.softmax_precision not in (_cudnn_dtype.FLOAT, _cudnn_dtype.HALF),
+            f"softmax_precision must be cudnn.data_type.FLOAT or HALF; got {self.softmax_precision}",
+        )
+        # The f16x2 exponent arm is numerics-changing and lives in the SM107
+        # sibling kernel only — honored exactly or declined (mirrors the
+        # split engine rows: only sdpa_fwd_prefill_sm107_d128_fp8 declares
+        # HALF in its softmax_precisions domain).
+        self._value_error_if(
+            self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor != (128, 128)),
+            "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+        )
+        if self.split_kv > 1:
+            # Split-KV: partials weighted by the per-split LSE, recombined by
+            # split_combine_sm100 (which also owns the FP8 amax of the
+            # recombined O). Structural limits mirror mismatch()'s
+            # facts x knobs gate so the standalone API declines identically.
+            self._not_implemented_error_if(
+                self._fp8 and self.dtype_o not in (torch.float16, torch.bfloat16),
+                "split_kv > 1 on a quantized graph requires a bf16/fp16 O (the combine reduces half-precision partials)",
+            )
+            self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
+            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            self._value_error_if(
+                self.seq_kv_lens_present or self.seq_q_lens_present,
+                "split_kv > 1 serves unpadded dense graphs only",
             )
 
         swa_left = self.window_size_left
@@ -855,28 +956,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.causal_bottom_right and not self.is_causal,
             "SM100 DSL SDPA: causal_bottom_right requires is_causal=True",
         )
-        # Backstop for the engines.bottom_right_padded_seq_q gate: with dense
-        # per-batch Q lengths the kernel's BR diagonal (anchored at the global
-        # S_q) is wrong for any batch with seq_len_q[b] < S_q.
-        self._value_error_if(
-            self.causal_bottom_right and self.seq_q_lens_present,
-            "SM100 DSL SDPA: causal_bottom_right with per-batch seq_len_q is not "
-            "supported (kernel anchors the BR diagonal at the global S_q, not "
-            "seq_len_q[b])",
-        )
         if self.thd:
             self.seq_kv_lens_present = True
         self._not_implemented_error_if(
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
-        # The engine specs already declare thd=False for the FP8/MXFP8 cells
-        # (graph-API routing); this gate covers direct construction.
+        # Of the FP8/MXFP8 flavors only d128/d128 carries the write_thd_meta
+        # THD leg; the d192/d128 siblings are dense-only. The engine specs
+        # already route this (their d192 rows declare thd=False); the gate
+        # covers direct construction.
         self._not_implemented_error_if(
-            self.thd and self._fp8,
-            "THD/varlen is not supported by the SM100 FP8/MXFP8 kernels (the "
-            "legacy THD leg was removed; the port will follow the write_thd_meta "
-            "envelope design — issue #552)",
+            self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
+            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -891,18 +983,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.seq_q_lens_present and self._fp8,
             "seq_q_lens_present (dense padded-Q LSE trim) is not plumbed for the FP8/MXFP8 kernels",
-        )
-        # Dense BR + per-batch Q lengths: the kernels anchor the bottom-right
-        # diagonal with the GLOBAL S_q (compute_kv_loop_bounds: causal_diag =
-        # seq_kv_len - seqlen_q with the scalar S_q), but cuDNN semantics
-        # anchor it at the per-batch (seq_len_q[b], seq_len_kv[b]) corner —
-        # batches with seq_len_q[b] < S_q get over-masked. KV-only padding is
-        # exact (actual Q length == S_q), so only this combination is gated.
-        self._value_error_if(
-            self.causal_bottom_right and self.seq_q_lens_present,
-            "SM100 DSL SDPA: causal_bottom_right with per-batch seq_len_q (dense "
-            "padded-Q trim) is not supported — the kernel anchors the BR diagonal "
-            "at the global S_q, not seq_len_q[b]/seq_len_kv[b]",
         )
         # KV-tail correctness: the kernel zero-fills the last KV tile via TMA
         # OOB but only *masks* those columns on the padded / causal paths. A
@@ -947,18 +1027,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # picks the fused path with no user action.
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        # None = the standalone-wrapper tier stated no preference: derive the
+        # causal-balancing policy here. The graph path never hits this branch —
+        # the heuristic emits an explicit policy (the same primary this
+        # derivation picks) and it is honored verbatim, NATURAL included.
         sched_policy = self.sched_policy
-        if sched_policy == SCHED_NATURAL and self.window_right is not None:
-            # Causal: balance the triangular load; pick the LPT variant by working set.
-            _, _, s_kv_sched, _ = self.k_desc.shape
-            _, _, _, d_qk_sched = self.q_desc.shape
-            _, _, _, d_v_sched = self.v_desc.shape
-            sched_policy = _causal_sched_policy(
-                s_kv=s_kv_sched,
-                d_qk=d_qk_sched,
-                d_v=d_v_sched,
-                elem_bytes=1 if self._fp8 else 2,
-            )
+        if sched_policy is None:
+            sched_policy = SCHED_NATURAL
+            if self.window_right is not None:
+                # Causal: balance the triangular load; pick the LPT variant by working set.
+                _, _, s_kv_sched, _ = self.k_desc.shape
+                _, _, _, d_qk_sched = self.q_desc.shape
+                _, _, _, d_v_sched = self.v_desc.shape
+                sched_policy = _causal_sched_policy(
+                    s_kv=s_kv_sched,
+                    d_qk=d_qk_sched,
+                    d_v=d_v_sched,
+                    elem_bytes=1 if self._fp8 else 2,
+                )
         lpt_head_group = 1
         if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
             lpt_head_group = 8
@@ -978,6 +1064,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
             # selects the equivalent masked-interior lowering.
             template_window_right = self.s_k_max
+        from cudnn import data_type as _cudnn_dtype
+
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -992,6 +1080,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
+            softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+            split_kv=self.split_kv,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
@@ -999,29 +1089,41 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # compile as dynamic extents — issue #552), so compile HERE like
             # every dense specialization; execute()'s lru-cached call re-binds
             # this artifact. (The all-KV-zero clamp swaps the K/V strides and
-            # mints its own entry on first hit.) FP8/MXFP8 THD is rejected in
-            # check_support (the legacy THD leg was removed), so this branch is
-            # f16-only.
+            # mints its own entry on first hit.) The FP8/MXFP8 flavors serve
+            # the packed contract — their key carries no stride/head-dim
+            # entries (see _thd_compile_kwargs).
             self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
         elif self._fp8:
-            # FP8/MXFP8 kernels use exact native shapes (gated in check_support);
-            # their compile() has no envelope head-dim parameters. has_lse=False
-            # (no Stats output) compiles the LSE store out — no dummy buffer at
-            # any level (the amax_o atomicMax write is independent).
-            self._compiled_kernel = self._k_mod.compile(
+            # has_lse=False (no Stats output) compiles the LSE store out — no
+            # dummy buffer at any level (the amax_o atomicMax write is
+            # independent). A split REQUIRES the in-kernel LSE: the per-split
+            # LSE is the combine weight (the kernel skips its own amax write
+            # under a split; the combine reports the amax of the RECOMBINED O
+            # instead).
+            fp8_kwargs = dict(
                 b=self.batch_size,
                 qh=self.h_q,
                 kh=self.h_kv,
                 sq=self.s_q_max,
                 skv=self.s_k_max,
-                has_lse=self.lse_desc is not None,
+                has_lse=(self.lse_desc is not None) or self.split_kv > 1,
             )
+            if self._pertensor:
+                # ENVELOPE (per-tensor only): hand the kernel the ACTUAL head
+                # dims so its TMA descriptors carry the real extents (loads
+                # past them zero-fill — exact in FP8; O stores past d_v clip).
+                # Both fp8 flavor kernels take these; MXFP8 is exact-native
+                # (gated in check_support) and takes no head-dim parameters.
+                fp8_kwargs.update(d_qk=self.head_dim_qk, d_v=self.head_dim_v)
+            self._compiled_kernel = self._k_mod.compile(**fp8_kwargs)
         else:
             # ENVELOPE: hand the f16/bf16 kernel the ACTUAL head dims so its
             # TMA descriptors carry the real extents (loads past them
             # zero-fill, O stores past d_v clip); the tile box stays the
             # flavor's compile-time D. has_lse=False (no Stats output)
             # compiles the LSE store out — no dummy buffer at any level.
+            # Split-KV REQUIRES the in-kernel LSE regardless of a Stats
+            # output: the per-split LSE is the combine weight.
             self._compiled_kernel = self._k_mod.compile(
                 b=self.batch_size,
                 qh=self.h_q,
@@ -1030,7 +1132,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 skv=self.s_k_max,
                 d_qk=self.head_dim_qk,
                 d_v=self.head_dim_v,
+                has_lse=(self.lse_desc is not None) or self.split_kv > 1,
+            )
+        self._combine_kernel = None
+        if self.split_kv > 1:
+            # The recombine pass compiles at PLAN time like everything else;
+            # execute() only rebinds the partial slabs it carves. On the FP8
+            # families the combine also owns the amax of the recombined O
+            # (a max over per-split partials would over-report — each split's
+            # O is normalized by its own running sum).
+            from cudnn.sdpa.fwd.kernels import split_combine_sm100 as _split_combine
+
+            self._combine_kernel = _split_combine.compile(
+                b=self.batch_size,
+                h=self.h_q,
+                sq=self.s_q_max,
+                d_v=self.head_dim_v,
+                splits=self.split_kv,
+                dtype_o=self._combine_dtype_tag(),
                 has_lse=self.lse_desc is not None,
+                has_amax=self._fp8,
             )
         self._logger.debug("compile completed")
 
@@ -1057,9 +1178,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # kernel (issue #552). o_desc: 16 int64 per
             # sequence + 16 spare, the per-sequence O TMA descriptors the
             # builder kernel fills.
-            return ws_align((3 * b + 2) * 4) + ws_align((b * 16 + 16) * 8) + (0 if self.has_sink else ws_align(qh * 4))
-        if self._fp8:
+            # o_desc: 16 int64 per sequence + the dead-unit pad slot; the
+            # FP8/MXFP8 flavors carry two more slots for the packed-total-
+            # clamped K/V runtime descriptors (see the kernels' THD closures).
+            o_desc_slots = b + (3 if self._fp8 else 1)
+            return ws_align((3 * b + 2) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+        if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
+        if self.split_kv > 1:
+            # Split-major partial slabs the main kernel writes and the combine
+            # pass reduces: O_s [splits*B, S_q, H, d_v] in the O dtype (half —
+            # the split path requires a bf16/fp16 O even on the FP8 families)
+            # and lse_s [splits*B, H, S_q] fp32. Carved from the caller's
+            # workspace — zero per-execute allocations (Hard Rule 1).
+            o_bytes = self.split_kv * b * self.s_q_max * qh * self.head_dim_v * self._o_itemsize()
+            lse_bytes = self.split_kv * b * qh * self.s_q_max * 4
+            return ws_align(o_bytes) + ws_align(lse_bytes)
         # Dense padded-Q lens bind directly as their own kernel parameter
         # (no combine buffer since the seq_len_q-as-parameter change) — no scratch.
         return 0
@@ -1153,6 +1287,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 scale_o,
                 amax_o,
                 current_stream,
+                workspace=workspace,
             )
             return
 
@@ -1174,6 +1309,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sf_v,
                 amax_o,
                 current_stream,
+                workspace=workspace,
             )
             return
 
@@ -1220,21 +1356,58 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         import cutlass
 
-        self._compiled_kernel(
-            Q,
-            K,
-            V,
-            O_scratch if o_needs_copy_back else O_view,
-            lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max) if lse_tensor is not None else None,
-            sinks_t,
-            seq_kv_t,
-            o_desc_dummy,
-            (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
-            cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(0),
-            seq_q_t,
-            stream=current_stream,
-        )
+        o_arg = O_scratch if o_needs_copy_back else O_view
+        lse_arg = lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max) if lse_tensor is not None else None
+        if self.split_kv > 1:
+            # Redirect the mainloop into split-major partial slabs, then reduce
+            # into the caller's O/LSE with the plan-time-compiled combine pass.
+            # Slabs are carved from the caller's workspace (Hard Rule 1);
+            # standalone use (no workspace) torch-allocates, like the THD path.
+            # No zero-fill: the split kernel writes EVERY (split, batch) slot,
+            # emitting O := 0 / lse := -inf for empty split ranges itself.
+            s, b, h, sq, dv = self.split_kv, self.batch_size, self.h_q, self.s_q_max, self.head_dim_v
+            o_partial, lse_partial = self._split_partials(workspace, o_arg, device, current_stream)
+            self._compiled_kernel(
+                Q,
+                K,
+                V,
+                o_partial,
+                lse_partial,
+                sinks_t,
+                seq_kv_t,
+                o_desc_dummy,
+                (b, h, self.h_kv, sq, self.s_k_max, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(0),
+                seq_q_t,
+                stream=current_stream,
+            )
+            self._combine_kernel(
+                o_partial,
+                lse_partial,
+                o_arg,
+                lse_arg,
+                None,
+                (b, h, sq, dv),
+                cutlass.Int32(s),
+                stream=current_stream,
+            )
+        else:
+            self._compiled_kernel(
+                Q,
+                K,
+                V,
+                o_arg,
+                lse_arg,
+                sinks_t,
+                seq_kv_t,
+                o_desc_dummy,
+                (self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(0),
+                seq_q_t,
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
@@ -1255,12 +1428,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return (0, ts, hs, es)
 
         has_lse = self.lse_desc is not None
-        return dict(
+        kwargs = dict(
             b=self.batch_size,
             qh=self.h_q,
             kh=self.h_kv,
-            d_qk=self.head_dim_qk,
-            d_v=self.head_dim_v,
             # The Stats layout is a per-shape specialization (like d_qk/d_v):
             # has_lse=False compiles the store out; token-major binds the
             # packed rank-2 (T, H) view; head-major carries the caller-declared
@@ -1268,11 +1439,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_lse=has_lse,
             lse_head_major=has_lse and self.thd_stats_head_major,
             lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
+        )
+        if self._fp8:
+            # The FP8/MXFP8 cells serve only the packed contract at exact
+            # d128 (check_support) — no stride/head-dim keys.
+            return kwargs
+        kwargs.update(
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
             q_stride=_key(self.q_desc),
             k_stride=_key(self.k_desc),
             v_stride=_key(self.v_desc),
             o_stride=_key(self.o_desc),
         )
+        return kwargs
 
     def _thd_unit_envelope(self) -> int:
         """PLAN-TIME upper bound on live THD units:
@@ -1292,108 +1472,61 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q_decl = int(self.q_desc.shape[2])
         return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
-    def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
-        """THD / varlen execute: reconstruct the kernel's packed [1, T, H, D] views and metadata buffer from the cuDNN ragged buffers, then launch.
+    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, sinks, seq_kv_lens, seq_q_lens, workspace, label, current_stream=None, lse_tokens_cap=None):
+        """Shared SM100 THD (ragged) packing — issue #552, zero host reads.
 
-        With a ``workspace`` the metadata buffers (int32 length copies, the
-        [seq_kv | cu_q | cu_k] buffer, the per-sequence O TMA descriptors, the
-        sinks dummy) are carved from it — zero per-execute allocations;
-        without one they are torch-allocated (standalone use). ``lse_tensor``,
-        when given, is the caller's ragged Stats buffer, written by the
-        kernel directly in its declared layout: token-major packed ``(T, H)``
-        in the first ``T*H`` elements, or head-major ``(H, head_stride)``
-        with tokens contiguous within each head row; when ``None`` the kernel
-        compiles the LSE store out (has_lse=False) and no scratch exists.
-        Host round-trips (issue #552): NONE — the lengths never reach the
-        host (the setup kernel builds the metadata buffer device-side),
-        every ragged view binds its buffer's capacity, and the launch grid
-        is the plan-time envelope (dead units exit by kernel contract) —
-        the execute is fully async and CUDA-graph capturable. No compile is
-        keyed on runtime data: the kernels compile with DYNAMIC token
-        extents, so a new packed total re-binds the same artifact."""
-        import cutlass
+        Builds the [seq_kv | cu_q | cu_k] metadata scratch (WRITTEN device-side
+        by the kernels' setup launch from the caller's length tensors, returned
+        as ``q_lens_dev``/``kv_lens_dev`` + the ``lens_form`` bitmask), the
+        per-batch O-descriptor scratch, the plan-time envelope unit count, the
+        sinks binding, and the declared-stride ``(1, T, H, D)`` views with
+        CAPACITY token extents — Q/O (and a token-major LSE, via
+        ``lse_tokens_cap``) share one dynamic token symbol, K/V the other;
+        writes/loads never step past the real per-sequence lengths the kernel
+        reads from the device metadata, so the over-claim only widens the TMA
+        descriptors' bound. The FP8/MXFP8 packed contract declares compact
+        strides, so the same views ARE the packed ones. With a ``workspace``
+        every scratch chunk is carved from it (zero per-execute allocations);
+        torch allocations run on the LAUNCH stream. The prefix-sum invariants
+        are caller contract (a validation that needs a device read is not a
+        validation — AGENTS.md Rule 3).
 
+        Returns ``None`` when no Q token is addressable (zero capacity —
+        all-zero LENGTHS over live storage launch normally: every unit
+        decodes dead and neither O nor LSE is touched)."""
         dev = q_buf.device
-        b = self.batch_size
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm100 (THD)") if workspace is not None else None
-        # Metadata buffer: [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) ],
-        # built DEVICE-side by the setup kernel from the caller's length
-        # tensors (either form) — no host cumsum, no H2D, and the lengths
-        # NEVER reach the host (issue #552); the prefix-sum invariants are
-        # caller contract (a validation that needs a device read is not a
-        # validation — AGENTS.md Rule 3). The torch allocations run on the
-        # LAUNCH stream so they are ordered against the kernels that consume
-        # them — the execute-time handle may carry a stream that is not
-        # torch's current.
+        b, qh, kh = self.batch_size, self.h_q, self.h_kv
+        d_qk, d_v = self.head_dim_qk, self.head_dim_v
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
         with _torch_stream_context(current_stream, dev):
             meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-        kv_lens_dev = self._checked_cu_seq_lens(seq_len_kv, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_len_kv, "seq_kv_lens")
+        kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+        lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
 
-        qh, kh = self.h_q, self.h_kv
-        d_qk, d_v = self.head_dim_qk, self.head_dim_v
-
-        # Q/O token extent = buffer CAPACITY (issue #552: the packed Q total
-        # lives on device only). Q, O and a token-major (or compact
-        # head-major) LSE bind ONE dynamic token symbol, so take the shared
-        # floor. Writes never step past the real per-sequence lengths the
-        # kernel reads from the device metadata (O through the per-batch
-        # descriptors' extents, LSE via the row predicate), so the
-        # over-claim only widens the TMA descriptors' bound.
         (q_ts, _, _), _ = self._thd_declared(self.q_desc)
         (o_ts, _, _), _ = self._thd_declared(self.o_desc)
         t_q = min(q_buf.numel() // q_ts, o_buf.numel() // o_ts)
-        if lse_tensor is not None and not (self.thd_stats_head_major and self.thd_stats_head_stride):
-            t_q = min(t_q, lse_tensor.numel() // qh)
-
-        # Degenerate Q side: zero CAPACITY — no token is addressable, and a
-        # zero-token view cannot back a TMA descriptor — nothing to compute
-        # or write. All-zero LENGTHS over live storage launch normally:
-        # every unit decodes dead and neither O nor LSE is touched.
-        # (t_kv == 0 launches normally through the kernel's dead-row path;
-        # see the K/V binding below.)
+        if lse_tokens_cap is not None:
+            t_q = min(t_q, lse_tokens_cap)
         if t_q == 0:
-            self._logger.debug("execute (THD): no addressable Q token, nothing to do")
-            return
-        lse = None
-        if lse_tensor is not None:
-            if self.thd_stats_head_major:
-                # head_stride covering the packed total is caller contract
-                # (t_q is a device value — Rule 3).
-                head_stride = self.thd_stats_head_stride
-                if head_stride == 0:
-                    head_stride = t_q  # compact: the token extent itself
-                lse = lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
-            else:
-                # Token-major (TH1, the default): natural packed rank-2 (T, H)
-                # view — the kernel's epilogue dispatches on this static rank.
-                lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
+            return None
 
         # Per-sequence O TMA descriptors. No zero-init: the kernel's builder
         # pass copies every qword of each sequence's slot from the base
         # descriptor (then patches address/extent) before the fence and
         # before any consumer read, so stale bytes never survive — a fill
         # here is a wasted kernel launch on the execute hot path (Rule 1).
-        # Allocated on the launch stream (allocator stream-tagging + ordering
-        # vs the builder pass).
         with _torch_stream_context(current_stream, dev):
-            o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.empty(b * 16 + 16, dtype=torch.int64, device=dev)
+            # +2 slots on the FP8/MXFP8 flavors: the packed-total-clamped K/V
+            # runtime descriptors the setup kernel writes after the pad slot.
+            o_desc_slots = b + (3 if self._fp8 else 1)
+            o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
         units = self._thd_unit_envelope()
 
-        # Declared-stride (1, T, H, D) views, addressed NATIVELY by the kernel
-        # (the Q/K/V/O TMA descriptors are built from the tensor views, and
-        # the THD O-descriptor builder steps by O's declared seq stride);
-        # check_support rejected any declaration TMA cannot express.
         Q = self._thd_view(q_buf, self.q_desc, t_q)
         O = self._thd_view(o_buf, self.o_desc, t_q)
-        # KV token extent = buffer CAPACITY (issue #552: the packed KV total
-        # lives on device only). K and V bind the same dynamic token symbol,
-        # so take the shared floor. Loads never step past the REAL
-        # per-sequence lengths the kernel reads from the device metadata, so
-        # an over-claimed extent only widens the TMA descriptors' bound.
-        # All-zero lengths with a live buffer launch normally through the
-        # kernel's per-sequence dead-row path.
         (k_ts, _, _), _ = self._thd_declared(self.k_desc)
         (v_ts, _, _), _ = self._thd_declared(self.v_desc)
         t_kv = min(k_buf.numel() // k_ts, v_buf.numel() // v_ts)
@@ -1422,10 +1555,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             K = self._thd_view(k_buf, self.k_desc, t_kv)
             V = self._thd_view(v_buf, self.v_desc, t_kv)
-        # LSE binding: the caller's ragged Stats buffer in its declared layout
-        # when a Stats output exists; None otherwise — the kernel compiles the
-        # LSE store out (has_lse=False), so no dummy buffer exists at all.
-        LSE = lse
         if sinks is not None:
             sinks_t = self._checked_sinks_1d(sinks)
         else:
@@ -1436,38 +1565,104 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     sinks_t.zero_()
                 else:
                     sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
+        return SimpleNamespace(
+            meta=meta,
+            o_desc=o_desc,
+            units=units,
+            t_q=t_q,
+            t_kv=t_kv,
+            Q=Q,
+            K=K,
+            V=V,
+            O=O,
+            sinks_t=sinks_t,
+            q_lens_dev=q_lens_dev,
+            kv_lens_dev=kv_lens_dev,
+            lens_form=lens_form,
+        )
+
+    def _thd_lse_tokens_cap(self, lse_tensor):
+        """The LSE buffer's token capacity when it shares the Q/O dynamic token
+        symbol — token-major (the default) and COMPACT head-major (declared
+        head stride 0, i.e. the token extent itself) both do, so their
+        capacity joins the packed-Q floor; head-major with a declared
+        head_stride carries its own extent (covering the packed total is
+        caller contract — t_q is a device value, Rule 3), so it stays out."""
+        if lse_tensor is None or (self.thd_stats_head_major and self.thd_stats_head_stride):
+            return None
+        return lse_tensor.numel() // self.h_q
+
+    def _thd_lse_view(self, lse_tensor, t_q):
+        """The caller's ragged Stats buffer in its declared layout — token-major
+        packed rank-2 (T, H) (the default; cuDNN's TH1 ragged Stats recipe) or
+        head-major rank-3 (1, QH, head_stride) with head_stride covering the
+        packed total (caller contract — t_q is a device value, Rule 3; 0 =
+        compact = the token extent itself)."""
+        if lse_tensor is None:
+            return None
+        qh = self.h_q
+        if self.thd_stats_head_major:
+            head_stride = self.thd_stats_head_stride
+            if head_stride == 0:
+                head_stride = t_q
+            return lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
+        return lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
+
+    def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
+        """THD / varlen execute (f16 kernels): shared packing + launch.
+
+        ``lse_tensor``, when given, is the caller's ragged Stats buffer,
+        written by the kernel directly in its declared layout (token-major
+        packed ``(T, H)`` or head-major ``(H, head_stride)``); when ``None``
+        the kernel compiles the LSE store out (has_lse=False) and no scratch
+        exists. Host round-trips (issue #552): NONE — the lengths never reach
+        the host (the setup kernel builds the metadata buffer device-side),
+        every ragged view binds its buffer's capacity, and the launch grid is
+        the plan-time envelope (dead units exit by kernel contract) — the
+        execute is fully async and CUDA-graph capturable. No compile is keyed
+        on runtime data: the kernels compile with DYNAMIC token extents, so a
+        new packed total re-binds the same artifact."""
+        import cutlass
+
+        lse_cap = self._thd_lse_tokens_cap(lse_tensor)
+        pack = self._thd_pack(
+            q_buf, k_buf, v_buf, o_buf, sinks, seq_len_kv, seq_q_lens, workspace, "SdpaFwdDslSm100 (THD)", current_stream=current_stream, lse_tokens_cap=lse_cap
+        )
+        if pack is None:
+            self._logger.debug("execute (THD): no addressable Q token, nothing to do")
+            return
+        LSE = self._thd_lse_view(lse_tensor, pack.t_q)
 
         # PLAN-TIME-ONLY compile key (issue #552: keying on the packed totals
         # degenerated into a per-step recompile under continuous batching):
         # this lru-cached call re-binds the artifact compile() already built.
         # The K/V strides are taken from the BOUND views because the
-        # all-KV-zero clamp above swaps in packed batch-1 views (that rare
-        # shape mints its own cache entry); the batch stride is zeroed out of
-        # the key (a runtime value the kernel rebuilds symbolically).
+        # all-KV-zero clamp swaps in packed batch-1 views (that rare shape
+        # mints its own cache entry); the batch stride is zeroed out of the
+        # key (a runtime value the kernel rebuilds symbolically).
         kwargs = self._thd_compile_kwargs()
-        kwargs.update(k_stride=(0, *K.stride()[1:]), v_stride=(0, *V.stride()[1:]))
+        kwargs.update(k_stride=(0, *pack.K.stride()[1:]), v_stride=(0, *pack.V.stride()[1:]))
         fn = self._k_mod.compile(**kwargs)
         # The caller's length tensors ride to the setup kernel, which builds
         # the metadata buffer device-side; the form bitmask is a runtime
         # value (no compile key grows). problem_size sq/skv slots are 0 by
         # the THD contract (_host reads the dynamic extents).
-        lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
         fn(
-            Q,
-            K,
-            V,
-            O,
+            pack.Q,
+            pack.K,
+            pack.V,
+            pack.O,
             LSE,
-            sinks_t,
-            meta,
-            o_desc,
-            (b, qh, kh, 0, 0, 0),
+            pack.sinks_t,
+            pack.meta,
+            pack.o_desc,
+            (self.batch_size, self.h_q, self.h_kv, 0, 0, 0),
             cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(units),
+            cutlass.Int32(pack.units),
             None,
-            q_lens_dev,
-            kv_lens_dev,
-            cutlass.Int32(lens_form),
+            pack.q_lens_dev,
+            pack.kv_lens_dev,
+            cutlass.Int32(pack.lens_form),
             stream=current_stream,
         )
         self._logger.debug("execute (THD) completed")
@@ -1502,6 +1697,38 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         return flat.reshape(b, h, n_tiles, sf_smem_size)
 
+    def _reshape_sf_packed(self, sf: torch.Tensor, h: int, sf_smem_size: int, name: str, current_stream=None) -> torch.Tensor:
+        """THD packed SF buffer → the kernel's ``[1, H, T_sf, sf_smem_size]`` int8 view.
+
+        THD SF buffers hold the PACKED per-sequence-TILE-padded layout: per
+        head, every sequence's 128-row F8_128x4 SF tiles concatenated in
+        cu_seqlens order (tile index = cu_sf_base[b] + local tile — the same
+        base the kernel derives device-side from the metadata). The packed
+        tile extent ``T_sf`` is a runtime value that must come WITHOUT a
+        device read (Rule 3), so it derives from the buffer's byte size —
+        the buffer is the packed layout exactly (its head stride is
+        ``T_sf * sf_smem_size``, so a larger allocation could not be
+        addressed anyway). A zero-sized buffer (zero-capacity KV storage —
+        the one-token K/V clamp) binds a one-tile stub: the KV range of
+        every tile is empty there, so no SF byte is ever loaded."""
+        flat = sf.contiguous()
+        if flat.dtype != torch.int8:
+            flat = flat.view(torch.int8)
+        flat = flat.reshape(-1)
+        row = h * sf_smem_size
+        if flat.numel() == 0:
+            with _torch_stream_context(current_stream, sf.device):
+                return self._dummy(f"thd_sf_stub_{name}_{sf_smem_size}", sf.device, lambda: torch.zeros(row, dtype=torch.int8, device=sf.device)).reshape(
+                    1, h, 1, sf_smem_size
+                )
+        if flat.numel() % row != 0:
+            raise ValueError(
+                f"MXFP8 THD SF buffer {name}: {flat.numel()} bytes is not a whole number of packed "
+                f"[H={h} x SF_SMEM={sf_smem_size}] tile rows — THD SF buffers must hold exactly the "
+                f"packed per-sequence-TILE-padded layout (Σ_b ceil(S_b/128) tiles per head)"
+            )
+        return flat.reshape(1, h, flat.numel() // row, sf_smem_size)
+
     def _execute_mxfp8(
         self,
         q_tensor,
@@ -1518,16 +1745,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_v,
         amax_o,
         current_stream=None,
+        workspace=None,
     ):
-        """MXFP8 execute (dense): FP8 Q/K/V + per-32-block E8M0 SF → half O.
+        """MXFP8 execute: FP8 Q/K/V + per-32-block E8M0 SF → half/FP8 O.
 
         SF tensors come from cuDNN in F8_128x4 layout and are reshaped into the
-        kernel's per-tile view; ``Amax_O`` (if requested) is filled with ``max|O|``.
+        kernel's per-tile view; ``Amax_O`` (if requested) is produced in-kernel
+        (atomicMax over the pre-cast fp32 output rows). THD/varlen rides the
+        shared packed lowering (``_thd_pack``); there the SF buffers hold the
+        PACKED per-sequence-TILE-padded layout ([1, H, Σ_b ceil(S_b/128),
+        SF_SMEM] tile sequences in cu_seqlens order — the same TILE base the
+        kernel derives device-side from the metadata) and their packed tile
+        extent is derived from the buffer size (``_reshape_sf_packed``).
         """
         import cutlass
 
-        if self.thd:
-            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense only); see issue #552")
         if sf_q is None or sf_k is None or sf_v is None:
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k/sf_v (block-scale descale tensors)")
 
@@ -1535,6 +1767,60 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
         sq, skv = self.s_q_max, self.s_k_max
         device = q_tensor.device
+
+        if self.thd:
+            # amax_o reset first (launch-stream ordered): the degenerate
+            # early-returns below leave the correct 0 (no valid row).
+            amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
+            with _torch_stream_context(current_stream, device):
+                amax_o_buf.zero_()
+            lse_cap = self._thd_lse_tokens_cap(lse_tensor)
+            pack = self._thd_pack(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                sinks,
+                seq_kv_lens,
+                seq_q_lens,
+                workspace,
+                "SdpaFwdDslSm100 (MXFP8 THD)",
+                current_stream=current_stream,
+                lse_tokens_cap=lse_cap,
+            )
+            if pack is None:
+                self._logger.debug("execute (MXFP8 THD): no addressable Q token, nothing to do")
+                return
+            sf_q_v = self._reshape_sf_packed(sf_q, h_q, km.SF_SMEM_SIZE_Q, "sf_q", current_stream)
+            sf_k_v = self._reshape_sf_packed(sf_k, h_kv, km.SF_SMEM_SIZE_K, "sf_k", current_stream)
+            sf_v_v = self._reshape_sf_packed(sf_v, h_kv, km.SF_SMEM_SIZE_V, "sf_v", current_stream)
+            LSE = self._thd_lse_view(lse_tensor, pack.t_q)
+            # PLAN-TIME-ONLY compile key: re-binds the artifact compile()
+            # already built (packed totals + SF tile extents are dynamic).
+            fn = km.compile(**self._thd_compile_kwargs())
+            fn(
+                pack.Q,
+                pack.K,
+                pack.V,
+                pack.O,
+                sf_q_v,
+                sf_k_v,
+                sf_v_v,
+                LSE,
+                amax_o_buf,
+                pack.sinks_t,
+                pack.meta,
+                pack.o_desc,
+                (b, h_q, h_kv, 0, 0, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(pack.units),
+                pack.q_lens_dev,
+                pack.kv_lens_dev,
+                cutlass.Int32(pack.lens_form),
+                stream=current_stream,
+            )
+            self._logger.debug("execute (MXFP8 THD) completed")
+            return
 
         Q = self._to_bshd(q_tensor)
         K = self._to_bshd(k_tensor)
@@ -1566,22 +1852,43 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
+        # Split-KV: the mainloop writes split-major partials (skipping its own
+        # amax — each split's O is normalized by its own running sum, so a max
+        # over partials over-reports); the combine reduces them into the
+        # caller's O/LSE and owns the recombined amax.
+        O_dst, lse_dst = O, lse
+        if self.split_kv > 1:
+            O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
         self._compiled_kernel(
             Q,
             K,
             V,
-            O,
+            O_dst,
             sf_q_v,
             sf_k_v,
             sf_v_v,
-            lse,
+            lse_dst,
             amax_o_buf,
             sinks_t,
             seq_kv_t,
+            o_desc_dummy,
             (b, h_q, h_kv, sq, skv, 0),
             cutlass.Float32(scale_softmax_log2),
+            cutlass.Int32(0),
             stream=current_stream,
         )
+        if self.split_kv > 1:
+            self._combine_kernel(
+                O_dst,
+                lse_dst,
+                O,
+                lse,
+                amax_o_buf,
+                (b, h_q, sq, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             O_view.copy_(O)
         self._logger.debug("execute (MXFP8) completed")
@@ -1603,18 +1910,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         scale_o,
         amax_o,
         current_stream=None,
+        workspace=None,
     ):
-        """Per-tensor FP8 execute (dense): scalar descales fold into scale_softmax_log2
-        (attn·descale_q·descale_k·log2 e) and o_scale_fused (descale_v·scale_o).
-
-        ``Amax_S`` is produced in-kernel (atomicMax of the per-row softmax prob) into the
-        caller's pre-zeroed buffer; ``Amax_O`` is ``max|O|/scale_o`` post-kernel (exact
-        for half output).
+        """Per-tensor FP8 execute: scalar descales fold into scale_softmax_log2
+        (attn·descale_q·descale_k·log2 e) and o_scale_fused (descale_v·scale_o) —
+        both IN-KERNEL from device scales (Rule 3); ``Amax_O`` is produced
+        in-kernel and divided by scale_o on device post-kernel. THD/varlen
+        rides the shared packed lowering (``_thd_pack``); the scale folding
+        and the amax protocol are identical.
         """
         import cutlass
-
-        if self.thd:
-            raise NotImplementedError("Frost per-tensor FP8: the legacy THD leg was removed (dense d128 only); see issue #552")
 
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
         sq, skv = self.s_q_max, self.s_k_max
@@ -1631,6 +1936,64 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         so_t = self._scale_view(scale_o, "scale_o", device)
         scale_softmax_log2 = scale_val * math.log2(math.e)
         o_scale_fused = 1.0
+
+        if self.thd:
+            # amax_o reset first (launch-stream ordered): the degenerate
+            # early-returns below leave the correct 0 (no valid row).
+            amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
+            with _torch_stream_context(current_stream, device):
+                amax_o_buf.zero_()
+            lse_cap = self._thd_lse_tokens_cap(lse_tensor)
+            pack = self._thd_pack(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                sinks,
+                seq_kv_lens,
+                seq_q_lens,
+                workspace,
+                "SdpaFwdDslSm100 (FP8 THD)",
+                current_stream=current_stream,
+                lse_tokens_cap=lse_cap,
+            )
+            if pack is None:
+                self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
+                return
+            LSE = self._thd_lse_view(lse_tensor, pack.t_q)
+            # PLAN-TIME-ONLY compile key: re-binds the artifact compile()
+            # already built (the packed totals are dynamic extents).
+            fn = self._k_mod.compile(**self._thd_compile_kwargs())
+            fn(
+                pack.Q,
+                pack.K,
+                pack.V,
+                pack.O,
+                LSE,
+                pack.sinks_t,
+                pack.meta,
+                pack.o_desc,
+                (b, h_q, h_kv, 0, 0, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Float32(o_scale_fused),
+                cutlass.Int32(pack.units),
+                dq_t,
+                dk_t,
+                dv_t,
+                so_t,
+                amax_o_buf,
+                pack.q_lens_dev,
+                pack.kv_lens_dev,
+                cutlass.Int32(pack.lens_form),
+                stream=current_stream,
+            )
+            with _torch_stream_context(current_stream, device):
+                if amax_o is not None:
+                    # Device divisor: same div_, no readback; scale_o > 0 is
+                    # caller contract (None bound a cached 1.0 above).
+                    amax_o_buf.div_(so_t)
+            self._logger.debug("execute (FP8 per-tensor THD) completed")
+            return
 
         Q = self._to_bshd(q_tensor)
         K = self._to_bshd(k_tensor)
@@ -1658,17 +2021,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
+        # Split-KV: mainloop into split-major partials (the kernel skips its
+        # in-kernel amax under a split), combine into the caller's O/LSE with
+        # the recombined amax.
+        O_dst, lse_dst = O, lse
+        if self.split_kv > 1:
+            O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
         self._compiled_kernel(
             Q,
             K,
             V,
-            O,
-            lse,
+            O_dst,
+            lse_dst,
             sinks_t,
             seq_kv_t,
+            o_desc_dummy,
             (b, h_q, h_kv, sq, skv, 0),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
+            cutlass.Int32(0),
             dq_t,
             dk_t,
             dv_t,
@@ -1676,6 +2048,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf,
             stream=current_stream,
         )
+        if self.split_kv > 1:
+            self._combine_kernel(
+                O_dst,
+                lse_dst,
+                O,
+                lse,
+                amax_o_buf,
+                (b, h_q, sq, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             O_view.copy_(O)
         if amax_o is not None:
@@ -2109,6 +2492,28 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(d_q)
 
+        self._value_error_if(
+            self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
+            f"SM120 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
+        )
+        if self.split_kv > 1:
+            # The SM120 kernel's inline split chunking + the shared (arch-
+            # agnostic, one block per row) split_combine pass. The config
+            # backstop additionally bars a split under the LPT remaps —
+            # validated at compile via make_cfg, and the heuristic's split
+            # sets ride SCHED_NATURAL.
+            self._not_implemented_error_if(self._fp8, "SM120 split_kv > 1 is f16/bf16-only (the fp8 kernel has no split path)")
+            self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
+            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            self._value_error_if(
+                self.seq_kv_lens_present or self.seq_q_lens_present,
+                "split_kv > 1 serves unpadded dense graphs only",
+            )
+        self._value_error_if(
+            self.softmax_precision is not None,
+            "SM120 DSL SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
+        )
+
         self.batch_size = int(b)
         self.s_q_max = int(s_q)
         self.s_k_max = int(s_kv)
@@ -2129,18 +2534,23 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self._compiled_kernel is not None:
             return
 
-        # Causal: balance the triangular load; pick the LPT variant by working set.
+        # None = the standalone-wrapper tier stated no preference: derive the
+        # causal-balancing policy here. The graph path arrives with an explicit
+        # policy from the heuristic and it is honored verbatim, NATURAL included.
         sched_policy = self.sched_policy
-        if sched_policy == SCHED_NATURAL and self.window_right is not None:
-            _, _, s_kv_sched, _ = self.k_desc.shape
-            _, _, _, d_qk_sched = self.q_desc.shape
-            _, _, _, d_v_sched = self.v_desc.shape
-            sched_policy = _causal_sched_policy(
-                s_kv=s_kv_sched,
-                d_qk=d_qk_sched,
-                d_v=d_v_sched,
-                elem_bytes=1 if self._fp8 else 2,
-            )
+        if sched_policy is None:
+            sched_policy = SCHED_NATURAL
+            if self.window_right is not None:
+                # Causal: balance the triangular load; pick the LPT variant by working set.
+                _, _, s_kv_sched, _ = self.k_desc.shape
+                _, _, _, d_qk_sched = self.q_desc.shape
+                _, _, _, d_v_sched = self.v_desc.shape
+                sched_policy = _causal_sched_policy(
+                    s_kv=s_kv_sched,
+                    d_qk=d_qk_sched,
+                    d_v=d_v_sched,
+                    elem_bytes=1 if self._fp8 else 2,
+                )
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
@@ -2154,6 +2564,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             thd_varlen=self.thd,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
+            split_kv=self.split_kv,
         )
         self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
         if self.thd:
@@ -2176,9 +2587,27 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
             # No sample_lse -> the LSE store is compiled out; execute() then
-            # binds no LSE buffer at all (no dummy, no allocation).
-            has_lse=self.lse_desc is not None,
+            # binds no LSE buffer at all (no dummy, no allocation). A split
+            # REQUIRES it: the per-split LSE is the combine weight.
+            has_lse=(self.lse_desc is not None) or self.split_kv > 1,
         )
+        self._combine_kernel = None
+        if self.split_kv > 1:
+            # The recombine pass compiles at PLAN time; execute() only rebinds
+            # the partial slabs it carves. The combine kernel is arch-agnostic
+            # (one block per (q_row, head, batch), no cluster/TMEM features).
+            from cudnn.sdpa.fwd.kernels import split_combine_sm100 as _split_combine
+
+            self._combine_kernel = _split_combine.compile(
+                b=self.batch_size,
+                h=self.h_q,
+                sq=self.s_q_max,
+                d_v=self.head_dim_v,
+                splits=self.split_kv,
+                dtype_o=self._combine_dtype_tag(),
+                has_lse=self.lse_desc is not None,
+                has_amax=False,
+            )
         self._logger.debug("compile completed")
 
     def execute(
@@ -2298,12 +2727,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         v = self._to_bshd(v_tensor)
         o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
         o = o_scratch if o_needs_copy_back else o_view
+        # Split-KV: the kernel's inline chunking writes split-major partials
+        # (every (split, batch) slot — empty ranges as O := 0 / lse := -inf);
+        # the shared combine reduces them into the caller's O/LSE.
+        o_dst, lse_dst = o, lse
+        if self.split_kv > 1:
+            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
         self._compiled_kernel(
             q,
             k,
             v,
-            o,
-            lse,
+            o_dst,
+            lse_dst,
             sinks_t,
             seq_q_lens,
             seq_kv_lens,
@@ -2314,6 +2749,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             None,
             current_stream,
         )
+        if self.split_kv > 1:
+            self._combine_kernel(
+                o_dst,
+                lse_dst,
+                o,
+                lse,
+                None,
+                (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         if o_needs_copy_back:
             o_view.copy_(o_scratch)
 
@@ -2716,6 +3162,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
             b = self.batch_size
             return ws_align((3 * b + 2) * 4)
+        if self.split_kv > 1:
+            # Split-major partial slabs (see the SM100 sibling): O_s in the O
+            # dtype (half) + lse_s fp32, carved from the caller's workspace.
+            b, qh = self.batch_size, self.h_q
+            o_bytes = self.split_kv * b * self.s_q_max * qh * self.head_dim_v * self._o_itemsize()
+            lse_bytes = self.split_kv * b * qh * self.s_q_max * 4
+            return ws_align(o_bytes) + ws_align(lse_bytes)
         return 0
 
 
@@ -2812,7 +3265,6 @@ def sdpa_fwd_wrapper_dsl_sm120(
 # ``lower_dsl_prefill`` drives all three identically; converting the kernels
 # themselves to TemplateParams form is tracked as follow-up work.
 # =============================================================================
-import inspect as _sm80_inspect
 
 from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 
@@ -2844,22 +3296,6 @@ _SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
 _SM80_D256_FLAVORS = ("qwen",)
-
-_SM80_KERNEL_MOD: dict = {}
-
-
-def _sm80_kernel_mod(flavor: str = ""):
-    """Lazily import + cache the SM80 kernel module for ``flavor``.  qwen
-    (d=256) routes to ``prefill_d256_f16_sm80`` (symmetric K+V prefetch); the
-    rest use ``prefill_f16_sm80``."""
-    key = "d256" if flavor in _SM80_D256_FLAVORS else "f16"
-    if key not in _SM80_KERNEL_MOD:
-        if key == "d256":
-            from .kernels import prefill_d256_f16_sm80 as _mod
-        else:
-            from .kernels import prefill_f16_sm80 as _mod
-        _SM80_KERNEL_MOD[key] = _mod
-    return _SM80_KERNEL_MOD[key]
 
 
 def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
@@ -2924,35 +3360,128 @@ def _sm80_resolve_scheduler(
     raise ValueError(f"SM80 SDPA: scheduler must be 'auto' / 'default' / 'natural' / 'lpt' / 'lpt_l2', got {scheduler!r}")
 
 
+# --- SM80 template loading ---------------------------------------------------
+
+_LOG2E = math.log2(math.e)
+
+_SM80_KERNEL_FILES = {
+    "d256": "prefill_d256_f16_sm80.py",
+    "f16": "prefill_f16_sm80.py",
+}
+
+
+def _sm80_load_kernel_module(flavor: str, params):
+    """One uniquely-named module per (kernel file, TemplateParams) — the same
+    ``frost.template_loader`` mechanism the SM100/SM120 templates use. qwen
+    (d=256) routes to the symmetric-K+V-prefetch file; the rest share the
+    generic kernel."""
+    filename = _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
+    return load_template(path, params, tag=f"sm80_{filename.rsplit('.', 1)[0]}")
+
+
+def _sm80_sched_policy_int(token: str) -> int:
+    return {"default": SCHED_NATURAL, "lpt": SCHED_LPT, "lpt_l2": SCHED_LPT_L2}[token]
+
+
+def _sm80_call(
+    fn,
+    *,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    seq_kv,
+    seq_q,
+    sinks_log2,
+    bias,
+    cu_q,
+    cu_k,
+    rope_cs,
+    n_kv_tiles,
+    scale_log2,
+    sq,
+    skv,
+    d,
+    right_bound,
+    inv_scale,
+    thd_q_tiles,
+    n_batch_logical,
+    stream,
+):
+    """Invoke one compiled SM80 artifact (the traced ``_sdpa_host`` ABI:
+    12 tensors — LSE may be None-specialized — then 9 runtime scalars and the
+    launch stream)."""
+    import cutlass
+    from cutlass.cute.runtime import from_dlpack as _from_dlpack_raw
+
+    def from_dlpack(t):
+        # The kernels compile with --enable-tvm-ffi, so host-side conversions
+        # must produce TVM-FFI tensors regardless of the env latch.
+        return _from_dlpack_raw(t, enable_tvm_ffi=True)
+
+    fn(
+        from_dlpack(q),
+        from_dlpack(k),
+        from_dlpack(v),
+        from_dlpack(o),
+        from_dlpack(lse) if lse is not None else None,
+        from_dlpack(seq_kv),
+        from_dlpack(seq_q),
+        from_dlpack(sinks_log2),
+        from_dlpack(bias),
+        from_dlpack(cu_q),
+        from_dlpack(cu_k),
+        from_dlpack(rope_cs),
+        cutlass.Int32(n_kv_tiles),
+        cutlass.Float32(scale_log2),
+        cutlass.Int32(sq),
+        cutlass.Int32(skv),
+        cutlass.Int32(d),
+        cutlass.Int32(right_bound),
+        cutlass.Float32(inv_scale),
+        cutlass.Int32(thd_q_tiles),
+        cutlass.Int32(n_batch_logical),
+        stream,
+    )
+
+
 class SdpaFwdDslSm80(SdpaFwdDsl):
-    """SM80 (A100) SDPA forward via the pre-TemplateParams CuTe-DSL kernels.
+    """SM80 (A100) SDPA forward via the FROST template kernels.
 
-    Follows the SM100/SM120 adapter lifecycle (check_support → compile →
-    execute, caller buffers bound directly) on top of the self-caching SM80
-    kernel modules. SM80-only features (bias, RoPE) arrive as extra optional
-    ``execute`` keywords, exactly as the ``SdpaFwdDsl.execute`` contract
-    permits.  ALiBi, block_mask and the score-stat side outputs are
-    deliberately NOT served: the capability row declines such graphs and the
-    backend takes them.
+    Since the TemplateParams conversion this adapter has the same shape as
+    its SM100/SM120 siblings end to end: ``check_support`` resolves the
+    flavor/mask/scheduler into a plan-time :class:`config_sm80.TemplateParams`,
+    ``compile()`` loads the specialized template module and compiles the
+    per-shape artifact ONCE (THD packed token extents compile dynamic via
+    ``cute.sym_int`` — issue #604's key is gone), and ``execute()`` re-binds
+    caller buffers to the cached artifact (a compile-cache miss at execute is
+    a bug by contract).
 
-    Known deviations, both pre-existing and shared with the old
-    ``SdpafwdSm80`` path rather than introduced here:
+    SM80-only compile axes that have no home in the shared constructor arrive
+    as extra keyword-only arguments (``bias_present`` / ``bias_fp32`` /
+    ``rope_max_s``); the engine lowering forwards them only when the graph
+    declares the operands. ALiBi, block_mask and the score-stat side outputs
+    are deliberately NOT served: the capability row declines such graphs and
+    the backend takes them.
 
-    - dense GQA/MQA is served by expanding K/V heads adapter-side
-      (``repeat_interleave``): the kernels' native dense-GQA path exists but
-      is not yet qualified by the upstream validation harness (see
-      ``graph_analyzer.expand_gqa_heads``). Dropping the expansion once that
-      path is qualified on A100 CI is the tracked cleanup.
-    - a head-dim between flavor points pads V host-side
-      (``d_pad_multiple=1`` in the capability row).
+    Known deviations, pre-existing and tracked rather than introduced here:
+    dense GQA expands K/V heads adapter-side until the kernels' native dense
+    GQA path is qualified (see ``graph_analyzer.expand_gqa_heads``); an
+    off-flavor head dim pads V (and O, via a scratch) host-side; sink logits
+    are rescaled to log2 units with one (H,)-element multiply per execute.
     """
 
-    def __init__(self, *args, scheduler: Optional[str] = None, **kwargs) -> None:
-        # SM80-only scheduler-token override for standalone callers
-        # ("auto"/"default"/"natural"/"lpt"/"lpt_l2"). The graph path never
-        # sets it: the engine row's sched_policy domain is empty, so the
-        # base sched_policy stays NATURAL and maps to "auto" below.
+    def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
+        # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
+        # token override for standalone callers; the graph path leaves it None
+        # and carries the heuristic's explicit sched_policy knob instead
+        # (None = derive via "auto", explicit ints map to their tokens).
         self._scheduler_token = scheduler
+        self._bias_present = bool(bias_present)
+        self._bias_fp32 = bool(bias_fp32)
+        self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
 
     def _initialize_implementation(self) -> None:
@@ -2967,6 +3496,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.mask_token: Optional[str] = None
         self.swa_window_runtime: int = 0
         self.right_bound_runtime: int = 0
+        self._k_mod = None
+        self._params = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -3004,7 +3535,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
 
-        # ---- head-dim envelope ----------------------------------------
         max_d_qk = max(fdqk for fdqk, _ in _SM80_FLAVOR_DIMS.values())
         max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
         self._value_error_if(
@@ -3014,7 +3544,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"Larger heads are not yet ported.",
         )
 
-        # ---- dtype: FP16 or BF16 (both ride one SM80 mma pipeline) ----
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             self._check_dtype(
@@ -3032,17 +3561,27 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
             self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM80")
 
-        # ---- modes this adapter does not serve -------------------------
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's THD path launches them directly",
+            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
         )
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,
             "SM80 SDPA: window_size_right without is_causal=True has no diagonal to anchor to",
         )
+        self._not_implemented_error_if(
+            self._rope_max_s and (self.seq_kv_lens_present or self.seq_q_lens_present),
+            "SM80 SDPA: RoPE fusion is dense-unpadded-only",
+        )
+        self._not_implemented_error_if(
+            self.split_kv > 1,
+            "SM80 SDPA has no split-KV path (no partial slabs, no combine kernel)",
+        )
+        self._value_error_if(
+            self.softmax_precision is not None,
+            "SM80 SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
+        )
 
-        # ---- arch -------------------------------------------------------
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 SDPA")
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
@@ -3052,7 +3591,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             f"SdpaFwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}",
         )
 
-        # ---- flavor + tile knobs ---------------------------------------
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
         tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
@@ -3060,26 +3598,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.kernel_num_warps = num_warps_default
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
         self._value_error_if(
-            self.kernel_tile_n not in (64, 128),
-            f"SM80 SDPA: tile_n must be 64 or 128; got {self.kernel_tile_n}",
-        )
-        self._value_error_if(
-            self.kernel_tile_m % (self.kernel_num_warps * 16) != 0,
-            f"SM80 SDPA: tile_m ({self.kernel_tile_m}) must be a multiple of " f"num_warps*16 ({self.kernel_num_warps * 16})",
-        )
-        self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",
         )
 
-        # Bottom-right alignment shifts the band to the corner; it must affect
-        # SOMETHING — a causal upper bound and/or a left sliding-window.
         self._value_error_if(
             self.causal_bottom_right and not (self.is_causal or (self.window_size_left is not None and self.window_size_left >= 0)),
             "SM80 SDPA: causal_bottom_right requires is_causal=True and/or a left sliding-window (window_size_left >= 0).",
         )
 
-        # ---- mask token --------------------------------------------------
         swa_left = -1 if self.window_size_left is None else int(self.window_size_left)
         swa_right = 0 if self.window_size_right is None else int(self.window_size_right)
         self.right_bound_runtime = 0
@@ -3094,17 +3621,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self.mask_token = "none"
             self.swa_window_runtime = 0
 
-        # ---- scheduler ---------------------------------------------------
-        # Explicit token (standalone callers) wins; otherwise the sched_policy
-        # knob maps NATURAL → "auto" (the SM80 heuristic decides), LPT/LPT_L2
-        # → their tokens.
         token = self._scheduler_token
         if token is None:
-            token = {SCHED_NATURAL: "auto", SCHED_LPT: "lpt", SCHED_LPT_L2: "lpt_l2"}.get(self.sched_policy)
-            self._value_error_if(
-                token is None,
-                f"SM80 SDPA: unsupported sched_policy {self.sched_policy}",
-            )
+            # None = no preference anywhere -> "auto" (the adapter derives, a
+            # standalone-wrapper convenience). An explicit knob is honored
+            # verbatim — NATURAL included — never re-derived.
+            if self.sched_policy is None:
+                token = "auto"
+            else:
+                token = {SCHED_NATURAL: "default", SCHED_LPT: "lpt", SCHED_LPT_L2: "lpt_l2"}.get(self.sched_policy)
+                self._value_error_if(
+                    token is None,
+                    f"SM80 SDPA: unsupported sched_policy {self.sched_policy}",
+                )
         else:
             _VALID = ("auto", "natural", "default", "lpt", "lpt_l2")
             self._value_error_if(token not in _VALID, f"scheduler must be one of {_VALID}; got {token!r}")
@@ -3116,7 +3645,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             skv=int(s_kv),
         )
 
-        # ---- softmax scale -------------------------------------------
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
@@ -3134,18 +3662,52 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
     # ------------------------------------------------------------------
     def compile(self) -> None:
-        """Mark compiled — the kernel module owns the JIT cache.
+        """Load the TemplateParams-specialized module and compile the artifact.
 
-        The SM80 kernels self-cache one artifact per (shape, feature) key
-        (``_compile_cached``'s lru_cache), so there is no template module to
-        load here; the first ``execute()`` triggers the JIT. On the graph path
-        every key component is plan-time data (dense B/H/S/D from the frozen
-        graph), so the cache key is Rule-4 clean; the THD wrapper path's
-        packed-total keys are the known issue #604 cleanup.
+        Plan-time only (Hard Rule 4): every key component here is graph
+        declaration or capability data; execute()'s call into the module's
+        per-shape lru is a guaranteed hit.
         """
-        self._logger.debug("Entering compile (no-op — kernel self-caches)")
+        self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        self._compiled_kernel = True
+        from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
+
+        self._params = _sm80_cfg.TemplateParams(
+            io_bf16=(self.dtype == torch.bfloat16),
+            d_qk=self.flavor_d_qk,
+            d_v=self.flavor_d_v,
+            tile_m=self.kernel_tile_m,
+            num_warps=self.kernel_num_warps,
+            tile_n=self.kernel_tile_n,
+            is_causal=self.mask_token in ("causal", "causal_swa"),
+            has_swa=self.mask_token in ("swa", "causal_swa"),
+            causal_bottom_right=self.causal_bottom_right,
+            has_seq_kv_lens=self.seq_kv_lens_present,
+            has_seq_q_lens=self.seq_q_lens_present,
+            has_sink=self.has_sink,
+            has_bias=self._bias_present,
+            bias_is_fp32=self._bias_fp32,
+            has_rope=self._rope_max_s > 0,
+            thd_varlen=False,
+            sched_policy=_sm80_sched_policy_int(self.sched_token),
+            sched_l2_mib=self.sched_l2_mib,
+            has_lse=self.lse_desc is not None,
+        )
+        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
+        self._compiled_kernel = self._k_mod.compile(
+            b=self.batch_size,
+            # Dense GQA is served by adapter-side K/V head expansion until the
+            # kernels' native dense-GQA path is qualified (class docstring), so
+            # the artifact is compiled against the EXPANDED head count — the
+            # shapes execute() actually binds.
+            h=self.h_q,
+            h_kv=self.h_q,
+            sq=self.s_q_max,
+            skv=self.s_k_max,
+            d=self.head_dim_qk,
+            swa_window=int(self.swa_window_runtime),
+            rope_max_s=self._rope_max_s,
+        )
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
@@ -3171,15 +3733,23 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        p = self._params
 
-        # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
-        # [B, H, SQ] — rebind the squeezed view (zero-cost, same storage).
+        # Init-time flags are compile-time specializations; execute must match
+        # them exactly, in both directions (Hard Rule 1).
         if lse_tensor is not None and lse_tensor.ndim == 4:
             lse_tensor = lse_tensor.squeeze(-1)
+        self._value_error_if(p.has_lse and lse_tensor is None, "compiled with a Stats output but execute() got no lse_tensor")
+        self._value_error_if(not p.has_lse and lse_tensor is not None, "lse_tensor provided but the plan compiled the LSE store out")
+        self._value_error_if(p.has_bias != (bias_tensor is not None), "bias presence must match the compiled specialization")
+        self._value_error_if((p.has_rope) != (rope_freqs is not None), "rope_freqs presence must match the compiled specialization")
+        self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
+        self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
+        self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
-        kernel = _sm80_kernel_mod(self.flavor)
         device = q_tensor.device
+        launch_stream = self._get_default_stream(current_stream)
 
         with _torch_stream_context(current_stream, device):
             # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
@@ -3190,8 +3760,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             V = self._to_bshd(v_tensor)
             if self.h_kv != self.h_q:
                 # Dense GQA: expand K/V heads until the kernels' native dense
-                # GQA path is qualified (see class docstring).  BSHD head dim
-                # is 2.
+                # GQA path is qualified (see class docstring). BSHD head dim is 2.
                 reps = self.h_q // self.h_kv
                 K = K.repeat_interleave(reps, dim=2)
                 V = V.repeat_interleave(reps, dim=2)
@@ -3200,72 +3769,127 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             if pad_v:
                 V = _sm80_pad_last_dim(V, self.flavor_d_v)
 
-            # Output binding: hand the kernel the caller's BSHD view directly.
-            # A non-BSHD-physical O (dense_flex) binds a contiguous scratch the
-            # kernel writes, copied back below (the SM100 dense path's
-            # grandfathered normalization); only the padded-V envelope case
-            # falls back to kernel-side allocation + slice/copy.
+            # Output binding: the compiled O ABI is (B, SQ, H, flavor_d_v).
+            # Direct-bind the caller's BSHD view when it matches; the padded-V
+            # envelope and dense_flex cases go through a scratch + copy-back
+            # (both pre-existing normalizations).
             o_view, o_needs_copyback, o_scratch = self._to_bshd_writable(o_tensor)
             if pad_v:
-                bind_o = None
+                o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
             elif o_needs_copyback:
-                bind_o = o_scratch
+                o_kernel = o_scratch
             else:
-                bind_o = o_view
-            bind_lse = lse_tensor if (lse_tensor is not None and lse_tensor.is_contiguous()) else None
+                o_kernel = o_view
+            # DEFENSIVE zero-fill, not load-bearing: the dense epilogue stores
+            # every in-bounds row unconditionally; kept so a bound buffer can
+            # never surface uninitialized memory if a future path skips rows.
+            # (The pad_v scratch above is allocated zeroed already.)
+            if (seq_q_lens is not None or seq_kv_lens is not None) and not pad_v:
+                o_kernel.zero_()
+                if lse_tensor is not None:
+                    lse_tensor.zero_()
 
-            fwd_kwargs = dict(
-                scale=scale_val,
-                return_lse=True,
-                tile_m=self.kernel_tile_m,
-                num_warps=self.kernel_num_warps,
-                tile_n=self.kernel_tile_n,
-                d_qk=self.flavor_d_qk,
-                d_v=self.flavor_d_v,
-                mask=self.mask_token,
-                swa_window=int(self.swa_window_runtime),
-                right_bound=int(self.right_bound_runtime),
-                causal_bottom_right=self.causal_bottom_right,
-                seq_kv_lens=self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None,
-                seq_len_q=self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None,
-                bias=bias_tensor,
-                sinks=self._checked_sinks_1d(sinks) if sinks is not None else None,
-                sched=self.sched_token,
-                sched_l2_mib=self.sched_l2_mib,
-                rope_freqs=rope_freqs,
-                out_o=bind_o,
-                out_lse=bind_lse,
+            # Dummies fill compiled-out ABI slots (Rule 1); the kernel never
+            # dereferences them.  Base-class ``_dummy`` (key, device, factory).
+            seq_kv_b = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
             )
-            _accepted = _sm80_inspect.signature(kernel.forward).parameters
-            fwd_kwargs = {k: v for k, v in fwd_kwargs.items() if k in _accepted}
-            O_buf, LSE_buf = kernel.forward(Q, K, V, **fwd_kwargs)
+            seq_q_b = (
+                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                if seq_q_lens is not None
+                else self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
+            )
+            if sinks is not None:
+                # log2-unit rescale: one (H,)-element multiply per execute
+                # (pre-existing SM80 contract; the kernels consume log2 units).
+                sinks_b = (self._checked_sinks_1d(sinks) * _LOG2E).contiguous()
+            else:
+                sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            if bias_tensor is not None:
+                self._value_error_if(
+                    bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
+                    f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
+                )
+                self._value_error_if(
+                    tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
+                    f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
+                )
+                bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
+                self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
+            else:
+                bias_dt = q_tensor.dtype
+                bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
+            if rope_freqs is not None:
+                # (cos, sin) table build — wrapper-only fusion (the engine row
+                # never admits RoPE); per-execute by contract, like the caller
+                # passing fresh angle tables.
+                d2 = self.flavor_d_qk // 2
+                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
+                self._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+                self._value_error_if(
+                    rf.shape[0] != self._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({self._rope_max_s})"
+                )
+                angles = rf[:, :d2]
+                rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+            else:
+                rope_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+            cu_dummy = self._dummy("seq_i32", device, lambda: torch.ones(1, dtype=torch.int32, device=device))
 
-            # Copy-back only on the fallback paths the binding above skipped.
-            if bind_o is None:
-                # pad_v: the kernel allocated a flavor-wide O — slice + copy.
-                o_view.copy_(O_buf[..., : self.head_dim_v])
+            _sm80_call(
+                self._compiled_kernel,
+                q=Q,
+                k=K,
+                v=V,
+                o=o_kernel,
+                lse=lse_tensor if p.has_lse else None,
+                seq_kv=seq_kv_b,
+                seq_q=seq_q_b,
+                sinks_log2=sinks_b,
+                bias=bias_b,
+                cu_q=cu_dummy,
+                cu_k=cu_dummy,
+                rope_cs=rope_b,
+                n_kv_tiles=(self.s_k_max + p.tile_n - 1) // p.tile_n,
+                scale_log2=scale_val * _LOG2E,
+                sq=self.s_q_max,
+                skv=self.s_k_max,
+                d=self.head_dim_qk,
+                right_bound=int(self.right_bound_runtime),
+                inv_scale=1.0 / float(scale_val),
+                thd_q_tiles=0,
+                n_batch_logical=1,
+                stream=launch_stream,
+            )
+
+            if pad_v:
+                o_view.copy_(o_kernel[..., : self.head_dim_v])
             elif o_needs_copyback:
-                # dense_flex O: the kernel wrote the contiguous scratch.
                 o_view.copy_(o_scratch)
-            if lse_tensor is not None and bind_lse is None:
-                lse_tensor.copy_(LSE_buf)
         self._logger.debug("execute completed")
 
 
-def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks):
+def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal, window_size, causal_bottom_right, bias_tensor, sinks, current_stream=None):
     """THD / varlen forward: q/k/v are PACKED ``[1, T, H, D]`` (already BSHD —
-    no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Routes straight
-    to the kernel's THD path (graph-safe over-provisioned grid), reusing the
-    flavor-pick + d-pad.  Returns packed ``[1, T_q, H, D_v]`` O + LSE."""
+    no transpose), cu_q/cu_k are ``[B+1]`` cumulative seqlens.  Rides the same
+    TemplateParams-specialized module as the dense path; the packed token
+    extents compile DYNAMIC (``cute.sym_int``), so the compile key is
+    plan-time-only and a new token total re-binds the cached artifact (the
+    old per-total ``lru`` key — issue #604 — is gone).  Returns packed
+    ``[1, T_q, H, D_v]`` O + packed ``[1, H, T_q]`` LSE."""
+    from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
+
+    if bias_tensor is not None:
+        raise NotImplementedError("SM80 SDPA THD does not support bias (varlen has no single [1,H,SQ,SKV] bias shape)")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
+    h_kv = k.shape[2]
+    device = q.device
     flavor = _sm80_pick_flavor(d_qk, d_v)
     fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
-    # Resolve the default scale from the USER's head dim before padding: the
-    # kernel would otherwise derive 1/sqrt(D) from the padded flavor width
-    # (e.g. 1/sqrt(128) for a d=96 llama-flavor call) — silently wrong.
     if scale_softmax is None or scale_softmax == 0.0:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     if d_qk < fdqk:
@@ -3274,42 +3898,86 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     pad_v = d_v < fdv
     if pad_v:
         v = _sm80_pad_last_dim(v, fdv)
-    # mask token from cuDNN's (is_causal, window_size=(left,right)).
     wl, wr = window_size
-    if is_causal and wl >= 0:
-        mask_token, swa = "causal_swa", wl
-    elif is_causal:
-        mask_token, swa = "causal", 0
-    elif wl >= 0:
-        mask_token, swa = "swa", wl
-    else:
-        mask_token, swa = "none", 0
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
-    kernel = _sm80_kernel_mod(flavor)
-    fwd_kwargs = dict(
-        scale=scale_softmax,
-        return_lse=True,
+
+    n_seqs = int(cu_q.numel()) - 1
+    if n_seqs < 1:
+        raise ValueError("cu_seqlens_q must have >= 2 entries")
+    cu_q_t = cu_q.to(dtype=torch.int32, device=device).contiguous()
+    cu_k_t = cu_k.to(dtype=torch.int32, device=device).contiguous()
+
+    params = _sm80_cfg.TemplateParams(
+        io_bf16=(q.dtype == torch.bfloat16),
+        d_qk=fdqk,
+        d_v=fdv,
         tile_m=tile_m,
         num_warps=num_warps,
         tile_n=tile_n,
-        d_qk=fdqk,
-        d_v=fdv,
-        mask=mask_token,
-        swa_window=int(swa),
-        right_bound=int(right_bound),
+        is_causal=bool(is_causal),
+        has_swa=wl is not None and wl >= 0,
         causal_bottom_right=bool(causal_bottom_right),
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_s_q=int(max_s_q),
-        bias=bias_tensor,
-        sinks=sinks,
+        has_sink=sinks is not None,
+        thd_varlen=True,
+        has_lse=True,
     )
-    acc = _sm80_inspect.signature(kernel.forward).parameters
-    fwd_kwargs = {kk: vv for kk, vv in fwd_kwargs.items() if kk in acc}
-    O_buf, LSE_buf = kernel.forward(q, k, v, **fwd_kwargs)
+    mod = _sm80_load_kernel_module(flavor, params)
+    # Off-flavor d_qk was HOST-PADDED to fdqk above, so the compiled fakes and
+    # the runtime d must both be the padded width: the kernel derives its Q/K
+    # row strides from d_runtime (Q_ROW_STRIDE_E = H * d_runtime), and the
+    # zero columns are exact for the QK dot products.  (Same contract as the
+    # pre-template forward(), which read d_runtime off the padded shape.)
+    fn = mod.compile(
+        b=1,
+        h=h_q,
+        h_kv=h_kv,
+        sq=0,
+        skv=0,
+        d=int(fdqk),
+        swa_window=int(max(0, wl)) if wl is not None and wl >= 0 else 0,
+        n_batch_logical=n_seqs,
+    )
+
+    t_q = q.shape[1]
+    o_buf = torch.zeros(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
+    lse_buf = torch.zeros(1, h_q, t_q, dtype=torch.float32, device=device)
+    sinks_b = (
+        (sinks.to(dtype=torch.float32, device=device).reshape(h_q) * _LOG2E).contiguous()
+        if sinks is not None
+        else torch.ones(1, dtype=torch.float32, device=device)
+    )
+    dummy_i32 = torch.ones(1, dtype=torch.int32, device=device)
+    dummy_f32 = torch.ones(1, dtype=torch.float32, device=device)
+    dummy_io = torch.ones(1, dtype=q.dtype, device=device)
+
+    _sm80_call(
+        fn,
+        q=q,
+        k=k,
+        v=v,
+        o=o_buf,
+        lse=lse_buf,
+        seq_kv=dummy_i32,
+        seq_q=dummy_i32,
+        sinks_log2=sinks_b,
+        bias=dummy_io,
+        cu_q=cu_q_t,
+        cu_k=cu_k_t,
+        rope_cs=dummy_f32,
+        n_kv_tiles=(int(k.shape[1]) + tile_n - 1) // tile_n,
+        scale_log2=float(scale_softmax) * _LOG2E,
+        sq=int(t_q),
+        skv=int(k.shape[1]),
+        d=int(fdqk),
+        right_bound=int(right_bound),
+        inv_scale=1.0 / float(scale_softmax),
+        thd_q_tiles=(int(max_s_q) + tile_m - 1) // tile_m,
+        n_batch_logical=n_seqs,
+        stream=current_stream if current_stream is not None else cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    )
     if pad_v:
-        O_buf = O_buf[..., :d_v].contiguous()
-    return TupleDict(o_tensor=O_buf, lse_tensor=LSE_buf)
+        o_buf = o_buf[..., :d_v].contiguous()
+    return TupleDict(o_tensor=o_buf, lse_tensor=lse_buf)
 
 
 _sm80_wrapper_cache: dict = {}
@@ -3339,8 +4007,8 @@ def sdpa_fwd_wrapper_sm80(
 
     Returns ``TupleDict(o_tensor=..., lse_tensor=...)`` matching the DSL
     wrappers' contract.  Dense calls route through :class:`SdpaFwdDslSm80`;
-    packed THD calls (``cum_seqlen_*``) launch the kernel's varlen path
-    directly.  ALiBi, block_mask and the score-stat side outputs are not
+    packed THD calls (``cum_seqlen_*``) ride the same template with dynamic
+    token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
     """
     if q_tensor.ndim != 4 or v_tensor.ndim != 4:
@@ -3348,18 +4016,11 @@ def sdpa_fwd_wrapper_sm80(
     if scale_output not in (None, 1.0):
         raise NotImplementedError(f"SM80 SDPA: scale_output != 1.0 is not supported yet (got {scale_output})")
 
-    # THD / varlen: q/k/v are PACKED [1, T, H, D] (BSHD) + cu_seqlens.  Handled
-    # by a dedicated path that skips the dense BHSD transpose + dense O alloc.
     if cum_seqlen_q_tensor is not None:
         if max_s_q is None:
             raise ValueError("THD path requires max_s_q (host int) for the grid")
         if causal_bottom_right and not (is_causal or window_size[0] >= 0):
-            # Same anchor rule check_support enforces on the dense path: a
-            # bare bottom-right alignment has nothing to align.
             raise ValueError("SM80 SDPA: causal_bottom_right requires is_causal=True and/or a left sliding-window (window_size_left >= 0).")
-        # Reject dense-only features up front: _sm80_thd_forward does not plumb
-        # them, and silently computing without a requested feature is worse
-        # than an error.
         for label, present in (
             ("rope_freqs", rope_freqs is not None),
             ("seq_kv_lens", seq_kv_lens is not None),
@@ -3382,24 +4043,22 @@ def sdpa_fwd_wrapper_sm80(
                 causal_bottom_right=causal_bottom_right,
                 bias_tensor=bias_tensor,
                 sinks=sinks,
+                current_stream=current_stream,
             )
 
     b, h_q, s_q, _ = q_tensor.shape
     d_v = v_tensor.shape[-1]
-    # O takes Q's leading shape but V's head dim — supports dsv3-style
-    # D_QK != D_V.  Allocate as contiguous (B, S, H, D) then transpose to the
-    # (B, H, S, D) BSHD-physical view the adapter binds without copies.
     o_tensor = torch.empty(
         (b, s_q, h_q, d_v),
         dtype=q_tensor.dtype,
         device=q_tensor.device,
     ).transpose(1, 2)
     lse_tensor = _allocate_lse_tensor(q_tensor)
+
     wl, wr = window_size
     if not is_causal and wr >= 0:
-        # A right bound has no diagonal to anchor to without is_causal —
-        # reject rather than silently pick a mask (matches the THD path).
         raise NotImplementedError("SM80 SDPA: window_size_right without is_causal=True has no effect; pass is_causal=True or a left window")
+    rope_max_s = int(rope_freqs.shape[0]) if rope_freqs is not None else 0
     cache_key = (
         q_tensor.shape,
         k_tensor.shape,
@@ -3412,6 +4071,10 @@ def sdpa_fwd_wrapper_sm80(
         bool(causal_bottom_right),
         seq_kv_lens is not None,
         seq_len_q is not None,
+        sinks is not None,
+        bias_tensor is not None,
+        (bias_tensor.dtype if bias_tensor is not None else None),
+        rope_max_s,
         q_tensor.device,
     )
     api = _sm80_wrapper_cache.get(cache_key)
@@ -3429,7 +4092,11 @@ def sdpa_fwd_wrapper_sm80(
             scale_softmax=scale_softmax,
             seq_kv_lens_present=seq_kv_lens is not None,
             seq_q_lens_present=seq_len_q is not None,
+            has_sink=sinks is not None,
             scheduler=scheduler,
+            bias_present=bias_tensor is not None,
+            bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
+            rope_max_s=rope_max_s,
         )
         api.check_support()
         api.compile()

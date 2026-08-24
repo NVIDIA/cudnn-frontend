@@ -19,10 +19,13 @@ import cutlass.experimental.primitives as nvvm
 
 
 @cute.jit
-def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
+def l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=False):
     """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``swizzle_w == 1`` falls out of the math as the identity mapping.
+    L2 reuse. ``identity=True`` compiles out the general mapping when the caller
+    knows that ``swizzle_w == 1``.
     """
+    if cutlass.const_expr(identity):
+        return raw_m, raw_n
     t = raw_n * nt_m + raw_m
     blk = nt_m * swizzle_w
     sb = t // blk
@@ -73,6 +76,16 @@ def replace_tensormap_global_dim_1(desc_ptr, new_dim) -> None:
         desc_ptr,
         new_value=cutlass.Int32(new_dim),
         ord=1,
+    )
+
+
+@cute.jit
+def replace_tensormap_global_dim_2(desc_ptr, new_dim) -> None:
+    nvvm.tensormap_replace(
+        nvvm.TensormapField.GLOBAL_DIM,
+        desc_ptr,
+        new_value=cutlass.Int32(new_dim),
+        ord=2,
     )
 
 

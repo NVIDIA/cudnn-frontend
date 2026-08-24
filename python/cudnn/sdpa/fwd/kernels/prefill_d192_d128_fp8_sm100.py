@@ -178,6 +178,10 @@ def _exp2_emulated_scalar(x):
     return value
 
 
+_E5_SINK = CFG.HAS_SINK and CFG.DTYPE_QKV == 1
+_E5_SINK_WIDE_OUTPUT = _E5_SINK and CFG.DTYPE_O >= 2
+
+
 # Storage dtype + MMA kind dispatch keyed off CFG.DTYPE_QKV.
 if CFG.DTYPE_QKV == 0:
     STORAGE_DTYPE = cutlass.Float8E4M3FN
@@ -228,7 +232,6 @@ elif CFG.DTYPE_O == 3:
     OUT_STORAGE_DTYPE = cutlass.Float16
 else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
-
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     Bars,
@@ -616,6 +619,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sinks_tensor=sinks_tensor,
             sStats_raw=sStats_raw,
             bars=bars,
             score_bars=score_bars,
@@ -637,6 +641,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sinks_tensor=sinks_tensor,
             sStats_raw=sStats_raw,
             bars=bars,
             score_bars=score_bars,
@@ -1396,6 +1401,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
+    is_first_real_kv,
     tmem_base,
     sStats_raw,
     bars,
@@ -1428,7 +1434,7 @@ def _softmax_kv_body(
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     NEG_INF = cutlass.Float32(-3.4028235e38)
-    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD * (1.4426950408889634 if _E5_SINK else 1.0))
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
@@ -1461,6 +1467,7 @@ def _softmax_kv_body(
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
+                mask_value=float("-inf") if _E5_SINK else -3.4028235e38,
                 window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
@@ -1503,6 +1510,8 @@ def _softmax_kv_body(
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
+    if cutlass.const_expr(_E5_SINK_WIDE_OUTPUT):
+        update_cond = update_cond | (is_first_real_kv & (current_max > total_max))
     total_max = cutlass.Float32(
         arith.select(
             update_cond.ir_value(),
@@ -1584,6 +1593,7 @@ def _softmax_warp_group(
     scale_log2: cutlass.Float32,
     tmem_ptr_i32,
     sQ,
+    sinks_tensor,
     sStats_raw,
     bars,
     score_bars,
@@ -1632,6 +1642,8 @@ def _softmax_warp_group(
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+    if cutlass.const_expr(_E5_SINK):
+        sinks_arr = cutlass.make_array_view(sinks_tensor)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1644,6 +1656,13 @@ def _softmax_warp_group(
             (cutlass.Float32(0.0), cutlass.Float32(0.0)),
             cutlass.Float32,
         )
+        if cutlass.const_expr(_E5_SINK):
+            sink_log2 = cutlass.Float32(sinks_arr[head_idx]) * cutlass.Float32(1.4426950408889634)
+            total_max = sink_log2
+            total_sum = cutlass.Vector.from_elements(
+                (cutlass.Float32(1.0), cutlass.Float32(0.0)),
+                cutlass.Float32,
+            )
         q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
         q_abs = q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg
         # Bootstrap stat_empty wait lifts wait off per-iter critical path so
@@ -1664,6 +1683,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1688,6 +1708,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1711,6 +1732,7 @@ def _softmax_warp_group(
                     False,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1734,6 +1756,7 @@ def _softmax_warp_group(
                     True,
                     sub_tile_id,
                     kv_loop,
+                    kv_loop == bounds.left,
                     tmem_base,
                     sStats_raw,
                     bars,
@@ -1909,14 +1932,19 @@ def _correction_warp_group(
             bars.mb_stat_empty[qs].arrive()
             # Preserve the persistent-tile phase protocol used by the MMA
             # prologue; stats now live in SMEM rather than the S accumulator.
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(not _E5_SINK):
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             beta = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
-            if cutlass.const_expr(CFG.HAS_SINK):
+            if cutlass.const_expr(_E5_SINK):
+                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                beta = cute.arch.rcp_approx(cute.math.max(total_sum, cutlass.Float32(1e-30)))
+                inv_sum = o_scale_fused * beta
+            elif cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
@@ -1984,6 +2012,8 @@ def _correction_warp_group(
                         num=O_CHUNK,
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    if cutlass.const_expr(_E5_SINK and chunk_idx == N_CHUNKS_O - 1):
+                        bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                     o_scaled = o_chunk * inv_sum
 
                     for _i in cutlass.range_constexpr(O_CHUNK):
@@ -2052,6 +2082,9 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
 
+                if cutlass.const_expr(_E5_SINK):
+                    bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
                 o_scaled3 = o_chunk3 * inv_sum
                 o_half3 = o_scaled3.to(OUT_STORAGE_DTYPE)
                 sO_sub_base.subview(cutlass.Int32(O_TMA_GRANU_ELEMS + O_EPI_BLOCK_SIZE) + tid_in_wg * cutlass.Int32(O_D_BLOCK)).data_ptr().store_swizzled(
@@ -2105,14 +2138,22 @@ def _host(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
+    # SM100 FP8-family shared ABI: the THD slots ride every flavor so the
+    # adapter's launch shape is uniform; this dense-only kernel never reads
+    # them (o_desc_words is the 1-elem dense dummy, n_thd_units is 0).
+    o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    thd_q_lens_tensor: Optional[cute.Tensor] = None,
+    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
+    thd_lens_form: Optional[cutlass.Int32] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2216,33 +2257,55 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, has_lse: bool = True) -> Callable:  # noqa: A001
+def compile(  # noqa: A001
+    b: int = 1,
+    qh: int = 1,
+    kh: int = 1,
+    sq: int = 256,
+    skv: int = 128,
+    has_lse: bool = True,
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+) -> Callable:
     """Compile with ALL dims concrete — pins TMA strides at compile time.
+
+    ``d_qk``/``d_v`` <= the native (192, 128) tile serve the dense ENVELOPE:
+    the TMA descriptors carry the ACTUAL extents while the tile box stays the
+    compile-time D, so loads past them hardware zero-fill (exact in FP8 —
+    S/softmax/P·V are bit-identical to the unpadded problem, including the
+    statically-offset second Q/K chunk) and O stores past ``d_v`` are
+    OOB-clipped.
 
     ``has_lse=False`` specializes the LSE argument to ``None`` and removes
     the Stats store while retaining the independent amax writes."""
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
+        raise ValueError(f"fp8 d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+    if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
+        # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
+        # the binding TMA 16-byte global-stride constraint.
+        raise ValueError(f"fp8 d192 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
     _fake_batch = b
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_K),
+        (_fake_batch, sq, qh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_K),
+        (_fake_batch, skv, kh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (_fake_batch, skv, kh, CFG.TILE_O),
+        (_fake_batch, skv, kh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_STORAGE_DTYPE,
-        (_fake_batch, sq, qh, CFG.TILE_O),
+        (_fake_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -2284,6 +2347,14 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
             assumed_align=4,
         )
 
+    # SM100 FP8-family shared ABI: dense 1-elem o_desc dummy + n_thd_units=0
+    # (this flavor is dense-only; the kernel never reads either).
+    fake_o_desc = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64,
+        (1,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
     return cute.compile(
         _host,
         fake_q,
@@ -2293,14 +2364,19 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         fake_lse,
         fake_sinks,
         fake_seq_kv_lens,
+        fake_o_desc,
         (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
+        cutlass.Int32(0),
         _fake_scale(),
         _fake_scale(),
         _fake_scale(),
         _fake_scale(),
         fake_amax_o,
+        None,
+        None,
+        None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi --ptxas-options -uumn",
     )

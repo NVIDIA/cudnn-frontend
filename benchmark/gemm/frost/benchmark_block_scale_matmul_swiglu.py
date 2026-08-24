@@ -26,9 +26,9 @@ from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 from benchmark_utils import add_sweep_args, ceil_div, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms, to_blocked
 
 
-def _build_plan(g, cfg, cta_group, sched):
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
@@ -175,7 +175,7 @@ def _unfused_launch(a_s, b0_s, b1_s, out):
 
 
 def _build_spec_map():
-    """Label CONFIG_..._Nctamma[_static] -> (cfg, cta_group, scheduler) for every
+    """Label CONFIG_..._Nctamma -> (cfg, cta_group) for every
     multi-GEMM-capable sm100 block-scale strategy. Pins cta_tile_n=128 (SF 128x4
     swizzle + dual-GEMM TMEM: 256 overflows, 64/32 break the swizzle)."""
     chain = analyze(_graph(1, 256, 128, 512)[0])
@@ -183,8 +183,8 @@ def _build_spec_map():
     for t, cfg in _registry_candidates(chain):
         if cfg.pipeline not in ("sm100", "sm107") or cfg.mma_inst_m != 128 or cfg.cta_tile_n != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -236,12 +236,12 @@ def main() -> int:
         if spec is None:
             print(f"  {name:62s} UNKNOWN (not a sweepable block-scale strategy)")
             continue
-        cfg, cta_group, sched = spec
+        cfg, cta_group = spec
         if args.stream:
             print(f"  ▶ running {name} ...", flush=True)
         try:
             g, h = _graph(B, M, N, K)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError) as e:
             print(f"  {name:62s} SKIP: {str(e)[:42]}")
             continue

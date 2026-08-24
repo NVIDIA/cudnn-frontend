@@ -1573,13 +1573,12 @@ def _render_template(
     snippets: EpilogueSnippets,
     config: TileConfig,
     cta_group: int,
-    scheduler: str,
 ) -> str:
     # Template selected by the kernel registry from the pure-geometry config +
-    # execution strategy (cta_group/scheduler); mainloop/graph_type from chain.
+    # execution strategy (cta_group); mainloop/graph_type from chain.
     from .kernel_registry import select_template
 
-    tmpl = select_template(chain, config, cta_group, scheduler)
+    tmpl = select_template(chain, config, cta_group)
     fallback_cluster = _mixed_cga_fallback(config, cta_group, tmpl.file)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
@@ -1741,7 +1740,6 @@ def _render_block_scale_template(
     snippets: EpilogueSnippets,
     config: TileConfig,
     cta_group: int,
-    scheduler: str,
     fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
@@ -1749,7 +1747,7 @@ def _render_block_scale_template(
     template (not injected). Epilogue aux/tap markers still work."""
     from .kernel_registry import select_template
 
-    tmpl = select_template(chain, config, cta_group, scheduler)
+    tmpl = select_template(chain, config, cta_group)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
@@ -1856,6 +1854,13 @@ def _render_block_scale_template(
     moe_host_ma_pass = ",\n".join([f"a_{i}" for i in range(na)] + [f"_a_stride_sets[{i}][0]" for i in range(na)])
     if moe_host_ma_pass:
         moe_host_ma_pass += ","
+    moe_kernel_msfa_params = ",\n".join(f"mSFA_{i}: cute.Tensor" for i in range(na))
+    if moe_kernel_msfa_params:
+        moe_kernel_msfa_params += ","
+    moe_msfa_list = "mSFA_list = [" + ", ".join(f"mSFA_{i}" for i in range(na)) + "]"
+    moe_host_msfa_pass = ",\n".join(f"_sfa_operands[{i}]" for i in range(na))
+    if moe_host_msfa_pass:
+        moe_host_msfa_pass += ","
 
     replacements = {
         "INJECT_TILE_CONSTANTS": tile_constants,
@@ -1909,6 +1914,9 @@ def _render_block_scale_template(
                 "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
                 "INJECT_MOE_MA_LIST": moe_ma_list,
                 "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
+                "INJECT_MOE_KERNEL_MSFA_PARAMS": moe_kernel_msfa_params,
+                "INJECT_MOE_MSFA_LIST": moe_msfa_list,
+                "INJECT_MOE_HOST_MSFA_PASS": moe_host_msfa_pass,
             }
         )
 
@@ -2761,12 +2769,9 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
       wired (an M=64 MMA block drains through the packed lane<16 layout).
     - out dtype ∈ {bf16, fp16}: the drain widens to epi_n only for 2-byte output.
-    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
+    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store),
+      and not MoE: the six MoE templates carry only the N-major TMA store.
     """
-    if chain.has_moe:
-        # MoE scatters output rows by routed group; the TMA-store path writes
-        # contiguous tiles with no group offset → STG-only.
-        return False
     if chain.is_multi_gemm:
         # No multi-accumulator hook in the TMA-store path → STG only.
         return False
@@ -2804,6 +2809,8 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
     if cta_group == 2 and cfg.cta_tile_n < 64:
         return False
     if chain.out_major == "m":
+        if chain.has_moe:
+            return False
         m_align = 16 // DTYPE_BYTES[chain.output_dtype]
         return chain.matmul.M % m_align == 0
     return True
@@ -2935,7 +2942,6 @@ def probe_supported(
     config: TileConfig = DEFAULT_CONFIG,
     *,
     cta_group: int = 2,
-    scheduler: str = "clc",
 ) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. This is
@@ -2966,17 +2972,17 @@ def probe_supported(
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
 
-        tmpl = select_template(chain, config, cta_group, scheduler)
+        tmpl = select_template(chain, config, cta_group)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
                 f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
                 f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
-                f"scheduler={scheduler!r} → {tmpl.file}."
+                f"→ {tmpl.file}."
             )
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -2988,7 +2994,6 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
     *,
     cta_group: int = 2,
-    scheduler: str = "clc",
     force_stg_epi: bool = False,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
@@ -2999,7 +3004,7 @@ def jit_from_cudnn_graph(
     `graph` is a ``cudnn.pygraph`` built after ``import cudnn.gemm.frost`` (the
     import installs the op-recording hook). `config` is a PURE-GEOMETRY tile from
     `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
-    ``scheduler`` ∈ {"clc", "static"} pick the template (mainloop auto-detected).
+    picks the template (mainloop auto-detected).
     ``force_stg_epi=True`` skips the TMA-store path even when its gate accepts.
 
     Mixed CGA needs no argument and no caller change: where the GPU and the
@@ -3017,33 +3022,33 @@ def jit_from_cudnn_graph(
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
-        return _jit_moe_block_scale(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_moe_block_scale(chain, config, cta_group, binding=binding)
     # Block-scale is gated independently (own per-side case table).
     if chain.has_block_scale:
-        return _jit_block_scale(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_block_scale(chain, config, cta_group, binding=binding)
     # MoE grouped matmul: own template (grouped persistent scheduler + per-group
     # A TMA descriptor replacement).
     if chain.has_moe:
-        return _jit_moe(chain, config, cta_group, scheduler, binding=binding)
+        return _jit_moe(chain, config, cta_group, binding=binding)
     # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
     # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
 
-        tmpl = select_template(chain, config, cta_group, scheduler)
+        tmpl = select_template(chain, config, cta_group)
         if not tmpl.supports_multi_gemm:
             raise NotImplementedError(
                 f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
                 f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
-                f"scheduler={scheduler!r} → {tmpl.file}. Use cta_group=1, scheduler='clc'."
+                f"→ {tmpl.file}. Use cta_group=1."
             )
     # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
     # special-case combos]) gate, then the template family's active-GPU gate.
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3064,7 +3069,7 @@ def jit_from_cudnn_graph(
             output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
             use_tma_store=use_tma,
         )
-        src = _render_template(chain, snippets, config, cta_group, scheduler)
+        src = _render_template(chain, snippets, config, cta_group)
     finally:
         _FORCE_STG_EPI = prev_force
     mod = _import_kernel(src)
@@ -3215,18 +3220,22 @@ class CompiledMoeGemm:
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
     # clamped); drives the runtime output/aux alignment requirements.
     vec_bytes_epi: "int | None" = None
+    # Tensormap slots each CTA patches: one per distinct A operand, plus the
+    # output descriptor when the TMA-store epilogue is on (re-dimensioned per
+    # routed group so the hardware clips the ragged tail).
+    _desc_slots_per_cta: int = 0
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
     def workspace_bytes(self) -> int:
-        """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
-        distinct A operand. The persistent grid is shape-independent, so this is
+        """Per-CTA tensormap scratch: one 128-byte slot per CTA per patched
+        descriptor. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self.chain.num_a_operands * _MOE_DESC_SLOT_BYTES
+        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
-        """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
-        aligned). ``n_slots`` = grid_ctas * num_a_operands. Carved from the
+        """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
+        aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
@@ -3301,8 +3310,8 @@ class CompiledMoeGemm:
             (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
-        # A-descriptor workspace: one 128-byte tensormap slot per CTA.
-        workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
+        # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3422,8 +3431,8 @@ class CompiledMoeGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        # Workspace: one 128-B A descriptor per distinct A operand per CTA.
-        workspace = self._make_workspace(self._grid_ctas * na, workspace)
+        # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3440,7 +3449,6 @@ def _jit_moe(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeGemm:
@@ -3458,28 +3466,22 @@ def _jit_moe(
         )
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
+    _arch_reason = _sel_tmpl(chain, config, cta_group).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
-    global _FORCE_STG_EPI
-    prev_force = _FORCE_STG_EPI
-    _FORCE_STG_EPI = True  # MoE epilogue is STG-only
-    try:
-        vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-        _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
-        use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
-        snippets = generate(
-            chain,
-            vec_bytes_epi=vec_bytes_epi,
-            output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-            use_tma_store=use_tma,
-        )
-        src = _render_template(chain, snippets, config, cta_group, scheduler)
-    finally:
-        _FORCE_STG_EPI = prev_force
+    vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
+    _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
+    use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
+    snippets = generate(
+        chain,
+        vec_bytes_epi=vec_bytes_epi,
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+        use_tma_store=use_tma,
+    )
+    src = _render_template(chain, snippets, config, cta_group)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n
@@ -3494,6 +3496,7 @@ def _jit_moe(
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
         vec_bytes_epi=vec_bytes_epi,
+        _desc_slots_per_cta=chain.num_a_operands + (1 if use_tma else 0),
     )
 
 
@@ -3501,7 +3504,6 @@ def _jit_block_scale(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledFusedGemm:
@@ -3528,11 +3530,9 @@ def _jit_block_scale(
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
     from .kernel_registry import select_template
 
-    _tmpl = select_template(chain, config, cta_group, scheduler)
+    _tmpl = select_template(chain, config, cta_group)
     if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
-        raise NotImplementedError(
-            f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}, scheduler={scheduler!r})."
-        )
+        raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}).")
     _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
@@ -3547,7 +3547,7 @@ def _jit_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=use_tma,
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=fallback_cluster)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=fallback_cluster)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
@@ -3595,6 +3595,10 @@ class CompiledMoeBlockScaleGemm:
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
     # clamped); drives the runtime output/aux alignment requirements.
     vec_bytes_epi: "int | None" = None
+    # Tensormap slots each CTA patches: one per distinct A operand, one per SFA
+    # (its base carries start_sf_block_m and its m extent bounds the group), plus
+    # the output descriptor when the TMA-store epilogue re-dimensions it per group.
+    _desc_slots_per_cta: int = 0
     accepts_stream: ClassVar[bool] = True  # stream-aware dispatch (see CompiledFusedGemm)
 
     @property
@@ -3602,7 +3606,7 @@ class CompiledMoeBlockScaleGemm:
         """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
         distinct A operand. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self.chain.num_a_operands * _MOE_DESC_SLOT_BYTES
+        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
@@ -3690,7 +3694,7 @@ class CompiledMoeBlockScaleGemm:
         ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
-        workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3825,7 +3829,7 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        workspace = self._make_workspace(self._grid_ctas * na, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3844,7 +3848,6 @@ def _jit_moe_block_scale(
     chain: FusionChain,
     config: TileConfig,
     cta_group: int = 2,
-    scheduler: str = "clc",
     *,
     binding: "GemmBinding | None" = None,
 ) -> CompiledMoeBlockScaleGemm:
@@ -3873,20 +3876,21 @@ def _jit_moe_block_scale(
                 raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
     _check_input_alignment(chain)
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
-    _tmpl = select_template(chain, config, cta_group, scheduler)
+    _tmpl = select_template(chain, config, cta_group)
     _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _compute_output_vec_bytes(chain)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
+    use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
     _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
     snippets = generate(
         chain,
         vec_bytes_epi=vec_bytes_epi,
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        use_tma_store=(not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group),
+        use_tma_store=use_tma,
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
+    src = _render_block_scale_template(chain, snippets, config, cta_group, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n
@@ -3900,4 +3904,5 @@ def _jit_moe_block_scale(
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=vec_bytes_epi,
+        _desc_slots_per_cta=chain.num_a_operands * 2 + (1 if use_tma else 0),
     )

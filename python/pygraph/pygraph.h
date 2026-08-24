@@ -558,7 +558,12 @@ class PyGraph {
                py::object const& generate_stats,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                bool const unfuse_fma,
-               cudnn_frontend::AttentionImplementation_t const& implementation);
+               cudnn_frontend::AttentionImplementation_t const& implementation,
+               bool const use_padding_mask,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute

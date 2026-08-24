@@ -120,7 +120,7 @@ def _block_scale_case(combo: str, M: int, N: int, K: int) -> None:
     Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1, scheduler="clc")
+    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1)
 
     if combo == "nvfp4":
         lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
