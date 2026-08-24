@@ -355,7 +355,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             )
             self._value_error_if(
                 self.deterministic and b > 1 and int(self.bias_desc.shape[0]) == 1,
-                f"deterministic dBias requires a per-batch (B, H_q, S_q, S_kv) bias when B > 1 (a broadcast bias reduces over B through unordered atomics); got batch dim 1 with B = {b}",
+                "deterministic dBias requires a per-batch (B, H_q, S_q, S_kv) bias when B > 1 "
+                f"(a broadcast bias reduces over B through unordered atomics); got batch dim 1 with B = {b}",
             )
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
