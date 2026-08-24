@@ -1,0 +1,16 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
+auto_regressive_dit,auto_regressive_dit,cudnn,bfloat16,no_mask,1,985,62208,9,9,128,128,fwd,False,0.727,388.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,fp8,no_mask,1,985,62208,9,9,128,128,fwd,False,0.515,548.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,2141.000
+auto_regressive_dit,auto_regressive_dit,flash_attention_4,bfloat16,no_mask,1,985,62208,9,9,128,128,fwd,False,0.645,438.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,bfloat16,no_mask,1,1024,62208,9,9,128,128,fwd,False,0.727,404.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,fp8,no_mask,1,1024,62208,9,9,128,128,fwd,False,0.515,570.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,2141.000
+auto_regressive_dit,auto_regressive_dit,flash_attention_4,bfloat16,no_mask,1,1024,62208,9,9,128,128,fwd,False,0.646,454.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,bfloat16,no_mask,1,2048,62208,9,9,128,128,fwd,False,1.472,399.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,fp8,no_mask,1,2048,62208,9,9,128,128,fwd,False,1.026,572.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,2141.000
+auto_regressive_dit,auto_regressive_dit,flash_attention_4,bfloat16,no_mask,1,2048,62208,9,9,128,128,fwd,False,1.321,445.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,bfloat16,no_mask,1,4096,62208,9,9,128,128,fwd,False,2.225,528.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,fp8,no_mask,1,4096,62208,9,9,128,128,fwd,False,1.528,768.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,2141.000
+auto_regressive_dit,auto_regressive_dit,flash_attention_4,bfloat16,no_mask,1,4096,62208,9,9,128,128,fwd,False,2.010,584.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,bfloat16,no_mask,1,8192,62208,9,9,128,128,fwd,False,3.749,626.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
+auto_regressive_dit,auto_regressive_dit,cudnn,fp8,no_mask,1,8192,62208,9,9,128,128,fwd,False,2.548,922.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,2141.000
+auto_regressive_dit,auto_regressive_dit,flash_attention_4,bfloat16,no_mask,1,8192,62208,9,9,128,128,fwd,False,3.407,689.000,0.000,10,,True,False,,NVIDIA H200,1.28.0,92600.000,1071.000
