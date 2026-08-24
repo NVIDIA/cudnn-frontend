@@ -47,7 +47,7 @@ Deterministic dQ has two flavors. The relay (default) keeps the fused chain
 and orders the dq_accum adds per q-tile with turn counters. The
 ``det_2kernel`` split streams dS (io dtype, unscaled) to a
 ``[B, H_q, S_q, S_kv]`` workspace — the main kernel's dQ section (GEMM 4,
-scatter, relay) disappears — and ``dq2k`` (``dq_gemm_f16_sm120.py``)
+scatter, relay) disappears — and ``dq2k`` (``bprop_chain_f16_sm120.py``)
 computes dQ = attn_scale * dS @ K, replacing ``cvt``. The adapter routes
 shapes whose workspace cannot fit in device memory to the relay.
 """
@@ -69,10 +69,10 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.bwd.config_sm120 import SUPPORTED_HEAD_DIMS, TemplateParams, padded_head_dims, validate_params
-from cudnn.sdpa.bwd.kernels.dq_gemm_f16_sm120 import (
+from cudnn.sdpa.bwd.kernels._common_sm120 import (
     _COPY_ELEMS,
     _LOG2E,
-    SM120DetDqGemmKernel,
+    ceil_div,
     copy16_smem_to_gmem,
     load_a_frag,
     load_a_frag_transposed,
@@ -80,6 +80,14 @@ from cudnn.sdpa.bwd.kernels.dq_gemm_f16_sm120 import (
     mma_bstream,
     pack_half2,
     tile_ptr,
+)
+from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import (
+    SM120DetDqGemmKernel,
+    convert_dbias_host,
+    convert_dq_host,
+    dkv_reduce_host,
+    dot_do_o_host,
+    dsink_host,
 )
 
 # The FROST loader injects one immutable specialization before executing this
@@ -462,7 +470,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dq_accum: Optional[cute.Tensor],  # [B*SQ_r128*HQ*D_QK] fp32 (scrambled, zeroed; relay deterministic only)
         dq_sem: Optional[cute.Tensor],  # [B*HQ*num_q_tiles] int32 relay turn counters, one per (batch, head, q-tile); zeroed by dot (relay deterministic only)
         ds_ws: Optional[cute.Tensor],  # [B, HQ, SQ, SKV_pad] io dtype dS out (det_2kernel only)
-        dk_ws: cute.Tensor,  # [B, SKV, HQ, D] dK destination: dk itself when MHA; per-q-head partials summed by _dkv_reduce_kernel when GQA
+        dk_ws: cute.Tensor,  # [B, SKV, HQ, D] dK destination: dk itself when MHA; per-q-head partials summed by dkv_reduce_kernel when GQA
         dv_ws: cute.Tensor,  # [B, SKV, HQ, DV] dV destination (same as dK)
         seq_q_lens: Optional[cute.Tensor],  # [B] int32 per-batch Q lengths; None unless seq_q_lens_present
         seq_kv_lens: Optional[cute.Tensor],  # [B] int32 per-batch KV lengths; None unless seq_kv_lens_present
@@ -1442,618 +1450,6 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         )
 
 
-# ---------------------------------------------------------------------------
-# Preprocess kernel: delta = rowsum(dO * O) + dq_accum / dq_sem zeroing
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _dot_do_o_kernel(
-    o: cute.Tensor,  # [B, SQ, H, DV]
-    do: cute.Tensor,  # [B, SQ, H, DV]
-    delta: cute.Tensor,  # [B, H, SQ_r128] fp32 out
-    dq_accum: Optional[cute.Tensor],  # [B*SQ_r128*H*D_QK] fp32 (zeroed here); None in det_2kernel mode (nothing to zero)
-    dq_sem: Optional[cute.Tensor],  # [B*H*num_q_tiles] int32 relay turn counters (zeroed here when deterministic)
-    q_tile: cutlass.Constexpr[int],
-    d_qk: cutlass.Constexpr[int],  # D_QK: dq_accum's head dim
-    d_v: cutlass.Constexpr[int],  # D_V: O/dO's head dim
-    page: cutlass.Constexpr[int],
-    use_pdl: cutlass.Constexpr[bool],
-    deterministic: cutlass.Constexpr[bool],
-):
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_launch_dependents()
-    m_block, head, batch = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    SQ = o.shape[1]
-    H = o.shape[2]
-    SQ_R = ((SQ + 127) // 128) * 128
-    M = q_tile
-
-    o_ptr = o.iterator.raw_ptr()
-    do_ptr = do.iterator.raw_ptr()
-    dd_ptr = delta.iterator.raw_ptr()
-    if cutlass.const_expr(dq_accum is not None):
-        dqa_ptr = dq_accum.iterator.raw_ptr()
-
-    o_batch_stride, o_seq_stride, o_head_stride, _ = o.stride
-    do_batch_stride, do_seq_stride, do_head_stride, _ = do.stride
-    compact = (SQ * H * d_v, H * d_v, d_v)
-    io_strided = o.shape[3] != d_v or (o_batch_stride, o_seq_stride, o_head_stride) != compact or (do_batch_stride, do_seq_stride, do_head_stride) != compact
-    if cutlass.const_expr(io_strided):
-        o_base = batch * o_batch_stride + (m_block * M) * o_seq_stride + head * o_head_stride
-        do_base = batch * do_batch_stride + (m_block * M) * do_seq_stride + head * do_head_stride
-    else:
-        row_stride = H * d_v
-        base = ((batch * SQ + m_block * M) * H + head) * d_v
-    dd_base = (batch * H + head) * SQ_R + m_block * M
-    q_left = SQ - m_block * M
-
-    threads_per_row = page // _COPY_ELEMS
-    rows_per_pass = 256 // threads_per_row
-    col0 = (tidx % threads_per_row) * _COPY_ELEMS
-    row0 = tidx // threads_per_row
-    n_pages = d_v // page
-    for rp in cutlass.range_constexpr(M // rows_per_pass):
-        row = row0 + rp * rows_per_pass
-        acc = cutlass.Float32(0.0)
-        if row < q_left:
-            if cutlass.const_expr(io_strided):
-                o_off = o_base + row * o_seq_stride + col0
-                do_off = do_base + row * do_seq_stride + col0
-                for pg in cutlass.range_constexpr(n_pages):
-                    if cutlass.const_expr(o.shape[3] != d_v):
-                        # Envelope: rows are only o.shape[3] wide
-                        if col0 + pg * page < o.shape[3]:
-                            ov = (o_ptr + o_off + pg * page).load(count=_COPY_ELEMS)
-                            dov = (do_ptr + do_off + pg * page).load(count=_COPY_ELEMS)
-                            for kk in cutlass.range_constexpr(_COPY_ELEMS):
-                                acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
-                    else:
-                        ov = (o_ptr + o_off + pg * page).load(count=_COPY_ELEMS)
-                        dov = (do_ptr + do_off + pg * page).load(count=_COPY_ELEMS)
-                        for kk in cutlass.range_constexpr(_COPY_ELEMS):
-                            acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
-            else:
-                g_off = base + row * row_stride + col0
-                for pg in cutlass.range_constexpr(n_pages):
-                    ov = (o_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
-                    dov = (do_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
-                    for kk in cutlass.range_constexpr(_COPY_ELEMS):
-                        acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
-        # Allreduce over the threads sharing the row (lane-contiguous).
-        n_sh = 3 if cutlass.const_expr(threads_per_row == 8) else 2
-        for sh in cutlass.range_constexpr(n_sh):
-            acc = acc + prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=acc,
-                offset=1 << (n_sh - 1 - sh),
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.BFLY,
-            )
-        if tidx % threads_per_row == 0:
-            (dd_ptr + dd_base + row).store(acc)
-
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_wait()
-
-    if cutlass.const_expr(dq_accum is not None):
-        zero_rows_per_pass = 32 if cutlass.const_expr(d_qk == 32) else 16
-        zero_threads_per_row = 256 // zero_rows_per_pass
-        zero_row0 = tidx // zero_threads_per_row
-        zero_col0 = (tidx % zero_threads_per_row) * 4
-        zero4 = cutlass.Vector.from_elements(
-            (
-                cutlass.Float32(0.0),
-                cutlass.Float32(0.0),
-                cutlass.Float32(0.0),
-                cutlass.Float32(0.0),
-            ),
-            cutlass.Float32,
-        )
-        dqa_base = ((batch * SQ_R + m_block * M) * H + head) * d_qk
-        for im in cutlass.range_constexpr(M // zero_rows_per_pass):
-            for jn in cutlass.range_constexpr(d_qk // (zero_threads_per_row * 4)):
-                addr = dqa_base + (zero_row0 + im * zero_rows_per_pass) * (H * d_qk) + zero_col0 + jn * zero_threads_per_row * 4
-                (dqa_ptr + addr).store(zero4, alignment=16)
-
-    if cutlass.const_expr(deterministic and dq_sem is not None):
-        # Reset this q-tile's relay turn counter (PDL-ordered before the main
-        # kernel's first acquire, like the dq_accum zeroing above).
-        if tidx == 0:
-            num_q_tiles = (SQ + M - 1) // M
-            sem_ptr = dq_sem.iterator.raw_ptr()
-            (sem_ptr + (batch * H + head) * num_q_tiles + m_block).store(cutlass.Int32(0))
-
-
-@cute.jit
-def _dot_do_o_host(
-    o: cute.Tensor,
-    do: cute.Tensor,
-    delta: cute.Tensor,
-    dq_accum: Optional[cute.Tensor],
-    dq_sem: Optional[cute.Tensor],
-    q_tile: cutlass.Constexpr[int],
-    d_qk: cutlass.Constexpr[int],
-    d_v: cutlass.Constexpr[int],
-    page: cutlass.Constexpr[int],
-    use_pdl: cutlass.Constexpr[bool],
-    deterministic: cutlass.Constexpr[bool],
-    stream: cuda_driver.CUstream,
-):
-    m_blocks = cute.ceil_div(o.shape[1], q_tile)
-    _dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, d_qk, d_v, page, use_pdl, deterministic).launch(
-        grid=(m_blocks, o.shape[2], o.shape[0]),
-        block=(256, 1, 1),
-        stream=stream,
-        use_pdl=use_pdl,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Convert kernel: scrambled dq_accum (fp32) -> dQ (io dtype)
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _convert_dq_kernel(
-    dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32
-    dq: cute.Tensor,  # [B, SQ, H, D] io dtype out
-    q_tile: cutlass.Constexpr[int],
-    d_qk: cutlass.Constexpr[int],
-    page: cutlass.Constexpr[int],
-    warps_m_dq: cutlass.Constexpr[int],
-    attn_scale: cutlass.Float32,
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-):
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-    m_block, head, batch = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    lane = tidx % 32
-    warp = cute.arch.warp_idx()
-    g_lane = lane // 4
-    p_lane = lane % 4
-    SQ = dq.shape[1]
-    H = dq.shape[2]
-    SQ_R = ((SQ + 127) // 128) * 128
-    M = q_tile
-    WM_DQ = warps_m_dq
-    DQ_REPS = M // (16 * WM_DQ)
-    DQ_PER = d_qk * WM_DQ // 8
-    DQ_NF = DQ_PER // 8
-    wq = warp % WM_DQ
-    wd_q = warp // WM_DQ
-
-    dqa_ptr = dq_accum.iterator.raw_ptr()
-    dq_ptr = dq.iterator.raw_ptr()
-
-    sdQ = cutlass.Array(io_dtype, M * d_qk, space=cutlass.AddressSpace.smem, alignment=128)
-
-    t_r = tidx // 32
-    t_c = tidx % 32
-    dqa_base = ((batch * SQ_R + m_block * M) * H + head) * d_qk
-    for rep in cutlass.range_constexpr(DQ_REPS):
-        for nf in cutlass.range_constexpr(DQ_NF):
-            frag = cutlass.Array(cutlass.Float32, 4)
-            for hv in cutlass.range_constexpr(2):
-                i_pair = hv + rep * 2 + nf * 2 * DQ_REPS
-                if cutlass.const_expr(d_qk >= 64):
-                    jm = i_pair % (M // 8)
-                    jn = i_pair // (M // 8)
-                    addr = dqa_base + (t_r + jm * 8) * (H * d_qk) + t_c * 2 + jn * 64
-                else:
-                    addr = dqa_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * d_qk) + (t_c % 16) * 2
-                pv = (dqa_ptr + addr).load(count=2)
-                frag[hv * 2 + 0] = pv[0] * attn_scale
-                frag[hv * 2 + 1] = pv[1] * attn_scale
-            r0 = wq * 16 + rep * 16 * WM_DQ + g_lane
-            r8 = r0 + 8
-            c0 = wd_q * DQ_PER + nf * 8 + 2 * p_lane
-            tile_ptr(sdQ, r0, c0, page=page, rows=M).store(pack_half2(frag[0], frag[1], io_dtype), alignment=4)
-            tile_ptr(sdQ, r8, c0, page=page, rows=M).store(pack_half2(frag[2], frag[3], io_dtype), alignment=4)
-    prims.barrier_cta_sync(0)
-
-    q_left = SQ - m_block * M
-    dq_batch_stride, dq_seq_stride, dq_head_stride, _ = dq.stride
-    g_base = batch * dq_batch_stride + (m_block * M) * dq_seq_stride + head * dq_head_stride
-    chunks_per_row = d_qk // _COPY_ELEMS
-    for i in cutlass.range_constexpr(M * chunks_per_row // 256):
-        chunk = i * 256 + tidx
-        row = chunk // chunks_per_row
-        col = (chunk % chunks_per_row) * _COPY_ELEMS
-        if row < q_left:
-            if cutlass.const_expr(dq.shape[3] != d_qk):
-                # Envelope: dQ is only dq.shape[3] wide (pad columns are zero).
-                if col < dq.shape[3]:
-                    copy16_smem_to_gmem(
-                        tile_ptr(sdQ, row, col, page=page, rows=M),
-                        dq_ptr + g_base + row * dq_seq_stride + col,
-                    )
-            else:
-                copy16_smem_to_gmem(
-                    tile_ptr(sdQ, row, col, page=page, rows=M),
-                    dq_ptr + g_base + row * dq_seq_stride + col,
-                )
-
-
-@cute.jit
-def _convert_dq_host(
-    dq_accum: cute.Tensor,
-    dq: cute.Tensor,
-    q_tile: cutlass.Constexpr[int],
-    d_qk: cutlass.Constexpr[int],
-    page: cutlass.Constexpr[int],
-    warps_m_dq: cutlass.Constexpr[int],
-    attn_scale: cutlass.Float32,
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-    stream: cuda_driver.CUstream,
-):
-    m_blocks = cute.ceil_div(dq.shape[1], q_tile)
-    _convert_dq_kernel(dq_accum, dq, q_tile, d_qk, page, warps_m_dq, attn_scale, io_dtype, use_pdl).launch(
-        grid=(m_blocks, dq.shape[2], dq.shape[0]),
-        block=(256, 1, 1),
-        stream=stream,
-        use_pdl=use_pdl,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Convert kernel: dbias_accum (fp32) -> dBias (io dtype; fp32 outputs skip it)
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _convert_dbias_kernel(
-    dbias_accum: cute.Tensor,  # [total] fp32 (flat view of [1|B, HQ, SQ, SKV])
-    dbias: cute.Tensor,  # [total] out dtype (flat view, same layout)
-    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-):
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-    bidx, _, _ = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    total = dbias.shape[0]
-    acc_ptr = dbias_accum.iterator.raw_ptr()
-    out_ptr = dbias.iterator.raw_ptr()
-    gidx = bidx * 256 + tidx
-    if gidx < total:
-        (out_ptr + gidx).store((acc_ptr + gidx).load().to(out_dtype))
-
-
-@cute.jit
-def _convert_dbias_host(
-    dbias_accum: cute.Tensor,
-    dbias: cute.Tensor,
-    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-    stream: cuda_driver.CUstream,
-):
-    _convert_dbias_kernel(dbias_accum, dbias, out_dtype, use_pdl).launch(
-        grid=(cute.ceil_div(dbias.shape[0], 256), 1, 1),
-        block=(256, 1, 1),
-        stream=stream,
-        use_pdl=use_pdl,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Reduce kernel: per-q-head dk_ws/dv_ws partials (io dtype) -> dK/dV over the group
-# ---------------------------------------------------------------------------
-
-
-@cute.jit
-def _reduce_group_vec(
-    ws_ptr,
-    out_ptr,
-    idx,
-    hkv,
-    hq,
-    *,
-    d: cutlass.Constexpr[int],
-    group: cutlass.Constexpr[int],
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    out_batch_stride: cutlass.Constexpr[int] = 0,
-    out_seq_stride: cutlass.Constexpr[int] = 0,
-    out_head_stride: cutlass.Constexpr[int] = 0,
-    out_strided: cutlass.Constexpr[bool] = False,
-    skv: cutlass.Constexpr[int] = 0,
-):
-    """Sum one 16 B output vector over the group's q-head partials (fp32,
-    fixed order -> deterministic) and store it in the io dtype."""
-    VEC = 8  # 8 elements per vector (16 bytes)
-    pos = idx * VEC
-    col = pos % d
-    rowh = pos // d  # (b*SKV + s)*HKV + kv_head
-    kh = rowh % hkv
-    bs = rowh // hkv
-    in0 = (bs * hq + kh * group) * d + col
-    acc = cutlass.Array(cutlass.Float32, VEC)
-    for e in cutlass.range_constexpr(VEC):
-        acc[e] = cutlass.Float32(0.0)
-    for g in cutlass.range_constexpr(group):
-        w = (ws_ptr + in0 + g * d).load(count=VEC)
-        for e in cutlass.range_constexpr(VEC):
-            acc[e] = acc[e] + w[e].to(cutlass.Float32)
-    vec = cutlass.Vector.from_elements(tuple(acc[e].to(io_dtype) for e in range(VEC)), io_dtype)
-    if cutlass.const_expr(out_strided):
-        s_row = bs % skv
-        b_idx = bs // skv
-        (out_ptr + b_idx * out_batch_stride + s_row * out_seq_stride + kh * out_head_stride + col).store(vec, alignment=16)
-    else:
-        (out_ptr + pos).store(vec, alignment=16)
-
-
-@cute.jit
-def _reduce_group_vec_guarded(
-    ws_ptr,
-    out_ptr,
-    idx,
-    hkv,
-    hq,
-    *,
-    d: cutlass.Constexpr[int],
-    d_out: cutlass.Constexpr[int],
-    group: cutlass.Constexpr[int],
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    out_batch_stride: cutlass.Constexpr[int],
-    out_seq_stride: cutlass.Constexpr[int],
-    out_head_stride: cutlass.Constexpr[int],
-    out_strided: cutlass.Constexpr[bool],
-    skv: cutlass.Constexpr[int],
-):
-    """_reduce_group_vec, skipping the pad-column vectors when the output is
-    narrower than the padded ws rows (envelope: those columns are zero and
-    the user tensor has no room for them)."""
-    if cutlass.const_expr(d_out != d):
-        if (idx * 8) % d < d_out:
-            _reduce_group_vec(
-                ws_ptr,
-                out_ptr,
-                idx,
-                hkv,
-                hq,
-                d=d,
-                group=group,
-                io_dtype=io_dtype,
-                out_batch_stride=out_batch_stride,
-                out_seq_stride=out_seq_stride,
-                out_head_stride=out_head_stride,
-                out_strided=out_strided,
-                skv=skv,
-            )
-    else:
-        _reduce_group_vec(
-            ws_ptr,
-            out_ptr,
-            idx,
-            hkv,
-            hq,
-            d=d,
-            group=group,
-            io_dtype=io_dtype,
-            out_batch_stride=out_batch_stride,
-            out_seq_stride=out_seq_stride,
-            out_head_stride=out_head_stride,
-            out_strided=out_strided,
-            skv=skv,
-        )
-
-
-@cute.kernel
-def _dkv_reduce_kernel(
-    dk_ws: cute.Tensor,  # [B, SKV, HQ, D] io dtype (one dK partial per q head)
-    dv_ws: cute.Tensor,  # [B, SKV, HQ, DV] io dtype (one dV partial per q head)
-    dk: cute.Tensor,  # [B, SKV, HKV, D] io dtype out
-    dv: cute.Tensor,  # [B, SKV, HKV, DV] io dtype out
-    d_qk: cutlass.Constexpr[int],
-    d_v: cutlass.Constexpr[int],
-    group: cutlass.Constexpr[int],
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-):
-    # one thread per 16 B output vector, serial fp32 accumulation over the group's q-head slices (fixed order -> deterministic).
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-    bidx, _, _ = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    B = dk.shape[0]
-    SKV = dk.shape[1]
-    HKV = dk.shape[2]
-    HQ = HKV * group
-    VEC = 8  # 8 elements per vector (16 bytes)
-    dkws_ptr = dk_ws.iterator.raw_ptr()
-    dvws_ptr = dv_ws.iterator.raw_ptr()
-    dk_ptr = dk.iterator.raw_ptr()
-    dv_ptr = dv.iterator.raw_ptr()
-    dk_batch_stride, dk_seq_stride, dk_head_stride, _ = dk.stride
-    dv_batch_stride, dv_seq_stride, dv_head_stride, _ = dv.stride
-    dk_strided = (dk_batch_stride, dk_seq_stride, dk_head_stride) != (SKV * HKV * d_qk, HKV * d_qk, d_qk)
-    dv_strided = (dv_batch_stride, dv_seq_stride, dv_head_stride) != (SKV * HKV * d_v, HKV * d_v, d_v)
-    gidx = bidx * 256 + tidx  # host launch 256 threads
-    if cutlass.const_expr(d_qk == d_v):
-        OUT_VECS = B * SKV * HKV * d_qk // VEC
-        if gidx < OUT_VECS:
-            _reduce_group_vec_guarded(
-                dkws_ptr,
-                dk_ptr,
-                gidx,
-                HKV,
-                HQ,
-                d=d_qk,
-                d_out=dk.shape[3],
-                group=group,
-                io_dtype=io_dtype,
-                out_batch_stride=dk_batch_stride,
-                out_seq_stride=dk_seq_stride,
-                out_head_stride=dk_head_stride,
-                out_strided=dk_strided,
-                skv=SKV,
-            )
-            _reduce_group_vec_guarded(
-                dvws_ptr,
-                dv_ptr,
-                gidx,
-                HKV,
-                HQ,
-                d=d_qk,
-                d_out=dv.shape[3],
-                group=group,
-                io_dtype=io_dtype,
-                out_batch_stride=dv_batch_stride,
-                out_seq_stride=dv_seq_stride,
-                out_head_stride=dv_head_stride,
-                out_strided=dv_strided,
-                skv=SKV,
-            )
-    else:
-        # Unequal head dims: dK and dV vectors index different row widths, so
-        # the flat thread range covers dK's vectors first, then dV's.
-        K_VECS = B * SKV * HKV * d_qk // VEC
-        V_VECS = B * SKV * HKV * d_v // VEC
-        if gidx < K_VECS:
-            _reduce_group_vec_guarded(
-                dkws_ptr,
-                dk_ptr,
-                gidx,
-                HKV,
-                HQ,
-                d=d_qk,
-                d_out=dk.shape[3],
-                group=group,
-                io_dtype=io_dtype,
-                out_batch_stride=dk_batch_stride,
-                out_seq_stride=dk_seq_stride,
-                out_head_stride=dk_head_stride,
-                out_strided=dk_strided,
-                skv=SKV,
-            )
-        else:
-            if gidx < K_VECS + V_VECS:
-                _reduce_group_vec_guarded(
-                    dvws_ptr,
-                    dv_ptr,
-                    gidx - K_VECS,
-                    HKV,
-                    HQ,
-                    d=d_v,
-                    d_out=dv.shape[3],
-                    group=group,
-                    io_dtype=io_dtype,
-                    out_batch_stride=dv_batch_stride,
-                    out_seq_stride=dv_seq_stride,
-                    out_head_stride=dv_head_stride,
-                    out_strided=dv_strided,
-                    skv=SKV,
-                )
-
-
-@cute.jit
-def _dkv_reduce_host(
-    dk_ws: cute.Tensor,
-    dv_ws: cute.Tensor,
-    dk: cute.Tensor,
-    dv: cute.Tensor,
-    d_qk: cutlass.Constexpr[int],
-    d_v: cutlass.Constexpr[int],
-    group: cutlass.Constexpr[int],
-    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    use_pdl: cutlass.Constexpr[bool],
-    stream: cuda_driver.CUstream,
-):
-    if cutlass.const_expr(d_qk == d_v):
-        out_vecs = cute.ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * d_qk, 8)
-    else:
-        # Split index space: one thread per dK vector plus one per dV vector.
-        out_vecs = cute.ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (d_qk + d_v), 8)
-    _dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, d_qk, d_v, group, io_dtype, use_pdl).launch(
-        grid=(cute.ceil_div(out_vecs, 256), 1, 1),
-        block=(256, 1, 1),
-        stream=stream,
-        use_pdl=use_pdl,
-    )
-
-
-@cute.kernel
-def _dsink_kernel(
-    lse: cute.Tensor,  # [B, HQ, SQ] fp32 (natural-log, sink folded in by the fwd)
-    delta: cute.Tensor,  # [B, HQ, SQ_r128] fp32 (dot_do_o output)
-    sink: cute.Tensor,  # [HQ] fp32 sink logits
-    dsink: cute.Tensor,  # [HQ] fp32 out
-    seq_q_lens: Optional[cute.Tensor],  # [B] int32; None unless seq_q_lens_present
-    use_pdl: cutlass.Constexpr[bool],
-):
-    """dsink[h] = -sum_{b,q} exp(sink[h] - lse[b,h,q]) * delta[b,h,q].
-
-    One warp per query head, fixed reduction order -> bitwise deterministic."""
-    if cutlass.const_expr(use_pdl):
-        cute.arch.griddepcontrol_launch_dependents()
-        cute.arch.griddepcontrol_wait()
-    head, _, _ = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
-    B = lse.shape[0]
-    HQ = lse.shape[1]
-    SQ = lse.shape[2]
-    SQ_R = delta.shape[2]
-    lse_batch_stride, lse_head_stride, lse_seq_stride = lse.stride
-    lse_ptr = lse.iterator.raw_ptr()
-    delta_ptr = delta.iterator.raw_ptr()
-    s_val = (sink.iterator.raw_ptr() + head).load()
-    inf = cutlass.Float32(float("inf"))
-    acc = cutlass.Float32(0.0)
-    batch = cutlass.Int32(0)
-    # batch loop
-    while batch < B:
-        lse_base = batch * lse_batch_stride + head * lse_head_stride
-        delta_base = (batch * HQ + head) * SQ_R
-        q_bound = SQ
-        if cutlass.const_expr(seq_q_lens is not None):
-            q_bound = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(SQ)))
-        q = cutlass.Int32(tidx)
-        while q < q_bound:
-            lv = (lse_ptr + lse_base + q * lse_seq_stride).load()
-            # Padded / trimmed rows carry LSE = -inf: skip them, exp(sink + inf) * 0 = NaN
-            if lv > -inf and lv < inf:
-                dd = (delta_ptr + delta_base + q).load()
-                acc = acc + cute.math.exp2((s_val - lv) * cutlass.Float32(_LOG2E), fastmath=True) * dd
-            q = q + 32
-        batch = batch + 1
-    for sh in cutlass.range_constexpr(5):
-        acc = acc + prims.shfl_sync(
-            thread_mask=0xFFFFFFFF,
-            val=acc,
-            offset=1 << (4 - sh),
-            mask_and_clamp=0x1F,
-            kind=prims.Shfl.BFLY,
-        )
-    if tidx == 0:
-        (dsink.iterator.raw_ptr() + head).store(-acc)
-
-
-@cute.jit
-def _dsink_host(
-    lse: cute.Tensor,
-    delta: cute.Tensor,
-    sink: cute.Tensor,
-    dsink: cute.Tensor,
-    seq_q_lens: Optional[cute.Tensor],
-    use_pdl: cutlass.Constexpr[bool],
-    stream: cuda_driver.CUstream,
-):
-    _dsink_kernel(lse, delta, sink, dsink, seq_q_lens, use_pdl).launch(
-        grid=(lse.shape[1], 1, 1),
-        block=(32, 1, 1),
-        stream=stream,
-        use_pdl=use_pdl,
-    )
-
-
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     compute_capability: tuple[int, int],
@@ -2157,7 +1553,7 @@ def compile(  # noqa: A001
         fake_dq_sem = _fake(cutlass.Int32, (b * qh * ceil_div(sq, 32),))
         fake_ds_ws = None
     # Main-kernel dK/dV destinations, always HQ-headed: alias dk/d_v for MHA
-    # (qh == kvh); per-q-head partials summed by _dkv_reduce_kernel for GQA.
+    # (qh == kvh); per-q-head partials summed by dkv_reduce_kernel for GQA.
     fake_dk_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_qk)) if has_gqa else fake_dk
     fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_v)) if has_gqa else fake_dv
     fake_seq_q_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_q_lens_present else None
@@ -2170,7 +1566,7 @@ def compile(  # noqa: A001
     options = "--enable-tvm-ffi"
 
     compiled_dot = cute.compile(
-        _dot_do_o_host,
+        dot_do_o_host,
         fake_o,
         fake_do,
         fake_delta,
@@ -2232,7 +1628,7 @@ def compile(  # noqa: A001
         )
     else:
         compiled_cvt = cute.compile(
-            _convert_dq_host,
+            convert_dq_host,
             fake_dq_accum,
             fake_dq,
             bwd.q_tile,
@@ -2248,7 +1644,7 @@ def compile(  # noqa: A001
     compiled_reduce = None
     if has_gqa:
         compiled_reduce = cute.compile(
-            _dkv_reduce_host,
+            dkv_reduce_host,
             fake_dk_ws,
             fake_dv_ws,
             fake_dk,
@@ -2265,7 +1661,7 @@ def compile(  # noqa: A001
     if PARAMS.dbias_present and not PARAMS.dbias_is_fp32:
         dbias_total = bias_batch * qh * sq * skv
         compiled_dbias_cvt = cute.compile(
-            _convert_dbias_host,
+            convert_dbias_host,
             _fake(cutlass.Float32, (dbias_total,)),
             _fake(STORAGE_DTYPE, (dbias_total,)),
             STORAGE_DTYPE,
@@ -2278,7 +1674,7 @@ def compile(  # noqa: A001
         fake_sink = _fake(cutlass.Float32, (qh,))
         fake_dsink = _fake(cutlass.Float32, (qh,))
         compiled_dsink = cute.compile(
-            _dsink_host,
+            dsink_host,
             fake_lse,
             fake_delta,
             fake_sink,
