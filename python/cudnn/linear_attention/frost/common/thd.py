@@ -80,7 +80,7 @@ def emit_checkpoint_seq_descs(
     """Per-BATCH descriptor array for the per-chunk checkpoint tensor with the head
     axis as a descriptor dimension (``(dv, dk, chunk, head)``).  Derives the
     per-sequence checkpoint offsets from the TOKEN ``cu_seqlens`` on the fly
-    (``count_b = (seqlen_b - 1) // every_n + 1``, running-prefix-summed) — an
+    (``count_b = (batch_seqlen - 1) // every_n + 1``, running-prefix-summed) — an
     address fold no coordinate transform can express — and caps
     GLOBAL_DIM[``seq_ord``] to ``count_b``.  The head index is a load
     coordinate.  Runs on one electing thread; the calling warp elects and

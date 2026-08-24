@@ -61,9 +61,9 @@ def _leaves(master, dtype):
     return lv
 
 
-def _run(fn, master, dtype):
+def _run(fn, master, dtype, **kw):
     lv = _leaves(master, dtype)
-    o, _ = fn(lv["q"], lv["k"], lv["v"], lv["g"], lv["beta"], output_final_state=False)
+    o, _ = fn(lv["q"], lv["k"], lv["v"], lv["g"], lv["beta"], output_final_state=False, **kw)
     return o, lv
 
 
@@ -330,10 +330,15 @@ def test_kda_parity_fused():
 
 
 def test_fallback_is_transparent():
-    """An unsupported config (K != 128) falls back and returns FLA's exact result."""
-    m = _master(2, 256, 4, 4, 64, 128, seed=1)  # K=64 -> native declines
-    o_fla, _ = _run(chunk_gated_delta_rule, m, torch.bfloat16)
-    o_cud, _ = _run(shim, m, torch.bfloat16)
+    """A variant the native op does not model falls back and returns FLA's exact result.
+
+    Keyed on ``allow_neg_eigval``, which the shim declines by construction, so this stays
+    a fallback no matter which shapes the engines grow support for.
+    """
+    m = _master(2, 256, 4, 4, 128, 128, seed=1)
+    kw = dict(allow_neg_eigval=True, use_beta_sigmoid_in_kernel=True)  # FLA requires the pair
+    o_fla, _ = _run(chunk_gated_delta_rule, m, torch.bfloat16, **kw)
+    o_cud, _ = _run(shim, m, torch.bfloat16, **kw)
     assert last_path().startswith("fallback"), f"expected fallback, got {last_path()}"
     torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
 
