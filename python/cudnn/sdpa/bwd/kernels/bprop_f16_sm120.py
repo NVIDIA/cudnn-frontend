@@ -26,6 +26,9 @@ Constraints:
 * No dropout/alibi/softcap
 * Optional causal (top-left or bottom-right), right-band-widened causal
   (window_size_right), sliding-window masks and padding masks.
+* Optional additive bias ([1|B, H, SQ, SKV], post-scale pre-softmax) with an
+  optional dBias output (fp32 red.add accumulator; a broadcast batch dim
+  reduces over B for free, so dBias is non-deterministic when B > 1)
 * LSE input is the natural-log forward stats, fp32 (B, H, SQ); any
   non-broadcast layout
 * io tensors may declare any dense layout whose head dim is
@@ -36,7 +39,9 @@ One backward call is three kernel launches through the per-shape
 ``compile()`` cache at the bottom of this module: ``dot`` (delta =
 rowsum(dO*O), also zeroes the dq_accum workspace), ``main`` (the fused
 five-GEMM pass writing dK/dV), and ``cvt`` (dq_accum fp32 -> dQ io dtype);
-GQA adds ``reduce`` and a dSink_token output adds ``dsink``.
+GQA adds ``reduce``, a dSink_token output adds ``dsink``, and a dBias output
+adds ``dbias_cvt`` (fp32 accumulator -> the io dtype; an fp32 dBias output
+doubles as the accumulator and needs no convert).
 
 Deterministic dQ has two flavors. The relay (default) keeps the fused chain
 and orders the dq_accum adds per q-tile with turn counters. The
@@ -114,6 +119,14 @@ def _red_add_f32x2(ptr, v0: cutlass.Float32, v1: cutlass.Float32) -> None:
     prims.inline_ptx(
         "red.global.add.v2.f32 [$0], {$1, $2};",
         read_only_args=[ptr, v0, v1],
+    )
+
+
+@cute.jit
+def _red_add_f32(ptr, v0: cutlass.Float32) -> None:
+    prims.inline_ptx(
+        "red.global.add.f32 [$0], $1;",
+        read_only_args=[ptr, v0],
     )
 
 
@@ -325,6 +338,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         seq_q_lens_present: bool = False,
         sink_present: bool = False,
         det_2kernel: bool = False,
+        bias_present: bool = False,
+        dbias_present: bool = False,
+        bias_is_fp32: bool = False,
     ):
         self.in_dtype = in_dtype
         self.is_causal = is_causal
@@ -336,6 +352,11 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.det_2k = bool(det_2kernel)
         self.seq_kv_lens_present = bool(seq_kv_lens_present)
         self.seq_q_lens_present = bool(seq_q_lens_present)
+        self.bias_present = bool(bias_present)
+        self.dbias_present = bool(dbias_present)
+        if self.dbias_present and not self.bias_present:
+            raise ValueError("dbias_present requires bias_present")
+        self.bias_dtype = cutlass.Float32 if bias_is_fp32 else in_dtype
         # sink LSE is finite on padded rows; trim them explicitly (LSE := +inf, P = 0)
         self.trim_q_rows = bool(sink_present) and self.seq_q_lens_present
         # Use padded head dim for compute
@@ -445,6 +466,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dv_ws: cute.Tensor,  # [B, SKV, HQ, DV] dV destination (same as dK)
         seq_q_lens: Optional[cute.Tensor],  # [B] int32 per-batch Q lengths; None unless seq_q_lens_present
         seq_kv_lens: Optional[cute.Tensor],  # [B] int32 per-batch KV lengths; None unless seq_kv_lens_present
+        bias: Optional[cute.Tensor],  # [1|B, HQ, SQ, SKV] additive bias (contiguous); None unless bias_present
+        dbias_accum: Optional[cute.Tensor],  # [1|B, HQ, SQ, SKV] fp32 dBias accumulator; None unless dbias_present
         tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -523,6 +546,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dvws_ptr = dv_ws.iterator.raw_ptr()
         if cutlass.const_expr(self.deterministic and not self.det_2k):
             dqsem_ptr = dq_sem.iterator.raw_ptr()
+        if cutlass.const_expr(self.bias_present):
+            bias_ptr = bias.iterator.raw_ptr()
+            if cutlass.const_expr(bias.shape[0] == 1):  # broadcast
+                bias_hq_base = q_head * (SQ * SKV)
+            else:
+                bias_hq_base = (batch * HQ + q_head) * (SQ * SKV)
+        if cutlass.const_expr(self.dbias_present):
+            dbias_ptr = dbias_accum.iterator.raw_ptr()
 
         PARTIAL_Q = (SQ % M) != 0
         PARTIAL_KV = (SKV % N) != 0
@@ -900,10 +931,34 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                 s3 = neg_inf
                         lse0 = lse_r[rep * 2 + 0]
                         lse8 = lse_r[rep * 2 + 1]
-                        p0 = cute.math.exp2(s0 * softmax_scale_log2 - lse0, fastmath=True)
-                        p1 = cute.math.exp2(s1 * softmax_scale_log2 - lse0, fastmath=True)
-                        p2 = cute.math.exp2(s2 * softmax_scale_log2 - lse8, fastmath=True)
-                        p3 = cute.math.exp2(s3 * softmax_scale_log2 - lse8, fastmath=True)
+                        if cutlass.const_expr(self.bias_present):
+                            if cutlass.const_expr(PARTIAL_Q):
+                                bias_r0 = cute.math.min(r0, cutlass.Int32(SQ - 1))
+                                bias_r8 = cute.math.min(r8, cutlass.Int32(SQ - 1))
+                            else:
+                                bias_r0 = r0
+                                bias_r8 = r8
+                            if cutlass.const_expr(PARTIAL_KV):
+                                bias_k0 = cute.math.min(kv_a0, cutlass.Int32(SKV - 1))
+                                bias_k1 = cute.math.min(kv_a1, cutlass.Int32(SKV - 1))
+                            else:
+                                bias_k0 = kv_a0
+                                bias_k1 = kv_a1
+                            bias_row0 = bias_hq_base + bias_r0 * SKV
+                            bias_row8 = bias_hq_base + bias_r8 * SKV
+                            b00 = (bias_ptr + bias_row0 + bias_k0).load().to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                            b01 = (bias_ptr + bias_row0 + bias_k1).load().to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                            b80 = (bias_ptr + bias_row8 + bias_k0).load().to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                            b81 = (bias_ptr + bias_row8 + bias_k1).load().to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                            p0 = cute.math.exp2(s0 * softmax_scale_log2 + b00 - lse0, fastmath=True)
+                            p1 = cute.math.exp2(s1 * softmax_scale_log2 + b01 - lse0, fastmath=True)
+                            p2 = cute.math.exp2(s2 * softmax_scale_log2 + b80 - lse8, fastmath=True)
+                            p3 = cute.math.exp2(s3 * softmax_scale_log2 + b81 - lse8, fastmath=True)
+                        else:
+                            p0 = cute.math.exp2(s0 * softmax_scale_log2 - lse0, fastmath=True)
+                            p1 = cute.math.exp2(s1 * softmax_scale_log2 - lse0, fastmath=True)
+                            p2 = cute.math.exp2(s2 * softmax_scale_log2 - lse8, fastmath=True)
+                            p3 = cute.math.exp2(s3 * softmax_scale_log2 - lse8, fastmath=True)
                         acc_s[off + 0] = p0
                         acc_s[off + 1] = p1
                         acc_s[off + 2] = p2
@@ -964,6 +1019,31 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         sw8 = tile_ptr(sdS, pr8, kv_c0, page=PDS, rows=M)
                         sw0.store(pack_half2(acc_dp[off + 0], acc_dp[off + 1], io_dtype), alignment=4)
                         sw8.store(pack_half2(acc_dp[off + 2], acc_dp[off + 3], io_dtype), alignment=4)
+                        if cutlass.const_expr(self.dbias_present):
+                            db_q0 = q_row0 + pr0
+                            db_k0 = kv_base + kv_c0
+                            db_row0 = bias_hq_base + db_q0 * SKV + db_k0
+                            db_row8 = db_row0 + 8 * SKV
+                            db_q0_ok = True
+                            db_q8_ok = True
+                            if cutlass.const_expr(PARTIAL_Q):
+                                db_q0_ok = db_q0 < SQ
+                                db_q8_ok = db_q0 + 8 < SQ
+                            db_k0_ok = True
+                            db_k1_ok = True
+                            if cutlass.const_expr(PARTIAL_KV):
+                                db_k0_ok = db_k0 < SKV
+                                db_k1_ok = db_k0 + 1 < SKV
+                            if db_q0_ok:
+                                if db_k0_ok:
+                                    _red_add_f32(dbias_ptr + db_row0, acc_dp[off + 0])
+                                if db_k1_ok:
+                                    _red_add_f32(dbias_ptr + db_row0 + 1, acc_dp[off + 1])
+                            if db_q8_ok:
+                                if db_k0_ok:
+                                    _red_add_f32(dbias_ptr + db_row8, acc_dp[off + 2])
+                                if db_k1_ok:
+                                    _red_add_f32(dbias_ptr + db_row8 + 1, acc_dp[off + 3])
                 cute.arch.barrier(barrier_id=1, number_of_threads=256)
 
                 if cutlass.const_expr(self.det_2k):
@@ -1312,6 +1392,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dv_ws: cute.Tensor,
         seq_q_lens: Optional[cute.Tensor],
         seq_kv_lens: Optional[cute.Tensor],
+        bias: Optional[cute.Tensor],
+        dbias_accum: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         attn_scale: cutlass.Float32,
         stream: cuda_driver.CUstream,
@@ -1342,6 +1424,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             dv_ws,
             seq_q_lens,
             seq_kv_lens,
+            bias,
+            dbias_accum,
             tma_q_desc,
             tma_k_desc,
             tma_v_desc,
@@ -1611,6 +1695,47 @@ def _convert_dq_host(
     m_blocks = cute.ceil_div(dq.shape[1], q_tile)
     _convert_dq_kernel(dq_accum, dq, q_tile, d_qk, page, warps_m_dq, attn_scale, io_dtype, use_pdl).launch(
         grid=(m_blocks, dq.shape[2], dq.shape[0]),
+        block=(256, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convert kernel: dbias_accum (fp32) -> dBias (io dtype; fp32 outputs skip it)
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _convert_dbias_kernel(
+    dbias_accum: cute.Tensor,  # [total] fp32 (flat view of [1|B, HQ, SQ, SKV])
+    dbias: cute.Tensor,  # [total] out dtype (flat view, same layout)
+    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    use_pdl: cutlass.Constexpr[bool],
+):
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+    bidx, _, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    total = dbias.shape[0]
+    acc_ptr = dbias_accum.iterator.raw_ptr()
+    out_ptr = dbias.iterator.raw_ptr()
+    gidx = bidx * 256 + tidx
+    if gidx < total:
+        (out_ptr + gidx).store((acc_ptr + gidx).load().to(out_dtype))
+
+
+@cute.jit
+def _convert_dbias_host(
+    dbias_accum: cute.Tensor,
+    dbias: cute.Tensor,
+    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+):
+    _convert_dbias_kernel(dbias_accum, dbias, out_dtype, use_pdl).launch(
+        grid=(cute.ceil_div(dbias.shape[0], 256), 1, 1),
         block=(256, 1, 1),
         stream=stream,
         use_pdl=use_pdl,
@@ -1939,6 +2064,7 @@ def compile(  # noqa: A001
     d_qk: int = 128,
     d_v: int = 0,  # the V/O/dO/dV head dim (0 = ``d_qk``; unequal dims serve MLA).
     kvh: int = 0,  # the KV head count for GQA/MQA (0 = ``qh``, plain MHA).
+    bias_batch: int = 0,  # bias / dBias batch dim (1 = broadcast over B, b = per-batch); 0 unless bias_present.
     lse_strides: "tuple[int, int, int] | None" = None,  # non-contiguous LSE (B, H, S) strides; None = contiguous
     # Non-compact io ports: declared BSHD (batch, seq, head) element strides; None = compact BSHD.
     q_strides: "tuple[int, int, int] | None" = None,
@@ -1979,7 +2105,12 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         sink_present=PARAMS.sink_present,
         det_2kernel=det_2k,
+        bias_present=PARAMS.bias_present,
+        dbias_present=PARAMS.dbias_present,
+        bias_is_fp32=PARAMS.bias_is_fp32,
     )
+    if PARAMS.bias_present and bias_batch not in (1, b):
+        raise ValueError(f"bias_batch must be 1 (broadcast) or B={b}; got {bias_batch}")
     d_qk_orig, d_v_orig = bwd.d_qk_orig, bwd.d_v_orig
     d_qk, d_v = bwd.d_qk, bwd.d_v
     sq_r = ceil_div(sq, 128) * 128
@@ -2031,6 +2162,10 @@ def compile(  # noqa: A001
     fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d_v)) if has_gqa else fake_dv
     fake_seq_q_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_q_lens_present else None
     fake_seq_kv_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_kv_lens_present else None
+    # bias / dBias: contiguous [1|B, HQ, SQ, SKV]
+    bias_dtype = cutlass.Float32 if PARAMS.bias_is_fp32 else STORAGE_DTYPE
+    fake_bias = _fake(bias_dtype, (bias_batch, qh, sq, skv)) if PARAMS.bias_present else None
+    fake_dbias_accum = _fake(cutlass.Float32, (bias_batch, qh, sq, skv)) if PARAMS.dbias_present else None
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     options = "--enable-tvm-ffi"
 
@@ -2065,6 +2200,8 @@ def compile(  # noqa: A001
         fake_dv_ws,
         fake_seq_q_lens,
         fake_seq_kv_lens,
+        fake_bias,
+        fake_dbias_accum,
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),
         fake_stream,
@@ -2124,6 +2261,18 @@ def compile(  # noqa: A001
             fake_stream,
             options=options,
         )
+    compiled_dbias_cvt = None
+    if PARAMS.dbias_present and not PARAMS.dbias_is_fp32:
+        dbias_total = bias_batch * qh * sq * skv
+        compiled_dbias_cvt = cute.compile(
+            _convert_dbias_host,
+            _fake(cutlass.Float32, (dbias_total,)),
+            _fake(STORAGE_DTYPE, (dbias_total,)),
+            STORAGE_DTYPE,
+            bwd.use_pdl,
+            fake_stream,
+            options=options,
+        )
     compiled_dsink = None
     if PARAMS.dsink_present:
         fake_sink = _fake(cutlass.Float32, (qh,))
@@ -2145,5 +2294,6 @@ def compile(  # noqa: A001
         cvt=compiled_cvt,
         dq2k=compiled_dq2k,
         reduce=compiled_reduce,
+        dbias_cvt=compiled_dbias_cvt,
         dsink=compiled_dsink,
     )

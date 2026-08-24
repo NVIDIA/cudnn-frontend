@@ -47,6 +47,9 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     seq_kv_lens=None,        # (B,) int32 per-batch KV lengths (padding mask)
     sink_token=None,         # fp32 (1, H_q, 1, 1) sink logits; adds dsink_tensor
                              # to the result
+    bias_tensor=None,        # (1|B, H_q, S_q, S_kv) additive bias (io dtype or
+                             # fp32, contiguous); adds fp32 dbias_tensor to the
+                             # result
 )
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
@@ -109,6 +112,8 @@ reduce  GQA only: dK/dV = fixed-order sum of each KV head's group of q-head part
 cvt     dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
 dq2k    two-kernel deterministic route only, replacing cvt: dQ = attn_scale * dS @ K,
         one CTA per q tile streaming (K tile, dS panel) pairs in ascending kv order
+dbias_cvt  io-dtype dBias graphs only: the fp32 dBias accumulator -> the io dtype
+        (an fp32 dBias accumulates into the output directly and skips this)
 dsink   dSink_token graphs only, summing over every batch b and query row q:
         dsink[h] = -sum_{b,q} exp(sink[h] - LSE[b,h,q]) * delta[b,h,q]
 ```
@@ -295,11 +300,22 @@ only the unused relay operand remains in the kernel ABI.
   denominator); the `dSink_token` output adds one tiny `dsink` reduce kernel
   (`dsink[h] = -sum p_sink * delta`, fixed order — bitwise deterministic in
   both modes)
-- No dropout / bias / ALiBi / softcap / THD
+- Bias: additive `(1|B, H_q, S_q, S_kv)` bias (post-scale, pre-softmax;
+  contiguous, io dtype or fp32) with an optional `dBias` output of the same
+  dims. The main kernel folds `bias * log2(e)` into the softmax-recompute
+  exponent and accumulates `dBias = dS'` (the unscaled softmax VJP) into an
+  fp32 workspace with `red.global.add.f32`; a batch-1 bias thereby reduces
+  over B for free, which also makes `dBias` bitwise NON-deterministic when
+  `B > 1` (dQ/dK/dV determinism is unaffected). An fp32 `dBias` output is
+  that accumulator itself (no extra workspace, no convert kernel); an
+  io-dtype output adds the `dbias_cvt` cast.
+- No dropout / ALiBi / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` scratch, plus
   fp32 `dq_accum` and int32 relay-counter storage (non-deterministic and
   relay-deterministic modes) or the io-dtype `B·H_q·S_q·S_kv_r128` dS buffer
-  (two-kernel deterministic route); GQA adds the io-dtype `dk_ws`/`dv_ws`
+  (two-kernel deterministic route); an io-dtype dBias output adds the fp32
+  accumulator (`(1|B)·H_q·S_q·S_kv` elements; an fp32 dBias needs none);
+  GQA adds the io-dtype `dk_ws`/`dv_ws`
   partials buffers (`B·S_kv·H_q·d_qk_padded` and `B·S_kv·H_q·d_v_padded`
   elements, where `d_*_padded` are the adapter's zero-padded head
   dimensions); use `scratch_workspace_bytes()` for the exact total

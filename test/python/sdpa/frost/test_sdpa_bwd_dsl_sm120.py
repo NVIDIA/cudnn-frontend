@@ -87,6 +87,7 @@ def _ref_bwd(
     window_size_right: int | None = None,
     padding: tuple[list[int], list[int]] | None = None,
     sink_token: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ):
     """Reference via the canonical refs (sdpa/fp16_ref.py)."""
 
@@ -102,6 +103,7 @@ def _ref_bwd(
         k,
         v,
         attn_scale=scale,
+        bias=bias,
         diag_align=diag_align,
         right_bound=right_bound,
         left_bound=left_bound,
@@ -109,13 +111,14 @@ def _ref_bwd(
         sink_token=sink_token,
         torch_type=q.dtype,
     )
-    dq, dk, dv, _, dsink = compute_ref_backward(
+    dq, dk, dv, dbias, dsink = compute_ref_backward(
         q,
         k,
         v,
         o_ref,
         do,
         attn_scale=scale,
+        bias=bias,
         diag_align=diag_align,
         right_bound=right_bound,
         left_bound=left_bound,
@@ -123,7 +126,10 @@ def _ref_bwd(
         sink_token=sink_token,
         torch_type=q.dtype,
     )
-    return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), dsink
+    from types import SimpleNamespace
+
+    aux = SimpleNamespace(dsink=dsink, dbias=dbias)
+    return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), aux
 
 
 def _expect_det_2k(
@@ -161,6 +167,7 @@ def _expected_workspace_bytes(
     deterministic: bool = False,
     window_size_left: int | None = None,
     padded: bool = False,
+    dbias_batch: int = 0,
 ) -> int:
     from cudnn.sdpa.bwd.config_sm120 import padded_head_dims
     from cudnn.sdpa.fwd.api_dsl import ws_align
@@ -180,11 +187,12 @@ def _expected_workspace_bytes(
     else:
         dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
         dq_scratch = ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4)
+    dbias_ws = ws_align(dbias_batch * h_q * s_q * s_kv_eff * 4) if dbias_batch else 0
     # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
     dkv_ws = 0
     if h_kv != h_q:
         dkv_ws = ws_align(batch * s_kv_eff * h_q * d_pad * io_itemsize) + ws_align(batch * s_kv_eff * h_q * dv_pad * io_itemsize)
-    return ws_align(batch * h_q * sq_r * 4) + dq_scratch + dkv_ws
+    return ws_align(batch * h_q * sq_r * 4) + dq_scratch + dbias_ws + dkv_ws
 
 
 def _run_bwd_graph(
@@ -209,6 +217,8 @@ def _run_bwd_graph(
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
     sink_gpu: torch.Tensor | None = None,
+    bias_gpu: torch.Tensor | None = None,
+    dbias_gpu: torch.Tensor | None = None,  # filled in place when given (requires bias_gpu)
     build_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | None", str]:
     """Build and execute the SM120 FROST backward graph; returns (dq, dk, dv, dsink, plan_name)."""
@@ -271,6 +281,13 @@ def _run_bwd_graph(
         dsink_gpu = torch.empty_like(sink_gpu)
         dsink_t = graph.tensor_like(dsink_gpu, name="dSink")
         bwd_kwargs.update(sink_token=sink_t, dSink_token=dsink_t)
+    bias_t = dbias_t = None
+    if bias_gpu is not None:
+        bias_t = graph.tensor_like(bias_gpu, name="bias")
+        bwd_kwargs.update(bias=bias_t)
+        if dbias_gpu is not None:
+            dbias_t = graph.tensor_like(dbias_gpu, name="dBias")
+            bwd_kwargs.update(dBias=dbias_t)
     seq_q_t = seq_kv_t = None
     if seq_q_lens is not None or seq_kv_lens is not None:
         assert seq_q_lens is not None and seq_kv_lens is not None
@@ -322,6 +339,7 @@ def _run_bwd_graph(
             deterministic=deterministic,
             window_size_left=window_size_left,
             padded=seq_kv_lens is not None,
+            dbias_batch=dbias_gpu.shape[0] if dbias_gpu is not None and dbias_gpu.dtype != torch.float32 else 0,
         )
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
@@ -340,6 +358,10 @@ def _run_bwd_graph(
         variant_pack.update({seq_q_t: seq_q_lens, seq_kv_t: seq_kv_lens})
     if sink_t is not None:
         variant_pack.update({sink_t: sink_gpu, dsink_t: dsink_gpu})
+    if bias_t is not None:
+        variant_pack.update({bias_t: bias_gpu})
+        if dbias_t is not None:
+            variant_pack.update({dbias_t: dbias_gpu})
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
     return dq_gpu, dk_gpu, dv_gpu, dsink_gpu, plan_name
@@ -371,6 +393,9 @@ def _run_case(
     grad_layout: str = "bshd",
     padding: tuple[list[int], list[int]] | None = None,
     sink: bool = False,
+    bias: bool = False,
+    bias_dtype: torch.dtype | None = None,  # None = the io dtype
+    dbias: bool = True,  # bias only: also request the dBias output
     stats_layout: str = "contiguous",
 ) -> str:
     h_kv = h_q if h_kv is None else h_kv
@@ -381,7 +406,12 @@ def _run_case(
     v = _bhsd(batch, h_kv, s_kv, head_dim_v, dtype, layout=layout)
     do = _bhsd(batch, h_q, s_q, head_dim_v, dtype, layout=layout)
     sink_gpu = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if sink else None
-    o, stats, dq_ref, dk_ref, dv_ref, dsink_ref = _ref_bwd(
+    bias_gpu = dbias_gpu = None
+    if bias:
+        bias_gpu = torch.randn(1, h_q, s_q, s_kv, dtype=bias_dtype or dtype, device="cuda")
+        if dbias:
+            dbias_gpu = torch.empty_like(bias_gpu)
+    o, stats, dq_ref, dk_ref, dv_ref, aux = _ref_bwd(
         q,
         k,
         v,
@@ -393,6 +423,7 @@ def _run_case(
         window_size_right=window_size_right,
         padding=padding,
         sink_token=sink_gpu,
+        bias=bias_gpu.float() if bias_gpu is not None else None,
     )
     o = _bhsd(batch, h_q, s_q, head_dim_v, dtype, empty=True, layout=layout).copy_(o)
     if stats_layout == "strided":
@@ -421,13 +452,17 @@ def _run_case(
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         sink_gpu=sink_gpu,
+        bias_gpu=bias_gpu,
+        dbias_gpu=dbias_gpu,
     )
     tol = _tolerances(dtype)
     torch.testing.assert_close(dq.float(), dq_ref.float(), **tol)
     torch.testing.assert_close(dk.float(), dk_ref.float(), **tol)
     torch.testing.assert_close(dv.float(), dv_ref.float(), **tol)
     if sink:
-        torch.testing.assert_close(dsink.float(), dsink_ref.float(), **tol)
+        torch.testing.assert_close(dsink.float(), aux.dsink.float(), **tol)
+    if dbias_gpu is not None:
+        torch.testing.assert_close(dbias_gpu.float(), aux.dbias.float(), **tol)
     if padding is not None:
         for b, (len_q, len_kv) in enumerate(zip(*padding)):
             if len_q < s_q:
@@ -593,6 +628,54 @@ def test_sdpa_bwd_dsl_sm120_sink():
     _run_case(s_q=256, s_kv=256, head_dim=64, sink=True, deterministic=True)  # fixed-order reduce
     _run_case(s_q=193, s_kv=257, head_dim=128, is_causal=True, sink=True)  # ragged tails
     _run_case(s_q=256, s_kv=256, head_dim=64, sink=True, padding=([230, 120], [180, 240]))  # padded rows skip (LSE = -inf guard)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@torch_fork_set_rng(seed=60)
+def test_sdpa_bwd_dsl_sm120_bias(mask: str):
+    """Additive bias input + dBias output ((1, H, S_q, S_kv), batch-broadcast).
+    Bias indexing is head-dim independent, so one head dim per mask suffices."""
+
+    _run_case(head_dim=64 if mask == "dense" else 128, is_causal=mask == "causal", bias=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=61)
+def test_sdpa_bwd_dsl_sm120_bias_features():
+    """Bias composed with the other features."""
+
+    _run_case(head_dim=64, bias=True, dbias=False)  # no dBias output requested
+    _run_case(dtype=torch.bfloat16, head_dim=64, s_q=333, s_kv=467, bias=True)  # bf16 + partial tiles (bounds-checked red.add)
+    _run_case(head_dim=64, bias=True, bias_dtype=torch.float32)  # fp32 bias/dBias: in-place accumulation, no cvt kernel or accumulator ws
+    _run_case(h_q=8, h_kv=2, head_dim=64, bias=True)  # GQA: dBias is per q head — no group reduction
+    _run_case(batch=2, head_dim=64, s_q=512, s_kv=512, bias=True, padding=([301, 512], [512, 187]))  # padded cells contribute zero
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=66)
+def test_sdpa_bwd_dsl_sm120_bias_wrapper():
+    """Wrapper bias path: io-dtype bias in, fp32 dBias out (accumulated in
+    place — no accumulator workspace, no convert kernel)."""
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s, head_dim, dtype = 2, 4, 256, 64, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s, head_dim, dtype)
+    k = _bhsd(batch, heads, s, head_dim, dtype)
+    v = _bhsd(batch, heads, s, head_dim, dtype)
+    do = _bhsd(batch, heads, s, head_dim, dtype)
+    bias = torch.randn(1, heads, s, s, dtype=dtype, device="cuda")
+    o, stats, dq_ref, dk_ref, dv_ref, aux = _ref_bwd(q, k, v, do, scale=scale, is_causal=True, bias=bias.float())
+    o = _bhsd(batch, heads, s, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, scale_softmax=scale, bias_tensor=bias)
+    assert out["dbias_tensor"].dtype == torch.float32
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+    torch.testing.assert_close(out["dbias_tensor"], aux.dbias.float(), **tol)
 
 
 @pytest.mark.L0

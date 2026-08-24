@@ -72,6 +72,8 @@ class SdpaBwdDsl(APIBase):
         sample_dv: torch.Tensor | TensorDesc,
         sample_sink: Optional[torch.Tensor | TensorDesc] = None,
         sample_dsink: Optional[torch.Tensor | TensorDesc] = None,
+        sample_bias: Optional[torch.Tensor | TensorDesc] = None,
+        sample_dbias: Optional[torch.Tensor | TensorDesc] = None,
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
@@ -98,6 +100,8 @@ class SdpaBwdDsl(APIBase):
         self.dv_desc = self._make_tensor_desc(sample_dv, name="dV")
         self.sink_desc = self._make_tensor_desc(sample_sink, name="sink") if sample_sink is not None else None
         self.dsink_desc = self._make_tensor_desc(sample_dsink, name="dSink") if sample_dsink is not None else None
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="bias") if sample_bias is not None else None
+        self.dbias_desc = self._make_tensor_desc(sample_dbias, name="dBias") if sample_dbias is not None else None
 
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
@@ -148,6 +152,8 @@ class SdpaBwdDsl(APIBase):
         seq_kv_lens: Optional[torch.Tensor] = None,
         sink_tensor: Optional[torch.Tensor] = None,
         dsink_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
+        dbias_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute the compiled kernel chain using the common operand set."""
 
@@ -317,6 +323,37 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             )
             self._check_dtype(desc, torch.float32, name=desc.name)
 
+        self._value_error_if(
+            self.dbias_desc is not None and self.bias_desc is None,
+            "dBias output requires a bias input",
+        )
+        for desc in (self.bias_desc, self.dbias_desc):
+            if desc is None:
+                continue
+            self._value_error_if(
+                desc.device != self.q_desc.device,
+                f"{desc.name} must be on {self.q_desc.device} (with Q); got {desc.device}",
+            )
+            self._value_error_if(
+                tuple(desc.shape) not in ((1, h_q, s_q, s_kv), (b, h_q, s_q, s_kv)),
+                f"{desc.name} must be (1|B, H_q, S_q, S_kv) = (1|{b}, {h_q}, {s_q}, {s_kv}); got {tuple(desc.shape)}",
+            )
+            self._value_error_if(
+                not desc.is_contiguous(),
+                f"{desc.name} must be contiguous; got stride {desc.stride}",
+            )
+            self._check_dtype(desc, [self.dtype, torch.float32], name=desc.name)
+            # Kernel-side offsets are 32-bit element indices.
+            self._value_error_if(
+                int(desc.shape[0]) * h_q * s_q * s_kv >= 2**31,
+                f"{desc.name} is too large for 32-bit element indexing ({tuple(desc.shape)})",
+            )
+        if self.bias_desc is not None and self.dbias_desc is not None:
+            self._value_error_if(
+                tuple(self.dbias_desc.shape) != tuple(self.bias_desc.shape),
+                f"dBias must match the bias dims {tuple(self.bias_desc.shape)}; got {tuple(self.dbias_desc.shape)}",
+            )
+
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         self.compute_capability = torch.cuda.get_device_capability(self.q_desc.device)
         self._runtime_error_if(
@@ -389,6 +426,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             sink_present=self.sink_desc is not None,
             dsink_present=self.dsink_desc is not None,
             det_2kernel=self.det_2k,
+            bias_present=self.bias_desc is not None,
+            dbias_present=self.dbias_desc is not None,
+            bias_is_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
+            dbias_is_fp32=self.dbias_desc is not None and self.dbias_desc.dtype == torch.float32,
         )
         self._k_mod = _load_sm120_kernel_module(params)
         self._compiled_kernel = self._k_mod.compile(
@@ -400,6 +441,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             d_qk=self.head_dim_qk,
             kvh=self.h_kv,
             d_v=self.head_dim_v,
+            bias_batch=int(self.bias_desc.shape[0]) if self.bias_desc is not None else 0,
             lse_strides=self._lse_strides,
             q_strides=self._io_strides.get("q"),
             k_strides=self._io_strides.get("k"),
@@ -426,6 +468,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         rows = self.batch_size * self.s_k_max * self.h_q
         return (rows * self.head_dim_qk_padded, rows * self.head_dim_v_padded)
 
+    def _dbias_accum_elems(self) -> int:
+        """fp32 elements of the dBias accumulator ([1|B, H_q, S_q, S_kv]);
+        0 when no dBias output is requested or output dtype = f32."""
+
+        if self.dbias_desc is None or self.dbias_desc.dtype == torch.float32:
+            return 0
+        return int(self.dbias_desc.shape[0]) * self.h_q * self.s_q_max * self.s_k_max
+
     def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
         """Validate per-batch lengths and return a (B,) int32 view (never a copy/cast)."""
         self._value_error_if(
@@ -450,8 +500,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         """delta (fp32 [B, H, SQ_r128]) + the dQ scratch — relay path:
         dq_accum (fp32 flat [B*SQ_r128*H*D_QK]) + dq_sem (int32 flat
         [B*H*ceil(SQ/32)], relay counters); det_2kernel path: ds_ws (io
-        [B, H_q, SQ, SKV_r128]) — + dk_ws/dv_ws (io [B, SKV, H_q, D_QK] /
-        [B, SKV, H_q, D_V], per-q-head partials, GQA only)."""
+        [B, H_q, SQ, SKV_r128]) — + dbias_accum (fp32 [1|B, H_q, S_q, S_kv],
+        io-dtype dBias output only; an fp32 dBias accumulates in place)
+        + dk_ws/dv_ws (io [B, SKV, H_q, D_QK] / [B, SKV, H_q, D_V],
+        per-q-head partials, GQA only)."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
@@ -459,8 +511,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             dq_scratch_bytes = ws_align(self._ds_ws_elems() * self.dtype.itemsize)
         else:
             dq_scratch_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded * 4) + ws_align(self._dq_sem_len() * 4)
+        dbias_bytes = ws_align(self._dbias_accum_elems() * 4)
         dkv_ws_bytes = sum(ws_align(elems * self.dtype.itemsize) for elems in self._dkv_ws_elems())
-        return delta_bytes + dq_scratch_bytes + dkv_ws_bytes
+        return delta_bytes + dq_scratch_bytes + dbias_bytes + dkv_ws_bytes
 
     def execute(
         self,
@@ -480,6 +533,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         seq_kv_lens: Optional[torch.Tensor] = None,
         sink_tensor: Optional[torch.Tensor] = None,
         dsink_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
+        dbias_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization."""
 
@@ -510,6 +565,22 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             self.dsink_desc is None and dsink_tensor is not None,
             "this specialization was compiled without a dSink output; construct the API with sample_dsink",
         )
+        self._value_error_if(
+            self.bias_desc is not None and bias_tensor is None,
+            "bias_tensor is required by this compiled specialization",
+        )
+        self._value_error_if(
+            self.bias_desc is None and bias_tensor is not None,
+            "this specialization was compiled without a bias input; construct the API with sample_bias",
+        )
+        self._value_error_if(
+            self.dbias_desc is not None and dbias_tensor is None,
+            "dbias_tensor is required by this compiled specialization",
+        )
+        self._value_error_if(
+            self.dbias_desc is None and dbias_tensor is not None,
+            "this specialization was compiled without a dBias output; construct the API with sample_dbias",
+        )
 
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         scale_log2 = scale_val * math.log2(math.e)
@@ -524,6 +595,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         else:
             dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded, torch.float32)
             dq_sem = carver.take(self._dq_sem_len(), torch.int32)
+        dbias_accum_elems = self._dbias_accum_elems()
+        dbias_accum = carver.take(dbias_accum_elems, torch.float32) if dbias_accum_elems else None
 
         if current_stream is None:
             # Direct call (no dispatch-forwarded stream): fall back to torch's
@@ -574,8 +647,23 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 dk_ws = carver.take(dkw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_qk_padded)
                 dv_ws = carver.take(dvw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_v_padded)
 
-            # Kernel chain: dot -> main -> [reduce] -> cvt, or on the
-            # det_2kernel route dot -> main -> dq2k -> [reduce].
+            bias_view = None
+            dbias_dst = None
+            if self.bias_desc is not None:
+                bias_shape = tuple(int(x) for x in self.bias_desc.shape)
+                bias_view = bias_tensor.reshape(bias_shape)
+            if self.dbias_desc is not None:
+                dbias_shape = tuple(int(x) for x in self.dbias_desc.shape)
+                if dbias_accum is None:
+                    # fp32 output: the kernel red.adds into it directly.
+                    dbias_tensor.zero_()
+                    dbias_dst = dbias_tensor.reshape(dbias_shape)
+                else:
+                    dbias_accum.zero_()
+                    dbias_dst = dbias_accum.view(dbias_shape)
+
+            # Kernel chain: dot -> main -> [reduce] -> cvt -> [dbias_cvt], or on
+            # the det_2kernel route dot -> main -> dq2k -> [reduce] -> [dbias_cvt].
             kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
             kernels.main(
                 q,
@@ -591,6 +679,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 dv_ws,
                 seq_q_t,
                 seq_kv_t,
+                bias_view,
+                dbias_dst,
                 cutlass.Float32(scale_log2),
                 cutlass.Float32(scale_val),
                 current_stream,
@@ -602,6 +692,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 kernels.reduce(dk_ws, dv_ws, dk, dv, current_stream)
             if not self.det_2k:
                 kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
+            if kernels.dbias_cvt is not None:
+                kernels.dbias_cvt(dbias_accum, dbias_tensor.reshape(-1), current_stream)
             if kernels.dsink is not None:
                 kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), seq_q_t, current_stream)
 
@@ -630,6 +722,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
     seq_q_lens: Optional[torch.Tensor] = None,
     seq_kv_lens: Optional[torch.Tensor] = None,
     sink_token: Optional[torch.Tensor] = None,
+    bias_tensor: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Run SM120 SDPA backward and return ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...)``."""
 
@@ -637,6 +730,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
     dk_tensor = torch.empty_strided(k_tensor.shape, k_tensor.stride(), dtype=k_tensor.dtype, device=k_tensor.device)
     dv_tensor = torch.empty_strided(v_tensor.shape, v_tensor.stride(), dtype=v_tensor.dtype, device=v_tensor.device)
     dsink_tensor = torch.empty_like(sink_token) if sink_token is not None else None
+    dbias_tensor = torch.empty_like(bias_tensor, dtype=torch.float32) if bias_tensor is not None else None
 
     # check_support()/compile() run only on a miss, so the key must carry the
     # full signature of every operand the specialization depends on (dq/dk/dv
@@ -657,6 +751,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         seq_q_lens is not None,
         seq_kv_lens is not None,
         _tensor_signature(sink_token) if sink_token is not None else None,
+        _tensor_signature(bias_tensor) if bias_tensor is not None else None,
     )
     api = _wrapper_api_cache.get(cache_key)
     if api is None:
@@ -672,6 +767,8 @@ def sdpa_bwd_wrapper_dsl_sm120(
             sample_dv=dv_tensor,
             sample_sink=sink_token,
             sample_dsink=dsink_tensor,
+            sample_bias=bias_tensor,
+            sample_dbias=dbias_tensor,
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=window_size_left,
@@ -702,7 +799,12 @@ def sdpa_bwd_wrapper_dsl_sm120(
         seq_kv_lens=seq_kv_lens,
         sink_tensor=sink_token,
         dsink_tensor=dsink_tensor,
+        bias_tensor=bias_tensor,
+        dbias_tensor=dbias_tensor,
     )
+    out = TupleDict(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor)
+    if dbias_tensor is not None:
+        out["dbias_tensor"] = dbias_tensor
     if dsink_tensor is not None:
-        return TupleDict(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor, dsink_tensor=dsink_tensor)
-    return TupleDict(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor)
+        out["dsink_tensor"] = dsink_tensor
+    return out
