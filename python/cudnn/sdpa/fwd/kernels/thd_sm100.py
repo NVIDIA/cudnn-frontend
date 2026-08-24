@@ -183,7 +183,13 @@ def build_thd_meta_kernel(
     whole-block. The main kernel launched after it on the same stream sees the
     writes by kernel boundary ordering."""
     meta = cutlass.make_array_view(meta_t)
-    if nvvm.elect_sync():
+    tidx, _, _ = cute.arch.thread_idx()
+    nthreads, _, _ = cute.arch.block_dim()
+    # elect_sync elects one thread PER WARP, and this block is THD_SETUP_THREADS
+    # wide so the ranking below can run in parallel — narrow the single-thread
+    # body to warp 0's leader. Every warp still evaluates elect_sync (it is warp
+    # -uniform); only the added predicate is what excludes warps 1..N.
+    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
         write_thd_meta(
             meta,
             cutlass.make_array_view(q_lens_t),
@@ -193,8 +199,6 @@ def build_thd_meta_kernel(
         )
     # Barrier first: the ranking reads the cu_seqlens_q written above.
     cute.arch.barrier()
-    tidx, _, _ = cute.arch.thread_idx()
-    nthreads, _, _ = cute.arch.block_dim()
     write_thd_batch_remap(meta, n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     # Live unit total + claim counter, as on SM100 — a SM120 unit is q_tile
     # rows of one head, so the same count applies with cga_tile_m := q_tile.
@@ -239,7 +243,12 @@ def build_thd_meta_o_kv_descs_kernel(
     TMA-OOB and land as EXACT ZEROS in SMEM (zero V nulls the masked P·V
     terms; zero K keeps the pre-mask row-max finite). Slot ``n_batch`` stays
     the never-built dead-unit pad slot."""
-    if nvvm.elect_sync():
+    tidx, _, _ = cute.arch.thread_idx()
+    nthreads, _, _ = cute.arch.block_dim()
+    # Warp 0's leader only. This flavor launches one warp, so elect_sync alone
+    # would do; the predicate keeps all three setup kernels safe under any block
+    # width, since elect_sync elects one thread PER WARP.
+    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
         meta = cutlass.make_array_view(meta_t)
         write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
         cuq0 = n_batch
@@ -286,8 +295,6 @@ def build_thd_meta_o_kv_descs_kernel(
     # decode walks this permutation on every THD flavor, so a setup that skips
     # it leaves the region uninitialized and units decode garbage batches.
     cute.arch.barrier()
-    tidx, _, _ = cute.arch.thread_idx()
-    nthreads, _, _ = cute.arch.block_dim()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
 
 
@@ -320,7 +327,13 @@ def build_thd_meta_o_descs_kernel(
     O TMA descriptors from the cu_q values just written (same thread, program
     order). Replaces the host tolist → cumsum → H2D round-trip with work
     inside the setup launch that already existed for the descriptors."""
-    if nvvm.elect_sync():
+    tidx, _, _ = cute.arch.thread_idx()
+    nthreads, _, _ = cute.arch.block_dim()
+    # elect_sync elects one thread PER WARP, and this block is THD_SETUP_THREADS
+    # wide so the ranking below can run in parallel — narrow the single-thread
+    # body to warp 0's leader. Without this, one warp's descriptor base-copy can
+    # land after another's tensormap_replace and revert the patched address.
+    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
         meta = cutlass.make_array_view(meta_t)
         write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
         cuq0 = n_batch
@@ -356,8 +369,6 @@ def build_thd_meta_o_descs_kernel(
     # Outside the elect: every thread helps rank the batches. The barrier makes
     # the cu_seqlens_q written above visible to the whole block first.
     cute.arch.barrier()
-    tidx, _, _ = cute.arch.thread_idx()
-    nthreads, _, _ = cute.arch.block_dim()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     # Live unit total + claim counter for the persistent scheduler. The host
     # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the

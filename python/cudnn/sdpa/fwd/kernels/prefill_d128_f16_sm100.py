@@ -646,6 +646,7 @@ def _kernel(
                 cutlass.Int32(4) * n_batch + cutlass.Int32(3),
                 cutlass.Int32(4) * n_batch + cutlass.Int32(2),
                 CGA_SIZE,
+                CFG.CGA_M,
             )
         else:
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
@@ -2185,11 +2186,14 @@ def _host(
         # DEVICE-side from the caller's length tensors (no host cumsum, no
         # H2D — issue #552), then the per-batch O descriptor array (reuse
         # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
-        # PLAN-TIME ENVELOPE (n_thd_units = B * ceil(S_q_decl/CGA_TILE_M) * QH,
-        # from the DECLARED S_q — no runtime length reaches the host); units
-        # past a sequence's live tiles decode the batch == n_batch sentinel
-        # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
-        # Works at cga1 (CGA_M=1).
+        # PERSISTENT cluster count — the adapter hands down n_thd_units already
+        # capped to what the device holds resident, min(plan-time envelope,
+        # SMs / CTA_MMA), NOT the envelope itself. It doubles as the claim
+        # counter's seed: cluster c runs unit c off its blockIdx, then pulls
+        # from the counter, so the grid and the seed must be the same number.
+        # Dispatching past the live total stays safe either way — such a unit
+        # decodes the batch == n_batch sentinel and drains without loads or
+        # stores. grid_x = n_thd_units * CGA_M. Works at cga1 (CGA_M=1).
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.

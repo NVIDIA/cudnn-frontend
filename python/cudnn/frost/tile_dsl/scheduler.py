@@ -119,6 +119,7 @@ def scheduler_warp_loop_persistent(
     ctr_off,
     live_off,
     cga_size: int,
+    cga_m: int,
 ):
     """Persistent tile scheduler over a LIVE-ONLY unit range (THD).
 
@@ -132,6 +133,11 @@ def scheduler_warp_loop_persistent(
     peer's scheduler mbarrier -- the same shape as ``read_tile_id_arrive``.
     Multicast is not available here: it is a clusterlaunchcontrol facility, so
     dynamic claiming needs an explicit peer write.
+
+    ``cga_size`` is the DSMEM broadcast fan-out (CTAs per cluster); ``cga_m`` is
+    the stride the consumer's decode divides back out. They are equal while
+    CGA_N == 1, which is every config today -- taking both keeps the handout
+    correct if that ever stops holding.
     """
     meta = cutlass.make_array_view(meta_t)
     ctr_ptr = Pointer(meta_t.iterator.raw_ptr(), dtype=cutlass.Int32) + ctr_off
@@ -151,7 +157,9 @@ def scheduler_warp_loop_persistent(
             uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
             live = cutlass.Int32(meta[live_off])
             valid = cutlass.Int32(arith.select((uid < live).ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
-            linear = uid * cutlass.Int32(cga_size)
+            # Stride by CGA_M, not the cluster size: the consumer decodes the
+            # unit id back out as linear // CGA_M.
+            linear = uid * cutlass.Int32(cga_m)
             # store_async_dsmem wants CuTe pointers; the smem arrays hand out
             # base-DSL ones, so convert through the raw addresses.
             _tile_ptr = cute.make_ptr(
