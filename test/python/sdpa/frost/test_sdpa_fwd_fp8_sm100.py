@@ -52,7 +52,7 @@ def _quant(x, in_key):
     return (x / dq).clamp(-fmax, fmax).to(fp8), dq
 
 
-def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=None, sinks=None, seq_lens_kv=None):
+def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=None, sinks=None, seq_lens_kv=None, return_stats=False):
     b, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = vd.shape
     dev = qd.device
@@ -75,12 +75,19 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     scores = scores.masked_fill(masked, float("-inf"))
     if sinks is not None:
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
-        probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)
-        return torch.matmul(probs[..., :s_kv], v_e)
+        ext = torch.cat([scores, col], dim=-1)
+        probs = torch.softmax(ext, dim=-1)
+        o = torch.matmul(probs[..., :s_kv], v_e)
+        if return_stats:
+            return o, torch.logsumexp(ext, dim=-1)
+        return o
     row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
     probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
-    return torch.matmul(probs, v_e)
+    o = torch.matmul(probs, v_e)
+    if return_stats:
+        return o, torch.logsumexp(scores, dim=-1)
+    return o
 
 
 def _run(
@@ -102,6 +109,8 @@ def _run(
     sync_debug=False,
     d_qk=128,
     d_v=128,
+    pack_gqa=None,
+    return_lse=False,
 ):
     import cudnn
 
@@ -166,7 +175,7 @@ def _run(
     g.create_execution_plans([cudnn.heur_mode.A])
     # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
     # and the head-dim envelope) happens inside the lowering.
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
+    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     if not stats:
@@ -192,6 +201,10 @@ def _run(
     ref_kw = _ref_kwargs(sdpa_kwargs)
     if sink is not None:
         ref_kw["sinks"] = sink.flatten()
+    if return_lse:
+        assert stats, "return_lse requires stats=True"
+        o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, return_stats=True, **ref_kw)
+        return Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.view(B, H_q, S_q), lse_ref
     o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
     return Ob, o_ref, amax_o.item(), o_ref.abs().max().item()
 
@@ -423,6 +436,145 @@ def test_fp8_gqa(in_key):
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+# --- PackGQA: TILE_M/G tokens x G query heads per tile -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,h_kv",
+    [(8, 4), (8, 2), (8, 1), (16, 1)],
+    ids=["g2", "g4", "g8_mqa", "g16_mqa"],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_ratios(h_q, h_kv):
+    """Packed plans across GQA ratios, causal, tile-unaligned s_q, LSE checked."""
+    scale = 1.0 / math.sqrt(128)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        2, h_q, h_kv, 40, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True, return_lse=True
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [8, 64, 100], ids=["subspan", "exact_span", "tail"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_tiles(s_q):
+    """Packed tile-geometry edges at G=8 (s_q*G below / at / past the 512-row CGA span)."""
+    scale = 1.0 / math.sqrt(128)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        1, 64, 8, s_q, 256, "e4m3", torch.bfloat16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True, return_lse=True
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_dt", [torch.float16, torch.float8_e4m3fn], ids=["f16_out", "e4m3_out"])
+@pytest.mark.parametrize(
+    "mask",
+    ["none_padded", "causal", "causal_br", "swa", "sink_causal"],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_features(mask, out_dt):
+    """Packed plans x the fp8 mask/sink envelope x both output dtypes."""
+    scale = 1.0 / math.sqrt(128)
+    kw = dict()
+    sink = None
+    seq_lens_kv = None
+    if mask == "none_padded":
+        seq_lens_kv = [180, 240]
+    elif mask == "causal":
+        kw = dict(use_causal_mask=True)
+    elif mask == "causal_br":
+        kw = dict(use_causal_mask_bottom_right=True)
+    elif mask == "swa":
+        kw = dict(use_causal_mask=True, left_bound=17)
+    elif mask == "sink_causal":
+        kw = dict(use_causal_mask=True)
+        sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        2, 8, 2, 40, 256, "e4m3", out_dt, scale=scale, sdpa_kwargs=kw, sink=sink, seq_lens_kv=seq_lens_kv, pack_gqa=True, return_lse=True
+    )
+    _check(out, o_ref, out_dt, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_e5m2():
+    """Packed e5m2 input path."""
+    scale = 1.0 / math.sqrt(128)
+    out, o_ref, a_o, a_ref = _run(2, 8, 2, 40, 256, "e5m2", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True)
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
+    """Packed d192xd128 flavor across GQA ratios, causal, tile-unaligned s_q."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        2,
+        h_q,
+        h_kv,
+        40,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=192,
+        d_v=128,
+        pack_gqa=True,
+        return_lse=True,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_grouped_lpt():
+    """Packed d192xd128 through the grouped-LPT decoder: the head-group and
+    reverse-row (lpt_q_tiles) knobs must see the PACKED launch geometry —
+    B * (h_q/G) = 32 selects the group-of-8 decoder, and s_q*G spans two
+    reverse-row CGA tiles."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        8,
+        8,
+        4,
+        300,
+        512,
+        "e4m3",
+        torch.bfloat16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=192,
+        d_v=128,
+        pack_gqa=True,
+        return_lse=True,
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_on_rubin
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_e5m2_sink():
+    """Packed d192xd128 E5M2 + sink: the sink logit seeds the softmax per
+    ROW, so under packing the seed is lane-varying (row's true query head)."""
+    scale = 1.0 / math.sqrt(192)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref = _run(
+        2, 8, 2, 40, 256, "e5m2", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink, d_qk=192, d_v=128, pack_gqa=True
+    )
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
 @pytest.mark.L0

@@ -28,7 +28,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams, pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -301,6 +301,7 @@ class SdpaFwdDsl(APIBase):
         cga: Optional[int] = None,
         split_kv: Optional[int] = None,
         softmax_precision: Optional[int] = None,
+        pack_gqa: Optional[bool] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -375,6 +376,7 @@ class SdpaFwdDsl(APIBase):
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
         self.softmax_precision = softmax_precision
+        self.pack_gqa = bool(pack_gqa) if pack_gqa is not None else False
 
         self.batch_size: Optional[int] = None
         self.s_q_max: Optional[int] = None
@@ -803,10 +805,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
 
+        if self.pack_gqa:
+            self._not_implemented_error_if(
+                self.thd,
+                "PackGQA is dense-only (THD/ragged runs unpacked)",
+            )
+            self._value_error_if(
+                not pack_gqa_supported(int(h_qo), int(h_kv)),
+                f"PackGQA requires h_q/h_kv to divide the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
+            )
+
         # Q/K/V dtype: half (BF16/FP16, DTYPE_O == input) or FP8 (E4M3/E5M2 → MXFP8,
         # d128 only, DTYPE_O independent — typically BF16/FP16).
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        self._not_implemented_error_if(
+            self.pack_gqa and self._fp8 and not self._pertensor,
+            "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
+            "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
+            "(see the SF layout note in prefill_d128_mxfp8_sm100.py)",
+        )
         for desc in [self.k_desc, self.v_desc]:
             self._check_dtype(desc, self.dtype, name=desc.name, extra_error_msg=f"{desc.name} must match Q dtype")
         if self._fp8:
@@ -1045,12 +1063,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
+        _pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         lpt_head_group = 1
-        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
+        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q // _pack_g) % 8 == 0:
             lpt_head_group = 8
         lpt_q_tiles = 0
         if self._fp8 and self.flavor == (192, 128) and not self.thd:
-            lpt_q_tiles = (self.s_q_max + 511) // 512
+            lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
         template_window_right = self.window_right
         if (
             self._fp8
@@ -1079,9 +1098,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lpt_head_group=lpt_head_group,
             lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
+            pack_gqa=self.pack_gqa,
+            qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
+            split_kv=self.split_kv,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
-            split_kv=self.split_kv,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
@@ -2396,6 +2417,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        if self.pack_gqa:
+            self._not_implemented_error_if(
+                self.thd,
+                "PackGQA is dense-only (THD/ragged runs unpacked)",
+            )
+            self._value_error_if(
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile)),
+                f"PackGQA requires h_q/h_kv to divide q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+            )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
                 # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the
@@ -2564,6 +2594,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             thd_varlen=self.thd,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
+            pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
         )
         self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)

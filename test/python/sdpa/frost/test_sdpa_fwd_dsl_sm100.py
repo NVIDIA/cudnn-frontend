@@ -169,7 +169,7 @@ def _bhsd(b, h, s, d, dtype, device="cuda"):
     return torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
 
 
-def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q=None, sink=None):
+def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q=None, sink=None, pack_gqa=None, return_stats=False):
     """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
     import cudnn
 
@@ -181,37 +181,44 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     q = g.tensor_like(q_gpu)
     k = g.tensor_like(k_gpu)
     v = g.tensor_like(v_gpu)
-    kw = dict(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=scale)
+    kw = dict(name="sdpa", q=q, k=k, v=v, generate_stats=return_stats, attn_scale=scale)
     vp = {q: q_gpu, k: k_gpu, v: v_gpu}
     if seq_len_kv is not None:
         slk = g.tensor_like(seq_len_kv)
         kw["seq_len_kv"] = slk
         kw["use_padding_mask"] = True
         vp[slk] = seq_len_kv
-        # padding_mask requires a seq_len_q companion; when the caller passes
-        # none, synthesize full lengths (KV-only trim, every Q row live).
-        if seq_len_q is None:
-            seq_len_q = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
-        slq = g.tensor_like(seq_len_q)
+        # padding_mask requires a seq_len_q companion; without a caller-provided
+        # seq_len_q the kernel trims only KV (Q full).
+        slq_t = seq_len_q if seq_len_q is not None else torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
+        slq = g.tensor_like(slq_t)
         kw["seq_len_q"] = slq
-        vp[slq] = seq_len_q
+        vp[slq] = slq_t
     if sink is not None:
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
     kw.update(sdpa_kwargs)
-    o, _ = g.sdpa(**kw)
+    o, stats = g.sdpa(**kw)
     o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
+    stats_gpu = None
+    if return_stats:
+        stats_gpu = torch.empty(b, h_q, s_q, dtype=torch.float32, device="cuda")
+        stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        stats.set_dim((b, h_q, s_q, 1)).set_stride((h_q * s_q, s_q, 1, 1))
+        vp[stats] = stats_gpu
 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name())
+    _select_engine(g, engine_name(), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
     torch.cuda.synchronize()
+    if return_stats:
+        return o_gpu, stats_gpu
     return o_gpu
 
 
@@ -565,6 +572,250 @@ def test_dsl_sm100_gqa(dtype, d):
     o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True))
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+# --- PackGQA: TILE_M/G tokens x G query heads per tile -------
+def _pack_gqa_case(d, h_q, h_kv, s_q, s_kv, dtype, *, sdpa_kwargs):
+    q = _bhsd(2, h_q, s_q, d, dtype)
+    k = _bhsd(2, h_kv, s_kv, d, dtype)
+    v = _bhsd(2, h_kv, s_kv, d, dtype)
+    scale = 1.0 / math.sqrt(d)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=sdpa_kwargs, pack_gqa=True)
+    return q, k, v, scale, o
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_false_pinned():
+    """pack_gqa=False pinned on a GQA graph runs the classic unpacked kernel
+    and matches the reference — the knob's False side verified numerically,
+    independent of what the auto rule would rank first on this device."""
+    _require_dsl()
+    d, h_q, h_kv = 128, 8, 2
+    q = _bhsd(2, h_q, 40, d, torch.float16)
+    k = _bhsd(2, h_kv, 256, d, torch.float16)
+    v = _bhsd(2, h_kv, 256, d, torch.float16)
+    scale = 1.0 / math.sqrt(d)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.float16, sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=False)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,h_kv",
+    [(8, 4), (8, 2), (8, 1), (16, 1)],
+    ids=["g2", "g4", "g8_mqa", "g16_mqa"],
+)
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_ratios(d, h_q, h_kv):
+    """Packed plans across GQA ratios (incl. MQA), causal, tile-unaligned s_q."""
+    _require_dsl()
+    q, k, v, scale, o = _pack_gqa_case(d, h_q, h_kv, 40, 256, torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("h_q,h_kv", [(8, 2), (64, 1), (128, 1)], ids=["g4", "g64_mqa", "g128_mqa"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_d512(dtype, h_q, h_kv):
+    """Packed d512 flavor (SPLIT_PIPELINE / cga4; epilogue in the softmax WG).
+
+    G=64 packs 2 tokens per tile and G=128 one token per tile — the whole
+    tile is a single token's head family (MQA decode geometry)."""
+    _require_dsl()
+    q, k, v, scale, o = _pack_gqa_case(512, h_q, h_kv, 40, 256, dtype, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,s_q", [(64, 1), (64, 3), (128, 4)], ids=["g64_q1", "g64_q3_mtp", "g128_q4_mtp"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_d512_mqa_decode(h_q, s_q):
+    """MQA decode/MTP geometry on d512 (single shared KV head, long cache):
+    q_tokens 1-4 against s_kv=2048 with a bottom-right band — the packed
+    tile is dominated by one token's head family, and the whole q span fits
+    inside one packed tile span."""
+    _require_dsl()
+    dtype = torch.bfloat16
+    q = _bhsd(2, h_q, s_q, 512, dtype)
+    k = _bhsd(2, 1, 2048, 512, dtype)
+    v = _bhsd(2, 1, 2048, 512, dtype)
+    scale = 1.0 / math.sqrt(512)
+    kw = dict(use_causal_mask_bottom_right=True) if s_q > 1 else dict()
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, pack_gqa=True)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=s_q > 1, bottom_right=s_q > 1)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_d192_d128(dtype):
+    """Packed native DSv3 shape (d_qk=192 / d_v=128, QO_ALIAS, LPT-only)."""
+    _require_dsl()
+    b, h_q, h_kv, s_q, s_kv = 2, 8, 2, 40, 256
+    scale = 1.0 / math.sqrt(192)
+    q = _bhsd(b, h_q, s_q, 192, dtype)
+    k = _bhsd(b, h_kv, s_kv, 192, dtype)
+    v = _bhsd(b, h_kv, s_kv, 128, dtype)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,h_q,h_kv,s_q",
+    [
+        # d128: CGA token span 512/G.  G=8: sub-span (8), exact span (64), tail (100).
+        (128, 64, 8, 8),
+        (128, 64, 8, 64),
+        (128, 64, 8, 100),
+        # d256: CGA token span 256/G.  G=16: sub-span (4), exact span (16), tail (25).
+        (256, 32, 2, 4),
+        (256, 32, 2, 16),
+        (256, 32, 2, 25),
+    ],
+    ids=["d128_subspan", "d128_exact", "d128_tail", "d256_subspan", "d256_exact", "d256_tail"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_tiles(d, h_q, h_kv, s_q):
+    """Packed tile geometry edges: s_q*G below / at / past the CGA tile span."""
+    _require_dsl()
+    q, k, v, scale, o = _pack_gqa_case(d, h_q, h_kv, s_q, 256, torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("s_q", [1, 129, 1023, 2048])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_tiles_deep(s_q):
+    """Packed multi-wave / odd-length shapes (persistent scheduler wraps)."""
+    _require_dsl()
+    q, k, v, scale, o = _pack_gqa_case(128, 64, 8, s_q, 2048, torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "mask",
+    ["none", "causal", "causal_br", "swa", "band_right", "padded", "sink_swa"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_features(mask):
+    """Packed plans x the dense mask/sink/stats envelope, with LSE checked —
+    the packed epilogue scatters LSE across G head rows and reads per-row
+    sinks, so stats are the sharpest probe of the row-identity math."""
+    _require_dsl()
+    d, b, h_q, h_kv, s_q, s_kv = 128, 2, 8, 2, 40, 256
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    kw = dict()
+    ref = dict()
+    seq_len_kv = None
+    sink = None
+    if mask == "causal":
+        kw, ref = dict(use_causal_mask=True), dict(is_causal=True)
+    elif mask == "causal_br":
+        kw, ref = dict(use_causal_mask_bottom_right=True), dict(is_causal=True, bottom_right=True)
+    elif mask == "swa":
+        kw, ref = dict(use_causal_mask=True, sliding_window_length=17), dict(is_causal=True, swa_window=16)
+    elif mask == "band_right":
+        # diagonal_band_right_bound implies the causal diagonal (the graph API
+        # rejects combining it with use_causal_mask).
+        kw, ref = dict(diagonal_band_right_bound=8), dict(is_causal=True, band_right=8)
+    elif mask == "padded":
+        seq_len_kv = torch.tensor([180, 240], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        ref = dict(seq_kv_lens=seq_len_kv.flatten())
+    elif mask == "sink_swa":
+        sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+        kw, ref = dict(use_causal_mask=True, sliding_window_length=17), dict(is_causal=True, swa_window=16, sinks=sink.flatten())
+    o, lse = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, sink=sink, pack_gqa=True, return_stats=True)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **ref)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_qtrim():
+    """Packed dense padded-Q trim: rows past seq_len_q[b] write O := 0 and
+    LSE := -inf — under packing the trim predicate is per-TOKEN, exercised
+    here with per-batch lengths that are not multiples of the token span."""
+    _require_dsl()
+    d, b, h_q, h_kv, s_q, s_kv = 128, 2, 8, 2, 128, 256
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    q_lens = [37, 90]
+    kv_lens = [180, 240]
+    seq_len_q = torch.tensor(q_lens, dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    seq_len_kv = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o, lse = _run_dsl_graph(
+        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), seq_len_kv=seq_len_kv, seq_len_q=seq_len_q, pack_gqa=True, return_stats=True
+    )
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, seq_kv_lens=seq_len_kv.flatten(), return_stats=True)
+    for i, ql in enumerate(q_lens):
+        o_ref[i, :, ql:, :] = 0.0
+        lse_ref[i, :, ql:] = float("-inf")
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_pack_gqa_knob_contract():
+    """pack_gqa is honored-or-ineligible: no packed plan exists for MHA or a
+    ratio that does not divide tile_m, and an unpacked plan always does."""
+    _require_dsl()
+    import cudnn
+
+    def _plans_for(h_q, h_kv, s, b=2):
+        d, dtype = 128, torch.float16
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        q = g.tensor_like(_bhsd(b, h_q, s, d, dtype))
+        k = g.tensor_like(_bhsd(b, h_kv, s, d, dtype))
+        v = g.tensor_like(_bhsd(b, h_kv, s, d, dtype))
+        o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=1.0 / math.sqrt(d), use_causal_mask=True)
+        o.set_output(True).set_dim((b, h_q, s, d)).set_stride((s * h_q * d, d, h_q * d, 1))
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        name = engine_name()
+        out = []
+        for i in range(len(g.plans)):
+            pn = g.get_plan_name_at_index(i)
+            if pn == name or pn.startswith(name + "["):
+                out.append(getattr(g.plans[i].knobs, "pack_gqa", None))
+        return out
+
+    # MHA: only unpacked plans.
+    pg = _plans_for(8, 8, 64)
+    assert pg and True not in pg, f"MHA graph must not rank a packed plan; got {pg}"
+    # ratios that do not divide tile_m (full-ratio contract): only unpacked plans.
+    pg = _plans_for(6, 2, 64)
+    assert pg and True not in pg, f"ratio-3 graph must not rank a packed plan; got {pg}"
+    pg = _plans_for(12, 2, 64)
+    assert pg and True not in pg, f"ratio-6 graph must not rank a packed plan; got {pg}"
+    # GQA small s_q (s_q < the CGA tile): both variants ranked, packed
+    # first — the rule is shape-only, so no batch/SM-count staging needed.
+    pg = _plans_for(64, 8, 64)
+    assert pg[0] is True and False in pg, f"small-s_q GQA should rank packed first with unpacked runner-up; got {pg}"
+    # GQA full prefill: both variants ranked, unpacked first.
+    pg = _plans_for(64, 8, 8192)
+    assert pg[0] is False and True in pg, f"full-prefill GQA should rank unpacked first with packed runner-up; got {pg}"
 
 
 # THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of
