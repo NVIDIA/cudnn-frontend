@@ -28,12 +28,18 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Forward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256)
 - [SDPA Backward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [MoE + Expert Parallel API](moe_ep.md)
 
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax, GEMM + SwiGLU, and the grouped GEMM APIs require the `cutedsl` optional dependency, which can be installed via:
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
+```
+
+MoE + Expert Parallel requires its dedicated optional dependencies:
+```bash
+pip install nvidia-cudnn-frontend[moe_ep]
 ```
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
