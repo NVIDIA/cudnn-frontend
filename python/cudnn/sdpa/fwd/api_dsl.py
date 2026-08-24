@@ -1063,12 +1063,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
+        _pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         lpt_head_group = 1
-        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
+        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q // _pack_g) % 8 == 0:
             lpt_head_group = 8
         lpt_q_tiles = 0
         if self._fp8 and self.flavor == (192, 128) and not self.thd:
-            lpt_q_tiles = (self.s_q_max + 511) // 512
+            lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
         template_window_right = self.window_right
         if (
             self._fp8

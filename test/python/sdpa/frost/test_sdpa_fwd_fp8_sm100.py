@@ -509,6 +509,50 @@ def test_fp8_pack_gqa_e5m2():
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
+@_skip_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
+    """Packed d192xd128 flavor across GQA ratios, causal, tile-unaligned s_q."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        2, h_q, h_kv, 40, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=192, d_v=128, pack_gqa=True, return_lse=True
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_grouped_lpt():
+    """Packed d192xd128 through the grouped-LPT decoder: the head-group and
+    reverse-row (lpt_q_tiles) knobs must see the PACKED launch geometry —
+    B * (h_q/G) = 32 selects the group-of-8 decoder, and s_q*G spans two
+    reverse-row CGA tiles."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
+        8, 8, 4, 300, 512, "e4m3", torch.bfloat16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=192, d_v=128, pack_gqa=True, return_lse=True
+    )
+    _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_ref)
+    torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
+
+
+@_skip_on_rubin
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_fp8_pack_gqa_d192_d128_e5m2_sink():
+    """Packed d192xd128 E5M2 + sink: the sink logit seeds the softmax per
+    ROW, so under packing the seed is lane-varying (row's true query head)."""
+    scale = 1.0 / math.sqrt(192)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref = _run(
+        2, 8, 2, 40, 256, "e5m2", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink, d_qk=192, d_v=128, pack_gqa=True
+    )
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_bottom_right_rectangular():
