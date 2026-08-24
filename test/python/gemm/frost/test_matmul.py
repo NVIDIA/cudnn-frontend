@@ -909,7 +909,7 @@ def _straddle_graph(kind: str, M: int, N: int, K: int) -> cudnn.pygraph:
 
 
 # _TORCH_DTYPE covers the INPUT dtypes; a tap may also be fp32 / int32.
-_TAP_TORCH_DTYPE = {**_TORCH_DTYPE, "fp32": torch.float32, "int32": torch.int32}
+_TAP_TORCH_DTYPE = {**_TORCH_DTYPE, "fp32": torch.float32, "int32": torch.int32, "fp8_e8m0": torch.float8_e8m0fnu}
 
 
 def _straddle_outs(plan, M: int, N: int) -> list[torch.Tensor]:
@@ -2573,6 +2573,51 @@ def test_m_major_tma_store_serves_coordinate_reading_pointwise(config_name: str,
     assert bad == 0, f"\n  {config_name}\n  m-major {M}x{N}x{K}  {kind}\n  wrong at {bad}/{c.numel()}"
 
 
+def test_tma_arm_never_writes_past_the_output_rows() -> None:
+    """The TMA arm runs the epilogue for the whole tile and clips only its OWN
+    store; every other store must re-apply the row bound. A missed one is
+    INVISIBLE in the output tensor -- it writes past the last row, into whatever
+    the allocator put next -- so this test gives each output slack and poisons it.
+
+    The shape matters: M must not be a multiple of the CLUSTER tile height, or
+    there are no overhang rows to write. 384 with cluster2x1 x cta_tile_m=128
+    (cgrp_tile_m=256) leaves 128."""
+    M, N, K = 384, 256, 256
+    cfg, cta_group = _resolve("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    assert M % (cfg.cta_tile_m * cfg.cgrp_size_m) != 0
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    q, sc = g.block_scale_quantize(input=R, block_size=32, axis=-1, name="qr")
+    q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    sc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    plan = _plan(g, config=cfg, cta_group=cta_group)
+    if not plan._compiled.use_tma_store:
+        pytest.skip("this graph does not take the TMA-store arm")
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    slack = 256
+    backing, views = [], []
+    for o in plan.chain.outputs:
+        shape = o.dim if o.dim is not None else (1, M, N)
+        buf = torch.empty(shape[0], shape[1] + slack, shape[2], dtype=_TAP_TORCH_DTYPE[o.dtype], device="cuda")
+        buf.view(torch.uint8).fill_(0xAB)
+        backing.append(buf)
+        views.append(buf[:, : shape[1]])
+    plan(_vp(plan, a, b, views))
+    torch.cuda.synchronize()
+
+    for o, buf in zip(plan.chain.outputs, backing):
+        rows = (o.dim if o.dim is not None else (1, M, N))[1]
+        tail = buf[:, rows:].view(torch.uint8)
+        touched = int((tail != 0xAB).sum())
+        assert touched == 0, f"{o.source}: the epilogue wrote {touched} bytes past its {rows} rows"
+
+
 @pytest.mark.parametrize("out_major,want", (("n", True), ("m", False)))
 def test_extra_dense_outputs_take_the_tma_store_only_when_n_major(out_major: str, want: bool) -> None:
     """Extra dense outputs land through the STG emitters, which read `row` /
@@ -2588,12 +2633,15 @@ def test_extra_dense_outputs_take_the_tma_store_only_when_n_major(out_major: str
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     C = g.matmul(A=A, B=B, name="mm")
-    # Slot order is set_output order, and the gate keys on SLOT 0's majorness.
+    # Every non-virtual output carries the same layout, so vary them together;
+    # the gate keys on SLOT 0's majorness because that is the arm the kernel
+    # renders.
     R = g.relu(input=C, name="r")
-    if out_major == "m":
-        R.set_stride([M * N, 1, M])
-    R.set_output(True)
-    g.gelu_approx_tanh(input=R, name="ge").set_output(True)
+    Y = g.gelu_approx_tanh(input=R, name="ge")
+    for t in (R, Y):
+        if out_major == "m":
+            t.set_stride([M * N, 1, M])
+        t.set_output(True)
 
     chain = analyze(g)
     assert len(chain.output_specs) == 2
@@ -2667,17 +2715,37 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
 
 
 def test_no_template_hardcodes_the_staging_alignment() -> None:
-    """Every template must read the rendered constant; a literal would silently
-    go stale the next time `_epi_n` moves."""
+    """The staging alignment is the SMEM row width, which is per output
+    (`epi_n * its own element width`), so no template carries it: every one hands
+    its store sequence to `@@INJECT_TMA_STORE_SEQUENCE@@` and the renderer
+    unrolls it per output with that output's own width. A LITERAL in a template
+    would go stale the next time `_epi_n` moves."""
     import pathlib
+
+    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.tile_config import by_name
 
     tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
     files = sorted(p for p in tmpl_dir.glob("sm*.py"))
     assert len(files) == 16, [p.name for p in files]
     for path in files:
         src = path.read_text()
-        assert "alignment=epi_smem_row_bytes" in src, path.name
         assert "alignment=64" not in src, path.name
+        assert "@@INJECT_TMA_STORE_SEQUENCE@@" in src, path.name
+        assert "alignment=epi_smem_row_bytes" not in src, path.name
+
+    # The renderer emits the row width the output's OWN dtype implies.
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    chain = analyze(g)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    epi_n = _epi_n(cfg, 1, chain.output_dtype)
+    seq = _tma_store_sequence(chain, cfg, 1, frozenset({0}), epi_n)
+    assert f"alignment={epi_n * 2}" in seq, seq  # bf16
 
 
 @pytest.mark.parametrize(

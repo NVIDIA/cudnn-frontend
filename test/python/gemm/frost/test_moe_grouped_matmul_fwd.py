@@ -941,19 +941,25 @@ def test_moe_int8(cta_group):
 
 def test_moe_launch_tail_puts_the_tma_slot_last():
     """The host signature is TAP, AUX, then the trailing TMA-C parameter. Under
-    STG every dense output rides a tap slot; under TMA-store slot 0 binds the
-    TMA-only parameter and moves to the END. Passing `*cs, *aux` in both modes
+    STG every dense output rides a tap slot; an output on the TMA surface binds a
+    trailing TMA-only parameter and moves to the END. Passing `*cs, *aux` in both modes
     keeps the ARITY but shifts the mapping by one, which binds the output buffer
     to an aux parameter -- both are `cute.Tensor`, so nothing raises."""
     from cudnn.gemm.frost.compiler import _moe_launch_tail
 
-    assert _moe_launch_tail(["c0"], (), use_tma_store=False) == ("c0",)
-    assert _moe_launch_tail(["c0"], (), use_tma_store=True) == ("c0",)
-    assert _moe_launch_tail(["c0"], ["x"], use_tma_store=False) == ("c0", "x")
-    assert _moe_launch_tail(["c0"], ["x"], use_tma_store=True) == ("x", "c0")
-    assert _moe_launch_tail(["c0", "c1"], ["x"], use_tma_store=False) == ("c0", "c1", "x")
-    assert _moe_launch_tail(["c0", "c1"], ["x"], use_tma_store=True) == ("c1", "x", "c0")
-    assert _moe_launch_tail([], ["x"], use_tma_store=True) == ("x",)
+    NONE, S0, S1, BOTH = frozenset(), frozenset({0}), frozenset({1}), frozenset({0, 1})
+
+    assert _moe_launch_tail(["c0"], (), tma_slots=NONE) == ("c0",)
+    assert _moe_launch_tail(["c0"], (), tma_slots=S0) == ("c0",)
+    assert _moe_launch_tail(["c0"], ["x"], tma_slots=NONE) == ("c0", "x")
+    assert _moe_launch_tail(["c0"], ["x"], tma_slots=S0) == ("x", "c0")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=NONE) == ("c0", "c1", "x")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=S0) == ("c1", "x", "c0")
+    assert _moe_launch_tail([], ["x"], tma_slots=S0) == ("x",)
+    # Which slot takes the surface is a CHOICE, so the order follows the SET, not
+    # the position: slot 1 on the surface leaves slot 0 as the tap.
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=S1) == ("c0", "x", "c1")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=BOTH) == ("x", "c0", "c1")
 
 
 @requires_sm100
@@ -982,4 +988,4 @@ def test_moe_host_signature_matches_the_launch_order(force_stg: bool) -> None:
     assert len(tma_c) == (1 if tma else 0)
     if tma:
         assert params[-2] == tma_c[0], params
-    assert len(_moe_launch_tail(range(n_out), plan.aux_names, use_tma_store=tma)) == len(taps) + len(plan.aux_names) + len(tma_c)
+    assert len(_moe_launch_tail(range(n_out), plan.aux_names, tma_slots=plan._compiled.tma_slots)) == len(taps) + len(plan.aux_names) + len(tma_c)

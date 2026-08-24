@@ -12,6 +12,7 @@ Runs as a script too (forwards argv to pytest on this file).
 
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 import sys
@@ -2308,13 +2309,170 @@ def test_coordinate_reading_aux_is_clamped_on_the_tma_arm(mode: str, dims: list[
     assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in tma
 
 
+@pytest.mark.parametrize(
+    "cfg_name,dts,want",
+    [
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", ["bf16", "bf16"], ("tma", "tma")),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", ["bf16", "fp32"], ("tma", "tma")),
+        # epi_n is 64 only on this family, and 64 fp32 columns is a 256-byte row --
+        # wider than any swizzle in the table, so the fp32 output falls back alone.
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", ["bf16", "fp32"], ("tma", "stg")),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", ["fp32", "bf16"], ("tma", "tma")),
+    ],
+)
+def test_epi_n_is_one_shared_column_count_not_a_per_output_one(cfg_name: str, dts: list[str], want: tuple) -> None:
+    """The kernel renders ONE `epi_n`, from the primary slot's dtype. What is per
+    output is the ROW BYTES (`epi_n * its own element width`) and with them the
+    swizzle -- so a second TMA output is judged against the SHARED column count,
+    not against the one its own dtype would have produced. Asking per output
+    computes a width the kernel never renders, which at the 256x256 family lets
+    an fp32 output onto a 256-byte staging row that has no swizzle."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    cur.set_output(True).set_data_type(CU[dts[0]])
+    g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU[dts[1]])
+
+    chain = analyze(g)
+    cfg = by_name(cfg_name)
+    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == want
+
+
+@pytest.mark.parametrize("majors,want", [(("n", "m"), ("tma", "stg")), (("m", "n"), ("stg", "stg"))])
+def test_an_output_laid_out_against_the_arm_stays_on_stg(majors: tuple, want: tuple) -> None:
+    """The kernel renders ONE store arm and it follows slot 0's layout, so an
+    output laid out the other way has no sequence to ride -- the M-major arm
+    transposes through stmatrix, the N-major one stages a row-major subtile.
+
+    Every non-virtual output is MEANT to carry the same layout, but nothing
+    enforces that yet -- `analyze` accepts a mixed-major graph, which is why this
+    test can build one.
+
+    The OUTCOME below is currently delivered by other rules, not by the same-arm
+    conjunct: an M-major output beside another dense output is rejected by the
+    M-major arm's single-output rule, and an N-major output under an M-major slot
+    0 is rejected because `_epi_vec_bytes` (a chain-level width taken from slot
+    0's layout) drops below 16 there. So the conjunct is redundant TODAY and this
+    test would pass without it -- it is kept as insurance and pinned separately
+    below, because both of those rejections are coincidental rather than about
+    the arm.
+
+    TODO: the M-major output path is due a refactor that supports MIXED
+    m/n-major alongside tmastg; this test and that conjunct go away with it."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    Y = g.gelu_approx_tanh(input=R, name="ge")
+    for t, mj in zip((R, Y), majors):
+        if mj == "m":
+            t.set_stride([M * N, 1, M])
+        t.set_output(True)
+
+    chain = analyze(g)
+    assert [o.major for o in chain.output_specs] == list(majors), "the mixed-major graph must still be buildable"
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == want
+
+
+def test_the_store_gate_still_guards_against_the_wrong_arm() -> None:
+    """The same-arm conjunct is redundant today (see
+    `test_an_output_laid_out_against_the_arm_stays_on_stg`), so no behavioural
+    test can protect it. Pin it at the source instead: if it is deleted, the
+    protection is gone the moment either of the coincidental rejections moves."""
+    src = inspect.getsource(compiler._output_store_mode)
+    assert "out.major != chain.out_major" in src, "the wrong-arm guard is gone"
+    assert "TODO" in src, "keep the pointer to the M-major refactor that removes it"
+
+
+def test_more_than_one_output_can_take_the_tma_store() -> None:
+    """Every TMA-stored output walks the SAME SMEM ring -- the slot is sized for
+    the widest and each takes its own typed view -- so there is no budget to
+    spend: an output takes the surface iff it is eligible."""
+    from cudnn.gemm.frost.compiler import _epi_slot_widen, _epi_vec_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+    from cudnn.gemm.frost.graph_analyzer import analyze as _an
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    cur.set_output(True).set_data_type(CU["bf16"])
+    g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU["fp32"])
+    chain = _an(g)
+
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == ("tma", "tma")
+    # The ring is typed as the primary slot's dtype, so a wider companion widens
+    # the SLOT rather than adding a second ring.
+    assert _epi_slot_widen(chain) == 2
+
+
+def test_every_dense_store_on_the_tma_arm_carries_the_row_bound() -> None:
+    """The TMA arm runs the epilogue body for EVERY row of the tile and clips only
+    its own store (the C descriptor's extent does that in hardware). Every other
+    store in the body has to re-apply the bound itself.
+
+    A quant tap's DATA store is the one that does not go through
+    `_emit_tap_store`, and it was missed: `generate` appends it directly for
+    `spec.quant_idx is not None`. Unguarded it writes the tile's overhang rows,
+    which on a plain matmul run past the output buffer into whatever the
+    allocator put next -- observed as ~55 % of a neighbouring SCALE buffer coming
+    back as zero, and only on the first launch in a fresh process, because a warm
+    allocator lays the buffers out differently."""
+    M, N, K = 384, 256, 256
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    q, sc = g.block_scale_quantize(input=R, block_size=32, axis=-1, name="qr")
+    q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    sc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    chain = analyze(g)
+
+    # A quant pins the chunk to its block size; slot 0 is bf16 -> 32 * 2 bytes.
+    kw = dict(vec_bytes_epi=64, output_elem_bytes=2)
+    tma = generate(chain, tma_slots=frozenset({0}), **kw).epilogue
+    stg = generate(chain, tma_slots=frozenset(), **kw).epilogue
+
+    guarded = [ln for ln in tma.splitlines() if ln.startswith("    (gC_tap_")]
+    bare = [ln for ln in tma.splitlines() if ln.startswith("(gC_tap_")]
+    assert guarded, "the TMA arm must emit its tap stores under a bound"
+    assert not bare, f"unguarded store(s) on the TMA arm: {bare}"
+    # The STG arm inherits `row < M` / `col_j + vsize <= N` from the drain, so its
+    # stores must stay bare -- a guard there would change every shipping kernel.
+    assert not [ln for ln in stg.splitlines() if ln.strip().startswith("if (row <")]
+
+
 def test_coordinate_reading_pointwise_is_not_a_store_rule() -> None:
     """Neither arm's store rule may consult how a pointwise input reads its
     coordinates. What differs between the arms is the element -> (row, col) MAP,
     and `_elem_coord` publishes it; asking "does this graph read coordinates" in
     the gate is the shape of the bug, not the fix."""
     for fn in (compiler._tma_store_n_major_ok, compiler._tma_store_m_major_ok, compiler._tma_store_geometry_ok):
-        src = inspect.getsource(fn)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        # The prose may name these; the CODE may not.
+        body = tree.body[0].body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        src = "\n".join(ast.unparse(node) for node in body)
         for probe in ("bcast_mode", "grouped_by_moe", "gen_index"):
             assert probe not in src, f"{fn.__name__} consults {probe}: that is a pointwise concern"
 
@@ -2335,28 +2493,21 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
     is a `TensorSSA` whose `.shape` is the bare int `N` -- taken for a scalar,
     XORed once on the row base and written CONTIGUOUSLY, so each row's tail
     spills into the next. Every emitter that can reach the TMA arm must hand on
-    a Vector; the ones that cannot must stay behind the gate that says so."""
+    a Vector."""
     src = pathlib.Path(epilogue_codegen.__file__).read_text()
-    gate = "".join(
-        textwrap.dedent(inspect.getsource(fn)) for fn in (compiler._use_tma_store_epi, compiler._tma_store_n_major_ok, compiler._tma_store_m_major_ok)
-    )
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
     assert sites == 5, (
         f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 5. A new one either "
-        f"converts with .load().to_vector() or its feature stays gated off the TMA arm — "
-        f"decide which, then update this test."
+        f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
+        f"then update this test."
     )
-    assert converted == 4, f"expected exactly 4 converted rmem loads, found {converted}"
-
-    # The two unconverted sites are the row/col block-quantize emitters.
+    assert converted == 6, f"expected exactly 6 converted rmem loads, found {converted}"
+    # The two block-quantize emitters were the last holdouts: their result now
+    # reaches a TMA-stored dense output, so they must convert like the rest.
     assert src.count("_out = cute.make_rmem_tensor(") == 2
-    assert "if chain.quants:" in gate, (
-        "the block-quantize emitters build their result in an rmem tensor and hand it on as a "
-        "TensorSSA; they are only safe because quant graphs never take the TMA arm. Relaxing "
-        "that gate requires converting them first."
-    )
+    assert src.count("_vec = {p}_out.load().to_vector()") == 2, "the block-quantize emitters must hand on a Vector"
 
 
 _PW_M, _PW_N, _PW_K = 128, 128, 128

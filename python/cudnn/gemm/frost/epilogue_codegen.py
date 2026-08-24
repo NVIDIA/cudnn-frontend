@@ -122,6 +122,12 @@ def _elem_coord(e: int, mmajor_tma: bool) -> tuple[str, str]:
     return _mmajor_elem_coord(e) if mmajor_tma else ("row", f"col_j + {e}")
 
 
+def tma_out_value(j: int) -> str:
+    """The variable holding the j-th TMA-stored output's value. Slot 0 keeps the
+    legacy `vec_out`, so a single-TMA-output render is unchanged."""
+    return "vec_out" if j == 0 else f"_tma_out_{j}"
+
+
 def _aux_reads_row(aux: TensorRef) -> bool:
     return len(aux.dim) >= 2 and aux.dim[-2] != 1
 
@@ -801,6 +807,28 @@ def _emit_reduction_atomic(
     source_var: str,
     matmul: "MatmulSpec",
     vsize: int,
+    row_bound: str | None = None,
+) -> list[str]:
+    """A reduction is an atomic RMW, so an out-of-extent element cannot be
+    clamped onto a valid one -- it has to be SKIPPED. The STG arm inherits
+    `row < M` / `col_j + vsize <= N` from the drain; the TMA arm has neither, so
+    it re-applies them here. `_output_chunk_ok` forces N % chunk == 0 whenever a
+    reduction is present, which is what makes the chunk-level column test exact:
+    a chunk is wholly inside N or wholly past it, so the fold over it never mixes
+    real columns with OOB ones."""
+    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, matmul, vsize)
+    if row_bound is None:
+        return body
+    return [f"if (row < {row_bound}) & (col_j + {vsize} <= N):"] + [f"    {ln}" for ln in body]
+
+
+def _emit_reduction_atomic_body(
+    tap_idx: int,
+    red_idx: int,
+    red: ReductionSpec,
+    source_var: str,
+    matmul: "MatmulSpec",
+    vsize: int,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
@@ -998,6 +1026,7 @@ def _emit_block_quant_col(
     batch_index_expr: str,
     matmul_m: int,
     vsize: int,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Emit M-axis (col) block quantize for one epilogue vector. A warp
     (block 32) or half-warp (block 16) of lanes holds one block of rows, so
@@ -1056,7 +1085,7 @@ def _emit_block_quant_col(
             )
     lines.extend(
         [
-            f"{p}_vec = {p}_out.load()",
+            f"{p}_vec = {p}_out.load().to_vector()",
             (
                 f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
                 f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
@@ -1094,7 +1123,16 @@ def _emit_block_quant_col(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"{p}_mb * quant_scale_stride_m_{quant_idx} + {p}_n{k} * quant_scale_stride_n_{quant_idx}"
             )
-        lines.append(f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine_{k}, alignment=1)")
+        # The scale byte is a SIDE STORE: the STG arm sits inside `row < M`,
+        # the TMA arm has no row bound of its own.
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine_{k}, alignment=1)"
+        if row_bound is None:
+            lines.append(_st)
+        else:
+            # `_quant_output_chunk_ok` forces N % chunk == 0, so a chunk is wholly
+            # inside N or wholly past it -- the chunk-level column test is exact.
+            lines.append(f"if (row < {row_bound}) & (col_j + {vsize} <= N):")
+            lines.append(f"    {_st}")
     return lines
 
 
@@ -1108,6 +1146,7 @@ def _emit_block_quant(
     batch_index_expr: str = "tile_l",
     matmul_m: int = 0,
     vsize: int = 32,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Emit block quantize for one epilogue vector, binding the quantized
     vector to ``out_var`` and storing the scale byte(s) through the
@@ -1126,6 +1165,7 @@ def _emit_block_quant(
             batch_index_expr,
             matmul_m,
             vsize,
+            row_bound,
         )
     p = f"_q{quant_idx}"
     bs = quant.block_size
@@ -1150,7 +1190,7 @@ def _emit_block_quant(
             lines.append(f"{p}_out[{base + e}] = {p}_src[{base + e}] * {p}_inv{k}")
     lines.extend(
         [
-            f"{p}_vec = {p}_out.load()",
+            f"{p}_vec = {p}_out.load().to_vector()",
             (
                 f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
                 f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
@@ -1181,7 +1221,16 @@ def _emit_block_quant(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"row * quant_scale_stride_m_{quant_idx} + {p}_scol{k} * quant_scale_stride_n_{quant_idx}"
             )
-        lines.append(f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)")
+        # The scale byte is a SIDE STORE: the STG arm sits inside `row < M`,
+        # the TMA arm has no row bound of its own.
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"
+        if row_bound is None:
+            lines.append(_st)
+        else:
+            # `_quant_output_chunk_ok` forces N % chunk == 0, so a chunk is wholly
+            # inside N or wholly past it -- the chunk-level column test is exact.
+            lines.append(f"if (row < {row_bound}) & (col_j + {vsize} <= N):")
+            lines.append(f"    {_st}")
     return lines
 
 
@@ -1388,6 +1437,7 @@ def generate(
     for si, spec in enumerate(specs):
         src = _parent_value(spec.source_ref)
         if si in tma_slots:
+            _ov = tma_out_value(sorted(tma_slots).index(si))
             if spec.quant_idx is not None:
                 body_lines.extend(
                     _emit_block_quant(
@@ -1395,15 +1445,16 @@ def generate(
                         spec.quant_idx,
                         src,
                         spec.dtype,
-                        "vec_out",
+                        _ov,
                         _scale_tap_idx(spec.quant_idx),
                         quant_batch_expr,
                         chain.matmul.M,
                         vsize,
+                        store_row_bound,
                     )
                 )
             else:
-                body_lines.append(f"vec_out = {_store_cast_expr(src, spec.dtype)}")
+                body_lines.append(f"{_ov} = {_store_cast_expr(src, spec.dtype)}")
             continue
         tap_idx = _tap_of[si]
         if spec.major == "m":
@@ -1423,19 +1474,27 @@ def generate(
                     quant_batch_expr,
                     chain.matmul.M,
                     vsize,
+                    store_row_bound,
                 )
             )
-            if spec.dtype == "fp4_e2m1":
-                # packed 2-per-byte: the tap tensor is Int8 (B, M, N/2)
-                body_lines.append(f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment={max(vsize // 2, 4)})")
+            _align = max(vsize // 2, 4) if spec.dtype == "fp4_e2m1" else f"VEC_BYTES_TAP_{tap_idx}"
+            # fp4 is packed 2-per-byte, so its tap tensor is Int8 (B, M, N/2).
+            _st = f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment={_align})"
+            # A quant tap's DATA store does not go through `_emit_tap_store`, so it
+            # needs the arm's row bound applied here too. Without it a MoE tile,
+            # which overhangs its routed group into the NEXT one, writes rows that
+            # group's own tile also writes -- two tiles racing on the same bytes.
+            if store_row_bound is None:
+                body_lines.append(_st)
             else:
-                body_lines.append(f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment=VEC_BYTES_TAP_{tap_idx})")
+                body_lines.append(f"if (row < {store_row_bound}) & (col_j + {vsize} <= N):")
+                body_lines.append(f"    {_st}")
         else:
             body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_bound=store_row_bound))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
-        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize))
+        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_bound))
 
     epilogue = "\n".join(body_lines)
 

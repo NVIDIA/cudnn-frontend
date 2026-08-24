@@ -267,16 +267,6 @@ def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
     return reqs
 
 
-# Only dense slot 0 is ever put on the TMA-C surface: the templates build ONE
-# C descriptor and one SMEM-D ring. The store mode is nonetheless carried as a
-# SET so the slot numbering never has to ask "which mode is the kernel in".
-_TMA_SLOTS_0 = frozenset({0})
-
-
-def tma_slots_of(use_tma_store: bool) -> "frozenset[int]":
-    return _TMA_SLOTS_0 if use_tma_store else frozenset()
-
-
 def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_bytes: "int | None" = None) -> "list[int]":
     """Per-output required byte alignment, one per ``chain.outputs`` slot (dense
     specs, then reductions, then quant scales) = the width its store uses
