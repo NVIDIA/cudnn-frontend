@@ -614,13 +614,32 @@ def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any 
         dst.copy_(buf.permute(0, 2, 1, 3))
         return dst.permute(0, 2, 1, 3)
 
+    def _ir_view(buf, ir_t):
+        """Reinterpret a variant-pack buffer through the IR tensor's dim/stride.
+
+        cuDNN's execute contract treats variant-pack entries as raw storage
+        laid out per the IR tensor descriptor — the caller's torch tensor may
+        be flat or otherwise logically reshaped. The staging/squeeze/copy_
+        paths below consume torch views, so rebuild the IR-shaped view instead
+        of trusting the caller's metadata (mirrors the forward lowering's
+        ``_ir_view``). INPUT ports only: output-port IR strides are
+        PROVISIONAL row-major unless the user assigned them (the layout
+        invariant in docs/python_graph_and_execution_backends.md), so the
+        gradient outputs below keep the caller tensor's own view — re-striding
+        them to the provisional layout would scatter the copy-back.
+        """
+        dim, stride = tuple(ir_t.get_dim()), tuple(ir_t.get_stride())
+        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
+            return buf
+        return buf.as_strided(dim, stride)
+
     def _execute(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
         # squeeze(-1) is a valid view for ANY (B, H_q, S_q, 1) strides; the
         # kernels read a packed LSE, so a strided stats input (strided_stats)
         # is gathered into carved contiguous staging first.
-        lse = resolved[id(facts.stats_t)].squeeze(-1)
+        lse = _ir_view(resolved[id(facts.stats_t)], facts.stats_t).squeeze(-1)
         if stats_stage:
             lse_stage = carver.take(b * h_q * facts.s_q, lse.dtype).view(b, h_q, facts.s_q)
             lse_stage.copy_(lse)
@@ -629,11 +648,11 @@ def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any 
         dsink_buf = resolved.get(id(facts.dsink_t)) if facts.has_dsink and facts.dsink_t is not None else None
 
         api.execute(
-            q_tensor=_normalize(carver, resolved[id(facts.q_t)], stage_bytes["q"]),
-            k_tensor=_normalize(carver, resolved[id(facts.k_t)], stage_bytes["k"]),
-            v_tensor=_normalize(carver, resolved[id(facts.v_t)], stage_bytes["v"]),
-            o_tensor=_normalize(carver, resolved[id(facts.o_t)], stage_bytes["o"]),
-            do_tensor=_normalize(carver, resolved[id(facts.do_t)], stage_bytes["dO"]),
+            q_tensor=_normalize(carver, _ir_view(resolved[id(facts.q_t)], facts.q_t), stage_bytes["q"]),
+            k_tensor=_normalize(carver, _ir_view(resolved[id(facts.k_t)], facts.k_t), stage_bytes["k"]),
+            v_tensor=_normalize(carver, _ir_view(resolved[id(facts.v_t)], facts.v_t), stage_bytes["v"]),
+            o_tensor=_normalize(carver, _ir_view(resolved[id(facts.o_t)], facts.o_t), stage_bytes["o"]),
+            do_tensor=_normalize(carver, _ir_view(resolved[id(facts.do_t)], facts.do_t), stage_bytes["dO"]),
             lse_tensor=lse,
             dq_tensor=resolved[id(facts.dq_t)],
             dk_tensor=resolved[id(facts.dk_t)],
