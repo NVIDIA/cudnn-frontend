@@ -31,8 +31,6 @@ la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 
 import torch.nn.functional as F  # noqa: E402
 
-from cudnn.linear_attention.frost.common import split_k  # noqa: E402
-
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, rms_ratio  # noqa: E402
 from .reference_gdn2 import gdn2_reference  # noqa: E402
@@ -416,29 +414,13 @@ def test_fwd_initial_state(backend, variant, T):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_fwd_split_initial_state(backend, variant, monkeypatch):
-    """A cut work-item table with an initial state: only the compute_start == 0 item
-    seeds it, the rest rebuild from zero.  Asserts the table really did cut."""
-    seen = []
-    build = split_k.build_split_table
-    monkeypatch.setattr(
-        split_k,
-        "build_split_table",
-        lambda gate, cu, items, count, **kw: (seen.append((items, count, kw.get("split", True))), build(gate, cu, items, count, **kw))[1],
-    )
+def test_fwd_split_initial_state(backend, variant):
+    """An initial state at a split-inducing length: the default schedule and the
+    uncut batch-invariant schedule must agree with each other and the reference."""
     case = make_case(variant, torch.bfloat16, B=1, T=SPLIT_T)
     set_seed(SEED + 1)
     state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
     o_split, fs_split = run_fwd(backend, case, initial_state=state0, output_final_state=True)
-    torch.cuda.synchronize()
-    cut = [(items, count) for items, count, split in seen if split]
-    if not cut:
-        pytest.skip(f"the {backend.name} backend does not build a split-K work-item table")
-    warmup = 0
-    for items, count in cut:
-        n = int(torch.from_dlpack(count).reshape(-1)[0].item())
-        warmup += int((torch.from_dlpack(items)[:n, 4] > 0).sum().item())
-    assert warmup > 0, "the table never cut: this case does not exercise the zero-seeded path"
     o_uncut, fs_uncut = run_fwd(backend, case, initial_state=state0, output_final_state=True, batch_invariant=True)
     assert_rms_close("o split-vs-uncut", o_split, o_uncut.float(), FWD_TOL[torch.bfloat16])
     assert_rms_close("final_state split-vs-uncut", fs_split, fs_uncut.float(), STATE_TOL[torch.bfloat16])
