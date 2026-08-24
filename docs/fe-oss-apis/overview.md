@@ -36,6 +36,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [MoE + Expert Parallel API](moe_ep.md)
 
 ## Installation and setup
 
@@ -50,6 +51,11 @@ pip install --group torch   # torch + torch-c-dlpack-ext
 pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
 ```
 (For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
+
+MoE + Expert Parallel requires its dedicated optional dependencies:
+```bash
+pip install nvidia-cudnn-frontend[moe_ep]
+```
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
