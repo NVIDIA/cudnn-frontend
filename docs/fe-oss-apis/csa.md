@@ -48,12 +48,13 @@ gradients on such padding rows.
 All arithmetic is fp32 with one final bf16 rounding; `mul.rn.f32` / `fma.rn.f32` are
 pinned in PTX so results do not depend on compiler FMA contraction. The numerics
 contract is **per ratio family** (the two families intentionally differ — do not
-assume the ratio=4 guarantees at ratio=128):
+assume the ratio {2, 4} guarantees at ratio=128):
 
-- **`ratio == 4`** (production, unchanged): against an fp32-intermediate eager
-  reference (same op order, fp32 throughout), `dKV`/`dScore` are **bit-identical**
-  and the forward matches within one bf16 rounding step on a tiny fraction of
-  elements.
+- **`ratio in {2, 4}`** (generic kernels; the bitwise contract — ratio=4 as originally
+  validated, ratio=2 added on the same terms): against an
+  fp32-intermediate eager reference (same op order, fp32 throughout), `dKV`/`dScore`
+  are **bit-identical** and the forward matches within one bf16 rounding step on a
+  tiny fraction of elements.
 - **`ratio == 128`** (deterministic tolerance contract): the kernels are
   **deterministic and faithful to the fp32-intermediate eager reference** (the
   same eager region computed with fp32 intermediates and one final bf16 rounding —
@@ -132,8 +133,9 @@ that need a fully deterministic backward must use an eager implementation.
 
 - Compute-capability major **>= 10** (SM100 and newer; the kernels use no
   architecture-specific features beyond the SM100 baseline)
-- `ratio == 4`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
-  `coff == 1` the own-block window form) — served by the generic kernels, which are
+- `ratio in {2, 4}`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
+  `coff == 1` the own-block window form; `ratio == 2` is the configuration used in
+  production training) — served by the generic kernels, which are
   generic over `(ratio, head_dim, coff in {1, 2})` but keep the whole pooling window in
   registers (register-bound beyond `ratio = 32`)
 - `ratio == 128`, `coff in {1, 2}`, `head_dim in {128, 512}` — served by dedicated
@@ -338,7 +340,7 @@ never-consumed slots and fp32-atomic `dAPE`, exactly as at ratio=4. The backward
 defaults to the same fast exp outside the d=128 small-pack (vec=1) buckets.
 
 **The ratio=128 numerics contract is the deterministic tolerance contract described in
-[Numerics](#numerics), NOT the ratio=4 bitwise-`dKV`/`dScore` contract.** The
+[Numerics](#numerics), NOT the generic-family (ratio {2, 4}) bitwise-`dKV`/`dScore` contract.** The
 reduction orders (forward chunk merge, backward `den`/`S` partial merge), the
 backward's hoisted reciprocal, and the fast-exp buckets all differ from the eager op
 order by design, each adopted on a measured same-GPU win and gated on tolerance +
@@ -415,7 +417,7 @@ committed scripts `benchmark/csa/gate_csa_compressor_r128.py` and
 ```
 
 The tests validate numerics against an fp32-intermediate eager reference (bitwise
-`dKV`/`dScore` at ratio=4; the deterministic tolerance contract at ratio=128, with
+`dKV`/`dScore` at ratio {2, 4}; the deterministic tolerance contract at ratio=128, with
 fp64-oracle parity on finite-intermediate inputs), the upstream eager numerics, plus ragged packs, static-capacity
 padding, kernel-side zero-writes into uninitialized gradient buffers (NaN-canary with
 exact-zero assertions on every never-consumed slot class, and the `total_comp == 0`
