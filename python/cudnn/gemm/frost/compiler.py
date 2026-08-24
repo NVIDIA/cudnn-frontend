@@ -2860,11 +2860,14 @@ def _tma_store_n_major_ok(chain, cfg, cta_group: int, vec_bytes_epi: int) -> boo
 
 
 def _tma_store_m_major_ok(chain, cfg, cta_group: int) -> bool:
-    """The M-major arm is `tcgen05.ld 16x256b -> stmatrix.trans -> utmastg`. It
-    re-reads TMEM itself, runs the snippet TWICE under `for _h in range(2)`, and
-    `row` / `col_j` are the subtile base rather than the coordinates of the
-    fragment a lane holds -- so everything coordinate-reading or side-effecting
-    is out by construction, not pending."""
+    """The M-major arm is `tcgen05.ld 16x256b -> stmatrix.trans -> utmastg`: it
+    re-reads TMEM itself and each lane owns a TRANSPOSED patch, so `row` /
+    `col_j` are the subtile base rather than this element's coordinates.
+
+    Coordinate-READING pointwise inputs are served by `_mmajor_elem_coord` and do
+    not appear here. What is left splits three ways: real properties of the
+    transpose (output width, drain width, M alignment), a template gap (MoE), and
+    side effects that still have no per-register form."""
     # stmatrix.m8n8 has no b32 payload form.
     if DTYPE_BITS[chain.output_dtype] != _TMA_STORE_M_MAJOR_OUT_BITS:
         return False
@@ -2880,12 +2883,10 @@ def _tma_store_m_major_ok(chain, cfg, cta_group: int) -> bool:
     # to bind for the extra GEMMs.
     if chain.is_multi_gemm:
         return False
-    # Coordinate-reading pointwise inputs and side effects: wrong coordinates,
-    # and the double pass would fire each side effect twice.
-    if any(a.bcast_mode != "scalar" for a in chain.aux_tensors):
-        return False
-    if any(op.op == "gen_index" for op in chain.ops):
-        return False
+    # Side effects still wait: an extra dense output goes through
+    # `_emit_mmajor_scatter`, which has no per-register arm, and reductions /
+    # quants have no in-chunk mask. Coordinate-READING pointwise inputs are
+    # served by `_mmajor_elem_coord` and no longer gate this arm.
     if len(chain.output_specs) > 1 or chain.reductions or chain.quants:
         return False
     # 16x256b TMEM-load + stmatrix.trans + tma_store all move 16-byte units of M.

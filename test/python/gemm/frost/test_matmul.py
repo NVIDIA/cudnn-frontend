@@ -2504,6 +2504,75 @@ def test_drain_width_keys_on_the_mma_block_height(name: str, cta_group: int, wan
     assert _epi_tile_cols(by_name(name), cta_group) == want
 
 
+_MMAJOR_COORD_KINDS = ("gen_index_axis1", "gen_index_axis2", "per_row", "per_col", "per_elem")
+
+
+def _mmajor_coord_graph(kind: str, M: int, N: int, K: int) -> tuple[cudnn.pygraph, str | None]:
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    aux = None
+    if kind.startswith("gen_index"):
+        axis = int(kind[-1])
+        Y = g.add(a=C, b=g.gen_index(input=C, axis=axis, name="gi"), name="ad")
+    else:
+        dim, stride = {
+            "per_row": ([1, M, 1], [M, 1, 1]),
+            "per_col": ([1, 1, N], [N, N, 1]),
+            "per_elem": ([1, M, N], [M * N, N, 1]),
+        }[kind]
+        x = g.tensor(name="x", dim=dim, stride=stride, data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=x, name="w")
+        aux = "x"
+    Y.set_stride([M * N, 1, M])
+    Y.set_output(True)
+    return g, aux
+
+
+@pytest.mark.parametrize("kind", _MMAJOR_COORD_KINDS)
+@pytest.mark.parametrize("shape", ((256, 256, 256), (512, 128, 256)), ids=("256x256x256", "512x128x256"))
+@pytest.mark.parametrize("config_name", _STRADDLE_CONFIGS[:2], ids=[_config_id(n) for n in _STRADDLE_CONFIGS[:2]])
+def test_m_major_tma_store_serves_coordinate_reading_pointwise(config_name: str, shape: tuple[int, int, int], kind: str) -> None:
+    """`row` / `col_j` on the M-major TMA arm are the subtile base, not the
+    coordinates of the fragment a lane holds -- that arm loads 16x256b and each
+    lane owns a TRANSPOSED patch. Anything asking "which row / column am I"
+    (gen_index, per_row / per_col / per_elem aux) goes through
+    `_mmajor_elem_coord`; before it did not, and gen_index measured wrong on
+    BOTH axes here while being exact through STG."""
+    cfg, cta_group = _resolve(config_name)
+    M, N, K = shape
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", cta_group=cta_group, out_major="m")
+    if not ok:
+        pytest.skip(reason)
+
+    g, aux_name = _mmajor_coord_graph(kind, M, N, K)
+    plan = _plan(g, config=cfg, cta_group=cta_group)
+    if not plan._compiled.use_tma_store:
+        pytest.skip(f"{kind} does not take the M-major TMA-store path on {config_name}")
+
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", out_major="m")
+    args = []
+    if aux_name is not None:
+        n = {"per_row": M, "per_col": N, "per_elem": M * N}[kind]
+        shape3 = {"per_row": (1, M, 1), "per_col": (1, 1, N), "per_elem": (1, M, N)}[kind]
+        args.append((torch.arange(n, dtype=torch.float32, device="cuda") % 5 + 1).reshape(shape3))
+    plan(_vp(plan, a, b, [c], *args))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    if kind == "gen_index_axis1":
+        ref = ref + torch.arange(M, device="cuda", dtype=torch.float32).reshape(1, M, 1)
+    elif kind == "gen_index_axis2":
+        ref = ref + torch.arange(N, device="cuda", dtype=torch.float32).reshape(1, 1, N)
+    else:
+        ref = ref * args[0]
+    ref = ref.to(torch.bfloat16)
+
+    bad = int((c.to(torch.float32) != ref.to(torch.float32)).sum())
+    assert bad == 0, f"\n  {config_name}\n  m-major {M}x{N}x{K}  {kind}\n  wrong at {bad}/{c.numel()}"
+
+
 @pytest.mark.parametrize("out_major,want", (("n", True), ("m", False)))
 def test_extra_dense_outputs_take_the_tma_store_only_when_n_major(out_major: str, want: bool) -> None:
     """Extra dense outputs land through the STG emitters, which read `row` /

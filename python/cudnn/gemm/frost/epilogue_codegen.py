@@ -98,8 +98,62 @@ def _aux_index_expr(aux: TensorRef, *, row_var: str = "row", col_var: str = "col
     return " + ".join(terms) if terms else "0"
 
 
+def _mmajor_elem_coord(e: int) -> tuple[str, str]:
+    """Which (row, col) does element ``e`` of the M-major TMA arm's fragment hold?
+
+    That arm loads `tcgen05_ld(SHAPE_16X256B)` and its lane holds a TRANSPOSED
+    patch, so the `row` / `col_j` the drain sets just before the hook are the
+    subtile base, not this element's coordinates -- anything that asks "which row
+    / column am I" has to come through here. The two `_h` passes cover disjoint
+    row halves (the `16 * _h` term), so a side effect placed on this arm fires
+    once per element, not twice.
+
+    Element ``e`` contributes `8 * bit1` to M and `bit0 + 8 * (bits 2..)` to N,
+    which is what makes a lane's 2 rows x vsize/2 columns tile the subtile."""
+    return (
+        f"(coord_m + warp_idx * 32 + (lane // 4) + {8 * ((e >> 1) & 1)} + 16 * _h)",
+        f"(col + 2 * (lane % 4) + {(e & 1) + 8 * (e >> 2)})",
+    )
+
+
+def _elem_coord(e: int, mmajor_tma: bool) -> tuple[str, str]:
+    """The (row, col) of element ``e``: the N-major arms hand the snippet the
+    fragment's own coordinates, the M-major TMA arm does not."""
+    return _mmajor_elem_coord(e) if mmajor_tma else ("row", f"col_j + {e}")
+
+
 def _aux_reads_row(aux: TensorRef) -> bool:
     return len(aux.dim) >= 2 and aux.dim[-2] != 1
+
+
+def _mmajor_aux_prelude(chain: FusionChain, vsize: int) -> list[str]:
+    """Coordinate-reading aux on the M-major TMA arm. A lane's columns are not
+    contiguous there (`_tn` steps by 8 every 4 elements) and its rows come in two
+    halves, so there is no vector load to have -- each element reads at its own
+    CLAMPED coordinate. Out-of-extent elements land on the last valid one; the
+    TMA store clips them at the global extent, so their value is never used.
+    `per_row` joins the list here: `row` is uniform on the N-major arms, not on
+    this one."""
+    lines: list[str] = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode == "scalar":
+            continue
+        n, ptr = aux.name, _aux_ptr_var(aux.name)
+        lines.append(f"_auxt_{n} = cute.make_rmem_tensor({vsize}, {DTYPE_TO_CUTLASS[aux.dtype]})")
+        wants_row = _aux_reads_row(aux)
+        for k in range(vsize):
+            row_e, col_e = _mmajor_elem_coord(k)
+            row_var, col_var = "row", "col_j"
+            if wants_row:
+                row_var = f"_auxr_{n}"
+                lines.append(f"{row_var} = cute.math.min(cutlass.Int32({row_e}), cutlass.Int32(M) - 1)")
+            if aux.dim[-1] != 1:
+                col_var = f"_auxc_{n}"
+                lines.append(f"{col_var} = cute.math.min(cutlass.Int32({col_e}), cutlass.Int32(N) - 1)")
+            idx = _aux_index_expr(aux, row_var=row_var, col_var=col_var)
+            lines.append(f"_auxt_{n}[{k}] = ({ptr} + {idx}).load()")
+        lines.append(f"_auxv_{n} = _auxt_{n}.load().to_vector()")
+    return lines
 
 
 def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
@@ -138,7 +192,7 @@ def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
     return lines
 
 
-def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False) -> str:
+def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False, mmajor_tma: bool = False) -> str:
     """Expression yielding aux value(s) as a length-`vsize` vector in the op's
     compute dtype, matching ``like_var``'s dtype."""
     idx = _aux_index_expr(aux)
@@ -147,10 +201,12 @@ def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bound
         # scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
     if aux.bcast_mode == "per_row":
+        if mmajor_tma:
+            return f"_auxv_{aux.name}.to({cast})"
         # per-row scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
     if aux.bcast_mode in ("per_col", "per_elem"):
-        if bounded:
+        if bounded or mmajor_tma:
             return f"_auxv_{aux.name}.to({cast})"
         return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=ALIGN_AUX_{aux.name}).to({cast})"
     raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
@@ -347,6 +403,7 @@ def _emit_op(
     other_in_chain: str | None = None,
     third_in_chain: str | None = None,
     vsize: int = 32,
+    mmajor_tma: bool = False,
 ) -> tuple[list[str], str]:
     """Emit lines computing this op, given the previous-step var name.
     ``other_in_chain`` = second operand var for fan-in binary ops (else None).
@@ -405,10 +462,14 @@ def _emit_op(
 
     if op.op == "gen_index":
         axis = dict(op.attrs).get("axis")
-        if axis == 1:
+        # Row index is uniform across the vector on the N-major arms only -- the
+        # M-major TMA fragment holds two row halves, so it needs the map too.
+        if axis == 1 and not mmajor_tma:
             return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
-        gl += [f"_gi{idx}[{k}] = cutlass.Float32(col_j + {k})" for k in range(vsize)]
+        for k in range(vsize):
+            _row, _col = _elem_coord(k, mmajor_tma)
+            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({_row if axis == 1 else _col})")
         gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
@@ -643,7 +704,7 @@ def _emit_tap_store(
     lines = [
         f"{tap_var} = {_store_cast_expr(source_var, tap_dtype)}",
         f"if cutlass.const_expr(cd_out_is_m_major and use_tma_store_epi):",
-        f"    for _tr_{tap_idx} in cutlass.range_constexpr(16):",
+        f"    for _tr_{tap_idx} in cutlass.range_constexpr({vsize}):",
         f"        _tm_{tap_idx} = coord_m + warp_idx * 32 + (lane // 4)" f" + 8 * ((_tr_{tap_idx} >> 1) & 1) + 16 * _h",
         f"        _tn_{tap_idx} = col + 2 * (lane % 4)" f" + (_tr_{tap_idx} & 1) + 8 * (_tr_{tap_idx} >> 2)",
         f"        if _tm_{tap_idx} < M and _tn_{tap_idx} < N:",
@@ -1242,6 +1303,10 @@ def generate(
 
     # epilogue snippet (interleaves op chain with tap stores)
     on_tma_arm = 0 in tma_slots
+    # The M-major TMA arm's `row` / `col_j` are the subtile base, not the
+    # fragment's coordinates -- everything that asks "which row / column am I"
+    # goes through `_elem_coord` there. See `_mmajor_elem_coord`.
+    mmajor_tma = on_tma_arm and chain.out_major == "m"
     # The template binds `vec_f32_<g>` in the STG arm only, where the chunk is a
     # slice of the subtile. The TMA arm takes the whole subtile, and when it is
     # rendered the STG arm is deleted outright -- so emit the bindings here
@@ -1250,7 +1315,8 @@ def generate(
     # The TMA arm carries no row bound of its own; reuse the one its STG
     # sibling applies -- the routed group's end on MoE, the problem M elsewhere.
     store_row_bound = ("group_end" if chain.has_moe else "M") if on_tma_arm else None
-    body_lines: list[str] = tma_vec_bindings + (_bounded_aux_prelude(chain) if on_tma_arm else [])
+    _aux_pre = _mmajor_aux_prelude(chain, vsize) if mmajor_tma else (_bounded_aux_prelude(chain) if on_tma_arm else [])
+    body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
     result_var: dict[int, str] = {}
@@ -1275,7 +1341,7 @@ def generate(
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
-            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm)}")
+            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm, mmajor_tma=mmajor_tma)}")
             round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
             body_lines.extend(round_lines)
             result_var[i] = cur
@@ -1284,7 +1350,7 @@ def generate(
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm) for aux in chain.aux_tensors}
+        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm, mmajor_tma=mmajor_tma) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
@@ -1293,7 +1359,7 @@ def generate(
         if third_in_chain is not None:
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c")
             body_lines.extend(cast_lines)
-        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes)
+        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes, mmajor_tma=mmajor_tma)
         body_lines.extend(lines)
         # Round to the op's out_dtype (no-op for fp32) so every consumer —
         # downstream ops and outputs alike — sees the declared-dtype value.

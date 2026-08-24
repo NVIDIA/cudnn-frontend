@@ -2308,6 +2308,26 @@ def test_coordinate_reading_aux_is_clamped_on_the_tma_arm(mode: str, dims: list[
     assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in tma
 
 
+def test_coordinate_reading_pointwise_is_not_a_store_rule() -> None:
+    """Neither arm's store rule may consult how a pointwise input reads its
+    coordinates. What differs between the arms is the element -> (row, col) MAP,
+    and `_elem_coord` publishes it; asking "does this graph read coordinates" in
+    the gate is the shape of the bug, not the fix."""
+    for fn in (compiler._tma_store_n_major_ok, compiler._tma_store_m_major_ok, compiler._tma_store_geometry_ok):
+        src = inspect.getsource(fn)
+        for probe in ("bcast_mode", "grouped_by_moe", "gen_index"):
+            assert probe not in src, f"{fn.__name__} consults {probe}: that is a pointwise concern"
+
+
+def test_m_major_tap_scatter_covers_the_whole_fragment() -> None:
+    """The M-major TMA scatter walks one register per element, so its trip count
+    is the chunk (`epi_n // 2`), not a constant. It was pinned at 16 -- exact
+    only at epi_n == 32, dropping half the tap at the 64 the wide tiles reach."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    assert "cutlass.range_constexpr(16)" not in src, "the M-major scatter trip count must follow vsize"
+    assert "for _tr_{tap_idx} in cutlass.range_constexpr({vsize}):" in src
+
+
 def test_tma_staged_values_reach_the_store_as_vectors() -> None:
     """`store_swizzled` picks its path by sniffing whether the value's `.shape`
     is a tuple: a `cutlass.Vector` reports `(N,)` and gets the per-16-byte-granule
@@ -2323,12 +2343,12 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
-    assert sites == 4, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+    assert sites == 5, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 5. A new one either "
         f"converts with .load().to_vector() or its feature stays gated off the TMA arm — "
         f"decide which, then update this test."
     )
-    assert converted == 3, f"expected exactly 3 converted rmem loads, found {converted}"
+    assert converted == 4, f"expected exactly 4 converted rmem loads, found {converted}"
 
     # The two unconverted sites are the row/col block-quantize emitters.
     assert src.count("_out = cute.make_rmem_tensor(") == 2
