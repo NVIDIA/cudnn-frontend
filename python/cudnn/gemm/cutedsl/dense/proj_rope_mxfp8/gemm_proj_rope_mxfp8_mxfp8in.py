@@ -124,33 +124,44 @@ def _to_bf16_f32(v):
 # PTX.  The mnemonics are exactly the ones rotary_fwd_q_kernel compiles to (scripts/rope_ptx.py).
 # fma.rn.bf16 is the load-bearing one: it forms its product exactly and rounds the sum once,
 # which is what an fp32 fma followed by a narrow cannot reproduce.
+#
+# The operands are declared Int16 rather than BFloat16.  A bf16 MLIR type on an inline-asm
+# operand makes the NVVM backend fail to compile with no usable diagnostic; the registers are
+# the same .b16 either way, so passing the bit pattern sidesteps it at no cost.
 
 
 @cute.jit
 def _mul_bf16(a, b):
-    return cute.arch.inline_ptx(
+    r = cute.arch.inline_ptx(
         "mul.bf16 {$w0}, {$r0}, {$r1};",
-        write_only_types=[cutlass.BFloat16],
-        read_only_args=[a, b],
+        write_only_types=[cutlass.Int16],
+        read_only_args=[a.bitcast(cutlass.Int16), b.bitcast(cutlass.Int16)],
     )
+    return r.bitcast(cutlass.BFloat16)
 
 
 @cute.jit
 def _fma_bf16(a, b, c):
-    return cute.arch.inline_ptx(
+    r = cute.arch.inline_ptx(
         "fma.rn.bf16 {$w0}, {$r0}, {$r1}, {$r2};",
-        write_only_types=[cutlass.BFloat16],
-        read_only_args=[a, b, c],
+        write_only_types=[cutlass.Int16],
+        read_only_args=[
+            a.bitcast(cutlass.Int16),
+            b.bitcast(cutlass.Int16),
+            c.bitcast(cutlass.Int16),
+        ],
     )
+    return r.bitcast(cutlass.BFloat16)
 
 
 @cute.jit
 def _neg_bf16(a):
-    return cute.arch.inline_ptx(
+    r = cute.arch.inline_ptx(
         "neg.bf16 {$w0}, {$r0};",
-        write_only_types=[cutlass.BFloat16],
-        read_only_args=[a],
+        write_only_types=[cutlass.Int16],
+        read_only_args=[a.bitcast(cutlass.Int16)],
     )
+    return r.bitcast(cutlass.BFloat16)
 
 
 @cute.struct
