@@ -411,7 +411,13 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         # dq2k's q tile (128 at d_qk <= 128, else 64) must be a multiple of the main kernel's q tile
         if self.q_tile and (128 if self.head_dim_qk_padded <= 128 else 64) % self.q_tile:
             return False
-        ws_bytes = self.batch_size * self.h_q * self.s_q_max * self._skv_rounded * self.dtype.itemsize
+        # The full two-kernel scratch (scratch_workspace_bytes' det_2k branch).
+        ws_bytes = (
+            ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
+            + ws_align(self.batch_size * self.h_q * self.s_q_max * self._skv_rounded * self.dtype.itemsize)
+            + ws_align(self._dbias_accum_elems() * 4)
+            + sum(ws_align(elems * self.dtype.itemsize) for elems in self._dkv_ws_elems())
+        )
         total_mem = torch.cuda.get_device_properties(self.q_desc.device).total_memory
         return ws_bytes <= total_mem
 

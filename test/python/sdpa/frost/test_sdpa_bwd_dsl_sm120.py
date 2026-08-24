@@ -184,26 +184,27 @@ def _expected_workspace_bytes(
     h_kv = h_q if h_kv is None else h_kv
     s_kv_eff = s_kv if s_kv is not None else s_q
     skv_r = -(-s_kv_eff // 128) * 128
-    ds_ws_bytes = batch * h_q * s_q * skv_r * io_itemsize  # det_2kernel dS workspace
+    delta_ws = ws_align(batch * h_q * sq_r * 4)
+    dbias_ws = ws_align(dbias_batch * h_q * s_q * s_kv_eff * 4) if dbias_batch else 0
+    # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
+    dkv_ws = 0
+    if h_kv != h_q:
+        dkv_ws = ws_align(batch * s_kv_eff * h_q * d_pad * io_itemsize) + ws_align(batch * s_kv_eff * h_q * dv_pad * io_itemsize)
+    ds_ws_bytes = ws_align(batch * h_q * s_q * skv_r * io_itemsize)  # det_2kernel dS workspace
     if _expect_det_2k(
         head_dim=head_dim,
         head_dim_v=head_dim_v,
         deterministic=deterministic,
         window_size_left=window_size_left,
         padded=padded,
-        ws_bytes=ds_ws_bytes,
+        ws_bytes=delta_ws + ds_ws_bytes + dbias_ws + dkv_ws,  # the full two-kernel scratch
         q_tile=q_tile,
     ):
-        dq_scratch = ws_align(ds_ws_bytes)
+        dq_scratch = ds_ws_bytes
     else:
         dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
         dq_scratch = ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4)
-    dbias_ws = ws_align(dbias_batch * h_q * s_q * s_kv_eff * 4) if dbias_batch else 0
-    # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
-    dkv_ws = 0
-    if h_kv != h_q:
-        dkv_ws = ws_align(batch * s_kv_eff * h_q * d_pad * io_itemsize) + ws_align(batch * s_kv_eff * h_q * dv_pad * io_itemsize)
-    return ws_align(batch * h_q * sq_r * 4) + dq_scratch + dbias_ws + dkv_ws
+    return delta_ws + dq_scratch + dbias_ws + dkv_ws
 
 
 def _run_bwd_graph(
@@ -679,6 +680,83 @@ def test_sdpa_bwd_dsl_sm120_bias_broadcast_det_rejected():
     bias = torch.randn(1, heads, s, s, dtype=dtype, device="cuda")
     with pytest.raises(ValueError, match="per-batch"):
         sdpa_bwd_wrapper_dsl_sm120(q, q, q, o, o, stats, deterministic=True, bias_tensor=bias)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [64, 128])
+@torch_fork_set_rng(seed=68)
+def test_sdpa_bwd_dsl_sm120_bias_masked_rows(head_dim: int):
+    """All--inf bias rows (additive masking) yield zero gradients, not NaN
+    (the LSE = -inf flip): deterministic d64 pins the relay, d128 the
+    two-kernel route."""
+
+    # B = 1: deterministic + dBias requires a per-batch bias when B > 1.
+    batch, h_q, s, dtype = 1, 4, 256, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, h_q, s, head_dim, dtype)
+    k = _bhsd(batch, h_q, s, head_dim, dtype)
+    v = _bhsd(batch, h_q, s, head_dim, dtype)
+    do = _bhsd(batch, h_q, s, head_dim, dtype)
+    bias = torch.randn(1, h_q, s, s, dtype=dtype, device="cuda")
+    bias[:, :, :3, :] = float("-inf")  # fully masked rows
+    bias[:, :, 7, 1::2] = float("-inf")  # partially masked row
+    o, stats, dq_ref, dk_ref, dv_ref, aux = _ref_bwd(q, k, v, do, scale=scale, bias=bias.float())
+    o = _bhsd(batch, h_q, s, head_dim, dtype, empty=True).copy_(o)
+    dbias = torch.empty_like(bias)
+    dq, dk, dv, _, _ = _run_bwd_graph(q, k, v, o, do, stats, scale=scale, deterministic=True, bias_gpu=bias, dbias_gpu=dbias)
+    tol = _tolerances(dtype)
+    for name, got, want in (("dq", dq, dq_ref), ("dk", dk, dk_ref), ("dv", dv, dv_ref), ("dbias", dbias, aux.dbias)):
+        assert not torch.isnan(got).any(), f"{name} has NaN"
+        torch.testing.assert_close(got.float(), want.float(), **tol)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=69)
+def test_sdpa_bwd_dsl_sm120_det_2k_memory_gate(monkeypatch):
+    """The two-kernel route is picked only when its FULL scratch (delta + dS
+    + dBias accumulator + GQA partials) fits in device memory."""
+
+    import cudnn.sdpa.bwd.api_dsl as api_mod
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+    batch, h_q, h_kv, s, d, dtype = 2, 8, 2, 256, 128, torch.float16  # GQA: the partials count too
+
+    def mk():
+        t = lambda h, dd: _bhsd(batch, h, s, dd, dtype, empty=True)
+        stats = torch.empty(batch, h_q, s, 1, dtype=torch.float32, device="cuda")
+        return SdpaBwdDslSm120(
+            sample_q=t(h_q, d),
+            sample_k=t(h_kv, d),
+            sample_v=t(h_kv, d),
+            sample_o=t(h_q, d),
+            sample_do=t(h_q, d),
+            sample_stats=stats,
+            sample_dq=t(h_q, d),
+            sample_dk=t(h_kv, d),
+            sample_dv=t(h_kv, d),
+            deterministic=True,
+        )
+
+    def picks_det_2k(api):
+        api.scratch_workspace_bytes()  # runs the lazy support check that sets det_2k
+        return api.det_2k
+
+    api = mk()
+    full = api.scratch_workspace_bytes()
+    assert api.det_2k, "shape must be two-kernel eligible on the real device"
+
+    real = torch.cuda.get_device_properties(torch.cuda.current_device())
+
+    class _Props:
+        def __init__(self, total):
+            self.total_memory = total
+            # get_device_capability reads these through get_device_properties
+            self.major, self.minor = real.major, real.minor
+
+    monkeypatch.setattr(api_mod.torch.cuda, "get_device_properties", lambda dev: _Props(full))
+    assert picks_det_2k(mk())  # exactly fits
+    monkeypatch.setattr(api_mod.torch.cuda, "get_device_properties", lambda dev: _Props(full - 1))
+    assert not picks_det_2k(mk())  # one byte short of the FULL scratch -> relay
 
 
 @pytest.mark.L0

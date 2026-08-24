@@ -568,8 +568,13 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         # Skip the kv >= SKV check when padding already masks kv >= seqlen_kv (<= SKV).
         MASK_KV_GLOBAL = PARTIAL_KV and not self.seq_kv_lens_present
         # Fully-masked rows have LSE = -inf; flip to +inf so P = exp2(finite - inf) = 0, not NaN.
+        # A bias can mask a whole row too (an all--inf additive-mask row).
         FLIP_MASKED_LSE = (
-            (self.is_causal and not self.causal_top_left) or self.window_size_left is not None or self.seq_kv_lens_present or self.seq_q_lens_present
+            (self.is_causal and not self.causal_top_left)
+            or self.window_size_left is not None
+            or self.seq_kv_lens_present
+            or self.seq_q_lens_present
+            or self.bias_present
         )
 
         m_block_max = (seqlen_q + M - 1) // M
