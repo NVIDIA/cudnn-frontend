@@ -52,6 +52,12 @@ pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, ship
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
+### Import paths
+
+`from cudnn import {your_operation}` is the supported entry point and has been stable across releases. The modules behind it were reorganized in 1.27: the GEMM fusion packages now live under `cudnn.gemm.cutedsl.{dense,grouped,discrete_grouped}` (e.g. `cudnn.gemm.cutedsl.grouped.wgrad` instead of `cudnn.grouped_gemm.grouped_gemm_wgrad`). The pre-1.27 module paths — `cudnn.grouped_gemm`, `cudnn.discrete_grouped_gemm`, `cudnn.gemm_amax`, `cudnn.gemm_swiglu`, `cudnn.gemm_srelu`, `cudnn.gemm_dsrelu`, `cudnn.gemm_proj_rope_mxfp8`, and their submodules — remain importable as deprecated aliases of the new packages (a `DeprecationWarning` is emitted on first use). New code should use the top-level symbols.
+
+Note that a failed optional-dependency import surfaces as `ImportError: {your_operation} requires optional dependencies ...` when accessing the symbol; the underlying cause is chained onto the error (`raise ... from`), so run with the full traceback to see what is actually missing.
+
 ## API Usage
 
 Each operation exposes two APIs:
