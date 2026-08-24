@@ -1438,8 +1438,6 @@ def tcgen05_mma_warp(
                 bars.mb_da_done[intermediate_stage].arrive(cta_group=1)
 
             # ---- dK decay part = state(T) @ dY^T -------------------------------------
-            # wait stays outside the guard: the done arrive below must never outrun
-            # WG1's slot-gc publish, or WG1's single-slot parity wait can skip a phase
             bars.mb_dy_smem_ready.wait(gc % 2)
             if chunk_idx >= FIRST_STATE_CHUNK:
                 a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)), cutlass.Int8)
@@ -1494,9 +1492,6 @@ def tcgen05_mma_warp(
                 bars.mb_decay_done[decay_stage].arrive(cta_group=1)
 
         # ---- tile end: WG1's dstate0 store gates the next tile's dstate reuse --------
-        # zero-length tiles skip the handshake on both sides: WG1's arrive there is
-        # not gated on this wait having passed, so back-to-back arrives could skip
-        # the single-slot parity window
         if sk_nt > 0:
             bars.mb_dstate0_acc_stored.wait(dstate0_index.phase)
             dstate0_index = advance(dstate0_index, 1)
@@ -1554,7 +1549,7 @@ def tmaldg_warp(
     state_index = PipelineState.start(phase=1)
     scheduler_state = PipelineState.start(phase=1)
     tail_count = ((total_tiles - cutlass.Int32(1)) % num_ctas) + cutlass.Int32(1)
-    tail_base = total_tiles - tail_count
+    tail_base = (total_tiles - tail_count) if tail_count * 2 >= num_ctas else total_tiles
     tail_row = tail_base + cute.arch.smid()
     tail_row = tail_row if tail_row < total_tiles else cutlass.Int32(1 << 28)
 
@@ -2121,27 +2116,26 @@ def compute0_warp_group(
             if chunk_idx >= FIRST_STATE_CHUNK:
                 bars.mb_state_ready[state_index.idx].wait(state_index.phase)
                 state_src = sState_raw.data_ptr() + state_index.idx * (cfg.d_k * cfg.d_v)
-                for pl in cutlass.range_constexpr(2):
-                    for g8 in cutlass.range_constexpr(8):
-                        state_frag = cutlass.Vector.from_elements(
-                            tuple(
-                                (
-                                    state_src
-                                    + (value_dim // 64) * (cfg.d_v * 64)
-                                    + (pl * 64 + g8 * 8 + e) * 64
-                                    + swizzle_xor_128b(pl * 64 + g8 * 8 + e, value_dim % 64, elem_bytes=2)
-                                ).load()
-                                for e in range(8)
-                            ),
-                            cfg.io_dtype,
-                        )
-                        nvvm.tcgen05_st(
-                            "32x32b",
-                            nvvm.make_tmem_ptr(
-                                state_copy_addr + (tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2) + pl * 32 + g8 * 4), cutlass.Int8
-                            ),
-                            state_frag.bitcast(cutlass.Int32),
-                        )
+                ldm_row_coord = (lane_idx // 16) * 8 + (lane_idx & 7)
+                ldm_col_offset = ((lane_idx // 8) & 1) * 8
+                k_base = tmem_sp * cfg.threads_per_warp
+                k_seg_off = (k_base // 64) * (cfg.d_v * 64)
+                state_copy_hi_addr = state_copy_addr + (16 << 16)
+                state_col = tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)
+                for dv_blk in cutlass.range_constexpr(cfg.d_v // 16):
+                    dv_row = dv_blk * 16 + ldm_row_coord
+                    frag_lo = nvvm.ldmatrix(
+                        state_src + k_seg_off + dv_row * 64 + swizzle_xor_128b(dv_row, (k_base + ldm_col_offset) % 64, elem_bytes=2),
+                        4,
+                        nvvm.MMALayout.COL,
+                    )
+                    frag_hi = nvvm.ldmatrix(
+                        state_src + k_seg_off + dv_row * 64 + swizzle_xor_128b(dv_row, (k_base + 16 + ldm_col_offset) % 64, elem_bytes=2),
+                        4,
+                        nvvm.MMALayout.COL,
+                    )
+                    nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(state_copy_addr + (state_col + dv_blk * 8), cutlass.Int8), frag_lo)
+                    nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(state_copy_hi_addr + (state_col + dv_blk * 8), cutlass.Int8), frag_hi)
                 nvvm.tcgen05_wait("store")
                 bars.mb_state_cg0_done[state_index.idx].arrive()
                 state_index = advance(state_index, cfg.smem_state_stages)

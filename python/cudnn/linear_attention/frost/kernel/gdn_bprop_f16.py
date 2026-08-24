@@ -1659,7 +1659,7 @@ def tmaldg_warp(
     state_index = PipelineState.start(phase=1)
     scheduler_state = PipelineState.start(phase=1)
     tail_count = ((total_tiles - cutlass.Int32(1)) % num_ctas) + cutlass.Int32(1)
-    tail_base = total_tiles - tail_count
+    tail_base = (total_tiles - tail_count) if tail_count * 2 >= num_ctas else total_tiles
     tail_row = tail_base + cute.arch.smid()
     tail_row = tail_row if tail_row < total_tiles else cutlass.Int32(1 << 28)
 

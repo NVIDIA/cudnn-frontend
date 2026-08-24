@@ -1379,8 +1379,6 @@ def compute1_warp_group(
 
                 # ---- state stage + rescale -------------------------------------------
                 if valid_state:
-                    # chunk 0 of a seeded tile reads WG1's own seed store, so there
-                    # is no state MMA commit to consume there
                     if local_idx > 0:
                         bars.mb_state_acc_ready[kv_acc_index.idx].wait(kv_acc_index.phase)
                         kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)

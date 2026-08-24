@@ -1589,8 +1589,6 @@ def compute1_warp_group(
                     cumprod_total = sCumprod[sCumprod.shape[0] - 1, 0, gate_idx]
 
                     # ---- state stage + rescale ---------------------------------------
-                    # chunk 0 of an initial-state tile reads WG1's own seed store, so
-                    # there is no state MMA commit to consume there
                     if valid_state:
                         if cutlass.const_expr(cfg.use_initial_state):
                             if local_idx > 0:
