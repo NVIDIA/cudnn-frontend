@@ -130,6 +130,14 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         # ordered against the default stream here, so run in place.
         yield
         return
+    # Fast path: the launch stream is almost always the one torch is already on,
+    # and entering a context for the current stream is a no-op. Building the two
+    # Stream objects below costs ~3.4 us each and this runs several times per
+    # execute; the raw handle getter is ~0.07 us.
+    _idx = device.index if device.index is not None else torch.cuda.current_device()
+    if handle == torch._C._cuda_getCurrentRawStream(_idx):
+        yield
+        return
     torch_current = torch.cuda.current_stream(device)
     torch_default = torch.cuda.default_stream(device)
     if handle == torch_current.cuda_stream:
