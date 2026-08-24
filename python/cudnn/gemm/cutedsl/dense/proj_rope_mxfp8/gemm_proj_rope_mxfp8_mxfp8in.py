@@ -72,16 +72,6 @@ assert HALF == QK_ROPE // 2, "HALF must be QK_ROPE // 2"
 assert TILE_M % BLOCK == 0, "TILE_M must be a whole number of MXFP8 blocks"
 assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COLBLK x N_FEATCELL"
 
-# ---- Debug instrumentation (off by default) ----
-# When on, the epilogue also writes its two intermediates to GMEM so the fused result can be
-# bisected against the unfused GEMM -> RoPE -> quantize chain:
-#   DbgGemm  bf16 [tokens, NUM_HEADS, HEAD_DIM]  post-GEMM, post-bf16-stage, pre-RoPE
-#   DbgRope  fp32 [tokens, NUM_HEADS, HEAD_DIM]  post-RoPE, pre-quantize.  BF16-valued, but
-#            dumped as fp32 so it can also be scored against an exact reference.
-# Guarded with const_expr, so nothing is emitted at all when the flag is off; the buffers are
-# then 1-element placeholders.
-DBG = int(os.environ.get("NVTE_FUSED_Q_UPROJ_DEBUG", "0")) > 0
-
 # ---- RoPE arithmetic ----
 # The unfused path applies RoPE with Megatron's Triton rotary_fwd_q_kernel.  Reading the PTX
 # that kernel compiles to (scripts/rope_ptx.py) it contains no fp32 instruction at all: per
@@ -108,10 +98,6 @@ DBG = int(os.environ.get("NVTE_FUSED_Q_UPROJ_DEBUG", "0")) > 0
 # Both agree on all but ~1e-8 of elements; the flag exists to measure that difference and the
 # cost of closing it.
 ROPE_BF16_FMA = int(os.environ.get("NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA", "0")) > 0
-
-if DBG or ROPE_BF16_FMA:
-    print(f"[proj_rope_mxfp8] DBG={DBG} ROPE_BF16_FMA={ROPE_BF16_FMA}", flush=True)
-
 
 @cute.jit
 def _to_bf16_f32(v):
@@ -295,8 +281,6 @@ def gemm_proj_rope_mxfp8_kernel(
     mSrow: cute.Tensor,
     mQcol: cute.Tensor,
     mScol: cute.Tensor,
-    mDbgGemm: cute.Tensor,
-    mDbgRope: cute.Tensor,
     epi_tile: cute.Tile,
     cta_layout_vmnk: cute.Layout,
     tile_sched_params: utils.PersistentTileSchedulerParams,
@@ -531,13 +515,7 @@ def gemm_proj_rope_mxfp8_kernel(
             b = fc * 2 + (lane // HALFW)  # 32-feature row-block 0..5
             col_amax0 = cutlass.Float32(0.0)
             col_amax1 = cutlass.Float32(0.0)
-            if cutlass.const_expr(DBG):
-                # P1: raw GEMM tile straight out of sACC, before any rope. The (f0, f1) pairs
-                # over 12 warps x 32 lanes x 32 tokens tile TILE_M x HEAD_DIM exactly once, so
-                # this dumps every column in natural (nope | interleaved-rope) order.
-                for r in cutlass.range_constexpr(BLOCK):
-                    mDbgGemm[token_base + tok0 + r, head, f0] = sACC[tok0 + r, f0]
-                    mDbgGemm[token_base + tok0 + r, head, f1] = sACC[tok0 + r, f1]
+            
             # TE weight layout: NOPE at features 0..127, ROPE at features 128..191 (last cell)
             is_rope = fc == (N_FEATCELL - 1)
             if is_rope:
@@ -624,12 +602,7 @@ def gemm_proj_rope_mxfp8_kernel(
                     buf1[r] = v1
                     col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
                     col_amax1 = cute.arch.fmax(col_amax1, cute.arch.fmax(v1, -v1))
-            if cutlass.const_expr(DBG):
-                # P2: post-rope values, still fp32, before amax/quantize. buf0/buf1 map to the
-                # output features f0/f1 in both the rope and non-rope branches.
-                for r in cutlass.range_constexpr(BLOCK):
-                    mDbgRope[token_base + tok0 + r, head, f0] = buf0[r]
-                    mDbgRope[token_base + tok0 + r, head, f1] = buf1[r]
+            
             invc0, sbc0, invc1, sbc1 = _e8m0_pair(col_amax0, col_amax1)
             scol_row = m_idx * COLBLK + cb
             mScol[scol_row, head, f0] = cutlass.Uint8(sbc0)
@@ -699,8 +672,6 @@ def gemm_proj_rope_mxfp8_host(
     mSrow: cute.Tensor,
     mQcol: cute.Tensor,
     mScol: cute.Tensor,
-    mDbgGemm: cute.Tensor,
-    mDbgRope: cute.Tensor,
     grid_m: cutlass.Constexpr,
     num_heads: cutlass.Constexpr,
     max_active_clusters: cutlass.Constexpr,
@@ -769,8 +740,6 @@ def gemm_proj_rope_mxfp8_host(
         mSrow,
         mQcol,
         mScol,
-        mDbgGemm,
-        mDbgRope,
         epi_tile,
         cta_layout_vmnk,
         tile_sched_params,
