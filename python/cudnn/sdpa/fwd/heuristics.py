@@ -263,16 +263,12 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
 # --- pack_gqa (GQA head packing) --------------------------------------------
 
 
-def _pack_gqa_choices(caps: Capabilities, facts, tile_m: int):
-    if True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m):
-        return (False, True)
-    return (False,)
-
-
 def _pack_gqa_wins(facts, tile_q: int) -> bool:
     """Pack when the Q sequence cannot fit in a single tile, then we can further
-    apply split_kv on top of GQA packing. We may enhance this heuristic logic in
-    the future by considering more factors such as the device SM count.
+    apply split_kv on top of GQA packing.
+
+    TODO: we may enhance this heuristic logic in the future by considering more
+    factors such as the device SM count.
     """
     return facts.s_q < tile_q
 
@@ -293,6 +289,16 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int]) -> int:
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256)
     return cga_tile_m(512)
+
+
+def _pack_gqa_points(caps: Capabilities, facts, tile_m: int) -> Tuple[bool, ...]:
+    """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
+    ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
+    if not (True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)):
+        return (False,)
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m)):
+        return (True, False)
+    return (False, True)
 
 
 def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Optional[int], cga: Optional[int], pack_g: int = 1) -> List[Optional[int]]:
@@ -395,10 +401,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     # small tiles exist for, and a bigger tile admits a bigger G (G must
     # divide it) — while an unpacked set keeps the tile rule's choice.
     pack_tile = next(
-        ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_choices(caps, facts, m or 128)),
+        ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_points(caps, facts, m or 128)),
         None,
     )
-    packed_first = pack_tile is not None and _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, pack_tile[0]))
+    packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128)[0]
     unpacked_pack = False if True in caps.pack_gqas else _sole(caps.pack_gqas)
     base_tile = pack_tile if packed_first else tiles[0]
     # The split model sees the launch geometry of the set it rides — the
@@ -418,7 +424,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # A packed baseline's tile runners keep the packing, so tiles the
         # ratio cannot ride are skipped — emitted, they would only spend
         # set-cap slots for mismatch to drop.
-        if base.pack_gqa is True and True not in _pack_gqa_choices(caps, facts, tile_m or 128):
+        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128):
             continue
         out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
     for policy in scheds[1:]:

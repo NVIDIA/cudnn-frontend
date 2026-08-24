@@ -517,7 +517,19 @@ def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
     """Packed d192xd128 flavor across GQA ratios, causal, tile-unaligned s_q."""
     scale = 1.0 / math.sqrt(192)
     out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
-        2, h_q, h_kv, 40, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=192, d_v=128, pack_gqa=True, return_lse=True
+        2,
+        h_q,
+        h_kv,
+        40,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=192,
+        d_v=128,
+        pack_gqa=True,
+        return_lse=True,
     )
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_ref)
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
@@ -533,7 +545,19 @@ def test_fp8_pack_gqa_d192_d128_grouped_lpt():
     reverse-row CGA tiles."""
     scale = 1.0 / math.sqrt(192)
     out, o_ref, a_o, a_ref, lse_v, lse_ref = _run(
-        8, 8, 4, 300, 512, "e4m3", torch.bfloat16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), d_qk=192, d_v=128, pack_gqa=True, return_lse=True
+        8,
+        8,
+        4,
+        300,
+        512,
+        "e4m3",
+        torch.bfloat16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=192,
+        d_v=128,
+        pack_gqa=True,
+        return_lse=True,
     )
     _check(out, o_ref, torch.bfloat16, "e4m3", a_o, a_ref)
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)

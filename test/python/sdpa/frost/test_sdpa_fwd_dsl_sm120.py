@@ -1433,11 +1433,11 @@ def test_dsl_sm120_pack_gqa_features(mask: str):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
-@pytest.mark.parametrize("s_q", [1, 129, 1023])
+@pytest.mark.parametrize("s_q, h_kv", [(1, 8), (127, 8), (127, 1)], ids=["s1-g8", "s127-g8", "s127-mqa64"])
 @torch_fork_set_rng(seed=4)
-def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int):
-    """Packed multi-tile / odd-length shapes, bf16."""
-    _run_case(batch=1, h_q=64, h_kv=8, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
+def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
+    """Packed multi-tile / odd-length row spaces, bf16."""
+    _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
 
 
 @pytest.mark.L0

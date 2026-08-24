@@ -553,7 +553,7 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
 
 - More per-family tuning rules on top of the ranking frame, each with the
   measurements behind it. `sdpa/fwd/heuristics.py::_sm120_tiles` and
-  `_sm100_pack_gqa` are the two today; every other cell falls back to its
+  `_pack_gqa_wins` are the two today; every other cell falls back to its
   capability row's sole point per axis, which is the honest answer while
   nobody has timed it.
 - FALLBACK is one config per cell today — the smallest tile the row admits, the
