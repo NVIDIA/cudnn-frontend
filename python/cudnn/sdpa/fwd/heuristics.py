@@ -310,16 +310,19 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
     — the packed grid is smaller, which is exactly when splitting pays.
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
-    facts-level launch geometry (``tile_m*cga`` rows per tile — the recommend
-    tier's approximation of the kernel Cfg's exact ``TILES_Q*TILE_M*CTA_MMA``).
-    The generator respects the split path's structural limits (dense-only, no
-    sink — mismatch() enforces the same, so an emitted >1 never reaches a
-    kernel that cannot honor it).
+    EXACT launch geometry via :func:`_pack_gqa_tile_q` — the Q rows one grid
+    tile covers, which on SM100 is the cluster's ``TILES_Q*TILE_M*CTA_MMA``
+    (512 at d128/d192), not ``tile_m*cga`` (256). The distinction is the whole
+    model: fed 256 the chooser sees twice the tiles the launch actually has,
+    so it reads a half-empty machine as full and under-splits or declines to
+    split at all. The generator respects the split path's structural limits
+    (dense-only, no sink — mismatch() enforces the same, so an emitted >1
+    never reaches a kernel that cannot honor it).
 
-    The split point is deliberately a RUNNER-UP behind no-split until sweeps
-    justify flipping the default: first-build behavior stays exactly what this
-    dispatch has always done, and autotune / select_plan reach the split plan
-    today.
+    A split the model asks for LEADS, with no-split behind it as the runner-up
+    — so a plain ``build_plans()`` runs the split, and autotune / select_plan
+    can still reach the unsplit plan. Emitting it the other way round meant the
+    default build never used the split the model had just computed.
     """
     domain = caps.split_kvs
     if len(domain) <= 1:
@@ -338,7 +341,7 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]
-    rows_per_tile = (tile_m or 128) * (cga or 1)
+    rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m)
     split = choose_split_kv(
         q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
         heads_q=facts.h_q // pack_g,
@@ -352,7 +355,7 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
     usable = [s for s in sorted(domain) if 1 < s <= split]
     if not usable:
         return [no_split]
-    return [no_split, usable[-1]]
+    return [usable[-1], no_split]
 
 
 def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
@@ -410,15 +413,25 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     # The split model sees the launch geometry of the set it rides — the
     # packed grid when the baseline packs.
     splits = _split_points(caps, facts, base_tile[0], base_tile[1], cga, pack_g=(facts.h_q // facts.h_kv) if packed_first else 1)
-    base = SdpaFwdKnobs(
-        sched_policy=scheds[0],
-        tile_m=base_tile[0],
-        tile_n=base_tile[1],
-        cga=cga,
-        pack_gqa=True if packed_first else unpacked_pack,
-        split_kv=splits[0],
-        softmax_precision=_softmax_points(caps)[0],
-    )
+    # A split set rides the plain scheduler: the SM120 config bars a split under
+    # the LPT remaps, and in the underfilled regime a split targets, LPT
+    # balancing is moot — the split itself levels the grid. The coupling is
+    # structural, so it binds whichever leg leads; it cannot live only on the
+    # runner-up loop or a leading split would inherit the derived LPT policy.
+    plain_sched = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else scheds[0]
+
+    def _leg(split: Optional[int]) -> SdpaFwdKnobs:
+        return SdpaFwdKnobs(
+            sched_policy=plain_sched if (split or 1) > 1 else scheds[0],
+            tile_m=base_tile[0],
+            tile_n=base_tile[1],
+            cga=cga,
+            pack_gqa=True if packed_first else unpacked_pack,
+            split_kv=split,
+            softmax_precision=_softmax_points(caps)[0],
+        )
+
+    base = _leg(splits[0])
     out = [base]
     for tile_m, tile_n in tiles[1:]:
         # A packed baseline's tile runners keep the packing, so tiles the
@@ -427,8 +440,11 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128):
             continue
         out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
+    # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
+    # scheduler above, so an LPT runner is only a candidate without one.
+    sched_host = base if (base.split_kv or 1) == 1 else _leg(splits[-1])
     for policy in scheds[1:]:
-        out.append(replace(base, sched_policy=policy))
+        out.append(replace(sched_host, sched_policy=policy))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
     # admitting tile; unpacked: the tile rule's best).
     if pack_tile is not None:
@@ -437,10 +453,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         else:
             out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1]))
     for split in splits[1:]:
-        # Split sets ride the plain scheduler: the SM120 config bars a split
-        # under the LPT remaps, and in the underfilled regime a split targets
-        # the LPT balancing is moot — the split itself levels the grid.
-        out.append(replace(base, split_kv=split, sched_policy=SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else base.sched_policy))
+        out.append(_leg(split))
     seen, unique = set(), []
     for knobs in out:
         if knobs not in seen:

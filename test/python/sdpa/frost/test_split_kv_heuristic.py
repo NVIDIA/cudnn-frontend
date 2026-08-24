@@ -259,3 +259,38 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm120",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
+
+
+def test_split_points_feeds_the_exact_cluster_extent():
+    """_split_points must measure the launch in CLUSTERS, not CTA tiles.
+
+    The SM100 d128 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
+    its 2 CTAs — the same extent every helper above assumes. Feeding the model
+    ``tile_m * cga`` (256) instead doubles the apparent tile count, so a
+    half-empty machine reads as full and the chooser under-splits: the ar_dit
+    chunked-prefill shape below measured 4 on the true geometry and 2 on the
+    approximation, worth 1.72x vs 1.33x on B300.
+    """
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100").capabilities
+    # ar_dit: B1 x H9 x D128 bf16, 985 new tokens against a 62208-token clip.
+    facts = ga.SdpaGraphFacts(
+        b=1,
+        h_q=9,
+        h_kv=9,
+        s_q=985,
+        s_kv=62208,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        device_sm_count=B200_SMS,
+        device_cc=(10, 0),
+    )
+    points = _split_points(caps, facts, 128, 128, 2)
+    assert points[0] == 4, f"expected the 512-row cluster extent to choose 4, got {points}"
+    assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
