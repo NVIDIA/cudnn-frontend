@@ -62,6 +62,13 @@ def _build_fwd_graph(*, d=D, stats_stride=None, **sdpa_kwargs):
     return g, q, k, v, o, stats
 
 
+def _ws(g):
+    """The graph's carved-scratch workspace (issue #514): a non-zero
+    workspace_bytes executor carves from the caller's buffer."""
+    n = g.get_workspace_size()
+    return torch.empty(n, dtype=torch.uint8, device="cuda") if n else None
+
+
 def _native_then_pin(g, engine):
     g.validate()
     g.build_operation_graph()
@@ -129,7 +136,7 @@ def test_fwd_engine_end_to_end():
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
     torch.cuda.synchronize()
 
     ref = torch.nn.functional.scaled_dot_product_attention(q_buf.float(), k_buf.float(), v_buf.float(), is_causal=True, scale=_SCALE).to(torch.float16)
@@ -190,7 +197,7 @@ def test_bwd_engine_end_to_end():
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
 
     gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     st = _bshd_stride(B, H, S, D)
@@ -209,7 +216,7 @@ def test_bwd_engine_end_to_end():
     dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
     gb.execute(
         {qb: q_buf, kb: k_buf, vb: v_buf, ob: o_buf, dob: do_buf, statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf},
-        None,
+        _ws(gb),
     )
     torch.cuda.synchronize()
 
@@ -249,7 +256,7 @@ def test_fwd_engine_bhsd_contiguous_layout(gqa):
     v_buf = torch.randn(B, h_kv, S, D, dtype=torch.float16, device="cuda")
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
     torch.cuda.synchronize()
 
     ref = torch.nn.functional.scaled_dot_product_attention(
@@ -292,7 +299,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     dq_buf, dk_buf, dv_buf = (torch.empty(dims, dtype=torch.float16, device="cuda") for _ in range(3))
     gb.execute(
         {qb: bufs["q"], kb: bufs["k"], vb: bufs["v"], ob: o_buf, dob: bufs["do"], statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf},
-        None,
+        _ws(gb),
     )
     torch.cuda.synchronize()
 
@@ -316,7 +323,9 @@ def test_engine_execute_does_not_allocate():
     # Forward graph (with stats, so the LSE staging path runs too).
     g, q, k, v, o, stats = _build_fwd_graph()
     _native_then_pin(g, _FWD)
-    assert g.get_workspace_size() > 0, "the SM80 fwd executor must report its carved scratch"
+    # The fwd executor may report 0 here: the merged SdpaFwdDsl port binds
+    # caller buffers directly, so a plain compact-BSHD MHA graph needs no
+    # scratch at all (the allocation counter below is the real contract).
     torch.manual_seed(0)
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
     o_buf = torch.empty_like(q_buf)
