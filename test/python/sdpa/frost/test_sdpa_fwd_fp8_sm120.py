@@ -96,6 +96,7 @@ def _run(
     seq_lens_kv=None,
     seq_lens_q=None,
     tiles=None,
+    pack_gqa=None,
     s_descale_gain=1.0,
     sync_debug=False,
     D=128,
@@ -196,7 +197,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles)
+    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, stats: lse, amx_o: amax_o})
@@ -248,6 +249,71 @@ def _check(out, o_ref, amax_o, amax_o_ref, lse=None, lse_ref=None, tol_o=5e-2):
         assert torch.equal(torch.isfinite(lse), finite), "LSE -inf pattern differs from the reference"
         d = (lse[finite] - lse_ref[finite]).abs().max().item() if finite.any() else 0.0
         assert d <= 3e-2, f"max|LSE-ref|={d:.4f} > 0.03"
+
+
+# --- PackGQA: q_tile/G tokens x G query heads per tile -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,h_kv",
+    [(8, 4), (8, 2), (8, 1), (16, 1)],
+    ids=["g2", "g4", "g8_mqa", "g16_mqa"],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_pack_gqa_ratios(h_q, h_kv):
+    """Packed plans across GQA ratios (incl. MQA)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(2, h_q, h_kv, 40, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), pack_gqa=True)
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [4, 16, 25], ids=["subspan", "exact_span", "tail"])
+@torch_fork_set_rng(seed=1)
+def test_fp8_sm120_pack_gqa_tiles(s_q):
+    """Packed tile-geometry edges at G=8, q_tile=128 (token span 16/tile)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        1, 64, 8, s_q, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(128, 128), pack_gqa=True
+    )
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("o_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16_out", "e4m3_out"])
+@pytest.mark.parametrize("mask", ["none_padded", "causal", "causal_br", "swa", "sink_causal"])
+@torch_fork_set_rng(seed=2)
+def test_fp8_sm120_pack_gqa_features(mask, o_dtype):
+    """Packed plans x the fp8 mask/sink envelope x both output-dtype epilogues."""
+    kw = dict()
+    sinks = None
+    seq_lens_kv = None
+    if mask == "none_padded":
+        seq_lens_kv = [180, 240]
+    elif mask == "causal":
+        kw = dict(use_causal_mask=True)
+    elif mask == "causal_br":
+        kw = dict(use_causal_mask_bottom_right=True)
+    elif mask == "swa":
+        kw = dict(use_causal_mask=True, left_bound=17)
+    elif mask == "sink_causal":
+        kw = dict(use_causal_mask=True)
+        sinks = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, 8, 2, 40, 256, scale=1.0 / math.sqrt(128), sdpa_kwargs=kw, seq_lens_kv=seq_lens_kv, sinks=sinks, o_dtype=o_dtype, pack_gqa=True
+    )
+    tol_o = 5e-2
+    if o_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        floor = (o_ref - o_ref.to(o_dtype).float()).abs().max().item()
+        tol_o = max(tol_o, 3 * floor)
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref, tol_o=tol_o)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=3)
+def test_fp8_sm120_pack_gqa_tile64():
+    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    out, o_ref, a_o, a_ref, lse, lse_ref = _run(
+        2, 8, 2, 24, 192, scale=1.0 / math.sqrt(128), sdpa_kwargs=dict(use_causal_mask=True), tiles=(64, 64), pack_gqa=True
+    )
+    _check(out, o_ref, a_o, a_ref, lse, lse_ref)
 
 
 _MASKS = {

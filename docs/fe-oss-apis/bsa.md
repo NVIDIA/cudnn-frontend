@@ -10,7 +10,7 @@ be its query-block index and let `K_m` be the union of the key/value blocks
 listed for that query block. The operation is
 
 $$
-O_i = \operatorname{softmax}_{j \in K_m}
+O_i = \text{softmax}_{j \in K_m}
 \left(\frac{Q_i K_j^T}{\sqrt{D}}\right)V_j.
 $$
 
@@ -23,8 +23,7 @@ list of key/value blocks per **query block**. NSA Selection supplies routing
 metadata at query-token granularity and is one component of the larger NSA
 pipeline.
 
-This package contains only Python CuTe DSL/JIT kernels. The C++/CUTLASS AOT
-extension from the source repository is not included.
+BSA is implemented with Python CuTe DSL/JIT kernels.
 
 ## Installation
 
@@ -33,6 +32,12 @@ Install the CuTe DSL optional dependencies:
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
+
+The package-wide `nvidia-cutlass-dsl[cu13]>=4.5.0` dependency floor applies to
+BSA. The FP16/BF16 APIs continue to work with supported CuTe DSL 4.5 releases.
+The Sage FP8 API below performs an additional runtime check and requires
+`nvidia-cutlass-dsl>=4.6.1`; this narrower requirement does not change the
+package dependency floor or make importing `cudnn` require CuTe DSL 4.6.1.
 
 ## Forward
 
@@ -94,7 +99,7 @@ is consumed. Values in the inactive suffix are ignored.
   `[0, K_max]` when `allow_empty_block_nums=True`, and in `[1, K_max]`
   otherwise. Backward variable counts may be in `[0, K_max]`.
 - With fixed counts, `block_sparse_num` must be in `[1, K_max]`. The
-  SM100/SM110 blk128 path additionally requires an even value, i.e. an even
+  SM100/SM103 blk128 path additionally requires an even value, i.e. an even
   `block_sparse_num` in `[2, K_max]`.
 - The `block_sizes` entry for every physical KV block referenced by an active
   `q2k_block_index` value must be in `[1, sparse_block_size]`. Entries for
@@ -106,7 +111,7 @@ Tensor value ranges and per-row uniqueness are not validated at runtime.
 Violating the contract is unsupported and may produce invalid results or
 invalid device memory accesses.
 
-On the SM100/SM110 blk128 path, `pack_gqa=None` automatically packs GQA when
+On the SM100/SM103 blk128 path, `pack_gqa=None` automatically packs GQA when
 the GQA ratio `r = H_q / H_kv` divides 128. Packed metadata has shape
 `(B, H_kv, ceil(S_q * r / 128), K_max)`. Pass `pack_gqa=False` to use the
 unpacked `(B, H_q, ceil(S_q / 128), K_max)` contract on every architecture.
@@ -117,22 +122,65 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM110. Passing `sparse_block_size=64` explicitly selects the SM100/SM110
+SM100/SM103. Passing `sparse_block_size=64` explicitly selects the SM100/SM103
 blk64 CuTe DSL path, whose shape support is narrower. `kv_splits` is available
 on SM90 and the explicit Blackwell blk64 path; `use_clc` applies only to the
 explicit Blackwell blk64 path.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
-split count. The SM100/SM110 blk64 path also accepts `kv_splits="auto"`; CLC is
-disabled for split execution, and an explicit `use_clc=True` is incompatible
-with `kv_splits>1`. Every sparse row must contain at least the selected number
-of valid KV blocks so that every split is non-empty; this caller contract is not
-validated at runtime. Automatic split selection uses metadata capacity rather
-than per-row count values, so variable-count callers must also satisfy the
-automatically selected split count. It falls back to a smaller split count when
-the estimated live workspace does not fit the available CUDA allocator budget;
-an explicit split count that exceeds that budget raises `RuntimeError`.
+split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
+compatible with split execution. Pass `use_clc=True` to use persistent CLC
+scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
+default `use_clc=None` keeps CLC disabled for split execution because the
+automatic scheduler policy has not been tuned for that combination. Automatic
+split selection uses metadata capacity rather than per-row count values. It
+falls back to a smaller split count when the estimated live workspace does not
+fit the available CUDA allocator budget; an explicit split count that exceeds
+that budget raises `RuntimeError`.
+
+## Sage FP8 forward
+
+Sage FP8 is a forward-only blk64 path. Its public wrapper accepts contiguous
+BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
+internally:
+
+```python
+fp8_result = BSA.block_sparse_attention_fp8_forward(
+    q,
+    k,
+    v,
+    q2k_block_index,
+    block_sparse_num=4,
+)
+o_fp8 = fp8_result["o_tensor"]
+```
+
+Q, K, and V must be BF16 MHA tensors in contiguous BHSD layout, have matching
+batch and head counts, and use `D=128`. The wrapper accepts the same blk64
+sparse index metadata used by the regular forward API. It lazily loads the
+quantizer, creates the E4M3 tensors and FP32 scales needed by the kernel, and
+does not expose those implementation details as public inputs or outputs.
+
+The result is a one-key `TupleDict` containing `o_tensor`, a contiguous BF16
+tensor of shape `(B, H, S_q, 128)`. This API does not return LSE and has no
+backward implementation.
+
+The architecture-specific FP8 contracts are:
+
+- SM100/SM103 requires `B=1`, `H` equal to 4 or 8, and both sequence lengths
+  to be multiples of 64. It uses fixed `block_sparse_num` with full 64-token
+  KV blocks; `q2k_block_nums` and `block_sizes` are not supported. Split-KV is
+  selected internally, and the public FP8 API does not expose `kv_splits` or
+  `use_clc`.
+- SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
+  tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
+  `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
+
+`block_sparse_attention_fp8_forward` requires CuTe DSL 4.6.1 or newer at call
+time. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
+loaded lazily, so importing `cudnn` still works with the package-wide CuTe DSL
+4.5 dependency floor.
 
 ## Backward
 
@@ -162,24 +210,26 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
-Backward defaults to blk64 on SM90 and blk128 on SM100/SM110. Pass the same
+Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
-path. SM100/SM110 blk128 backward does not yet consume `block_sizes`; it
+path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
 therefore requires full physical KV blocks and `block_sizes=None`.
 
 ## Current support
 
 ### Forward
 
-| Architecture | Sparse block | Dtype | QK / V dimensions | Attention |
+| Architecture | Sparse block | Public input / kernel dtype | QK / V dimensions | Attention |
 | --- | ---: | --- | --- | --- |
 | SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
-| SM100/SM110 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
-| SM100/SM110 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
+| SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
+| SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
+| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA (B=1, H=4 or 8) |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
+| SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
-any positive value. The SM100/SM110 blk128 fixed count must be even and at
+any positive value. The SM100/SM103 blk128 fixed count must be even and at
 least two; SM120 and the explicit Blackwell blk64 path accept any positive
 fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
 defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
@@ -192,8 +242,8 @@ branch-free fast path. Split-KV execution therefore excludes empty rows.
 | Architecture | Sparse block | Dtype | Head dimension | Attention |
 | --- | ---: | --- | ---: | --- |
 | SM90 | 64 | BF16 | 128 | MHA |
-| SM100/SM110 | 64 | BF16 | 128 | MHA |
-| SM100/SM110 | 128 | BF16 | 64 or 128 | MHA |
+| SM100/SM103 | 64 | BF16 | 128 | MHA |
+| SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
 
 Backward is not implemented for SM120. It requires equal QK/V dimensions and
 does not currently support GQA/MQA.
@@ -202,9 +252,11 @@ does not currently support GQA/MQA.
 
 The current sparse kernels do not implement causal or local masking, dropout,
 `mask_mod`, `score_mod`, paged KV cache, softcap, or variable-length packed
-sequences. Inputs must be rank four, use FP16/BF16 as allowed above, and have a
-contiguous last (head-dimension) axis. Forward outputs are contiguous in the
-requested BHSD or BSHD layout, including split-KV execution.
+sequences. Regular forward/backward inputs must be rank four, use FP16/BF16 as
+allowed above, and have a contiguous last (head-dimension) axis. Sage FP8 uses
+the stricter BF16 BHSD contract described above and quantizes to E4M3
+internally. Regular forward outputs are contiguous in the requested BHSD or
+BSHD layout, including split-KV execution; FP8 output is contiguous BF16 BHSD.
 
 Compilation is lazy. The first call for a new static configuration JIT-compiles
 the relevant kernel; subsequent calls reuse an in-process cache.
@@ -216,10 +268,9 @@ lifecycle for BSA.
 Correctness tests and FP32 references are under
 `test/python/fe_api/bsa`.
 
-## Source provenance
+## Acknowledgements
 
-The kernel sources were adapted from the
-[`Block-Sparse-Attention`](https://github.com/NVIDIA-JerryChen/Block-Sparse-Attention/tree/a9fa5f2966aa17fcf1ce2890c489d45a4a89acf1)
-checkout at commit `a9fa5f2966aa17fcf1ce2890c489d45a4a89acf1`. See
-`python/cudnn/block_sparse_attention/PROVENANCE.md` for the migrated scope and
-integration changes.
+We would like to express our gratitude to <huangyitong.hyt@alibaba-inc.com> and
+<wenting.swt@alibaba-inc.com> for providing testing and optimization feedback
+throughout the deployment process, which has continuously advanced the BSA kernel
+toward Speed of Light.

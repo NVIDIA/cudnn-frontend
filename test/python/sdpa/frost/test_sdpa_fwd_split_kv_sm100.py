@@ -45,19 +45,19 @@ def _ref_sdpa(q, k, v, scale, is_causal, kh):
     return torch.matmul(p, vb).permute(0, 2, 1, 3)
 
 
-def _kernel_module(splits, dtype_qkv, causal, cta_mma=2):
+def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_d128_f16_sm100.py")
-    kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma}
+    kw = {"dtype_qkv": dtype_qkv, "split_kv": splits, "cta_mma": cta_mma, "pack_gqa": pack_gqa, "qh_per_kh": qh_per_kh}
     if causal:
         kw["window_right"] = 0
-    return load_template(path, TemplateParams(**kw), tag=f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}")
+    return load_template(path, TemplateParams(**kw), tag=f"splitkv{splits}_d{dtype_qkv}_{'caus' if causal else 'dense'}_cga{cta_mma}_pg{int(pack_gqa)}")
 
 
-def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2):
+def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
     """Launch the split kernel + DSL combine; returns the recombined O (BSHD fp32)."""
     import cutlass
     import cuda.bindings.driver as cuda_driver
@@ -71,7 +71,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2):
     k = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
     v = torch.randn(B, SKV, KH, D, device=dev, dtype=dtype)
 
-    mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma)
+    mod = _kernel_module(splits, 3 if dtype == torch.float16 else 2, causal, cta_mma=cta_mma, pack_gqa=pack_gqa, qh_per_kh=H // KH)
     fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=D, d_v=D, has_lse=True)
 
     o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=dtype)
@@ -148,6 +148,22 @@ def test_split_kv_gqa(splits):
     got, (q, k, v, scale) = _run(splits, B, H, KH, SQ, SKV, torch.float16, causal=False)
     ref = _ref_sdpa(q, k, v, scale, is_causal=False, kh=KH)
     assert (got - ref).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("splits", [2, 4])
+def test_split_kv_pack_gqa(splits):
+    """KV split x PackGQA: the split chunks the PACKED tile's KV range
+    (_bounds_for_tile_split's trailing pack_g), the partial epilogue scatters
+    rows to their logical (batch', head, token) slots, and the combine — which
+    reads logical positions — is packing-agnostic.  Tile-unaligned s_q on
+    purpose; GQA 8:2 -> G=4."""
+    o, (q, k, v, scale) = _run(splits, 2, 8, 2, 40, 512, torch.float16, causal=True, pack_gqa=True)
+    ref = _ref_sdpa(q, k, v, scale, True, 2)
+    torch.testing.assert_close(o, ref, atol=5e-2, rtol=3e-2)
+    # And the packed split result must match the packed UNSPLIT kernel.
+    o1, _ = _run(1, 2, 8, 2, 40, 512, torch.float16, causal=True, pack_gqa=True)
+    torch.testing.assert_close(o, o1, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0

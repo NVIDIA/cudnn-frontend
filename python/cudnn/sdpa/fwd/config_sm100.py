@@ -94,6 +94,11 @@ class TemplateParams:
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
     thd_varlen: bool = False
+    # PackGQA: pack Q rows from the G query heads sharing one KV head into a
+    # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
+    # tiles stay full for GQA/MQA.
+    pack_gqa: bool = False
+    qh_per_kh: int = 1
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
     # that kernels/split_combine_sm100.py reduces.  1 = off (byte-identical
@@ -191,6 +196,11 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
     if fp8 and flavor == "d192" and k.split_kv != 1:
         raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
+    if k.qh_per_kh < 1:
+        raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
+    if k.pack_gqa:
+        if k.thd_varlen:
+            raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -245,6 +255,20 @@ def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
 
 def rescale_threshold(dtype_qkv: int) -> float:
     return 4.0 if dtype_qkv <= 1 else 8.0
+
+
+def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128) -> bool:
+    return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and tile_m % (h_q // h_kv) == 0
+
+
+def cga_tile_m(d_qk: int) -> int:
+    """Q rows one cluster covers for a flavor: TILES_Q * TILE_M * CTA_MMA.
+
+    The tile-count denominator the pack_gqa heuristic needs (d128/d192: 512;
+    d256/d512: 256), computed from the flavor Cfg classes, not literals.
+    """
+    cls = {128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    return cls.TILES_Q * cls.TILE_M * cls.CTA_MMA
 
 
 def _tma_iters_for(d_elems: int, bpe_val: int, swz_b: int) -> int:
@@ -363,6 +387,10 @@ class CfgD256:
     # KV split; 1 = off.  See TemplateParams.split_kv.
     SPLIT_KV: int = 1
 
+    PACK_GQA: int = 0
+
+    QH_PER_KH: int = 1
+
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
@@ -409,8 +437,12 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
         SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
     )
     _validate_cfg_d256(cfg)
+    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
+        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -506,6 +538,10 @@ class CfgD512:
     # KV split; 1 = off.  See TemplateParams.split_kv.
     SPLIT_KV: int = 1
 
+    PACK_GQA: int = 0
+
+    QH_PER_KH: int = 1
+
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
@@ -556,8 +592,12 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
         SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
     )
     _validate_cfg_d512(cfg)
+    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
+        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -655,6 +695,10 @@ class CfgD128:
 
     # KV split; 1 = off.  See TemplateParams.split_kv.
     SPLIT_KV: int = 1
+
+    PACK_GQA: int = 0
+
+    QH_PER_KH: int = 1
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -771,8 +815,12 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
         SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
     )
     _validate_cfg_d128(cfg)
+    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
+        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -887,8 +935,12 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
     )
     _validate_cfg_d192(cfg)
+    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
+        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 

@@ -322,9 +322,13 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     ``bounds_for_tile`` is the caller's own bounds closure, taking
     ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor,
-    batch_idx)`` — flavors differ in whether they apply the dead-Q-tile trim, so
-    the split narrowing composes on top of whatever they already do.
-
+    batch_idx, qh_per_kh)`` — flavors differ in whether they apply the
+    dead-Q-tile trim, so the split narrowing composes on top of whatever they
+    already do.  ``qh_per_kh`` (trailing, default 1) is the graph's GQA
+    ratio; with CFG.PACK_GQA it is the packing group
+    size: the split chunks the tile's PACKED token-span bounds, so packing
+    and KV split compose; without CFG.PACK_GQA the bounds fold to the classic
+    single-head-per-tile form.
     At SPLIT_KV == 1 every closure below folds away and the traced code is the
     classic single-pass kernel.
     """
@@ -440,17 +444,19 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         return q, h, b % n_batch, b // n_batch
 
     @cute.jit
-    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx):
-        """The flavor's bounds, narrowed to this split's slice of the KV range.
+    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, qh_per_kh: int = 1):
+        """The flavor's (possibly packed) bounds, narrowed to this split's slice
+        of the KV range.
 
         Splitting the ALREADY-masked ``[left, right)`` rather than the raw KV
         extent is what keeps causal / SWA correct AND balanced: each split gets
-        an equal share of the tile's real work, not of the sequence.  The
-        unmasked band is clamped into the slice, which preserves the
-        ``left <= unmasked_lo <= unmasked_hi <= right`` invariant the mainloop
-        relies on, because clamping is monotone.
+        an equal share of the tile's real work, not of the sequence — and under
+        PackGQA that range is already in packed token-span units, so the two
+        features compose.  The unmasked band is clamped into the slice, which
+        preserves the ``left <= unmasked_lo <= unmasked_hi <= right`` invariant
+        the mainloop relies on, because clamping is monotone.
         """
-        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh)
         if cutlass.const_expr(SPLIT_KV == 1):
             return b
         lo, hi = _split_chunk(b.left, b.right, split_idx)
@@ -646,9 +652,12 @@ def make_sdpa_helpers(
                 return _lpt_q_super(row, cta_in_pair), head, batch
 
     @cute.jit
-    def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
+    def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh: int = 1):
+        # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
+        # rows/G tokens when packing (CFG.PACK_GQA), else one token per row.
+        tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
-        q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+        q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
         return compute_kv_loop_bounds(
             q_row_coord,
             seqlen_q,
@@ -656,13 +665,13 @@ def make_sdpa_helpers(
             CFG.WINDOW_LEFT,
             CFG.MASK_FLAGS,
             CFG.TILE_N,
-            cga_tile_m,
+            cga_tile_m // qh_per_kh if CFG.PACK_GQA else cga_tile_m,
             bottom_right=bool(CFG.BOTTOM_RIGHT),
             window_right=int(CFG.WINDOW_RIGHT),
         )
 
     @cute.jit
-    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx):
+    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
         """bounds_for_tile + cuDNN-style dead-Q-tile KV-loop collapse.
 
         Mirrors cuDNN fort (mma_pipeline_op_native_sdpa_prefill_sm100_nonfp8
@@ -674,17 +683,21 @@ def make_sdpa_helpers(
         empty (right := left, matching the SWA empty-tile machinery) — the
         grid stays padded-sized and a dead tile costs prologue+epilogue only.
         q_len_b == 0 (whole batch dead) collapses every tile since the base
-        row coord is always >= 0.  The row coord is the SAME cga-base value
-        _bounds_for_tile uses, and q lens are per-batch constants, so every
-        warp group calling this helper sees identical (collapsed) bounds and
-        the barrier handshakes stay in lockstep.  The epilogue's
-        SEQ_Q_LENS_PRESENT trim (applied after the sink fold) already forces
-        O := 0 / LSE := -inf for every row of a collapsed tile.
+        row coord is always >= 0.  Under PackGQA the dead-tile
+        compare is the tile's base TOKEN (rows // G) against the per-batch
+        Q length — the same token-space value the packed bounds use.  Either way
+        the row coord is the SAME cga-base value _bounds_for_tile uses and q
+        lens are per-batch constants, so every warp group calling this helper
+        sees identical (collapsed) bounds and the barrier handshakes stay in
+        lockstep.  The epilogue's SEQ_Q_LENS_PRESENT trim (applied after the
+        sink fold) already forces O := 0 / LSE := -inf for every row of a
+        collapsed tile.
         """
-        b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair)
+        b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
+            tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
-            q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+            q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cutlass.make_array_view(seq_q_lens_tensor)
             q_len_b = cutlass.Int32(arr[batch_idx])
             tile_dead = q_row_coord >= q_len_b
@@ -762,12 +775,16 @@ def make_sdpa_helpers(
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        if cutlass.const_expr(CFG.PACK_GQA):
+            qh_per_kh = cutlass.Int32(1)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
     def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        if cutlass.const_expr(CFG.PACK_GQA):
+            qh_per_kh = cutlass.Int32(1)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
