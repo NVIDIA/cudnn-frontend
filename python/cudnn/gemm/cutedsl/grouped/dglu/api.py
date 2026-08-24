@@ -1091,43 +1091,64 @@ def _dglu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = 
     )
 
 
-def _grouped_gemm_dglu_bf16_call(call: DgluCall) -> TupleDict:
-    framework = detect_framework(call.a_tensor)
-    valid_m = get_shape(call.a_tensor)[0]
-    n_weight = get_shape(call.b_tensor)[0] if call.b_tensor is not None else call.n
-    two_n = 2 * n_weight
+def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, num_experts, a_tensor, current_stream):
+    """Outputs for the BF16 dGLU path. dbias is zeroed because the kernel accumulates
+    into it with atomic adds; d_row is written in full and only needs allocating."""
     if framework == "torch":
         import torch
 
         # _torch_stream_context is torch-only; other frameworks never enter it.
-        with _torch_stream_context(call.current_stream, call.a_tensor.device):
+        with _torch_stream_context(current_stream, a_tensor.device):
             d_row_tensor = torch.empty_strided(
                 (valid_m, two_n, 1),
                 (two_n, 1, valid_m * two_n),
-                dtype=framework_dtype(call.d_dtype, "torch"),
-                device=call.a_tensor.device,
+                dtype=framework_dtype(d_dtype, "torch"),
+                device=a_tensor.device,
             )
-            dbias_tensor = (
-                torch.zeros(
-                    (call.num_experts, two_n, 1),
-                    dtype=torch.bfloat16,
-                    device=call.a_tensor.device,
-                )
-                if call.generate_dbias
-                else None
-            )
-    else:
-        import jax
-        import jax.numpy as jnp
+            dbias_tensor = torch.zeros((num_experts, two_n, 1), dtype=torch.bfloat16, device=a_tensor.device) if generate_dbias else None
+        return d_row_tensor, dbias_tensor
 
-        # n-major C-contiguous outputs; the extent-1 batch dim's stride is unobservable.
-        # The kernel writes into these buffers on the launch stream; materialize them first.
-        d_row_tensor = jax.block_until_ready(jnp.empty((valid_m, two_n, 1), dtype=framework_dtype(call.d_dtype, "jax"), device=call.a_tensor.device))
-        dbias_tensor = (
-            jax.block_until_ready(jnp.zeros((call.num_experts, two_n, 1), dtype=framework_dtype(cutlass.BFloat16, "jax"), device=call.a_tensor.device))
-            if call.generate_dbias
-            else None
-        )
+    import jax
+    import jax.numpy as jnp
+
+    # n-major C-contiguous outputs; the extent-1 batch dim's stride is unobservable.
+    # The kernel writes into these buffers on the launch stream; materialize them first.
+    d_row_tensor = jax.block_until_ready(jnp.empty((valid_m, two_n, 1), dtype=framework_dtype(d_dtype, "jax"), device=a_tensor.device))
+    dbias_tensor = (
+        jax.block_until_ready(jnp.zeros((num_experts, two_n, 1), dtype=framework_dtype(cutlass.BFloat16, "jax"), device=a_tensor.device))
+        if generate_dbias
+        else None
+    )
+    return d_row_tensor, dbias_tensor
+
+
+def _dglu_operand_meta(tensor):
+    """Everything the wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: CPython recycles a freed tensor's address,
+    so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
+    they vary per call and nothing derived here depends on them; their alignment is
+    re-checked inside execute().
+    """
+    if tensor is None or not hasattr(tensor, "shape"):
+        return tensor
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+# Operand-metadata key -> the BF16 path's derived result. One entry per distinct
+# (operand metadata, config), the same growth as _cache_of_GroupedGemmDgluSm100Objects.
+_dglu_wrapper_memo: dict = {}
+
+
+def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
+    framework = detect_framework(call.a_tensor)
+    valid_m = get_shape(call.a_tensor)[0]
+    n_weight = get_shape(call.b_tensor)[0] if call.b_tensor is not None else call.n
+    two_n = 2 * n_weight
+    d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
+        framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
+    )
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
@@ -1206,6 +1227,9 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall) -> TupleDict:
         api.compile()
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
+    if memo_key is not None:
+        _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
+
     api._implementation.execute(
         a_tensor=call.a_tensor,
         c_tensor=call.c_tensor,
@@ -1273,6 +1297,87 @@ def grouped_gemm_dglu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
+    # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
+    # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
+    # the op cache-key rebuild -- and a pure function of the operands' metadata plus the
+    # scalar config, both of which are in the key. A hit skips the derivation, never a
+    # check: execute() still validates every operand, including the data pointers the key
+    # omits. linear_offset is excluded on purpose (not in the op cache key either) and
+    # passed through per call.
+    memo_key = (
+        type(a_tensor),
+        _dglu_operand_meta(a_tensor),
+        _dglu_operand_meta(c_tensor),
+        _dglu_operand_meta(sfa_tensor),
+        _dglu_operand_meta(padded_offsets),
+        _dglu_operand_meta(alpha_tensor),
+        _dglu_operand_meta(beta_tensor),
+        _dglu_operand_meta(prob_tensor),
+        _dglu_operand_meta(dprob_tensor),
+        _dglu_operand_meta(b_tensor),
+        _dglu_operand_meta(sfb_tensor),
+        _dglu_operand_meta(b_ptrs),
+        _dglu_operand_meta(sfb_ptrs),
+        _dglu_operand_meta(norm_const_tensor),
+        use_single_group_runtime_offsets,
+        generate_dbias,
+        n,
+        b_dtype,
+        b_major,
+        acc_dtype,
+        d_dtype,
+        cd_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        sf_vec_size,
+        sf_fp8_dtype_override,
+        vector_f32,
+        m_aligned,
+        discrete_col_sfd,
+        act_func,
+        geglu_alpha,
+        glu_clamp_max,
+        glu_clamp_min,
+        situ_beta1,
+        situ_beta2,
+        epilogue_op,
+        use_dynamic_sched,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _dglu_wrapper_memo.get(memo_key)
+    if memo is not None:
+        api, memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts = memo
+        # The full path resolves this during normalization; the memo bypasses that, so
+        # apply the same default here rather than handing None to the kernel.
+        resolved_linear_offset = linear_offset if linear_offset is not None else (1.0 if act_func == "dgeglu" else 0.0)
+        d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
+            memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
+        )
+        api._implementation.execute(
+            a_tensor=a_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            b_tensor=b_tensor,
+            b_ptrs=b_ptrs,
+            dbias_tensor=dbias_tensor,
+            linear_offset=resolved_linear_offset,
+            current_stream=current_stream,
+        )
+        return TupleDict(
+            d_row_tensor=d_row_tensor,
+            d_col_tensor=None,
+            dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
+            amax_tensor=None,
+            sfd_row_tensor=None,
+            sfd_col_tensor=None,
+        )
+
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dglu_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -1323,7 +1428,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     )
     normalized, backend = _normalize_dglu_call(call)
     if backend is GroupedGemmBackend.BF16:
-        return _grouped_gemm_dglu_bf16_call(normalized)
+        return _grouped_gemm_dglu_bf16_call(normalized, memo_key)
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_dglu_block_scaled_call(normalized)
