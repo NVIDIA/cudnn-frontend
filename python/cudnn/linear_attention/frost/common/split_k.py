@@ -16,22 +16,23 @@ itself — no state is exchanged between items.
 
 Work-item table row (``WORK_ITEM_FIELDS`` x int32, chunk units)::
 
-    [batch_idx, head_idx, wstart, wend, cstart, cend, batch_start, batch_end]
+    [batch_idx, head_idx, write_start, write_end, compute_start, compute_end, batch_start, batch_end]
 
 ``batch_start``/``batch_end`` are the token bounds ``cu_seqlens[b]`` /
 ``cu_seqlens[b+1]`` denormalized into the row: decode reads one 32-byte
 vectorizable row instead of chasing a dependent ``cu_seqlens`` load pair.
 
-The item OWNS (writes outputs for) chunks ``[wstart, wend)``.  The forward
-kernel COMPUTES chunks ``[cstart, wend)`` — ``[cstart, wstart)`` is the
-left warmup that rebuilds the incoming state from zero (accurate to
-``2^log2_threshold`` because the gate decay over the window saturates).
-The backward kernel computes ``[wstart, cend)`` — ``[wend, cend)`` is the
-right warmup for the reverse dstate recurrence (the forward states come exactly
-from the per-chunk state checkpoints).  ``cstart == 0`` items seed the true
-initial state; ``cend == num_chunks`` items seed the true ``d_final_state``
-— so the un-cut degenerate item ``(0, nc, 0, nc)`` reproduces the serial
-kernel exactly.
+The item OWNS (writes outputs for) chunks ``[write_start, write_end)``.
+The forward kernel COMPUTES chunks ``[compute_start, write_end)`` —
+``[compute_start, write_start)`` is the left warmup that rebuilds the
+incoming state from zero (accurate to ``2^log2_threshold`` because the
+gate decay over the window saturates).  The backward kernel computes
+``[write_start, compute_end)`` — ``[write_end, compute_end)`` is the
+right warmup for the reverse dstate recurrence (the forward states come
+exactly from the per-chunk state checkpoints).  ``compute_start == 0``
+items seed the true initial state; ``compute_end == num_chunks`` items
+seed the true ``d_final_state`` — so the un-cut degenerate item
+``(0, nc, 0, nc)`` reproduces the serial kernel exactly.
 
 Piece choice per (batch, head): spans never exceed ``ideal_chunks`` (total
 work / SM count), so outlier-long sequences are always cut down to the
@@ -57,11 +58,11 @@ The pipeline (one fixed shape regardless of gate kind):
    ``item_scratch``.
 3. order (:func:`order_body`, hosted by each kernel module's
    prologue kernel alongside its TMA-descriptor build — one launch for
-   both): bitonic-sort the items into ``work_items``, longest ``[cstart,
-   cend)`` first, so the ticket scheduler consumes them in LPT order —
-   the makespan tail is set by whatever starts last, so the big items
-   must go first.  This is what keeps ragged varlen batches balanced
-   without cutting them.
+   both): bitonic-sort the items into ``work_items``, longest
+   ``[compute_start, compute_end)`` first, so the ticket scheduler
+   consumes them in LPT order — the makespan tail is set by whatever
+   starts last, so the big items must go first.  This is what keeps
+   ragged varlen batches balanced without cutting them.
 
 The order body also zeroes the main kernels' scheduler ticket rings
 (dirty on exit), and with ``split=False`` it replaces the whole pipeline:
@@ -84,7 +85,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import data_ptr
 
-from .elementwise import softplus
+from cudnn.frost.tile_dsl.pointwise import sigmoid, softplus
 
 WORK_ITEM_FIELDS = 8
 WARMUP_CAP_CHUNKS = 32  # hard warmup cap: a cut must saturate within one warp of chunks per side
@@ -101,8 +102,8 @@ P_WINDOW = 16  # fill-regime piece-count search width
 P_BELOW = 8  # how far below the ideal-cap floor the fill-regime search may go
 
 ORDER_THREADS = 1024
-ORDER_ELEMS = 4
-ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMS  # sort capacity (32 KB SMEM); past this the device-side branch copies through unsorted
+ORDER_ELEMENTS = 4
+ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMENTS  # sort capacity (32 KB SMEM); past this the device-side branch copies through unsorted
 
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
@@ -139,37 +140,38 @@ def max_work_items(total_tokens: int, batch_size: int, n_heads_out: int, ideal_c
 def decode_work_item(cfg, tile_idx, mWorkItems):
     """Tile decode shared by every warp body of the main kernels: read the
     work-item row (an uncut table row IS the whole sequence).  Returns
-    ``(batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b,
-    wstart, wend, cstart, cend)`` with chunk-unit bounds."""
+    ``(batch_idx, head_idx, batch_start, batch_end, batch_seqlen,
+    batch_num_chunks, write_start, write_end, compute_start,
+    compute_end)`` with chunk-unit bounds."""
     batch_idx = mWorkItems[tile_idx, 0]
     head_idx = mWorkItems[tile_idx, 1]
-    wstart = mWorkItems[tile_idx, 2]
-    wend = mWorkItems[tile_idx, 3]
-    cstart = mWorkItems[tile_idx, 4]
-    cend = mWorkItems[tile_idx, 5]
+    write_start = mWorkItems[tile_idx, 2]
+    write_end = mWorkItems[tile_idx, 3]
+    compute_start = mWorkItems[tile_idx, 4]
+    compute_end = mWorkItems[tile_idx, 5]
     batch_start = mWorkItems[tile_idx, 6]
     batch_end = mWorkItems[tile_idx, 7]
-    seqlen_b = batch_end - batch_start
-    num_chunks_b = cute.ceil_div(seqlen_b, cfg.b_t)
-    return batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend
+    batch_seqlen = batch_end - batch_start
+    batch_num_chunks = cute.ceil_div(batch_seqlen, cfg.b_t)
+    return batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end
 
 
 @cute.jit
-def emit_item(mWorkItems, mCount, batch_idx, head_idx, wstart, wend, cstart, cend, batch_start, batch_end):
+def emit_item(mWorkItems, mCount, batch_idx, head_idx, write_start, write_end, compute_start, compute_end, batch_start, batch_end):
     count_addr = mCount.iterator.toint()
-    wi = inline_ptx(
+    slot = inline_ptx(
         "atom.global.add.s32 {$w0}, [{$r0}], 1;",
         write_only_types=[cutlass.Int32],
         read_only_args=[count_addr],
     )
-    mWorkItems[wi, 0] = batch_idx
-    mWorkItems[wi, 1] = head_idx
-    mWorkItems[wi, 2] = wstart
-    mWorkItems[wi, 3] = wend
-    mWorkItems[wi, 4] = cstart
-    mWorkItems[wi, 5] = cend
-    mWorkItems[wi, 6] = batch_start
-    mWorkItems[wi, 7] = batch_end
+    mWorkItems[slot, 0] = batch_idx
+    mWorkItems[slot, 1] = head_idx
+    mWorkItems[slot, 2] = write_start
+    mWorkItems[slot, 3] = write_end
+    mWorkItems[slot, 4] = compute_start
+    mWorkItems[slot, 5] = compute_end
+    mWorkItems[slot, 6] = batch_start
+    mWorkItems[slot, 7] = batch_end
 
 
 @cute.jit
@@ -184,12 +186,12 @@ def clamped_log2(log_gate: cutlass.Constexpr[bool], gate_val: cutlass.Float32) -
 
 
 @cute.jit
-def piece_choice(overhead_chunks: cutlass.Constexpr[int], num_chunks_b, n_tiles, num_sms, ideal_chunks):
+def piece_choice(overhead_chunks: cutlass.Constexpr[int], batch_num_chunks, n_tiles, num_sms, ideal_chunks):
     """Per-tile piece choice.  Returns ``(span, num_blocks)``."""
     # even spread: spans never exceed ideal_chunks (total work / SM count)
-    p_hi = num_chunks_b if num_chunks_b < cutlass.Int32(MAX_BLOCKS) else cutlass.Int32(MAX_BLOCKS)
+    p_hi = batch_num_chunks if batch_num_chunks < cutlass.Int32(MAX_BLOCKS) else cutlass.Int32(MAX_BLOCKS)
     p_hi = p_hi if p_hi > 0 else cutlass.Int32(1)
-    p = (num_chunks_b + ideal_chunks - cutlass.Int32(1)) // ideal_chunks
+    p = (batch_num_chunks + ideal_chunks - cutlass.Int32(1)) // ideal_chunks
     p = p if p > 0 else cutlass.Int32(1)
     p = p if p < p_hi else p_hi
     if n_tiles < cutlass.Int32(2) * num_sms:
@@ -199,40 +201,40 @@ def piece_choice(overhead_chunks: cutlass.Constexpr[int], num_chunks_b, n_tiles,
         p_start = p_start if p_start > 0 else cutlass.Int32(1)
         best = cutlass.Int32(2147483647)
         for dp in cutlass.range_constexpr(P_WINDOW):
-            cand = p_start + cutlass.Int32(dp)
-            cand = cand if cand < p_hi else p_hi
-            span_c = (num_chunks_b + cand - cutlass.Int32(1)) // cand
-            waves = (n_tiles * cand + num_sms - cutlass.Int32(1)) // num_sms
-            est = waves * (span_c + cutlass.Int32(overhead_chunks))
-            hit = est < best
-            best = est if hit else best
-            p = cand if hit else p
+            candidate = p_start + cutlass.Int32(dp)
+            candidate = candidate if candidate < p_hi else p_hi
+            span_c = (batch_num_chunks + candidate - cutlass.Int32(1)) // candidate
+            waves = (n_tiles * candidate + num_sms - cutlass.Int32(1)) // num_sms
+            estimate = waves * (span_c + cutlass.Int32(overhead_chunks))
+            hit = estimate < best
+            best = estimate if hit else best
+            p = candidate if hit else p
         # the estimate flatters marginal cuts; cut only on a clear margin over uncut
-        est1 = ((n_tiles + num_sms - cutlass.Int32(1)) // num_sms) * (num_chunks_b + cutlass.Int32(overhead_chunks))
-        if cutlass.Int32(4) * best > cutlass.Int32(3) * est1:
+        uncut_estimate = ((n_tiles + num_sms - cutlass.Int32(1)) // num_sms) * (batch_num_chunks + cutlass.Int32(overhead_chunks))
+        if cutlass.Int32(4) * best > cutlass.Int32(3) * uncut_estimate:
             p = cutlass.Int32(1)
     span = cutlass.Int32(0)
     num_blocks = cutlass.Int32(0)
-    if num_chunks_b > 0:
-        span = (num_chunks_b + p - cutlass.Int32(1)) // p
-        num_blocks = (num_chunks_b + span - cutlass.Int32(1)) // span
+    if batch_num_chunks > 0:
+        span = (batch_num_chunks + p - cutlass.Int32(1)) // p
+        num_blocks = (batch_num_chunks + span - cutlass.Int32(1)) // span
     return span, num_blocks
 
 
 @cute.jit
 def tile_spans(b_t: cutlass.Constexpr[int], overhead_chunks: cutlass.Constexpr[int], n_heads_out, n_tiles, num_sms, ideal_chunks, mCuSeqlens, tile):
     """Per-tile decode + piece choice.  Returns ``(batch_idx, head_idx,
-    batch_start, batch_end, num_chunks_b, cv_base, span, num_blocks)``;
-    ``cv_base`` is the tile's row base in the GMEM chunk scratch."""
+    batch_start, batch_end, batch_num_chunks, chunk_value_base, span, num_blocks)``;
+    ``chunk_value_base`` is the tile's row base in the GMEM chunk scratch."""
     batch_idx = tile // n_heads_out
     head_idx = tile % n_heads_out
     batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
     batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-    seqlen_b = batch_end - batch_start
-    num_chunks_b = cute.ceil_div(seqlen_b, b_t)
-    cv_base = batch_start // cutlass.Int32(b_t) + batch_idx
-    span, num_blocks = piece_choice(overhead_chunks, num_chunks_b, n_tiles, num_sms, ideal_chunks)
-    return batch_idx, head_idx, batch_start, batch_end, num_chunks_b, cv_base, span, num_blocks
+    batch_seqlen = batch_end - batch_start
+    batch_num_chunks = cute.ceil_div(batch_seqlen, b_t)
+    chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
+    span, num_blocks = piece_choice(overhead_chunks, batch_num_chunks, n_tiles, num_sms, ideal_chunks)
+    return batch_idx, head_idx, batch_start, batch_end, batch_num_chunks, chunk_value_base, span, num_blocks
 
 
 @cute.jit
@@ -280,7 +282,7 @@ def scan_kernel(
     head_idx = cutlass.Int32(bidx[1])
     if cutlass.Int32(bidx[0]) == 0 and head_idx == 0 and tidx == 0:
         mCount[0] = cutlass.Int32(0)
-    lidx = tidx % cutlass.Int32(WARP_SIZE)
+    lane_idx = tidx % cutlass.Int32(WARP_SIZE)
     widx = tidx // cutlass.Int32(WARP_SIZE)
     row0 = (cutlass.Int32(bidx[0]) * cutlass.Int32(SCAN_WARPS) + widx) * cutlass.Int32(SCAN_ROWS_PER_WARP)
 
@@ -295,10 +297,10 @@ def scan_kernel(
     batch_idx = lo
     batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
     batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-    num_chunks_b = cute.ceil_div(batch_end - batch_start, b_t)
-    cv_base = batch_start // cutlass.Int32(b_t) + batch_idx
+    batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
+    chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
     # the piece choice is computed per batch, NOT per row
-    span, num_blocks = piece_choice(overhead_chunks, num_chunks_b, n_tiles, num_sms, ideal_chunks)
+    span, num_blocks = piece_choice(overhead_chunks, batch_num_chunks, n_tiles, num_sms, ideal_chunks)
     for rr in cutlass.range_constexpr(SCAN_ROWS_PER_WARP):
         row = row0 + cutlass.Int32(rr)
         while (batch_idx + cutlass.Int32(1) < batch_size) and (
@@ -307,17 +309,17 @@ def scan_kernel(
             batch_idx = batch_idx + cutlass.Int32(1)
             batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
             batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-            num_chunks_b = cute.ceil_div(batch_end - batch_start, b_t)
-            cv_base = batch_start // cutlass.Int32(b_t) + batch_idx
-            span, num_blocks = piece_choice(overhead_chunks, num_chunks_b, n_tiles, num_sms, ideal_chunks)
-        c = row - cv_base
-        if (c >= 0) and (c < num_chunks_b) and (num_blocks > 1):
+            batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
+            chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
+            span, num_blocks = piece_choice(overhead_chunks, batch_num_chunks, n_tiles, num_sms, ideal_chunks)
+        c = row - chunk_value_base
+        if (c >= 0) and (c < batch_num_chunks) and (num_blocks > 1):
             if near_boundary(c, span if span > 0 else cutlass.Int32(1), num_blocks):
                 # chunk value = max over channels of the per-channel
                 # clamped-log2 sums (each lane owns a contiguous channel run)
                 cpl = gate_channels // WARP_SIZE
-                row_elems = cutlass.Int32(mGate.stride[0])
-                lane_base = cutlass.Int64(head_idx * cutlass.Int32(mGate.stride[1]) + lidx * cutlass.Int32(cpl))
+                row_elements = cutlass.Int32(mGate.stride[0])
+                lane_base = cutlass.Int64(head_idx * cutlass.Int32(mGate.stride[1]) + lane_idx * cutlass.Int32(cpl))
                 gate_addr = mGate.iterator.toint() + lane_base * cutlass.Int64(4)
                 gate_ptr = mGate.iterator + lane_base
                 a_exp = cutlass.Float32(1.0)
@@ -326,7 +328,7 @@ def scan_kernel(
                     # per-head rate + per-lane channel biases, fixed for the whole chunk
                     a_exp = cute.math.exp2(mALog[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True)
                     for q in cutlass.range_constexpr(cpl):
-                        dt_vals[q] = mDtBias[head_idx, lidx * cutlass.Int32(cpl) + cutlass.Int32(q)].to(cutlass.Float32)
+                        dt_vals[q] = mDtBias[head_idx, lane_idx * cutlass.Int32(cpl) + cutlass.Int32(q)].to(cutlass.Float32)
                 ch_acc = cutlass.Array(cutlass.Float32, cpl, alignment=16)
                 for q in cutlass.range_constexpr(cpl):
                     ch_acc[q] = cutlass.Float32(0.0)
@@ -335,7 +337,7 @@ def scan_kernel(
                     pos = batch_start + c * cutlass.Int32(b_t) + cutlass.Int32(tt)
                     inb = pos < batch_end
                     pos_r = pos if inb else batch_start
-                    grow = cutlass.Int64(pos_r) * cutlass.Int64(row_elems)
+                    grow = cutlass.Int64(pos_r) * cutlass.Int64(row_elements)
                     if cutlass.const_expr(cpl % 4 == 0):
                         for q4 in cutlass.range_constexpr(cpl // 4):
                             addr = gate_addr + (grow + cutlass.Int64(4 * q4)) * cutlass.Int64(4)
@@ -347,9 +349,7 @@ def scan_kernel(
                             for qq, gvq in enumerate((g0, g1, g2, g3)):
                                 q = 4 * q4 + qq
                                 if cutlass.const_expr(safe_gate):
-                                    # the main kernel's transform, in log2 domain: scale * sigmoid(exp(a_log) * (g + dt_bias))
-                                    half = cutlass.Float32(0.5)
-                                    sig = cute.math.tanh(a_exp * (gvq + dt_vals[q]) * half, approx=True) * half + half
+                                    sig = sigmoid(a_exp * (gvq + dt_vals[q]))
                                     contrib = gate_scale_log2 * sig
                                     contrib = contrib if inb else cutlass.Float32(0.0)
                                 else:
@@ -360,8 +360,7 @@ def scan_kernel(
                         for q in cutlass.range_constexpr(cpl):
                             gv = (gate_ptr + grow + cutlass.Int32(q)).load()
                             if cutlass.const_expr(safe_gate):
-                                half = cutlass.Float32(0.5)
-                                sig = cute.math.tanh(a_exp * (gv + dt_vals[q]) * half, approx=True) * half + half
+                                sig = sigmoid(a_exp * (gv + dt_vals[q]))
                                 contrib = gate_scale_log2 * sig
                                 contrib = contrib if inb else cutlass.Float32(0.0)
                             else:
@@ -374,8 +373,8 @@ def scan_kernel(
                 for off in [1, 2, 4, 8, 16]:
                     other = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, m, off, 31, kind=nvvm.Shfl.BFLY))
                     m = m if m > other else other
-                if lidx == 0:
-                    mChunkVals[cv_base + c, head_idx] = m
+                if lane_idx == 0:
+                    mChunkVals[chunk_value_base + c, head_idx] = m
 
 
 @cute.kernel
@@ -409,16 +408,15 @@ def scan_scalar_kernel(
     tidx = cutlass.Int32(tidx)
     if cutlass.Int32(bidx[0]) == 0 and cutlass.Int32(bidx[1]) == 0 and tidx == 0:
         mCount[0] = cutlass.Int32(0)
-    lidx = tidx % cutlass.Int32(WARP_SIZE)
+    lane_idx = tidx % cutlass.Int32(WARP_SIZE)
     widx = tidx // cutlass.Int32(WARP_SIZE)
-    h = cutlass.Int32(bidx[1]) * cutlass.Int32(WARP_SIZE) + lidx
+    h = cutlass.Int32(bidx[1]) * cutlass.Int32(WARP_SIZE) + lane_idx
     h_ok = h < n_heads_out
     h_r = h if h_ok else n_heads_out - cutlass.Int32(1)
-    a_l2 = cutlass.Float32(0.0)
+    a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     if cutlass.const_expr(safe_gate):
-        # per-head transform constants, fixed for the lane's whole sweep
-        a_l2 = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        a = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
         bias = mDtBias[h_r].to(cutlass.Float32)
     row0 = (cutlass.Int32(bidx[0]) * cutlass.Int32(SCAN_WARPS) + widx) * cutlass.Int32(SCAN_ROWS_PER_WARP)
 
@@ -433,9 +431,9 @@ def scan_scalar_kernel(
     batch_idx = lo
     batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
     batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-    num_chunks_b = cute.ceil_div(batch_end - batch_start, b_t)
-    cv_base = batch_start // cutlass.Int32(b_t) + batch_idx
-    span, num_blocks = piece_choice(overhead_chunks, num_chunks_b, n_tiles, num_sms, ideal_chunks)
+    batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
+    chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
+    span, num_blocks = piece_choice(overhead_chunks, batch_num_chunks, n_tiles, num_sms, ideal_chunks)
     for rr in cutlass.range_constexpr(SCAN_ROWS_PER_WARP):
         row = row0 + cutlass.Int32(rr)
         while (batch_idx + cutlass.Int32(1) < batch_size) and (
@@ -444,11 +442,11 @@ def scan_scalar_kernel(
             batch_idx = batch_idx + cutlass.Int32(1)
             batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
             batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-            num_chunks_b = cute.ceil_div(batch_end - batch_start, b_t)
-            cv_base = batch_start // cutlass.Int32(b_t) + batch_idx
-            span, num_blocks = piece_choice(overhead_chunks, num_chunks_b, n_tiles, num_sms, ideal_chunks)
-        c = row - cv_base
-        if (c >= 0) and (c < num_chunks_b) and (num_blocks > 1):
+            batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
+            chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
+            span, num_blocks = piece_choice(overhead_chunks, batch_num_chunks, n_tiles, num_sms, ideal_chunks)
+        c = row - chunk_value_base
+        if (c >= 0) and (c < batch_num_chunks) and (num_blocks > 1):
             if near_boundary(c, span if span > 0 else cutlass.Int32(1), num_blocks):
                 oob = cutlass.Float32(0.0) if cutlass.const_expr(log_gate) else cutlass.Float32(1.0)
                 acc = cutlass.Float32(0.0)
@@ -458,13 +456,13 @@ def scan_scalar_kernel(
                     pos_r = pos if inb else batch_start
                     gv = (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + h_r).load()
                     if cutlass.const_expr(safe_gate):
-                        contrib = a_l2 * softplus(gv + bias)
+                        contrib = a * softplus(gv + bias)
                         acc = acc + (contrib if inb else cutlass.Float32(0.0))
                     else:
                         gv = gv if inb else oob
                         acc = acc + clamped_log2(log_gate, gv)
                 if h_ok:
-                    mChunkVals[cv_base + c, h] = acc
+                    mChunkVals[chunk_value_base + c, h] = acc
 
 
 @cute.kernel
@@ -489,73 +487,73 @@ def walk_kernel(
     bidx = cute.arch.block_idx()[0]
     tidx = cutlass.Int32(tidx)
 
-    batch_idx, head_idx, batch_start, batch_end, num_chunks_b, cv_base, span, num_blocks = tile_spans(
+    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks, chunk_value_base, span, num_blocks = tile_spans(
         b_t, overhead_chunks, n_heads_out, n_tiles, num_sms, ideal_chunks, mCuSeqlens, cutlass.Int32(bidx)
     )
     if num_blocks <= 1:
         # single piece: no cuts, nothing scanned
         if tidx == 0:
-            emit_item(mStaging, mCount, batch_idx, head_idx, cutlass.Int32(0), num_chunks_b, cutlass.Int32(0), num_chunks_b, batch_start, batch_end)
+            emit_item(mStaging, mCount, batch_idx, head_idx, cutlass.Int32(0), batch_num_chunks, cutlass.Int32(0), batch_num_chunks, batch_start, batch_end)
 
     else:
-        # packed per-boundary probe results: warm_b | warm_f << 8, 0 = no cut
-        sWarm = cutlass.Array(cutlass.Int32, MAX_BLOCKS, space=cutlass.AddressSpace.smem, alignment=16)
-        lidx = tidx % cutlass.Int32(WARP_SIZE)
+        # packed per-boundary probe results: warmup_before | warmup_after << 8, 0 = no cut
+        sWarmup = cutlass.Array(cutlass.Int32, MAX_BLOCKS, space=cutlass.AddressSpace.smem, alignment=16)
+        lane_idx = tidx % cutlass.Int32(WARP_SIZE)
         widx = tidx // cutlass.Int32(WARP_SIZE)
         big = cutlass.Int32(2 * WARMUP_CAP_CHUNKS)
         j = widx + cutlass.Int32(1)
         while j < num_blocks:
-            wend = j * span
-            # fwd warmup: smallest chunk suffix of [0, wend) that saturates
-            idx = wend - cutlass.Int32(1) - lidx
+            write_end = j * span
+            # fwd warmup: smallest chunk suffix of [0, write_end) that saturates
+            idx = write_end - cutlass.Int32(1) - lane_idx
             ok_b = idx >= 0
-            v = mChunkVals[cv_base + (idx if ok_b else cutlass.Int32(0)), head_idx]
+            v = mChunkVals[chunk_value_base + (idx if ok_b else cutlass.Int32(0)), head_idx]
             acc = v if ok_b else cutlass.Float32(0.0)
             for off in [1, 2, 4, 8, 16]:
                 o = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, off, 0, kind=nvvm.Shfl.UP))
-                acc = acc + (o if lidx >= cutlass.Int32(off) else cutlass.Float32(0.0))
-            cand = lidx + cutlass.Int32(1) if (ok_b and acc <= log2_thresh) else big
+                acc = acc + (o if lane_idx >= cutlass.Int32(off) else cutlass.Float32(0.0))
+            candidate = lane_idx + cutlass.Int32(1) if (ok_b and acc <= log2_thresh) else big
             for off in [1, 2, 4, 8, 16]:
-                other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, cand, off, 31, kind=nvvm.Shfl.BFLY))
-                cand = cand if cand < other else other
-            warm_b = cand if cand < big else cutlass.Int32(0)
-            # bwd warmup: smallest chunk prefix of [wend, nc) that saturates
-            idx = wend + lidx
-            ok_f = idx < num_chunks_b
-            v = mChunkVals[cv_base + (idx if ok_f else cutlass.Int32(0)), head_idx]
+                other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, candidate, off, 31, kind=nvvm.Shfl.BFLY))
+                candidate = candidate if candidate < other else other
+            warmup_before = candidate if candidate < big else cutlass.Int32(0)
+            # bwd warmup: smallest chunk prefix of [write_end, nc) that saturates
+            idx = write_end + lane_idx
+            ok_f = idx < batch_num_chunks
+            v = mChunkVals[chunk_value_base + (idx if ok_f else cutlass.Int32(0)), head_idx]
             acc = v if ok_f else cutlass.Float32(0.0)
             for off in [1, 2, 4, 8, 16]:
                 o = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, off, 0, kind=nvvm.Shfl.UP))
-                acc = acc + (o if lidx >= cutlass.Int32(off) else cutlass.Float32(0.0))
-            cand = lidx + cutlass.Int32(1) if (ok_f and acc <= log2_thresh) else big
+                acc = acc + (o if lane_idx >= cutlass.Int32(off) else cutlass.Float32(0.0))
+            candidate = lane_idx + cutlass.Int32(1) if (ok_f and acc <= log2_thresh) else big
             for off in [1, 2, 4, 8, 16]:
-                other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, cand, off, 31, kind=nvvm.Shfl.BFLY))
-                cand = cand if cand < other else other
-            warm_f = cand if cand < big else cutlass.Int32(0)
-            if lidx == 0:
-                packed = warm_b + warm_f * cutlass.Int32(256)
-                packed = packed if (warm_b > 0 and warm_f > 0) else cutlass.Int32(0)
-                sWarm[j] = packed
+                other = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, candidate, off, 31, kind=nvvm.Shfl.BFLY))
+                candidate = candidate if candidate < other else other
+            warmup_after = candidate if candidate < big else cutlass.Int32(0)
+            if lane_idx == 0:
+                packed = warmup_before + warmup_after * cutlass.Int32(256)
+                packed = packed if (warmup_before > 0 and warmup_after > 0) else cutlass.Int32(0)
+                sWarmup[j] = packed
             j = j + cutlass.Int32(WARPS)
         nvvm.barrier_cta_sync()
 
         if tidx == 0:
-            prev_cut = cutlass.Int32(0)  # wstart of the open item, chunk units
-            cur_cstart = cutlass.Int32(0)  # cstart of the open item, chunk units
+            prev_cut = cutlass.Int32(0)  # write_start of the open item, chunk units
+            current_compute_start = cutlass.Int32(0)  # compute_start of the open item, chunk units
             jj = cutlass.Int32(1)
             while jj < num_blocks:
-                r = sWarm[jj]
+                r = sWarmup[jj]
                 if r != 0:
-                    wend = jj * span
-                    warm_b = r % cutlass.Int32(256)
-                    warm_f = r // cutlass.Int32(256)
-                    cend = wend + warm_f
-                    cend = cend if cend < num_chunks_b else num_chunks_b
-                    emit_item(mStaging, mCount, batch_idx, head_idx, prev_cut, wend, cur_cstart, cend, batch_start, batch_end)
-                    cur_cstart = wend - warm_b
-                    prev_cut = wend
+                    write_end = jj * span
+                    warmup_before = r % cutlass.Int32(256)
+                    warmup_after = r // cutlass.Int32(256)
+                    compute_end = write_end + warmup_after
+                    compute_end = compute_end if compute_end < batch_num_chunks else batch_num_chunks
+                    emit_item(mStaging, mCount, batch_idx, head_idx, prev_cut, write_end, current_compute_start, compute_end, batch_start, batch_end)
+                    current_compute_start = write_end - warmup_before
+                    prev_cut = write_end
                 jj = jj + cutlass.Int32(1)
-            emit_item(mStaging, mCount, batch_idx, head_idx, prev_cut, num_chunks_b, cur_cstart, num_chunks_b, batch_start, batch_end)
+            emit_item(mStaging, mCount, batch_idx, head_idx, prev_cut, batch_num_chunks, current_compute_start, batch_num_chunks, batch_start, batch_end)
 
 
 @cute.jit
@@ -566,8 +564,8 @@ def gen_item_bounds(b_t: cutlass.Constexpr[int], n_heads_out, mCuSeqlens, item):
     head_idx = item % n_heads_out
     batch_start = cutlass.Int32(mCuSeqlens[batch_idx])
     batch_end = cutlass.Int32(mCuSeqlens[batch_idx + 1])
-    num_chunks_b = cute.ceil_div(batch_end - batch_start, b_t)
-    return batch_idx, head_idx, batch_start, batch_end, num_chunks_b
+    batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
+    return batch_idx, head_idx, batch_start, batch_end, batch_num_chunks
 
 
 @cute.jit
@@ -584,13 +582,13 @@ def write_item(
     """Final-table row ``dst`` from source item ``src``: the walk's staged
     row, or (``gen``) the synthesized uncut item ``(0, nc, 0, nc)``."""
     if cutlass.const_expr(gen):
-        batch_idx, head_idx, batch_start, batch_end, num_chunks_b = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, src)
+        batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, src)
         mWorkItems[dst, 0] = batch_idx
         mWorkItems[dst, 1] = head_idx
         mWorkItems[dst, 2] = cutlass.Int32(0)
-        mWorkItems[dst, 3] = num_chunks_b
+        mWorkItems[dst, 3] = batch_num_chunks
         mWorkItems[dst, 4] = cutlass.Int32(0)
-        mWorkItems[dst, 5] = num_chunks_b
+        mWorkItems[dst, 5] = batch_num_chunks
         mWorkItems[dst, 6] = batch_start
         mWorkItems[dst, 7] = batch_end
     else:
@@ -601,10 +599,10 @@ def write_item(
 @cute.jit
 def order_body(
     gen: cutlass.Constexpr[bool],
-    has_sched: cutlass.Constexpr[bool],
+    has_scheduler: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     n_threads: cutlass.Constexpr[int],
-    order_elems: cutlass.Constexpr[int],
+    order_elements: cutlass.Constexpr[int],
     tidx,
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
@@ -612,27 +610,28 @@ def order_body(
     mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
-    mSched: cute.Tensor | None,
+    mScheduler: cute.Tensor | None,
     sKey,
     sIdx,
     sSpread,
 ):
     """LPT ordering body over ``n_threads`` CTA threads and caller-owned SMEM
-    staging (``sKey``/``sIdx`` of ``n_threads * order_elems`` Int32 cells +
-    a 2-cell ``sSpread``): bitonic-sort the items by span ``cend - cstart``,
-    longest first, into the final table.  Sorts the walk's staged items, or
-    with ``gen`` synthesizes the uncut whole-sequence item per (batch, head)
-    from ``cu_seqlens`` directly — the no-cuts table.  Thread 0 also zeroes
-    every ``sched_ctr`` cell (the main kernels' ticket rings, dirty on exit).
-    Runs on the standalone :func:`order_kernel` CTA, or fused into a main
-    kernel's CTA 0 prologue.  Internally CTA-wide-barriers; every thread of
+    staging (``sKey``/``sIdx`` of ``n_threads * order_elements`` Int32 cells +
+    a 2-cell ``sSpread``): bitonic-sort the items by span
+    ``compute_end - compute_start``, longest first, into the final table.
+    Sorts the walk's staged items, or with ``gen`` synthesizes the uncut
+    whole-sequence item per (batch, head) from ``cu_seqlens`` directly —
+    the no-cuts table.  Thread 0 also zeroes every ``scheduler_counter`` cell
+    (the main kernels' ticket rings, dirty on exit).
+    Runs fused into each main kernel's single-CTA prologue launch.
+    Internally CTA-wide-barriers; every thread of
     the calling CTA must reach it."""
-    capacity = cutlass.const_expr(n_threads * order_elems)
-    if cutlass.const_expr(has_sched):
+    capacity = cutlass.const_expr(n_threads * order_elements)
+    if cutlass.const_expr(has_scheduler):
         if tidx == 0:
             si = cutlass.Int32(0)
-            while si < mSched.shape[0]:
-                mSched[si] = cutlass.Int32(0)
+            while si < mScheduler.shape[0]:
+                mScheduler[si] = cutlass.Int32(0)
                 si = si + cutlass.Int32(1)
     if cutlass.const_expr(gen):
         n = n_tiles
@@ -655,12 +654,12 @@ def order_body(
         nvvm.barrier_cta_sync()
         kmin = cutlass.Int32(2147483647)
         kmax = cutlass.Int32(-2147483648)
-        for e in cutlass.range_constexpr(order_elems):
+        for e in cutlass.range_constexpr(order_elements):
             i = tidx + cutlass.Int32(e * n_threads)
             if i < n:
                 if cutlass.const_expr(gen):
-                    batch_idx, head_idx, batch_start, batch_end, num_chunks_b = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i)
-                    key = num_chunks_b
+                    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i)
+                    key = batch_num_chunks
                 else:
                     key = mStaging[i, 5] - mStaging[i, 4]
                 sKey[i] = key
@@ -685,7 +684,7 @@ def order_body(
             while k <= b_pad:
                 j = k // cutlass.Int32(2)
                 while j > 0:
-                    for e in cutlass.range_constexpr(order_elems):
+                    for e in cutlass.range_constexpr(order_elements):
                         i = tidx + cutlass.Int32(e * n_threads)
                         if i < b_pad:
                             l = i ^ j
@@ -704,7 +703,7 @@ def order_body(
                     nvvm.barrier_cta_sync()
                     j = j // cutlass.Int32(2)
                 k = k * cutlass.Int32(2)
-            for e in cutlass.range_constexpr(order_elems):
+            for e in cutlass.range_constexpr(order_elements):
                 i = tidx + cutlass.Int32(e * n_threads)
                 if i < n:
                     src = sIdx[i]
@@ -719,7 +718,7 @@ def launch(
     safe_gate: cutlass.Constexpr[bool],
     gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
-    has_sched: cutlass.Constexpr[bool],
+    has_scheduler: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
     num_sms: cutlass.Int32,
@@ -735,7 +734,7 @@ def launch(
     mStaging: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
-    mSched: cute.Tensor | None,
+    mScheduler: cute.Tensor | None,
     n_scan_ctas: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
     stream: cuda.CUstream,
@@ -828,7 +827,7 @@ class TableRecipe(NamedTuple):
     n_walk_ctas: int
 
 
-def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, work_items, work_count, sched_ctr, stream) -> None:
+def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream) -> None:
     """The lowered split-table launch: no validation, no key build.  Only
     buffers move between calls; every scalar comes from the recipe."""
     r.compiled(
@@ -847,7 +846,7 @@ def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, 
         item_scratch if r.split else None,
         work_items,
         work_count,
-        sched_ctr,
+        scheduler_counter,
         r.n_scan_ctas,
         r.n_walk_ctas,
         cuda.CUstream(int(stream)),
@@ -872,7 +871,7 @@ def build_split_table(
     a_log=None,
     dt_bias=None,
     gate_lower_bound=None,
-    sched_ctr=None,
+    scheduler_counter=None,
     split=True,
     stream,
 ) -> "TableRecipe":
@@ -887,21 +886,18 @@ def build_split_table(
     ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` per element;
     scalar (GDN) ``-exp(a_log[h]) * softplus(g + dt_bias[h])`` per head.
 
-    With ``split=False`` the scan and walk never launch: the order kernel
-    alone synthesizes the no-cuts table — the uncut whole-sequence item per
-    (batch, head), LPT-sorted by sequence length — and ``ideal_chunks`` /
-    ``chunk_scratch`` / ``item_scratch`` / the gate contents are unused.
-    Batch-invariant mode and coarse checkpoint cadences (cuts may not cross
-    a checkpoint period) take this path.
+    ``split=False`` is rejected: the no-cuts table (the uncut whole-sequence
+    item per (batch, head), LPT-sorted) is synthesized by each main kernel's
+    own prologue (``order_gen``), so batch-invariant mode and coarse
+    checkpoint cadences (cuts may not cross a checkpoint period) never
+    involve this function.
 
     ``work_items`` and ``item_scratch`` are ``(max_items,
-    WORK_ITEM_FIELDS)`` int32 with ``max_items >= max_work_items(...)``
-    (``>= n_tiles`` rows and no ``item_scratch`` with ``split=False``);
-    ``work_count`` is ``(1,)`` int32.  Every cell of ``sched_ctr`` when
+    WORK_ITEM_FIELDS)`` int32 with ``max_items >= max_work_items(...)``;
+    ``work_count`` is ``(1,)`` int32.  Every cell of ``scheduler_counter`` when
     passed — the main kernels' int32 ticket rings, ``(2,)`` per kernel
     launch that consumes this table, dirty on exit — is zeroed by the
-    order kernel, which runs in both modes; the count is zeroed by the
-    scan (split) or written by the order kernel (non-split).
+    order phase; the count is zeroed by the scan.
     ``chunk_scratch`` is ``(>= chunk_scratch_rows(total_tokens,
     B, b_t), HO)`` fp32 (contents managed here).  Runs entirely on device
     — no host synchronization."""
@@ -920,41 +916,27 @@ def build_split_table(
     gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
-    if split:
-        if ideal_chunks is None or chunk_scratch is None or item_scratch is None:
-            raise ValueError("split=True requires ideal_chunks, chunk_scratch, and item_scratch")
-        if gate_channels and gate_channels % WARP_SIZE != 0:
-            raise ValueError(f"per-channel gate dim must be a multiple of {WARP_SIZE}, got {gate_channels}")
-        if gate_channels and gate_channels % 128 == 0 and data_ptr(gate) % 16 != 0:
-            raise ValueError("per-channel gate base must be 16-byte aligned (vectorized scan loads)")
-        n_walk_ctas = batch_size * n_heads_out
-        need_rows = chunk_scratch_rows(gate.shape[0], batch_size, b_t)
-        n_scan_ctas = -(-need_rows // (SCAN_WARPS * SCAN_ROWS_PER_WARP))
-        if len(chunk_scratch.shape) != 2 or chunk_scratch.shape[0] < need_rows or chunk_scratch.shape[1] != n_heads_out:
-            raise ValueError(f"chunk_scratch must be (>= {need_rows}, {n_heads_out}) fp32, got {tuple(chunk_scratch.shape)}")
-        if tuple(item_scratch.shape) != tuple(work_items.shape) or work_items.shape[1] != WORK_ITEM_FIELDS:
-            raise ValueError(
-                f"item_scratch must match work_items (max_items, {WORK_ITEM_FIELDS}) int32, got {tuple(item_scratch.shape)} vs {tuple(work_items.shape)}"
-            )
-    else:
-        if work_items.shape[0] < n_tiles or work_items.shape[1] != WORK_ITEM_FIELDS:
-            raise ValueError(f"work_items must be (>= {n_tiles}, {WORK_ITEM_FIELDS}) int32, got {tuple(work_items.shape)}")
-        log_gate = False
-        safe_gate = False
-        gate_channels = 0
-        a_log = None
-        dt_bias = None
-        gate_scale_log2 = 0.0
-        gate = None
-        chunk_scratch = None
-        item_scratch = None
-        ideal_chunks = 0
-        n_scan_ctas = 0
-        n_walk_ctas = 0
+    if not split:
+        raise ValueError("split=False has no host-side stage: each main kernel's prologue synthesizes the no-cuts table (order_gen)")
+    if ideal_chunks is None or chunk_scratch is None or item_scratch is None:
+        raise ValueError("split=True requires ideal_chunks, chunk_scratch, and item_scratch")
+    if gate_channels and gate_channels % WARP_SIZE != 0:
+        raise ValueError(f"per-channel gate dim must be a multiple of {WARP_SIZE}, got {gate_channels}")
+    if gate_channels and gate_channels % 128 == 0 and data_ptr(gate) % 16 != 0:
+        raise ValueError("per-channel gate base must be 16-byte aligned (vectorized scan loads)")
+    n_walk_ctas = batch_size * n_heads_out
+    need_rows = chunk_scratch_rows(gate.shape[0], batch_size, b_t)
+    n_scan_ctas = -(-need_rows // (SCAN_WARPS * SCAN_ROWS_PER_WARP))
+    if len(chunk_scratch.shape) != 2 or chunk_scratch.shape[0] < need_rows or chunk_scratch.shape[1] != n_heads_out:
+        raise ValueError(f"chunk_scratch must be (>= {need_rows}, {n_heads_out}) fp32, got {tuple(chunk_scratch.shape)}")
+    if tuple(item_scratch.shape) != tuple(work_items.shape) or work_items.shape[1] != WORK_ITEM_FIELDS:
+        raise ValueError(
+            f"item_scratch must match work_items (max_items, {WORK_ITEM_FIELDS}) int32, got {tuple(item_scratch.shape)} vs {tuple(work_items.shape)}"
+        )
     overhead_chunks = max(1, OVERHEAD_TOKENS // b_t)
     cu_stream = cuda.CUstream(int(stream))
 
-    key = (bool(split), b_t, n_heads_out, bool(log_gate), bool(safe_gate), gate_channels, sched_ctr is not None, str(cu_seqlens.dtype))
+    key = (bool(split), b_t, n_heads_out, bool(log_gate), bool(safe_gate), gate_channels, scheduler_counter is not None, str(cu_seqlens.dtype))
     if key not in compiled_cache:
 
         dt_bias_c = None
@@ -980,7 +962,7 @@ def build_split_table(
             bool(safe_gate),
             gate_channels,
             overhead_chunks,
-            sched_ctr is not None,
+            scheduler_counter is not None,
             cutlass.Int32(n_heads_out),
             cutlass.Int32(n_tiles),
             cutlass.Int32(num_sms),
@@ -996,7 +978,7 @@ def build_split_table(
             item_scratch_c,
             work_items_c,
             work_count_c,
-            from_dlpack(sched_ctr, assumed_align=4).mark_layout_dynamic() if sched_ctr is not None else None,
+            from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic() if scheduler_counter is not None else None,
             cutlass.Int32(n_scan_ctas),
             cutlass.Int32(n_walk_ctas),
             cu_stream,
@@ -1018,7 +1000,7 @@ def build_split_table(
         item_scratch,
         work_items,
         work_count,
-        sched_ctr,
+        scheduler_counter,
         n_scan_ctas,
         n_walk_ctas,
         cu_stream,

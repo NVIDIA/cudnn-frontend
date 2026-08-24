@@ -29,13 +29,13 @@ def build_gdn(graph):
         raise ValueError("build_gdn: graph does not contain exactly one GDN/GDN_BWD node")
     node = nodes[0]
     if node.node_type.name == "GDN_BWD":
-        from .kernel import gdn_bprop_f16 as bwd_mod
-        from .kernel import gdn_recompute_f16 as regen_mod
+        from .kernel import gdn_bprop_f16 as bwd_module
+        from .kernel import gdn_recompute_f16 as recompute_module
 
-        return CompiledGdnBwd(node, bwd_mod, regen_mod)
-    from .kernel import gdn_prefill_f16 as kernel_mod
+        return CompiledGdnBwd(node, bwd_module, recompute_module)
+    from .kernel import gdn_prefill_f16 as kernel_module
 
-    return CompiledGdn(node, kernel_mod)
+    return CompiledGdn(node, kernel_module)
 
 
 class GdnFrostEngine(BaseEngine):
@@ -52,9 +52,9 @@ class GdnFrostEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         frost_la_gate("GdnFrostEngine", facts, "GDN")
-        ckpt = facts.checkpoint_every_n_tokens
-        if ckpt and (facts.is_bwd or ckpt % 64 != 0):
-            raise NotImplementedError(f"GdnFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 64 on the GDN node (got {ckpt})")
+        checkpoint = facts.checkpoint_every_n_tokens
+        if checkpoint and (facts.is_bwd or checkpoint % 64 != 0):
+            raise NotImplementedError(f"GdnFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 64 on the GDN node (got {checkpoint})")
         if not facts.gates_at_ho:
             raise NotImplementedError(f"GdnFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
         fp32 = cudnn.data_type.FLOAT
@@ -103,11 +103,11 @@ class GdnFrostEngine(BaseEngine):
 class CompiledGdn:
     """Compiled FROST GDN plan: a callable over the resolved node buffers."""
 
-    def __init__(self, node, kernel_mod):
+    def __init__(self, node, kernel_module):
         from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
 
         self.node = node
-        self.kernel = kernel_mod
+        self.kernel = kernel_module
         self.build_split_table = build_split_table
         self.run_table = run_table
         self.table = None
@@ -123,24 +123,24 @@ class CompiledGdn:
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
 
         q, v, g = node.inputs["q"], node.inputs["v"], node.inputs["g"]
-        self.b_t = kernel_mod.CFG.B_T
+        self.b_t = kernel_module.CFG.B_T
         total = q.dim[0]
         HO = g.dim[1]
         HQ, HK = q.dim[1], node.inputs["k"].dim[1]
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_final_state = "final_state" in node.outputs
-        self.ckpt = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        self.split = self.ckpt % self.b_t == 0 and not self.batch_invariant
+        self.split = self.checkpoint % self.b_t == 0 and not self.batch_invariant
 
         layout = WorkspaceLayout()
         from .common.host import tensormap_workspace_bytes
 
-        self.tensormap_words = tensormap_workspace_bytes(kernel_mod, B) // 8
+        self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
-        self.off_sched = layout.add(8)
+        self.off_scheduler = layout.add(8)
         self.num_sm = multiprocessor_count(current_device())
         self.n_tiles = B * HO
         self.n_heads_out = HO
@@ -162,10 +162,10 @@ class CompiledGdn:
             self.off_inv_q = layout.add(total * HQ * 4)
             self.off_inv_k = layout.add(total * HK * 4)
         self.needs_table = self.split
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         regions = [
             (self.off_tensormaps, "int64", (self.tensormap_words,)),
-            (self.off_sched, "int32", (2,)),
+            (self.off_scheduler, "int32", (2,)),
             (self.off_work_items, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             (self.off_work_count, "int32", (1,)),
         ]
@@ -184,7 +184,7 @@ class CompiledGdn:
         self.carve = carve_plan("GdnFrostEngine (GDN)", regions)
 
     def workspace_bytes(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
@@ -217,9 +217,9 @@ class CompiledGdn:
         stream = stream if stream is not None else 0
         carved = workspace.carve(self.carve)
         if self.split:
-            tensormaps, sched_ctr, work_items, work_count, item_scratch, chunk_scratch, *l2n = carved
+            tensormaps, scheduler_counter, work_items, work_count, item_scratch, chunk_scratch, *l2n = carved
         else:
-            tensormaps, sched_ctr, work_items, work_count, *l2n = carved
+            tensormaps, scheduler_counter, work_items, work_count, *l2n = carved
             item_scratch = chunk_scratch = None
         if self.use_qk_l2norm:
             q_n, k_n, inv_q, inv_k = l2n
@@ -228,7 +228,7 @@ class CompiledGdn:
 
         if self.kcache is not None and (self.table is not None or not self.needs_table):
             if self.needs_table:
-                self.run_table(self.table, g, a_log, dt_bias, cu, chunk_scratch, item_scratch, work_items, work_count, sched_ctr, stream)
+                self.run_table(self.table, g, a_log, dt_bias, cu, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream)
             self.kernel.run_prefill(
                 self.kcache,
                 q,
@@ -243,10 +243,10 @@ class CompiledGdn:
                 state_checkpoints,
                 work_items,
                 work_count,
-                sched_ctr,
+                scheduler_counter,
                 item_scratch,
                 tensormaps,
-                self.ckpt,
+                self.checkpoint,
                 self.scale,
                 stream,
                 a_log=a_log if self.safe_gate else None,
@@ -272,7 +272,7 @@ class CompiledGdn:
                 safe_gate=self.safe_gate,
                 a_log=a_log,
                 dt_bias=dt_bias,
-                sched_ctr=sched_ctr,
+                scheduler_counter=scheduler_counter,
                 split=self.split,
                 stream=stream,
             )
@@ -290,8 +290,8 @@ class CompiledGdn:
             self.scale,
             work_items=work_items,
             work_count=work_count,
-            sched_ctr=sched_ctr,
-            checkpoint_every_n_tokens=self.ckpt,
+            scheduler_counter=scheduler_counter,
+            checkpoint_every_n_tokens=self.checkpoint,
             output_state_checkpoints=state_checkpoints,
             log_gate=True,
             safe_gate=self.safe_gate,
@@ -312,17 +312,17 @@ class CompiledGdnBwd:
     the node's ``state_checkpoints`` input, or regenerates them with the recompute
     (checkpoint-only) kernel when the port is absent."""
 
-    def __init__(self, node, bwd_mod, regen_mod):
+    def __init__(self, node, bwd_module, recompute_module):
         from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
 
         self.node = node
-        self.bwd = bwd_mod
-        self.regen = regen_mod
+        self.bwd = bwd_module
+        self.recompute = recompute_module
         self.build_split_table = build_split_table
         self.run_table = run_table
         self.table = None
         self.kcache = None
-        self.regen_cache = None
+        self.recompute_cache = None
         self.plan_name = "GdnFrostEngine (GDN_BWD)"
         from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
         from .common.head_reduce import head_group_reduce
@@ -340,7 +340,7 @@ class CompiledGdnBwd:
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
 
         q, v, g = node.inputs["q"], node.inputs["v"], node.inputs["g"]
-        self.b_t = bwd_mod.CFG.B_T
+        self.b_t = bwd_module.CFG.B_T
         total = q.dim[0]
         self.gate_bwd_blocks = scalar_gate_blocks(total)
         K, V = q.dim[-1], v.dim[-1]
@@ -351,19 +351,19 @@ class CompiledGdnBwd:
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
 
         self.num_sm = multiprocessor_count(current_device())
-        self.bwd_dyn_sched = B * HO <= self.num_sm
+        self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         # cuts never in batch-invariant mode
         self.split = not self.batch_invariant
         layout = WorkspaceLayout()
-        self.off_sched = layout.add(16)
-        self.tensormap_words = tensormap_workspace_bytes(bwd_mod, B) // 8
+        self.off_scheduler = layout.add(16)
+        self.tensormap_words = tensormap_workspace_bytes(bwd_module, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
         if not self.has_state_checkpoints:
             self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
-            self.regen_tensormap_words = tensormap_workspace_bytes(regen_mod, B) // 8
-            self.off_regen_tensormaps = layout.add(self.regen_tensormap_words * 8)
+            self.recompute_tensormap_words = tensormap_workspace_bytes(recompute_module, B) // 8
+            self.off_recompute_tensormaps = layout.add(self.recompute_tensormap_words * 8)
         HK = node.inputs["k"].dim[1]
         self.fold_dq = HQ < HO
         self.fold_dk = HK < HO
@@ -396,14 +396,14 @@ class CompiledGdnBwd:
             self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
         self.needs_table = self.split
-        self.regen_orders = not self.has_state_checkpoints
+        self.recompute_orders = not self.has_state_checkpoints
         self.bwd_orders = self.has_state_checkpoints
         self.n_heads_out, self.total = HO, total
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         regions = [
-            ("sched_regen", self.off_sched, "int32", (2,)),
-            ("sched_bwd", self.off_sched + 8, "int32", (2,)),
-            ("sched_all", self.off_sched, "int32", (4,)),
+            ("scheduler_recompute", self.off_scheduler, "int32", (2,)),
+            ("scheduler_bwd", self.off_scheduler + 8, "int32", (2,)),
+            ("scheduler_all", self.off_scheduler, "int32", (4,)),
             ("tensormaps", self.off_tensormaps, "int64", (self.tensormap_words,)),
             ("work_items", self.off_work_items, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ("work_count", self.off_work_count, "int32", (1,)),
@@ -413,7 +413,7 @@ class CompiledGdnBwd:
             regions.append(("chunk_scratch", self.off_chunk_scratch, "float32", (self.chunk_scratch_rows, HO)))
         if not self.has_state_checkpoints:
             regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, V, K)))
-            regions.append(("regen_tensormaps", self.off_regen_tensormaps, "int64", (self.regen_tensormap_words,)))
+            regions.append(("recompute_tensormaps", self.off_recompute_tensormaps, "int64", (self.recompute_tensormap_words,)))
         if self.fold_dq:
             regions.append(("dq_ho", self.off_dq_ho, self.io_name, (total, HO, K)))
         if self.fold_dk:
@@ -432,7 +432,7 @@ class CompiledGdnBwd:
         self.carve = carve_plan("GdnFrostEngine (GDN_BWD)", [(off, dt, shape) for _name, off, dt, shape in regions])
 
     def workspace_bytes(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
@@ -481,8 +481,8 @@ class CompiledGdnBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        sched_regen = region["sched_regen"]
-        sched_bwd = region["sched_bwd"]
+        scheduler_recompute = region["scheduler_recompute"]
+        scheduler_bwd = region["scheduler_bwd"]
         work_items = region["work_items"]
         work_count = region["work_count"]
         if self.use_qk_l2norm:
@@ -501,15 +501,15 @@ class CompiledGdnBwd:
                     region.get("item_scratch"),
                     work_items,
                     work_count,
-                    region["sched_all"],
+                    region["scheduler_all"],
                     stream,
                 )
             if self.has_state_checkpoints:
                 checkpoint_series = state_checkpoints
             else:
                 checkpoint_series = region["state_checkpoints"]
-                self.regen.run_recompute(
-                    self.regen_cache,
+                self.recompute.run_recompute(
+                    self.recompute_cache,
                     k,
                     v,
                     g,
@@ -520,10 +520,10 @@ class CompiledGdnBwd:
                     checkpoint_series,
                     work_items,
                     work_count,
-                    sched_regen,
-                    region["sched_all"] if self.regen_orders else None,
-                    region.get("item_scratch") if self.regen_orders else None,
-                    region["regen_tensormaps"],
+                    scheduler_recompute,
+                    region["scheduler_all"] if self.recompute_orders else None,
+                    region.get("item_scratch") if self.recompute_orders else None,
+                    region["recompute_tensormaps"],
                     self.b_t,
                     stream,
                     a_log=a_log if self.safe_gate else None,
@@ -551,8 +551,8 @@ class CompiledGdnBwd:
                 dstate_in,
                 work_items,
                 work_count,
-                sched_bwd if self.bwd_dyn_sched else None,
-                region["sched_all"] if self.bwd_orders else None,
+                scheduler_bwd if self.bwd_dynamic_scheduling else None,
+                region["scheduler_all"] if self.bwd_orders else None,
                 region.get("item_scratch") if self.bwd_orders else None,
                 region["tensormaps"],
                 self.scale,
@@ -588,7 +588,7 @@ class CompiledGdnBwd:
                 safe_gate=self.safe_gate,
                 a_log=a_log,
                 dt_bias=dt_bias,
-                sched_ctr=region["sched_all"],
+                scheduler_counter=region["scheduler_all"],
                 split=self.split,
                 stream=stream,
             )
@@ -597,7 +597,7 @@ class CompiledGdnBwd:
             checkpoint_series = state_checkpoints
         else:
             checkpoint_series = region["state_checkpoints"]
-            self.regen_cache = self.regen.chunk_gdn_recompute_sm100(
+            self.recompute_cache = self.recompute.chunk_gdn_recompute_sm100(
                 k,
                 v,
                 g,
@@ -613,12 +613,12 @@ class CompiledGdnBwd:
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 work_items=work_items,
                 work_count=work_count,
-                sched_ctr=sched_regen,
-                sched_all=region["sched_all"] if self.regen_orders else None,
-                work_item_scratch=region.get("item_scratch") if self.regen_orders else None,
-                order_in_prologue=self.regen_orders,
+                scheduler_counter=scheduler_recompute,
+                scheduler_all=region["scheduler_all"] if self.recompute_orders else None,
+                work_item_scratch=region.get("item_scratch") if self.recompute_orders else None,
+                order_in_prologue=self.recompute_orders,
                 log_gate=True,
-                workspace=region["regen_tensormaps"],
+                workspace=region["recompute_tensormaps"],
                 stream=stream,
             )
 
@@ -653,8 +653,8 @@ class CompiledGdnBwd:
             use_beta_sigmoid=self.use_beta_sigmoid,
             work_items=work_items,
             work_count=work_count,
-            sched_ctr=sched_bwd if self.bwd_dyn_sched else None,
-            sched_all=region["sched_all"] if self.bwd_orders else None,
+            scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,
+            scheduler_all=region["scheduler_all"] if self.bwd_orders else None,
             work_item_scratch=region.get("item_scratch") if self.bwd_orders else None,
             order_in_prologue=self.bwd_orders,
             log_gate=True,

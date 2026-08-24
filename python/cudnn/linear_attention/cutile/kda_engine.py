@@ -108,7 +108,7 @@ class KdaCuTilePlan(CompiledPlan):
             if to_buffer_dtype(g.get_data_type()) != f32:
                 regions.append(("dg_cum", layout.add(total * HV * K * 4), f32, (total, HV, K)))
 
-        self.ws_bytes = layout.size
+        self.workspace_size = layout.size
         self.carve_names = [name for name, _off, _dtype, _shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dtype, shape) for _name, off, dtype, shape in regions])
         self.expect = expect_table(node)
@@ -146,7 +146,7 @@ class KdaCuTilePlan(CompiledPlan):
         self.indices = None
 
     def get_workspace_size(self) -> int:
-        return self.ws_bytes
+        return self.workspace_size
 
     def execute(self, graph, variant_pack, ctx) -> None:
         if self.ports is None:
@@ -158,8 +158,8 @@ class KdaCuTilePlan(CompiledPlan):
         check_layouts_compact(self.plan_name, self.expect, self.names, views)
         nb = dict(zip(self.names, views))
         stream = ctx.stream if ctx.stream is not None else 0
-        ws = Workspace.over(variant_pack, self.ws_bytes, self.plan_name)
-        region = dict(zip(self.carve_names, ws.carve(self.carve)))
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         self.common.build_chunk_table(
             region["chunk_table"],
             region["chunk_count"],
