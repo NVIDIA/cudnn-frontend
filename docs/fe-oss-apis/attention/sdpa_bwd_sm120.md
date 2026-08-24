@@ -79,8 +79,9 @@ multiple KV-tile CTAs. `deterministic=True` (the graph API's
 per shape; dK/dV are deterministic in both modes and on both routes —
 including under GQA, where the group reduction runs in a fixed q-head order.
 
-- **Two-kernel split** (dense/causal; head dims padding to `128/128`,
-  `192/128` (MLA), or `256/256`): the main kernel streams the I/O-dtype dS
+- **Two-kernel split** (dense/causal; `d_qk` exactly 128, 192, or 256 —
+  `d_v` may pad — giving `128/128`, `192/128` (MLA), or `256/256`): the
+  main kernel streams the I/O-dtype dS
   tiles to a `[B, H_q, S_q, S_kv]` workspace instead of scattering dQ —
   GEMM 4, the atomics, and the relay disappear — and a dedicated
   Q-stationary kernel computes `dQ = attn_scale * dS @ K` with register
@@ -306,7 +307,9 @@ only the unused relay operand remains in the kernel ABI.
   exponent and accumulates `dBias = dS'` (the unscaled softmax VJP) into an
   fp32 workspace with `red.global.add.f32`; a batch-1 bias thereby reduces
   over B for free, which also makes `dBias` bitwise NON-deterministic when
-  `B > 1` (dQ/dK/dV determinism is unaffected). An fp32 `dBias` output is
+  `B > 1` (dQ/dK/dV determinism is unaffected) — deterministic mode
+  therefore requires a per-batch bias when `B > 1` and a `dBias` output is
+  requested. An fp32 `dBias` output is
   that accumulator itself (no extra workspace, no convert kernel); an
   io-dtype output adds the `dbias_cvt` cast.
 - No dropout / ALiBi / softcap / THD

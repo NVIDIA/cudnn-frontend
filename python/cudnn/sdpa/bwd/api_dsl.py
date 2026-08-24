@@ -353,6 +353,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 tuple(self.dbias_desc.shape) != tuple(self.bias_desc.shape),
                 f"dBias must match the bias dims {tuple(self.bias_desc.shape)}; got {tuple(self.dbias_desc.shape)}",
             )
+            self._value_error_if(
+                self.deterministic and b > 1 and int(self.bias_desc.shape[0]) == 1,
+                f"deterministic dBias requires a per-batch (B, H_q, S_q, S_kv) bias when B > 1 (a broadcast bias reduces over B through unordered atomics); got batch dim 1 with B = {b}",
+            )
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         self.compute_capability = torch.cuda.get_device_capability(self.q_desc.device)
@@ -395,10 +399,16 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             return False
         if (self.head_dim_qk_padded, self.head_dim_v_padded) not in _SM120_DET_2K_HEAD_DIM_PAIRS:
             return False
+        # dq2k reads K / writes dQ at the declared head dim (no zero-fill envelope)
+        if self.head_dim_qk != self.head_dim_qk_padded:
+            return False
         if self.window_size_left is not None or self.seq_kv_lens_present or self.seq_q_lens_present:
             return False
         # dq2k addresses K/dQ as compact BSHD
         if "k" in self._io_strides or "dQ" in self._io_strides:
+            return False
+        # dq2k's q tile (128 at d_qk <= 128, else 64) must be a multiple of the main kernel's q tile
+        if self.q_tile and (128 if self.head_dim_qk_padded <= 128 else 64) % self.q_tile:
             return False
         ws_bytes = self.batch_size * self.h_q * self.s_q_max * self._skv_rounded * self.dtype.itemsize
         total_mem = torch.cuda.get_device_properties(self.q_desc.device).total_memory

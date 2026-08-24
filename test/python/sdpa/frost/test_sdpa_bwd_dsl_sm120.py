@@ -140,6 +140,7 @@ def _expect_det_2k(
     window_size_left: int | None,
     padded: bool,
     ws_bytes: int,
+    q_tile: int | None = None,
 ) -> bool:
     """Mirror of SdpaBwdDslSm120._pick_det_2k (two-kernel deterministic route)."""
     from cudnn.sdpa.bwd.api_dsl import _SM120_DET_2K_HEAD_DIM_PAIRS
@@ -147,12 +148,15 @@ def _expect_det_2k(
 
     if not deterministic:
         return False
-    if padded_head_dims(head_dim, head_dim_v) not in _SM120_DET_2K_HEAD_DIM_PAIRS:
+    pads = padded_head_dims(head_dim, head_dim_v)
+    if pads not in _SM120_DET_2K_HEAD_DIM_PAIRS or pads[0] != head_dim:
         return False
     if window_size_left is not None or padded:
         return False
+    if q_tile and (128 if pads[0] <= 128 else 64) % q_tile:
+        return False
     # 2K whenever the full dS buffer can physically fit
-    return ws_bytes <= torch.cuda.get_device_properties(0).total_memory
+    return ws_bytes <= torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
 
 
 def _expected_workspace_bytes(
@@ -168,6 +172,7 @@ def _expected_workspace_bytes(
     window_size_left: int | None = None,
     padded: bool = False,
     dbias_batch: int = 0,
+    q_tile: int | None = None,
 ) -> int:
     from cudnn.sdpa.bwd.config_sm120 import padded_head_dims
     from cudnn.sdpa.fwd.api_dsl import ws_align
@@ -181,7 +186,13 @@ def _expected_workspace_bytes(
     skv_r = -(-s_kv_eff // 128) * 128
     ds_ws_bytes = batch * h_q * s_q * skv_r * io_itemsize  # det_2kernel dS workspace
     if _expect_det_2k(
-        head_dim=head_dim, head_dim_v=head_dim_v, deterministic=deterministic, window_size_left=window_size_left, padded=padded, ws_bytes=ds_ws_bytes
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        deterministic=deterministic,
+        window_size_left=window_size_left,
+        padded=padded,
+        ws_bytes=ds_ws_bytes,
+        q_tile=q_tile,
     ):
         dq_scratch = ws_align(ds_ws_bytes)
     else:
@@ -340,6 +351,7 @@ def _run_bwd_graph(
             window_size_left=window_size_left,
             padded=seq_kv_lens is not None,
             dbias_batch=dbias_gpu.shape[0] if dbias_gpu is not None and dbias_gpu.dtype != torch.float32 else 0,
+            q_tile=q_tile,
         )
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
@@ -650,6 +662,23 @@ def test_sdpa_bwd_dsl_sm120_bias_features():
     _run_case(head_dim=64, bias=True, bias_dtype=torch.float32)  # fp32 bias/dBias: in-place accumulation, no cvt kernel or accumulator ws
     _run_case(h_q=8, h_kv=2, head_dim=64, bias=True)  # GQA: dBias is per q head — no group reduction
     _run_case(batch=2, head_dim=64, s_q=512, s_kv=512, bias=True, padding=([301, 512], [512, 187]))  # padded cells contribute zero
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_sdpa_bwd_dsl_sm120_bias_broadcast_det_rejected():
+    """B > 1 + batch-broadcast bias + dBias is rejected in deterministic mode
+    (dBias reduces over B through unordered atomics)."""
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s, head_dim, dtype = 2, 2, 128, 64, torch.float16
+    q = _bhsd(batch, heads, s, head_dim, dtype)
+    o = _bhsd(batch, heads, s, head_dim, dtype)
+    stats = torch.zeros(batch, heads, s, 1, dtype=torch.float32, device="cuda")
+    bias = torch.randn(1, heads, s, s, dtype=dtype, device="cuda")
+    with pytest.raises(ValueError, match="per-batch"):
+        sdpa_bwd_wrapper_dsl_sm120(q, q, q, o, o, stats, deterministic=True, bias_tensor=bias)
 
 
 @pytest.mark.L0

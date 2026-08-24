@@ -244,7 +244,7 @@ class SM120DetDqGemmKernel:
         self.stages = 2
         self.k_tile_elems = kv_tile * head_dim
         self.ds_tile_elems = q_tile * kv_tile
-        smem_bytes = self.stages * (self.k_tile_elems + self.ds_tile_elems) * in_dtype.bytes
+        smem_bytes = self.stages * (self.k_tile_elems + self.ds_tile_elems) * in_dtype.bytes + self.stages * 8
         cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
         if smem_bytes > cap:
             raise ValueError(f"det_2kernel dQ smem {smem_bytes} bytes exceeds the sm_120 cap of {cap} bytes")

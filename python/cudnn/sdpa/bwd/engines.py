@@ -271,6 +271,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"{label} must be fp32 or match the io dtype {facts.dtype}; got {bias_like_t.get_data_type()}"
     if facts.has_dbias and tuple(facts.dbias_t.get_dim()) != tuple(facts.bias_t.get_dim()):
         return f"dBias dims must match the bias dims {tuple(facts.bias_t.get_dim())}; got {tuple(facts.dbias_t.get_dim())}"
+    if facts.has_dbias and facts.deterministic and facts.b > 1 and tuple(facts.bias_t.get_dim())[0] == 1:
+        return "deterministic dBias requires a per-batch bias when B > 1 (a broadcast bias reduces over B through unordered atomics)"
     return None
 
 
