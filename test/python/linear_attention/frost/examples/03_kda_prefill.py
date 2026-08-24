@@ -27,7 +27,7 @@ def _build_plans(g) -> None:
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(names.index("kda_frost"))  # pin the FROST entry
+    g.select_plan(names.index("kda_frost"))
     g.check_support()
     g.build_plans()
 
@@ -58,7 +58,7 @@ def _reference(q, k, v, g, beta, cu, scale):
             residual = v[t] - torch.einsum("hd,hdv->hv", k[t], S)
             S = S + beta[t][:, None, None] * torch.einsum("hd,hv->hdv", k[t], residual)
             o[t] = torch.einsum("hd,hdv->hv", q[t] * scale, S)
-        fs[n] = S
+        fs[n] = S.transpose(-2, -1)
     return o, fs
 
 

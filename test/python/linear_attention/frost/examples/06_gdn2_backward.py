@@ -6,8 +6,11 @@
 The GDN2_BWD node takes the forward inputs plus ``dO`` and returns
 ``(dQ, dK, dV, dG, dBeta, dW)`` (per-key-channel ``dG``/``dBeta``, per-value
 ``dW``; ``dBeta``/``dW`` in io dtype). Without the optional per-chunk ``h``
-input the engine recomputes the forward state pass internally. Gradients are
-checked against fp64 autograd through the per-token recurrence.
+input the engine recomputes the forward state pass internally. This example
+runs the in-kernel q/k L2 norm plus the erase-side beta safeguard
+(``beta_guard``); the guard is straight-through, so the reference applies the
+projection detached (identity gradient to ``beta``, none to ``g``).
+Gradients are checked against fp64 autograd through the per-token recurrence.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ def _build_plans(g) -> None:
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(names.index("gdn2_frost"))  # pin the FROST entry
+    g.select_plan(names.index("gdn2_frost"))
     g.check_support()
     g.build_plans()
 
@@ -33,10 +36,38 @@ def _rms_ratio(out, ref):
     return ((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-12)).item()
 
 
+def _beta_guard(kn, beta, alpha, io_dtype):
+    """fp64 mirror of the kernel beta guard: kn l2-normalized, alpha = exp(g)."""
+    w = kn * kn
+    n = w.sum(-1)
+    a = (beta * w).sum(-1)
+    nu = (beta * beta * w).sum(-1)
+    r2 = (n * nu - a * a).clamp_min(0.0)
+    inv_c2 = alpha.amax(-1).pow(2)
+    c2 = 1.0 / inv_c2
+    r2_crit = ((c2 - 1.0) * (1.0 - (1.0 - a).pow(2) * inv_c2)).clamp_min(0.0)
+    unsafe = (n > 1.0e-20) & (r2 > r2_crit)
+    mu = a / n.clamp_min(1.0e-20)
+    eta = ((1.0 - 1.0 / 32) * r2_crit / r2.clamp_min(1.0e-30)).sqrt().clamp(0.0, 1.0)
+    cand = torch.where(unsafe[..., None], mu[..., None] + eta[..., None] * (beta - mu[..., None]), beta).to(io_dtype).double()
+    a_q = (cand * w).sum(-1)
+    nu_q = (cand * cand * w).sum(-1)
+    r2_q = (n * nu_q - a_q * a_q).clamp_min(0.0)
+    r2_crit_q = ((c2 - 1.0) * (1.0 - (1.0 - a_q).pow(2) * inv_c2)).clamp_min(0.0)
+    tol = 4.0 * torch.finfo(io_dtype).eps * (n * nu_q + a_q * a_q)
+    fallback = unsafe & (r2_q > r2_crit_q + tol)
+    mu_q = (a_q / n.clamp_min(1.0e-20)).to(io_dtype).double()
+    return torch.where(fallback[..., None], mu_q[..., None], cand)
+
+
 def _reference_o(q, k, v, g, beta, w, cu, scale):
-    """Differentiable fp64 per-token recurrence; returns o."""
+    """Differentiable fp64 per-token recurrence with the in-kernel L2 norm and
+    the straight-through beta guard; returns o."""
     total, H, D = q.shape
     V = v.shape[2]
+    q = torch.nn.functional.normalize(q, dim=-1)
+    k = torch.nn.functional.normalize(k, dim=-1)
+    beta = beta + (_beta_guard(k.detach(), beta.detach(), g.exp().detach(), torch.bfloat16) - beta.detach())
     outs = []
     for n in range(cu.numel() - 1):
         S = torch.zeros(H, D, V, dtype=torch.float64, device=q.device)
@@ -55,10 +86,12 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     total, num_seqs = sum(seq_lens), len(seq_lens)
     scale = 1.0 / math.sqrt(D)
 
-    q = torch.nn.functional.normalize(torch.randn(total, H, D, device=device), dim=-1).bfloat16()
-    k = torch.nn.functional.normalize(torch.randn(total, H, D, device=device), dim=-1).bfloat16()
+    q = torch.randn(total, H, D, device=device).bfloat16()
+    k = torch.randn(total, H, D, device=device).bfloat16()
     v = torch.randn(total, H, D, device=device).bfloat16()
-    gate = torch.empty(total, H, D, device=device).uniform_(0.5, 1.0).log().contiguous()
+    gate = torch.empty(total, H, D, device=device).uniform_(0.5, 1.0).log()
+    gate[::2] += math.log(0.5)
+    gate = gate.contiguous()
     beta = (torch.rand(total, H, D, device=device).sigmoid() * 2.0).bfloat16().contiguous()
     w = torch.rand(total, H, D, device=device).sigmoid().bfloat16().contiguous()
     do = torch.randn(total, H, D, device=device).bfloat16()
@@ -83,6 +116,8 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
         cu_seqlens=cu_t,
         dO=do_t,
         scale=scale,
+        use_qk_l2norm=True,
+        beta_guard=True,
         name="gdn2_bwd",
     )
     dtypes = (cudnn.data_type.BFLOAT16,) * 3 + (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.BFLOAT16)
@@ -113,7 +148,7 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     ):
         r = _rms_ratio(out, ref)
         assert r < 5e-2, f"{name} rms ratio {r:.4g}"
-    print(f"[06] PASS  gdn2 backward (recompute)   seq_lens={list(seq_lens)} H={H} D={D}")
+    print(f"[06] PASS  gdn2 backward (beta guard)  seq_lens={list(seq_lens)} H={H} D={D}")
 
 
 if __name__ == "__main__":
