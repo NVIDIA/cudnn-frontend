@@ -38,6 +38,9 @@ _SM120_ROW_ROUND = 128
 # dq_sem is sized for the smallest legal q-tile so one formula covers every
 # tile choice; must match the template's fake_dq_sem sizing.
 _SM120_MIN_Q_TILE = 32
+# (d_qk, d_v) pairs served by the deterministic two-kernel split; d64
+# measured slower than the relay (dS-workspace traffic dominates).
+_SM120_DET_2K_HEAD_DIM_PAIRS = ((128, 128), (192, 128), (256, 256))
 
 _logger = logging.getLogger(__name__)
 
@@ -159,6 +162,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.compute_capability: Optional[tuple[int, int]] = None
         self._k_mod = None
         self._sq_rounded: Optional[int] = None
+        self._skv_rounded: Optional[int] = None
         # Kernel-facing head dims per side (QK: Q/K/dQ/dK, V: V/O/dO/dV).
         # Padding by TMA zero-fill
         self.head_dim_qk_padded: Optional[int] = None
@@ -330,11 +334,38 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
+        # delta - [B, H_q, SQ_r128], dq_accum (relay path only) - [B*SQ_r128*H*D]
         self._sq_rounded = _round_up(self.s_q_max, _SM120_ROW_ROUND)
+        # ds_ws (deterministic two kernel path only) - [B, H_q, S_q, SKV_r128]
+        self._skv_rounded = _round_up(self.s_k_max, _SM120_ROW_ROUND)
+        self.det_2k = self._pick_det_2k()
         self._is_supported = True
 
         self._logger.debug("check_support completed successfully")
         return True
+
+    def _ds_ws_elems(self) -> int:
+        """io-dtype elements of the det_2kernel dS workspace, [B, H_q, S_q, S_kv_r128]."""
+
+        if not self.det_2k:
+            return 0
+        return self.batch_size * self.h_q * self.s_q_max * self._skv_rounded
+
+    def _pick_det_2k(self) -> bool:
+        """Deterministic-mode route: two-kernel dS-workspace split vs the ordered-relay dQ scatter."""
+
+        if not self.deterministic:
+            return False
+        if (self.head_dim_qk_padded, self.head_dim_v_padded) not in _SM120_DET_2K_HEAD_DIM_PAIRS:
+            return False
+        if self.window_size_left is not None or self.seq_kv_lens_present or self.seq_q_lens_present:
+            return False
+        # dq2k addresses K/dQ as compact BSHD
+        if "k" in self._io_strides or "dQ" in self._io_strides:
+            return False
+        ws_bytes = self.batch_size * self.h_q * self.s_q_max * self._skv_rounded * self.dtype.itemsize
+        total_mem = torch.cuda.get_device_properties(self.q_desc.device).total_memory
+        return ws_bytes <= total_mem
 
     def compile(self) -> None:
         """Compile the shape-specialized SM120 FROST backward template."""
@@ -357,6 +388,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             sink_present=self.sink_desc is not None,
             dsink_present=self.dsink_desc is not None,
+            det_2kernel=self.det_2k,
         )
         self._k_mod = _load_sm120_kernel_module(params)
         self._compiled_kernel = self._k_mod.compile(
@@ -415,17 +447,20 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         return seq_lens.reshape(-1)
 
     def scratch_workspace_bytes(self) -> int:
-        """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D_QK])
-        + dq_sem (int32 flat [B*H*ceil(SQ/32)], deterministic relay counters)
-        + dk_ws/dv_ws (io [B, SKV, H_q, D_QK] / [B, SKV, H_q, D_V], per-q-head
-        partials, GQA only)."""
+        """delta (fp32 [B, H, SQ_r128]) + the dQ scratch — relay path:
+        dq_accum (fp32 flat [B*SQ_r128*H*D_QK]) + dq_sem (int32 flat
+        [B*H*ceil(SQ/32)], relay counters); det_2kernel path: ds_ws (io
+        [B, H_q, SQ, SKV_r128]) — + dk_ws/dv_ws (io [B, SKV, H_q, D_QK] /
+        [B, SKV, H_q, D_V], per-q-head partials, GQA only)."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
-        dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded * 4)
-        dq_sem_bytes = ws_align(self._dq_sem_len() * 4)
+        if self.det_2k:
+            dq_scratch_bytes = ws_align(self._ds_ws_elems() * self.dtype.itemsize)
+        else:
+            dq_scratch_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded * 4) + ws_align(self._dq_sem_len() * 4)
         dkv_ws_bytes = sum(ws_align(elems * self.dtype.itemsize) for elems in self._dkv_ws_elems())
-        return delta_bytes + dq_accum_bytes + dq_sem_bytes + dkv_ws_bytes
+        return delta_bytes + dq_scratch_bytes + dkv_ws_bytes
 
     def execute(
         self,
@@ -481,8 +516,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm120")
         delta = carver.take(self.batch_size * self.h_q * self._sq_rounded, torch.float32).reshape(self.batch_size, self.h_q, self._sq_rounded)
-        dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded, torch.float32)
-        dq_sem = carver.take(self._dq_sem_len(), torch.int32)
+        dq_accum = None
+        dq_sem = None
+        ds_ws = None
+        if self.det_2k:
+            ds_ws = carver.take(self._ds_ws_elems(), self.dtype).view(self.batch_size, self.h_q, self.s_q_max, self._skv_rounded)
+        else:
+            dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded, torch.float32)
+            dq_sem = carver.take(self._dq_sem_len(), torch.int32)
 
         if current_stream is None:
             # Direct call (no dispatch-forwarded stream): fall back to torch's
@@ -533,7 +574,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 dk_ws = carver.take(dkw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_qk_padded)
                 dv_ws = carver.take(dvw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_v_padded)
 
-            # Kernel chain (dot -> main -> [reduce] -> cvt)
+            # Kernel chain: dot -> main -> [reduce] -> cvt, or on the
+            # det_2kernel route dot -> main -> dq2k -> [reduce].
             kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
             kernels.main(
                 q,
@@ -544,6 +586,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 delta,
                 dq_accum,
                 dq_sem,
+                ds_ws,
                 dk_ws,
                 dv_ws,
                 seq_q_t,
@@ -552,10 +595,13 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 cutlass.Float32(scale_val),
                 current_stream,
             )
+            if self.det_2k:
+                kernels.dq2k(k, ds_ws, dq, cutlass.Float32(scale_val), current_stream)
             # GQA only
             if kernels.reduce is not None:
                 kernels.reduce(dk_ws, dv_ws, dk, dv, current_stream)
-            kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
+            if not self.det_2k:
+                kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             if kernels.dsink is not None:
                 kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), seq_q_t, current_stream)
 

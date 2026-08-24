@@ -58,6 +58,8 @@ class TemplateParams:
     # Sink Attention
     sink_present: bool = False
     dsink_present: bool = False
+    # Deterministic two-kernel split
+    det_2kernel: bool = False
 
 
 def validate_params(params: TemplateParams) -> None:
@@ -82,6 +84,10 @@ def validate_params(params: TemplateParams) -> None:
         raise ValueError("SM120 SDPA bwd: seq_q_lens_present requires seq_kv_lens_present (padding mask)")
     if params.dsink_present and not params.sink_present:
         raise ValueError("SM120 SDPA bwd: dsink_present requires sink_present (a dSink output needs the sink logits)")
+    if params.det_2kernel and not params.deterministic:
+        raise ValueError("SM120 SDPA bwd: det_2kernel is a deterministic-mode split and requires deterministic=True")
+    if params.det_2kernel and (params.window_size_left is not None or params.seq_kv_lens_present or params.seq_q_lens_present):
+        raise ValueError("SM120 SDPA bwd: det_2kernel does not support sliding-window or padding masks (use the relay path)")
     if params.q_tile not in (0,) + SEQ_Q_TILES:
         raise ValueError(f"SM120 SDPA bwd: q_tile must be one of {(0,) + SEQ_Q_TILES} (0 = per-head-dim default); got {params.q_tile}")
     if params.kv_tile not in (0,) + SEQ_KV_TILES:

@@ -126,6 +126,29 @@ def _ref_bwd(
     return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), dsink
 
 
+def _expect_det_2k(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    deterministic: bool,
+    window_size_left: int | None,
+    padded: bool,
+    ws_bytes: int,
+) -> bool:
+    """Mirror of SdpaBwdDslSm120._pick_det_2k (two-kernel deterministic route)."""
+    from cudnn.sdpa.bwd.api_dsl import _SM120_DET_2K_HEAD_DIM_PAIRS
+    from cudnn.sdpa.bwd.config_sm120 import padded_head_dims
+
+    if not deterministic:
+        return False
+    if padded_head_dims(head_dim, head_dim_v) not in _SM120_DET_2K_HEAD_DIM_PAIRS:
+        return False
+    if window_size_left is not None or padded:
+        return False
+    # 2K whenever the full dS buffer can physically fit
+    return ws_bytes <= torch.cuda.get_device_properties(0).total_memory
+
+
 def _expected_workspace_bytes(
     batch: int,
     h_q: int,
@@ -135,6 +158,9 @@ def _expected_workspace_bytes(
     s_kv: int | None = None,
     io_itemsize: int = 2,
     head_dim_v: int | None = None,
+    deterministic: bool = False,
+    window_size_left: int | None = None,
+    padded: bool = False,
 ) -> int:
     from cudnn.sdpa.bwd.config_sm120 import padded_head_dims
     from cudnn.sdpa.fwd.api_dsl import ws_align
@@ -145,12 +171,20 @@ def _expected_workspace_bytes(
     sq_r = -(-s_q // 128) * 128
     h_kv = h_q if h_kv is None else h_kv
     s_kv_eff = s_kv if s_kv is not None else s_q
-    dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
+    skv_r = -(-s_kv_eff // 128) * 128
+    ds_ws_bytes = batch * h_q * s_q * skv_r * io_itemsize  # det_2kernel dS workspace
+    if _expect_det_2k(
+        head_dim=head_dim, head_dim_v=head_dim_v, deterministic=deterministic, window_size_left=window_size_left, padded=padded, ws_bytes=ds_ws_bytes
+    ):
+        dq_scratch = ws_align(ds_ws_bytes)
+    else:
+        dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
+        dq_scratch = ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4)
     # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
     dkv_ws = 0
     if h_kv != h_q:
         dkv_ws = ws_align(batch * s_kv_eff * h_q * d_pad * io_itemsize) + ws_align(batch * s_kv_eff * h_q * dv_pad * io_itemsize)
-    return ws_align(batch * h_q * sq_r * 4) + ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4) + dkv_ws
+    return ws_align(batch * h_q * sq_r * 4) + dq_scratch + dkv_ws
 
 
 def _run_bwd_graph(
@@ -285,6 +319,9 @@ def _run_bwd_graph(
             s_kv=k_gpu.shape[2],
             io_itemsize=q_gpu.element_size(),
             head_dim_v=head_dim_v,
+            deterministic=deterministic,
+            window_size_left=window_size_left,
+            padded=seq_kv_lens is not None,
         )
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
@@ -984,12 +1021,13 @@ def _run_bitwise_case(n_runs: int = 3, padding: tuple[list[int], list[int]] | No
     s_q = case_kwargs.pop("s_q", 1024)
     s_kv = case_kwargs.pop("s_kv", 1024)
     head_dim = case_kwargs.pop("head_dim", 64)
+    head_dim_v = case_kwargs.pop("head_dim_v", head_dim)
     h_kv = case_kwargs.pop("h_kv", heads)
     scale = 1.0 / math.sqrt(head_dim)
     q = _bhsd(batch, heads, s_q, head_dim, dtype)
     k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
-    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
-    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    v = _bhsd(batch, h_kv, s_kv, head_dim_v, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim_v, dtype)
     o, stats, _, _, _, _ = _ref_bwd(
         q,
         k,
@@ -1001,7 +1039,7 @@ def _run_bitwise_case(n_runs: int = 3, padding: tuple[list[int], list[int]] | No
         window_size_left=case_kwargs.get("window_size_left"),
         padding=padding,
     )
-    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    o = _bhsd(batch, heads, s_q, head_dim_v, dtype, empty=True).copy_(o)
     if padding is not None:
         case_kwargs["seq_q_lens"] = torch.tensor(padding[0], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
         case_kwargs["seq_kv_lens"] = torch.tensor(padding[1], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
@@ -1315,3 +1353,142 @@ def test_sdpa_bwd_dsl_sm120_strided_stats():
     _run_case(head_dim=128, head_dim_v=64, is_causal=True, stats_layout="strided")  # rectangular
     _run_case(head_dim=64, stats_layout="strided", padding=([512, 300], [512, 128]))  # -inf padded rows
     _run_case(head_dim=64, sink=True, stats_layout="strided", padding=([512, 300], [512, 128]))  # dSink's own LSE reads
+
+
+# ---------------------------------------------------------------------------
+# Deterministic two-kernel split (dS workspace + dQ GEMM). Auto-routed for
+# the 128/128 and 192/128 head-dim pairs; the relay tests below pin the other
+# flavor by patching the route pick.
+# ---------------------------------------------------------------------------
+
+
+def _force_relay(monkeypatch):
+    """Pin the relay route on two-kernel-eligible shapes (adapter + the
+    workspace mirror above)."""
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+    monkeypatch.setattr(SdpaBwdDslSm120, "_pick_det_2k", lambda self: False)
+    monkeypatch.setitem(globals(), "_expect_det_2k", lambda **kw: False)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal", "causal_br"])
+@torch_fork_set_rng(seed=30)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_numeric(mask: str):
+    """Two-kernel deterministic route: numeric parity per mask."""
+
+    _run_case(
+        s_q=384 if mask == "causal_br" else 512,
+        s_kv=1024 if mask == "causal_br" else 512,
+        head_dim=128,
+        is_causal=mask != "dense",
+        causal_bottom_right=mask == "causal_br",
+        deterministic=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=31)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_tails():
+    """Non-tile-multiple S_q/S_kv: padded ws kv columns carry masked zeros,
+    rows past S_q are TMA zero-fill."""
+
+    _run_case(s_q=1000, s_kv=999, head_dim=128, is_causal=True, deterministic=True)
+    _run_case(s_q=193, s_kv=161, head_dim=128, is_causal=True, deterministic=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=32)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_right_band():
+    """Causal right-band widening (the dQ GEMM's kv bound follows the
+    widened diagonal)."""
+
+    _run_case(s_q=256, s_kv=256, head_dim=128, is_causal=True, window_size_right=32, deterministic=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(("mask", "h_kv"), [("dense", 2), ("causal", 1)], ids=["dense_gqa2", "causal_mqa"])
+@torch_fork_set_rng(seed=33)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_gqa(mask: str, h_kv: int):
+    """GQA/MQA: dQ GEMM reads the shared KV head; dK/dV keep the
+    fixed-order group reduce."""
+
+    _run_case(h_kv=h_kv, head_dim=128, is_causal=mask != "dense", deterministic=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=35)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_sink():
+    """Sink token: dS is sink-agnostic; dSink keeps its fixed-order reduce."""
+
+    _run_case(s_q=256, s_kv=256, head_dim=128, sink=True, deterministic=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@torch_fork_set_rng(seed=36)
+def test_sdpa_bwd_dsl_sm120_det_relay(mask: str, monkeypatch):
+    """Relay route pinned on a two-kernel-eligible d128 shape: numeric +
+    bitwise (d64 always routes the relay and is covered by the
+    deterministic tests above)."""
+
+    _force_relay(monkeypatch)
+    _run_case(head_dim=128, is_causal=mask != "dense", deterministic=True)
+    _run_bitwise_case(head_dim=128, is_causal=mask != "dense")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+def test_sdpa_bwd_dsl_sm120_det_relay_features():
+    """Sliding-window and padding masks stay deterministic on the relay
+    (the split serves dense/causal only)."""
+
+    _run_case(head_dim=128, is_causal=True, window_size_left=127, deterministic=True)
+    _run_case(head_dim=64, is_causal=True, padding=([500, 300], [400, 128]), deterministic=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=38)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_mla():
+    """MLA 192/128 (the dQ GEMM only touches the QK side): numeric via the
+    direct wrapper (D>128 has no graph surface), with tails in the second
+    case."""
+
+    _require_dsl()
+    tol = _tolerances(torch.float16)
+    for s_q, s_kv in ((512, 512), (257, 193)):
+        runs, (dq_ref, dk_ref, dv_ref) = _run_wrapper_det_case(192, head_dim_v=128, s_q=s_q, s_kv=s_kv, is_causal=True, window_size_left=None)
+        out = runs[0]
+        torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+        torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+        torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=39)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_mla_bitwise():
+    """Repeated MLA (192/128) runs are bitwise identical."""
+
+    _require_dsl()
+    runs, _ = _run_wrapper_det_case(192, head_dim_v=128, s_q=1024, s_kv=1024, is_causal=True, window_size_left=None, n_runs=3)
+    for run_i, out in enumerate(runs[1:], start=1):
+        for grad in ("dq_tensor", "dk_tensor", "dv_tensor"):
+            assert torch.equal(out[grad], runs[0][grad]), f"run {run_i}: {grad} is not bitwise reproducible (det_2kernel MLA)"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=40)
+def test_sdpa_bwd_dsl_sm120_det_2kernel_d256():
+    """256/256 (auto pair): numeric with tails + bitwise via the wrapper."""
+
+    _require_dsl()
+    tol = _tolerances(torch.float16)
+    for s_q, s_kv in ((512, 512), (257, 193)):
+        runs, (dq_ref, dk_ref, dv_ref) = _run_wrapper_det_case(256, head_dim_v=256, s_q=s_q, s_kv=s_kv, is_causal=True, window_size_left=None, n_runs=3)
+        out = runs[0]
+        torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+        torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+        torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+        for run_i, o2 in enumerate(runs[1:], start=1):
+            for grad in ("dq_tensor", "dk_tensor", "dv_tensor"):
+                assert torch.equal(o2[grad], runs[0][grad]), f"run {run_i}: {grad} is not bitwise reproducible (det_2kernel d256)"
