@@ -685,6 +685,8 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     bool const use_padding_mask,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+                    py::object const& max_total_seq_len_q,
+                    py::object const& max_total_seq_len_kv,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
     auto attributes =
@@ -705,6 +707,14 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     }
     if (cu_seq_len_kv) {
         attributes.set_cu_seq_len_kv(cu_seq_len_kv);
+    }
+
+    if (!max_total_seq_len_q.is_none()) {
+        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+    }
+
+    if (!max_total_seq_len_kv.is_none()) {
+        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
     }
 
     // Handle causal mask settings
@@ -1405,6 +1415,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("use_padding_mask", false),
           py::arg_v("seq_len_q", nullptr),
           py::arg_v("seq_len_kv", nullptr),
+          py::arg_v("max_total_seq_len_q", py::none()),
+          py::arg_v("max_total_seq_len_kv", py::none()),
           py::arg_v("cu_seq_len_q", nullptr),
           py::arg_v("cu_seq_len_kv", nullptr),
           R"pbdoc(

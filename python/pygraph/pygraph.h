@@ -566,6 +566,8 @@ class PyGraph {
                bool const use_padding_mask,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+               py::object const& max_total_seq_len_q,
+               py::object const& max_total_seq_len_kv,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
 
