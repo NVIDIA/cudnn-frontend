@@ -74,9 +74,13 @@ jobs:
                     projectItems(first: 1) { totalCount }
                   }
                 }
-              }' --jq '.data.repository.pullRequest.projectItems.totalCount')
-            if [ "${project_count}" -gt 0 ] 2> /dev/null; then
+              }' --jq '.data.repository.pullRequest.projectItems.totalCount' \
+              2> gh_stderr.txt) || project_count=""
+            if [ -n "${project_count}" ] && [ "${project_count}" -gt 0 ] 2> /dev/null; then
               echo "PR is on ${project_count} project board(s)."
+            elif [ -z "${project_count}" ]; then
+              echo "::error::Could not query the Projects field. Is the PROJECT_READ_TOKEN secret a valid PAT with read access to organization projects? API said: $(tr '\n' ' ' < gh_stderr.txt)"
+              failed=1
             else
               echo "::error::This PR is not on any Project board."
               failed=1
