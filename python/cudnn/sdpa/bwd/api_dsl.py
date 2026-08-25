@@ -511,6 +511,64 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         )
         return seq_lens.reshape(-1)
 
+    def _checked_bias_view(self, tensor: torch.Tensor, desc: TensorDesc, name: str) -> torch.Tensor:
+        """Validate a bias/dBias buffer and return the declared (1|B, H_q, S_q, S_kv) view."""
+        shape = tuple(int(x) for x in desc.shape)
+        self._value_error_if(
+            tensor.dtype != desc.dtype,
+            f"{name} must be {desc.dtype} (as declared at build); got {tensor.dtype}",
+        )
+        self._value_error_if(
+            tensor.numel() != math.prod(shape),
+            f"{name} must have {math.prod(shape)} elements {shape}; got {tensor.numel()}",
+        )
+        self._value_error_if(
+            not tensor.is_contiguous(),
+            f"{name} must be contiguous (the kernel accesses it as the declared {shape} view)",
+        )
+        return tensor.view(shape)
+
+    def _checked_sinks_1d(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        """Validate a sink/dSink buffer and return the kernel's (H_q,) fp32 view."""
+        self._value_error_if(
+            tensor.dtype != torch.float32,
+            f"{name} must be float32; got {tensor.dtype}",
+        )
+        self._value_error_if(
+            tensor.numel() != self.h_q,
+            f"{name} must have H_q = {self.h_q} elements; got {tensor.numel()}",
+        )
+        self._value_error_if(
+            not tensor.is_contiguous(),
+            f"{name} must be contiguous (bound to the kernel as a flat (H_q,) view)",
+        )
+        return tensor.view(-1)
+
+    def _checked_lse_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Validate the Stats buffer and return the kernel's (B, H_q, S_q) LSE view."""
+        shape = (self.batch_size, self.h_q, self.s_q_max)
+        self._value_error_if(
+            tensor.dtype != torch.float32,
+            f"stats_tensor must be float32; got {tensor.dtype}",
+        )
+        self._value_error_if(
+            tensor.numel() != math.prod(shape),
+            f"stats_tensor must have B*H_q*S_q = {math.prod(shape)} elements; got {tensor.numel()}",
+        )
+        if self._lse_strides is None:
+            self._value_error_if(
+                not tensor.is_contiguous(),
+                "stats_tensor must be contiguous (the kernel was compiled for a contiguous LSE layout)",
+            )
+            return tensor.view(shape)
+        try:
+            return tensor.as_strided(shape, self._lse_strides, tensor.storage_offset())
+        except RuntimeError as exc:
+            raise ValueError(
+                f"stats_tensor backing storage is too small for declared shape {shape}, stride {self._lse_strides}, "
+                f"and storage_offset {tensor.storage_offset()}"
+            ) from exc
+
     def scratch_workspace_bytes(self) -> int:
         """delta (fp32 [B, H, SQ_r128]) + the dQ scratch — relay path:
         dq_accum (fp32 flat [B*SQ_r128*H*D_QK]) + dq_sem (int32 flat
@@ -647,10 +705,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             dq = _native_view(dq_tensor.transpose(1, 2), "dQ")
             dk = _native_view(dk_tensor.transpose(1, 2), "dK")
             dv = _native_view(dv_tensor.transpose(1, 2), "dV")
-            if self._lse_strides is not None:
-                lse = stats_tensor.squeeze(-1)
-            else:
-                lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
+            lse = self._checked_lse_view(stats_tensor)
 
             kernels = self._compiled_kernel
             # dK/dV destinations for the main kernel: MHA writes the user
@@ -663,19 +718,19 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 dv_ws = carver.take(dvw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, self.head_dim_v_padded)
 
             bias_view = None
+            dbias_view = None
             dbias_dst = None
             if self.bias_desc is not None:
-                bias_shape = tuple(int(x) for x in self.bias_desc.shape)
-                bias_view = bias_tensor.reshape(bias_shape)
+                bias_view = self._checked_bias_view(bias_tensor, self.bias_desc, "bias_tensor")
             if self.dbias_desc is not None:
-                dbias_shape = tuple(int(x) for x in self.dbias_desc.shape)
+                dbias_view = self._checked_bias_view(dbias_tensor, self.dbias_desc, "dbias_tensor")
                 if dbias_accum is None:
                     # fp32 output: the kernel red.adds into it directly.
-                    dbias_tensor.zero_()
-                    dbias_dst = dbias_tensor.reshape(dbias_shape)
+                    dbias_view.zero_()
+                    dbias_dst = dbias_view
                 else:
                     dbias_accum.zero_()
-                    dbias_dst = dbias_accum.view(dbias_shape)
+                    dbias_dst = dbias_accum.view(dbias_view.shape)
 
             # Kernel chain: dot -> main -> [reduce] -> cvt -> [dbias_cvt], or on
             # the det_2kernel route dot -> main -> dq2k -> [reduce] -> [dbias_cvt].
@@ -708,9 +763,11 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             if not self.det_2k:
                 kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             if kernels.dbias_cvt is not None:
-                kernels.dbias_cvt(dbias_accum, dbias_tensor.reshape(-1), current_stream)
+                kernels.dbias_cvt(dbias_accum, dbias_view.view(-1), current_stream)
             if kernels.dsink is not None:
-                kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), seq_q_t, current_stream)
+                sink_1d = self._checked_sinks_1d(sink_tensor, "sink_tensor")
+                dsink_1d = self._checked_sinks_1d(dsink_tensor, "dsink_tensor")
+                kernels.dsink(lse, delta, sink_1d, dsink_1d, seq_q_t, current_stream)
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
