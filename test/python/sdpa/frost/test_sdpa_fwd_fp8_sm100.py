@@ -19,6 +19,7 @@ Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (fp8 SDPA). Skips otherw
 """
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -44,6 +45,27 @@ _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
 _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
+
+
+class _ReferenceWithStats(NamedTuple):
+    output: torch.Tensor
+    stats: torch.Tensor
+
+
+class _RunResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+
+
+class _RunWithStatsResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+    stats: torch.Tensor
+    reference_stats: torch.Tensor
 
 
 def _quant(x, in_key):
@@ -79,14 +101,14 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         probs = torch.softmax(ext, dim=-1)
         o = torch.matmul(probs[..., :s_kv], v_e)
         if return_stats:
-            return o, torch.logsumexp(ext, dim=-1)
+            return _ReferenceWithStats(o, torch.logsumexp(ext, dim=-1))
         return o
     row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
     probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
     o = torch.matmul(probs, v_e)
     if return_stats:
-        return o, torch.logsumexp(scores, dim=-1)
+        return _ReferenceWithStats(o, torch.logsumexp(scores, dim=-1))
     return o
 
 
@@ -110,6 +132,7 @@ def _run(
     d_qk=128,
     d_v=128,
     pack_gqa=None,
+    stats_layout="contiguous",
     return_lse=False,
 ):
     import cudnn
@@ -127,7 +150,7 @@ def _run(
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
-    lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
+    lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -167,7 +190,7 @@ def _run(
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     if stats:
-        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -204,9 +227,9 @@ def _run(
     if return_lse:
         assert stats, "return_lse requires stats=True"
         o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, return_stats=True, **ref_kw)
-        return Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.view(B, H_q, S_q), lse_ref
+        return _RunWithStatsResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
     o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
-    return Ob, o_ref, amax_o.item(), o_ref.abs().max().item()
+    return _RunResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item())
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -222,8 +245,12 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
+def _half_atol(in_key):
+    return 7e-2 if in_key == "e5m2" else 5e-2
+
+
 def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = 7e-2 if in_key == "e5m2" else 5e-2
+    atol = _half_atol(in_key)
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -243,6 +270,51 @@ _MASKS = {
     # diagonal_band_left_bound node param that the analyzer reads).
     "swa": dict(use_causal_mask=True, left_bound=65),
 }
+
+
+def _check_fp8_strided_stats(d_qk, d_v, in_key):
+    if torch.cuda.get_device_capability() == (10, 7) and d_qk != 128:
+        pytest.skip("SM107 per-tensor FP8 supports only d128")
+    kwargs = dict(
+        B=2,
+        H_q=4,
+        H_kv=2,
+        S_q=128,
+        S_kv=128,
+        in_key=in_key,
+        out_dt=torch.float16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d_qk,
+        d_v=d_v,
+        return_lse=True,
+    )
+    torch.manual_seed(59)
+    contiguous = _run(**kwargs, stats_layout="contiguous")
+    torch.manual_seed(59)
+    strided = _run(**kwargs, stats_layout="strided")
+    _check(strided.output, strided.reference, torch.float16, in_key, strided.amax, strided.reference_amax)
+    torch.testing.assert_close(strided.stats, contiguous.stats, rtol=0, atol=0)
+    torch.testing.assert_close(strided.stats, strided.reference_stats, rtol=3e-2, atol=_half_atol(in_key))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_fp8_strided_stats():
+    """The per-tensor FP8 L0 flavor preserves dense Stats strides."""
+    _check_fp8_strided_stats(128, 128, "e4m3")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("d_qk", "d_v", "in_key"),
+    [(128, 128, "e5m2"), (192, 128, "e4m3"), (192, 128, "e5m2")],
+    ids=["d128_e5m2", "d192_d128_e4m3", "d192_d128_e5m2"],
+)
+@torch_fork_set_rng(seed=59)
+def test_fp8_strided_stats_other_flavors(d_qk, d_v, in_key):
+    """The remaining per-tensor FP8 flavors preserve dense Stats strides."""
+    _check_fp8_strided_stats(d_qk, d_v, in_key)
 
 
 @pytest.mark.L0

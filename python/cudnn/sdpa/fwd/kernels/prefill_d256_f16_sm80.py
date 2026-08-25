@@ -440,26 +440,28 @@ def _sdpa_kernel(
 
     # Per-tile GMEM element offsets to (batch, q_row_base, head, 0).
     q_row_base = q_tile_idx * tile_m
-    SQ_i64 = cutlass.Int64(SQ)
     SKV_i64 = cutlass.Int64(SKV)
-    H_i64 = cutlass.Int64(H)
     H_kv_i64 = cutlass.Int64(H_kv)
     # Seq origin (in rows) absorbs both the dense batch*S term and the THD
     # cu_*[b] packed offset — the row-stride multiply is identical either way.
     q_seq_abs64 = q_seq_origin + cutlass.Int64(q_row_base)
     Q_BASE = q_seq_abs64 * Q_ROW_STRIDE_E.to(cutlass.Int64) + cutlass.Int64(head_idx) * d_runtime64
     O_BASE = q_seq_abs64 * O_ROW_STRIDE_E.to(cutlass.Int64) + cutlass.Int64(head_idx) * d_v64
-    # LSE: dense [B, H_q, SQ]; THD packed [1, H_q, T] — element-contiguous along
-    # the seq axis.  THD uses the packed seq position (cu_q[b] + q_row_base).
+    # LSE: dense [B, H_q, SQ]; THD packed [1, H_q, T]. Dense strides are
+    # compile-time layout metadata; THD remains compact.
     # None-specialized: no Stats output ⇒ view/base/pointer are compiled out
     # together with the epilogue store below.
     if cutlass.const_expr(LSE is not None):
         LSE_view = cutlass.make_array_view(LSE)
+        LSE_S_STRIDE_E = cutlass.Int64(LSE.stride[2])
         if cutlass.const_expr(THD_VARLEN):
-            T_lse_i64 = cutlass.Int64(LSE.shape[2])
-            LSE_BASE = cutlass.Int64(head_idx) * T_lse_i64 + q_seq_origin + cutlass.Int64(q_row_base)
+            LSE_BASE = cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + (q_seq_origin + cutlass.Int64(q_row_base)) * LSE_S_STRIDE_E
         else:
-            LSE_BASE = cutlass.Int64(batch_idx) * H_i64 * SQ_i64 + cutlass.Int64(head_idx) * SQ_i64 + cutlass.Int64(q_row_base)
+            LSE_BASE = (
+                cutlass.Int64(batch_idx) * cutlass.Int64(LSE.stride[0])
+                + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1])
+                + cutlass.Int64(q_row_base) * LSE_S_STRIDE_E
+            )
         lse_gmem = LSE_view.data_ptr() + LSE_BASE
 
     # K/V offsets parameterised on kv_row_base (variable in mainloop).  Uses
@@ -1413,8 +1415,8 @@ def _sdpa_kernel(
                 trim_bot = q_row_base_i32 + block_row_bot
                 lse_top = cutlass.Float32(arith.select((trim_top < eff_sq).ir_value(), lse_top.ir_value(), _ninf.ir_value()))
                 lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
-            lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top)
-            lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot)
+            lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top) * LSE_S_STRIDE_E
+            lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot) * LSE_S_STRIDE_E
 
             # Row predication for OOB Q-rows when ~is_even_mn.  All 4 lanes of a
             # threadquad share the same row → predicate is uniform within the
@@ -1691,6 +1693,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     swa_window: int = 0,
     rope_max_s: int = 0,
     n_batch_logical: int = 0,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1763,11 +1766,15 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     # LSE: dense [B, H, SQ]; THD packed [1, H, T] (shares the Q/O token
     # symbol, which is exactly what the kernel's LSE.shape[2] read needs).
     if p.has_lse:
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_b, h, _sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
+            if lse_stride is not None and not p.thd_varlen
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_b, h, _sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     else:
         fake_lse = None

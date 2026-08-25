@@ -12,7 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -169,7 +169,21 @@ def _bhsd(b, h, s, d, dtype, device="cuda"):
     return torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
 
 
-def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q=None, sink=None, pack_gqa=None, return_stats=False):
+def _run_dsl_graph(
+    q_gpu,
+    k_gpu,
+    v_gpu,
+    *,
+    scale,
+    dtype,
+    sdpa_kwargs,
+    seq_len_kv=None,
+    seq_len_q=None,
+    sink=None,
+    pack_gqa=None,
+    return_stats=False,
+    stats_layout="contiguous",
+):
     """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
     import cudnn
 
@@ -203,10 +217,9 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
     stats_gpu = None
     if return_stats:
-        stats_gpu = torch.empty(b, h_q, s_q, dtype=torch.float32, device="cuda")
-        stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-        stats.set_dim((b, h_q, s_q, 1)).set_stride((h_q * s_q, s_q, 1, 1))
-        vp[stats] = stats_gpu
+        assert stats is not None
+        stats_gpu = make_dense_stats(b, h_q, s_q, stats_layout)
+        stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
     g.build_operation_graph()
@@ -215,11 +228,49 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
+    if stats_gpu is not None:
+        vp[stats] = stats_gpu
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
     torch.cuda.synchronize()
     if return_stats:
         return o_gpu, stats_gpu
     return o_gpu
+
+
+def _check_dsl_sm100_strided_stats(d_qk, d_v):
+    _require_dsl()
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves only the per-tensor FP8 d128 forward path")
+    b, h, s = 2, 4, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h, s, d_qk, dtype)
+    k = _bhsd(b, h, s, d_qk, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+
+    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True)
+    o, strided_stats = _run_dsl_graph(
+        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True, stats_layout="strided"
+    )
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)
+    torch.testing.assert_close(strided_stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm100_strided_stats():
+    """The SM100 half L0 flavor writes permuted, gapped LSE directly."""
+    _check_dsl_sm100_strided_stats(128, 128)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(("d_qk", "d_v"), [(192, 128), (256, 256), (512, 512)], ids=["d192_d128", "d256", "d512"])
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm100_strided_stats_other_flavors(d_qk, d_v):
+    """The remaining SM100 half flavors preserve dense Stats strides."""
+    _check_dsl_sm100_strided_stats(d_qk, d_v)
 
 
 @pytest.mark.L0

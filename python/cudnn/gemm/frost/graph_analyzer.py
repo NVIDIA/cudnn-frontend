@@ -20,10 +20,10 @@ import cudnn
 _LOG = logging.getLogger(__name__)
 
 from .fusion_ir import (
+    out_major_of,
     AMajor,
     BMajor,
     BlockQuantizeSpec,
-    OutMajor,
     OutputSpec,
     Dtype,
     FusionChain,
@@ -562,27 +562,9 @@ def build_gemm_plan(graph: cudnn.pygraph):
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import jit_from_cudnn_graph
-    from .kernel_registry import preferred_strategy
-    from .tile_config import select_config
+    from .compiler import jit_from_cudnn_graph, plan_config
 
-    chain = analyze(graph)
-    tile_m = chain.matmul.M
-    if chain.moe is not None:
-        groups = chain.moe.num_groups
-        tile_m = (chain.matmul.M + groups - 1) // groups
-    from .dtypes import DTYPE_BYTES
-
-    config, cta_group = select_config(
-        tile_m,
-        chain.matmul.N,
-        chain.num_gemms,
-        K=chain.matmul.K,
-        block_scale=chain.has_block_scale,
-        b_n_major=chain.matmul.b_major == "n",
-        b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
-    )
-    config, cta_group = preferred_strategy(chain, config, cta_group)
+    config, cta_group = plan_config(analyze(graph))
     return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
 
 
@@ -622,16 +604,6 @@ def _infer_b_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> BMajor:
     if stride[-1] == 1:
         return "n"
     raise ValueError(f"B must be K-major or N-major in the inner (K,N) plane; " f"got dim={dim} stride={stride}")
-
-
-def _infer_out_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> OutMajor:
-    if not stride:
-        return "n"
-    if stride[-1] == 1:
-        return "n"
-    if stride[-2] == 1:
-        return "m"
-    raise ValueError(f"output must be N-major or M-major in the inner (M,N) plane; " f"got dim={dim} stride={stride}")
 
 
 def _resolve_out_dtype(
@@ -1242,7 +1214,7 @@ def _build_multi_moe_chain(
                 _layout["dim"] = tuple(_d_i)
             if _s_i:
                 _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, major=_infer_out_major(_d_i, _s_i), **_layout), _obj_i)
+            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
@@ -1883,7 +1855,6 @@ def _build_multi_gemm_chain(
         elif not reductions:
             raise ValueError("graph materializes no output; mark at least one tensor " "set_output(True)")
 
-    out_major: OutMajor = "n"
     if dense_entries:
         from dataclasses import replace as _spec_replace
 
@@ -1895,9 +1866,6 @@ def _build_multi_gemm_chain(
                 _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
                 if _meta_i is not None:
                     _d_i, _s_i = _meta_i.dim, _meta_i.stride
-            _major_i = _infer_out_major(_d_i, _s_i)
-            if _di == 0:
-                out_major = _major_i
             # Recorded independently — a derived tensor carries its stride long
             # before cuDNN fills its dim (only at build_operation_graph time).
             _layout = {}
@@ -1905,7 +1873,7 @@ def _build_multi_gemm_chain(
                 _layout["dim"] = tuple(_d_i)
             if _s_i:
                 _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, major=_major_i, **_layout), _obj_i)
+            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,

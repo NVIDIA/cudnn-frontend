@@ -39,7 +39,7 @@ class Cfg:
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # kv_decay_v / v-k*state / epi ops
     LOAD_GATE_BETA_WARP_ID: int = 8  # gate/beta chunk loads + TMEM lifecycle
     TMA_KV_WARP_ID: int = 9
-    MMA_WARP_ID: int = 10  # sole tcgen05 issuer: KK pairs + KS/U/KV per chunk
+    TCGEN05_MMA_WARP_ID: int = 10  # sole tcgen05 issuer: KK pairs + KS/U/KV per chunk
     EPILOGUE_WARP_ID: int = 11
 
     # --- register split ---
@@ -52,7 +52,7 @@ class Cfg:
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
 
     # --- SMEM stage counts ---
-    SMEM_SCHED_STAGES: int = 2
+    SMEM_SCHEDULER_STAGES: int = 2
     SMEM_KQ_STAGES: int = 4
     SMEM_V_STAGES: int = 2
     SMEM_T_INV_STAGES: int = 3

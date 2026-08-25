@@ -136,7 +136,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     required_out = (["dQ", "dK", "dV", "dG", "dBeta"] + (["dW"] if op == "GDN2" else [])) if is_bwd else ["O"]
 
     safe_gate = bool(params.get("safe_gate", False))
-    ckpt = int(params.get("checkpoint_every_n_tokens", 0) or 0)
+    checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -158,11 +158,11 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "d_a_log/d_dt_bias dims must match a_log/dt_bias"
     elif params.get("gate_lower_bound") is not None and not safe_gate:
         invalid = "gate_lower_bound requires safe_gate=True"
-    elif ckpt < 0:
+    elif checkpoint < 0:
         invalid = "checkpoint_every_n_tokens must be non-negative"
-    elif not is_bwd and ckpt > 0 and "state_checkpoints" not in outs:
+    elif not is_bwd and checkpoint > 0 and "state_checkpoints" not in outs:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
-    elif not is_bwd and ckpt == 0 and "state_checkpoints" in outs:
+    elif not is_bwd and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
     if invalid is not None:
         return LaGraphFacts(invalid=invalid, op=op, is_bwd=is_bwd)
@@ -181,10 +181,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     total_t = int(q.dim[0]) if thd_layout else 0
     cu = ins["cu_seqlens"]
     n_seq = int(cu.dim[0]) - 1 if cu.dim else 0
-    ckpt_port = ins.get("state_checkpoints")
-    if ckpt_port is None:
-        ckpt_port = outs.get("state_checkpoints")
-    state_checkpoint_rows = int(ckpt_port.dim[0]) if ckpt_port is not None and ckpt_port.dim else 0
+    checkpoint_port = ins.get("state_checkpoints")
+    if checkpoint_port is None:
+        checkpoint_port = outs.get("state_checkpoints")
+    state_checkpoint_rows = int(checkpoint_port.dim[0]) if checkpoint_port is not None and checkpoint_port.dim else 0
     gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
     io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
     state_dtypes = {in_dt.get("initial_state"), out_dt.get("final_state")} - {None}
@@ -237,6 +237,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         safe_gate=safe_gate,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
-        checkpoint_every_n_tokens=ckpt,
+        checkpoint_every_n_tokens=checkpoint,
         batch_invariant=bool(params.get("batch_invariant", False)),
     )

@@ -53,7 +53,6 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
-from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
@@ -192,7 +191,6 @@ def _kernel(
     # @@INJECT_AB_DESC_LISTS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_TMA_C_LISTS@@
-    tma_c_desc = tma_c_descs[0]
     # @@TMA_STORE_ONLY:END@@
 
     mma_warp_id = 4
@@ -264,7 +262,8 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_sfb_descs[_j].get_ptr())
 
         # @@TMA_STORE_ONLY:BEGIN@@
-        nvvm.prefetch_tensormap(tma_c_desc.get_ptr())
+        for _ci in cutlass.range_constexpr(n_tma_outputs):
+            nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
         # @@TMA_STORE_ONLY:END@@
 
     init_raw_m = bidx >> _preferred_cluster_m_shift
@@ -362,7 +361,9 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    epi_subtile_elems = epi_tile_mn[0] * epi_tile_mn[1]
+    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
+    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
+    epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
         epi_subtile_elems * EPI_SMEM_STAGES,
@@ -431,8 +432,7 @@ def _kernel(
 
     # @@INJECT_TAP_PTRS@@
 
-    VEC_BYTES = vec_bytes_epi
-    vsize = (VEC_BYTES * 8) // cd_dtype.width
+    vsize = epi_chunk_elems
 
     M = m
     N = n
@@ -1333,16 +1333,15 @@ def _kernel(
                         subtile_w = epi_n
                     else:
                         subtile_col_offset, subtile_w = epi_spans[subtile_idx]
-                    if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
-                        c_rmem_vecs = []
-                        for g in cutlass.range_constexpr(num_gemms):
-                            subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
-                            tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
-                            _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
-                            c_rmem_vecs.append(_cv)
-                        c_rmem_vec = c_rmem_vecs[0]
+                    c_rmem_vecs = []
+                    for g in cutlass.range_constexpr(num_gemms):
+                        subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
+                        tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
+                        _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                        c_rmem_vecs.append(_cv)
+                    c_rmem_vec = c_rmem_vecs[0]
 
-                    if cutlass.const_expr(((not use_acc_overlap) or cd_out_is_m_major) and not (use_tma_store_epi and cd_out_is_m_major)):
+                    if cutlass.const_expr(not use_acc_overlap):
                         if cutlass.const_expr(mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1):
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1353,7 +1352,7 @@ def _kernel(
                                     relaxed=True,
                                 )
 
-                    if use_acc_overlap and (not cd_out_is_m_major) and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1:
+                    if use_acc_overlap and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
@@ -1366,81 +1365,13 @@ def _kernel(
                     col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
-                    epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                    smem_subtile_ptr = smem_d_ptr.subview(epi_stage_idx * epi_subtile_elems)
-                    smem_thr_ptr = smem_subtile_ptr.subview(tidx * subtile_w)
+                    vec_f32 = c_rmem_vec
+                    col_j = col
+                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
-                    if cutlass.const_expr(cd_out_is_m_major):
-                        ld_col = mi_col_base + subtile_col_offset
-                        for _h in cutlass.range(2, unroll_full=True):
-                            ld_row = base_row_id + warp_idx * 32 + _h * 16
-                            ld_addr = (ld_row << 16) | ld_col
-                            ld_tmem = cutlass.inttoptr(ld_addr, 6, mma_c_dtype)
-                            _lv = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_16X256B, ld_tmem, num=epi_n // 8)
-                            vec_f32 = _lv
-                            col_j = col
-                            linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                    # @@INJECT_EPILOGUE@@
 
-                            # @@INJECT_EPILOGUE@@
-
-                            _i32 = vec_out.bitcast(cutlass.Int32)
-                            for _blk in cutlass.range_constexpr(epi_n // 16):
-                                _regs = [_i32[_blk * 4 + _j] for _j in range(4)]
-                                _n_full = (lane % 8) + 8 * (lane // 16) + 16 * _blk
-                                _m_base = warp_idx * 32 + _h * 16 + 8 * ((lane // 8) % 2)
-                                _stm_off = (
-                                    (_m_base // cd_mmajor_atom_m) * (cd_mmajor_atom_m * epi_tile_mn[1])
-                                    + (_m_base % cd_mmajor_atom_m)
-                                    + _n_full * cd_mmajor_atom_m
-                                )
-                                nvvm.stmatrix(
-                                    _apply_smem_swizzle(
-                                        smem_subtile_ptr.data_ptr() + _stm_off,
-                                        cutlass.Swizzle(3, 4, 3),
-                                    ),
-                                    _regs,
-                                    nvvm.MMALayout.COL,
-                                    shape=nvvm.StoreShape.M8N8,
-                                )
-                    else:
-                        vec_f32 = c_rmem_vec
-                        col_j = col
-                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
-
-                        # @@INJECT_EPILOGUE@@
-
-                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=epi_smem_swizzle)
-
-                    cute.arch.fence_view_async_shared()
-                    nvvm.barrier_cta_sync(
-                        barrier_id=EPI_SYNC_BAR_ID,
-                        thread_count=num_epilogue_warps * 32,
-                    )
-
-                    if warp_idx == 0:
-                        if cutlass.const_expr(cd_out_is_m_major):
-                            for _mb in cutlass.range_constexpr(epi_tile_mn[0] // cd_mmajor_atom_m):
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_global_shared_cta(
-                                        tma_c_desc.get_ptr(),
-                                        smem_subtile_ptr.subview(_mb * (cd_mmajor_atom_m * epi_tile_mn[1])),
-                                        (coord_m + _mb * cd_mmajor_atom_m, col, tile_l),
-                                    )
-                        else:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_global_shared_cta(
-                                    tma_c_desc.get_ptr(),
-                                    smem_subtile_ptr,
-                                    (col, coord_m, tile_l),
-                                )
-                        if elect_one:
-                            nvvm.cp_async_bulk_commit_group()
-                        nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
-
-                    nvvm.barrier_cta_sync(
-                        barrier_id=EPI_SYNC_BAR_ID,
-                        thread_count=num_epilogue_warps * 32,
-                    )
+                    # @@INJECT_TMA_STORE_SEQUENCE@@
                     # @@TMA_STORE_ONLY:END@@
 
                     # @@STG_ONLY:BEGIN@@
@@ -1454,14 +1385,6 @@ def _kernel(
 
                                 # @@INJECT_EPILOGUE@@
                     # @@STG_ONLY:END@@
-
-            # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
-            if cutlass.const_expr(use_tma_store_epi and cd_out_is_m_major):
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                if elect_one:
-                    mbar_pair_ptr = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)
-                    nvvm.mbarrier_arrive(mbar_pair_ptr, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
             # @@EPILOGUE_DRAIN:END@@
             consumer_stage = tile_iter % CLC_SCHED_STAGES
@@ -1631,32 +1554,7 @@ def _host(
         )
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_LISTS@@
-    c = _tma_c_outputs[0]
-    if cutlass.const_expr(cd_out_is_m_major):
-        tma_c_desc = _tma.create_tensor_map_tiled(
-            global_address=c.iterator.toint(),
-            dtype=cd_tma_dtype,
-            global_dims=[m, n, batch],
-            global_strides=[
-                out_stride_n_0 * cd_dtype.width // 128,
-                out_stride_l_0 * cd_dtype.width // 128,
-            ],
-            box_dims=[cd_mmajor_atom_m, epi_tile_mn[1], 1],
-            swizzle=(_tma.TensorMapSwizzle.s128b if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
-        )
-    else:
-        tma_c_desc = _tma.create_tensor_map_tiled(
-            global_address=c.iterator.toint(),
-            dtype=cd_tma_dtype,
-            global_dims=[n, m, batch],
-            global_strides=[
-                out_stride_m_0 * cd_dtype.width // 128,
-                out_stride_l_0 * cd_dtype.width // 128,
-            ],
-            box_dims=[epi_tile_mn[1], epi_tile_mn[0], 1],
-            swizzle=(epi_tma_swizzle if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
-        )
-    tma_c_desc_list = [tma_c_desc]
+    # @@INJECT_HOST_TMA_C_DESCS@@
     # @@TMA_STORE_ONLY:END@@
 
     cluster_m = cluster_shape_mnk[0]
@@ -1760,11 +1658,11 @@ def compile() -> Callable:
         )
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    def _make_fake_c():
+    def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
-            cd_dtype,
-            (sym_m, sym_n // cd_fake_n_div, sym_l),
-            stride_order=(0, 1, 2) if cd_out_is_m_major else (1, 0, 2),
+            _dt,
+            (sym_m, sym_n // _div, sym_l),
+            stride_order=(0, 1, 2) if _mm else (1, 0, 2),
             assumed_align=16,
         )
 

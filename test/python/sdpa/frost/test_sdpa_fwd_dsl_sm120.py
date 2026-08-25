@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, _dsl_installed
 
 
 def _is_sm120() -> bool:
@@ -169,6 +169,7 @@ def _run_case(
     with_sink: bool = False,
     check_stats: bool = False,
     pack_gqa: bool | None = None,
+    stats_layout: str = "contiguous",
 ) -> None:
     q = _bhsd(batch, h_q, s_q, head_dim, dtype)
     k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
@@ -193,6 +194,7 @@ def _run_case(
         pack_gqa=pack_gqa,
         scale=scale,
         return_stats=check_stats,
+        stats_layout=stats_layout,
         **mask_kwargs,
     )
     if check_stats:
@@ -244,6 +246,7 @@ def _run_dsl_graph(
     kv_tile: int | None = None,
     pack_gqa: bool | None = None,
     return_stats: bool = False,
+    stats_layout: str = "contiguous",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
 
@@ -311,7 +314,7 @@ def _run_dsl_graph(
     stats_gpu = None
     if return_stats:
         assert stats is not None
-        stats_gpu = torch.empty(batch, heads, sequence, 1, dtype=torch.float32, device="cuda")
+        stats_gpu = make_dense_stats(batch, heads, sequence, stats_layout)
         stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride())
         stats.set_data_type(cudnn.data_type.FLOAT)
         variant_pack[stats] = stats_gpu
@@ -690,6 +693,25 @@ def test_dsl_sm120_stats(mask_kwargs):
     """generate_stats=True: the Stats output matches the natural-log LSE."""
 
     _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, **mask_kwargs)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm120_strided_stats():
+    """Dense LSE is written directly through a permuted, gapped layout."""
+
+    _require_dsl()
+    batch, h_q, h_kv, sequence, head_dim = 2, 4, 2, 128, 128
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, h_q, sequence, head_dim, torch.float16)
+    k = _bhsd(batch, h_kv, sequence, head_dim, torch.float16)
+    v = _bhsd(batch, h_kv, sequence, head_dim, torch.float16)
+    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    output, strided_stats = _run_dsl_graph(q, k, v, scale=scale, is_causal=True, return_stats=True, stats_layout="strided")
+    expected, expected_stats = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)
+    torch.testing.assert_close(strided_stats.squeeze(-1), expected_stats, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(output.float(), expected, atol=0.1, rtol=5e-2)
 
 
 @pytest.mark.L0

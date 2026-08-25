@@ -152,6 +152,22 @@ ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
 )
 
 
+def out_major_of(stride: "tuple[int, ...] | None") -> "OutMajor":
+    """A dense output's layout, read off its STRIDE alone.
+
+    Not off `dim`: cuDNN fills a derived tensor's extents only at
+    `build_operation_graph()` time, while its stride is there from the start, so
+    the extents are not available to disambiguate a degenerate N == 1. An unset
+    stride is the default layout."""
+    if not stride:
+        return "n"
+    if stride[-1] == 1:
+        return "n"
+    if stride[-2] == 1:
+        return "m"
+    raise ValueError(f"output must be N-major or M-major in the inner (M,N) plane; got stride={stride!r}")
+
+
 @dataclass(frozen=True)
 class ChainOutput:
     """One materialized GMEM output. ``source`` = where the value is taken from:
@@ -162,10 +178,15 @@ class ChainOutput:
     source: str
     dtype: Dtype
     dim: "tuple[int, int, int] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    stride: "tuple[int, int, int] | None" = None
     is_reduction: bool = False
     is_quant_scale: bool = False
     quant_block_size: int | None = None
+
+    @property
+    def major(self) -> "OutMajor":
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -180,18 +201,22 @@ class OutputSpec:
 
     source_ref: int
     dtype: Dtype
-    major: OutMajor = "n"
     quant_idx: int | None = None
-    dim: "tuple[int, ...] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    dim: "tuple[int, int, int] | None" = None
+    stride: "tuple[int, int, int] | None" = None
 
     def __post_init__(self) -> None:
+        for _f, _v in (("dim", self.dim), ("stride", self.stride)):
+            if _v is not None and len(_v) != 3:
+                raise ValueError(f"output {_f} must be rank-3 (got {_v!r})")
         if self.dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported output dtype {self.dtype!r}")
-        if self.major not in ("n", "m"):
-            raise ValueError(f"output major must be 'n' or 'm' (got {self.major!r})")
-        if self.quant_idx is not None and self.dtype not in ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1"):
-            raise ValueError(f"block quantize output dtype {self.dtype!r} is not supported; " "expected fp8_e4m3, fp8_e5m2, or fp4_e2m1")
+        self.major  # noqa: B018 -- reject an unsupported layout at construction
+
+    @property
+    def major(self) -> OutMajor:
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -220,6 +245,16 @@ class ReductionSpec:
             raise ValueError(f"reduction compute_dtype {self.compute_dtype!r} is not supported; " f"expected one of {REDUCTION_DTYPES}")
         if self.dtype != self.compute_dtype:
             raise ValueError(f"reduction output dtype {self.dtype!r} must match compute_dtype " f"{self.compute_dtype!r} for direct atomic reduction")
+
+
+# What a block_scale_quantize may emit as DATA. The SCALE half has its own set on
+# `BlockQuantizeSpec.scale_dtype` -- ue5m3 lives there, not here: it is a scale
+# format, carried end to end as an opaque byte.
+QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
+
+# A sub-byte dtype packs two adjacent M rows into one byte, and those rows are
+# held by different lanes -- a read-modify-write race, not an implementation gap.
+M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
 @dataclass(frozen=True)
@@ -660,6 +695,9 @@ class FusionChain:
                     raise ValueError(f"quants[{qi}] source GEMM {g} out of range for " f"{self.num_gemms} GEMM(s)")
             elif not (0 <= q.source_ref < len(self.ops)):
                 raise ValueError(f"quants[{qi}] source op index {q.source_ref} out of range " f"for {len(self.ops)} op(s)")
+        for i, spec in enumerate(self.output_specs):
+            if spec.major == "m" and spec.dtype not in M_MAJOR_OUT_DTYPES:
+                raise ValueError(f"output_specs[{i}] is M-major, so its dtype must be one of " f"{M_MAJOR_OUT_DTYPES}; got {spec.dtype!r}.")
         quant_refs = []
         for i, spec in enumerate(self.output_specs):
             if spec.quant_idx is None:
@@ -670,6 +708,13 @@ class FusionChain:
                 raise ValueError(
                     f"output_specs[{i}] source ref {spec.source_ref} does not match "
                     f"quants[{spec.quant_idx}] source ref {self.quants[spec.quant_idx].source_ref}"
+                )
+            if spec.dtype not in QUANT_DATA_DTYPES:
+                raise ValueError(
+                    f"output_specs[{i}] carries quants[{spec.quant_idx}], so its value is that "
+                    f"node's quantized DATA and its dtype must be one of {QUANT_DATA_DTYPES}; got "
+                    f"{spec.dtype!r}. The SCALE half is a separate output and its dtype is "
+                    f"`BlockQuantizeSpec.scale_dtype`."
                 )
             quant_refs.append(spec.quant_idx)
         if sorted(quant_refs) != list(range(len(self.quants))):

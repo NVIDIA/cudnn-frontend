@@ -32,9 +32,7 @@ from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2
-
-from .elementwise import lane_group_sum, sigmoid, softplus
+from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2, lane_group_sum, sigmoid, sigmoid2, softplus
 
 GATE_BWD_BLOCKS = 128  # channel-gate token stripes (partials carve = 128 * HO * 128 fp32)
 SCALAR_BLOCK_CAP = 8192  # scalar-gate stripe ceiling
@@ -108,14 +106,14 @@ def scalar_gate_bwd_finish_kernel(
     pairwise and one butterfly tree across the 32 lanes — a fixed-shape
     bracketing regardless of the stripe count."""
     bid = cute.arch.block_idx()
-    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane_idx = cutlass.Int32(cute.arch.thread_idx()[0])
     h = cutlass.Int32(bid[0])
     a8 = cutlass.Array(cutlass.Float32, 8)
     d8 = cutlass.Array(cutlass.Float32, 8)
     for j in cutlass.range_constexpr(8):
         a8[j] = cutlass.Float32(0.0)
         d8[j] = cutlass.Float32(0.0)
-    s = lane
+    s = lane_idx
     while s + cutlass.Int32(224) < n_blocks:
         for j in cutlass.range_constexpr(8):
             idx = (s + cutlass.Int32(32 * j)) * h_o + h
@@ -135,7 +133,7 @@ def scalar_gate_bwd_finish_kernel(
     acc_a, acc_dt = fadd2(q0a, q0d, q1a, q1d)
     acc_a = lane_group_sum(acc_a, 32)
     acc_dt = lane_group_sum(acc_dt, 32)
-    if lane == 0:
+    if lane_idx == 0:
         mDA[h] = acc_a
         mDDt[h] = acc_dt
 
@@ -166,8 +164,8 @@ def channel_gate_bwd_partial_kernel(
     g_blk = cutlass.Int32(bid[0])
     h = cutlass.Int32(bid[1])
     wrp = tidx // cutlass.Int32(32)
-    lane = tidx % cutlass.Int32(32)
-    d0 = lane * cutlass.Int32(4)
+    lane_idx = tidx % cutlass.Int32(32)
+    d0 = lane_idx * cutlass.Int32(4)
     exp_a = cute.math.exp(mALog[h], fastmath=True)
     bias = cutlass.Array(cutlass.Float32, 4)
     for q in cutlass.range_constexpr(4):
@@ -209,8 +207,7 @@ def channel_gate_bwd_partial_kernel(
             one = cutlass.Float32(1.0)
             y_lo, y_hi = fadd2(gvv[i], gvv[j], bias[i], bias[j])
             z_lo, z_hi = fmul2(exp_a, exp_a, y_lo, y_hi)
-            sig_lo = sigmoid(z_lo)
-            sig_hi = sigmoid(z_hi)
+            sig_lo, sig_hi = sigmoid2(z_lo, z_hi)
             c_lo, c_hi = fadd2(one, one, -sig_lo, -sig_hi)
             k_lo, k_hi = fmul2(sig_lo, sig_hi, c_lo, c_hi)
             b_lo, b_hi = fmul2(dgv[i], dgv[j], lower_bound, lower_bound)
@@ -260,7 +257,7 @@ def channel_gate_bwd_finish_kernel(
     h = cutlass.Int32(bid[0])
     d = tidx
     wrp = tidx // cutlass.Int32(32)
-    lane = tidx % cutlass.Int32(32)
+    lane_idx = tidx % cutlass.Int32(32)
     a8 = cutlass.Array(cutlass.Float32, 8)
     d8 = cutlass.Array(cutlass.Float32, 8)
     for j in cutlass.range_constexpr(8):
@@ -278,7 +275,7 @@ def channel_gate_bwd_finish_kernel(
     mDDt[h, d] = col_dt
     sWa = cutlass.Array(cutlass.Float32, 4, space=cutlass.AddressSpace.smem, alignment=16)
     va = lane_group_sum(col_a, 32)
-    if lane == 0:
+    if lane_idx == 0:
         sWa[wrp] = va
     nvvm.barrier_cta_sync()
     if tidx == 0:

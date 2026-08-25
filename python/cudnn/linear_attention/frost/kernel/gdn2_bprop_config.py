@@ -44,16 +44,10 @@ class Cfg:
     EPILOGUE_WARP_ID: int = 15  # dq/dk/dv TMA stores only
 
     # --- register split ---
-    # WG1's drain runs at the register ceiling (spilled at 152) while WG0
-    # sits near ~100 live regs, so WG0 funds WG1.  Constraints: compute
-    # groups can't go below the 128-reg launch base (setmaxregister is
-    # INCREASE-only there), and warps 12-15 are one warpgroup so they must
-    # share a single setmaxregister value (56; super/epilogue peak ~R49).
-    # dht configs keep ~15 in-loop WG2 spills at 136 (152 doesn't fit).
     NUM_REGS_COMPUTE_GROUP_0: int = 128
     NUM_REGS_COMPUTE_GROUP_1: int = 184
     NUM_REGS_COMPUTE_GROUP_2: int = 136
-    NUM_REGS_OTHER: int = 64  # warpgroup-uniform; +8 donated by CG1
+    NUM_REGS_OTHER: int = 64
 
     THREADS_PER_WARP: int = 32
 

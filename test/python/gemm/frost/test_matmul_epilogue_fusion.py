@@ -12,7 +12,11 @@ Runs as a script too (forwards argv to pytest on this file).
 
 from __future__ import annotations
 
+import ast
+import inspect
+import pathlib
 import sys
+import textwrap
 from dataclasses import dataclass
 from typing import Callable
 
@@ -32,6 +36,8 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
+from cudnn.gemm.frost import compiler, epilogue_codegen
+from cudnn.gemm.frost.epilogue_codegen import generate
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
@@ -1533,6 +1539,47 @@ def test_matmul_tap_only() -> None:
     torch.testing.assert_close(c_term, torch.relu(mm).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@pytest.mark.parametrize("N,want_chunk", [(256, 32), (384, 32), (40, 8), (24, 8)])
+def test_reduction_only_chain_sizes_its_chunk_from_n(N: int, want_chunk: int) -> None:
+    """A chain whose ONLY output is a reduction has no dense store to size the
+    epilogue chunk. It used to be sized off `chain.output_dtype`, which INVENTS a
+    bf16 output when there are no specs -- so the chunk came from a tensor that
+    does not exist, capped by that tensor's memory-access width. N is the real
+    bound: the chunk walks N and nothing else constrains it.
+
+    Nothing exercised this path before; the whole suite ran with it never taken."""
+    from cudnn.gemm.frost.compiler import _epi_chunk_elems, _store_modes, _epi_vec_bytes
+    from cudnn.gemm.frost.tile_config import by_name
+
+    M, K = 128, 64
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+
+    def build():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="relu")
+        R = g.reduction(input=Y, mode=cudnn.reduction_mode.MAX, name="red")
+        R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        return g, A, B, R
+
+    g, _, _, _ = build()
+    chain = analyze(g)
+    assert not chain.output_specs and len(chain.reductions) == 1
+    assert _epi_chunk_elems(chain, cfg, 1, False) == want_chunk
+    assert _store_modes(chain, cfg, 1) == ("stg",)
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+    r = torch.zeros(1, 1, 1, device="cuda", dtype=torch.float32)
+    gg, aa, bb, rr = build()
+    compiler.jit_from_cudnn_graph(gg, config=cfg, cta_group=1)({aa: a, bb: b, rr: r})
+    torch.cuda.synchronize()
+    ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float())).max()
+    assert abs(r.item() - ref.item()) < 1e-3, (r.item(), ref.item())
+
+
 @pytest.mark.parametrize(
     "mode,ref_fn",
     (
@@ -2268,6 +2315,492 @@ if __name__ == "__main__":
 
 
 # --- full cuDNN pointwise-mode coverage (new ops, 2026-07-20) ---------------
+
+
+@pytest.mark.parametrize("mode,dims", (("per_col", [1, 1, 128]), ("per_elem", [1, 128, 128])))
+def test_coordinate_reading_aux_is_clamped_on_the_tma_arm(mode: str, dims: list[int]) -> None:
+    """The TMA arm hands the snippet a subtile base with no N or M bound, so a
+    `per_col` / `per_elem` LDG at `col_j + k` reads past the aux allocation.
+    The clamped fallback keeps every address inside both extents; the STG arm
+    already carries `col_j + vsize <= N` and must stay byte-identical."""
+    M = N = K = 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    stride = [dims[1] * dims[2], dims[2], 1]
+    x = g.tensor(name="x", dim=dims, stride=stride, data_type=cudnn.data_type.FLOAT)
+    g.mul(a=C, b=x, name="w").set_output(True)
+    chain = analyze(g)
+
+    stg = generate(chain, tma_slots=frozenset()).epilogue
+    tma = generate(chain, tma_slots=frozenset({0})).epilogue
+
+    assert "_auxv_x" not in stg, "the STG arm's own predicate already bounds the read — no fallback wanted"
+    assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in stg
+
+    assert "cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32(N) - 1)" in tma
+    assert ("cute.math.min(cutlass.Int32(row), cutlass.Int32(M) - 1)" in tma) == (mode == "per_elem")
+    # The whole-chunk load is still the fast path; the clamp is the tail only.
+    assert "if (col_j + vsize <= N)" in tma
+    assert ".load(count=vsize, alignment=ALIGN_AUX_x)" in tma
+
+
+@pytest.mark.parametrize(
+    "cfg_name,dts,want",
+    [
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", ["bf16", "bf16"], ("tma", "tma")),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", ["bf16", "fp32"], ("tma", "tma")),
+        # epi_n is 64 only on this family, and 64 fp32 columns is a 256-byte row --
+        # wider than any swizzle in the table, so the fp32 output falls back alone.
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", ["bf16", "fp32"], ("tma", "stg")),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", ["fp32", "bf16"], ("tma", "tma")),
+    ],
+)
+def test_epi_n_is_one_shared_column_count_not_a_per_output_one(cfg_name: str, dts: list[str], want: tuple) -> None:
+    """The kernel renders ONE `epi_n`, from the primary slot's dtype. What is per
+    output is the ROW BYTES (`epi_n * its own element width`) and with them the
+    swizzle -- so a second TMA output is judged against the SHARED column count,
+    not against the one its own dtype would have produced. Asking per output
+    computes a width the kernel never renders, which at the 256x256 family lets
+    an fp32 output onto a 256-byte staging row that has no swizzle."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    cur.set_output(True).set_data_type(CU[dts[0]])
+    g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU[dts[1]])
+
+    chain = analyze(g)
+    cfg = by_name(cfg_name)
+    assert _store_modes(chain, cfg, 1) == want
+
+
+@pytest.mark.parametrize(
+    "majors,want",
+    [
+        (("n", "n"), ("tma", "tma")),
+        (("n", "m"), ("tma", "tma")),
+        (("m", "m"), ("tma", "tma")),
+        (("m", "n"), ("tma", "tma")),
+    ],
+)
+def test_outputs_of_either_layout_share_one_epilogue(majors: tuple, want: tuple) -> None:
+    """Layout and store mode are independent axes: every output rides the same
+    row-per-lane fragment and differs only in how its store stages it, so one
+    epilogue serves any mix of m/n-major and any mix of tma/stg."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
+    from cudnn.gemm.frost.tile_config import by_name
+
+    M = N = K = 256
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+
+    def build():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        Y = g.gelu_approx_tanh(input=R, name="ge")
+        for t, mj in zip((R, Y), majors):
+            if mj == "m":
+                t.set_stride([M * N, 1, M])
+            t.set_output(True)
+        return g, A, B, R, Y
+
+    g, *_ = build()
+    chain = analyze(g)
+    assert _store_modes(chain, cfg, 1) == want
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        slack, outs, raws = 4096, [], []
+        for mj in majors:
+            raw = torch.full((2 * M * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+            v = raw.view(torch.bfloat16)[: M * N]
+            outs.append(v.view(1, N, M).transpose(1, 2) if mj == "m" else v.view(1, M, N))
+            raws.append((raw, raw[2 * M * N :].clone()))
+        gg, aa, bb, rr, yy = build()
+        jit_from_cudnn_graph(gg, config=cfg, cta_group=1, force_stg_epi=force_stg)({aa: a, bb: b, rr: outs[0], yy: outs[1]})
+        torch.cuda.synchronize()
+        for raw, tail in raws:
+            assert torch.equal(raw[2 * M * N :], tail), "a store ran past its output"
+        return [o.contiguous() for o in outs]
+
+    for got, ref in zip(run(False), run(True)):
+        assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+
+
+def test_both_renderers_emit_the_tma_output_COUNT_not_a_flag() -> None:
+    """`n_tma_outputs` sizes the descriptor prefetch, and on MoE also the
+    tensormap scratch and the per-CTA workspace stride. The block-scale renderer
+    used to emit `1 if use_tma_store_epi else 0` -- a FLAG -- which under-counts
+    the moment a block-scale graph puts two outputs on the surface, so the second
+    descriptor's scratch and workspace slot overlap somebody else's."""
+    import re
+
+    from cudnn.gemm.frost.compiler import (
+        _epi_vec_bytes,
+        _render_block_scale_tile_constants,
+        _render_tile_constants,
+        _tma_slots_for,
+    )
+    from cudnn.gemm.frost.tile_config import by_name
+
+    E4, E8, RE = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0, cudnn.tensor_reordering.F8_128x4
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=E4)
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=E4)
+    sfa = g.tensor(name="sfa", dim=[1, M, K // 32], stride=[M * K // 32, K // 32, 1], data_type=E8, reordering_type=RE)
+    sfb = g.tensor(name="sfb", dim=[1, K // 32, N], stride=[K * N // 32, 1, K // 32], data_type=E8, reordering_type=RE)
+    c = g.matmul(
+        A=g.block_scale_dequantize(input=A, descale=sfa, block_size=[1, 32], name="dqa"),
+        B=g.block_scale_dequantize(input=B, descale=sfb, block_size=[32, 1], name="dqb"),
+        name="mm",
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    R = g.relu(input=c, name="r")
+    R.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    g.mul(a=R, b=R, name="sq").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    chain = analyze(g)
+    assert chain.has_block_scale
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    want = len(_tma_slots_for(chain, cfg, 1))
+    assert want == 2, "this graph is meant to put BOTH outputs on the surface"
+
+    for render in (
+        _render_block_scale_tile_constants(cfg, chain, 1, use_tma_store_epi=True),
+        _render_tile_constants(cfg, chain, 1),
+    ):
+        m = re.search(r"^n_tma_outputs = (\d+)$", render, re.M)
+        assert m, "every renderer must emit n_tma_outputs"
+        assert int(m.group(1)) == want, f"emitted {m.group(1)}, real TMA slots {want}"
+
+
+def test_a_quant_output_must_carry_a_quantized_data_dtype() -> None:
+    """An output holding `quant_idx` IS that node's quantized data, so its dtype
+    has to be one the quantizer emits. The check needs BOTH halves -- the dtype
+    is on the OutputSpec, the quant node is on the chain -- so it lives in
+    `FusionChain.__post_init__` beside the other cross-references, not on either
+    piece alone. ue5m3 is deliberately absent: it is a SCALE format
+    (`BlockQuantizeSpec.scale_dtype`, validated there), carried as an opaque
+    byte, never quantized DATA."""
+    from cudnn.gemm.frost.fusion_ir import (
+        QUANT_DATA_DTYPES,
+        BlockQuantizeSpec,
+        FusionChain,
+        MatmulSpec,
+        OutputSpec,
+        gemm_source,
+    )
+
+    assert "fp8_e5m3" not in QUANT_DATA_DTYPES
+    assert "fp8_e5m3" in BlockQuantizeSpec(source_ref=gemm_source(0), block_size=32, scale_dtype="fp8_e5m3").scale_dtype
+
+    mm = MatmulSpec(M=256, N=256, K=256, batch=1, a_batch=1, b_batch=1)
+    q = BlockQuantizeSpec(source_ref=gemm_source(0), block_size=32)
+
+    def build(dtype: str) -> FusionChain:
+        return FusionChain(matmul=mm, ops=[], quants=[q], output_specs=[OutputSpec(source_ref=gemm_source(0), dtype=dtype, quant_idx=0)])
+
+    for dtype in QUANT_DATA_DTYPES:
+        build(dtype)
+    for dtype in ("bf16", "fp32", "fp8_e5m3"):
+        with pytest.raises(ValueError, match="quantized DATA"):
+            build(dtype)
+    # It is NOT a constraint on an ordinary output of the same dtype.
+    FusionChain(matmul=mm, ops=[], output_specs=[OutputSpec(source_ref=gemm_source(0), dtype="bf16")])
+
+
+@pytest.mark.parametrize(
+    "cfg_name,cta_group",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1", 1),
+    ],
+)
+@pytest.mark.parametrize("second", ["bf16", "fp32"])
+def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_group: int, second: str) -> None:
+    """The epilogue ring's per-stage size is computed in THREE places: the host
+    reserve (`_smem_d_bytes`, subtracted from the AB budget), the template's own
+    `epi_subtile_elems`, and each TMA output's typed view of a slot. They must
+    agree -- a reserve that is too small overflows the ring, one that is too large
+    silently costs an `ab_stage`.
+
+    The template's formula is READ here, not restated, so changing it fails this
+    rather than drifting."""
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.experimental.cuda.tensor_map as _tma
+    import cutlass.experimental.primitives as nvvm
+    from cudnn.gemm.frost.compiler import (
+        _EPI_SMEM_STAGES,
+        _epi_n,
+        _epi_vec_bytes,
+        _epi_stage_rows,
+        _render_tile_constants,
+        _smem_d_bytes,
+        _tma_out_dtypes,
+        _tma_slots_for,
+    )
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.tile_config import by_name
+
+    tmpl = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
+    formulas = set()
+    for f in sorted(tmpl.glob("sm*.py")):
+        got = [l.strip() for l in f.read_text().split("\n") if l.strip().startswith("epi_subtile_elems = ")]
+        assert len(got) == 1, f.name
+        formulas.add(got[0])
+    assert len(formulas) == 1, f"templates disagree on the ring slot size: {formulas}"
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    cur.set_output(True).set_data_type(CU["bf16"])
+    g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU[second])
+    chain = analyze(g)
+    cfg = by_name(cfg_name)
+
+    ns = {"cutlass": cutlass, "cute": cute, "nvvm": nvvm, "_tma": _tma, "num_epilogue_warps": 4}
+    exec(_render_tile_constants(cfg, chain, cta_group), ns)
+    exec(formulas.pop(), ns)
+    slot_bytes = ns["epi_subtile_elems"] * (ns["cd_dtype"].width // 8)
+
+    assert _EPI_SMEM_STAGES * slot_bytes + 16 == _smem_d_bytes(cfg, chain, cta_group)
+
+    epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
+    slots = _tma_slots_for(chain, cfg, cta_group)
+    for _slot, dt in _tma_out_dtypes(chain, slots):
+        view = _epi_stage_rows(cfg, cta_group) * epi_n * DTYPE_BYTES[dt]
+        assert view <= slot_bytes, f"{dt} view {view}B does not fit a {slot_bytes}B slot"
+
+
+@pytest.mark.parametrize("cfg_name,cta_group", [("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1), ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2)])
+@pytest.mark.parametrize("block_size", (16, 32))
+def test_sub_byte_output_takes_the_tma_store(cfg_name: str, cta_group: int, block_size: int) -> None:
+    """An fp4 quant DATA output rides the TMA arm. It is the one dtype whose
+    element is narrower than the carrier its descriptor is declared with, so
+    `epi_n` (LOGICAL columns) and the ring row, the box and the store coordinate
+    (all PACKED) part company -- mixing the two is what kept it on STG.
+
+    Measured 4096x4096x4096 nvfp4 out, `128x128` 1ctamma: 83.0 vs 85.5 us."""
+    from cudnn.gemm.frost.compiler import _epi_row_bytes, _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
+    from cudnn.gemm.frost.tile_config import by_name
+
+    M = K = 256
+    N = 256
+    cfg = by_name(cfg_name)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        q, sf = g.block_scale_quantize(input=Y, block_size=block_size, axis=2, name="q")
+        q.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+        sf.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        return g, A, B, q, sf
+
+    g, _, _, _, _ = build()
+    chain = analyze(g)
+    assert _store_modes(chain, cfg, cta_group) == ("tma", "stg")
+    # the packed row is half the logical column count, in bytes
+    assert _epi_row_bytes("fp4_e2m1", 32) == 16 and _epi_row_bytes("bf16", 32) == 64
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        nbytes, slack = M * (N // 2), 4096
+        raw = torch.full((nbytes + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+        data = raw[:nbytes].view(1, M, N // 2)
+        data.zero_()
+        tail = raw[nbytes:].clone()
+        scale = torch.zeros(1, M, N // block_size, device="cuda", dtype=torch.float8_e8m0fnu)
+        gg, aa, bb, qq, ss = build()
+        jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group, force_stg_epi=force_stg)({aa: a, bb: b, qq: data, ss: scale})
+        torch.cuda.synchronize()
+        assert torch.equal(raw[nbytes:], tail), "the store ran past the packed output"
+        return data.clone(), scale.view(torch.uint8).clone()
+
+    got_d, got_s = run(False)
+    ref_d, ref_s = run(True)
+    assert torch.equal(got_d, ref_d)
+    assert torch.equal(got_s, ref_s)
+
+
+def test_only_a_tma_stored_output_widens_the_ring() -> None:
+    """The ring slot spans the widest TMA-stored output's element width. An
+    output that takes STG never touches the ring, so it must not size it -- a
+    wide STG-only output beside a narrow TMA one used to double the reserve and
+    take the bytes straight out of `ab_stages`."""
+    from cudnn.gemm.frost.compiler import _epi_slot_widen, _epi_vec_bytes, _smem_d_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+
+    def build(second: str) -> FusionChain:
+        g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        cur.set_output(True).set_data_type(CU["bf16"])
+        g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU[second])
+        return analyze(g)
+
+    # epi_n = 64 here, so an fp32 output's 256-byte staging row has no swizzle
+    # and it declines the TMA arm.
+    stg = by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1")
+    chain = build("fp32")
+    assert _store_modes(chain, stg, 1) == ("tma", "stg")
+    assert _epi_slot_widen(chain, stg, 1) == 1
+    assert _smem_d_bytes(stg, chain, 1) == _smem_d_bytes(stg, build("bf16"), 1)
+
+    # ...but at epi_n = 32 the same fp32 output IS TMA-stored, and then it does.
+    tma = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    chain = build("fp32")
+    assert _store_modes(chain, tma, 1) == ("tma", "tma")
+    assert _epi_slot_widen(chain, tma, 1) == 2
+
+
+def test_more_than_one_output_can_take_the_tma_store() -> None:
+    """Every TMA-stored output walks the SAME SMEM ring -- the slot is sized for
+    the widest and each takes its own typed view -- so there is no budget to
+    spend: an output takes the surface iff it is eligible."""
+    from cudnn.gemm.frost.compiler import _epi_slot_widen, _epi_vec_bytes, _store_modes
+    from cudnn.gemm.frost.tile_config import by_name
+    from cudnn.gemm.frost.graph_analyzer import analyze as _an
+
+    CU = {"bf16": cudnn.data_type.BFLOAT16, "fp32": cudnn.data_type.FLOAT}
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=CU["bf16"], intermediate_data_type=CU["fp32"], compute_data_type=CU["fp32"])
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    cur = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    cur.set_output(True).set_data_type(CU["bf16"])
+    g.mul(a=cur, b=cur, name="sq").set_output(True).set_data_type(CU["fp32"])
+    chain = _an(g)
+
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    assert _store_modes(chain, cfg, 1) == ("tma", "tma")
+    # The ring is typed as the primary slot's dtype, so a wider companion widens
+    # the SLOT rather than adding a second ring.
+    assert _epi_slot_widen(chain, cfg, 1) == 2
+
+
+def test_every_dense_store_on_the_tma_arm_carries_the_row_bound() -> None:
+    """The TMA arm runs the epilogue body for EVERY row of the tile and clips only
+    its own store (the C descriptor's extent does that in hardware). Every other
+    store in the body has to re-apply the bound itself.
+
+    A quant tap's DATA store is the one that does not go through
+    `_emit_tap_store`, and it was missed: `generate` appends it directly for
+    `spec.quant_idx is not None`. Unguarded it writes the tile's overhang rows,
+    which on a plain matmul run past the output buffer into whatever the
+    allocator put next -- observed as ~55 % of a neighbouring SCALE buffer coming
+    back as zero, and only on the first launch in a fresh process, because a warm
+    allocator lays the buffers out differently."""
+    M, N, K = 384, 256, 256
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    q, sc = g.block_scale_quantize(input=R, block_size=32, axis=-1, name="qr")
+    q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    sc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    chain = analyze(g)
+
+    # A quant pins the chunk to its block size; slot 0 is bf16 -> 32 * 2 bytes.
+    kw = dict(vec_bytes_epi=64, output_elem_bytes=2)
+    tma = generate(chain, tma_slots=frozenset({0}), **kw).epilogue
+    stg = generate(chain, tma_slots=frozenset(), **kw).epilogue
+
+    guarded = [ln for ln in tma.splitlines() if ln.startswith("    (gC_tap_")]
+    bare = [ln for ln in tma.splitlines() if ln.startswith("(gC_tap_")]
+    assert guarded, "the TMA arm must emit its tap stores under a bound"
+    assert not bare, f"unguarded store(s) on the TMA arm: {bare}"
+    # The STG arm inherits `row < M` / `col_j + vsize <= N` from the drain, so its
+    # stores must stay bare -- a guard there would change every shipping kernel.
+    assert not [ln for ln in stg.splitlines() if ln.strip().startswith("if (row <")]
+
+
+def test_coordinate_reading_pointwise_is_not_a_store_rule() -> None:
+    """The store rule may not consult how a pointwise input reads its
+    coordinates. Every arm hands the snippet the SAME row-per-lane fragment, so
+    `row` / `col_j` are always its real coordinates; asking "does this graph read
+    coordinates" in the gate is the shape of the bug, not the fix."""
+    for fn in (compiler._output_store_mode,):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        # The prose may name these; the CODE may not.
+        body = tree.body[0].body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        src = "\n".join(ast.unparse(node) for node in body)
+        for probe in ("bcast_mode", "grouped_by_moe", "gen_index"):
+            assert probe not in src, f"{fn.__name__} consults {probe}: that is a pointwise concern"
+
+
+def test_m_major_scatter_covers_the_whole_chunk() -> None:
+    """An M-major output stores one element per chunk column through its own
+    strides. The trip count must follow the chunk -- it was once pinned at 16,
+    exact only at `epi_n == 32` and dropping half the output at the 64 the wide
+    tiles reach."""
+    from cudnn.gemm.frost.epilogue_codegen import _emit_mmajor_scatter
+
+    for vsize in (8, 16, 32, 64):
+        lines = _emit_mmajor_scatter(0, 0, "vec_out", "bf16", 1, vsize)
+        assert sum(".store(" in l for l in lines) == vsize, vsize
+
+
+def test_tma_staged_values_reach_the_store_as_vectors() -> None:
+    """`store_swizzled` picks its path by sniffing whether the value's `.shape`
+    is a tuple: a `cutlass.Vector` reports `(N,)` and gets the per-16-byte-granule
+    scatter the SMEM swizzle needs, while `cute.make_rmem_tensor(N, ...).load()`
+    is a `TensorSSA` whose `.shape` is the bare int `N` -- taken for a scalar,
+    XORed once on the row base and written CONTIGUOUSLY, so each row's tail
+    spills into the next. Every emitter that can reach the TMA arm must hand on
+    a Vector."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+
+    sites = src.count("cute.make_rmem_tensor(")
+    converted = src.count(".load().to_vector()")
+    assert sites == 4, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+        f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
+        f"then update this test."
+    )
+    assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
+    # The two block-quantize emitters were the last holdouts: their result now
+    # reaches a TMA-stored dense output, so they must convert like the rest.
+    assert src.count("_out = cute.make_rmem_tensor(") == 2
+    assert src.count("_vec = {p}_out.load().to_vector()") == 2, "the block-quantize emitters must hand on a Vector"
+
 
 _PW_M, _PW_N, _PW_K = 128, 128, 128
 

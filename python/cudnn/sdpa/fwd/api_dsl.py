@@ -538,9 +538,13 @@ class SdpaFwdDsl(APIBase):
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided LSE buffer and return the kernel's (B, H_q, S_q) view.
 
-        The kernel WRITES through the returned view, so this must be a true
-        view: a silent ``reshape`` copy of a non-contiguous buffer would
-        receive the output and be dropped, leaving the caller's LSE unwritten.
+        The logical contract is exactly ``B*H_q*S_q`` fp32 elements. Graph
+        Stats commonly arrive as a rank-4 ``(B, H_q, S_q, 1)`` view, which is
+        reinterpreted as the declared rank-3 LSE layout without copying. The
+        kernel writes through the returned view, so a silent ``reshape`` copy
+        of a non-contiguous buffer would leave the caller's Stats unwritten.
+        Dense adapters therefore record ``_lse_stride`` and rebuild that
+        declared view directly over the caller's storage.
         """
         self._value_error_if(
             dtype_name(lse_tensor) != "float32",
@@ -551,11 +555,22 @@ class SdpaFwdDsl(APIBase):
             lse_tensor.numel() != expected,
             f"lse_tensor must have B*H_q*S_q = {expected} elements; got {lse_tensor.numel()}",
         )
-        self._value_error_if(
-            not lse_tensor.is_contiguous(),
-            "lse_tensor must be contiguous (the kernel writes through this buffer)",
-        )
-        return lse_tensor.view(self.batch_size, self.h_q, self.s_q_max)
+        shape = (self.batch_size, self.h_q, self.s_q_max)
+        stride = getattr(self, "_lse_stride", None)
+        if stride is None:
+            self._value_error_if(
+                not lse_tensor.is_contiguous(),
+                "lse_tensor must be contiguous (the kernel writes through this buffer)",
+            )
+            return lse_tensor.view(shape)
+        if tuple(lse_tensor.shape) == shape and tuple(lse_tensor.stride()) == stride:
+            return lse_tensor
+        try:
+            return lse_tensor.as_strided(shape, stride, lse_tensor.storage_offset())
+        except RuntimeError as exc:
+            raise ValueError(
+                f"lse_tensor backing storage is too small for declared shape {shape}, stride {stride}, and storage_offset {lse_tensor.storage_offset()}"
+            ) from exc
 
     def _checked_sinks_1d(self, sinks: torch.Tensor) -> torch.Tensor:
         """Validate caller-provided sink logits and return the kernel's (H_q,) fp32 view.
@@ -728,6 +743,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.flavor: Optional[tuple[int, int]] = None
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
+        self._lse_stride: Optional[tuple[int, int, int]] = None
         self._k_mod = None
 
     def check_support(self) -> bool:
@@ -853,7 +869,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd_stats_head_major = head_major
                 self.thd_stats_head_stride = int(stride_h) if head_major else 0
             else:
-                self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM100 DSL")
+                self._value_error_if(
+                    not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
+                    f"LSE must use a dense-compatible B/H/S permutation or padded layout "
+                    f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
+                )
+                self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM100 DSL SDPA")
         device = self.q_desc.device
@@ -1128,6 +1149,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 sq=self.s_q_max,
                 skv=self.s_k_max,
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
+                lse_stride=None if self.split_kv > 1 else self._lse_stride,
             )
             if self._pertensor:
                 # ENVELOPE (per-tensor only): hand the kernel the ACTUAL head
@@ -1154,6 +1176,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_qk=self.head_dim_qk,
                 d_v=self.head_dim_v,
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
+                lse_stride=None if self.split_kv > 1 else self._lse_stride,
             )
         self._combine_kernel = None
         if self.split_kv > 1:
@@ -1173,6 +1196,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 dtype_o=self._combine_dtype_tag(),
                 has_lse=self.lse_desc is not None,
                 has_amax=self._fp8,
+                lse_stride=self._lse_stride,
             )
         self._logger.debug("compile completed")
 
@@ -1378,7 +1402,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         o_arg = O_scratch if o_needs_copy_back else O_view
-        lse_arg = lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max) if lse_tensor is not None else None
+        lse_arg = lse_tensor
         if self.split_kv > 1:
             # Redirect the mainloop into split-major partial slabs, then reduce
             # into the caller's O/LSE with the plan-time-compiled combine pass.
@@ -1856,7 +1880,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
-        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
+        lse = lse_tensor
         sinks_t = (
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
@@ -2023,7 +2047,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O = O_scratch if o_needs_copy_back else O_view
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
-        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
+        lse = lse_tensor
         sinks_t = (
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
@@ -2318,6 +2342,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.head_dim_v: Optional[int] = None
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
+        self._lse_stride: Optional[tuple[int, int, int]] = None
         self._k_mod = None
 
     def check_support(self) -> bool:
@@ -2390,7 +2415,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.thd_stats_head_major = head_major
                 self.thd_stats_head_stride = int(stride_h) if head_major else 0
             else:
-                self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM120 DSL")
+                self._value_error_if(
+                    not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
+                    f"LSE must use a dense-compatible B/H/S permutation or padded layout "
+                    f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
+                )
+                self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         for label, val in (
             ("B", b),
@@ -2621,6 +2651,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # binds no LSE buffer at all (no dummy, no allocation). A split
             # REQUIRES it: the per-split LSE is the combine weight.
             has_lse=(self.lse_desc is not None) or self.split_kv > 1,
+            lse_stride=None if self.split_kv > 1 else self._lse_stride,
         )
         self._combine_kernel = None
         if self.split_kv > 1:
@@ -2638,6 +2669,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 dtype_o=self._combine_dtype_tag(),
                 has_lse=self.lse_desc is not None,
                 has_amax=False,
+                lse_stride=self._lse_stride,
             )
         self._logger.debug("compile completed")
 
@@ -3529,6 +3561,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.right_bound_runtime: int = 0
         self._k_mod = None
         self._params = None
+        self._lse_stride: Optional[tuple[int, int, int]] = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -3590,7 +3623,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
-            self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM80")
+            self._value_error_if(
+                not dense_layout_ok((*self.lse_desc.shape, 1), (*self.lse_desc.stride, 1)),
+                f"LSE must use a dense-compatible B/H/S permutation or padded layout "
+                f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
+            )
+            self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
 
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
@@ -3738,6 +3776,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             d=self.head_dim_qk,
             swa_window=int(self.swa_window_runtime),
             rope_max_s=self._rope_max_s,
+            lse_stride=self._lse_stride,
         )
         self._logger.debug("compile completed")
 
@@ -3768,8 +3807,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         # Init-time flags are compile-time specializations; execute must match
         # them exactly, in both directions (Hard Rule 1).
-        if lse_tensor is not None and lse_tensor.ndim == 4:
-            lse_tensor = lse_tensor.squeeze(-1)
         self._value_error_if(p.has_lse and lse_tensor is None, "compiled with a Stats output but execute() got no lse_tensor")
         self._value_error_if(not p.has_lse and lse_tensor is not None, "lse_tensor provided but the plan compiled the LSE store out")
         self._value_error_if(p.has_bias != (bias_tensor is not None), "bias presence must match the compiled specialization")
@@ -3777,6 +3814,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._value_error_if(p.has_sink != (sinks is not None), "sinks presence must match the compiled specialization")
         self._value_error_if(p.has_seq_kv_lens != (seq_kv_lens is not None), "seq_kv_lens presence must match the compiled specialization")
         self._value_error_if(p.has_seq_q_lens != (seq_q_lens is not None), "seq_q_lens presence must match the compiled specialization")
+        # Graph Stats declarations arrive as (B, H, S, 1); the kernels write
+        # [B, H, SQ] through the exact declared strides.
+        if lse_tensor is not None:
+            lse_tensor = self._checked_lse_view(lse_tensor)
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         device = q_tensor.device

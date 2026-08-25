@@ -25,6 +25,7 @@ Skips cleanly otherwise.
 """
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -32,7 +33,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -45,6 +46,25 @@ _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
 _BLOCK = 32
+
+
+class _ReferenceWithStats(NamedTuple):
+    output: torch.Tensor
+    stats: torch.Tensor
+
+
+class _RunResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: torch.Tensor
+
+
+class _RunWithStatsResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: torch.Tensor
+    stats: torch.Tensor
+    reference_stats: torch.Tensor
 
 
 def _cdiv(a, b):
@@ -69,7 +89,7 @@ def _quantize(t, b, h, s, d, fp8, *, columnwise):
     return data_d, swz_d, dq, (s_pad, d_scale_pad)
 
 
-def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=None, sinks=None, seq_lens_kv=None):
+def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=None, sinks=None, seq_lens_kv=None, return_stats=False):
     """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware)."""
     b, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = vd.shape
@@ -93,14 +113,41 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     scores = scores.masked_fill(masked, float("-inf"))
     if sinks is not None:
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
-        probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)
-        return torch.matmul(probs[..., :s_kv], v_e)
-    return torch.matmul(torch.softmax(scores, dim=-1), v_e)
+        ext = torch.cat([scores, col], dim=-1)
+        probs = torch.softmax(ext, dim=-1)
+        o = torch.matmul(probs[..., :s_kv], v_e)
+        if return_stats:
+            return _ReferenceWithStats(o, torch.logsumexp(ext, dim=-1))
+        return o
+    o = torch.matmul(torch.softmax(scores, dim=-1), v_e)
+    if return_stats:
+        return _ReferenceWithStats(o, torch.logsumexp(scores, dim=-1))
+    return o
 
 
-def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stats=True, seq_lens_kv=None, d_qk=128, d_v=128):
+def _run(
+    B,
+    H_q,
+    H_kv,
+    S,
+    in_key,
+    out_dt,
+    *,
+    scale,
+    sdpa_kwargs,
+    sink=None,
+    stats=True,
+    seq_lens_kv=None,
+    d_qk=128,
+    d_v=128,
+    stats_layout="contiguous",
+    return_lse=False,
+):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
-    Returns (O_frost [B,H,S,D] on device, O_ref fp32 [B,H,S,D])."""
+
+    Returns ``_RunResult`` or, when ``return_lse`` is set,
+    ``_RunWithStatsResult``.
+    """
     import cudnn
 
     dev = "cuda"
@@ -117,7 +164,7 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stat
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
-    lse = torch.empty(B, H_q, S, 1, device=dev, dtype=torch.float32)
+    lse = make_dense_stats(B, H_q, S, stats_layout)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     sfq_g = sfq.view(torch.uint8).reshape(B, H_q, sqp, dsc)
     sfk_g = sfk.view(torch.uint8).reshape(B, H_kv, skp, dsc)
@@ -161,7 +208,7 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stat
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
     if stats:
-        stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride([H_q * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+        stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -183,8 +230,20 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stat
     ref_kwargs = {k2: v2 for k2, v2 in _ref_from_sdpa(sdpa_kwargs).items()}
     if sink is not None:
         ref_kwargs["sinks"] = sink.flatten()
+    if return_lse:
+        assert stats, "return_lse requires stats=True"
+        o_ref, lse_ref = _ref(
+            Q8.float() * dqq,
+            K8.float() * dqk,
+            V8.float() * dqv,
+            scale=scale,
+            seq_lens_kv=seq_lens_kv,
+            return_stats=True,
+            **ref_kwargs,
+        )
+        return _RunWithStatsResult(Ob, o_ref, amax, lse.squeeze(-1), lse_ref)
     o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kwargs)
-    return Ob, o_ref, amax
+    return _RunResult(Ob, o_ref, amax)
 
 
 def _ref_from_sdpa(sdpa_kwargs):
@@ -201,6 +260,10 @@ def _ref_from_sdpa(sdpa_kwargs):
     return out
 
 
+def _half_atol(in_key, d_qk):
+    return 8e-2 if in_key == "e5m2" and d_qk > 128 else 7e-2 if in_key == "e5m2" else 5e-2
+
+
 def _check(O, O_ref, out_dt, in_key=None, d_qk=128):
     """Compare frost output to fp32 ref; for FP8 output, gauge against the fp8-quant floor.
 
@@ -209,7 +272,7 @@ def _check(O, O_ref, out_dt, in_key=None, d_qk=128):
     """
     # D192 accumulates 50% more QK products than D128. Keep the existing D128
     # threshold unchanged while allowing the measured E5M2 accumulation floor.
-    atol_half = 8e-2 if in_key == "e5m2" and d_qk > 128 else 7e-2 if in_key == "e5m2" else 5e-2
+    atol_half = _half_atol(in_key, d_qk)
     diff = (O.float() - O_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (O_ref - O_ref.to(out_dt).float()).abs().max().item()
@@ -226,6 +289,50 @@ _MASKS = {
     "causal_br": dict(use_causal_mask_bottom_right=True),
     "swa": dict(use_causal_mask=True, diagonal_band_left_bound=65),  # window = 64
 }
+
+
+def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves per-tensor FP8 d128, not block-scaled MXFP8")
+    kwargs = dict(
+        B=2,
+        H_q=4,
+        H_kv=2,
+        S=128,
+        in_key=in_key,
+        out_dt=torch.float16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d_qk,
+        d_v=d_v,
+        return_lse=True,
+    )
+    torch.manual_seed(59)
+    contiguous = _run(**kwargs, stats_layout="contiguous")
+    torch.manual_seed(59)
+    strided = _run(**kwargs, stats_layout="strided")
+    _check(strided.output, strided.reference, torch.float16, in_key, d_qk=d_qk)
+    torch.testing.assert_close(strided.stats, contiguous.stats, rtol=0, atol=0)
+    torch.testing.assert_close(strided.stats, strided.reference_stats, rtol=3e-2, atol=_half_atol(in_key, d_qk))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_mxfp8_strided_stats():
+    """The block-scaled FP8 L0 flavor preserves dense Stats strides."""
+    _check_mxfp8_strided_stats(128, 128, "e4m3")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("d_qk", "d_v", "in_key"),
+    [(128, 128, "e5m2"), (192, 128, "e4m3"), (192, 128, "e5m2")],
+    ids=["d128_e5m2", "d192_d128_e4m3", "d192_d128_e5m2"],
+)
+@torch_fork_set_rng(seed=59)
+def test_mxfp8_strided_stats_other_flavors(d_qk, d_v, in_key):
+    """The remaining block-scaled FP8 flavors preserve dense Stats strides."""
+    _check_mxfp8_strided_stats(d_qk, d_v, in_key)
 
 
 @pytest.mark.L0
