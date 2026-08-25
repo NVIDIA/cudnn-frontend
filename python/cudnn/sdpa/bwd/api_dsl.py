@@ -907,22 +907,20 @@ _SM80_BWD_FLAVOR_DIMS = {
 _SM80_BWD_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
 
 
-def _sm80_bwd_kernel_mod(key: str = "f16"):
-    """Lazily import + cache an SM80 BPROP kernel module.
+def _sm80_bwd_kernel_mod(key: str = "d64"):
+    """Lazily import + cache the dedicated d=64 SM80 BPROP kernel module.
 
-    ``"f16"`` is the GENERIC kernel (``bprop_f16_sm80``): fully parameterized
-    on d_qk/d_v with the full feature set (masks / bias / dBias /
-    sink / rope / THD / deterministic).  ``"d64"`` is the
-    dedicated plain-dense d=64 MHA perf variant (~2x faster on A100); it
-    supports NO features — its ``backward(**_ignored)`` silently swallows
-    every feature kwarg, so callers must never rely on the signature filter
-    and only select it through :func:`_sm80_d64_fast_path_eligible`.
+    ``"d64"`` (the only key) is the plain-dense d=64 MHA perf variant (~2x
+    faster on A100); it supports NO features — its ``backward(**_ignored)``
+    silently swallows every feature kwarg, so callers must never rely on the
+    signature filter and only select it through
+    :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
+    (``bprop_f16_sm80``) is a TemplateParams module loaded per-specialization
+    via :func:`_load_sm80_bwd_module` instead.
     """
+    assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        if key == "d64":
-            from .kernels import bprop_d64_f16_sm80 as _mod
-        else:
-            from .kernels import bprop_f16_sm80 as _mod
+        from .kernels import bprop_d64_f16_sm80 as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -981,12 +979,25 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
     """THD / varlen backward: q/k/v/o/do are PACKED ``[1, T, H, D]`` (BSHD,
     B==1 — no transpose), ``lse`` is packed ``[1, H, T_q]`` (head-major,
     matching the kernel's THD LSE layout), and cu_q/cu_k are ``[n_seq+1]``
-    cumulative seqlens.  Routes straight to the kernel's THD backward
-    (over-provisioned grid; MHA-only), reusing the flavor-pick + d-pad.
-    Returns packed ``[1, T, H, D]`` dQ/dK/dV (BHSD-equivalent for B==1)."""
+    cumulative seqlens.  Loads the THD template specialization (packed token
+    totals are ``cute.sym_int`` dynamics — one artifact per (params, n_seq),
+    issue #604) and drives the kernel chain directly (over-provisioned grid;
+    GQA reduces over the query-head group).  Returns packed ``[1, T, H, D]``
+    dQ/dK/dV (BHSD-equivalent for B==1).
+
+    Wrapper-only Rule-3 residual: the grid extents (max seqlen per side, the
+    logical sequence count) are RUNTIME ints read from cu_seqlens on the HOST
+    — a D2H sync this functional wrapper accepts (the graph/engine path never
+    routes THD here without materialized host seqlens).
+    """
+    if sinks is not None:
+        raise NotImplementedError("SM80 THD bprop: attention sinks are dense-only")
+    if deterministic:
+        raise NotImplementedError("SM80 THD bprop: deterministic dQ is dense-only (no plan-time semaphore size under sym_int sq)")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
+    h_kv = k.shape[2]
     flavor = _sm80_bwd_pick_flavor(d_qk, d_v)
     fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
     # Resolve the default scale from the USER's head dim before padding: the
@@ -1004,54 +1015,199 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
         v = _sm80_bwd_pad_last_dim(v, fdv)
         o = _sm80_bwd_pad_last_dim(o, fdv)
         do = _sm80_bwd_pad_last_dim(do, fdv)
-    # mask token from cuDNN's (is_causal, window_size=(left,right)).
+    # cuDNN's (is_causal, window_size=(left,right)) → mask params.
     wl, wr = window_size
-    if is_causal and wl >= 0:
-        mask_token, swa = "causal_swa", wl
-    elif is_causal:
-        mask_token, swa = "causal", 0
-    elif wl >= 0:
-        mask_token, swa = "swa", wl
-    else:
-        mask_token, swa = "none", 0
-    right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
-    kernel = _sm80_bwd_kernel_mod()
-    sinks_t = sinks.to(dtype=torch.float32, device=q.device).reshape(h_q).contiguous() if sinks is not None else None
-    bw_kwargs = dict(
-        scale=scale_softmax,
-        mask=mask_token,
-        swa_window=int(swa),
-        right_bound=int(right_bound),
-        causal_bottom_right=bool(causal_bottom_right),
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        sinks=sinks_t,
-        deterministic=bool(deterministic),
+    has_swa = wl is not None and wl >= 0
+    swa = int(wl) if has_swa else 0
+    right_bound = int(wr) if (is_causal and wr is not None and wr > 0) else 0
+    from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
+
+    params = bwd_params_for_flavor(
+        flavor,
+        io_bf16=(q.dtype == torch.bfloat16),
+        is_causal=bool(is_causal),
+        has_swa=has_swa,
+        causal_bottom_right=bool(causal_bottom_right) and (bool(is_causal) or has_swa),
+        thd_varlen=True,
+        sched_policy=_BWD_SCHED_NATURAL,  # LPT+THD is a future tweak
     )
-    acc = inspect.signature(kernel.backward).parameters
-    bw_kwargs = {kk: vv for kk, vv in bw_kwargs.items() if kk in acc}
-    res = kernel.backward(q, k, v, do, o, lse, **bw_kwargs)
-    dQ_k, dK_k, dV_k = res[0], res[1], res[2]
-    _idx = 3
-    dSink_k = None
-    if sinks_t is not None:
-        dSink_k = res[_idx]
-        _idx += 1
+    mod = _load_sm80_bwd_module(params)
+    # Host-side grid math (the wrapper-only D2H documented above).
+    cu_q_host = cu_q.to(dtype=torch.int32, device="cpu")
+    cu_k_host = cu_k.to(dtype=torch.int32, device="cpu")
+    n_seq = cu_q_host.numel() - 1
+    assert cu_k_host.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
+    max_sq = int((cu_q_host[1:] - cu_q_host[:-1]).max())
+    max_skv = int((cu_k_host[1:] - cu_k_host[:-1]).max())
+    c = mod.compile(1, h_q, h_kv, 0, 0, swa_window=swa, n_batch_logical=n_seq)
+    t_q = q.shape[1]
+    t_kv = k.shape[1]
+    dev = q.device
+    stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+    q, k, v, o, do = (t.contiguous() for t in (q, k, v, o, do))
+    lse_t = lse.to(dtype=torch.float32, device=dev).contiguous()
+    cu_q_t = cu_q.to(dtype=torch.int32, device=dev).contiguous()
+    cu_k_t = cu_k.to(dtype=torch.int32, device=dev).contiguous()
+    dq_acc = torch.zeros(1, t_q, h_q, fdqk, dtype=torch.float32, device=dev)
+    dQ_k = torch.empty(1, t_q, h_q, fdqk, dtype=q.dtype, device=dev)
+    # dK/dV write buffers carry the h_q query heads (one slice per query head);
+    # MHA: they ARE the outputs.  GQA: reduced over the group below.
+    dk_ws = torch.empty(1, t_kv, h_q, fdqk, dtype=q.dtype, device=dev)
+    dv_ws = torch.empty(1, t_kv, h_q, fdv, dtype=q.dtype, device=dev)
+    dot = torch.empty(1, h_q, t_q, dtype=torch.float32, device=dev)
+    dummy_i32 = torch.zeros(1, dtype=torch.int32, device=dev)
+    dummy_f32 = torch.zeros(1, dtype=torch.float32, device=dev)
+    c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _int32(h_q * t_q), stream)
+    _sm80_bwd_call(
+        c.main,
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        dq_acc=dq_acc,
+        dk_ws=dk_ws,
+        dv_ws=dv_ws,
+        lse=lse_t,
+        do_dot=dot,
+        seq_kv=dummy_i32,
+        bias=dummy_f32,
+        dbias=dummy_f32,
+        rope_cs=dummy_f32,
+        cu_q=cu_q_t,
+        cu_k=cu_k_t,
+        seq_q=dummy_i32,
+        dq_sem=dummy_i32,
+        n_q_tiles=(t_q + params.tile_q - 1) // params.tile_q,
+        scale_log2=float(scale_softmax) * _BWD_LOG2E,
+        attn_scale=float(scale_softmax),
+        right_bound=right_bound,
+        inv_scale=1.0 / float(scale_softmax),
+        bias_bstride=0,
+        sem_q_stride=0,
+        grid_kv_tiles=(max_skv + params.tile_kv - 1) // params.tile_kv,
+        grid_batch=n_seq,
+        stream=stream,
+    )
+    c.cast(_fd_tvm(dq_acc), _fd_tvm(dQ_k), _int32((t_q * h_q * fdqk) // 2), stream)
+    if h_q != h_kv:
+        dK_k = torch.empty(1, t_kv, h_kv, fdqk, dtype=q.dtype, device=dev)
+        dV_k = torch.empty(1, t_kv, h_kv, fdv, dtype=q.dtype, device=dev)
+        c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dK_k), _int32(t_kv * h_kv * fdqk), stream)
+        c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dV_k), _int32(t_kv * h_kv * fdv), stream)
+    else:
+        dK_k, dV_k = dk_ws, dv_ws
     if pad_qk:
         dQ_k = dQ_k[..., :d_qk].contiguous()
         dK_k = dK_k[..., :d_qk].contiguous()
     if pad_v:
         dV_k = dV_k[..., :d_v].contiguous()
-    out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
-    if dSink_k is not None:
-        out["dsink_tensor"] = dSink_k
-    return out
+    return TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
 
 
 # ---------------------------------------------------------------------------
 # Functional wrapper (mirrors the forward surface).
 # ---------------------------------------------------------------------------
 _cache_of_objects: dict = {}
+
+
+_SM80_BWD_KERNEL_FILE = "bprop_f16_sm80.py"
+# The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
+# decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
+from cudnn.frost.tile_dsl.constants import SCHED_LPT as _BWD_SCHED_LPT  # noqa: E402
+from cudnn.frost.tile_dsl.constants import SCHED_NATURAL as _BWD_SCHED_NATURAL  # noqa: E402
+
+
+def _load_sm80_bwd_module(params):
+    """Load one uniquely named backward kernel module per parameter set."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", _SM80_BWD_KERNEL_FILE)
+    return load_template(path, params, tag="sdpa_bwd_sm80")
+
+
+def _sm80_bwd_call(
+    compiled,
+    *,
+    q,
+    k,
+    v,
+    do,
+    dq_acc,
+    dk_ws,
+    dv_ws,
+    lse,
+    do_dot,
+    seq_kv,
+    bias,
+    dbias,
+    rope_cs,
+    cu_q,
+    cu_k,
+    seq_q,
+    dq_sem,
+    n_q_tiles,
+    scale_log2,
+    attn_scale,
+    right_bound,
+    inv_scale,
+    bias_bstride,
+    sem_q_stride,
+    grid_kv_tiles,
+    grid_batch,
+    stream,
+):
+    """Invoke one compiled main-bprop artifact (the traced ``_bprop_host``
+    ABI: 17 tensors, then 9 runtime scalars and the launch stream)."""
+    import cutlass
+    from cutlass.cute.runtime import from_dlpack as _fd
+
+    def fd(t):
+        # The kernels compile with --enable-tvm-ffi, so host-side conversions
+        # must produce TVM-FFI tensors regardless of the env latch.
+        return _fd(t, enable_tvm_ffi=True)
+
+    compiled(
+        fd(q),
+        fd(k),
+        fd(v),
+        fd(do),
+        fd(dq_acc),
+        fd(dk_ws),
+        fd(dv_ws),
+        fd(lse),
+        fd(do_dot),
+        fd(seq_kv),
+        fd(bias),
+        fd(dbias),
+        fd(rope_cs),
+        fd(cu_q),
+        fd(cu_k),
+        fd(seq_q),
+        fd(dq_sem),
+        cutlass.Int32(n_q_tiles),
+        cutlass.Float32(scale_log2),
+        cutlass.Float32(attn_scale),
+        cutlass.Int32(right_bound),
+        cutlass.Float32(inv_scale),
+        cutlass.Int32(bias_bstride),
+        cutlass.Int32(sem_q_stride),
+        cutlass.Int32(grid_kv_tiles),
+        cutlass.Int32(grid_batch),
+        stream,
+    )
+
+
+_BWD_LOG2E = math.log2(math.e)
+
+
+def _int32(v):
+    import cutlass
+
+    return cutlass.Int32(int(v))
+
+
+def _fd_tvm(t):
+    from cutlass.cute.runtime import from_dlpack as _fd
+
+    return _fd(t, enable_tvm_ffi=True)
 
 
 class SdpaBwdDslSm80(SdpaBwdDsl):
@@ -1072,13 +1228,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     workspace provided, execute allocates nothing).
     """
 
-    def __init__(self, *args, has_bias: bool = False, bias_is_fp32: bool = True, bias_batch: int = 1, has_rope: bool = False, **kwargs) -> None:
-        # SM80-only plan-time facts (scratch sizing + kernel gating); the
+    def __init__(
+        self, *args, has_bias: bool = False, bias_is_fp32: bool = True, bias_batch: int = 1, has_rope: bool = False, rope_max_s: int = 0, **kwargs
+    ) -> None:
+        # SM80-only plan-time facts (scratch sizing + template identity); the
         # base contract carries everything else.
         self._has_bias = bool(has_bias)
         self._bias_is_fp32 = bool(bias_is_fp32)
         self._bias_batch = int(bias_batch)
         self._has_rope = bool(has_rope)
+        self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
 
     def _initialize_implementation(self) -> None:
@@ -1088,6 +1247,18 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self.mask_token: Optional[str] = None
         self.swa_window_runtime: int = 0
         self.right_bound_runtime: int = 0
+        self._dummy_cache: dict = {}
+
+    def _dummy(self, key: str, device: torch.device, factory) -> torch.Tensor:
+        """A cached device-local dummy for a dead ABI slot (AGENTS.md Rule 1:
+        no per-execute allocation; the matching has_* Constexpr is False so
+        the kernel never reads it)."""
+        cache_key = (key, device)
+        tensor = self._dummy_cache.get(cache_key)
+        if tensor is None:
+            tensor = factory()
+            self._dummy_cache[cache_key] = tensor
+        return tensor
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -1190,11 +1361,88 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
     # ------------------------------------------------------------------
     def compile(self) -> None:
-        """Mark compiled — the kernel modules own their per-shape JIT caches
-        until the TemplateParams conversion moves the compile to plan time."""
-        self._logger.debug("Entering compile (no-op — kernels self-cache)")
+        """Plan-time JIT: build the TemplateParams from the plan facts, load
+        the specialized module via ``frost.template_loader`` (same seam as the
+        SM120 adapter), and compile the full kernel chain for this shape.
+        The dedicated plain-dense d=64 fast path keeps its self-caching module
+        (dense-only — issue #604 concerns the THD extents, which never route
+        there); its JIT happens on the first execute."""
+        self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        self._compiled_kernel = True
+        from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
+
+        # Scheduler resolution (the old backward()'s "auto"): kv-major LPT for
+        # causal load-balance, the plain 3-D grid otherwise; the deterministic
+        # relay REQUIRES the plain decode (kv_tile == blockIdx.x).
+        sched = _BWD_SCHED_LPT if (self.is_causal and not self.deterministic) else _BWD_SCHED_NATURAL
+        # NOTE: the generic pipeline always ran the llama-swept tile point
+        # regardless of flavor (the old backward() defaults); the gptoss
+        # wide-Q-tile row stays unwired pending an adapter-level perf gate.
+        self._params = bwd_params_for_flavor(
+            "llama",
+            io_bf16=self.dtype == torch.bfloat16,
+            d_qk=self.flavor_d_qk,
+            d_v=self.flavor_d_v,
+            is_causal=self.is_causal,
+            has_swa=self.swa_window_runtime > 0 or (self.window_size_left is not None and self.window_size_left >= 0),
+            causal_bottom_right=self.causal_bottom_right,
+            has_seq_kv_lens=self.seq_kv_lens_present,
+            has_seq_q_lens=self.seq_q_lens_present,
+            has_bias=self._has_bias,
+            bias_is_fp32=self._bias_is_fp32,
+            bias_broadcast=self._bias_batch == 1,
+            has_sink=self.sink_desc is not None,
+            has_rope=self._has_rope,
+            deterministic=self.deterministic,
+            thd_varlen=False,
+            sched_policy=sched,
+        )
+        # RoPE preconditions the old backward() asserted (the params validator
+        # covers d_qk <= 128; these two involve the shape, known only here).
+        if self._has_rope:
+            self._value_error_if(
+                self._rope_max_s < max(self.s_q_max, self.s_k_max),
+                f"rope_freqs rows ({self._rope_max_s}) must cover max(S_q={self.s_q_max}, S_kv={self.s_k_max})",
+            )
+            self._not_implemented_error_if(
+                bool(self.s_q_max % self._params.tile_q or self.s_k_max % self._params.tile_kv),
+                "SM80 bprop: RoPE requires S_q/S_kv tile-aligned",
+            )
+        # d64 fast-path gate: every input is plan-time state now.
+        self._use_d64 = _sm80_d64_fast_path_eligible(
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+            h_q=self.h_q,
+            h_kv=self.h_kv,
+            s_q=self.s_q_max,
+            s_kv=self.s_k_max,
+            mask_token=self.mask_token,
+            right_bound=int(self.right_bound_runtime),
+            causal_bottom_right=self.causal_bottom_right,
+            bw_kwargs=dict(
+                seq_kv_lens=object() if self.seq_kv_lens_present else None,
+                seq_len_q=object() if self.seq_q_lens_present else None,
+                bias=object() if self._has_bias else None,
+                sinks=object() if self.sink_desc is not None else None,
+                rope_freqs=object() if self._has_rope else None,
+                deterministic=self.deterministic,
+            ),
+        )
+        if self._use_d64:
+            self._kmod = None
+            self._compiled_kernel = True  # d64 self-caches on first execute
+        else:
+            self._kmod = _load_sm80_bwd_module(self._params)
+            self._compiled_kernel = self._kmod.compile(
+                b=self.batch_size,
+                h=self.h_q,
+                h_kv=self.h_kv,
+                sq=self.s_q_max,
+                skv=self.s_k_max,
+                swa_window=int(self.swa_window_runtime),
+                rope_max_s=self._rope_max_s,
+                n_batch_logical=0,
+            )
         self._logger.debug("compile completed")
 
     # ------------------------------------------------------------------
@@ -1290,13 +1538,23 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
         scale_val = self.scale_softmax if (scale_softmax is None or scale_softmax == 0.0) else float(scale_softmax)
         device = q_tensor.device
-        kernel = _sm80_bwd_kernel_mod()
+        launch_stream = self._get_default_stream(current_stream)
 
         # Per-execute scratch: carved from the caller's workspace when one is
         # provided (the engine lowering passes one sized by
         # scratch_workspace_bytes(); issue #514), otherwise allocated (the
-        # standalone wrapper path). Carve order mirrors the sizing order.
+        # standalone wrapper path). Carve order mirrors the sizing order:
+        # operand staging first, then the kernel-internal buffers.
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaBwdDslSm80") if workspace is not None else None
+
+        def _take(numel, dtype, zero=False, shape=None):
+            if carver is not None:
+                t = carver.take(numel, dtype)
+                if zero:
+                    t.zero_()
+            else:
+                t = (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=device)
+            return t.view(shape) if shape is not None else t
 
         with _torch_stream_context(current_stream, device):
             pad_qk = self.head_dim_qk < self.flavor_d_qk
@@ -1310,20 +1568,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 view = t.transpose(1, 2)
                 d = view.shape[-1]
                 if pad:
-                    if carver is not None:
-                        bb, ss, hh, _ = view.shape
-                        dst = carver.take(bb * ss * hh * fd, t.dtype).view(bb, ss, hh, fd)
-                        dst[..., :d].copy_(view)
-                        dst[..., d:].zero_()
-                        return dst
-                    return _sm80_bwd_pad_last_dim(view.contiguous() if not view.is_contiguous() else view, fd)
+                    bb, ss, hh, _ = view.shape
+                    dst = _take(bb * ss * hh * fd, t.dtype, shape=(bb, ss, hh, fd))
+                    dst[..., :d].copy_(view)
+                    dst[..., d:].zero_()
+                    return dst
                 if view.is_contiguous():
                     return view
-                if carver is not None:
-                    dst = carver.take(t.numel(), t.dtype).view(view.shape)
-                    dst.copy_(view)
-                    return dst
-                return view.contiguous()
+                dst = _take(t.numel(), t.dtype, shape=view.shape)
+                dst.copy_(view)
+                return dst
 
             # BHSD → BSHD, in scratch_workspace_bytes()'s sizing order.
             Q = _stage(q_tensor, pad_qk, self.flavor_d_qk)
@@ -1333,80 +1587,151 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             dO = _stage(do_tensor, pad_v, self.flavor_d_v)
 
             # Stats → packed (B, H, S) LSE; squeeze(-1) is a valid view for
-            # any (B, H, S, 1) strides; strided inputs gather into staging.
+            # any (B, H, S, 1) strides; strided inputs gather into staging
+            # (the kernels READ a packed LSE — raw-pointer addressing).
             lse = stats_tensor.squeeze(-1) if stats_tensor.ndim == 4 else stats_tensor
             if not lse.is_contiguous():
-                if carver is not None:
-                    lse_stage = carver.take(lse.numel(), torch.float32).view(lse.shape)
-                else:
-                    lse_stage = torch.empty_like(lse, memory_format=torch.contiguous_format)
+                lse_stage = _take(lse.numel(), torch.float32, shape=lse.shape)
                 lse_stage.copy_(lse)
                 lse = lse_stage
 
-            bw_kwargs = dict(
-                scale=scale_val,
-                mask=self.mask_token,
-                swa_window=int(self.swa_window_runtime),
-                right_bound=int(self.right_bound_runtime),
-                causal_bottom_right=self.causal_bottom_right,
-                seq_kv_lens=seq_kv_lens.reshape(-1) if seq_kv_lens is not None else None,
-                seq_len_q=seq_q_lens.reshape(-1) if seq_q_lens is not None else None,
-                bias=bias_tensor,
-                sinks=sink_tensor.reshape(-1) if sink_tensor is not None else None,
-                rope_freqs=rope_freqs,
-                deterministic=self.deterministic,
-                # Kernel-internal scratch: the unconsumed workspace tail.
-                workspace=carver.remaining() if carver is not None else None,
-            )
-            # Route plain dense MHA d=64 calls to the dedicated perf kernel
-            # (~2x faster on A100). The gate must stay exhaustive: the d64
-            # kernel's ``backward(**_ignored)`` silently swallows any feature
-            # kwarg it does not implement.
-            if _sm80_d64_fast_path_eligible(
-                d_qk=self.head_dim_qk,
-                d_v=self.head_dim_v,
-                h_q=self.h_q,
-                h_kv=self.h_kv,
-                s_q=self.s_q_max,
-                s_kv=self.s_k_max,
-                mask_token=self.mask_token,
-                right_bound=int(self.right_bound_runtime),
-                causal_bottom_right=self.causal_bottom_right,
-                bw_kwargs=bw_kwargs,
-            ):
-                kernel = _sm80_bwd_kernel_mod("d64")
-                self._logger.debug("execute: routing to the dedicated d64 kernel")
-            accepted = inspect.signature(kernel.backward).parameters
-            bw_kwargs = {kk: vv for kk, vv in bw_kwargs.items() if kk in accepted}
+            # --- d64 fast path: the dedicated plain-dense MHA kernel keeps
+            # its legacy self-caching module (dense-only; #604 is THD-only).
+            if self._use_d64:
+                d64 = _sm80_bwd_kernel_mod("d64")
+                res = d64.backward(Q, K, V, dO, O, lse, scale=scale_val, workspace=carver.remaining() if carver is not None else None)
+                dQ_k, dK_k, dV_k = res[0], res[1], res[2]
+                dq_tensor.copy_(dQ_k.transpose(1, 2))
+                dk_tensor.copy_(dK_k.transpose(1, 2))
+                dv_tensor.copy_(dV_k.transpose(1, 2))
+                self._logger.debug("execute completed (d64 fast path)")
+                return
 
-            res = kernel.backward(Q, K, V, dO, O, lse, **bw_kwargs)
-            dQ_k, dK_k, dV_k = res[0], res[1], res[2]
-            # backward() appends optional grads in a FIXED order: dBias (if
-            # bias), then dSink (if sinks).
-            _idx = 3
-            dBias_k = None
-            dSink_k = None
+            p_ = self._params
+            c = self._compiled_kernel
+            b, hq, hkv = self.batch_size, self.h_q, self.h_kv
+            sq, skv = self.s_q_max, self.s_k_max
+            fdqk, fdv = self.flavor_d_qk, self.flavor_d_v
+            gqa = hq != hkv
+
+            # Kernel-internal scratch, in the module scratch_bytes() order.
+            dsink_acc = _take(hq, torch.float32, zero=True) if sink_tensor is not None else None
+            dq_acc = _take(b * sq * hq * fdqk, torch.float32, zero=True, shape=(b, sq, hq, fdqk))
+            dq_ws = _take(b * sq * hq * fdqk, self.dtype, shape=(b, sq, hq, fdqk))
+            if p_.deterministic:
+                sem_units = max(b * hq * c.sem_q_stride, 1)
+                dq_sem = _take(sem_units, torch.int32, zero=True)
+            else:
+                dq_sem = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
+            # dK/dV: MHA at native dims binds the caller's compact-BSHD views
+            # directly (no copy-back, mirroring the SM120 adapter); anything
+            # else stages (GQA per-q-head partials, head-dim pads, dense_flex).
+            dk_view = dk_tensor.transpose(1, 2)
+            dv_view = dv_tensor.transpose(1, 2)
+            dk_direct = not gqa and not pad_qk and dk_view.is_contiguous()
+            dv_direct = not gqa and not pad_v and dv_view.is_contiguous()
+            dk_ws = dk_view if dk_direct else _take(b * skv * hq * fdqk, self.dtype, shape=(b, skv, hq, fdqk))
+            dv_ws = dv_view if dv_direct else _take(b * skv * hq * fdv, self.dtype, shape=(b, skv, hq, fdv))
+            dk_out = dv_out = None
+            if gqa:
+                dk_out = _take(b * skv * hkv * fdqk, self.dtype, shape=(b, skv, hkv, fdqk))
+                dv_out = _take(b * skv * hkv * fdv, self.dtype, shape=(b, skv, hkv, fdv))
             if bias_tensor is not None:
-                dBias_k = res[_idx]
-                _idx += 1
+                self._value_error_if(not bias_tensor.is_contiguous(), "bias must be contiguous")
+                self._value_error_if(
+                    tuple(bias_tensor.shape) != (self._bias_batch, hq, sq, skv),
+                    f"bias must be ({self._bias_batch}, {hq}, {sq}, {skv}); got {tuple(bias_tensor.shape)}",
+                )
+                bias_b = bias_tensor
+                dbias_acc = _take(self._bias_batch * hq * sq * skv, torch.float32, zero=True, shape=(self._bias_batch, hq, sq, skv))
+            else:
+                bias_dt = torch.float32 if p_.bias_is_fp32 else self.dtype
+                bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
+                dbias_acc = self._dummy("zero_f32", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+            dot = _take(b * hq * sq, torch.float32, shape=(b, hq, sq))
+            if rope_freqs is not None:
+                # (cos, sin) table build — wrapper-only fusion (the engine row
+                # never admits RoPE); per-execute by contract, like the caller
+                # passing fresh angle tables.
+                d2 = fdqk // 2
+                rf = rope_freqs.to(dtype=torch.float32, device=device).reshape(rope_freqs.shape[0], -1)
+                self._value_error_if(rf.shape[1] < d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})")
+                self._value_error_if(
+                    rf.shape[0] != self._rope_max_s, f"rope_freqs rows ({rf.shape[0]}) must equal the compiled rope_max_s ({self._rope_max_s})"
+                )
+                angles = rf[:, :d2]
+                rope_b = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+            else:
+                rope_b = self._dummy("zero_f32", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+            if seq_kv_lens is not None:
+                seq_kv_b = seq_kv_lens.reshape(-1)
+                self._value_error_if(seq_kv_b.dtype != torch.int32 or not seq_kv_b.is_contiguous(), "seq_kv_lens must be contiguous int32")
+            else:
+                seq_kv_b = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
+            if seq_q_lens is not None:
+                seq_q_b = seq_q_lens.reshape(-1)
+                self._value_error_if(seq_q_b.dtype != torch.int32 or not seq_q_b.is_contiguous(), "seq_q_lens must be contiguous int32")
+            else:
+                seq_q_b = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
             if sink_tensor is not None:
-                dSink_k = res[_idx]
-                _idx += 1
+                sinks_b = sink_tensor.reshape(-1)
+                self._value_error_if(sinks_b.dtype != torch.float32 or not sinks_b.is_contiguous(), "sinks must be contiguous fp32")
+            cu_dummy = self._dummy("zero_i32", device, lambda: torch.zeros(1, dtype=torch.int32, device=device))
 
-            # Slice off any d-padding, transpose BSHD → BHSD, copy into the
-            # caller's buffers (copy_ casts in place; no .to()).
-            if pad_qk:
-                dQ_k = dQ_k[..., : self.head_dim_qk]
-                dK_k = dK_k[..., : self.head_dim_qk]
-            if pad_v:
-                dV_k = dV_k[..., : self.head_dim_v]
-            dq_tensor.copy_(dQ_k.transpose(1, 2))
-            dk_tensor.copy_(dK_k.transpose(1, 2))
-            dv_tensor.copy_(dV_k.transpose(1, 2))
-            if dbias_tensor is not None and dBias_k is not None:
-                dbias_tensor.copy_(dBias_k)
-            if dsink_tensor is not None and dSink_k is not None:
-                dsink_tensor.view(-1).copy_(dSink_k)
+            # --- launch chain: do_dot → (dSink) → main → dQ cast → (GQA reduce)
+            c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _int32(b * hq * sq), launch_stream)
+            if sink_tensor is not None:
+                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _int32(b * hq), launch_stream)
+            _sm80_bwd_call(
+                c.main,
+                q=Q,
+                k=K,
+                v=V,
+                do=dO,
+                dq_acc=dq_acc,
+                dk_ws=dk_ws,
+                dv_ws=dv_ws,
+                lse=lse,
+                do_dot=dot,
+                seq_kv=seq_kv_b,
+                bias=bias_b,
+                dbias=dbias_acc,
+                rope_cs=rope_b,
+                cu_q=cu_dummy,
+                cu_k=cu_dummy,
+                seq_q=seq_q_b,
+                dq_sem=dq_sem,
+                n_q_tiles=(sq + p_.tile_q - 1) // p_.tile_q,
+                scale_log2=scale_val * _BWD_LOG2E,
+                attn_scale=scale_val,
+                right_bound=int(self.right_bound_runtime),
+                inv_scale=1.0 / float(scale_val),
+                bias_bstride=0 if self._bias_batch == 1 else hq * sq * skv,
+                sem_q_stride=c.sem_q_stride,
+                grid_kv_tiles=0,
+                grid_batch=0,
+                stream=launch_stream,
+            )
+            c.cast(_fd_tvm(dq_acc), _fd_tvm(dq_ws), _int32((b * sq * hq * fdqk) // 2), launch_stream)
+            if gqa:
+                c.reduce_k(_fd_tvm(dk_ws), _fd_tvm(dk_out), _int32(b * skv * hkv * fdqk), launch_stream)
+                c.reduce_v(_fd_tvm(dv_ws), _fd_tvm(dv_out), _int32(b * skv * hkv * fdv), launch_stream)
+
+            # Copy-backs: slice any d-padding, transpose BSHD → BHSD into the
+            # caller's buffers (copy_ casts in place; no .to()). Direct-bound
+            # dK/dV already landed in place.
+            dq_src = dq_ws[..., : self.head_dim_qk] if pad_qk else dq_ws
+            dq_tensor.copy_(dq_src.transpose(1, 2))
+            dk_src = dk_out if gqa else dk_ws
+            dv_src = dv_out if gqa else dv_ws
+            if not dk_direct:
+                dk_tensor.copy_((dk_src[..., : self.head_dim_qk] if pad_qk else dk_src).transpose(1, 2))
+            if not dv_direct:
+                dv_tensor.copy_((dv_src[..., : self.head_dim_v] if pad_v else dv_src).transpose(1, 2))
+            if dbias_tensor is not None and bias_tensor is not None:
+                dbias_tensor.copy_(dbias_acc)
+            if dsink_tensor is not None and dsink_acc is not None:
+                dsink_tensor.view(-1).copy_(dsink_acc)
         self._logger.debug("execute completed")
 
 
@@ -1507,6 +1832,7 @@ def sdpa_bwd_wrapper_sm80(
         (bias_tensor.shape[0] if bias_tensor is not None else None),
         sinks is not None,
         rope_freqs is not None,
+        (int(rope_freqs.shape[0]) if rope_freqs is not None else 0),
         q_tensor.device,
     )
     sdpa_bwd = _sm80_bwd_cache.get(cache_key)
@@ -1537,6 +1863,7 @@ def sdpa_bwd_wrapper_sm80(
             bias_is_fp32=(bias_tensor.dtype == torch.float32 if bias_tensor is not None else True),
             bias_batch=(int(bias_tensor.shape[0]) if bias_tensor is not None else 1),
             has_rope=rope_freqs is not None,
+            rope_max_s=(int(rope_freqs.shape[0]) if rope_freqs is not None else 0),
         )
         assert sdpa_bwd.check_support(), "Unsupported configuration"
         sdpa_bwd.compile()
