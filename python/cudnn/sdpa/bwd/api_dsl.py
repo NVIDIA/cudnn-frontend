@@ -18,6 +18,7 @@ from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.sdpa.bwd.config_sm120 import (
+    ROW_ROUND as _SM120_ROW_ROUND,
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_SUPPORTED_HEAD_DIMS,
@@ -32,9 +33,6 @@ _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
 }
-# delta / dq_accum rows are padded to multiples of 128 (the kernel's
-# dq_accum layout contract: tile_q must divide 128).
-_SM120_ROW_ROUND = 128
 # dq_sem is sized for the smallest legal q-tile so one formula covers every
 # tile choice; must match the template's fake_dq_sem sizing.
 _SM120_MIN_Q_TILE = 32

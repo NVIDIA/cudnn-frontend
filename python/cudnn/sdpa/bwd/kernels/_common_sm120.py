@@ -27,13 +27,13 @@ def tile_ptr(
     row: cutlass.Int32,
     col: cutlass.Int32,
     *,
-    page: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
 ):
     """Element pointer into a swizzled smem tile."""
-    pg = col // page
-    in_col = col % page
-    off = pg * (rows * page) + row * page + swizzle_xor(row, in_col, page, 2)
+    chunk = col // chunk_elems
+    in_col = col % chunk_elems
+    off = chunk * (rows * chunk_elems) + row * chunk_elems + swizzle_xor(row, in_col, chunk_elems, 2)
     return sbuf.subview(off).data_ptr()
 
 
@@ -51,12 +51,12 @@ def load_a_frag(
     lane,
     *,
     rows: cutlass.Constexpr[int],
-    page: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
 ):
     """ldmatrix.x4 one (16 x 16) row-major A fragment."""
     row = row0 + lane % 16
     col = kc * 16 + (lane // 16) * 8
-    return prims.ldmatrix(tile_ptr(sbuf, row, col, page=page, rows=rows), 4, prims.MMALayout.ROW)
+    return prims.ldmatrix(tile_ptr(sbuf, row, col, chunk_elems=chunk_elems, rows=rows), 4, prims.MMALayout.ROW)
 
 
 @cute.jit
@@ -67,12 +67,12 @@ def load_a_frag_transposed(
     lane,
     *,
     rows: cutlass.Constexpr[int],
-    page: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
 ):
     """ldmatrix.trans.x4: A[M, K] from a tile stored physically [K, M]."""
     row = kc * 16 + lane % 16
     col = col0 + (lane // 16) * 8
-    return prims.ldmatrix(tile_ptr(sbuf, row, col, page=page, rows=rows), 4, prims.MMALayout.COL)
+    return prims.ldmatrix(tile_ptr(sbuf, row, col, chunk_elems=chunk_elems, rows=rows), 4, prims.MMALayout.COL)
 
 
 @cute.jit
@@ -93,7 +93,7 @@ def mma_bstream(
     N: cutlass.Constexpr[int],
     b_trans: cutlass.Constexpr[bool],
     b_rows: cutlass.Constexpr[int],
-    b_page: cutlass.Constexpr[int],
+    b_chunk_elems: cutlass.Constexpr[int],
     lane,
     ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
     col_base=0,
@@ -128,7 +128,7 @@ def mma_bstream(
         else:
             row = row_base + (n_frag + n_offset) * 8 + b_row
             col = b_k_step * 16 + b_col_subchunk * 8 + col_base
-        b_ptr = tile_ptr(sB, row, col, page=b_page, rows=b_rows)
+        b_ptr = tile_ptr(sB, row, col, chunk_elems=b_chunk_elems, rows=b_rows)
         b_v = prims.ldmatrix(b_ptr, 4, layout_flag)
         for m_block in cutlass.range_constexpr(M_BLOCKS):
             a_off = m_block * a_stride
