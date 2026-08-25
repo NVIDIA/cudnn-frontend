@@ -38,6 +38,7 @@ We are now shipping **OSS kernels**, allowing you to inspect, modify, and contri
 *   **[Grouped GEMM + Quant (Unified)](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/grouped/quant):** Unified grouped GEMM quant API with per-row gating for MoE FC2/dFC1 workloads.
 *   **[Grouped GEMM + Wgrad](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/grouped/wgrad):** Unified BF16 and legacy block-scaled grouped GEMM weight-gradient API supporting dense and discrete output layouts for MoE workloads.
 *   **[BSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/block_sparse_attention/):** Block-sparse attention forward and backward CuTe DSL kernels for block-level routing metadata.
+*   **[Flex Attention](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/flex_attention/):** SM90/SM100/SM103 CuTe DSL attention with reusable arbitrary interval-mask plans and PyTorch autograd.
 *   **[NSA](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/native_sparse_attention/):** Native Sparse attention as described in the Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.
 *   **[SDPA Backward: SM100, D=256](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/sdpa):** SDPA Backward pass for D=256 on SM100.
 *   **[cudnn SDPA Fprop](https://github.com/NVIDIA/cudnn-frontend/tree/main/include/cudnn_frontend/generated/sdpa):** Open sourcing the Hopper and Blackwell fprop kernels with stats.
@@ -144,7 +145,7 @@ cmake --build . -j16
 *   **Blog & Deep Dives:** [nvidia.github.io/cudnn-frontend](https://nvidia.github.io/cudnn-frontend/) — release notes, installation guides, and technical deep-dives (MXFP8 attention, FP8 scale layouts, etc.)
 *   **C++ Samples:** See [`samples/cpp`](samples/cpp) for end-to-end examples covering convolution, matmul, SDPA / Flash Attention, normalization, and more.
 *   **Python Samples:** See [`samples/python`](samples/python) for Jupyter notebooks and PyTorch integration patterns.
-*   **OSS Kernels:** See [`python/cudnn/`](python/cudnn/) for source of SDPA, grouped GEMM + SwiGLU/GLU, RMSNorm + SiLU, Native Sparse Attention, and other open-sourced kernels.
+*   **OSS Kernels:** See [`python/cudnn/`](python/cudnn/) for source of SDPA, Flex Attention, grouped GEMM + SwiGLU/GLU, RMSNorm + SiLU, Native Sparse Attention, and other open-sourced kernels.
 *   **PyTorch Custom Ops:** See [`python/cudnn/experimental/ops`](python/cudnn/experimental/ops) for `torch.compile`-compatible wrappers around cuDNN kernels.
 
 ## 🤝 Contributing

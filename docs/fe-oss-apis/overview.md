@@ -30,6 +30,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
+- [Flex Attention](attention/flex_attention.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
@@ -54,7 +55,9 @@ After installation, you can import the APIs directly from the `cudnn` package, i
 
 ## API Usage
 
-Each operation exposes two APIs:
+Most compiler-style operations expose the following two APIs. Functional
+autograd integrations such as BSA and Flex Attention instead document their
+own wrapper and reusable-plan lifecycle on their operation pages.
 
 ### 1. High-level wrapper
 
