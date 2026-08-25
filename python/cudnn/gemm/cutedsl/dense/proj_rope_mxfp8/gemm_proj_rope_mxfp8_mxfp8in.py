@@ -72,31 +72,7 @@ assert HALF == QK_ROPE // 2, "HALF must be QK_ROPE // 2"
 assert TILE_M % BLOCK == 0, "TILE_M must be a whole number of MXFP8 blocks"
 assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COLBLK x N_FEATCELL"
 
-# ---- RoPE arithmetic ----
-# The unfused path applies RoPE with Megatron's Triton rotary_fwd_q_kernel.  Reading the PTX
-# that kernel compiles to (scripts/rope_ptx.py) it contains no fp32 instruction at all: per
-# output element it emits one mul.bf16, one neg.bf16, and one fma.rn.bf16.  So Triton computes
-#
-#   left  = fma.rn.bf16( x1, cos_l, -mul.bf16(x2, sin_l) )
-#   right = fma.rn.bf16( x1, sin_r,  mul.bf16(x2, cos_r) )
-#
-# where the fma forms its product exactly and rounds the sum exactly once.
-#
-# Two evaluations of that expression are implemented below and selected by
-# NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA:
-#
-#   0 (default): reproduce the *shape* -- which product is materialized, which is folded into
-#     the fma -- but evaluate in fp32 with packed-f32x2 ops and narrow at the end.  That is a
-#     double rounding: when the fp32 result lands exactly on a BF16 midpoint, the second
-#     rounding breaks a tie that a single rounding would never have seen, and the result is one
-#     ULP off the correctly rounded value.  Measured at 1 element in 1e8 (README T21).
-#
-#   1: emit the same bf16 instructions Triton does, via inline PTX.  Single rounding, so it is
-#     both correctly rounded and bit-identical to the unfused path.  Costs the packed-f32x2
-#     throughput on the rope cell (1 of 3 feature cells).
-#
-# Both agree on all but ~1e-8 of elements; the flag exists to measure that difference and the
-# cost of closing it.
+
 ROPE_BF16_FMA = int(os.environ.get("NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA", "0")) > 0
 
 @cute.jit
@@ -104,26 +80,6 @@ def _to_bf16_f32(v):
     """Round an fp32 value through BF16 and back, matching the unfused RoPE's storage."""
     return v.to(cutlass.BFloat16).to(cutlass.Float32)
 
-
-# ---- Native BF16 rope, packed ----
-# cute.arch exposes packed-f32x2 arithmetic but no bf16 arithmetic, so this goes through inline
-# PTX.  Two details are load-bearing:
-#
-#   fma.rn.bf16x2 forms its products exactly and rounds each half once, which is what an fp32
-#   fma followed by a narrow cannot reproduce.  Its per-half rounding is identical to the scalar
-#   fma.rn.bf16 that rotary_fwd_q_kernel emits, so the packed form is not an approximation of
-#   the scalar one -- it is the same function, verified elementwise in scripts/probe_bf16_ptx.py.
-#
-#   The whole pair goes in *one* asm block.  A first cut used one block per instruction, six per
-#   pair, and cost 5.2x on the kernel (README T24).  Halving the instruction count by packing is
-#   the small part of the win: an inline_ptx block is opaque to ptxas, so six of them per pair
-#   with BLOCK=32 unrolled put up to 192 barriers through an epilogue that has to overlap this
-#   arithmetic with the quantize, the amax reduction and the stores.
-#
-# Operands are raw bit patterns, not BFloat16: a bf16 MLIR type on an inline-asm operand makes
-# the NVVM backend fail to compile with no usable diagnostic.  Everything arrives as a 16-bit
-# value and gets packed here; an earlier version fetched the adjacent cos/sin as one 32-bit load
-# instead, which saves two loads but reintroduces that same silent compile failure.
 _ROPE_PROLOGUE = (
     "{\n"
     " .reg .b32 pp, qq, cc, ss, tq;\n"
@@ -575,11 +531,7 @@ def gemm_proj_rope_mxfp8_kernel(
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
                             qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
-                            qc0 = _to_bf16_f32(qc0)
-                            qc1 = _to_bf16_f32(qc1)
                             v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
-                            v0 = _to_bf16_f32(v0)
-                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -611,11 +563,7 @@ def gemm_proj_rope_mxfp8_kernel(
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
                             qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
-                            qs0 = _to_bf16_f32(qs0)
-                            qs1 = _to_bf16_f32(qs1)
                             v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
-                            v0 = _to_bf16_f32(v0)
-                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
