@@ -1,6 +1,23 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
  */
 
 #include <inttypes.h>
@@ -2833,3 +2850,59 @@ TEST_CASE("Batch normalization", "[frontend][fusion][bn]") {
     std::cout << "\n========================================================================================\n";
 }
 #endif
+
+// Correct test for run_conv_scale_bias_relu_gen_index_selection
+TEST_CASE("Test conv scale bias relu gen index selection", "[myconv][genindex]") {
+    int64_t x_dim[] = {64, 3, 224, 224};
+    int64_t w_dim[] = {32, 3, 3, 3};
+    int64_t y_dim[] = {64, 32, 224, 224};
+    int64_t s_dim[] = {1, 32, 1, 1};
+    int64_t b_dim[] = {1, 32, 1, 1};
+    int64_t threshold_dim[] = {1, 1, 1, 1};
+    cudnnDataType_t dataType = CUDNN_DATA_HALF;
+    int convDim = 2;
+    int64_t conv_padA[] = {1, 1};
+    int64_t conv_dilationA[] = {1, 1};
+    int64_t conv_strideA[] = {1, 1};
+    int axis = 1;
+
+    void *devPtrX, *devPtrW, *devPtrY, *devPtrS, *devPtrB, *devPtrTopThreshold, *devPtrBottomThreshold;
+    size_t xBytes = x_dim[0]*x_dim[1]*x_dim[2]*x_dim[3] * sizeof(__half);
+    size_t wBytes = w_dim[0]*w_dim[1]*w_dim[2]*w_dim[3] * sizeof(__half);
+    size_t yBytes = y_dim[0]*y_dim[1]*y_dim[2]*y_dim[3] * sizeof(__half);
+    size_t sBytes = s_dim[0]*s_dim[1]*s_dim[2]*s_dim[3] * sizeof(float);
+    size_t bBytes = b_dim[0]*b_dim[1]*b_dim[2]*b_dim[3] * sizeof(float);
+    size_t thBytes = 4;
+
+    cudaMalloc(&devPtrX, xBytes);
+    cudaMalloc(&devPtrW, wBytes);
+    cudaMalloc(&devPtrY, yBytes);
+    cudaMalloc(&devPtrS, sBytes);
+    cudaMalloc(&devPtrB, bBytes);
+    cudaMalloc(&devPtrTopThreshold, thBytes);
+    cudaMalloc(&devPtrBottomThreshold, thBytes);
+
+    try {
+        run_conv_scale_bias_relu_gen_index_selection(
+            x_dim, w_dim, y_dim, s_dim, b_dim, threshold_dim,
+            dataType, convDim,
+            conv_padA, conv_dilationA, conv_strideA,
+            axis,
+            devPtrX, devPtrW, devPtrY, devPtrS, devPtrB,
+            devPtrTopThreshold, devPtrBottomThreshold
+        );
+        REQUIRE(true);
+    } catch (const std::exception& e) {
+        FAIL(e.what());
+    } catch (...) {
+        FAIL("Unknown exception");
+    }
+
+    cudaFree(devPtrX);
+    cudaFree(devPtrW);
+    cudaFree(devPtrY);
+    cudaFree(devPtrS);
+    cudaFree(devPtrB);
+    cudaFree(devPtrTopThreshold);
+    cudaFree(devPtrBottomThreshold);
+}
