@@ -114,6 +114,10 @@ _SM120_DTYPE_QKV_CODE = {
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
 _WS_ALIGN = 128
 
+# Private torch symbol, resolved once. It only shortcuts the stream context, so
+# a build without it must fall through to the public API rather than fail.
+_CUDA_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
 
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
@@ -134,10 +138,11 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     # and entering a context for the current stream is a no-op. Building the two
     # Stream objects below costs ~3.4 us each and this runs several times per
     # execute; the raw handle getter is ~0.07 us.
-    _idx = device.index if device.index is not None else torch.cuda.current_device()
-    if handle == torch._C._cuda_getCurrentRawStream(_idx):
-        yield
-        return
+    if _CUDA_RAW_STREAM is not None:
+        _idx = device.index if device.index is not None else torch.cuda.current_device()
+        if handle == _CUDA_RAW_STREAM(_idx):
+            yield
+            return
     torch_current = torch.cuda.current_stream(device)
     torch_default = torch.cuda.default_stream(device)
     if handle == torch_current.cuda_stream:
