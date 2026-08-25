@@ -249,9 +249,7 @@ def _check_dsl_sm100_strided_stats(d_qk, d_v):
     v = _bhsd(b, h, s, d_v, dtype)
 
     _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True)
-    o, strided_stats = _run_dsl_graph(
-        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True, stats_layout="strided"
-    )
+    o, strided_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True, stats_layout="strided")
     o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)

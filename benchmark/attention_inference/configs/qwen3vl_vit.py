@@ -34,16 +34,16 @@ CONFIG = InferenceBenchmarkConfig(
     name="qwen3vl_vit",
     models=[QWEN3VL_VIT],
     context_seqlens=[
-        8836,   # 94x94 patch grid
+        8836,  # 94x94 patch grid
         15376,  # 124x124 (most frequent single-image forward)
         24336,  # 156x156
         35344,  # 188x188 (FLOPs-median forward)
         47376,  # non-square grid (e.g. 168x282)
         62500,  # 250x250
     ],
-    context_chunked_shapes=[],   # encoder: no chunked prefill against a cache
-    generation_shapes=[],        # encoder: no decode phase
-    context_causal=False,        # bidirectional ViT self-attention
+    context_chunked_shapes=[],  # encoder: no chunked prefill against a cache
+    generation_shapes=[],  # encoder: no decode phase
+    context_causal=False,  # bidirectional ViT self-attention
     # bf16 only: this suite expresses fp8 solely as the generation-phase
     # kv-cache axis (the fp8 attention graph), and an encoder has no
     # generation phase — the context path has no fp8 route today. The training

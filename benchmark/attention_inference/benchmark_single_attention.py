@@ -240,10 +240,18 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
     q, k, v = graph.tensor_like(q_gpu), graph.tensor_like(k_gpu), graph.tensor_like(v_gpu)
     scalars = {n: graph.tensor_like(t) for n, t in ones.items()}
     kwargs = dict(
-        q=q, k=k, v=v,
-        descale_q=scalars["dq"], descale_k=scalars["dk"], descale_v=scalars["dv"],
-        descale_s=scalars["ds"], scale_s=scalars["ss"], scale_o=scalars["so"],
-        is_inference=True, attn_scale=args.sm_scale, name="sdpa_fp8",
+        q=q,
+        k=k,
+        v=v,
+        descale_q=scalars["dq"],
+        descale_k=scalars["dk"],
+        descale_v=scalars["dv"],
+        descale_s=scalars["ds"],
+        scale_s=scalars["ss"],
+        scale_o=scalars["so"],
+        is_inference=True,
+        attn_scale=args.sm_scale,
+        name="sdpa_fp8",
     )
     if args.phase == "generation" and sq > 1:
         kwargs["use_causal_mask_bottom_right"] = True
@@ -725,12 +733,22 @@ def main():
     ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
 
     flops = attention_flops(
-        args.batch_size, args.q_tokens, args.kv_len, args.num_q_heads, args.head_dim_qk, args.head_dim_vo,
+        args.batch_size,
+        args.q_tokens,
+        args.kv_len,
+        args.num_q_heads,
+        args.head_dim_qk,
+        args.head_dim_vo,
         causal_prefill=args.causal and args.phase == "context",
     )
     byts = attention_bytes(
-        args.batch_size, args.q_tokens, args.kv_len, args.num_q_heads, args.num_kv_heads,
-        args.head_dim_qk, args.head_dim_vo,
+        args.batch_size,
+        args.q_tokens,
+        args.kv_len,
+        args.num_q_heads,
+        args.num_kv_heads,
+        args.head_dim_qk,
+        args.head_dim_vo,
         kv_shared=args.kind == "mla_absorbed",
         sliding_window=args.sliding_window_size,
         kv_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" else 2,
@@ -742,10 +760,7 @@ def main():
     peak = get_peak_bw_gbps()
     sol = f"{gbps / peak * 100.0:.4f}" if peak else ""
 
-    print(
-        f"RESULT,{ms:.6f},{tflops:.3f},{gbps:.3f},{sol},"
-        f"{torch.cuda.get_device_name().replace(',', ';')},{detail.replace(',', ';')}"
-    )
+    print(f"RESULT,{ms:.6f},{tflops:.3f},{gbps:.3f},{sol}," f"{torch.cuda.get_device_name().replace(',', ';')},{detail.replace(',', ';')}")
 
 
 if __name__ == "__main__":
