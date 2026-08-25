@@ -612,10 +612,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - split_kvs / split_d_shapes: only the SM100 d128 kernel wires
       SplitHelpers; the SM107 sibling has no split path yet, and the
       d192x128 file forks its own scheduler and has none either.
-    - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
-      sibling (issue #653); {NATURAL} keeps requests honest AND routes the
-      graph path around the un-ported derivation (place() hands the adapter
-      an explicit policy from this domain).
+    - sched_policies: both rows carry the LPT/LPT_L2 remap. The SM107
+      sibling reached its decode through call sites that dropped the two
+      trailing arguments LPT_L2 needs, so it served NATURAL only (issue
+      #653); the arguments are threaded now and the domains match.
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
@@ -665,9 +665,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            # LPT/LPT_L2 remap is not yet ported to the SM107 sibling (issue
-            # #653) — its row serves NATURAL only until the port lands.
-            sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
