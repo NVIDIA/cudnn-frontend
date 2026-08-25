@@ -528,6 +528,8 @@ class PyGraph {
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
              py::object const& paged_attention_max_seq_len_kv,
+             py::object const& max_total_seq_len_q,
+             py::object const& max_total_seq_len_kv,
              cudnn_frontend::DataType_t const& compute_data_type,
              std::string const& name,
              std::optional<PyCallback> fn,
