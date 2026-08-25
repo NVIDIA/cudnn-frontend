@@ -71,6 +71,7 @@ class TemplateParams:
     sched_policy: int = SCHED_NATURAL
     q_tile: int = SEQ_Q_TILES[0]
     kv_tile: int = SEQ_KV_TILES[0]
+    pack_gqa: bool = False
     # KV split: each Q tile's KV-tile range [min_kv_tile, num_kv_tiles) is cut
     # into ``split_kv`` contiguous chunks, each run by its own CTA writing a
     # partial (O, LSE) that kernels/split_combine_sm100.py reduces.  1 = off.
@@ -132,3 +133,5 @@ def validate_params(
             raise ValueError("SM120 SDPA: thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
             raise ValueError("SM120 SDPA: seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+    if params.pack_gqa and params.thd_varlen:
+        raise ValueError("SM120 SDPA: pack_gqa is not supported with thd_varlen")

@@ -47,6 +47,7 @@ import cudnn
 
 from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, mismatch
 
@@ -259,8 +260,54 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     return [primary if primary in domain else _sole(domain) or SCHED_NATURAL] + runners
 
 
-def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Optional[int], cga: Optional[int]) -> List[Optional[int]]:
+# --- pack_gqa (GQA head packing) --------------------------------------------
+
+
+def _pack_gqa_wins(facts, tile_q: int) -> bool:
+    """Pack when the Q sequence cannot fit in a single tile, then we can further
+    apply split_kv on top of GQA packing.
+
+    TODO: we may enhance this heuristic logic in the future by considering more
+    factors such as the device SM count.
+    """
+    return facts.s_q < tile_q
+
+
+def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int]) -> int:
+    """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
+
+    The SM100 family runs CGA tiles — ``cga_tile_m`` of the flavor the envelope
+    lowering picks for the graph's head dims (d128/d192: 512; d256/d512:
+    256). SM120 launches one CTA per tile, so it is ``tile_m`` itself.
+    """
+    if caps.sm_lo >= 120 and caps.sm_hi < 130:
+        return tile_m or 128
+    if facts.d_qk <= 128 and facts.d_v <= 128:
+        return cga_tile_m(128)
+    if facts.d_qk <= 192 and facts.d_v <= 128:
+        return cga_tile_m(192)
+    if facts.d_qk <= 256 and facts.d_v <= 256:
+        return cga_tile_m(256)
+    return cga_tile_m(512)
+
+
+def _pack_gqa_points(caps: Capabilities, facts, tile_m: int) -> Tuple[bool, ...]:
+    """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
+    ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
+    if not (True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)):
+        return (False,)
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m)):
+        return (True, False)
+    return (False, True)
+
+
+def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Optional[int], cga: Optional[int], pack_g: int = 1) -> List[Optional[int]]:
     """Ordered split-KV candidates for the chosen tile geometry.
+
+    ``pack_g`` is the pack_gqa group of the set the split rides (1 =
+    unpacked): packing multiplies each head-group's Q rows by G and divides
+    the head count by it, so the wave-cost model must see the PACKED launch
+    — the packed grid is smaller, which is exactly when splitting pays.
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
     facts-level launch geometry (``tile_m*cga`` rows per tile — the recommend
@@ -293,8 +340,8 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
         return [no_split]
     rows_per_tile = (tile_m or 128) * (cga or 1)
     split = choose_split_kv(
-        q_tiles=_ceil_div(facts.s_q, rows_per_tile),
-        heads_q=facts.h_q,
+        q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
+        heads_q=facts.h_q // pack_g,
         batch=facts.b,
         kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
         sm_count=sm_count,
@@ -338,29 +385,57 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
     The baseline takes the best value on every axis; runners-up deviate on ONE
-    axis at a time in impact order (tiles, sched, split) with the other axes
-    held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Axis interactions
-    the kernels cannot serve are the generators'/mismatch's job — nothing here
-    multiplies domains together.
+    axis at a time in impact order (tiles, sched, pack_gqa, split) with the
+    other axes held at their best, capped at ``_MAX_SETS_PER_ENGINE``. Two
+    axes carry a structural coupling: a packed set rides the largest tile
+    that admits the ratio, and a split set rides the plain scheduler. Axis
+    interactions the kernels cannot serve are the generators'/mismatch's job
+    — nothing here multiplies domains together.
     """
     caps = spec.capabilities
     tiles = _tile_points(spec, facts)
     scheds = _sched_points(caps, facts)
     cga = _cga_points(caps)[0]
-    splits = _split_points(caps, facts, tiles[0][0], tiles[0][1], cga)
+    # pack_gqa couples with the tile axis: a packed set rides the LARGEST
+    # SMEM-fitting tile that admits the ratio — packing fixes the underfill
+    # small tiles exist for, and a bigger tile admits a bigger G (G must
+    # divide it) — while an unpacked set keeps the tile rule's choice.
+    pack_tile = next(
+        ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_points(caps, facts, m or 128)),
+        None,
+    )
+    packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128)[0]
+    unpacked_pack = False if True in caps.pack_gqas else _sole(caps.pack_gqas)
+    base_tile = pack_tile if packed_first else tiles[0]
+    # The split model sees the launch geometry of the set it rides — the
+    # packed grid when the baseline packs.
+    splits = _split_points(caps, facts, base_tile[0], base_tile[1], cga, pack_g=(facts.h_q // facts.h_kv) if packed_first else 1)
     base = SdpaFwdKnobs(
         sched_policy=scheds[0],
-        tile_m=tiles[0][0],
-        tile_n=tiles[0][1],
+        tile_m=base_tile[0],
+        tile_n=base_tile[1],
         cga=cga,
+        pack_gqa=True if packed_first else unpacked_pack,
         split_kv=splits[0],
         softmax_precision=_softmax_points(caps)[0],
     )
     out = [base]
     for tile_m, tile_n in tiles[1:]:
+        # A packed baseline's tile runners keep the packing, so tiles the
+        # ratio cannot ride are skipped — emitted, they would only spend
+        # set-cap slots for mismatch to drop.
+        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128):
+            continue
         out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
     for policy in scheds[1:]:
         out.append(replace(base, sched_policy=policy))
+    # The opposite pack_gqa leg, riding its own tile (packed: the largest
+    # admitting tile; unpacked: the tile rule's best).
+    if pack_tile is not None:
+        if packed_first:
+            out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1]))
+        else:
+            out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1]))
     for split in splits[1:]:
         # Split sets ride the plain scheduler: the SM120 config bars a split
         # under the LPT remaps, and in the underfilled regime a split targets
@@ -386,6 +461,7 @@ def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
         tile_m=min(caps.tile_ms, default=None),
         tile_n=min(caps.tile_ns, default=None),
         cga=_sole(caps.cgas),
+        pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
         split_kv=1 if 1 in caps.split_kvs else _sole(caps.split_kvs),
         softmax_precision=_sole(caps.softmax_precisions),
     )

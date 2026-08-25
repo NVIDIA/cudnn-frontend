@@ -257,6 +257,19 @@ _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
+# === PackGQA ===
+# PackGQA is not supported for MXFP8 with the current SF contract: sf_q arrives
+# as one opaque 512-byte F8_128x4 atom per (batch, head, 128-row tile) with
+# intra-atom byte order (r%32)*16 + (r//32)*4 + c. The finest TMA-addressable
+# unit inside an atom (16 B) bundles source rows {m, m+32, m+64, m+96} of one
+# head, while a packed tile row j needs token j//G of head j%G — expressing that
+# gather needs a 4-byte-stride dim (illegal: TMA global strides are 16-B units)
+# and 6 dims (> the 5-dim TMA max).
+# Unblock options (all change the contract or add a pass): a packed upstream SF
+# layout, a device-side repack kernel, or an in-kernel quadrant gather + SMEM
+# permute.
+if CFG.PACK_GQA:
+    raise ValueError("prefill_d128_mxfp8_sm100: PACK_GQA is unsupported (F8_128x4 sf_q atom is not TMA-gatherable at token granularity)")
 
 # === KV split ===
 #
@@ -269,13 +282,13 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 
 
 @cute.jit
-def _bounds_for_tile_uniform(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx):
-    """Uniform 6-arg bounds signature for make_split_helpers.
+def _bounds_for_tile_uniform(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
+    """Uniform bounds signature for make_split_helpers.
 
-    This flavor has no dead-Q-tile trim, so the trailing two args are
-    accepted and ignored — callers pass None for them.
+    This flavor has no dead-Q-tile trim, so the seq-lens args are accepted
+    and ignored (callers pass None for them).
     """
-    return _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair)
+    return _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
 
 
 _split_h = make_split_helpers(
@@ -2307,8 +2320,7 @@ def _correction_warp_group(
                         # TMA-STG put the chunk's O.  The pair (O_s, lse_s) is everything
                         # the combine needs.  Folds to batch_idx at SPLIT_KV == 1.
                         lse_batch = _partial_batch(batch_idx, split_idx, n_batch)
-                        lse_row = lse_arr[lse_batch, head_idx, :]
-                        lse_row[q_row_global] = lse_val
+                        lse_arr[lse_batch, head_idx, q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2610,6 +2622,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
 
@@ -2723,11 +2736,15 @@ def compile(  # noqa: A001
     else:
         if lse_head_major or lse_head_stride:
             raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None and SPLIT_KV == 1
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_lse_batch, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

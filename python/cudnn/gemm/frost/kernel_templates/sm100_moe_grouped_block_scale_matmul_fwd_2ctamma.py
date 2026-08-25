@@ -49,7 +49,7 @@ from cuda.bindings import driver as _cuda
 
 # Tensormap workspace slots per CTA: the A operands, plus the output descriptor
 # when the TMA-store epilogue re-dimensions it per routed group.
-moe_desc_slots = num_a_operands * 2 + (1 if use_tma_store_epi else 0)
+moe_desc_slots = num_a_operands * 2 + n_tma_outputs
 
 if use_acc_overlap and any(_w != epi_n for _, _w in _epi_subtile_spans(epi_cols_per_mma_m, epi_n)):
     raise NotImplementedError(f"{__name__}: acc overlap reverses subtiles by index, which needs a uniform drain width")
@@ -123,7 +123,6 @@ def _kernel(
     # @@INJECT_MOE_MSFA_LIST@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_TMA_C_LISTS@@
-    tma_c_desc = tma_c_descs[0]
     # @@TMA_STORE_ONLY:END@@
 
     mma_warp_id = 4
@@ -168,7 +167,8 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_sfb_descs[_j].get_ptr())
 
         # @@TMA_STORE_ONLY:BEGIN@@
-        nvvm.prefetch_tensormap(tma_c_desc.get_ptr())
+        for _ci in cutlass.range_constexpr(n_tma_outputs):
+            nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
         # @@TMA_STORE_ONLY:END@@
 
     a_pattern = 0
@@ -226,7 +226,7 @@ def _kernel(
 
     # @@TMA_STORE_ONLY:BEGIN@@
     # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    epi_subtile_elems = epi_tile_mn[0] * epi_tile_mn[1]
+    epi_subtile_elems = epi_tile_mn[0] * epi_tile_mn[1] * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
         epi_subtile_elems * EPI_SMEM_STAGES,
@@ -235,7 +235,7 @@ def _kernel(
     )
     tma_c_desc_smem = cutlass.Array(
         cutlass.Int64,
-        TENSOR_MAP_QWORDS,
+        TENSOR_MAP_QWORDS * n_tma_outputs,
         space=cutlass.AddressSpace.smem,
         alignment=128,
     )
@@ -331,7 +331,7 @@ def _kernel(
     # @@INJECT_TAP_PTRS@@
 
     VEC_BYTES = vec_bytes_epi
-    vsize = (VEC_BYTES * 8) // cd_dtype.width
+    vsize = epi_chunk_elems
 
     M = m
     N = n
@@ -1098,16 +1098,16 @@ def _kernel(
         # The routed output is a single (1, S, N) tensor, so the batch coord is fixed.
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
-        d_desc_base = a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands * 2) * TENSOR_MAP_QWORDS
-        d_desc_tma_ptr = cute.make_ptr(
-            cutlass.Int64,
-            d_desc_base.toint(),
-            mem_space=cute.AddressSpace.generic,
-        )
+        d_desc_base_list = [
+            a_tma_workspace.iterator.raw_ptr() + (epi_block_linear * moe_desc_slots + num_a_operands * 2 + _di) * TENSOR_MAP_QWORDS
+            for _di in range(n_tma_outputs)
+        ]
+        d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
         previous_group_end = cutlass.Int32(-1)
         if warp_idx == 0:
-            if elect_one:
-                _copy_tensormap_to_workspace(tma_c_desc.get_ptr(), tma_c_desc_smem)
+            for _di in cutlass.range_constexpr(n_tma_outputs):
+                if elect_one:
+                    _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
             nvvm.bar_warp_sync(0xFFFFFFFF)
         # @@TMA_STORE_ONLY:END@@
 
@@ -1140,14 +1140,18 @@ def _kernel(
                 if warp_idx == 0:
                     if group_end != previous_group_end:
                         previous_group_end = group_end
+                        # One drain retires the in-flight stores of EVERY descriptor,
+                        # so it does not repeat per output.
                         nvvm.cp_async_bulk_wait_group(0, read=True)
-                        _fence_tensormap_acquire(d_desc_tma_ptr)
-                        if elect_one:
-                            _replace_tensormap_global_dim_1(tma_c_desc_smem, group_end)
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < TENSOR_MAP_QWORDS:
-                            (d_desc_base + lane).store((tma_c_desc_smem.subview(lane)).load())
-                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        for _di in cutlass.range_constexpr(n_tma_outputs):
+                            _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
+                            _fence_tensormap_acquire(d_desc_ptr_list[_di])
+                            if elect_one:
+                                _replace_tensormap_global_dim_1(_scratch, group_end)
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            if lane < TENSOR_MAP_QWORDS:
+                                (d_desc_base_list[_di] + lane).store((_scratch.subview(lane)).load())
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
                 # @@TMA_STORE_ONLY:END@@
                 # @@EPILOGUE_DRAIN:BEGIN@@
@@ -1220,39 +1224,13 @@ def _kernel(
                         col = coord_n_c + subtile_col_offset
 
                         # @@TMA_STORE_ONLY:BEGIN@@
-                        epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                        smem_subtile_ptr = smem_d_ptr.subview(epi_stage_idx * epi_subtile_elems)
-                        smem_thr_ptr = smem_subtile_ptr.subview(tidx * subtile_w)
-
                         vec_f32 = c_rmem_vec
                         col_j = col
                         linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                         # @@INJECT_EPILOGUE@@
 
-                        smem_thr_ptr.data_ptr().store_swizzled(vec_out, alignment=64, swizzle=epi_smem_swizzle)
-
-                        cute.arch.fence_view_async_shared()
-                        nvvm.barrier_cta_sync(
-                            barrier_id=EPI_SYNC_BAR_ID,
-                            thread_count=num_epilogue_warps * 32,
-                        )
-
-                        if warp_idx == 0:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_global_shared_cta(
-                                    d_desc_tma_ptr,
-                                    smem_subtile_ptr,
-                                    (col, coord_m, tile_l),
-                                )
-                            if elect_one:
-                                nvvm.cp_async_bulk_commit_group()
-                            nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
-
-                        nvvm.barrier_cta_sync(
-                            barrier_id=EPI_SYNC_BAR_ID,
-                            thread_count=num_epilogue_warps * 32,
-                        )
+                        # @@INJECT_TMA_STORE_SEQUENCE@@
                         # @@TMA_STORE_ONLY:END@@
 
                         # @@STG_ONLY:BEGIN@@
@@ -1327,19 +1305,7 @@ def _host(
 
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_LISTS@@
-    c = _tma_c_outputs[0]
-    tma_c_desc = _tma.create_tensor_map_tiled(
-        global_address=c.iterator.toint(),
-        dtype=cd_tma_dtype,
-        global_dims=[n, m, 1],
-        global_strides=[
-            out_stride_m_0 * cd_dtype.width // 128,
-            out_stride_l_0 * cd_dtype.width // 128,
-        ],
-        box_dims=[epi_tile_mn[1], epi_tile_mn[0], 1],
-        swizzle=epi_tma_swizzle,
-    )
-    tma_c_desc_list = [tma_c_desc]
+    # @@INJECT_HOST_TMA_C_DESCS@@
     # @@TMA_STORE_ONLY:END@@
 
     tma_a_desc_list = []
@@ -1556,10 +1522,10 @@ def compile() -> Callable:
     # @@INJECT_COMPILE_TAP_FAKES@@
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    def _make_fake_c():
+    def _make_fake_c(_dt=None, _div=None):
         return make_fake_compact_tensor(
-            cd_dtype,
-            (sym_m, sym_n // cd_fake_n_div, 1),
+            cd_dtype if _dt is None else _dt,
+            (sym_m, sym_n // (cd_fake_n_div if _div is None else _div), 1),
             stride_order=(1, 0, 2),
             assumed_align=16,
         )

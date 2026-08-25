@@ -19,12 +19,11 @@ from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, ffma2, fmul2, fp32_to_fp16
-from .elementwise import l2norm_inv, lane_group_sum
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, ffma2, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 
 THREADS_PER_ROW = 16
 ROWS_PER_CTA = 8
-FWD_LANES = 4  # fwd lanes per row: 32 elems/lane (4 x 128-bit loads), 2-step butterfly
+FWD_LANES = 4  # fwd lanes per row: 32 elements/lane (4 x 128-bit loads), 2-step butterfly
 FWD_ROWS_PER_GROUP = 2  # fwd rows batched per lane group: 8 independent loads in flight per thread
 
 
@@ -53,11 +52,11 @@ def l2norm_qk_kernel(
     bid = cute.arch.block_idx()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     grp = tidx // cutlass.Int32(FWD_LANES)
-    lane = tidx % cutlass.Int32(FWD_LANES)
+    lane_idx = tidx % cutlass.Int32(FWD_LANES)
     row0 = (cutlass.Int32(bid[0]) * cutlass.Int32(128 // FWD_LANES) + grp) * cutlass.Int32(FWD_ROWS_PER_GROUP)
-    v0 = lane * cutlass.Int32(32)
+    v0 = lane_idx * cutlass.Int32(32)
     rows = []
-    ws_addrs = []
+    workspace_addrs = []
     nrm_addrs = []
     vals = []
     for r in cutlass.range_constexpr(FWD_ROWS_PER_GROUP):
@@ -67,22 +66,22 @@ def l2norm_qk_kernel(
         # [T, H, 128] strides while workspace rows sit at row * 128.  Both
         # branches are traced, so the addresses have to exist beforehand.
         src_addr = cutlass.Int64(0)
-        ws_addr = cutlass.Int64(0)
+        workspace_addr = cutlass.Int64(0)
         nrm_addr = cutlass.Int64(0)
         if row_r < n_q_rows:
             t = row_r // h_q
             h = row_r % h_q
-            src_elems = t * cutlass.Int64(mQ.stride[0]) + h * cutlass.Int64(mQ.stride[1]) + cutlass.Int64(v0)
-            src_addr = mQ.iterator.toint() + src_elems * cutlass.Int64(2)
-            ws_addr = mQn.iterator.toint() + (cutlass.Int64(row_r) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
+            src_elements = t * cutlass.Int64(mQ.stride[0]) + h * cutlass.Int64(mQ.stride[1]) + cutlass.Int64(v0)
+            src_addr = mQ.iterator.toint() + src_elements * cutlass.Int64(2)
+            workspace_addr = mQn.iterator.toint() + (cutlass.Int64(row_r) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvQ.iterator.toint() + cutlass.Int64(row_r) * cutlass.Int64(4)
         else:
             k_row = row_r - n_q_rows
             t = k_row // h_k
             h = k_row % h_k
-            src_elems = t * cutlass.Int64(mK.stride[0]) + h * cutlass.Int64(mK.stride[1]) + cutlass.Int64(v0)
-            src_addr = mK.iterator.toint() + src_elems * cutlass.Int64(2)
-            ws_addr = mKn.iterator.toint() + (cutlass.Int64(k_row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
+            src_elements = t * cutlass.Int64(mK.stride[0]) + h * cutlass.Int64(mK.stride[1]) + cutlass.Int64(v0)
+            src_addr = mK.iterator.toint() + src_elements * cutlass.Int64(2)
+            workspace_addr = mKn.iterator.toint() + (cutlass.Int64(k_row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         chunks = []
         for c in cutlass.range_constexpr(4):
@@ -97,7 +96,7 @@ def l2norm_qk_kernel(
             f6, f7 = f16x2_to_f32(w3, dtype=mQ.element_type)
             chunks.append((f0, f1, f2, f3, f4, f5, f6, f7))
         rows.append(row)
-        ws_addrs.append(ws_addr)
+        workspace_addrs.append(workspace_addr)
         nrm_addrs.append(nrm_addr)
         vals.append(chunks)
     for r in cutlass.range_constexpr(FWD_ROWS_PER_GROUP):
@@ -119,9 +118,9 @@ def l2norm_qk_kernel(
                 w3 = fp32_to_fp16(s6, s7, dtype=mQ.element_type)
                 inline_ptx(
                     "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-                    read_only_args=[ws_addrs[r] + cutlass.Int64(16 * c), w0, w1, w2, w3],
+                    read_only_args=[workspace_addrs[r] + cutlass.Int64(16 * c), w0, w1, w2, w3],
                 )
-            if lane == cutlass.Int32(0):
+            if lane_idx == cutlass.Int32(0):
                 inline_ptx("st.global.f32 [$0], $1;", read_only_args=[nrm_addrs[r], inv])
 
 
@@ -147,26 +146,26 @@ def l2norm_qk_bwd_kernel(
     bid = cute.arch.block_idx()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     row = cutlass.Int32(bid[0]) * cutlass.Int32(ROWS_PER_CTA) + tidx // cutlass.Int32(THREADS_PER_ROW)
-    lane = tidx % cutlass.Int32(THREADS_PER_ROW)
+    lane_idx = tidx % cutlass.Int32(THREADS_PER_ROW)
     if row < n_rows:
-        v0 = lane * cutlass.Int32(8)
+        v0 = lane_idx * cutlass.Int32(8)
         grad_addr = cutlass.Int64(0)
-        ws_addr = cutlass.Int64(0)
+        workspace_addr = cutlass.Int64(0)
         nrm_addr = cutlass.Int64(0)
         if row < n_q_rows:
             t = row // h_q
             h = row % h_q
-            grad_elems = t * cutlass.Int64(mDq.stride[0]) + h * cutlass.Int64(mDq.stride[1]) + cutlass.Int64(v0)
-            grad_addr = mDq.iterator.toint() + grad_elems * cutlass.Int64(2)
-            ws_addr = mQn.iterator.toint() + (cutlass.Int64(row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
+            grad_elements = t * cutlass.Int64(mDq.stride[0]) + h * cutlass.Int64(mDq.stride[1]) + cutlass.Int64(v0)
+            grad_addr = mDq.iterator.toint() + grad_elements * cutlass.Int64(2)
+            workspace_addr = mQn.iterator.toint() + (cutlass.Int64(row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvQ.iterator.toint() + cutlass.Int64(row) * cutlass.Int64(4)
         else:
             k_row = row - n_q_rows
             t = k_row // h_k
             h = k_row % h_k
-            grad_elems = t * cutlass.Int64(mDk.stride[0]) + h * cutlass.Int64(mDk.stride[1]) + cutlass.Int64(v0)
-            grad_addr = mDk.iterator.toint() + grad_elems * cutlass.Int64(2)
-            ws_addr = mKn.iterator.toint() + (cutlass.Int64(k_row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
+            grad_elements = t * cutlass.Int64(mDk.stride[0]) + h * cutlass.Int64(mDk.stride[1]) + cutlass.Int64(v0)
+            grad_addr = mDk.iterator.toint() + grad_elements * cutlass.Int64(2)
+            workspace_addr = mKn.iterator.toint() + (cutlass.Int64(k_row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         gw0, gw1, gw2, gw3 = inline_ptx(
             "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
@@ -180,7 +179,7 @@ def l2norm_qk_bwd_kernel(
         nw0, nw1, nw2, nw3 = inline_ptx(
             "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
             write_only_types=[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32],
-            read_only_args=[ws_addr],
+            read_only_args=[workspace_addr],
         )
         n0, n1 = f16x2_to_f32(nw0, dtype=mQn.element_type)
         n2, n3 = f16x2_to_f32(nw1, dtype=mQn.element_type)

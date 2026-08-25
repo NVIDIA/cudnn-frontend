@@ -528,13 +528,13 @@ levels, with no shared vocabulary at all:
 
 - **Vocabulary per operation.** Each op defines a typed, frozen dataclass:
   `cudnn.sdpa.fwd.engines.SdpaFwdKnobs(sched_policy=None, tile_m=None,
-  tile_n=None, cga=None)`, where `None` means "no preference". SDPA's knobs
-  cannot collide with GEMM's; fields have real types instead of
-  enum-plus-int64.
+  tile_n=None, cga=None, pack_gqa=None)`, where `None` means "no
+  preference". SDPA's knobs cannot collide with GEMM's; fields have real
+  types instead of enum-plus-int64.
 - **Domains per engine.** Each `Capabilities` row advertises the values its
   lowering honors: `sched_policies = {NATURAL}`, `tile_ms = {128}`,
-  `tile_ns = {128}`, `cgas = {2}`. Two engines of the same op may honor
-  different subsets.
+  `tile_ns = {128}`, `cgas = {2}`, `pack_gqas = {False}`. Two engines of the
+  same op may honor different subsets.
 - **Per plan, not per graph.** A knob set rides on `PlanConfig.knobs`, so a
   tuning choice is part of the plan's identity: a family that wants several
   tunings ranked emits several `PlanConfig`s from `recommend()`, each with its

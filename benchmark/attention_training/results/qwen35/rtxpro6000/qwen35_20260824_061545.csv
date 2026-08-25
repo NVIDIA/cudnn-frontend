@@ -1,0 +1,11 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
+qwen35,qwen35,cudnn,bfloat16,top_left,1,32768,32768,32,2,256,256,fwd,False,107.209,164.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,466.000
+qwen35,qwen35,cudnn_oss,bfloat16,top_left,1,32768,32768,32,2,256,256,fwd,False,46.468,379.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,459.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,16384,16384,32,2,256,256,fwd,False,27.199,162.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn_oss,bfloat16,top_left,1,16384,16384,32,2,256,256,fwd,False,11.411,385.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,8192,8192,32,2,256,256,fwd,False,6.980,158.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn_oss,bfloat16,top_left,1,8192,8192,32,2,256,256,fwd,False,3.090,356.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,459.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,4096,4096,32,2,256,256,fwd,False,1.928,143.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn_oss,bfloat16,top_left,1,4096,4096,32,2,256,256,fwd,False,0.840,327.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,2048,2048,32,2,256,256,fwd,False,0.542,127.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000
+qwen35,qwen35,cudnn_oss,bfloat16,top_left,1,2048,2048,32,2,256,256,fwd,False,0.303,227.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.28.0,92600.000,458.000

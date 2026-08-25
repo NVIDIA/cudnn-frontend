@@ -36,6 +36,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -87,6 +88,7 @@ class SdpaFwdKnobs:
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
     cga: Optional[int] = None  # cluster size (CTAs cooperating per tile)
+    pack_gqa: Optional[bool] = None  # Head packing for GQA/MQA
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
@@ -239,6 +241,7 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    pack_gqas: frozenset[bool] = frozenset({False})
     # Split-KV domain. {1} = the axis exists but only "off" is served; rows
     # whose kernels wire the split path AND whose adapter launches the combine
     # widen this (the SM100 f16 rows today).
@@ -293,6 +296,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
             (knobs.split_kv, capabilities.split_kvs, "split_kv"),
             (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
@@ -323,6 +327,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return (
                     f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
                 )
+        if knobs.pack_gqa:
+            if facts.thd:
+                return "PackGQA is currently not supported for THD/ragged graphs"
+            _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m):
+                return f"PackGQA requires h_q/h_kv to divide tile_m: h_q/h_kv = {facts.h_q}/{facts.h_kv} does not tile at tile_m={_pg_tile_m}"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -444,6 +454,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
+    if facts.stats_t is not None and not facts.thd:
+        if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
+            return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
+        stats_dim = tuple(facts.stats_t.get_dim())
+        stats_stride = tuple(facts.stats_t.get_stride())
+        expected_dim = (facts.b, facts.h_q, facts.s_q, 1)
+        if stats_dim != expected_dim:
+            return f"stats must be (B, H_q, S_q, 1) = {expected_dim}; got {stats_dim}"
+        if not ga.dense_layout_ok(stats_dim, stats_stride):
+            return (
+                "stats must use a dense-compatible B/H/S permutation or padded layout "
+                f"with non-broadcast, non-overlapping-by-span strides; got {stats_stride}"
+            )
+
     if capabilities.single_wave_only:
         # See Capabilities.single_wave_only. 512 = TILES_Q * TILE_M * CTA_MMA
         # rows per cluster; resident clusters = SM count / CTA_MMA (one CTA per
@@ -517,6 +541,7 @@ def _sm100_spec() -> EngineSpec:
             # carves the partial slabs + launches split_combine_sm100 when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
             split_kvs=frozenset({1, 2, 4}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -567,6 +592,11 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # The split path also needs a half-precision O (mismatch's
             # facts x knobs gate) and rides the d128 flavor (split_d_shapes).
             split_kvs=frozenset({1, 2, 4}),
+            # PackGQA is currently not supported for the MXFP8 SDPA engine:
+            # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
+            # head, so a packed tile's interleaved (token, head) rows cannot
+            # gather their scale factors at token granularity.
+            pack_gqas=frozenset({False}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -664,6 +694,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # quantized rows; split_d_shapes pins it to the d128 flavor.
             split_kvs=frozenset({1}) if rubin_row else frozenset({1, 2, 4}),
             split_d_shapes=frozenset({(128, 128)}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -753,6 +784,7 @@ def _sm120_spec() -> EngineSpec:
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -847,6 +879,7 @@ def lower_dsl_prefill(
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
         cga=knobs.cga if knobs is not None else None,
+        pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=knobs.softmax_precision if knobs is not None else None,
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
@@ -1109,6 +1142,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )

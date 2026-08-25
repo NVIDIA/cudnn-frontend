@@ -40,7 +40,7 @@ import cudnn
 # ---------------------------------------------------------------------------
 
 
-_TORCH_DTYPE_TO_CUDNN = {
+TORCH_DTYPE_TO_CUDNN = {
     torch.float16: cudnn.data_type.HALF,
     torch.bfloat16: cudnn.data_type.BFLOAT16,
     torch.float32: cudnn.data_type.FLOAT,
@@ -48,10 +48,9 @@ _TORCH_DTYPE_TO_CUDNN = {
     torch.int64: cudnn.data_type.INT64,
 }
 
-# one graph per static configuration (shapes, dtypes, scale, flags, device)
-_fprop_cache: Dict[tuple, tuple] = {}
-_bprop_cache: Dict[tuple, tuple] = {}
-_cudnn_handles: Dict[int, int] = {}
+fprop_cache: Dict[tuple, tuple] = {}
+bprop_cache: Dict[tuple, tuple] = {}
+cudnn_handles: Dict[int, int] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +72,9 @@ def select_plan(graph, plan_name):
     graph.check_support()
 
 
-def _graph_workspace(graph, device):
+def graph_workspace(graph, device):
     """Caller-side workspace for a compiled graph."""
     if not graph._is_built:
-        # mirror execute()'s auto-build: plan first (a bare build() would
-        # lower GDN2 to the backend, which has no lowering)
         if not graph._planning_done:
             graph.create_execution_plans()
         if graph.selected_engine is None:
@@ -85,36 +82,36 @@ def _graph_workspace(graph, device):
         else:
             graph.build_plans()
     size = graph.get_workspace_size()
-    ws = getattr(graph, "_la_ops_workspace", None)
-    if ws is None or ws.numel() < size or ws.device != device:
-        ws = torch.empty(max(size, 1), dtype=torch.uint8, device=device)
-        graph._la_ops_workspace = ws
-    return ws
+    workspace = getattr(graph, "la_ops_workspace", None)
+    if workspace is None or workspace.numel() < size or workspace.device != device:
+        workspace = torch.empty(max(size, 1), dtype=torch.uint8, device=device)
+        graph.la_ops_workspace = workspace
+    return workspace
 
 
-def _get_handle(device):
+def get_handle(device):
     """Per-device cuDNN handle carrying the caller's current stream."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    handle = _cudnn_handles.get(idx)
+    handle = cudnn_handles.get(idx)
     if handle is None:
         with torch.cuda.device(idx):
             handle = cudnn.create_handle()
-        _cudnn_handles[idx] = handle
+        cudnn_handles[idx] = handle
     cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
     return handle
 
 
-def _torch_dtype_to_cudnn(dtype: torch.dtype):
+def torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
-    return _TORCH_DTYPE_TO_CUDNN[dtype]
+    return TORCH_DTYPE_TO_CUDNN[dtype]
 
 
-def _check_dtype(name, t, want) -> None:
+def check_dtype(name, t, want) -> None:
     if t.dtype != want:
         raise TypeError(f"gated_delta_net_v2: {name} must be {want} (kernel-native; callers convert), got {t.dtype}")
 
 
-def _make_fprop_cache_key(
+def make_fprop_cache_key(
     total,
     N,
     H,
@@ -136,7 +133,7 @@ def _make_fprop_cache_key(
     safe_gate,
     gate_lower_bound,
     has_initial_state,
-    ckpt,
+    checkpoint,
     device,
     plan_name,
 ):
@@ -163,13 +160,13 @@ def _make_fprop_cache_key(
         bool(safe_gate),
         float(gate_lower_bound) if gate_lower_bound is not None else None,
         bool(has_initial_state),
-        ckpt,
+        checkpoint,
         device,
         plan_name,
     )
 
 
-def _make_bprop_cache_key(
+def make_bprop_cache_key(
     total,
     N,
     H,
@@ -186,7 +183,7 @@ def _make_bprop_cache_key(
     cu_dtype,
     state_dtype,
     dstate_in_dtype,
-    ckpt_rows,
+    checkpoint_rows,
     scale,
     use_qk_l2norm,
     batch_invariant,
@@ -214,7 +211,7 @@ def _make_bprop_cache_key(
         cu_dtype,
         state_dtype,
         dstate_in_dtype,
-        ckpt_rows,
+        checkpoint_rows,
         float(scale),
         bool(use_qk_l2norm),
         bool(batch_invariant),
@@ -231,7 +228,7 @@ def _make_bprop_cache_key(
 # ---------------------------------------------------------------------------
 
 
-def _build_fprop_graph(
+def build_fprop_graph(
     total,
     N,
     H,
@@ -250,7 +247,7 @@ def _build_fprop_graph(
     batch_invariant,
     safe_gate,
     gate_lower_bound,
-    ckpt,
+    checkpoint,
     use_beta_sigmoid=False,
 ):
     graph = cudnn.pygraph()
@@ -288,7 +285,7 @@ def _build_fprop_graph(
         use_beta_sigmoid=use_beta_sigmoid or None,
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
-        checkpoint_every_n_tokens=ckpt,
+        checkpoint_every_n_tokens=checkpoint,
         name="gdn2",
     )
     return graph, dict(
@@ -314,7 +311,7 @@ def _build_fprop_graph(
 
 
 @torch.library.custom_op("cudnn::gated_delta_net_v2_fwd", mutates_args=())
-def _gdn2_fwd(
+def gdn2_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -352,24 +349,24 @@ def _gdn2_fwd(
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"gated_delta_net_v2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
-    _check_dtype("g", g, torch.float32)
-    _check_dtype("beta", beta, q.dtype)
-    _check_dtype("w", w, q.dtype)
+    check_dtype("g", g, torch.float32)
+    check_dtype("beta", beta, q.dtype)
+    check_dtype("w", w, q.dtype)
     if safe_gate:
         if a_log is None or dt_bias is None:
             raise ValueError("gated_delta_net_v2: safe_gate requires a_log and dt_bias")
-        _check_dtype("a_log", a_log, torch.float32)
-        _check_dtype("dt_bias", dt_bias, torch.float32)
+        check_dtype("a_log", a_log, torch.float32)
+        check_dtype("dt_bias", dt_bias, torch.float32)
     elif a_log is not None or dt_bias is not None:
         raise ValueError("gated_delta_net_v2: a_log/dt_bias require safe_gate=True")
     if initial_state is not None:
-        _check_dtype("initial_state", initial_state, torch.float32)
+        check_dtype("initial_state", initial_state, torch.float32)
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     g32 = g
     beta_io = beta
     w_io = w
-    for _name, _t in (
+    for tensor_name, tensor in (
         ("k", k),
         ("v", v),
         ("g", g),
@@ -380,12 +377,12 @@ def _gdn2_fwd(
         ("a_log", a_log),
         ("dt_bias", dt_bias),
     ):
-        if _t is not None and _t.device != device:
-            raise ValueError(f"gated_delta_net_v2: {_name} must be on q's device ({device}); got {_t.device}")
+        if tensor is not None and tensor.device != device:
+            raise ValueError(f"gated_delta_net_v2: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
-    ckpt = int(checkpoint_every_n_tokens)
+    checkpoint = int(checkpoint_every_n_tokens)
 
-    cache_key = _make_fprop_cache_key(
+    cache_key = make_fprop_cache_key(
         total,
         N,
         H,
@@ -407,12 +404,12 @@ def _gdn2_fwd(
         safe_gate,
         gate_lower_bound,
         state0 is not None,
-        ckpt,
+        checkpoint,
         device,
         plan_name,
     )
-    if cache_key not in _fprop_cache:
-        _fprop_cache[cache_key] = _build_fprop_graph(
+    if cache_key not in fprop_cache:
+        fprop_cache[cache_key] = build_fprop_graph(
             total,
             N,
             H,
@@ -420,23 +417,23 @@ def _gdn2_fwd(
             HV,
             K,
             V,
-            _torch_dtype_to_cudnn(q.dtype),
+            torch_dtype_to_cudnn(q.dtype),
             cudnn.data_type.FLOAT,
-            _torch_dtype_to_cudnn(q.dtype),
+            torch_dtype_to_cudnn(q.dtype),
             cudnn.data_type.FLOAT if state0 is not None else None,
-            _torch_dtype_to_cudnn(cu_seqlens.dtype),
+            torch_dtype_to_cudnn(cu_seqlens.dtype),
             float(scale),
             bool(output_final_state),
             bool(use_qk_l2norm_in_kernel),
             bool(batch_invariant),
             bool(safe_gate),
             float(gate_lower_bound) if gate_lower_bound is not None else None,
-            ckpt,
+            checkpoint,
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
         )
-        select_plan(_fprop_cache[cache_key][0], plan_name)
+        select_plan(fprop_cache[cache_key][0], plan_name)
 
-    graph, t = _fprop_cache[cache_key]
+    graph, t = fprop_cache[cache_key]
 
     o = torch.empty(total, HO, V, dtype=q.dtype, device=device)
     variant_pack = {
@@ -459,16 +456,16 @@ def _gdn2_fwd(
         final_state = torch.empty(N, HO, V, K, dtype=torch.float32, device=device)
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
-    if ckpt > 0:
-        total_checkpoints = max(total // ckpt + N, 1)
+    if checkpoint > 0:
+        total_checkpoints = max(total // checkpoint + N, 1)
         state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
-    graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
+    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     return o, final_state, state_checkpoints
 
 
-@_gdn2_fwd.register_fake
-def _gdn2_fwd_fake(
+@gdn2_fwd.register_fake
+def gdn2_fwd_fake(
     q,
     k,
     v,
@@ -515,7 +512,7 @@ def _gdn2_fwd_fake(
 # ---------------------------------------------------------------------------
 
 
-def _build_bprop_graph(
+def build_bprop_graph(
     total,
     N,
     H,
@@ -529,7 +526,7 @@ def _build_bprop_graph(
     state_dtype,
     dstate_in_dtype,
     cu_dtype,
-    ckpt_rows,
+    checkpoint_rows,
     scale,
     use_qk_l2norm,
     batch_invariant,
@@ -553,9 +550,9 @@ def _build_bprop_graph(
     dfs_t = None
     if dstate_in_dtype is not None:
         dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
-    ckpts_t = None
-    if ckpt_rows is not None:
-        ckpts_t = graph.tensor([ckpt_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
+    checkpoints_t = None
+    if checkpoint_rows is not None:
+        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
     a_log_t = None
     dt_bias_t = None
     if safe_gate:
@@ -570,7 +567,7 @@ def _build_bprop_graph(
         w=w_t,
         cu_seqlens=cu_t,
         dO=dO_t,
-        state_checkpoints=ckpts_t,
+        state_checkpoints=checkpoints_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
         a_log=a_log_t,
@@ -605,7 +602,7 @@ def _build_bprop_graph(
         dstate0=dstate0_t,
         d_a_log=dA_t,
         d_dt_bias=dDt_t,
-        ckpts=ckpts_t,
+        checkpoints=checkpoints_t,
     )
 
 
@@ -615,7 +612,7 @@ def _build_bprop_graph(
 
 
 @torch.library.custom_op("cudnn::gated_delta_net_v2_bwd", mutates_args=())
-def _gdn2_bwd(
+def gdn2_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -650,8 +647,6 @@ def _gdn2_bwd(
     logits and ``dbeta`` is the raw-logit gradient.
     """
     total, H, K = q.shape
-    # autograd materializes reduction grads as broadcast (stride-0)
-    # views; densify ONLY those (dense callers pass through untouched)
     if 0 in dO.stride():
         dO = dO.contiguous()
     if d_final_state is not None and 0 in d_final_state.stride():
@@ -666,25 +661,25 @@ def _gdn2_bwd(
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"gated_delta_net_v2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
-    _check_dtype("g", g, torch.float32)
-    _check_dtype("beta", beta, q.dtype)
-    _check_dtype("w", w, q.dtype)
+    check_dtype("g", g, torch.float32)
+    check_dtype("beta", beta, q.dtype)
+    check_dtype("w", w, q.dtype)
     if safe_gate:
         if a_log is None or dt_bias is None:
             raise ValueError("gated_delta_net_v2: safe_gate requires a_log and dt_bias")
-        _check_dtype("a_log", a_log, torch.float32)
-        _check_dtype("dt_bias", dt_bias, torch.float32)
+        check_dtype("a_log", a_log, torch.float32)
+        check_dtype("dt_bias", dt_bias, torch.float32)
     elif a_log is not None or dt_bias is not None:
         raise ValueError("gated_delta_net_v2: a_log/dt_bias require safe_gate=True")
     if initial_state is not None:
-        _check_dtype("initial_state", initial_state, torch.float32)
+        check_dtype("initial_state", initial_state, torch.float32)
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     if d_final_state is not None:
-        _check_dtype("d_final_state", d_final_state, torch.float32)
+        check_dtype("d_final_state", d_final_state, torch.float32)
     if state_checkpoints is not None:
-        _check_dtype("state_checkpoints", state_checkpoints, q.dtype)
-    for _name, _t in (
+        check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+    for tensor_name, tensor in (
         ("k", k),
         ("v", v),
         ("g", g),
@@ -697,12 +692,12 @@ def _gdn2_bwd(
         ("a_log", a_log),
         ("dt_bias", dt_bias),
     ):
-        if _t is not None and _t.device != device:
-            raise ValueError(f"gated_delta_net_v2: {_name} must be on q's device ({device}); got {_t.device}")
+        if tensor is not None and tensor.device != device:
+            raise ValueError(f"gated_delta_net_v2: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     dstate_in = d_final_state if d_final_state is not None else None
 
-    cache_key = _make_bprop_cache_key(
+    cache_key = make_bprop_cache_key(
         total,
         N,
         H,
@@ -729,8 +724,8 @@ def _gdn2_bwd(
         device,
         plan_name,
     )
-    if cache_key not in _bprop_cache:
-        _bprop_cache[cache_key] = _build_bprop_graph(
+    if cache_key not in bprop_cache:
+        bprop_cache[cache_key] = build_bprop_graph(
             total,
             N,
             H,
@@ -738,12 +733,12 @@ def _gdn2_bwd(
             HV,
             K,
             V,
-            _torch_dtype_to_cudnn(q.dtype),
+            torch_dtype_to_cudnn(q.dtype),
             cudnn.data_type.FLOAT,
-            _torch_dtype_to_cudnn(q.dtype),
-            _torch_dtype_to_cudnn(state0.dtype) if state0 is not None else None,
-            _torch_dtype_to_cudnn(dstate_in.dtype) if dstate_in is not None else None,
-            _torch_dtype_to_cudnn(cu_seqlens.dtype),
+            torch_dtype_to_cudnn(q.dtype),
+            torch_dtype_to_cudnn(state0.dtype) if state0 is not None else None,
+            torch_dtype_to_cudnn(dstate_in.dtype) if dstate_in is not None else None,
+            torch_dtype_to_cudnn(cu_seqlens.dtype),
             state_checkpoints.shape[0] if state_checkpoints is not None else None,
             float(scale),
             bool(use_qk_l2norm_in_kernel),
@@ -752,9 +747,9 @@ def _gdn2_bwd(
             safe_gate=bool(safe_gate),
             gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
         )
-        select_plan(_bprop_cache[cache_key][0], plan_name)
+        select_plan(bprop_cache[cache_key][0], plan_name)
 
-    graph, t = _bprop_cache[cache_key]
+    graph, t = bprop_cache[cache_key]
 
     dq = torch.empty(total, H, K, dtype=q.dtype, device=device)
     dk = torch.empty(total, HK, K, dtype=q.dtype, device=device)
@@ -786,7 +781,7 @@ def _gdn2_bwd(
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
     if state_checkpoints is not None:
-        variant_pack[t["ckpts"]] = state_checkpoints
+        variant_pack[t["checkpoints"]] = state_checkpoints
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
     d_dt_bias = torch.empty(0, dtype=torch.float32, device=device)
     if safe_gate:
@@ -796,14 +791,14 @@ def _gdn2_bwd(
         d_dt_bias = torch.empty(HO, K, dtype=torch.float32, device=device)
         variant_pack[t["d_a_log"]] = d_a_log
         variant_pack[t["d_dt_bias"]] = d_dt_bias
-    graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
+    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=torch.float32, device=device)
     return dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias
 
 
-@_gdn2_bwd.register_fake
-def _gdn2_bwd_fake(
+@gdn2_bwd.register_fake
+def gdn2_bwd_fake(
     dO,
     q,
     k,
@@ -848,7 +843,7 @@ def _gdn2_bwd_fake(
 # ---------------------------------------------------------------------------
 
 
-def _gdn2_setup_context(ctx, inputs, output):
+def gdn2_setup_context(ctx, inputs, output):
     (
         q,
         k,
@@ -870,11 +865,9 @@ def _gdn2_setup_context(ctx, inputs, output):
         checkpoint_every_n_tokens,
         plan_name,
     ) = inputs
-    # save_for_backward cannot hold None; keep initial_state as an attribute.
-    # g/beta are saved as passed: raw logits under safe_gate / use_beta_sigmoid.
     saved = [q, k, v, g, beta, w, cu_seqlens]
-    ctx.ckpt_reuse = checkpoint_every_n_tokens == 16 and output[2].numel() > 0
-    if ctx.ckpt_reuse:
+    ctx.checkpoint_reuse = checkpoint_every_n_tokens == 16 and output[2].numel() > 0
+    if ctx.checkpoint_reuse:
         saved.append(output[2])
     if safe_gate:
         saved.extend([a_log, dt_bias])
@@ -891,11 +884,11 @@ def _gdn2_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[2])
 
 
-def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
+def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
     a_log = dt_bias = None
     if ctx.safe_gate:
         a_log, dt_bias = ctx.saved_tensors[-2:]
-    if ctx.ckpt_reuse:
+    if ctx.checkpoint_reuse:
         q, k, v, g, beta, w, cu_seqlens, state_checkpoints = ctx.saved_tensors[:8]
     else:
         q, k, v, g, beta, w, cu_seqlens = ctx.saved_tensors[:7]
@@ -927,10 +920,6 @@ def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
         dt_bias=dt_bias,
         plan_name=ctx.plan_name,
     )
-    # q, k, v, g, beta, w, cu_seqlens, scale, initial_state,
-    # output_final_state, use_qk_l2norm_in_kernel, batch_invariant,
-    # use_beta_sigmoid_in_kernel, safe_gate, gate_lower_bound, a_log,
-    # dt_bias, checkpoint_every_n_tokens, plan_name
     return (
         dq,
         dk,
@@ -956,8 +945,8 @@ def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
 
 torch.library.register_autograd(
     "cudnn::gated_delta_net_v2_fwd",
-    _gdn2_backward,
-    setup_context=_gdn2_setup_context,
+    gdn2_backward,
+    setup_context=gdn2_setup_context,
 )
 
 

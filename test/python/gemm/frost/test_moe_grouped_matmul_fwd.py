@@ -6,6 +6,8 @@ correctness vs a torch group-loop reference (uneven + empty groups)."""
 
 from __future__ import annotations
 
+import pathlib
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -930,3 +932,64 @@ def test_moe_int8(cta_group):
             ref[0, lo:hi] = a[0, lo:hi].float() @ b[gi].float().t()
     # Small-magnitude integer products are exact in bf16's range → bit-exact.
     torch.testing.assert_close(outb, ref.to(torch.bfloat16), atol=0.0, rtol=0.0)
+
+
+# --- launch ABI -------------------------------------------------------------
+
+# MoE has no recipe (`_check_executable` returns early for it), so its four
+# launch sites are hand-written positional calls and nothing else pins their
+# order against the rendered `_host` signature.
+
+
+def test_moe_launch_tail_puts_the_tma_slot_last():
+    """The host signature is TAP, AUX, then the trailing TMA-C parameter. Under
+    STG every dense output rides a tap slot; an output on the TMA surface binds a
+    trailing TMA-only parameter and moves to the END. Passing `*cs, *aux` in both modes
+    keeps the ARITY but shifts the mapping by one, which binds the output buffer
+    to an aux parameter -- both are `cute.Tensor`, so nothing raises."""
+    from cudnn.gemm.frost.compiler import _moe_launch_tail
+
+    NONE, S0, S1, BOTH = frozenset(), frozenset({0}), frozenset({1}), frozenset({0, 1})
+
+    assert _moe_launch_tail(["c0"], (), tma_slots=NONE) == ("c0",)
+    assert _moe_launch_tail(["c0"], (), tma_slots=S0) == ("c0",)
+    assert _moe_launch_tail(["c0"], ["x"], tma_slots=NONE) == ("c0", "x")
+    assert _moe_launch_tail(["c0"], ["x"], tma_slots=S0) == ("x", "c0")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=NONE) == ("c0", "c1", "x")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=S0) == ("c1", "x", "c0")
+    assert _moe_launch_tail([], ["x"], tma_slots=S0) == ("x",)
+    # Which slot takes the surface is a CHOICE, so the order follows the SET, not
+    # the position: slot 1 on the surface leaves slot 0 as the tap.
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=S1) == ("c0", "x", "c1")
+    assert _moe_launch_tail(["c0", "c1"], ["x"], tma_slots=BOTH) == ("x", "c0", "c1")
+
+
+@requires_sm100
+@pytest.mark.parametrize("force_stg", [False, True], ids=["tmastg", "stg"])
+def test_moe_host_signature_matches_the_launch_order(force_stg: bool) -> None:
+    """Pin the rendered `_host` parameter list the four launchers feed: every
+    dense output is a `c_tap_<i>`, except the slot-0 output under TMA-store,
+    which becomes the trailing `c_<i>` the TMA-C marker injects."""
+    import re
+
+    from cudnn.gemm.frost.compiler import _moe_launch_tail
+
+    g = _build_graph(E=8, S=2048, N=256, K=256)
+    plan = _plan(g, config=by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"), cta_group=2, force_stg_epi=force_stg)
+    tma = plan._compiled.use_tma_store
+    assert tma is not force_stg
+
+    src = pathlib.Path(plan.generated_path).read_text()
+    m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
+    assert m, f"no _host signature in {plan.generated_path}"
+    body = m.group(1)
+    params = [ln.strip().split(":")[0] for ln in body.splitlines() if ln.strip()]
+    taps = [p for p in params if p.startswith("c_tap_")]
+    tma_c = [p for p in params if re.fullmatch(r"c_\d+", p)]
+    n_out = len(plan.chain.outputs)
+
+    assert len(taps) == n_out - (1 if tma else 0)
+    assert len(tma_c) == (1 if tma else 0)
+    if tma:
+        assert params[-2] == tma_c[0], params
+    assert len(_moe_launch_tail(range(n_out), plan.aux_names, tma_slots=plan._compiled.tma_slots)) == len(taps) + len(plan.aux_names) + len(tma_c)

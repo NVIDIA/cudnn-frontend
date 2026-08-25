@@ -86,5 +86,5 @@ class FrostLaPlan(CompiledPlan):
         if not ok:
             raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
         views = variant_pack.operands(self.indices)
-        workspace = Workspace.over(variant_pack, self.compiled.ws_bytes, type(self.compiled).__name__)
+        workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
         self.compiled.run(views, workspace, ctx.stream)

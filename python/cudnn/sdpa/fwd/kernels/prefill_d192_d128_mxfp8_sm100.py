@@ -2449,8 +2449,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if _row_valid:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, head_idx, q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2702,6 +2701,7 @@ def compile(  # noqa: A001
     sq: int = 256,
     skv: int = 128,
     has_lse: bool = True,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
 
@@ -2764,11 +2764,15 @@ def compile(  # noqa: A001
         # is compiled out entirely — no dummy buffer exists at any level.
         fake_lse = None
     else:
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (b, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (b, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

@@ -61,6 +61,24 @@ def test_importing_cudnn_pulls_no_framework():
 
 
 @pytest.mark.L0
+def test_gnn_import_failure_has_optional_dependency_guidance():
+    code = """
+import sys
+sys.modules["torch"] = None
+import cudnn
+try:
+    cudnn.gnn
+except ImportError as error:
+    # GNN does not use CuTeDSL, but this is currently the existing optional
+    # dependency extra that installs Torch.
+    assert "nvidia-cudnn-frontend[cutedsl]" in str(error)
+else:
+    raise AssertionError("cudnn.gnn unexpectedly imported without torch")
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.L0
 def test_importing_cudnn_ops_pulls_no_framework():
     _assert_absent(_imported_by("import cudnn\nimport cudnn.ops"), "import cudnn.ops")
 

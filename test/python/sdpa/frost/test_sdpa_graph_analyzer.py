@@ -599,6 +599,54 @@ def test_knob_request_none_fields_are_no_preference():
     assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs())
 
 
+def _mk_gqa_graph(h_q, h_kv, d=128):
+    """Causal GQA graph (BSHD-physical strides) for the pack_gqa knob tests."""
+    g = _mk_graph()
+    dims_q, strides_q = (B, h_q, S, d), (S * h_q * d, d, h_q * d, 1)
+    dims_kv, strides_kv = (B, h_kv, S, d), (S * h_kv * d, d, h_kv * d, 1)
+    q = g.tensor(dim=dims_q, stride=strides_q, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims_kv, stride=strides_kv, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims_kv, stride=strides_kv, data_type=DTYPE, name="v")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
+    _finish_output(o, dims_q, strides_q)
+    return g
+
+
+def test_knob_request_pack_gqa_eligible_on_gqa():
+    # The f16 SM100 rows declare pack_gqas={False, True}; a dense GQA graph
+    # with a power-of-2 group admits the packed request.
+    g = _mk_gqa_graph(8, 2)
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_on_mha_is_identity():
+    # MHA: G == 1 compiles the identity (bit-exact unpacked fold), so an
+    # explicit pack_gqa=True is honorable and the engine stays eligible.
+    g = _mk_eligible_graph()
+    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
+    # GQA ratio 3 does not divide tile_m (128) so pack_gqa_supported is False.
+    g = _mk_gqa_graph(6, 2)
+    assert not _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+def test_knob_request_pack_gqa_false_always_eligible():
+    # Running unpacked is trivially honorable — on MHA graphs too.
+    assert engines.engine_name() in _eligible(_mk_eligible_graph(), engines.SdpaFwdKnobs(pack_gqa=False))
+    assert engines.engine_name() in _eligible(_mk_gqa_graph(8, 2), engines.SdpaFwdKnobs(pack_gqa=False))
+
+
+def test_knob_request_pack_gqa_outside_domain_rejects_row():
+    # The mxfp8/SM80 rows keep the default {False} domain, so an explicit
+    # packed request must never make them eligible; the packable set is
+    # pinned exactly by test_pack_gqa_capability_domains.
+    g = _mk_gqa_graph(8, 2)
+    eligible = _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert eligible <= {s.name for s in engines.ENGINE_SPECS if True in s.capabilities.pack_gqas}, eligible
+
+
 # ---------------------------------------------------------------------------
 # SM120 engine row (sdpa_fwd_prefill_sm120) — same probes under a faked
 # SM120/SM121 device. Executable coverage lives in test_sdpa_fwd_dsl_sm120.py.
@@ -613,6 +661,17 @@ def _mk_sm120_graph(d: int = 128, **sdpa_kwargs):
     q, k, v, dims, strides = _mk_qkv(g, d=d)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, **sdpa_kwargs)
     _finish_output(o, dims, strides)
+    return g
+
+
+def _mk_dense_stats_graph(stats_stride, *, stats_dim=(B, H, S, 1), stats_dtype=cudnn.data_type.FLOAT):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g, d=128)
+    o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
+    _finish_output(o, dims, strides)
+    assert stats is not None
+    stats.set_output(True).set_dim(stats_dim).set_stride(stats_stride)
+    stats.set_data_type(stats_dtype)
     return g
 
 
@@ -765,14 +824,54 @@ def test_sm120_probe_accepts_mixed_head_dims(monkeypatch):
 
 def test_sm120_probe_accepts_stats_output(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g, d=128)
-    o, stats = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, generate_stats=True)
-    _finish_output(o, dims, strides)
-    assert stats is not None
-    stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1))
-    stats.set_data_type(cudnn.data_type.FLOAT)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert engines.engine_name(arch="sm120") in _eligible(_mk_dense_stats_graph((H * S, S, 1, 1)))
+
+
+@pytest.mark.parametrize(
+    ("cc", "engine"),
+    [
+        ((8, 0), engines.engine_name(arch="sm80")),
+        ((10, 0), engines.engine_name(arch="sm100")),
+        ((12, 0), engines.engine_name(arch="sm120")),
+    ],
+    ids=["sm80", "sm100", "sm120"],
+)
+def test_fwd_probe_accepts_strided_stats(monkeypatch, cc, engine):
+    monkeypatch.setattr(ga, "_device_cc", lambda: cc)
+    # B is innermost, then H, then S; the extra two head rows leave a gap
+    # between adjacent S positions.
+    stats_stride = (1, B, (H + 2) * B, 1)
+    assert engine in _eligible(_mk_dense_stats_graph(stats_stride))
+
+
+@pytest.mark.parametrize(
+    ("cc", "engine"),
+    [
+        ((8, 0), engines.engine_name(arch="sm80")),
+        ((10, 0), engines.engine_name(arch="sm100")),
+        ((12, 0), engines.engine_name(arch="sm120")),
+    ],
+    ids=["sm80", "sm100", "sm120"],
+)
+@pytest.mark.parametrize("stats_stride", [(0, S, 1, 1), (1, 1, 1, 1)], ids=["broadcast", "overlapping"])
+def test_fwd_probe_rejects_aliasing_stats(monkeypatch, cc, engine, stats_stride):
+    monkeypatch.setattr(ga, "_device_cc", lambda: cc)
+    assert engine not in _eligible(_mk_dense_stats_graph(stats_stride))
+
+
+@pytest.mark.parametrize(
+    ("stats_dim", "stats_stride", "stats_dtype", "reason"),
+    [
+        ((B, H, S, 1), (H * S, S, 1, 1), cudnn.data_type.HALF, "stats must be fp32"),
+        ((B, H, S), (H * S, S, 1), cudnn.data_type.FLOAT, "stats must be (B, H_q, S_q, 1)"),
+    ],
+    ids=["dtype", "shape"],
+)
+def test_fwd_probe_rejects_invalid_stats_metadata(monkeypatch, stats_dim, stats_stride, stats_dtype, reason):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    facts = ga.analyze(_mk_dense_stats_graph(stats_stride, stats_dim=stats_dim, stats_dtype=stats_dtype))
+    capabilities = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == engines.engine_name(arch="sm100"))
+    assert reason in engines.mismatch(capabilities, facts)
 
 
 def test_sm120_probe_accepts_padded_stats(monkeypatch):

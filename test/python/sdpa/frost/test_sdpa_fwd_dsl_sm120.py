@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, _dsl_installed
 
 
 def _is_sm120() -> bool:
@@ -168,6 +168,8 @@ def _run_case(
     scale: float | None = None,
     with_sink: bool = False,
     check_stats: bool = False,
+    pack_gqa: bool | None = None,
+    stats_layout: str = "contiguous",
 ) -> None:
     q = _bhsd(batch, h_q, s_q, head_dim, dtype)
     k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
@@ -189,8 +191,10 @@ def _run_case(
         v,
         q_tile=q_tile,
         kv_tile=kv_tile,
+        pack_gqa=pack_gqa,
         scale=scale,
         return_stats=check_stats,
+        stats_layout=stats_layout,
         **mask_kwargs,
     )
     if check_stats:
@@ -240,7 +244,9 @@ def _run_dsl_graph(
     sinks: torch.Tensor | None = None,
     q_tile: int | None = None,
     kv_tile: int | None = None,
+    pack_gqa: bool | None = None,
     return_stats: bool = False,
+    stats_layout: str = "contiguous",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
 
@@ -308,21 +314,18 @@ def _run_dsl_graph(
     stats_gpu = None
     if return_stats:
         assert stats is not None
-        stats_gpu = torch.empty(batch, heads, sequence, 1, dtype=torch.float32, device="cuda")
+        stats_gpu = make_dense_stats(batch, heads, sequence, stats_layout)
         stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride())
         stats.set_data_type(cudnn.data_type.FLOAT)
         variant_pack[stats] = stats_gpu
+    tiles = None
     if q_tile is not None or kv_tile is not None:
-        pytest.skip(
-            "graph.set_engine_knobs() was removed with the monkey-patch dispatch layer and has no replacement in "
-            "this MR: knobs now ride on the plan (engines.base.PlanConfig.knobs), one ranked entry per knob set, "
-            "picked with select_plan(). Re-enable once the SDPA fwd family proposes its tile domain as plans."
-        )
+        tiles = (q_tile, kv_tile)
 
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch="sm120"))
+    _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Honest workspace: the SM120 kernel None-specializes the LSE store, so a
@@ -690,6 +693,25 @@ def test_dsl_sm120_stats(mask_kwargs):
     """generate_stats=True: the Stats output matches the natural-log LSE."""
 
     _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, **mask_kwargs)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm120_strided_stats():
+    """Dense LSE is written directly through a permuted, gapped layout."""
+
+    _require_dsl()
+    batch, h_q, h_kv, sequence, head_dim = 2, 4, 2, 128, 128
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, h_q, sequence, head_dim, torch.float16)
+    k = _bhsd(batch, h_kv, sequence, head_dim, torch.float16)
+    v = _bhsd(batch, h_kv, sequence, head_dim, torch.float16)
+    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    output, strided_stats = _run_dsl_graph(q, k, v, scale=scale, is_causal=True, return_stats=True, stats_layout="strided")
+    expected, expected_stats = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)
+    torch.testing.assert_close(strided_stats.squeeze(-1), expected_stats, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(output.float(), expected, atol=0.1, rtol=5e-2)
 
 
 @pytest.mark.L0
@@ -1373,6 +1395,71 @@ def test_dsl_sm120_thd_mixed_head_dims_sink(stats_layout: str):
 @torch_fork_set_rng(seed=3)
 def test_dsl_sm120_grouped_query_attention(h_q: int, h_kv: int):
     _run_case(batch=2, h_q=h_q, h_kv=h_kv, s_q=256, s_kv=256, head_dim=64)
+
+
+# --- PackGQA: q_tile/G tokens x G query heads per tile -------
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,h_kv",
+    [(8, 4), (8, 2), (8, 1), (16, 1)],
+    ids=["g2", "g4", "g8_mqa", "g16_mqa"],
+)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm120_pack_gqa_ratios(h_q: int, h_kv: int):
+    """Packed plans across GQA ratios (incl. MQA)."""
+    _run_case(batch=2, h_q=h_q, h_kv=h_kv, s_q=40, s_kv=256, head_dim=128, is_causal=True, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [4, 16, 25], ids=["subspan", "exact_span", "tail"])
+@torch_fork_set_rng(seed=1)
+def test_dsl_sm120_pack_gqa_tiles(s_q: int):
+    """Packed tile-geometry edges at G=8, q_tile=128 (token span 16/tile)."""
+    _run_case(batch=1, h_q=64, h_kv=8, s_q=s_q, s_kv=256, head_dim=128, is_causal=True, q_tile=128, kv_tile=128, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=2)
+def test_dsl_sm120_pack_gqa_tile64():
+    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    _run_case(batch=2, h_q=8, h_kv=2, s_q=24, s_kv=192, head_dim=64, is_causal=True, q_tile=64, kv_tile=64, pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "mask",
+    ["none", "causal", "causal_br", "swa", "band_right", "padded_qtrim", "sink_swa"],
+)
+@torch_fork_set_rng(seed=3)
+def test_dsl_sm120_pack_gqa_features(mask: str):
+    """Packed plans x the dense mask/sink/trim envelope, stats checked."""
+    kw: dict = dict(batch=2, h_q=8, h_kv=2, s_q=40, s_kv=256, head_dim=128, pack_gqa=True, check_stats=True)
+    if mask == "causal":
+        kw.update(is_causal=True)
+    elif mask == "causal_br":
+        kw.update(is_causal=True, causal_bottom_right=True, window_size_right=0)
+    elif mask == "swa":
+        kw.update(is_causal=True, window_size_left=16)
+    elif mask == "band_right":
+        kw.update(window_size_right=8)
+    elif mask == "padded_qtrim":
+        kw.update(
+            s_q=128,
+            seq_q_lens=torch.tensor([37, 90], dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor([180, 240], dtype=torch.int32, device="cuda"),
+        )
+    elif mask == "sink_swa":
+        kw.update(is_causal=True, window_size_left=16, with_sink=True)
+    _run_case(**kw)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+@pytest.mark.parametrize("s_q, h_kv", [(1, 8), (127, 8), (127, 1)], ids=["s1-g8", "s127-g8", "s127-mqa64"])
+@torch_fork_set_rng(seed=4)
+def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
+    """Packed multi-tile / odd-length row spaces, bf16."""
+    _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
 
 
 @pytest.mark.L0
