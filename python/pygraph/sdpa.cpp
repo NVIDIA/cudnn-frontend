@@ -39,6 +39,8 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
                        py::object const& paged_attention_max_seq_len_kv,
+                       py::object const& max_total_seq_len_q,
+                       py::object const& max_total_seq_len_kv,
                        cudnn_frontend::DataType_t const& compute_data_type,
                        std::string const& name,
                        std::optional<PyCallback> fn,
@@ -107,6 +109,16 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         } else {
             throw std::runtime_error("paged_attention_max_seq_len_kv must be an int (or None)");
         }
+    }
+
+    if (!max_total_seq_len_q.is_none()) {
+        int64_t const max_total_seq_len_q_value = max_total_seq_len_q.cast<int64_t>();
+        attributes.set_max_total_seq_len_q(max_total_seq_len_q_value);
+    }
+
+    if (!max_total_seq_len_kv.is_none()) {
+        int64_t const max_total_seq_len_kv_value = max_total_seq_len_kv.cast<int64_t>();
+        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 
     // Set attn_scale
@@ -247,6 +259,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
               py::object const& paged_attention_max_seq_len_kv,
+              py::object const& max_total_seq_len_q,
+              py::object const& max_total_seq_len_kv,
               cudnn_frontend::DataType_t const& compute_data_type,
               std::string const& name,
               std::optional<PyCallback> fn,
@@ -335,6 +349,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          paged_attention_k_table,
                                          paged_attention_v_table,
                                          paged_attention_max_seq_len_kv,
+                                         max_total_seq_len_q,
+                                         max_total_seq_len_kv,
                                          compute_data_type,
                                          name,
                                          fn,
@@ -621,6 +637,8 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          paged_attention_k_table,
                                          paged_attention_v_table,
                                          paged_attention_max_seq_len_kv,
+                                         py::none(),
+                                         py::none(),
                                          compute_data_type,
                                          name,
                                          fn,
@@ -1128,6 +1146,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("paged_attention_k_table", py::none()),
           py::arg_v("paged_attention_v_table", py::none()),
           py::arg_v("paged_attention_max_seq_len_kv", py::none()),
+          py::arg_v("max_total_seq_len_q", py::none()),
+          py::arg_v("max_total_seq_len_kv", py::none()),
           py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
           py::arg_v("name", ""),
           py::arg_v("score_mod", std::nullopt),
@@ -1157,6 +1177,10 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     paged_attention_k_table (Optional[cudnn_tensor]): The page table to look up offsets into 'k'
                     paged_attention_v_table (Optional[cudnn_tensor]): The page table to look up offsets into 'v'
                     paged_attention_max_seq_len_kv (Optional[integer]): The maximum sequence length for k/v caches when paged attention is active.
+                    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O/Stats sharing its token axis).
+                    Ragged layouts declare (B, H, S_max, D) plus a device ragged-offset tensor, so the packed total is not otherwise
+                    expressible; supplying it bounds the token axis exactly instead of inferring it from buffer extents. Ragged only. Default is None.
+                    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V. Only valid on a ragged layout. Default is None.
                     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
                     name (Optional[str]): The name of the operation.
                     generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
