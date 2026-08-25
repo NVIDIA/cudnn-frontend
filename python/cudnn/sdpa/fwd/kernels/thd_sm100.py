@@ -203,7 +203,10 @@ def build_thd_meta_kernel(
     # Live unit total + claim counter, as on SM100 — a SM120 unit is q_tile
     # rows of one head, so the same count applies with cga_tile_m := q_tile.
     cute.arch.barrier()
-    if nvvm.elect_sync() and tidx == cutlass.Int32(0):
+    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
+    # implementation-defined lane, so conjoining it with tidx == 0 can
+    # select no thread at all and leave these words unwritten.
+    if tidx == cutlass.Int32(0):
         live = cutlass.Int32(0)
         cuq0 = n_batch
         for b in cutlass.range(0, n_batch, 1, unroll=1):
@@ -375,7 +378,10 @@ def build_thd_meta_o_descs_kernel(
     # kernel reads its own bound from here. The counter starts at n_clusters:
     # cluster c takes unit c from its blockIdx, then pulls from the counter.
     cute.arch.barrier()
-    if nvvm.elect_sync() and tidx == cutlass.Int32(0):
+    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
+    # implementation-defined lane, so conjoining it with tidx == 0 can
+    # select no thread at all and leave these words unwritten.
+    if tidx == cutlass.Int32(0):
         meta_w = cutlass.make_array_view(meta_t)
         cuq0 = n_batch
         live = cutlass.Int32(0)
