@@ -22,7 +22,7 @@ from frost_test_utils import requires_dsl
 pytestmark = [requires_dsl, pytest.mark.L0]
 
 
-class _Sm120CaseResult(NamedTuple):
+class _ApiCaseResult(NamedTuple):
     split: int
     output: torch.Tensor
     reference: torch.Tensor
@@ -106,7 +106,7 @@ def _sm120_case(h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, causal=
         gaps = torch.ones_like(lse_storage, dtype=torch.bool)
         gaps[:s_q, :h_q, :] = False
         assert torch.all(lse_storage[gaps] == -12345.0), "the combine LSE store touched padding outside its declared view"
-    return _Sm120CaseResult(split, o.float(), torch.matmul(p, vb), ws_bytes, expected, None if lse is None else lse.clone())
+    return _ApiCaseResult(split, o.float(), torch.matmul(p, vb), ws_bytes, expected, None if lse is None else lse.clone())
 
 
 def test_sm120_splits_a_decode_shape():
