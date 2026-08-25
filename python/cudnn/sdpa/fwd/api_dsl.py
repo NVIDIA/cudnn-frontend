@@ -160,6 +160,27 @@ _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # change under a live process, and the query costs ~7 us on the execute hot
 # path, so resolve it once per device.
 _THD_CTAS_CACHE: dict = {}
+# Raw multi_processor_count, cached separately: _THD_CTAS_CACHE holds an
+# already-scaled CTA count, so the two cannot share a key.
+_THD_SMS_CACHE: dict = {}
+
+
+def _thd_cache_key(device):
+    """Cache key for a device. ``torch.device("cuda")`` carries index None and
+    means the CURRENT device, so resolve it — keying on None would hand every
+    device on a multi-GPU host whichever entry landed first."""
+    key = getattr(device, "index", None)
+    return torch.cuda.current_device() if key is None else key
+
+
+def _device_sm_count(device) -> int:
+    """``multi_processor_count``, resolved once per device (see above)."""
+    key = _thd_cache_key(device)
+    n = _THD_SMS_CACHE.get(key)
+    if n is None:
+        n = torch.cuda.get_device_properties(device).multi_processor_count
+        _THD_SMS_CACHE[key] = n
+    return n
 
 
 def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int:
@@ -1566,10 +1587,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # the grid no longer has to cover the work list -- which is what made
         # 38-84% of clusters dead.
         _env = self._thd_unit_envelope()
-        _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
-        _sms = torch.cuda.get_device_properties(q_buf.device).multi_processor_count
         if getattr(self._k_mod, "THD_PERSISTENT", False):
-            units = min(_env, max(1, _sms // max(1, _cta_mma)))
+            # Resolved here, not above: the CLC path below never reads it, and
+            # this runs per execute.
+            _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
+            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cta_mma)))
             _dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if _dbg > 0:
                 units = min(_env, _dbg)
@@ -3225,7 +3247,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         under-launching only costs parallelism. One CTA per SM matches the
         kernel's ``min_blocks_per_mp``.
         """
-        key = getattr(device, "index", device)
+        key = _thd_cache_key(device)
         n = _THD_CTAS_CACHE.get(key)
         if n is None:
             forced = int(os.environ.get("FROST_THD_CTAS", "0"))
