@@ -1374,7 +1374,6 @@ def generate(
     for _oi in range(len(chain.outputs)):
         if _oi not in tma_slots:
             _tap_of[_oi] = len(_tap_of)
-    n_dense_taps = sum(1 for si in range(len(specs)) if si not in tma_slots)
 
     def _scale_tap_idx(qi: int) -> int:
         return _tap_of[len(specs) + len(chain.reductions) + qi]

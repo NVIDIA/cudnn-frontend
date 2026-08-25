@@ -178,12 +178,6 @@ def _aux_fake_shape_code(aux: TensorRef) -> str:
     raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
 
-def _aux_fake_stride_order(aux: TensorRef) -> str:
-    if len(aux.dim) == 3:
-        return "(2, 1, 0)"
-    return "(1, 0)"
-
-
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     # Rank-1 aux is represented as a rank-2 broadcastable fake at compile, so
     # its raw rank-1 stride is not a valid fake stride.
@@ -250,7 +244,7 @@ def _tma_c_plumbing(chain: FusionChain, tma_slots: "frozenset[int]" = frozenset(
         "INJECT_HOST_TMA_C_PASS": ",\n".join(f"tma_c_desc_list[{i}]" for i in range(n_out)) + ",",
         "INJECT_COMPILE_TMA_C_FAKES": "\n".join(
             f"fake_c_{j} = _make_fake_c({_cd_cutlass(dt)}, {2 if dt == 'fp4_e2m1' else 1}, {_fake_c_major(chain, slot)})"
-            for j, (slot, dt) in enumerate(_tma_out_dtypes(chain, tma_slots) or [(0, chain.output_dtype)])
+            for j, (slot, dt) in enumerate(_tma_out_dtypes(chain, tma_slots))
         ),
         "INJECT_COMPILE_TMA_C_PASS": ",\n".join(f"fake_c_{i}" for i in range(n_out)) + ",",
     }
@@ -759,7 +753,6 @@ def _render_tile_constants(
         f"epi_tile_mn = {(cfg.epi_tile_mn[0], _epi_n(cfg, cta_group, out_dt))}",
         f"threads_per_cta = {cfg.threads_per_cta}",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
-        f"matmul_batch = {chain.matmul.batch}",
         f"matmul_a_batch = {chain.matmul.a_batch}",
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"a_is_m_major = {chain.matmul.a_major == 'm'}",
@@ -773,7 +766,6 @@ def _render_tile_constants(
         f"b_mcast_slices = {b_mcast_slices}",
         f"ab_empty_full_mask = {ab_empty_full_mask}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
-        f"ab_smem_swizzle_bytes = {smem_swizzle_bytes}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
         f"a_smem_desc_stride_byte_offset = {a_sbo}",
         f"a_smem_k_step_bytes = {a_k_step}",
@@ -817,7 +809,6 @@ def _render_tile_constants(
     total_tmem = _tmem_cols_for_arch()
     lines.append(f"num_tmem_alloc_cols = {total_tmem}")
     lines.append(f"tmem_alloc_exclusive = {total_tmem > _MAX_NON_EXCLUSIVE_TMEM_COLS}")
-    lines.append(f"b_collector_ok = {_b_collector_supported()}")
     # TMEM accumulator budget. One acc stage holds, per GEMM, one region of
     # `num_mma_m` MMA-M blocks each `_epi_tile_cols` columns wide (the N-direction
     # MMAs subdivide that width, they do not add to it). `total_tmem == 0` means
@@ -896,8 +887,8 @@ def _render_tile_constants(
     lines.append(f"frost_compile_options = {_frost_compile_options()!r}")
     # Epilogue store mode: TMA-store-via-SMEM (preferred) vs per-thread STG
     # (fallback). See _use_tma_store_epi() for gating.
-    use_tma = _use_tma_store_epi(chain, cfg, vec_bytes_epi, cta_group)
-    lines.append(f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group, vec_bytes_epi))}")
+    use_tma = _use_tma_store_epi(chain, cfg, cta_group)
+    lines.append(f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group))}")
     lines.append(f"epi_slot_widen = {_epi_slot_widen(chain, cfg, cta_group)}")
     lines.append(f"epi_stage_rows = {_epi_stage_rows(cfg, cta_group)}")
     lines.append(f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma)}")
@@ -1194,8 +1185,6 @@ def _mixed_cga_fallback(cfg: TileConfig, cta_group: int, template_file: str) -> 
     fallback = min_fallback_cluster(cta_group)
     if fallback == (cfg.cgrp_size_m, cfg.cgrp_size_n) or cfg.tile_swizzle_n > 1:
         return None
-    if cfg.cgrp_size_m % fallback[0] or cfg.cgrp_size_n % fallback[1]:
-        return None
     return fallback
 
 
@@ -1442,8 +1431,6 @@ def _render_block_scale_tile_constants(
     # Per-distinct-operand SF word col bases (single-GEMM → length-1 lists).
     sfa_col_bases = [sf_region_base + i * sfa_tmem_cols for i in range(na)]
     sfb_col_bases = [sf_region_base + na * sfa_tmem_cols + j * sfb_tmem_cols for j in range(nb)]
-    sfa_col_base = sfa_col_bases[0]
-    sfb_col_base = sfb_col_bases[0]
     # tcgen05.alloc requires a power-of-2 column count; allocate the full TMEM.
     used_cols = sf_region_base + sf_total_cols
     num_tmem_alloc_cols = total_tmem
@@ -1512,12 +1499,8 @@ def _render_block_scale_tile_constants(
 
     lines = [
         f"# Block-scale config: {cfg.name} data={bs.a_dtype}x{bs.b_dtype} sf={bs.sf_dtype} block={bs.block_size}",
-        f"cta_tile_m = {cta_m}",
-        f"cta_tile_n = {cta_n}",
-        f"cta_tile_k_elems = {cta_k_elems}",
         f"cta_tile_mnk = ({cta_m}, {cta_n // cta_group}, {cta_k_elems})",
         # MMA instruction M = mma_inst_m × cta_group (256 for the 2-CTA pair).
-        f"mma_inst_shape_mnk = ({cfg.mma_inst_m * cta_group}, {cfg.mma_inst_n}, {mma_inst_k_elems})",
         # MMA instructions the CTA tile spans along M.
         f"num_mma_m = {cfg.num_mma_m}",
         f"cgrp_tile_mnk = ({cta_m * cfg.cgrp_size_m}, {cta_n * cfg.cgrp_size_n}, {cta_k_elems})",
@@ -1570,7 +1553,6 @@ def _render_block_scale_tile_constants(
         f"ab_packed_per_row = {ab_packed_per_row}",
         f"sA_packed_elems = {sA_packed_elems}",
         f"sB_packed_elems = {sB_packed_elems}",
-        f"ab_tma_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         # TMA-descriptor element dtype. FP4 uses the NATIVE 4-bit Float4E2M1FN
         # (not the packed-pair Float4E2M1FNx2) so cute scales the descriptor by
         # width=4 itself (no manual stride halving). FP8 same as ab_tma_dtype.
@@ -1602,7 +1584,7 @@ def _render_block_scale_tile_constants(
         # The COUNT, not the flag: a block-scale graph can put more than one
         # output on the TMA-C surface, and on MoE this number also sizes the
         # tensormap scratch and the per-CTA workspace stride.
-        f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group, vec_bytes_epi))}",
+        f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group))}",
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg, cta_group)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg, cta_group)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma_store_epi)}",
@@ -1623,7 +1605,6 @@ def _render_block_scale_tile_constants(
         f"# scale factors",
         f"block_size = {bs.block_size}",
         f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
-        f"sf_k = {sf_k}",
         f"sf_scales_per_inst = {scales_per_inst}",
         f"sf_insts_per_atom = {insts_per_word}",
         f"num_sf_atoms = {num_sf_words}",
@@ -1640,8 +1621,6 @@ def _render_block_scale_tile_constants(
         f"registers_per_atom = {_REGISTERS_PER_ATOM}",
         f"sf_atom_desc_stride = {sf_atom_desc_stride}",
         f"sf_block_desc_stride = {sf_block_desc_stride}",
-        f"sfa_col_base = {sfa_col_base}",
-        f"sfb_col_base = {sfb_col_base}",
         f"num_tmem_alloc_cols = {num_tmem_alloc_cols}",
         f"tmem_alloc_exclusive = {num_tmem_alloc_cols > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
         f"b_collector_ok = {_b_collector_supported()}",
@@ -1698,7 +1677,6 @@ def _render_block_scale_tile_constants(
         # A's per-row byte stride = k * ab_data_elem_bits / 8 (FP4: k/2 bytes);
         # routed-group base offset = group_begin rows × this. NOT ab_dtype.width
         # (that is the packed Float4E2M1FNx2 8-bit type).
-        lines.append(f"ab_data_elem_bits = {data_elem_bits}")
     lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
@@ -1725,12 +1703,6 @@ def _resolve_path_blocks(src: str, use_tma_store_epi: bool) -> str:
     src = keep_pat.sub(r"\1", src)
     src = drop_pat.sub("", src)
     return src
-
-
-def _mainloop_template_file(base_template_file: str) -> str:
-    """Map a template filename to its mainloop-fusion variant
-    (``sm100_matmul_1ctamma.py`` -> ``sm100_matmul_mainloop_1ctamma.py``)."""
-    return base_template_file.replace("_matmul_", "_matmul_mainloop_")
 
 
 _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
@@ -1775,7 +1747,7 @@ def _render_template(
     # Strip the unused epilogue path FIRST so its @@INJECT_EPILOGUE@@ marker
     # doesn't survive into the marker-replacement step.
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+    store_modes = _store_modes(chain, config, cta_group)
     tma_slots = frozenset(i for i, m in enumerate(store_modes) if m == "tma")
     use_tma = bool(tma_slots)
     src = _resolve_path_blocks(src, use_tma)
@@ -1947,7 +1919,7 @@ def _render_block_scale_template(
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+    store_modes = _store_modes(chain, config, cta_group)
     tma_slots = frozenset(i for i, m in enumerate(store_modes) if m == "tma")
     use_tma = bool(tma_slots)
     src = _resolve_path_blocks(src, use_tma_store_epi=use_tma)
@@ -2958,8 +2930,6 @@ def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
 
 def _epi_swizzle_lines(cfg, cta_group: int, out_dt: str) -> list[str]:
     epi_n = _epi_n(cfg, cta_group, out_dt)
-    row_bytes = epi_n * DTYPE_BYTES[out_dt]
-    b, tma = _EPI_SWIZZLE_BY_ROW_BYTES.get(row_bytes, _EPI_SWIZZLE_BY_ROW_BYTES[min(_EPI_SWIZZLE_BY_ROW_BYTES)])
     return [
         f"epi_n = {epi_n}",
         f"epi_row_elems = {_epi_row_elems(out_dt, epi_n)}",
@@ -2970,7 +2940,7 @@ def _epi_slot_widen(chain, cfg, cta_group: int) -> int:
     """One shared slot spans the widest TMA-stored row. An STG output never
     touches the ring, so it must not widen it."""
     epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
-    tma = _tma_slots_for(chain, cfg, cta_group, _epi_vec_bytes(chain, cfg, cta_group))
+    tma = _tma_slots_for(chain, cfg, cta_group)
     widths = [_epi_row_bytes(chain.output_specs[i].dtype, epi_n) for i in sorted(tma) if i < len(chain.output_specs)]
     if not widths:
         return 1
@@ -3009,13 +2979,9 @@ def _smem_d_bytes(cfg, chain, cta_group: int) -> int:
     return _EPI_SMEM_STAGES * _epi_stage_rows(cfg, cta_group) * row_bytes * _epi_slot_widen(chain, cfg, cta_group) + 16
 
 
-def _output_store_mode(out, chain, cfg, cta_group: int, vec_bytes_epi: int) -> str:
+def _output_store_mode(out, chain, cfg, cta_group: int) -> str:
     """Store mode for ONE output, from the output itself plus the geometry it is
     stored with -- never from what the others need."""
-    # No dense surface, so no C descriptor to bind.
-    if out.is_reduction or out.is_quant_scale:
-        return "stg"
-
     # TMA addresses its contiguous dim in 16-byte units, and truncates. The next
     # two rejections are that granule at a different extent.
     epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
@@ -3036,12 +3002,11 @@ def _output_store_mode(out, chain, cfg, cta_group: int, vec_bytes_epi: int) -> s
         return "stg"
 
     # The chunk is SHARED, so an output that FOLDS it constrains the arm for all.
+    # `epi_n % block_size == 0` needs no check: `_check_block_quant_supported`
+    # already forces it through `_pow2_floor(cols)`.
     # The emitters guard a whole chunk, so one straddling N is skipped outright.
     quants = [chain.quants[q.quant_idx] for q in chain.output_specs if q.quant_idx is not None]
     if (chain.reductions or quants) and chain.matmul.N % epi_n:
-        return "stg"
-    # One scale per WHOLE block of the chunk.
-    if any(epi_n % q.block_size for q in quants):
         return "stg"
 
     if out.major == "m":
@@ -3054,7 +3019,7 @@ def _output_store_mode(out, chain, cfg, cta_group: int, vec_bytes_epi: int) -> s
     return "tma"
 
 
-def _store_modes(chain, cfg, cta_group: int, vec_bytes_epi: int) -> tuple[str, ...]:
+def _store_modes(chain, cfg, cta_group: int) -> tuple[str, ...]:
     """One store mode per output, in `chain.outputs` slot order.
 
     Every TMA-stored output shares ONE SMEM ring -- the slot is sized for the
@@ -3068,20 +3033,20 @@ def _store_modes(chain, cfg, cta_group: int, vec_bytes_epi: int) -> tuple[str, .
         return ("stg",) * len(outs)
     modes = ["stg"] * len(outs)
     for i in range(len(chain.output_specs)):
-        modes[i] = _output_store_mode(outs[i], chain, cfg, cta_group, vec_bytes_epi)
+        modes[i] = _output_store_mode(outs[i], chain, cfg, cta_group)
     return tuple(modes)
 
 
-def _tma_slots_for(chain, cfg, cta_group: int, vec_bytes_epi: int) -> "frozenset[int]":
-    return frozenset(i for i, m in enumerate(_store_modes(chain, cfg, cta_group, vec_bytes_epi)) if m == "tma")
+def _tma_slots_for(chain, cfg, cta_group: int) -> "frozenset[int]":
+    return frozenset(i for i, m in enumerate(_store_modes(chain, cfg, cta_group)) if m == "tma")
 
 
-def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
+def _use_tma_store_epi(chain, cfg, cta_group: int) -> bool:
     """Does the kernel render the TMA-store arm at all? True iff some output
     takes it -- the renderer deletes one of `@@STG_ONLY@@` / `@@TMA_STORE_ONLY@@`,
     so this is a property of the TEMPLATE, while `_store_modes` is the per-output
     answer the emitters consume."""
-    return "tma" in _store_modes(chain, cfg, cta_group, vec_bytes_epi)
+    return "tma" in _store_modes(chain, cfg, cta_group)
 
 
 def _check_block_quant_supported(
@@ -3437,7 +3402,7 @@ def jit_from_cudnn_graph(
     _FORCE_STG_EPI = force_stg_epi
     try:
         vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-        store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+        store_modes = _store_modes(chain, config, cta_group)
         use_tma = "tma" in store_modes
         snippets = generate(
             chain,
@@ -3856,7 +3821,7 @@ def _jit_moe(
     """JIT path for a MoE grouped matmul forward pass (mode=NONE)."""
     _precheck_moe(chain, config, cta_group)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+    store_modes = _store_modes(chain, config, cta_group)
     use_tma = "tma" in store_modes
     snippets = generate(
         chain,
@@ -3905,7 +3870,7 @@ def _jit_block_scale(
     _precheck_block_scale(chain, config, cta_group)
     fallback_cluster = _mixed_cga_fallback(config, cta_group, select_template(chain, config, cta_group).file)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+    store_modes = _store_modes(chain, config, cta_group)
     use_tma = "tma" in store_modes
     snippets = generate(
         chain,
@@ -4238,7 +4203,7 @@ def _jit_moe_block_scale(
     _precheck_moe_block_scale(chain, config, cta_group)
     _tmpl = select_template(chain, config, cta_group)
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
-    store_modes = _store_modes(chain, config, cta_group, vec_bytes_epi)
+    store_modes = _store_modes(chain, config, cta_group)
     use_tma = "tma" in store_modes
     snippets = generate(
         chain,

@@ -589,7 +589,7 @@ def test_moe_m_major_output(cta_group: int) -> None:
     g, _, _, _, _ = build()
     chain = analyze(g)
     assert chain.out_major == "m"
-    assert _store_modes(chain, cfg, cta_group, _epi_vec_bytes(chain, cfg, cta_group)) == ("stg",)
+    assert _store_modes(chain, cfg, cta_group) == ("stg",)
 
     torch.manual_seed(0)
     tk = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)

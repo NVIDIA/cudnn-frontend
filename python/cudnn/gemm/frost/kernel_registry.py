@@ -589,10 +589,3 @@ def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:
         for cfg in tmpl.candidate_configs(chain):  # stages 0 + 2 + 3 + 4
             out.append((tmpl, cfg))
     return out
-
-
-def enumerate_candidates(
-    chain: FusionChain,
-) -> list[tuple[KernelTemplate, TileConfig]]:
-    """Alias for :func:`candidates` (the four-stage funnel)."""
-    return candidates(chain)

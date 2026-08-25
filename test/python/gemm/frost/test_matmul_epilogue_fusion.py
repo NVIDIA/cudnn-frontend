@@ -1567,7 +1567,7 @@ def test_reduction_only_chain_sizes_its_chunk_from_n(N: int, want_chunk: int) ->
     chain = analyze(g)
     assert not chain.output_specs and len(chain.reductions) == 1
     assert _epi_chunk_elems(chain, cfg, 1, False) == want_chunk
-    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == ("stg",)
+    assert _store_modes(chain, cfg, 1) == ("stg",)
 
     torch.manual_seed(0)
     a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
@@ -2382,7 +2382,7 @@ def test_epi_n_is_one_shared_column_count_not_a_per_output_one(cfg_name: str, dt
 
     chain = analyze(g)
     cfg = by_name(cfg_name)
-    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == want
+    assert _store_modes(chain, cfg, 1) == want
 
 
 @pytest.mark.parametrize(
@@ -2418,7 +2418,7 @@ def test_outputs_of_either_layout_share_one_epilogue(majors: tuple, want: tuple)
 
     g, *_ = build()
     chain = analyze(g)
-    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == want
+    assert _store_modes(chain, cfg, 1) == want
 
     torch.manual_seed(0)
     a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
@@ -2478,7 +2478,7 @@ def test_both_renderers_emit_the_tma_output_COUNT_not_a_flag() -> None:
     chain = analyze(g)
     assert chain.has_block_scale
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
-    want = len(_tma_slots_for(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)))
+    want = len(_tma_slots_for(chain, cfg, 1))
     assert want == 2, "this graph is meant to put BOTH outputs on the surface"
 
     for render in (
@@ -2588,7 +2588,7 @@ def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_grou
     assert _EPI_SMEM_STAGES * slot_bytes + 16 == _smem_d_bytes(cfg, chain, cta_group)
 
     epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
-    slots = _tma_slots_for(chain, cfg, cta_group, _epi_vec_bytes(chain, cfg, cta_group))
+    slots = _tma_slots_for(chain, cfg, cta_group)
     for _slot, dt in _tma_out_dtypes(chain, slots):
         view = _epi_stage_rows(cfg, cta_group) * epi_n * DTYPE_BYTES[dt]
         assert view <= slot_bytes, f"{dt} view {view}B does not fit a {slot_bytes}B slot"
@@ -2622,7 +2622,7 @@ def test_sub_byte_output_takes_the_tma_store(cfg_name: str, cta_group: int, bloc
 
     g, _, _, _, _ = build()
     chain = analyze(g)
-    assert _store_modes(chain, cfg, cta_group, _epi_vec_bytes(chain, cfg, cta_group)) == ("tma", "stg")
+    assert _store_modes(chain, cfg, cta_group) == ("tma", "stg")
     # the packed row is half the logical column count, in bytes
     assert _epi_row_bytes("fp4_e2m1", 32) == 16 and _epi_row_bytes("bf16", 32) == 64
 
@@ -2673,14 +2673,14 @@ def test_only_a_tma_stored_output_widens_the_ring() -> None:
     # and it declines the TMA arm.
     stg = by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1")
     chain = build("fp32")
-    assert _store_modes(chain, stg, 1, _epi_vec_bytes(chain, stg, 1)) == ("tma", "stg")
+    assert _store_modes(chain, stg, 1) == ("tma", "stg")
     assert _epi_slot_widen(chain, stg, 1) == 1
     assert _smem_d_bytes(stg, chain, 1) == _smem_d_bytes(stg, build("bf16"), 1)
 
     # ...but at epi_n = 32 the same fp32 output IS TMA-stored, and then it does.
     tma = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
     chain = build("fp32")
-    assert _store_modes(chain, tma, 1, _epi_vec_bytes(chain, tma, 1)) == ("tma", "tma")
+    assert _store_modes(chain, tma, 1) == ("tma", "tma")
     assert _epi_slot_widen(chain, tma, 1) == 2
 
 
@@ -2703,7 +2703,7 @@ def test_more_than_one_output_can_take_the_tma_store() -> None:
     chain = _an(g)
 
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
-    assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == ("tma", "tma")
+    assert _store_modes(chain, cfg, 1) == ("tma", "tma")
     # The ring is typed as the primary slot's dtype, so a wider companion widens
     # the SLOT rather than adding a second ring.
     assert _epi_slot_widen(chain, cfg, 1) == 2

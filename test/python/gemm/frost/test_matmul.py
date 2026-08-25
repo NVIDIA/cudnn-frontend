@@ -2633,7 +2633,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     g.matmul(A=A, B=B, name="mm").set_output(True)
     cfg = by_name(name)
     assert cfg.cta_tile_n < 64
-    assert _use_tma_store_epi(analyze(g), cfg, 16, 2) is True
+    assert _use_tma_store_epi(analyze(g), cfg, 2) is True
 
 
 @pytest.mark.parametrize(
@@ -2667,7 +2667,7 @@ def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: t
         return g, A, B, C
 
     g, _, _, _ = build()
-    assert _store_modes(analyze(g), cfg, cta_group, _epi_vec_bytes(analyze(g), cfg, cta_group)) == ("tma",)
+    assert _store_modes(analyze(g), cfg, cta_group) == ("tma",)
 
     torch.manual_seed(0)
     a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
@@ -2824,7 +2824,7 @@ def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> N
     g, _, _, _ = build()
     chain = analyze(g)
     assert chain.out_major == "m"
-    assert _store_modes(chain, cfg, cta_group, 16) == ("tma",)
+    assert _store_modes(chain, cfg, cta_group) == ("tma",)
 
     torch.manual_seed(0)
     a = torch.randn(1, m, k, device="cuda", dtype=torch.bfloat16)

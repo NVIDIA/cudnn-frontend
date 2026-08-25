@@ -131,9 +131,7 @@ def _kernel(
     tidx = cute.arch.thread_idx()[0]
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
-    bidz = cute.arch.block_idx()[2]
     gridx = cute.arch.grid_dim()[0]
-    gridy = cute.arch.grid_dim()[1]
 
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]

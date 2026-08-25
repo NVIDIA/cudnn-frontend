@@ -673,8 +673,6 @@ def select_config(
         wide = [c for c in choices if c >= 128]
         if wide:
             choices = wide
-    if not choices:
-        choices = [cta_n_max]
     cta_n = max(choices, key=lambda c: _tile_score(rep_m, N, K, cta_m, c, sm))
 
     if block_scale:
@@ -705,8 +703,6 @@ def select_config(
     pool = [g for g in _CLUSTERS_1D + _CLUSTERS_2D if not _hang_prone(cta_m, cta_n, g[0], g[1])]
     if cta_group == 2:
         pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cgrp_size_m % 2 == 0
-    if not pool:
-        pool = [(2, 1)] if cta_group == 2 else [(1, 1)]
     cgrp_m, cgrp_n = max(pool, key=lambda g: _cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm))
 
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x{_MMA_INST_K_BYTES}_cluster{cgrp_m}x{cgrp_n}"
