@@ -32,7 +32,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import requires_cudnn_9_24, requires_pre_rubin_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -750,6 +750,7 @@ def test_mxfp8_thd_zero_len_kv():
 
 
 @pytest.mark.L0
+@requires_cudnn_9_24
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cu_seq_len():
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
