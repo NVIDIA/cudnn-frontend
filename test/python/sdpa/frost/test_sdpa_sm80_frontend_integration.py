@@ -313,6 +313,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     torch.testing.assert_close(dv_buf.float(), v_ref.grad, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.L0
 @_SM80
 def test_engine_execute_does_not_allocate():
     """Issue #514: after the first (JIT + cache-warming) execute, re-executing
