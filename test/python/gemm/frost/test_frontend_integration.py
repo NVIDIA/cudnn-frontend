@@ -359,6 +359,71 @@ def test_ineligible_graph_not_listed():
     assert not any(is_python_engine(p.engine_id) for p in g.plans)
 
 
+def _bf16_graph(m, n, k, *, epi=None, out_dt=None, b_major="k", ntap=0):
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    bs = [k * n, 1, k] if b_major == "k" else [k * n, n, 1]
+    B = g.tensor(name="B", dim=[1, k, n], stride=bs)
+    C = g.matmul(A=A, B=B, name="mm")
+    if ntap:
+        C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    T = getattr(g, epi)(input=C, name="e") if epi else C
+    T.set_output(True).set_data_type(out_dt or cudnn.data_type.BFLOAT16)
+    return g
+
+
+def _moe_graph(s, n, k, e, *, token_major="k"):
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    ts = [s * k, k, 1] if token_major == "k" else [s * k, 1, s]
+    tok = g.tensor(name="token", dim=[1, s, k], stride=ts, data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[e, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    return g
+
+
+_AGREEMENT_GRAPHS = {
+    "plain": lambda: _bf16_graph(256, 256, 256),
+    "relu": lambda: _bf16_graph(256, 256, 256, epi="relu"),
+    "tap": lambda: _bf16_graph(256, 256, 256, epi="relu", ntap=1),
+    "fp32_out": lambda: _bf16_graph(256, 256, 256, out_dt=cudnn.data_type.FLOAT),
+    "b_n_major": lambda: _bf16_graph(256, 256, 256, b_major="n"),
+    "tall_narrow": lambda: _bf16_graph(4096, 64, 256),
+    "moe": lambda: _moe_graph(2048, 256, 256, 8),
+    "moe_token_m_major": lambda: _moe_graph(2048, 256, 256, 8, token_major="m"),
+}
+
+
+@_GPU
+@pytest.mark.parametrize("name", sorted(_AGREEMENT_GRAPHS))
+def test_probe_and_build_agree(name):
+    """``probe_gemm_plan`` is what puts frost_gemm in the ranked list, and
+    ``build_gemm_plan`` is what has to honour it. When the probe is the more
+    permissive of the two, the engine is listed, ``build_plans`` drops it and
+    native cuDNN silently serves the graph -- a rejection with NO test failure.
+    This pins them equal, which is the only regression signal the epilogue gates
+    have on the public path."""
+    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan, probe_gemm_plan
+
+    g = _AGREEMENT_GRAPHS[name]()
+    probed = probe_gemm_plan(g)
+    try:
+        build_gemm_plan(_AGREEMENT_GRAPHS[name]())
+        built, why = True, ""
+    except (NotImplementedError, ValueError) as exc:
+        built, why = False, str(exc)
+    assert probed == built, f"probe={probed} but build={built}" + (f" ({why})" if why else "")
+
+
 @_GPU
 def test_wrapper_graph_path():
     """wrapper.Graph(heuristics=[A]) plans and executes the fused graph."""

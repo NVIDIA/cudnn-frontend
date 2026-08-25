@@ -166,6 +166,7 @@ class ChainOutput:
     is_reduction: bool = False
     is_quant_scale: bool = False
     quant_block_size: int | None = None
+    major: "OutMajor" = "n"
 
 
 @dataclass(frozen=True)
@@ -774,7 +775,7 @@ class FusionChain:
         then one quant scale per ``quants`` entry. Callers must pass runtime
         output tensors in this order."""
         outs: list[ChainOutput] = [
-            ChainOutput(source=self._output_label(spec), dtype=spec.dtype, dim=spec.dim, stride=spec.stride) for spec in self.output_specs
+            ChainOutput(source=self._output_label(spec), dtype=spec.dtype, dim=spec.dim, stride=spec.stride, major=spec.major) for spec in self.output_specs
         ]
         for i, red in enumerate(self.reductions):
             outs.append(
