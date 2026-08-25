@@ -454,6 +454,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
+    if facts.stats_t is not None and not facts.thd:
+        if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
+            return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
+        stats_dim = tuple(facts.stats_t.get_dim())
+        stats_stride = tuple(facts.stats_t.get_stride())
+        expected_dim = (facts.b, facts.h_q, facts.s_q, 1)
+        if stats_dim != expected_dim:
+            return f"stats must be (B, H_q, S_q, 1) = {expected_dim}; got {stats_dim}"
+        if not ga.dense_layout_ok(stats_dim, stats_stride):
+            return (
+                "stats must use a dense-compatible B/H/S permutation or padded layout "
+                f"with non-broadcast, non-overlapping-by-span strides; got {stats_stride}"
+            )
+
     if capabilities.single_wave_only:
         # See Capabilities.single_wave_only. 512 = TILES_Q * TILE_M * CTA_MMA
         # rows per cluster; resident clusters = SM count / CTA_MMA (one CTA per

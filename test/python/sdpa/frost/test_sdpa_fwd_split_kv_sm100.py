@@ -14,6 +14,7 @@ masks, MHA and GQA.
 
 import math
 import os
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
@@ -26,6 +27,14 @@ D = 128
 TILE_N = 128
 # One cga2 cluster covers TILES_Q * TILE_M * CTA_MMA Q rows.
 ROWS_PER_CLUSTER = 2 * 128 * 2
+
+
+class _ApiCaseResult(NamedTuple):
+    split: int
+    output: torch.Tensor
+    reference: torch.Tensor
+    workspace_bytes: int
+    stats: Optional[torch.Tensor]
 
 
 def _ref_sdpa(q, k, v, scale, is_causal, kh):
@@ -209,6 +218,56 @@ def test_split_kv_requires_lse():
     mod = _kernel_module(4, 3, causal=False)
     with pytest.raises(ValueError, match="has_lse"):
         mod.compile(b=1, qh=4, kh=4, sq=128, skv=2048, d_qk=D, d_v=D, has_lse=False)
+
+
+@pytest.mark.L0
+def test_split_combine_compile_keeps_partial_lse_compact_and_strides_final_lse(monkeypatch):
+    """Only the caller-visible Stats output inherits its non-compact layout."""
+    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+
+    def fake_compact_tensor(_dtype, shape, **kwargs):
+        return {"kind": "compact", "shape": tuple(shape), **kwargs}
+
+    def fake_tensor(_dtype, shape, stride, **kwargs):
+        return {"kind": "strided", "shape": tuple(shape), "stride": tuple(stride), **kwargs}
+
+    captured = {}
+    compiled = object()
+
+    def fake_compile(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return compiled
+
+    monkeypatch.setattr(comb.cute.runtime, "make_fake_compact_tensor", fake_compact_tensor)
+    monkeypatch.setattr(comb.cute.runtime, "make_fake_tensor", fake_tensor)
+    monkeypatch.setattr(comb.cute.runtime, "make_fake_stream", lambda **_kwargs: object())
+    monkeypatch.setattr(comb.cute, "compile", fake_compile)
+
+    comb.compile.cache_clear()
+    try:
+        result = comb.compile(
+            b=2,
+            h=4,
+            sq=5,
+            d_v=16,
+            splits=3,
+            has_lse=True,
+            lse_stride=(97, 19, 3),
+        )
+    finally:
+        comb.compile.cache_clear()
+
+    assert result is compiled
+    assert captured["args"][2]["kind"] == "compact"
+    assert captured["args"][2]["shape"] == (6, 4, 5)
+    assert captured["args"][2]["assumed_align"] == 16
+    assert captured["args"][4] == {
+        "kind": "strided",
+        "shape": (2, 4, 5),
+        "stride": (97, 19, 3),
+        "assumed_align": 4,
+    }
 
 
 # --- cga1 (CTA_MMA=1) ---------------------------------------------------
@@ -859,7 +918,7 @@ def _expected_split(b, h_q, s_q, s_kv, *, rows_per_tile=512, ctas_per_tile=2, kv
     )
 
 
-def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True):
+def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True, lse_layout="contiguous", split_kv=None):
     """Drive SdpaFwdDslSm100 the way the graph path does — the chooser's value
     arrives as the explicit ``split_kv`` constructor knob, exactly as
     ``lower_dsl_prefill`` forwards a plan's knobs; return (split, O, ref)."""
@@ -874,9 +933,18 @@ def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True):
     k = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
     v = torch.randn(b, h_kv, s_kv, d, device=dev, dtype=torch.float16)
     o = torch.zeros_like(q)
-    lse = torch.zeros(b, h_q, s_q, device=dev, dtype=torch.float32) if with_lse else None
+    lse_storage = None
+    if not with_lse:
+        lse = None
+    elif lse_layout == "contiguous":
+        lse = torch.zeros(b, h_q, s_q, device=dev, dtype=torch.float32)
+    elif lse_layout == "strided":
+        lse_storage = torch.full((s_q + 7, h_q + 2, b), -12345.0, device=dev, dtype=torch.float32)
+        lse = lse_storage.permute(2, 1, 0)[:, :h_q, :s_q]
+    else:
+        raise ValueError(f"unknown LSE layout {lse_layout!r}")
 
-    split_knob = _expected_split(b, h_q, s_q, s_kv)
+    split_knob = _expected_split(b, h_q, s_q, s_kv) if split_kv is None else split_kv
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, split_kv=split_knob)
     assert api.check_support()
     split = api.split_kv
@@ -891,8 +959,15 @@ def _api_case(b, h_q, h_kv, s_q, s_kv, *, with_lse=False, workspace=True):
     if h_q != h_kv:
         kb = kb.repeat_interleave(h_q // h_kv, dim=1)
         vb = vb.repeat_interleave(h_q // h_kv, dim=1)
-    p = torch.softmax(torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d), dim=-1)
-    return split, o.float(), torch.matmul(p, vb), ws_bytes
+    scores = torch.matmul(qb, kb.transpose(-1, -2)) / math.sqrt(d)
+    p = torch.softmax(scores, dim=-1)
+    if lse is not None:
+        torch.testing.assert_close(lse, torch.logsumexp(scores, dim=-1), rtol=3e-2, atol=5e-2)
+    if lse_storage is not None:
+        gaps = torch.ones_like(lse_storage, dtype=torch.bool)
+        gaps[:s_q, :h_q, :] = False
+        assert torch.all(lse_storage[gaps] == -12345.0), "the combine LSE store touched padding outside its declared view"
+    return _ApiCaseResult(split, o.float(), torch.matmul(p, vb), ws_bytes, None if lse is None else lse.clone())
 
 
 @pytest.mark.L0
@@ -901,10 +976,10 @@ def test_api_splits_a_decode_shape_and_is_correct():
     split, the knob delivers it, the adapter sizes its own workspace and still
     matches fp32. S_kv is the smallest that still splits -- the fp32 reference
     is O(h * s_q * s_kv) and this is L0."""
-    split, got, ref, ws_bytes = _api_case(1, 8, 1, 512, 16384)
-    assert split == _expected_split(1, 8, 512, 16384) > 1
-    assert ws_bytes > 0, "a split needs the split-major O/LSE partials in workspace"
-    assert (got - ref).abs().max().item() <= 2e-2
+    result = _api_case(1, 8, 1, 512, 16384)
+    assert result.split == _expected_split(1, 8, 512, 16384) > 1
+    assert result.workspace_bytes > 0, "a split needs the split-major O/LSE partials in workspace"
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
@@ -914,10 +989,10 @@ def test_api_does_not_split_a_full_chip():
     so hard-coding split==1 would fail on a smaller SM100 part for a device
     reason rather than a policy one."""
     want = _expected_split(1, 16, 2048, 8192)
-    split, got, ref, ws_bytes = _api_case(1, 16, 16, 2048, 8192)
-    assert split == want
-    assert (ws_bytes > 0) == (split > 1), "workspace is needed exactly when we split"
-    assert (got - ref).abs().max().item() <= 2e-2
+    result = _api_case(1, 16, 16, 2048, 8192)
+    assert result.split == want
+    assert (result.workspace_bytes > 0) == (result.split > 1), "workspace is needed exactly when we split"
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
@@ -925,18 +1000,28 @@ def test_api_does_not_split_a_full_chip():
 def test_api_split_with_and_without_workspace(workspace):
     """With a workspace the partials are carved from it; without one they are
     torch-allocated (standalone use). Same answer either way."""
-    split, got, ref, _ = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
-    assert split > 1
-    assert (got - ref).abs().max().item() <= 2e-2
+    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace)
+    assert result.split > 1
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
 def test_api_split_writes_the_recombined_lse():
     """A Stats output under a split comes from the combine, not from any one
     chunk: the per-chunk LSE is compiled in even when the caller wants none."""
-    split, got, ref, _ = _api_case(1, 8, 1, 512, 16384, with_lse=True)
-    assert split > 1
-    assert (got - ref).abs().max().item() <= 2e-2
+    result = _api_case(1, 8, 1, 512, 16384, with_lse=True)
+    assert result.split > 1
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+def test_api_split_writes_strided_recombined_lse():
+    """The combine writes the caller's final LSE through its declared stride."""
+    contiguous = _api_case(1, 8, 1, 128, 1024, with_lse=True, split_kv=2)
+    strided = _api_case(1, 8, 1, 128, 1024, with_lse=True, lse_layout="strided", split_kv=2)
+    assert strided.split == 2
+    assert (strided.output - strided.reference).abs().max().item() <= 2e-2
+    torch.testing.assert_close(strided.stats, contiguous.stats, atol=0, rtol=0)
 
 
 # --- the adapter splits the FP8 family too ----------------------------------

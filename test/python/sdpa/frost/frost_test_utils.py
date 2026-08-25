@@ -111,3 +111,17 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
 def offers_engine(graph, name) -> bool:
     """Whether any ranked entry is a plan for engine ``name``."""
     return any(_is_plan_for(graph.get_plan_name_at_index(i), name) for i in range(len(graph.plans)))
+
+
+def make_dense_stats(batch: int, heads: int, sequence: int, layout: str):
+    """Allocate dense Stats in compact or permuted-and-gapped storage."""
+    import torch
+
+    if layout == "contiguous":
+        return torch.empty(batch, heads, sequence, 1, dtype=torch.float32, device="cuda")
+    if layout == "strided":
+        storage = torch.empty(sequence + 7, heads + 2, batch, dtype=torch.float32, device="cuda")
+        stats = storage.permute(2, 1, 0)[:, :heads, :sequence].unsqueeze(-1)
+        assert not stats.is_contiguous()
+        return stats
+    raise ValueError(f"unknown dense Stats layout {layout!r}")
