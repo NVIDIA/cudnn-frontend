@@ -26,6 +26,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from ..common.beta_guard import beta_guard
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
@@ -1254,6 +1255,10 @@ def compute0_warp_group(
                 q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
                 k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
+            # ---- beta guard ------------------------------------------------------------
+            if cutlass.const_expr(cfg.beta_guard):
+                beta_guard(cfg, raw_beta_regs, raw_k_regs, k_inv_norm, sGate_ptr, decay_row, lane_in_row_group)
+
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
             exp_g_last_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
@@ -2350,6 +2355,7 @@ class Gdn2Cfg:
     safe_gate: bool
     gate_scale_log2: float
     beta_sigmoid: bool
+    beta_guard: bool
     q_ratio: int
     k_ratio: int
     v_ratio: int
@@ -2436,6 +2442,7 @@ def build_cfg(
     safe_gate: bool,
     gate_scale_log2: float,
     beta_sigmoid: bool,
+    beta_guard: bool = False,
     q_ratio: int,
     k_ratio: int,
     v_ratio: int,
@@ -2447,6 +2454,8 @@ def build_cfg(
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
     if io_dtype not in (cutlass.Float16, cutlass.BFloat16):
         raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
+    if beta_guard and not l2norm:
+        raise ValueError("beta_guard requires l2norm (the sensor is defined on the normalized key)")
     cfg = Gdn2Cfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2457,6 +2466,7 @@ def build_cfg(
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         beta_sigmoid=beta_sigmoid,
+        beta_guard=beta_guard,
         q_ratio=q_ratio,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
@@ -2823,6 +2833,7 @@ def get_compiled_cache(
     safe_gate: bool,
     gate_lower_bound: float,
     beta_sigmoid: bool,
+    beta_guard: bool,
     dynamic_scheduling: bool,
     order_gen: bool,
 ):
@@ -2840,6 +2851,7 @@ def compile(
     safe_gate: bool,
     gate_scale_log2: float,
     beta_sigmoid: bool,
+    beta_guard: bool,
     q_ratio: int,
     k_ratio: int,
     v_ratio: int,
@@ -2878,6 +2890,7 @@ def compile(
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         beta_sigmoid=beta_sigmoid,
+        beta_guard=beta_guard,
         q_ratio=q_ratio,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
@@ -2932,6 +2945,7 @@ def chunk_gdn2_sm100(
     a_log=None,
     dt_bias=None,
     use_beta_sigmoid: bool = False,
+    beta_guard: bool = False,
     work_items=None,
     work_count=None,
     scheduler_counter=None,
@@ -3037,6 +3051,7 @@ def chunk_gdn2_sm100(
         safe_gate,
         gate_lower_bound,
         use_beta_sigmoid,
+        beta_guard,
         dynamic_scheduling,
         order_gen,
     )
@@ -3083,6 +3098,7 @@ def chunk_gdn2_sm100(
             safe_gate,
             gate_scale_log2,
             use_beta_sigmoid,
+            beta_guard,
             q_ratio,
             k_ratio,
             v_ratio,

@@ -67,6 +67,42 @@ def recurrent_dense(q, k, v, alpha, beta, w, state0):
     return torch.stack(outs, dim=2), state
 
 
+def beta_guard_reference(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    alpha: torch.Tensor,
+    io_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp64 mirror of the kernel beta guard (``frost/common/beta_guard.py``).
+
+    ``k`` l2-normalized, ``alpha = exp(g)`` per token; all ``[B, T, HO, K]``.
+    Returns ``(beta_eff, unsafe, fallback)``; the decision masks let tests
+    assert the sensor actually fires and compare against other guard
+    implementations."""
+    weight = k * k
+    n = weight.sum(-1)
+    a = (beta * weight).sum(-1)
+    nu = (beta * beta * weight).sum(-1)
+    r2 = (n * nu - a * a).clamp_min(0.0)
+    inv_c2 = alpha.amax(-1).pow(2)
+    c2 = 1.0 / inv_c2
+    r2_crit = ((c2 - 1.0) * (1.0 - (1.0 - a).pow(2) * inv_c2)).clamp_min(0.0)
+    unsafe = (n > 1.0e-20) & (r2 > r2_crit)
+    mu = a / n.clamp_min(1.0e-20)
+    eta = ((1.0 - 1.0 / 32) * r2_crit / r2.clamp_min(1.0e-30)).sqrt().clamp(0.0, 1.0)
+    projected = mu[..., None] + eta[..., None] * (beta - mu[..., None])
+    candidate_q = torch.where(unsafe[..., None], projected, beta).to(io_dtype).double()
+    a_q = (candidate_q * weight).sum(-1)
+    nu_q = (candidate_q * candidate_q * weight).sum(-1)
+    r2_q = (n * nu_q - a_q * a_q).clamp_min(0.0)
+    r2_crit_q = ((c2 - 1.0) * (1.0 - (1.0 - a_q).pow(2) * inv_c2)).clamp_min(0.0)
+    quant_tol = 4.0 * torch.finfo(io_dtype).eps * (n * nu_q + a_q * a_q)
+    fallback = unsafe & (r2_q > r2_crit_q + quant_tol)
+    mu_q = (a_q / n.clamp_min(1.0e-20)).to(io_dtype).double()
+    beta_eff = torch.where(fallback[..., None], mu_q[..., None], candidate_q)
+    return beta_eff, unsafe, fallback
+
+
 def gdn2_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,6 +119,7 @@ def gdn2_reference(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     use_beta_sigmoid: bool = False,
+    beta_guard: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN-2 reference.
 
@@ -99,6 +136,9 @@ def gdn2_reference(
             (differentiable; a_log ``[Hg]``, dt_bias ``[Hg, K]``).
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         use_beta_sigmoid: treat ``beta`` as raw logits; apply ``sigmoid``.
+        beta_guard: apply the erase-side beta safeguard (straight-through:
+            the projection is detached, gradients flow as identity to
+            ``beta`` and not at all to ``g``). Requires l2-normalized ``k``.
 
     Returns:
         ``(o, final_state)`` in fp64: o ``[B, T, HO, V]``, final_state
@@ -135,6 +175,10 @@ def gdn2_reference(
         betaf = betaf.unsqueeze(3).expand(-1, -1, -1, HO // beta.shape[2], -1).reshape(beta.shape[0], beta.shape[1], HO, -1)
     if w.shape[2] != HO:
         wf = wf.unsqueeze(3).expand(-1, -1, -1, HO // w.shape[2], -1).reshape(w.shape[0], w.shape[1], HO, -1)
+
+    if beta_guard:
+        beta_eff, _, _ = beta_guard_reference(kf.detach(), betaf.detach(), alphaf.detach(), beta.dtype)
+        betaf = betaf + (beta_eff - betaf.detach())
 
     # [B, T, HO, *] -> [B, HO, T, *]
     qf = qf.permute(0, 2, 1, 3)
