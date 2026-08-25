@@ -1551,7 +1551,10 @@ def _render_block_scale_tile_constants(
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"frost_compile_options = {_frost_compile_options()!r}",
         f"use_tma_store_epi = {use_tma_store_epi}",
-        f"n_tma_outputs = {1 if use_tma_store_epi else 0}",
+        # The COUNT, not the flag: a block-scale graph can put more than one
+        # output on the TMA-C surface, and on MoE this number also sizes the
+        # tensormap scratch and the per-CTA workspace stride.
+        f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group, vec_bytes_epi))}",
         f"epi_slot_widen = {_epi_slot_widen(chain)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma_store_epi)}",
         f"cd_out_is_m_major = {chain.out_major == 'm'}",

@@ -2385,6 +2385,54 @@ def test_an_output_laid_out_against_the_arm_stays_on_stg(majors: tuple, want: tu
     assert _store_modes(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)) == want
 
 
+def test_both_renderers_emit_the_tma_output_COUNT_not_a_flag() -> None:
+    """`n_tma_outputs` sizes the descriptor prefetch, and on MoE also the
+    tensormap scratch and the per-CTA workspace stride. The block-scale renderer
+    used to emit `1 if use_tma_store_epi else 0` -- a FLAG -- which under-counts
+    the moment a block-scale graph puts two outputs on the surface, so the second
+    descriptor's scratch and workspace slot overlap somebody else's."""
+    import re
+
+    from cudnn.gemm.frost.compiler import (
+        _epi_vec_bytes,
+        _render_block_scale_tile_constants,
+        _render_tile_constants,
+        _tma_slots_for,
+    )
+    from cudnn.gemm.frost.tile_config import by_name
+
+    E4, E8, RE = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0, cudnn.tensor_reordering.F8_128x4
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=E4)
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=E4)
+    sfa = g.tensor(name="sfa", dim=[1, M, K // 32], stride=[M * K // 32, K // 32, 1], data_type=E8, reordering_type=RE)
+    sfb = g.tensor(name="sfb", dim=[1, K // 32, N], stride=[K * N // 32, 1, K // 32], data_type=E8, reordering_type=RE)
+    c = g.matmul(
+        A=g.block_scale_dequantize(input=A, descale=sfa, block_size=[1, 32], name="dqa"),
+        B=g.block_scale_dequantize(input=B, descale=sfb, block_size=[32, 1], name="dqb"),
+        name="mm",
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    R = g.relu(input=c, name="r")
+    R.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    g.mul(a=R, b=R, name="sq").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    chain = analyze(g)
+    assert chain.has_block_scale
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
+    want = len(_tma_slots_for(chain, cfg, 1, _epi_vec_bytes(chain, cfg, 1)))
+    assert want == 2, "this graph is meant to put BOTH outputs on the surface"
+
+    for render in (
+        _render_block_scale_tile_constants(cfg, chain, 1, use_tma_store_epi=True),
+        _render_tile_constants(cfg, chain, 1),
+    ):
+        m = re.search(r"^n_tma_outputs = (\d+)$", render, re.M)
+        assert m, "every renderer must emit n_tma_outputs"
+        assert int(m.group(1)) == want, f"emitted {m.group(1)}, real TMA slots {want}"
+
+
 def test_the_store_gate_still_guards_against_the_wrong_arm() -> None:
     """The same-arm conjunct is redundant today (see
     `test_an_output_laid_out_against_the_arm_stays_on_stg`), so no behavioural

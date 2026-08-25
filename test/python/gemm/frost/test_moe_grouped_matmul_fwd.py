@@ -6,6 +6,8 @@ correctness vs a torch group-loop reference (uneven + empty groups)."""
 
 from __future__ import annotations
 
+import pathlib
+
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
@@ -977,8 +979,10 @@ def test_moe_host_signature_matches_the_launch_order(force_stg: bool) -> None:
     tma = plan._compiled.use_tma_store
     assert tma is not force_stg
 
-    src = open(plan.generated_path).read()
-    body = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M).group(1)
+    src = pathlib.Path(plan.generated_path).read_text()
+    m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
+    assert m, f"no _host signature in {plan.generated_path}"
+    body = m.group(1)
     params = [ln.strip().split(":")[0] for ln in body.splitlines() if ln.strip()]
     taps = [p for p in params if p.startswith("c_tap_")]
     tma_c = [p for p in params if re.fullmatch(r"c_\d+", p)]

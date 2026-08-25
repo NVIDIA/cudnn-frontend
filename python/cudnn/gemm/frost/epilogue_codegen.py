@@ -1351,7 +1351,11 @@ def generate(
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # epilogue snippet (interleaves op chain with tap stores)
-    on_tma_arm = 0 in tma_slots
+    # ANY slot on the TMA surface means the kernel renders the TMA arm, so the
+    # bounds the arm does not supply have to be emitted -- keying this on slot 0
+    # leaves them off whenever slot 0 is the one that fell back (an fp4 data
+    # output beside a bf16 one, say).
+    on_tma_arm = bool(tma_slots)
     # The M-major TMA arm's `row` / `col_j` are the subtile base, not the
     # fragment's coordinates -- everything that asks "which row / column am I"
     # goes through `_elem_coord` there. See `_mmajor_elem_coord`.
