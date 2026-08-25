@@ -20,10 +20,10 @@ import cudnn
 _LOG = logging.getLogger(__name__)
 
 from .fusion_ir import (
+    out_major_of,
     AMajor,
     BMajor,
     BlockQuantizeSpec,
-    OutMajor,
     OutputSpec,
     Dtype,
     FusionChain,
@@ -604,16 +604,6 @@ def _infer_b_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> BMajor:
     if stride[-1] == 1:
         return "n"
     raise ValueError(f"B must be K-major or N-major in the inner (K,N) plane; " f"got dim={dim} stride={stride}")
-
-
-def _infer_out_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> OutMajor:
-    if not stride:
-        return "n"
-    if stride[-1] == 1:
-        return "n"
-    if stride[-2] == 1:
-        return "m"
-    raise ValueError(f"output must be N-major or M-major in the inner (M,N) plane; " f"got dim={dim} stride={stride}")
 
 
 def _resolve_out_dtype(
@@ -1224,7 +1214,7 @@ def _build_multi_moe_chain(
                 _layout["dim"] = tuple(_d_i)
             if _s_i:
                 _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, major=_infer_out_major(_d_i, _s_i), **_layout), _obj_i)
+            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
@@ -1865,7 +1855,6 @@ def _build_multi_gemm_chain(
         elif not reductions:
             raise ValueError("graph materializes no output; mark at least one tensor " "set_output(True)")
 
-    out_major: OutMajor = "n"
     if dense_entries:
         from dataclasses import replace as _spec_replace
 
@@ -1877,9 +1866,6 @@ def _build_multi_gemm_chain(
                 _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
                 if _meta_i is not None:
                     _d_i, _s_i = _meta_i.dim, _meta_i.stride
-            _major_i = _infer_out_major(_d_i, _s_i)
-            if _di == 0:
-                out_major = _major_i
             # Recorded independently — a derived tensor carries its stride long
             # before cuDNN fills its dim (only at build_operation_graph time).
             _layout = {}
@@ -1887,7 +1873,7 @@ def _build_multi_gemm_chain(
                 _layout["dim"] = tuple(_d_i)
             if _s_i:
                 _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, major=_major_i, **_layout), _obj_i)
+            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
