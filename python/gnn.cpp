@@ -68,7 +68,7 @@ ensure_cuda_runtime_context() {
 }  // namespace
 
 void
-init_gnn_submodule(py::module_ &m) {
+init_gnn_submodule([[maybe_unused]] py::module_ &m) {
 #if CUDNN_VERSION >= 92600 && !defined(_WIN32)
     py::enum_<cudnnGnnAggOp_t>(m, "gnn_agg_op")
         .value("SUM", CUDNN_GNN_AGG_SUM)
