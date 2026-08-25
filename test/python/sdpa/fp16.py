@@ -18,6 +18,7 @@ from .helpers import (
     convert_packed_to_uniform,
     convert_uniform_to_packed,
     create_container_and_page_table,
+    inject_negative_score_rows,
     time_execution,
     time_execution_cupti,
     profile_execution,
@@ -150,6 +151,10 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.q] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, strides=q_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        if not perf:
+            # keep at least a few q rows in the deeply-negative-score regime
+            # (see inject_negative_score_rows); 0.125 matches this file's attn_scale
+            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
@@ -166,6 +171,8 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.q] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        if not perf:
+            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o)
         allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.is_train else (None, None, None)
         allocs[TensorUid.score_max] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_max else (None, None, None)

@@ -11,7 +11,14 @@ import torch
 import math
 from enum import IntEnum
 
-from .helpers import exact_equal, fill_sparse_small_int, time_execution, profile_execution, note_frost_routing
+from .helpers import (
+    exact_equal,
+    fill_sparse_small_int,
+    inject_negative_score_rows,
+    time_execution,
+    profile_execution,
+    note_frost_routing,
+)
 from .mxfp8_ref import compute_ref, compute_ref_backward
 
 # Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
@@ -20,7 +27,9 @@ from .mxfp8_ref import compute_ref, compute_ref_backward
 # no longer required to run the MXFP8 SDPA tests; TE-parity of these
 # primitives is covered by test_mxfp8_quant.py (which only runs when TE is
 # installed).
-from .mxfp8_quant import quantize_to_mxfp8  # noqa: F401  (re-exported; mxfp8_ref imports it from here)
+from .mxfp8_quant import (
+    quantize_to_mxfp8,
+)  # noqa: F401  (re-exported; mxfp8_ref imports it from here)
 
 # fmt: off
 
@@ -503,6 +512,9 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     fill_sparse_small_int(q_f32, rng_data, sparsity=0.8, abs_max=2)
     k_f32 = torch.empty(b, h_k, s_kv, d_qk, dtype=torch.float32, device="cuda")
     fill_sparse_small_int(k_f32, rng_data, sparsity=0.8, abs_max=2)
+    # keep at least a few q rows in the deeply-negative-score regime (see
+    # inject_negative_score_rows); must run before mxfp8 quantization
+    inject_negative_score_rows(q_f32, k_f32, rng_data, attn_scale=attn_scale)
     v_f32 = torch.empty(b, h_v, s_kv, d_vo, dtype=torch.float32, device="cuda")
     fill_sparse_small_int(v_f32, rng_data, sparsity=0.8, abs_max=2)
 

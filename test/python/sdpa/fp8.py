@@ -17,6 +17,7 @@ from .helpers import (
     get_fp8_descale_factor,
     convert_to_cudnn_type,
     create_sparse_int_tensor,
+    inject_negative_score_rows,
     print_tensor_stats,
     exact_equal,
     prefix_sum,
@@ -397,6 +398,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     q_gen = create_sparse_int_tensor((b, s_qo, h_q, d_qk), torch.float, rng_data)
     k_gen = create_sparse_int_tensor((b, s_kv, h_k, d_qk), torch.float, rng_data)
     v_gen = create_sparse_int_tensor((b, s_kv, h_v, d_vo), torch.float, rng_data)
+    # keep at least a few q rows in the deeply-negative-score regime (see
+    # inject_negative_score_rows); must run before the amax/descale computation
+    inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale)
 
     q_amax = q_gen.abs().max().item()
     k_amax = k_gen.abs().max().item()
