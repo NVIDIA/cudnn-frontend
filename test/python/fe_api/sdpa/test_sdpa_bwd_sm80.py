@@ -186,13 +186,13 @@ def test_sdpa_bwd_sm80_d64_fast_path():
     """The dedicated d=64 kernel routes only for plain dense MHA and agrees
     with the generic kernel on the same inputs."""
     try:
-        from cudnn.sdpa.bwd import api as api_sm80
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
         from cudnn.sdpa.bwd.kernels import bprop_d64_f16_sm80 as d64, bprop_f16_sm80 as gen
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
 
     common = dict(d_qk=64, d_v=64, h_q=8, h_kv=8, s_q=512, s_kv=512, mask_token="none", right_bound=0, causal_bottom_right=False, bw_kwargs={})
-    assert api_sm80._d64_fast_path_eligible(**common)
+    assert api_sm80._sm80_d64_fast_path_eligible(**common)
     # every gated condition individually disqualifies
     for override in (
         dict(d_qk=48, d_v=48),  # padded flavor
@@ -204,7 +204,7 @@ def test_sdpa_bwd_sm80_d64_fast_path():
         dict(bw_kwargs={"bias": object()}),
         dict(bw_kwargs={"deterministic": True}),
     ):
-        assert not api_sm80._d64_fast_path_eligible(**{**common, **override}), override
+        assert not api_sm80._sm80_d64_fast_path_eligible(**{**common, **override}), override
 
     b, h, s, d = 2, 8, 512, 64
     q = torch.randn(b, s, h, d, dtype=torch.float16, device="cuda")  # BSHD (kernel layout)
