@@ -24,7 +24,7 @@ from cutlass.cute.arch import clc as cute_clc
 # @@INJECT_TILE_CONSTANTS@@
 
 
-CLC_SCHED_STAGES = 2
+CLC_SCHED_STAGES = 1
 
 # Programmatic Dependent Launch (PDL, sm_90+; supported on sm_120).
 USE_PDL = True
@@ -219,6 +219,7 @@ def _kernel(
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    elect_one = nvvm.elect_sync()
 
     tidx = cute.arch.thread_idx()[0]
     bidx = cute.arch.block_idx()[0]
@@ -310,12 +311,15 @@ def _kernel(
     # clc full: tx-count armed by the scheduler; completed by the response.
     # clc empty: one elected arrive per consumer warp per slot.
     if warp_idx == 0:
-        if nvvm.elect_sync():
-            for i in range(ab_stages):
+        for i in range(ab_stages):
+            if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), NUM_COMPUTE_WARPS)
-            for i in range(CLC_SCHED_STAGES):
+        for i in range(CLC_SCHED_STAGES):
+            if elect_one:
                 nvvm.mbarrier_init(clc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), NUM_CLC_CONSUMER_WARPS)
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync(0)
@@ -352,8 +356,9 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(clc_empty_mbar_ptr.subview(stage), clc_empty_phase, time_limit=10_000_000):
                 pass
 
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive_expect_tx(clc_full_mbar_ptr.subview(stage), 16)
+            if elect_one:
                 cute_clc.issue_clc_query(
                     clc_full_mbar_cute_base + stage,
                     clc_response_ptr_base + stage,
@@ -368,7 +373,7 @@ def _kernel(
             is_valid_sched = vld
 
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(clc_empty_mbar_ptr.subview(stage))
 
             sched_iter += 1
@@ -377,8 +382,7 @@ def _kernel(
     if warp_idx == TMA_WARP_ID:
         nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
-                nvvm.griddepcontrol("wait")
+            nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
         ab_iter = cutlass.Int32(0)
         tile_m = init_tile_m
@@ -408,19 +412,23 @@ def _kernel(
                     pass
 
                 coord_k = k_tile_idx * cta_tile_mnk[2]
-                if nvvm.elect_sync():
+                # One elected lane only: the barrier's arrival count is 1, and
+                # the TMA copies deliver exactly num_tma_copy_bytes once.
+                if elect_one:
                     nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
-                    # K-major A: TMA box [K_tile, cta_m] at (k, m, l); OOB rows/cols
-                    # are hardware zero-filled (K tails contribute 0 to the MMA).
-                    for _ai in cutlass.range_constexpr(num_a_operands):
+                # K-major A: TMA box [K_tile, cta_m] at (k, m, l); OOB rows/cols
+                # are hardware zero-filled (K tails contribute 0 to the MMA).
+                for _ai in cutlass.range_constexpr(num_a_operands):
+                    if elect_one:
                         nvvm.cp_async_bulk_tensor_shared_cta_global(
                             smem_a_list[_ai].subview(sA_elems * stage),
                             tma_a_descs[_ai].get_ptr(),
                             (coord_k, coord_m, tile_l_a),
                             ab_full_mbar_ptr.subview(stage),
                         )
-                    # K-major B: TMA box [K_tile, cta_n] at (k, n, l).
-                    for _bj in cutlass.range_constexpr(num_b_operands):
+                # K-major B: TMA box [K_tile, cta_n] at (k, n, l).
+                for _bj in cutlass.range_constexpr(num_b_operands):
+                    if elect_one:
                         nvvm.cp_async_bulk_tensor_shared_cta_global(
                             smem_b_list[_bj].subview(sB_elems * stage),
                             tma_b_descs[_bj].get_ptr(),
@@ -444,24 +452,37 @@ def _kernel(
             tile_m, tile_n = _l2_swizzle_tile(m_idx, n_idx, gridx, gridy, swizzle_w)
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(clc_empty_mbar_ptr.subview(consumer_stage))
             tile_iter += 1
 
-        # Drain: wait until the compute warps have consumed the final stage so
-        # the producer never exits with a stage it would have re-armed pending.
+        # # Drain: wait until the compute warps have consumed the final stage so
+        # # the producer never exits with a stage it would have re-armed pending.
+        # tail_stage = ab_iter % ab_stages
+        # tail_phase = ab_empty_phase_bit
+        # if tail_stage == 0 and ab_iter != 0:
+        #     tail_phase = tail_phase ^ 1
+        # for _ in range(ab_stages - 1):
+        #     tail_stage = tail_stage + 1
+        #     if tail_stage == ab_stages:
+        #         tail_stage = cutlass.Int32(0)
+        #         tail_phase = tail_phase ^ 1
+        # if elect_one:
+        #     while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+        #         pass
+
         tail_stage = ab_iter % ab_stages
         tail_phase = ab_empty_phase_bit
         if tail_stage == 0 and ab_iter != 0:
             tail_phase = tail_phase ^ 1
-        for _ in range(ab_stages - 1):
-            tail_stage = tail_stage + 1
-            if tail_stage == ab_stages:
-                tail_stage = cutlass.Int32(0)
-                tail_phase = tail_phase ^ 1
-        if nvvm.elect_sync():
-            while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
-                pass
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+            for _ in range(ab_stages):
+                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
+                tail_stage = tail_stage + 1
+                if tail_stage == ab_stages:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
 
     # -- Compute warps: mma.sync mainloop + epilogue --------------------------
     if warp_idx < NUM_COMPUTE_WARPS:
@@ -574,7 +595,7 @@ def _kernel(
 
                 # Stage fully consumed by this warp (ldmatrix is synchronous).
                 nvvm.bar_warp_sync(0xFFFFFFFF)
-                if nvvm.elect_sync():
+                if elect_one:
                     nvvm.mbarrier_arrive(ab_empty_mbar_ptr.subview(stage))
                 ab_iter += 1
 
@@ -628,7 +649,7 @@ def _kernel(
                 )
 
                 if warp_idx == 0:
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.cp_async_bulk_tensor_global_shared_cta(
                             tma_c_desc.get_ptr(),
                             smem_subtile_ptr,
@@ -704,7 +725,7 @@ def _kernel(
             tile_m, tile_n = _l2_swizzle_tile(m_idx, n_idx, gridx, gridy, swizzle_w)
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(clc_empty_mbar_ptr.subview(consumer_stage))
 
             tile_iter += 1
@@ -713,7 +734,7 @@ def _kernel(
         # (fort fires launch_dependent_grids at the same point).
         if cutlass.const_expr(USE_PDL):
             if warp_idx == 0:
-                if nvvm.elect_sync():
+                if elect_one:
                     nvvm.griddepcontrol("launch_dependents")
 
         # @@TMA_STORE_ONLY:BEGIN@@
