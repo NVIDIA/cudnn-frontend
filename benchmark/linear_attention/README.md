@@ -45,6 +45,14 @@ python benchmark_single_linear_attention.py \
     --la_backend cudnn --variant gdn2 --data_type bfloat16 \
     --skip_ref --profile_pass fwd
 
+# cuDNN Frontend (GDP, n Householder sub-tokens per token; k/v/beta carry
+# seqlen * num_householder rows)
+python benchmark_single_linear_attention.py \
+    --batch_size 1 --seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --la_backend cudnn --variant gdp --num_householder 3 --data_type bfloat16 \
+    --skip_ref --fwd_bwd
+
 # GQA (q-heads grouped over v-heads, backward pass only)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
@@ -83,14 +91,14 @@ python benchmark_single_linear_attention.py \
 
 Run `python benchmark_single_linear_attention.py --help` for all options.
 
-The `kda` and `gdn2` variants fuse q/k L2 normalization in-kernel on every backend; `gdn` runs unfused.
+The `kda` and `gdn2` variants fuse q/k L2 normalization in-kernel on every backend; `gdn` and `gdp` run unfused (opt in with `--use_qk_l2norm`).
 
 ## Supported Backends
 
 | Backend | Description |
 |---------|-------------|
 | `cudnn` | cuDNN (native, via the cuDNN Frontend torch custom ops) |
-| `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, and `gdn2`) |
+| `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, `gdn2`, and `gdp`) |
 | `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 | `flash_kda` | FlashKDA (`kda` forward variant only) |
 
@@ -115,3 +123,7 @@ pass. Runs were captured on GB200 and GB300 (GB300 results shown below).
 ### GB300 - GDN-2
 ![GDN-2 on GB300](results/gdn2/gb300/gdn2_fixed_batch_flops.png)
 - `batch=4; num_q_heads=64; num_kv_heads=64; head_dim=128; seqlen 2048-32768; bf16`
+
+### B300 - GDP
+![GDP on B300](results/gdp/b300/gdp_fixed_batch_flops.png)
+- `batch=4; num_q_heads=64; num_kv_heads=64; head_dim_qk=128; head_dim_vo=64; num_householder=3; seqlen 2048-32768; bf16` (FLA is the only third-party GDP backend)

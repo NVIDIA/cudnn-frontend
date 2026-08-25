@@ -2486,6 +2486,13 @@ def _linear_attention_o_dims(node):
     return [v[0], max(q[1], v[1]), v[2]]
 
 
+def _gdp_o_dims(node):
+    # [total_T, HO, V]: q rows are the real tokens; k/v/beta rows carry the
+    # num_householder sub-token expansion, so O follows q, not v
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    return [q[0], max(q[1], v[1]), v[2]]
+
+
 def _block_quant_scale_dims(node):
     d = list(node.inputs["input"].dim)
     bs = node.params.get("block_size")
@@ -2673,6 +2680,37 @@ _STRUCTURED_OPS = {
             "d_initial_state": _like("initial_state"),
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
+        },
+        dtype_like={"d_initial_state": "initial_state"},
+        python_only=True,
+    ),
+    "gdp": dict(
+        node_type=NodeType.GDP,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state"),
+        attrs=("num_householder", "scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "batch_invariant"),
+        outputs=("O", "final_state", "state_checkpoints"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _gdp_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        python_only=True,
+    ),
+    "gdp_bwd": dict(
+        node_type=NodeType.GDP_BWD,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
+        attrs=("num_householder", "scale", "use_qk_l2norm", "use_beta_sigmoid", "batch_invariant"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "d_initial_state": _like("initial_state"),
         },
         dtype_like={"d_initial_state": "initial_state"},
         python_only=True,

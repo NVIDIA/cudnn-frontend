@@ -39,6 +39,8 @@ LA_NODE_OPS = {
     cudnn.NodeType.KDA_BWD: ("KDA", True),
     cudnn.NodeType.GDN2: ("GDN2", False),
     cudnn.NodeType.GDN2_BWD: ("GDN2", True),
+    cudnn.NodeType.GDP: ("GDP", False),
+    cudnn.NodeType.GDP_BWD: ("GDP", True),
 }
 
 
@@ -54,7 +56,7 @@ class LaGraphFacts:
 
     invalid: Optional[str] = None
 
-    op: str = ""  # "GDN" | "KDA" | "GDN2"
+    op: str = ""  # "GDN" | "KDA" | "GDN2" | "GDP"
     is_bwd: bool = False
 
     # geometry (THD; zeros when the port ranks are not declared)
@@ -111,6 +113,8 @@ class LaGraphFacts:
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
     batch_invariant: bool = False
+    # GDP: k/v/beta rows == q rows * num_householder (total_t stays q rows)
+    num_householder: int = 1
 
 
 def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
@@ -138,6 +142,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
 
     safe_gate = bool(params.get("safe_gate", False))
     checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
+    num_householder = int(params.get("num_householder", 1) or 1)
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -165,6 +170,12 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
     elif not is_bwd and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
+    elif num_householder < 1:
+        invalid = "num_householder must be a positive integer"
+    elif op == "GDP" and ins["q"].dim and any(t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) * num_householder for t in (ins["k"], ins["v"], ins["beta"])):
+        invalid = "GDP k/v/beta rows must equal q rows * num_householder (the sub-token expansion)"
+    elif op == "GDP" and ins["q"].dim and any(t is not None and t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) for t in (ins["g"], ins.get("dO"))):
+        invalid = "GDP g and dO rows must equal q rows (real tokens)"
     if invalid is not None:
         return LaGraphFacts(invalid=invalid, op=op, is_bwd=is_bwd)
 
@@ -241,4 +252,5 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=bool(params.get("batch_invariant", False)),
+        num_householder=num_householder,
     )

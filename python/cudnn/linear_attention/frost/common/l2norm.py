@@ -10,7 +10,7 @@ kernel's dq_n/dk_n (gradients wrt the normalized rows) back through the
 normalize Jacobian in place: ``dq = inv_norm * (dq_n - (dq_n . q_n) q_n)``.
 """
 
-import functools
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -26,8 +26,8 @@ USE_PDL = True
 
 THREADS_PER_ROW = 16
 ROWS_PER_CTA = 8
-FWD_LANES = 4  # fwd lanes per row: 32 elements/lane (4 x 128-bit loads), 2-step butterfly
-FWD_ROWS_PER_GROUP = 2  # fwd rows batched per lane group: 8 independent loads in flight per thread
+FWD_LANES = 4
+FWD_ROWS_PER_GROUP = 2
 
 
 @cute.kernel
@@ -42,6 +42,8 @@ def frost_l2norm_qk(
     n_rows: cutlass.Int32,
     h_q: cutlass.Int32,
     h_k: cutlass.Int32,
+    expand_num: cutlass.Constexpr[int],
+    expand_phase: cutlass.Constexpr[int],
 ) -> None:
     """Grid over all q rows then all k rows, FWD_LANES lanes x 32 elements
     per row (4 x 128-bit loads per lane), FWD_ROWS_PER_GROUP consecutive rows
@@ -76,7 +78,11 @@ def frost_l2norm_qk(
             h = row_r % h_q
             src_elements = t * cutlass.Int64(mQ.stride[0]) + h * cutlass.Int64(mQ.stride[1]) + cutlass.Int64(v0)
             src_addr = mQ.iterator.toint() + src_elements * cutlass.Int64(2)
-            workspace_addr = mQn.iterator.toint() + (cutlass.Int64(row_r) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
+            if cutlass.const_expr(expand_num > 1):
+                out_row = (t * cutlass.Int64(expand_num) + cutlass.Int64(expand_phase)) * cutlass.Int64(h_q) + cutlass.Int64(h)
+            else:
+                out_row = cutlass.Int64(row_r)
+            workspace_addr = mQn.iterator.toint() + (out_row * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvQ.iterator.toint() + cutlass.Int64(row_r) * cutlass.Int64(4)
         else:
             k_row = row_r - n_q_rows
@@ -212,9 +218,11 @@ def l2norm_qk_launch(
     h_q: cutlass.Int32,
     h_k: cutlass.Int32,
     n_blocks: cutlass.Int32,
+    expand_num: cutlass.Constexpr[int],
+    expand_phase: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
+    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k, expand_num, expand_phase).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
@@ -239,19 +247,36 @@ def l2norm_qk_bwd_launch(
     )
 
 
-@functools.cache
-def l2norm_cache(key):
-    return {}
+compiled_cache = {}
 
 
-def l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, stream):
-    """Normalize q/k rows into the compact io workspace copies and stash the
-    fp32 inverse norms.  Sources are read through their own strides."""
+class L2NormQkRecipe(NamedTuple):
+    """Build-time facts of one q/k normalize launch.  Produced by
+    :func:`build_l2norm_qk`."""
+
+    compiled: object
+    n_q_rows: int
+    n_rows: int
+    h_q: int
+    h_k: int
+    n_blocks: int
+
+
+def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
+    """The lowered normalize launch: no validation, no key build."""
+    r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
+
+
+def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, stream) -> L2NormQkRecipe:
+    """Compile (cached), run once, and bake the q/k normalize: rows into the
+    compact io workspace copies, fp32 inverse norms to their slots.  Sources
+    are read through their own strides; ``expand_num > 1`` writes the q rows
+    onto sub-token ``expand_phase`` of the expanded workspace."""
     ROWS = (128 // FWD_LANES) * FWD_ROWS_PER_GROUP
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, d_k = (int(s_) for s_ in k.shape)
-    if d != 128 or d_k != 128 or total_k != total:
-        raise ValueError(f"q/k must be [total, H, 128] with matching totals; got {tuple(q.shape)} / {tuple(k.shape)}")
+    if d != 128 or d_k != 128:
+        raise ValueError(f"q/k must be [total, H, 128]; got {tuple(q.shape)} / {tuple(k.shape)}")
     for name, t in (("q", q), ("k", k)):
         st = tuple(int(s_) for s_ in t.stride())
         if st[2] != 1 or st[0] % 8 != 0 or st[1] % 8 != 0 or data_ptr(t) % 16 != 0:
@@ -263,25 +288,46 @@ def l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, stream):
         if tuple(int(s_) for s_ in buf.stride()) != (h, 1):
             raise ValueError(f"{name} workspace must be compact [total, {h}] fp32")
     n_q_rows = total * h_q
-    n_rows = n_q_rows + total * h_k
+    n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
-    cache = l2norm_cache(("fwd", str(q.dtype)))
     cu_stream = cuda.CUstream(int(stream))
-    if "compiled" not in cache:
+    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase))
+    if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
-        cache["compiled"] = cute.compile(
+        compiled_cache[key] = cute.compile(
             l2norm_qk_launch,
             *(from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))),
             *(cutlass.Int32(a) for a in args),
+            int(expand_num),
+            int(expand_phase),
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["compiled"](q, k, q_n, k_n, inv_q, inv_k, *args, cu_stream)
+    r = L2NormQkRecipe(compiled_cache[key], *args)
+    run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream)
+    return r
 
 
-def l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, *, stream):
-    """Project dq/dk in place through the normalize Jacobian using the saved
-    normalized rows and inverse norms.  Run after any head-group fold so the
+class L2NormQkBwdRecipe(NamedTuple):
+    """Build-time facts of one dq/dk normalize-Jacobian launch.  Produced by
+    :func:`build_l2norm_qk_bwd`."""
+
+    compiled: object
+    n_q_rows: int
+    n_rows: int
+    h_q: int
+    h_k: int
+    n_blocks: int
+
+
+def run_l2norm_qk_bwd(r, dq, dk, q_n, k_n, inv_q, inv_k, stream) -> None:
+    """The lowered normalize-Jacobian launch: no validation, no key build."""
+    r.compiled(dq, dk, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
+
+
+def build_l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, *, stream) -> L2NormQkBwdRecipe:
+    """Compile (cached), run once, and bake the in-place dq/dk projection
+    through the normalize Jacobian.  Run after any head-group fold so the
     gradients are back at the native q/k head counts."""
     ROWS = ROWS_PER_CTA
     total, h_q, d = (int(s_) for s_ in dq.shape)
@@ -301,18 +347,20 @@ def l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, *, stream):
     n_q_rows = total * h_q
     n_rows = n_q_rows + total * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
-    cache = l2norm_cache(("bwd", str(dq.dtype)))
     cu_stream = cuda.CUstream(int(stream))
-    if "compiled" not in cache:
+    key = ("bwd", str(dq.dtype))
+    if key not in compiled_cache:
         tensors = (dq, dk, q_n, k_n, inv_q, inv_k)
-        cache["compiled"] = cute.compile(
+        compiled_cache[key] = cute.compile(
             l2norm_qk_bwd_launch,
             *(from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))),
             *(cutlass.Int32(a) for a in args),
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["compiled"](dq, dk, q_n, k_n, inv_q, inv_k, *args, cu_stream)
+    r = L2NormQkBwdRecipe(compiled_cache[key], *args)
+    run_l2norm_qk_bwd(r, dq, dk, q_n, k_n, inv_q, inv_k, stream)
+    return r
 
 
 frost_l2norm_qk.set_name_prefix("cudnn", remove_cutlass_symbol=True)

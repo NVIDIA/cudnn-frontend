@@ -5,7 +5,10 @@
 (``kernel/gdn_prefill_f16.py``) and GDN_BWD nodes on the chunked backward
 kernel (``kernel/gdn_bprop_f16.py``), SM100/SM103/SM107, bf16/fp16.
 The backward regenerates the per-chunk state checkpoints with the recompute kernel
-(``kernel/gdn_recompute_f16.py``) when the graph does not provide one."""
+(``kernel/gdn_recompute_f16.py``) when the graph does not provide one.
+GDP/GDP_BWD nodes run the same compiled plans on the ``num_householder``-expanded
+timeline: q/g/dO scatter into expanded workspace copies, O/dQ/dG gather back
+(``common/expand.py``)."""
 
 from __future__ import annotations
 
@@ -25,10 +28,10 @@ def build_gdn(graph):
     primitives; the cute.compile itself is cached inside the kernel per static
     config and runs on first execute, when the real buffers are known)."""
     nodes = list(graph.nodes)
-    if len(nodes) != 1 or getattr(nodes[0].node_type, "name", None) not in ("GDN", "GDN_BWD"):
-        raise ValueError("build_gdn: graph does not contain exactly one GDN/GDN_BWD node")
+    if len(nodes) != 1 or getattr(nodes[0].node_type, "name", None) not in ("GDN", "GDN_BWD", "GDP", "GDP_BWD"):
+        raise ValueError("build_gdn: graph does not contain exactly one GDN/GDN_BWD/GDP/GDP_BWD node")
     node = nodes[0]
-    if node.node_type.name == "GDN_BWD":
+    if node.node_type.name in ("GDN_BWD", "GDP_BWD"):
         from .kernel import gdn_bprop_f16 as bwd_module
         from .kernel import gdn_recompute_f16 as recompute_module
 
@@ -36,6 +39,51 @@ def build_gdn(graph):
     from .kernel import gdn_prefill_f16 as kernel_module
 
     return CompiledGdn(node, kernel_module)
+
+
+def gdn_support_gates(engine: str, facts) -> None:
+    """The GDN kernel family's dtype/attribute gates, shared with the GDP engine."""
+    import cudnn
+
+    checkpoint = facts.checkpoint_every_n_tokens
+    if checkpoint and (facts.is_bwd or checkpoint % 64 != 0):
+        raise NotImplementedError(f"{engine}: checkpoint_every_n_tokens must be a positive multiple of 64 on the forward node (got {checkpoint})")
+    if not facts.gates_at_ho:
+        raise NotImplementedError(f"{engine}: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
+    fp32 = cudnn.data_type.FLOAT
+    io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+    state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
+    beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (fp32, facts.io_dtype)
+    if facts.beta_dtype not in beta_wants + (None,):
+        raise NotImplementedError(f"{engine}: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+    for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
+        if got not in (fp32, None):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32, got {got}")
+    for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
+        if got not in state_dtypes + (None,):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16, got {got}")
+    if not facts.state_pair_match:
+        raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
+    if facts.is_bwd:
+        for port, got in (("d_a_log", facts.d_a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype)):
+            if got not in (fp32, None):
+                raise NotImplementedError(f"{engine}: '{port}' must be fp32, got {got}")
+        state_grad_want = facts.state_dtype if facts.state_dtype is not None else fp32
+        for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
+            if got not in (state_grad_want, None):
+                raise NotImplementedError(f"{engine}: '{port}' must match the state dtype ({state_grad_want}), got {got}")
+        if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
+            raise NotImplementedError(f"{engine}: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
+        if facts.dg_dtype not in (facts.g_dtype, None):
+            raise NotImplementedError(f"{engine}: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
+        if facts.do_dtype not in io + (None,):
+            raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
+        if facts.io_dtype is not None and facts.state_checkpoints_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError(f"{engine}: 'state_checkpoints' must match the io dtype")
+        if facts.dbeta_dtype not in (facts.beta_dtype, None):
+            raise NotImplementedError(f"{engine}: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
+    elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
+        raise NotImplementedError(f"{engine}: 'state_checkpoints' must match the io dtype")
 
 
 class GdnFrostEngine(BaseEngine):
@@ -48,53 +96,11 @@ class GdnFrostEngine(BaseEngine):
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
-        import cudnn
-
         facts = graph._facts_for(analyze)
-        frost_la_gate("GdnFrostEngine", facts, "GDN")
-        checkpoint = facts.checkpoint_every_n_tokens
-        if checkpoint and (facts.is_bwd or checkpoint % 64 != 0):
-            raise NotImplementedError(f"GdnFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 64 on the GDN node (got {checkpoint})")
-        if not facts.gates_at_ho:
-            raise NotImplementedError(f"GdnFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
-        fp32 = cudnn.data_type.FLOAT
-        io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
-        state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
-        beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (fp32, facts.io_dtype)
-        if facts.beta_dtype not in beta_wants + (None,):
-            raise NotImplementedError(f"GdnFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
-        for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
-            if got not in (fp32, None):
-                raise NotImplementedError(f"GdnFrostEngine: '{port}' must be fp32, got {got}")
-        for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-            if got not in state_dtypes + (None,):
-                raise NotImplementedError(f"GdnFrostEngine: '{port}' must be fp32/bf16, got {got}")
-        if not facts.state_pair_match:
-            raise NotImplementedError("GdnFrostEngine: initial_state and final_state dtypes must match")
-        if facts.is_bwd:
-            for port, got in (("d_a_log", facts.d_a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype)):
-                if got not in (fp32, None):
-                    raise NotImplementedError(f"GdnFrostEngine: '{port}' must be fp32, got {got}")
-            state_grad_want = facts.state_dtype if facts.state_dtype is not None else fp32
-            for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
-                if got not in (state_grad_want, None):
-                    raise NotImplementedError(f"GdnFrostEngine: '{port}' must match the state dtype ({state_grad_want}), got {got}")
-            if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
-                raise NotImplementedError(f"GdnFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
-            if facts.dg_dtype not in (facts.g_dtype, None):
-                raise NotImplementedError(f"GdnFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
-            if facts.do_dtype not in io + (None,):
-                raise NotImplementedError(f"GdnFrostEngine: 'dO' must be fp16/bf16, got {facts.do_dtype}")
-            if facts.io_dtype is not None and facts.state_checkpoints_dtype not in (facts.io_dtype, None):
-                raise NotImplementedError("GdnFrostEngine: 'state_checkpoints' must match the io dtype")
-            if facts.dbeta_dtype not in (facts.beta_dtype, None):
-                raise NotImplementedError(f"GdnFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
-        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError("GdnFrostEngine: 'state_checkpoints' must match the io dtype")
+        frost_la_gate("GdnFrostEngine", facts, "GDN", d_v_allowed=(64, 128))
+        gdn_support_gates("GdnFrostEngine", facts)
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        # Bake the plan for the handle's device (via ctx), not the ambient one; a
-        # foreign raw-int handle (or none) carries no device -> None -> current.
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):
@@ -113,10 +119,22 @@ class CompiledGdn:
         self.run_table = run_table
         self.table = None
         self.kcache = None
-        self.plan_name = "GdnFrostEngine (GDN)"
-        from .common.l2norm import l2norm_qk
+        self.plan_name = "GdpFrostEngine (GDP)" if node.node_type.name == "GDP" else "GdnFrostEngine (GDN)"
+        from .common.l2norm import build_l2norm_qk, run_l2norm_qk
 
-        self.l2norm_qk = l2norm_qk
+        self.build_l2norm_qk = build_l2norm_qk
+        self.run_l2norm_qk = run_l2norm_qk
+        self.l2norm = None
+        self.num_householder = int(node.params.get("num_householder", 1) or 1)
+        if self.num_householder > 1:
+            from .common.expand import build_gather_o, build_pack_fwd, run_gather_o, run_pack_fwd
+
+            self.build_pack_fwd = build_pack_fwd
+            self.run_pack_fwd = run_pack_fwd
+            self.build_gather_o = build_gather_o
+            self.run_gather_o = run_gather_o
+            self.pack_fwd = None
+            self.gather_o = None
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
@@ -125,10 +143,12 @@ class CompiledGdn:
 
         q, v, g = node.inputs["q"], node.inputs["v"], node.inputs["g"]
         self.b_t = kernel_module.CFG.B_T
-        total = q.dim[0]
+        total = node.inputs["k"].dim[0]
         HO = g.dim[1]
         HQ, HK = q.dim[1], node.inputs["k"].dim[1]
+        V = v.dim[2]
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
+        self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_final_state = "final_state" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
@@ -162,6 +182,10 @@ class CompiledGdn:
             self.off_k_n = layout.add(total * HK * 128 * 2)
             self.off_inv_q = layout.add(total * HQ * 4)
             self.off_inv_k = layout.add(total * HK * 4)
+        if self.num_householder > 1:
+            self.off_q_x = layout.add(total * HQ * 128 * 2)
+            self.off_g_x = layout.add(total * HO * 4)
+            self.off_o_x = layout.add(total * HO * V * 2)
         self.needs_table = self.split
         self.workspace_size = layout.size
         regions = [
@@ -182,7 +206,13 @@ class CompiledGdn:
                 (self.off_inv_q, "float32", (total, HQ)),
                 (self.off_inv_k, "float32", (total, HK)),
             ]
-        self.carve = carve_plan("GdnFrostEngine (GDN)", regions)
+        if self.num_householder > 1:
+            regions += [
+                (self.off_q_x, self.io_name, (total, HQ, 128)),
+                (self.off_g_x, "float32", (total, HO)),
+                (self.off_o_x, self.io_name, (total, HO, V)),
+            ]
+        self.carve = carve_plan(self.plan_name, regions)
 
     def workspace_bytes(self) -> int:
         return self.workspace_size
@@ -218,18 +248,56 @@ class CompiledGdn:
         stream = stream if stream is not None else 0
         carved = workspace.carve(self.carve)
         if self.split:
-            tensormaps, scheduler_counter, work_items, work_count, item_scratch, chunk_scratch, *l2n = carved
+            tensormaps, scheduler_counter, work_items, work_count, item_scratch, chunk_scratch, *rest = carved
         else:
-            tensormaps, scheduler_counter, work_items, work_count, *l2n = carved
+            tensormaps, scheduler_counter, work_items, work_count, *rest = carved
             item_scratch = chunk_scratch = None
-        if self.use_qk_l2norm:
-            q_n, k_n, inv_q, inv_k = l2n
-            self.l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, stream=stream)
+        o_x = None
+        if self.num_householder > 1:
+            n = self.num_householder
+            *rest, q_x, g_x, o_x = rest
+            if self.use_qk_l2norm:
+                q_n, k_n, inv_q, inv_k = rest
+                if self.pack_fwd is None:
+                    self.pack_fwd = self.build_pack_fwd(g, g_x, None, None, self.num_householder, stream)
+                else:
+                    self.run_pack_fwd(self.pack_fwd, g, g_x, None, None, stream)
+                if self.l2norm is None:
+                    self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, expand_num=n, expand_phase=n - 1, stream=stream)
+                else:
+                    self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
+                q, k = q_n, k_n
+            else:
+                if self.pack_fwd is None:
+                    self.pack_fwd = self.build_pack_fwd(g, g_x, q, q_x, self.num_householder, stream)
+                else:
+                    self.run_pack_fwd(self.pack_fwd, g, g_x, q, q_x, stream)
+                q = q_x
+            g = g_x
+        elif self.use_qk_l2norm:
+            q_n, k_n, inv_q, inv_k = rest
+            if self.l2norm is None:
+                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, stream=stream)
+            else:
+                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
             q, k = q_n, k_n
 
         if self.kcache is not None and (self.table is not None or not self.needs_table):
             if self.needs_table:
-                self.run_table(self.table, g, a_log, dt_bias, cu, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream)
+                self.run_table(
+                    self.table,
+                    g,
+                    a_log,
+                    dt_bias,
+                    cu,
+                    chunk_scratch,
+                    item_scratch,
+                    work_items,
+                    work_count,
+                    scheduler_counter,
+                    stream,
+                    expand_num=self.num_householder,
+                )
             self.kernel.run_prefill(
                 self.kcache,
                 q,
@@ -237,7 +305,7 @@ class CompiledGdn:
                 v,
                 g,
                 beta,
-                o,
+                o if o_x is None else o_x,
                 cu,
                 state0,
                 final_state,
@@ -253,6 +321,11 @@ class CompiledGdn:
                 a_log=a_log if self.safe_gate else None,
                 dt_bias=dt_bias if self.safe_gate else None,
             )
+            if o_x is not None:
+                if self.gather_o is None:
+                    self.gather_o = self.build_gather_o(o_x, o, self.num_householder, stream)
+                else:
+                    self.run_gather_o(self.gather_o, o_x, o, stream)
             return
 
         if not self.needs_table:
@@ -275,6 +348,7 @@ class CompiledGdn:
                 dt_bias=dt_bias,
                 scheduler_counter=scheduler_counter,
                 split=self.split,
+                expand_num=self.num_householder,
                 stream=stream,
             )
 
@@ -284,7 +358,7 @@ class CompiledGdn:
             v,
             g,
             beta,
-            o,
+            o if o_x is None else o_x,
             cu,
             state0,
             final_state,
@@ -300,9 +374,15 @@ class CompiledGdn:
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
             work_item_scratch=item_scratch,
+            expand_num=self.num_householder,
             workspace=tensormaps,
             stream=stream,
         )
+        if o_x is not None:
+            if self.gather_o is None:
+                self.gather_o = self.build_gather_o(o_x, o, self.num_householder, stream)
+            else:
+                self.run_gather_o(self.gather_o, o_x, o, stream)
         return None
 
 
@@ -324,16 +404,30 @@ class CompiledGdnBwd:
         self.table = None
         self.kcache = None
         self.recompute_cache = None
-        self.plan_name = "GdnFrostEngine (GDN_BWD)"
+        self.plan_name = "GdpFrostEngine (GDP_BWD)" if node.node_type.name == "GDP_BWD" else "GdnFrostEngine (GDN_BWD)"
         from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.l2norm import l2norm_qk, l2norm_qk_bwd
+        from .common.l2norm import build_l2norm_qk, build_l2norm_qk_bwd, run_l2norm_qk, run_l2norm_qk_bwd
 
         self.head_group_reduce = head_group_reduce
         self.scalar_gate_bwd = scalar_gate_bwd
-        self.l2norm_qk = l2norm_qk
-        self.l2norm_qk_bwd = l2norm_qk_bwd
+        self.build_l2norm_qk = build_l2norm_qk
+        self.run_l2norm_qk = run_l2norm_qk
+        self.build_l2norm_qk_bwd = build_l2norm_qk_bwd
+        self.run_l2norm_qk_bwd = run_l2norm_qk_bwd
+        self.l2norm = None
+        self.l2norm_bwd = None
+        self.num_householder = int(node.params.get("num_householder", 1) or 1)
+        if self.num_householder > 1:
+            from .common.expand import build_gather_bwd, build_pack_bwd, run_gather_bwd, run_pack_bwd
+
+            self.build_pack_bwd = build_pack_bwd
+            self.run_pack_bwd = run_pack_bwd
+            self.build_gather_bwd = build_gather_bwd
+            self.run_gather_bwd = run_gather_bwd
+            self.pack_bwd = None
+            self.gather_bwd = None
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
@@ -342,7 +436,7 @@ class CompiledGdnBwd:
 
         q, v, g = node.inputs["q"], node.inputs["v"], node.inputs["g"]
         self.b_t = bwd_module.CFG.B_T
-        total = q.dim[0]
+        total = node.inputs["k"].dim[0]
         self.gate_bwd_blocks = scalar_gate_blocks(total)
         K, V = q.dim[-1], v.dim[-1]
         HQ, HV = q.dim[1], v.dim[1]
@@ -350,6 +444,7 @@ class CompiledGdnBwd:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
+        self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
 
         self.num_sm = multiprocessor_count(current_device())
         self.bwd_dynamic_scheduling = True
@@ -382,6 +477,12 @@ class CompiledGdnBwd:
         if self.safe_gate:
             self.off_gate_part_a = layout.add(self.gate_bwd_blocks * HO * 4)
             self.off_gate_part_dt = layout.add(self.gate_bwd_blocks * HO * 4)
+        if self.num_householder > 1:
+            self.off_q_x = layout.add(total * HQ * 128 * 2)
+            self.off_g_x = layout.add(total * HO * 4)
+            self.off_do_x = layout.add(total * HO * V * 2)
+            self.off_dq_x = layout.add(total * HQ * K * 2)
+            self.off_dg_x = layout.add(total * HO * 4)
         self.n_tiles = B * HO
         if self.split:
             self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
@@ -428,8 +529,14 @@ class CompiledGdnBwd:
         if self.safe_gate:
             regions.append(("gate_part_a", self.off_gate_part_a, "float32", (self.gate_bwd_blocks * HO,)))
             regions.append(("gate_part_dt", self.off_gate_part_dt, "float32", (self.gate_bwd_blocks * HO,)))
+        if self.num_householder > 1:
+            regions.append(("q_x", self.off_q_x, self.io_name, (total, HQ, 128)))
+            regions.append(("g_x", self.off_g_x, "float32", (total, HO)))
+            regions.append(("do_x", self.off_do_x, self.io_name, (total, HO, V)))
+            regions.append(("dq_x", self.off_dq_x, self.io_name, (total, HQ, K)))
+            regions.append(("dg_x", self.off_dg_x, "float32", (total, HO)))
         self.carve_names = [name for name, _off, _dt, _shape in regions]
-        self.carve = carve_plan("GdnFrostEngine (GDN_BWD)", [(off, dt, shape) for _name, off, dt, shape in regions])
+        self.carve = carve_plan(self.plan_name, [(off, dt, shape) for _name, off, dt, shape in regions])
 
     def workspace_bytes(self) -> int:
         return self.workspace_size
@@ -485,8 +592,20 @@ class CompiledGdnBwd:
         scheduler_bwd = region["scheduler_bwd"]
         work_items = region["work_items"]
         work_count = region["work_count"]
+        dq_node = dg_node = None
+        if self.num_householder > 1:
+            if self.pack_bwd is None:
+                self.pack_bwd = self.build_pack_bwd(q, region["q_x"], g, region["g_x"], do, region["do_x"], self.num_householder, stream)
+            else:
+                self.run_pack_bwd(self.pack_bwd, q, region["q_x"], g, region["g_x"], do, region["do_x"], stream)
+            q, g, do = region["q_x"], region["g_x"], region["do_x"]
+            dq_node, dg_node = dq, dg
+            dq, dg = region["dq_x"], region["dg_x"]
         if self.use_qk_l2norm:
-            self.l2norm_qk(q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+            if self.l2norm is None:
+                self.l2norm = self.build_l2norm_qk(q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+            else:
+                self.run_l2norm_qk(self.l2norm, q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
             q, k = region["q_n"], region["k_n"]
 
         if self.kcache is not None and (self.table is not None or not self.needs_table):
@@ -503,6 +622,7 @@ class CompiledGdnBwd:
                     work_count,
                     region["scheduler_all"],
                     stream,
+                    expand_num=self.num_householder,
                 )
             if self.has_state_checkpoints:
                 checkpoint_series = state_checkpoints
@@ -567,7 +687,15 @@ class CompiledGdnBwd:
                     if src_ho is not dst:
                         self.head_group_reduce(src_ho, dst, stream=stream)
             if self.use_qk_l2norm:
-                self.l2norm_qk_bwd(dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+                if self.l2norm_bwd is None:
+                    self.l2norm_bwd = self.build_l2norm_qk_bwd(dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+                else:
+                    self.run_l2norm_qk_bwd(self.l2norm_bwd, dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
+            if dq_node is not None:
+                if self.gather_bwd is None:
+                    self.gather_bwd = self.build_gather_bwd(dq, dq_node, dg, dg_node, self.num_householder, stream)
+                else:
+                    self.run_gather_bwd(self.gather_bwd, dq, dq_node, dg, dg_node, stream)
             return
 
         if not self.needs_table:
@@ -590,6 +718,7 @@ class CompiledGdnBwd:
                 dt_bias=dt_bias,
                 scheduler_counter=region["scheduler_all"],
                 split=self.split,
+                expand_num=self.num_householder,
                 stream=stream,
             )
 
@@ -618,6 +747,7 @@ class CompiledGdnBwd:
                 work_item_scratch=region.get("item_scratch") if self.recompute_orders else None,
                 order_in_prologue=self.recompute_orders,
                 log_gate=True,
+                expand_num=self.num_householder,
                 workspace=region["recompute_tensormaps"],
                 stream=stream,
             )
@@ -658,6 +788,7 @@ class CompiledGdnBwd:
             work_item_scratch=region.get("item_scratch") if self.bwd_orders else None,
             order_in_prologue=self.bwd_orders,
             log_gate=True,
+            expand_num=self.num_householder,
             workspace=region["tensormaps"],
             stream=stream,
         )
@@ -668,5 +799,13 @@ class CompiledGdnBwd:
                 if src_ho is not dst:
                     self.head_group_reduce(src_ho, dst, stream=stream)
         if self.use_qk_l2norm:
-            self.l2norm_qk_bwd(dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+            if self.l2norm_bwd is None:
+                self.l2norm_bwd = self.build_l2norm_qk_bwd(dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+            else:
+                self.run_l2norm_qk_bwd(self.l2norm_bwd, dq, dk, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
+        if dq_node is not None:
+            if self.gather_bwd is None:
+                self.gather_bwd = self.build_gather_bwd(dq, dq_node, dg, dg_node, self.num_householder, stream)
+            else:
+                self.run_gather_bwd(self.gather_bwd, dq, dq_node, dg, dg_node, stream)
         return None

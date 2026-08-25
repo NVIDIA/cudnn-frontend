@@ -51,7 +51,7 @@ class Gdn2FrostEngine(BaseEngine):
         import cudnn
 
         facts = graph._facts_for(analyze)
-        frost_la_gate("Gdn2FrostEngine", facts, "GDN2")
+        frost_la_gate("Gdn2FrostEngine", facts, "GDN2", d_v_allowed=(64, 128))
         checkpoint = facts.checkpoint_every_n_tokens
         if checkpoint and (facts.is_bwd or checkpoint % 16 != 0):
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the GDN-2 node (got {checkpoint})")
@@ -97,8 +97,6 @@ class Gdn2FrostEngine(BaseEngine):
             raise NotImplementedError("Gdn2FrostEngine: initial_state and final_state dtypes must match")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        # Bake the plan for the handle's device (via ctx), not the ambient one; a
-        # foreign raw-int handle (or none) carries no device -> None -> current.
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):

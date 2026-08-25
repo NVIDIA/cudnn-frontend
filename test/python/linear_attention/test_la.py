@@ -32,7 +32,7 @@ la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 import torch.nn.functional as F  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
-from .reference_gdn import gdn_reference, rms_ratio  # noqa: E402
+from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
 from .reference_gdn2 import beta_guard_reference, gdn2_reference  # noqa: E402
 from .reference_kda import kda_reference  # noqa: E402
 
@@ -89,9 +89,9 @@ OP_NAMES = {"gdn": "gated_delta_net", "kda": "kimi_delta_attention", "gdn2": "ga
 
 
 def op_modules():
-    from cudnn.linear_attention.ops import gdn, gdn2, kda
+    from cudnn.linear_attention.ops import gdn, gdn2, gdp, kda
 
-    return {"gdn": gdn, "kda": kda, "gdn2": gdn2}
+    return {"gdn": gdn, "kda": kda, "gdn2": gdn2, "gdp": gdp}
 
 
 def family_engines(backend_name):
@@ -514,12 +514,36 @@ def test_fwd_packed_matches_per_sequence(backend, variant):
 
 @pytest.mark.parametrize(
     "variant,K,V",
-    [("gdn", 64, 64), ("gdn", 64, 128), ("gdn", 128, 128), ("gdn", 256, 128), ("kda", 64, 64), ("kda", 64, 128), ("kda", 128, 128), ("gdn2", 128, 128)],
+    [
+        ("gdn", 64, 64),
+        ("gdn", 64, 128),
+        ("gdn", 128, 64),
+        ("gdn", 128, 128),
+        ("gdn", 256, 128),
+        ("kda", 64, 64),
+        ("kda", 64, 128),
+        ("kda", 128, 64),
+        ("kda", 128, 128),
+        ("gdn2", 128, 64),
+        ("gdn2", 128, 128),
+    ],
 )
 def test_fwd_head_dims(backend, variant, K, V):
-    """K/V head-dim variants; engines that only serve K = V = 128 decline."""
+    """K/V head-dim variants; an engine that does not serve a combination declines."""
     case = make_case(variant, torch.bfloat16, T=192, K=K, V=V)
     assert_fwd_parity(backend, case)
+
+
+@pytest.mark.parametrize("variant,K,V", [("gdn", 128, 64), ("gdn", 128, 128), ("kda", 128, 64), ("gdn2", 128, 64)])
+def test_bwd_head_dims(backend, variant, K, V):
+    """Backward at the non-square head dims (V = 64 exercises the m64
+    lane-packed accumulator paths end to end)."""
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=192, H=2, HV=4, K=K, V=V))
+
+
+@pytest.mark.parametrize("variant,K,V", [("gdn", 128, 64)])
+def test_bwd_head_dims_states_varlen(backend, variant, K, V):
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[64, 128], K=K, V=V), use_initial_state=True, use_dfs=True, l2norm=True)
 
 
 @pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
@@ -2199,3 +2223,258 @@ def test_hang_stress_initial_state_boundaries(backend, variant, capfd):
     (the gdn prefill/recompute seed-credit wedge)."""
     case = make_case(variant, torch.bfloat16, seq_lens=[64, 0, 128, 0, 64] * 24, H=16)
     run_hang_stress(backend, case, use_initial_state=True, fwd_each_iter=True, label=f"initial_state_boundaries[{variant}]", capfd=capfd)
+
+
+# ---------------------------------------------------------------------------
+# GDP (Gated DeltaProduct): the GDN kernels behind the num_householder
+# sub-token expansion; served by gdp_frost only (its own engine family)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def gdp_frost():
+    """Pin gdp_frost; skip when the gdp family offers no engine here."""
+    from cudnn.engines import manifest
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    family = next(f for f in manifest.MANIFEST if f.name == "gdp")
+    if not manifest.instantiate(family, family.offered_ids()):
+        pytest.skip("no gdp engine available in this environment")
+    gdp_module.fprop_cache.clear()
+    gdp_module.bprop_cache.clear()
+    try:
+        yield functools.partial(la_ops.gated_delta_product, plan_name="gdp_frost")
+    finally:
+        gdp_module.fprop_cache.clear()
+        gdp_module.bprop_cache.clear()
+
+
+def run_gdp(pinned, *args, **kw):
+    try:
+        return pinned(*args, **kw)
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        pytest.skip(f"gdp_frost declined: {exc}")
+
+
+def make_gdp_case(dtype, n, *, B=1, T=None, seq_lens=None, H=2, HK=None, HV=None, K=128, V=128, lo=None, seed=SEED):
+    """q/g/cu at real tokens plus k/v/beta on the expanded sub-token timeline."""
+    base = make_case("gdn", dtype, B=B, T=T, seq_lens=seq_lens, H=H, HK=HK, HV=HV, K=K, V=V, lo=lo, seed=seed)
+    expanded = make_case(
+        "gdn",
+        dtype,
+        B=B,
+        T=None if seq_lens is not None else base.T * n,
+        seq_lens=None if seq_lens is None else [sl * n for sl in seq_lens],
+        H=H,
+        HK=HK,
+        HV=HV,
+        K=K,
+        V=V,
+        lo=lo,
+        seed=seed + 1,
+    )
+    return base, expanded
+
+
+def gdp_args(base, expanded, n):
+    return [to_thd(base.q), to_thd(expanded.k), to_thd(expanded.v), to_thd(base.gates["g"]), to_thd(expanded.gates["beta"]), base.cu, n]
+
+
+def gdp_ref(base, expanded, n, *, scale=None, initial_state=None, l2norm=False):
+    q, k = base.q, expanded.k
+    if l2norm:
+        q = F.normalize(q.float(), dim=-1)
+        k = F.normalize(k.float(), dim=-1)
+    kwargs = dict(num_householder=n, scale=scale, initial_state=initial_state)
+    if base.varlen:
+        kwargs["cu_seqlens"] = base.cu
+    with torch.no_grad():
+        return gdp_reference(q, k, expanded.v, base.gates["g"], expanded.gates["beta"], **kwargs)
+
+
+def assert_gdp_fwd_parity(pinned, base, expanded, n, *, scale=None, use_initial_state=False, l2norm=False, seed=SEED + 1):
+    set_seed(seed)
+    state0 = None
+    if use_initial_state:
+        state0 = torch.randn(base.N, base.HO, base.V, base.K, device="cuda", dtype=torch.float32) * 0.05
+    o, fs = run_gdp(pinned, *gdp_args(base, expanded, n), scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+    o_ref, fs_ref = gdp_ref(base, expanded, n, scale=scale, initial_state=state0, l2norm=l2norm)
+    assert_rms_close("o", o, o_ref, FWD_TOL[base.dtype])
+    assert_rms_close("final_state", fs, fs_ref, STATE_TOL[base.dtype])
+
+
+def assert_gdp_bwd_parity(pinned, base, expanded, n, *, use_initial_state=False, use_dfs=False, l2norm=False, seed=SEED + 1):
+    tol = BWD_TOL[base.dtype]
+    tensors = {"q": base.q, "k": expanded.k, "v": expanded.v, "g": base.gates["g"], "beta": expanded.gates["beta"]}
+    op_leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
+    ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in tensors.items()}
+    set_seed(seed)
+    state0_op = state0_ref = None
+    if use_initial_state:
+        state0 = torch.randn(base.N, base.HO, base.V, base.K, device="cuda", dtype=torch.float32) * 0.05
+        state0_op = state0.detach().clone().requires_grad_(True)
+        state0_ref = state0.detach().double().requires_grad_(True)
+
+    o, fs = run_gdp(
+        pinned,
+        op_leaves["q"],
+        op_leaves["k"],
+        op_leaves["v"],
+        op_leaves["g"],
+        op_leaves["beta"],
+        base.cu,
+        n,
+        initial_state=state0_op,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=l2norm,
+    )
+    dO = torch.randn_like(o)
+    outputs, grad_outputs = [o], [dO]
+    dFS = None
+    if use_dfs:
+        dFS = torch.randn_like(fs) * 0.1
+        outputs.append(fs)
+        grad_outputs.append(dFS)
+    grad_inputs = list(op_leaves.values()) + ([state0_op] if use_initial_state else [])
+    grads = torch.autograd.grad(outputs, grad_inputs, grad_outputs)
+
+    qd, kd = ref_leaves["q"], ref_leaves["k"]
+    if l2norm:
+        qd, kd = F.normalize(qd, dim=-1), F.normalize(kd, dim=-1)
+    ref_kwargs = dict(num_householder=n, initial_state=state0_ref)
+    if base.varlen:
+        ref_kwargs["cu_seqlens"] = base.cu
+    o_ref, fs_ref = gdp_reference(qd, kd, ref_leaves["v"], ref_leaves["g"], ref_leaves["beta"], **ref_kwargs)
+    ref_outputs, ref_gos = [o_ref], [dO.double().reshape(o_ref.shape)]
+    if use_dfs:
+        ref_outputs.append(fs_ref)
+        ref_gos.append(dFS.double().reshape(fs_ref.shape))
+    ref_grads = torch.autograd.grad(ref_outputs, list(ref_leaves.values()) + ([state0_ref] if use_initial_state else []), ref_gos)
+
+    names = list(op_leaves) + (["initial_state"] if use_initial_state else [])
+    for name, got, want in zip(names, grads, ref_grads):
+        assert_rms_close(f"d{name}", got, want, STATE_GRAD_TOL if name == "initial_state" else tol)
+
+
+@pytest.mark.parametrize("n", (1, 2, 3))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_gdp_fwd_parity(gdp_frost, n, dtype):
+    base, expanded = make_gdp_case(dtype, n, T=256)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n)
+
+
+@pytest.mark.parametrize("n", (2, 3))
+def test_gdp_fwd_varlen_l2norm_state(gdp_frost, n):
+    base, expanded = make_gdp_case(torch.bfloat16, n, seq_lens=[100, 156])
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n, l2norm=True, use_initial_state=True)
+
+
+@pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
+def test_gdp_fwd_gqa(gdp_frost, H, HK, HV):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_fwd_split_table(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=SPLIT_T, lo=0.1)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+@pytest.mark.parametrize("l2norm", (False, True), ids=["plain", "l2norm"])
+@pytest.mark.parametrize("n", (2, 3))
+def test_gdp_bwd_parity(gdp_frost, n, l2norm):
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, n, l2norm=l2norm)
+
+
+@pytest.mark.parametrize("H,HK,HV", [(6, 6, 2), (2, 4, 4)])
+def test_gdp_bwd_gqa(gdp_frost, H, HK, HV):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_bwd_varlen_states(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, seq_lens=[64, 128])
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, use_initial_state=True, use_dfs=True)
+
+
+def test_gdp_beta_two(gdp_frost):
+    """beta in (0, 2): the negative-eigenvalue GDP regime (fp32 beta, fusion off)."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128)
+    expanded.gates["beta"] = torch.rand_like(expanded.gates["beta"]) * 1.95
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_use_beta_sigmoid(gdp_frost):
+    n = 2
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    logits = torch.randn(expanded.T, expanded.HO, device="cuda", dtype=torch.bfloat16)
+    args = gdp_args(base, expanded, n)
+    args[4] = logits
+    o, fs = run_gdp(gdp_frost, *args, output_final_state=True, use_beta_sigmoid_in_kernel=True)
+    expanded.gates["beta"] = logits.float().sigmoid().reshape(1, expanded.T, expanded.HO)
+    o_ref, fs_ref = gdp_ref(base, expanded, n)
+    assert_rms_close("o", o, o_ref, FWD_TOL[torch.bfloat16])
+    assert_rms_close("final_state", fs, fs_ref, STATE_TOL[torch.bfloat16])
+
+
+def test_gdp_n1_matches_gdn_bitwise(gdp_frost):
+    """num_householder == 1 is the GDN math on the GDN kernels: bitwise."""
+    case = make_case("gdn", torch.bfloat16, T=256)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"]), case.cu]
+    o, fs = run_gdp(gdp_frost, *args, 1, output_final_state=True)
+    o_gdn, fs_gdn = la_ops.gated_delta_net(*args, output_final_state=True, plan_name="gdn_frost")
+    assert torch.equal(o, o_gdn) and torch.equal(fs, fs_gdn)
+
+
+def test_gdp_checkpoint_series(gdp_frost):
+    """checkpoint counts expanded sub-tokens: 64 = bwd-reusable chunk cadence,
+    64 * n = every checkpoint on a real-token boundary."""
+    n, T = 3, 256
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=T)
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64)
+    assert out[2].shape[0] == T * n // 64 + base.N
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64 * n)
+    assert out[2].shape[0] == T * n // (64 * n) + base.N
+
+
+def test_gdp_bwd_checkpoint_reuse(gdp_frost):
+    """checkpoint_every_n_tokens=64 makes the backward consume the forward's
+    series instead of recomputing; gradients stay at oracle parity."""
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+    out = run_gdp(gdp_frost, *leaves, base.cu, n, checkpoint_every_n_tokens=64)
+    grads = torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
+    assert all(torch.isfinite(gr.float()).all() for gr in grads)
+    assert any(t.get("checkpoints") is not None for _g, t in gdp_module.bprop_cache.values()), "backward did not consume the forward's checkpoint series"
+
+
+def test_gdp_engine_routing(gdp_frost):
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    base, expanded = make_gdp_case(torch.bfloat16, 2, T=128)
+    run_gdp(gdp_frost, *gdp_args(base, expanded, 2))
+    names = {g.selected_engine.name for g, _t in gdp_module.fprop_cache.values() if g.selected_engine is not None}
+    assert names == {"gdp_frost"}
+
+
+@pytest.mark.parametrize("V", (64, 128))
+def test_gdp_v_head_dim(gdp_frost, V):
+    """GDP at V = 64 rides the same m64 kernel paths as GDN."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, V=V)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_invalid_rows_raise(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=64)
+    args = gdp_args(base, expanded, 3)
+    args[1] = to_thd(base.k)
+    with pytest.raises(ValueError, match="rows"):
+        la_ops.gated_delta_product(*args)
+    with pytest.raises(ValueError, match="positive"):
+        la_ops.gated_delta_product(*gdp_args(base, expanded, 3)[:-1], 0)

@@ -105,6 +105,7 @@ def generate_charts(
     variant: str = "gdn",
     batch_sizes: Optional[List[int]] = None,
     x_axis: str = "seqlen",
+    dims_label: Optional[str] = None,
 ) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,8 +154,9 @@ def generate_charts(
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
+            dims = dims_label if dims_label else f"d = {head_dim}"
             fig.suptitle(
-                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
+                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 
@@ -210,6 +212,7 @@ def main():
     parser.add_argument("--gpu-name", default="", help="GPU name for the chart title")
     parser.add_argument("--cudnn-version", default=None, help="cuDNN backend version for the legend (e.g. 9.24.0)")
     parser.add_argument("--variant", default="gdn", help="Linear attention variant to plot")
+    parser.add_argument("--dims-label", default=None, help="Head-dim label for the chart title (default: 'd = <head_dim>')")
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes to plot (default: all in the CSV)")
     parser.add_argument(
         "--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)"
@@ -224,7 +227,16 @@ def main():
         raise ValueError(f"CSV is missing expected columns: {missing}")
 
     output_dir = args.output_dir if args.output_dir is not None else args.csv.parent
-    generate_charts(df, output_dir, gpu_name=args.gpu_name, cudnn_version=args.cudnn_version, variant=args.variant, batch_sizes=batch_sizes, x_axis=args.x_axis)
+    generate_charts(
+        df,
+        output_dir,
+        gpu_name=args.gpu_name,
+        cudnn_version=args.cudnn_version,
+        variant=args.variant,
+        batch_sizes=batch_sizes,
+        x_axis=args.x_axis,
+        dims_label=args.dims_label,
+    )
 
 
 if __name__ == "__main__":

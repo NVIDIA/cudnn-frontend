@@ -271,7 +271,7 @@ def tmaldg_warp(
         leading_byte_offset=0,
         stride_byte_offset=0,
         layout=0,
-        tma_loads_per_tile=(cfg.d_k // 64),
+        tma_loads_per_tile=(cfg.d_v // 64),
         tma_granu_elems=64,
         tma_subtile_stride_elems=(cfg.b_t * 64),
     )
@@ -293,7 +293,7 @@ def tmaldg_warp(
         leading_byte_offset=0,
         stride_byte_offset=0,
         layout=0,
-        tma_loads_per_tile=(cfg.d_k // 64),
+        tma_loads_per_tile=(cfg.d_v // 64),
         tma_granu_elems=64,
         tma_subtile_stride_elems=(cfg.b_t * 64),
     )
@@ -846,9 +846,9 @@ def epilogue_warp(
             leading_byte_offset=0,
             stride_byte_offset=0,
             layout=0,
-            tma_loads_per_tile=(cfg.d_v // 64),
+            tma_loads_per_tile=(cfg.d_k // 64),
             tma_granu_elems=64,
-            tma_subtile_stride_elems=cfg.d_k * 64,
+            tma_subtile_stride_elems=cfg.d_v * 64,
         )
     checkpoint_ready_index = PipelineState.start(phase=0)
     sO_tma = SmemTile(
@@ -1468,10 +1468,18 @@ def compute1_warp_group(
     tmem_row = tmem_base >> 16
     row_lo_addr = tmem_row << 16
     row_hi_addr = (tmem_row + 16) << 16
-    tmem_subpartition = warp_idx % (cfg.d_v // cfg.threads_per_warp)
+    tmem_subpartition = warp_idx % len(cfg.compute_group_1_warp_ids)
     ov_row_coord = (lane_idx // 16) * 8 + (lane_idx & 7)
     ov_col_offset = ((lane_idx // 8) & 1) * 8
-    value_dim = tmem_subpartition * cfg.threads_per_warp + lane_idx
+    dv_halves = cutlass.const_expr(cfg.d_v // 64)
+    if cutlass.const_expr(cfg.d_v == 128):
+        value_dim_base = tmem_subpartition * cfg.threads_per_warp
+        state_gmem_row = tmem_subpartition * cfg.threads_per_warp + lane_idx
+        state_row_valid = cutlass.Boolean(True)
+    else:
+        value_dim_base = tmem_subpartition * 16
+        state_gmem_row = tmem_subpartition * 16 + lane_idx % 16
+        state_row_valid = lane_idx < 16
     state_k_acc_index = PipelineState.start(phase=0)
     u_acc_index = PipelineState.start(phase=0)
     o_acc_index = PipelineState.start(phase=0)
@@ -1500,7 +1508,7 @@ def compute1_warp_group(
             if cutlass.const_expr(mState_init is not None):
                 if seed_from_initial_state:
                     seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
                     state_vecs = []
                     for i in cutlass.range_constexpr(cfg.d_k // 16):
                         state_block = []
@@ -1537,12 +1545,13 @@ def compute1_warp_group(
                                     checkpoint_addr = (
                                         checkpoint_stage_base
                                         + (dk // 64) * (cfg.d_v * 64)
-                                        + value_dim * 64
-                                        + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                        + state_gmem_row * 64
+                                        + swizzle_xor_128b(state_gmem_row, dk % 64, elem_bytes=2)
                                     )
-                                    (sCheckpoint_ptr + checkpoint_addr).store(
-                                        cutlass.Vector.from_elements(packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
-                                    )
+                                    if state_row_valid:
+                                        (sCheckpoint_ptr + checkpoint_addr).store(
+                                            cutlass.Vector.from_elements(packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
+                                        )
                             nvvm.fence_proxy("async.shared", space="cta")
                             bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
                         bars.mb_state_acc_read_done.arrive()
@@ -1558,11 +1567,15 @@ def compute1_warp_group(
                         for g in cutlass.range_constexpr(2):
                             dk = i * 16 + g * 8
                             checkpoint_addr = (
-                                checkpoint_stage_base + (dk // 64) * (cfg.d_v * 64) + value_dim * 64 + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                checkpoint_stage_base
+                                + (dk // 64) * (cfg.d_v * 64)
+                                + state_gmem_row * 64
+                                + swizzle_xor_128b(state_gmem_row, dk % 64, elem_bytes=2)
                             )
-                            (sCheckpoint_ptr + checkpoint_addr).store(
-                                cutlass.Vector.from_elements(zero_packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
-                            )
+                            if state_row_valid:
+                                (sCheckpoint_ptr + checkpoint_addr).store(
+                                    cutlass.Vector.from_elements(zero_packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
+                                )
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
 
@@ -1570,7 +1583,6 @@ def compute1_warp_group(
             bars.mb_v_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             projection_col_id = tmem_col + cfg.tmem_state_k_acc_offset
             input_col_id = tmem_col + cfg.tmem_y_input_offset
-            value_dim_base = tmem_subpartition * cfg.threads_per_warp
 
             # ---- raw V fragments, then W, then the k state acc read ------------------
             raw_v_frag_lo = nvvm.ldmatrix(
@@ -1581,14 +1593,15 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            raw_v_frag_hi = nvvm.ldmatrix(
-                sV_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                raw_v_frag_hi = nvvm.ldmatrix(
+                    sV_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             bars.mb_w_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             raw_w_frag_lo = nvvm.ldmatrix(
                 sW_ptr
@@ -1598,31 +1611,35 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            raw_w_frag_hi = nvvm.ldmatrix(
-                sW_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                raw_w_frag_hi = nvvm.ldmatrix(
+                    sW_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             y_lo = [cutlass.Int32(0) for _ in range(4)]
             y_hi = [cutlass.Int32(0) for _ in range(4)]
             for reg_idx in cutlass.range_constexpr(4):
                 y_lo[reg_idx] = mul_f16x2(raw_w_frag_lo[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype)
-                y_hi[reg_idx] = mul_f16x2(raw_w_frag_hi[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype)
+                if cutlass.const_expr(dv_halves == 2):
+                    y_hi[reg_idx] = mul_f16x2(raw_w_frag_hi[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype)
             if cutlass.const_expr(mState_init is not None):
                 if seed_from_initial_state:
                     bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
                     state_k_acc_index = advance(state_k_acc_index, 1)
                     state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
-                    state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
+                    if cutlass.const_expr(dv_halves == 2):
+                        state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
                         state_k_lo = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                        state_k_hi = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
                         y_lo[reg_idx] = sub_f16x2(y_lo[reg_idx], state_k_lo, cfg.io_dtype)
-                        y_hi[reg_idx] = sub_f16x2(y_hi[reg_idx], state_k_hi, cfg.io_dtype)
+                        if cutlass.const_expr(dv_halves == 2):
+                            state_k_hi = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
+                            y_hi[reg_idx] = sub_f16x2(y_hi[reg_idx], state_k_hi, cfg.io_dtype)
 
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
@@ -1630,7 +1647,8 @@ def compute1_warp_group(
                 y_input_pack_lo[reg_idx] = y_lo[reg_idx]
                 y_input_pack_hi[reg_idx] = y_hi[reg_idx]
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id, cutlass.Int8), y_input_pack_lo[0:4])
-            nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
             nvvm.tcgen05_wait("store")
             bars.mb_v_done[raw_index.idx].arrive()
             bars.mb_w_done[raw_index.idx].arrive()
@@ -1711,20 +1729,21 @@ def compute1_warp_group(
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_done_index.phase)
                     checkpoint_done_index = advance(checkpoint_done_index, cfg.smem_checkpoint_stages)
                     checkpoint_stage_base = checkpoint_stage * (cfg.d_k * cfg.d_v)
-                    checkpoint_vbase = tmem_subpartition * cfg.threads_per_warp
-                    checkpoint_swz_off_lo = (checkpoint_vbase + ov_col_offset) // 64 * (cfg.d_k * 64)
-                    checkpoint_swz_col_lo = (checkpoint_vbase + ov_col_offset) % 64
-                    checkpoint_swz_off_hi = (checkpoint_vbase + 16 + ov_col_offset) // 64 * (cfg.d_k * 64)
-                    checkpoint_swz_col_hi = (checkpoint_vbase + 16 + ov_col_offset) % 64
                     for k_base in cutlass.range_constexpr(0, cfg.d_k, 32):
                         checkpoint_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + state_col_id + k_base, cutlass.Float32), num=32)
                         for g in cutlass.range_constexpr(4):
                             packs = tuple(fp32_to_fp16(checkpoint_vec[g * 8 + 2 * t], checkpoint_vec[g * 8 + 2 * t + 1], dtype=cfg.io_dtype) for t in range(4))
                             dk = k_base + g * 8
                             checkpoint_addr = (
-                                checkpoint_stage_base + (dk // 64) * (cfg.d_v * 64) + value_dim * 64 + swizzle_xor_128b(value_dim, dk % 64, elem_bytes=2)
+                                checkpoint_stage_base
+                                + (dk // 64) * (cfg.d_v * 64)
+                                + state_gmem_row * 64
+                                + swizzle_xor_128b(state_gmem_row, dk % 64, elem_bytes=2)
                             )
-                            (sCheckpoint_ptr + checkpoint_addr).store(cutlass.Vector.from_elements(packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16)
+                            if state_row_valid:
+                                (sCheckpoint_ptr + checkpoint_addr).store(
+                                    cutlass.Vector.from_elements(packs, cutlass.Int32).bitcast(cfg.io_dtype), alignment=16
+                                )
                     nvvm.tcgen05_wait("load")
                     bars.mb_state_acc_read_done.arrive()
                     nvvm.fence_proxy("async.shared", space="cta")
@@ -1734,19 +1753,20 @@ def compute1_warp_group(
             bars.mb_o_acc_ready.wait(o_acc_index.phase)
             o_acc_index = advance(o_acc_index, 1)
             projection_col_id = tmem_col + cfg.tmem_q_state_acc_offset + prev_q_state_acc_stage * cfg.b_t
-            value_dim_base = tmem_subpartition * cfg.threads_per_warp
 
             loaded_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
-            loaded_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
+            if cutlass.const_expr(dv_halves == 2):
+                loaded_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
 
             # ---- output store: O acc TMEM -> scaled b16 SMEM -------------------------
             o_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             o_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 scaled0_0, scaled0_1 = fmul2(loaded_vec_lo[2 * reg_idx], loaded_vec_lo[2 * reg_idx + 1], scale, scale)
-                scaled1_0, scaled1_1 = fmul2(loaded_vec_hi[2 * reg_idx], loaded_vec_hi[2 * reg_idx + 1], scale, scale)
                 o_pack_lo[reg_idx] = fp32_to_fp16(scaled0_0, scaled0_1, dtype=mO.element_type)
-                o_pack_hi[reg_idx] = fp32_to_fp16(scaled1_0, scaled1_1, dtype=mO.element_type)
+                if cutlass.const_expr(dv_halves == 2):
+                    scaled1_0, scaled1_1 = fmul2(loaded_vec_hi[2 * reg_idx], loaded_vec_hi[2 * reg_idx + 1], scale, scale)
+                    o_pack_hi[reg_idx] = fp32_to_fp16(scaled1_0, scaled1_1, dtype=mO.element_type)
 
             bars.mb_o_tmastg_done[prev_o_stage].wait(((prev_global_chunk // cfg.smem_o_stages) + 1) % 2)
             nvvm.stmatrix(
@@ -1759,16 +1779,17 @@ def compute1_warp_group(
                 nvvm.MMALayout.COL,
                 shape=nvvm.StoreShape.M8N8,
             )
-            nvvm.stmatrix(
-                sO_ptr
-                + prev_o_stage_base
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                o_pack_hi.data_ptr().load(count=4, alignment=4),
-                nvvm.MMALayout.COL,
-                shape=nvvm.StoreShape.M8N8,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.stmatrix(
+                    sO_ptr
+                    + prev_o_stage_base
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    o_pack_hi.data_ptr().load(count=4, alignment=4),
+                    nvvm.MMALayout.COL,
+                    shape=nvvm.StoreShape.M8N8,
+                )
             bars.mb_o_acc_done[prev_q_state_acc_stage].arrive()
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_o_tmastg_ready[prev_o_stage].arrive()
@@ -1777,7 +1798,6 @@ def compute1_warp_group(
             bars.mb_v_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             projection_col_id = tmem_col + cfg.tmem_state_k_acc_offset
             input_col_id = tmem_col + cfg.tmem_y_input_offset
-            value_dim_base = tmem_subpartition * cfg.threads_per_warp
 
             # ---- raw V fragments, then W, then the k state acc read ------------------
             raw_v_frag_lo = nvvm.ldmatrix(
@@ -1788,14 +1808,15 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            raw_v_frag_hi = nvvm.ldmatrix(
-                sV_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                raw_v_frag_hi = nvvm.ldmatrix(
+                    sV_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             bars.mb_w_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             raw_w_frag_lo = nvvm.ldmatrix(
                 sW_ptr
@@ -1805,18 +1826,20 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            raw_w_frag_hi = nvvm.ldmatrix(
-                sW_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                raw_w_frag_hi = nvvm.ldmatrix(
+                    sW_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
 
             bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
             state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
-            state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
+            if cutlass.const_expr(dv_halves == 2):
+                state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
 
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
@@ -1836,24 +1859,26 @@ def compute1_warp_group(
                 )
 
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            for reg_idx in cutlass.range_constexpr(4):
-                frag_pair = reg_idx * 2
-                state_k_val0, state_k_val1 = state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1]
-                state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
-                w_pair = raw_w_frag_hi[reg_idx]
-                wv_pair = mul_f16x2(
-                    w_pair,
-                    raw_v_frag_hi[reg_idx],
-                    cfg.io_dtype,
-                )
-                y_input_pack_hi[reg_idx] = sub_f16x2(
-                    wv_pair,
-                    state_k_pair,
-                    cfg.io_dtype,
-                )
+            if cutlass.const_expr(dv_halves == 2):
+                for reg_idx in cutlass.range_constexpr(4):
+                    frag_pair = reg_idx * 2
+                    state_k_val0, state_k_val1 = state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1]
+                    state_k_pair = fp32_to_fp16(state_k_val0, state_k_val1, dtype=cfg.io_dtype)
+                    w_pair = raw_w_frag_hi[reg_idx]
+                    wv_pair = mul_f16x2(
+                        w_pair,
+                        raw_v_frag_hi[reg_idx],
+                        cfg.io_dtype,
+                    )
+                    y_input_pack_hi[reg_idx] = sub_f16x2(
+                        wv_pair,
+                        state_k_pair,
+                        cfg.io_dtype,
+                    )
 
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id, cutlass.Int8), y_input_pack_lo[0:4])
-            nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
             nvvm.tcgen05_wait("store")
             state_k_acc_index = advance(state_k_acc_index, 1)
             bars.mb_v_done[raw_index.idx].arrive()
@@ -1898,19 +1923,20 @@ def compute1_warp_group(
             bars.mb_o_acc_ready.wait(o_acc_index.phase)
             o_acc_index = advance(o_acc_index, 1)
             projection_col_id = tmem_col + cfg.tmem_q_state_acc_offset + final_q_state_acc_stage * cfg.b_t
-            value_dim_base = tmem_subpartition * cfg.threads_per_warp
 
             loaded_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
-            loaded_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
+            if cutlass.const_expr(dv_halves == 2):
+                loaded_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
 
             # ---- output store: O acc TMEM -> scaled b16 SMEM -------------------------
             o_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             o_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 scaled0_0, scaled0_1 = fmul2(loaded_vec_lo[2 * reg_idx], loaded_vec_lo[2 * reg_idx + 1], scale, scale)
-                scaled1_0, scaled1_1 = fmul2(loaded_vec_hi[2 * reg_idx], loaded_vec_hi[2 * reg_idx + 1], scale, scale)
                 o_pack_lo[reg_idx] = fp32_to_fp16(scaled0_0, scaled0_1, dtype=mO.element_type)
-                o_pack_hi[reg_idx] = fp32_to_fp16(scaled1_0, scaled1_1, dtype=mO.element_type)
+                if cutlass.const_expr(dv_halves == 2):
+                    scaled1_0, scaled1_1 = fmul2(loaded_vec_hi[2 * reg_idx], loaded_vec_hi[2 * reg_idx + 1], scale, scale)
+                    o_pack_hi[reg_idx] = fp32_to_fp16(scaled1_0, scaled1_1, dtype=mO.element_type)
 
             bars.mb_o_tmastg_done[final_o_stage].wait(((last_global_chunk // cfg.smem_o_stages) + 1) % 2)
             nvvm.stmatrix(
@@ -1923,16 +1949,17 @@ def compute1_warp_group(
                 nvvm.MMALayout.COL,
                 shape=nvvm.StoreShape.M8N8,
             )
-            nvvm.stmatrix(
-                sO_ptr
-                + final_o_stage_base
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                o_pack_hi.data_ptr().load(count=4, alignment=4),
-                nvvm.MMALayout.COL,
-                shape=nvvm.StoreShape.M8N8,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.stmatrix(
+                    sO_ptr
+                    + final_o_stage_base
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    o_pack_hi.data_ptr().load(count=4, alignment=4),
+                    nvvm.MMALayout.COL,
+                    shape=nvvm.StoreShape.M8N8,
+                )
             bars.mb_o_acc_done[final_q_state_acc_stage].arrive()
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_o_tmastg_ready[final_o_stage].arrive()
@@ -1944,7 +1971,7 @@ def compute1_warp_group(
             if batch_seqlen > 0:
                 if owns_final:
                     state_vw = 16 // (mState_out.element_type.width // 8)
-                    state_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                    state_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
                     for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                         loaded = nvvm.tcgen05_ld(
                             "32x32b",
@@ -1953,21 +1980,23 @@ def compute1_warp_group(
                         )
 
                         for g in cutlass.range_constexpr(32 // state_vw):
-                            (state_dst + key_block_start + g * state_vw).store(
-                                cutlass.Vector.from_elements(
-                                    tuple(loaded[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)),
-                                    mState_out.element_type,
-                                ),
-                                alignment=16,
-                            )
+                            if state_row_valid:
+                                (state_dst + key_block_start + g * state_vw).store(
+                                    cutlass.Vector.from_elements(
+                                        tuple(loaded[g * state_vw + t].to(mState_out.element_type) for t in range(state_vw)),
+                                        mState_out.element_type,
+                                    ),
+                                    alignment=16,
+                                )
             else:
                 for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                     for col in cutlass.range_constexpr(32):
                         key_dim = key_block_start + col
-                        if cutlass.const_expr(mState_init is not None):
-                            mState_out[batch_idx, head_o, value_dim, key_dim] = mState_init[batch_idx, head_o, value_dim, key_dim]
-                        else:
-                            mState_out[batch_idx, head_o, value_dim, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
+                        if state_row_valid:
+                            if cutlass.const_expr(mState_init is not None):
+                                mState_out[batch_idx, head_o, state_gmem_row, key_dim] = mState_init[batch_idx, head_o, state_gmem_row, key_dim]
+                            else:
+                                mState_out[batch_idx, head_o, state_gmem_row, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
         global_chunk_base += num_tile_chunks
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
 
@@ -2149,8 +2178,8 @@ def frost_gdn2_prefill(
         base=sK_restore_raw,
         elems_per_stage=(cfg.d_k * cfg.b_t),
         stages=cfg.smem_decay_stages,
-        leading_byte_offset=(cfg.b_t * (cfg.d_v // 2) * 2),
-        stride_byte_offset=(8 * (cfg.d_v // 2) * 2),
+        leading_byte_offset=(cfg.b_t * 128),
+        stride_byte_offset=(8 * 128),
         layout=nvvm.Tcgen05SmemSwizzle.SWIZZLE_128B,
     )
     sState_scale_diag = SmemTile(
@@ -2476,6 +2505,8 @@ def build_cfg(
     n_heads_out: int,
     max_active_clusters: int,
     dynamic_scheduling: bool = False,
+    d_k: int = CFG.D_K,
+    d_v: int = CFG.D_V,
 ) -> Gdn2Cfg:
     """Build the per-compile ``Gdn2Cfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
@@ -2483,6 +2514,10 @@ def build_cfg(
         raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
     if beta_guard and not l2norm:
         raise ValueError("beta_guard requires l2norm (the sensor is defined on the normalized key)")
+    if d_k != 128:
+        raise ValueError(f"d_k={d_k} not supported; the q/k head dim must be 128")
+    if d_v not in (64, 128):
+        raise ValueError(f"d_v={d_v} not supported; the v head dim must be 64 or 128")
     cfg = Gdn2Cfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2501,6 +2536,8 @@ def build_cfg(
         n_heads_out=n_heads_out,
         max_active_clusters=max_active_clusters,
         dynamic_scheduling=dynamic_scheduling,
+        d_k=d_k,
+        d_v=d_v,
     )
     if enable_checkpoints:
         cfg.smem_raw_stages = 3
@@ -2808,7 +2845,7 @@ def prologue(
                 stride=(state_checkpoints.stride[3], state_checkpoints.stride[2], state_checkpoints.stride[0], state_checkpoints.stride[1]),
             ),
         )
-        base_checkpoint = cuda.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(tma_granu_elems, d_k, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz)
+        base_checkpoint = cuda.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(tma_granu_elems, d_v, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz)
     frost_gdn2_prefill_prologue(
         order_gen,
         has_scheduler,
@@ -2860,6 +2897,8 @@ def get_compiled_cache(
     HQ: int,
     HK: int,
     HV: int,
+    DK: int,
+    DV: int,
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
@@ -2892,6 +2931,8 @@ def compile(
     v_ratio: int,
     n_heads_out: int,
     dynamic_scheduling: bool = False,
+    d_k: int = CFG.D_K,
+    d_v: int = CFG.D_V,
     *,
     num_sm: int,
     q_cute,
@@ -2933,6 +2974,8 @@ def compile(
         n_heads_out=n_heads_out,
         max_active_clusters=num_sm,
         dynamic_scheduling=dynamic_scheduling,
+        d_k=d_k,
+        d_v=d_v,
     )
 
     return cute.compile(
@@ -3035,6 +3078,8 @@ def chunk_gdn2_sm100(
     HK = k.shape[1]
     HV = v.shape[1]
     HO = max(HQ, HV)
+    DK = q.shape[2]
+    DV = v.shape[2]
     use_initial_state = initial_state is not None
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
@@ -3082,6 +3127,8 @@ def chunk_gdn2_sm100(
         HQ,
         HK,
         HV,
+        DK,
+        DV,
         use_initial_state,
         store_final_state,
         enable_checkpoints,
@@ -3144,6 +3191,8 @@ def chunk_gdn2_sm100(
             v_ratio,
             HO,
             dynamic_scheduling,
+            d_k=DK,
+            d_v=DV,
             num_sm=multiprocessor_count(current_device()),
             q_cute=q_cute,
             k_cute=k_cute,

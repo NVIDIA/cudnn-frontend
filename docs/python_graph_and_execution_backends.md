@@ -296,6 +296,23 @@ are close.
   `KdaFrostEngine`), and serves `gdn2_bwd` the same way (checkpoint
   recompute when the series is absent); the op is
   `cudnn.linear_attention.ops.gated_delta_net_v2`.
+- Gated DeltaProduct (`gdp` / `gdp_bwd`) applies `num_householder` beta-gated
+  Householder updates per token with one scalar decay per token: the GDN
+  recurrence on an expanded sub-token timeline (gate on sub-token 0, readout
+  on sub-token `n - 1`). The node carries q/g/O/dO/dQ/dG at real-token rows
+  and k/v/beta/dK/dV/dBeta at `total_T * num_householder` rows;
+  `num_householder == 1` is exactly `gdn`. `GdpFrostEngine`
+  (`cudnn.linear_attention.frost.gdp_engine`, SM100/SM103) is its only
+  engine and runs the unmodified GDN kernels: q/g/dO are zero-scattered into
+  expanded workspace copies, `cu_seqlens` is scaled by `n` on device, and
+  O/dQ/dG are gathered back (`frost/common/expand.py`), so
+  `checkpoint_every_n_tokens` counts expanded sub-tokens (64 = the
+  bwd-reusable chunk cadence; a multiple of `lcm(64, n)` puts every
+  checkpoint on a real-token boundary). `safe_gate` is declined (no exact
+  neutral fill exists for raw logits on the pad sub-token rows);
+  `use_beta_sigmoid` passes through (beta in `(0, 1)` — for
+  negative-eigenvalue GDP pass fp32 `beta = 2 * sigmoid(x)` with the fusion
+  off). The op is `cudnn.linear_attention.ops.gated_delta_product`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
