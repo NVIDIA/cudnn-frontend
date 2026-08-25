@@ -129,6 +129,10 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
         pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
+    if cudnn_version < "9.26.0" and cfg.is_train and cfg.is_ragged and cfg.with_sink_token:
+        print("@@@@ Overall result: WAIVED, bwd ragged with a sink token requires cuDNN 9.26.0 or higher.")
+        pytest.skip("bwd ragged with a sink token hits a compute_dot_do_o OOB read (fixed in cuDNN 9.26.0)")
+
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
