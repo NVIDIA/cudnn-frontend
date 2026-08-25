@@ -63,6 +63,8 @@ if (CUDNN_FRONTEND_BUILD_SAMPLES)
     add_subdirectory(samples)
 endif()
 
+add_subdirectory(custom-scale)
+
 if (CUDNN_FRONTEND_BUILD_TESTS)
     add_subdirectory(test)
 endif()
