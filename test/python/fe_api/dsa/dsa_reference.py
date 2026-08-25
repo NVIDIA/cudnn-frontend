@@ -191,6 +191,54 @@ def check_ref_indexer_forward(
     )
 
 
+def check_ref_compressed_topk(
+    dense_scores: torch.Tensor,
+    indices: torch.Tensor,
+    logits: torch.Tensor,
+    top_k: int,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+) -> None:
+    """Validate local compressed Top-K ids/logits against dense scores.
+
+    The radix emit order is intentionally unspecified, so this checks the
+    selected set after sorting. Rows with fewer than ``top_k`` finite
+    candidates must use ``-1``/``-inf`` padding.
+    """
+    assert indices.shape == logits.shape == (*dense_scores.shape[:-1], top_k)
+    assert indices.dtype == torch.int32
+    assert logits.dtype == torch.float32
+
+    valid = indices >= 0
+    expected_count = torch.isfinite(dense_scores).sum(dim=-1).clamp(max=top_k)
+    assert torch.equal(valid.sum(dim=-1), expected_count)
+    assert bool(((indices < dense_scores.shape[-1]) | ~valid).all())
+
+    gathered = torch.gather(dense_scores, -1, indices.clamp(min=0).long())
+    if bool(valid.any()):
+        torch.testing.assert_close(
+            logits[valid],
+            gathered[valid],
+            atol=atol,
+            rtol=rtol,
+        )
+    if bool((~valid).any()):
+        assert bool(torch.isneginf(logits[~valid]).all())
+
+    expected_values = torch.topk(dense_scores, top_k, dim=-1).values
+    actual_values = torch.sort(logits, dim=-1, descending=True).values
+    expected_finite = torch.isfinite(expected_values)
+    assert torch.equal(torch.isfinite(actual_values), expected_finite)
+    if bool(expected_finite.any()):
+        torch.testing.assert_close(
+            actual_values[expected_finite],
+            expected_values[expected_finite],
+            atol=atol,
+            rtol=rtol,
+        )
+
+
 def ref_indexer_top_k(
     input_values: torch.Tensor,  # (n_rows, num_cols)
     seq_lens: torch.Tensor,  # (batch_size,)
@@ -234,17 +282,19 @@ def check_ref_indexer_top_k(
     # effective length. The DSA kernel returns indices for a particular row; we
     # verify that the set of picked indices matches the reference set.
     n_rows = input_values.shape[0]
+    batch = seq_lens.shape[0]
+    rows_per_batch = n_rows // batch
     for r in range(n_rows):
-        # Build sets of picked indices, but cap at the smaller of the effective
-        # lengths. The reference pads with zeros beyond seq_lens[b]; so do
-        # actual. We rely on value equality at matched indices via the value
-        # tensor check when return_val is True.
-        ref_set = set(int(i) for i in idx_ref[r].tolist())
-        act_set = set(int(i) for i in idx_actual[r].tolist())
+        # Only the first min(top_k, seq_lens[b]) entries of a row are picked.
+        # Past that the reference pads with zeros while the kernel leaves its
+        # sentinel init, so comparing whole rows compares two paddings.
+        k_eff = min(top_k, int(seq_lens[r // rows_per_batch].item()))
+        ref_set = set(int(i) for i in idx_ref[r, :k_eff].tolist())
+        act_set = set(int(i) for i in idx_actual[r, :k_eff].tolist())
         # Values within the effective top-k slice should match after sorting.
         if return_val:
-            ref_sorted = torch.sort(val_ref[r]).values
-            act_sorted = torch.sort(val_actual[r].to(val_ref.dtype)).values
+            ref_sorted = torch.sort(val_ref[r, :k_eff]).values
+            act_sorted = torch.sort(val_actual[r, :k_eff].to(val_ref.dtype)).values
             torch.testing.assert_close(act_sorted, ref_sorted, atol=atol, rtol=rtol)
 
 

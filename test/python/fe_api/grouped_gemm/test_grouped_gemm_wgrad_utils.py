@@ -9,6 +9,25 @@ import pytest
 import torch
 from fe_api.test_fe_api_utils import ceil_div
 
+
+def _skip_unless_e5m3_supported():
+    """E5M3 scales need Rubin plus an internal cutlass-dsl build.
+
+    Shared by the glu, dglu, quant and wgrad e5m3 guard tests -- those are the
+    only four APIs that expose ``sf_fp8_dtype_override``.
+    """
+    try:
+        import cutlass
+
+        from cudnn.api_base import get_device_type
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+    if get_device_type() != "rubin":
+        pytest.skip("e5m3 scale factors require Rubin (SM107)")
+    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
+        pytest.skip("cutlass-dsl build does not provide FloatNV8E5M3FNU")
+
+
 GROUPED_GEMM_WGRAD_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize("ab_dtype", [torch.float4_e2m1fn_x2]),
     pytest.mark.parametrize("wgrad_dtype", [torch.bfloat16]),
@@ -17,6 +36,7 @@ GROUPED_GEMM_WGRAD_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (2, 1)]),
     pytest.mark.parametrize("sf_vec_size", [16]),
     pytest.mark.parametrize("sf_dtype", [torch.float8_e4m3fn]),
+    pytest.mark.parametrize("sf_fp8_dtype_override", [None, "e5m3"], ids=["sf_e4m3", "sf_e5m3"]),
 ]
 
 GROUPED_GEMM_WGRAD_PARAM_MARKS_FP8 = [

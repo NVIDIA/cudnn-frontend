@@ -74,22 +74,22 @@ def _index_term(var: str, stride: int) -> str:
     return f"{var} * {stride}"
 
 
-def _aux_index_expr(aux: TensorRef) -> str:
+def _aux_index_expr(aux: TensorRef, *, row_var: str = "row", col_var: str = "col_j") -> str:
     """Linear element offset for the current epilogue location. Extent-1
     dims are broadcast and don't contribute to the offset."""
     if len(aux.dim) == 1:
-        axes = ((aux.dim[0], aux.stride[0], "col_j"),)
+        axes = ((aux.dim[0], aux.stride[0], col_var),)
     elif len(aux.dim) == 2:
         axes = (
-            (aux.dim[0], aux.stride[0], "row"),
-            (aux.dim[1], aux.stride[1], "col_j"),
+            (aux.dim[0], aux.stride[0], row_var),
+            (aux.dim[1], aux.stride[1], col_var),
         )
     elif len(aux.dim) == 3:
         lead_var = "group_idx" if aux.grouped_by_moe else "tile_l"
         axes = (
             (aux.dim[0], aux.stride[0], lead_var),
-            (aux.dim[1], aux.stride[1], "row"),
-            (aux.dim[2], aux.stride[2], "col_j"),
+            (aux.dim[1], aux.stride[1], row_var),
+            (aux.dim[2], aux.stride[2], col_var),
         )
     else:
         raise ValueError(f"unsupported aux rank {len(aux.dim)} for {aux.name!r}")
@@ -98,7 +98,107 @@ def _aux_index_expr(aux: TensorRef) -> str:
     return " + ".join(terms) if terms else "0"
 
 
-def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str) -> str:
+def _mmajor_elem_coord(e: int) -> tuple[str, str]:
+    """Which (row, col) does element ``e`` of the M-major TMA arm's fragment hold?
+
+    That arm loads `tcgen05_ld(SHAPE_16X256B)` and its lane holds a TRANSPOSED
+    patch, so the `row` / `col_j` the drain sets just before the hook are the
+    subtile base, not this element's coordinates -- anything that asks "which row
+    / column am I" has to come through here. The two `_h` passes cover disjoint
+    row halves (the `16 * _h` term), so a side effect placed on this arm fires
+    once per element, not twice.
+
+    Element ``e`` contributes `8 * bit1` to M and `bit0 + 8 * (bits 2..)` to N,
+    which is what makes a lane's 2 rows x vsize/2 columns tile the subtile."""
+    return (
+        f"(coord_m + warp_idx * 32 + (lane // 4) + {8 * ((e >> 1) & 1)} + 16 * _h)",
+        f"(col + 2 * (lane % 4) + {(e & 1) + 8 * (e >> 2)})",
+    )
+
+
+def _elem_coord(e: int, mmajor_tma: bool) -> tuple[str, str]:
+    """The (row, col) of element ``e``: the N-major arms hand the snippet the
+    fragment's own coordinates, the M-major TMA arm does not."""
+    return _mmajor_elem_coord(e) if mmajor_tma else ("row", f"col_j + {e}")
+
+
+def tma_out_value(j: int) -> str:
+    """The variable holding the j-th TMA-stored output's value. Slot 0 keeps the
+    legacy `vec_out`, so a single-TMA-output render is unchanged."""
+    return "vec_out" if j == 0 else f"_tma_out_{j}"
+
+
+def _aux_reads_row(aux: TensorRef) -> bool:
+    return len(aux.dim) >= 2 and aux.dim[-2] != 1
+
+
+def _mmajor_aux_prelude(chain: FusionChain, vsize: int) -> list[str]:
+    """Coordinate-reading aux on the M-major TMA arm. A lane's columns are not
+    contiguous there (`_tn` steps by 8 every 4 elements) and its rows come in two
+    halves, so there is no vector load to have -- each element reads at its own
+    CLAMPED coordinate. Out-of-extent elements land on the last valid one; the
+    TMA store clips them at the global extent, so their value is never used.
+    `per_row` joins the list here: `row` is uniform on the N-major arms, not on
+    this one."""
+    lines: list[str] = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode == "scalar":
+            continue
+        n, ptr = aux.name, _aux_ptr_var(aux.name)
+        lines.append(f"_auxt_{n} = cute.make_rmem_tensor({vsize}, {DTYPE_TO_CUTLASS[aux.dtype]})")
+        wants_row = _aux_reads_row(aux)
+        for k in range(vsize):
+            row_e, col_e = _mmajor_elem_coord(k)
+            row_var, col_var = "row", "col_j"
+            if wants_row:
+                row_var = f"_auxr_{n}"
+                lines.append(f"{row_var} = cute.math.min(cutlass.Int32({row_e}), cutlass.Int32(M) - 1)")
+            if aux.dim[-1] != 1:
+                col_var = f"_auxc_{n}"
+                lines.append(f"{col_var} = cute.math.min(cutlass.Int32({col_e}), cutlass.Int32(N) - 1)")
+            idx = _aux_index_expr(aux, row_var=row_var, col_var=col_var)
+            lines.append(f"_auxt_{n}[{k}] = ({ptr} + {idx}).load()")
+        lines.append(f"_auxv_{n} = _auxt_{n}.load().to_vector()")
+    return lines
+
+
+def _bounded_aux_prelude(chain: FusionChain) -> list[str]:
+    """The TMA arm hands the snippet a SUBTILE base with neither an N nor an M
+    bound -- the store is clipped by the descriptor's global extent, so nothing
+    downstream needs one, but a `per_col` / `per_elem` LDG at `col_j + k` is a
+    real read past the aux allocation (N=144, cta_tile_n=128, epi_n=32: the
+    subtile at col=224 reads columns 224..255, and at row M-1 that is 80
+    elements past a `per_elem` tensor's end). Take the whole-chunk vector load
+    when the window is inside both extents -- the case on every subtile but the
+    last -- and otherwise read element-wise at a CLAMPED coordinate: the lanes
+    past the extent land on the last valid element, whose value is never stored."""
+    lines: list[str] = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode not in ("per_col", "per_elem"):
+            continue
+        n, ptr = aux.name, _aux_ptr_var(aux.name)
+        lines.append(f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})")
+        lines.append(f"_auxv_{n} = _auxt_{n}.load().to_vector()")
+        cond = ["col_j + vsize <= N"]
+        if _aux_reads_row(aux):
+            cond.append("row < M")
+        lines.append(f"if {' & '.join(f'({c})' for c in cond)}:")
+        lines.append(f"    _auxv_{n} = ({ptr} + {_aux_index_expr(aux)}).load(count=vsize, alignment=ALIGN_AUX_{n})")
+        lines.append("else:")
+        row_var = f"_auxr_{n}"
+        if _aux_reads_row(aux):
+            lines.append(f"    {row_var} = cute.math.min(cutlass.Int32(row), cutlass.Int32(M) - 1)")
+        else:
+            row_var = "row"
+        lines.append("    for _auxk in cutlass.range_constexpr(vsize):")
+        lines.append(f"        _auxc_{n} = cute.math.min(cutlass.Int32(col_j) + _auxk, cutlass.Int32(N) - 1)")
+        idx = _aux_index_expr(aux, row_var=row_var, col_var=f"_auxc_{n}")
+        lines.append(f"        _auxt_{n}[_auxk] = ({ptr} + {idx}).load()")
+        lines.append(f"    _auxv_{n} = _auxt_{n}.load().to_vector()")
+    return lines
+
+
+def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False, mmajor_tma: bool = False) -> str:
     """Expression yielding aux value(s) as a length-`vsize` vector in the op's
     compute dtype, matching ``like_var``'s dtype."""
     idx = _aux_index_expr(aux)
@@ -107,13 +207,13 @@ def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str) -> str:
         # scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
     if aux.bcast_mode == "per_row":
+        if mmajor_tma:
+            return f"_auxv_{aux.name}.to({cast})"
         # per-row scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
-    if aux.bcast_mode == "per_col":
-        # vector load of vsize elements from aux_ptr[col_j]
-        return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=ALIGN_AUX_{aux.name}).to({cast})"
-    if aux.bcast_mode == "per_elem":
-        # vector load of vsize elements from aux_ptr[row*N + col_j]
+    if aux.bcast_mode in ("per_col", "per_elem"):
+        if bounded or mmajor_tma:
+            return f"_auxv_{aux.name}.to({cast})"
         return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=ALIGN_AUX_{aux.name}).to({cast})"
     raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
@@ -309,6 +409,7 @@ def _emit_op(
     other_in_chain: str | None = None,
     third_in_chain: str | None = None,
     vsize: int = 32,
+    mmajor_tma: bool = False,
 ) -> tuple[list[str], str]:
     """Emit lines computing this op, given the previous-step var name.
     ``other_in_chain`` = second operand var for fan-in binary ops (else None).
@@ -367,11 +468,15 @@ def _emit_op(
 
     if op.op == "gen_index":
         axis = dict(op.attrs).get("axis")
-        if axis == 1:
+        # Row index is uniform across the vector on the N-major arms only -- the
+        # M-major TMA fragment holds two row halves, so it needs the map too.
+        if axis == 1 and not mmajor_tma:
             return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
         gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
-        gl += [f"_gi{idx}[{k}] = cutlass.Float32(col_j + {k})" for k in range(vsize)]
-        gl.append(f"{new} = _gi{idx}.load()")
+        for k in range(vsize):
+            _row, _col = _elem_coord(k, mmajor_tma)
+            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({_row if axis == 1 else _col})")
+        gl.append(f"{new} = _gi{idx}.load().to_vector()")
         return gl, new
 
     if op.op == "binary_select":
@@ -546,19 +651,23 @@ def _dense_store_offset(i: int, is_fp4: bool, batch: int) -> str:
     return f"(tile_l * out_stride_l_{i} + {base})" if batch > 1 else f"({base})"
 
 
-def _emit_mmajor_scatter(tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int) -> list[str]:
+def _emit_mmajor_scatter(tap_idx: int, i: int, source_var: str, dtype: Dtype, batch: int, vsize: int, *, row_bound: str | None = None) -> list[str]:
     """Per-element scatter for an M-major (or arbitrarily strided) dense
     output: vsize scalar stores through the output's own runtime strides."""
     tap_var = f"_tap_{tap_idx}"
     l_term = f"tile_l * out_stride_l_{i} + " if batch > 1 else ""
     lines = [f"{tap_var} = {_store_cast_expr(source_var, dtype)}"]
-    for e in range(32):
-        lines.append(f"if cutlass.const_expr({e} < vsize):")
-        lines.append(
-            f"    (gC_tap_{tap_idx}_ptr + {l_term}row * out_stride_m_{i} + "
+    for e in range(vsize):
+        store = (
+            f"(gC_tap_{tap_idx}_ptr + {l_term}row * out_stride_m_{i} + "
             f"(col_j + {e}) * out_stride_n_{i}).store({tap_var}[{e} : {e} + 1], "
             f"alignment={DTYPE_BYTES[dtype]})"
         )
+        if row_bound is not None:
+            lines.append(f"if (row < {row_bound}) & (col_j + {e} < N):")
+            lines.append(f"    {store}")
+        else:
+            lines.append(store)
     return lines
 
 
@@ -581,7 +690,17 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
 
 
 def _emit_tap_store(
-    tap_idx: int, source_var: str, tap_dtype: Dtype, chain: FusionChain, dim, stride, vsize: int, offset_expr: str = "linear_idx", spec_idx: int = 0
+    tap_idx: int,
+    source_var: str,
+    tap_dtype: Dtype,
+    chain: FusionChain,
+    dim,
+    stride,
+    vsize: int,
+    offset_expr: str = "linear_idx",
+    spec_idx: int = 0,
+    *,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Store one tap vector. M-major TMA taps scatter the 16x256b fragment;
     all other paths store ``offset_expr`` in ``_tap_store_elems``-wide chunks (a
@@ -591,7 +710,7 @@ def _emit_tap_store(
     lines = [
         f"{tap_var} = {_store_cast_expr(source_var, tap_dtype)}",
         f"if cutlass.const_expr(cd_out_is_m_major and use_tma_store_epi):",
-        f"    for _tr_{tap_idx} in cutlass.range_constexpr(16):",
+        f"    for _tr_{tap_idx} in cutlass.range_constexpr({vsize}):",
         f"        _tm_{tap_idx} = coord_m + warp_idx * 32 + (lane // 4)" f" + 8 * ((_tr_{tap_idx} >> 1) & 1) + 16 * _h",
         f"        _tn_{tap_idx} = col + 2 * (lane % 4)" f" + (_tr_{tap_idx} & 1) + 8 * (_tr_{tap_idx} >> 2)",
         f"        if _tm_{tap_idx} < M and _tn_{tap_idx} < N:",
@@ -600,13 +719,20 @@ def _emit_tap_store(
         f"{tap_var}[_tr_{tap_idx} : _tr_{tap_idx} + 1], alignment=VEC_BYTES_TAP_{tap_idx})",
         f"else:",
     ]
-    if store_elems >= vsize:
-        lines.append(f"    (gC_tap_{tap_idx}_ptr + {offset_expr}).store({tap_var}, alignment=VEC_BYTES_TAP_{tap_idx})")
-    else:
-        for _s in range(0, vsize, store_elems):
-            lines.append(
-                f"    (gC_tap_{tap_idx}_ptr + {offset_expr} + {_s}).store(" f"{tap_var}[{_s} : {_s + store_elems}], alignment=VEC_BYTES_TAP_{tap_idx})"
-            )
+    # The STG arm sits inside `row < M` / `col_j + vsize <= N`; the TMA arm has
+    # neither -- its store is clipped by the descriptor's global extent instead.
+    # `_tap_store_elems` divides both N and `col_j`, so a sub-chunk is wholly
+    # inside N or wholly outside: the whole-chunk predicate loses no column.
+    for _s in range(0, vsize, store_elems) if store_elems < vsize else (None,):
+        span = f"{tap_var}" if _s is None else f"{tap_var}[{_s} : {_s + store_elems}]"
+        off = f"{offset_expr}" if _s is None else f"{offset_expr} + {_s}"
+        width = vsize if _s is None else store_elems
+        store = f"(gC_tap_{tap_idx}_ptr + {off}).store({span}, alignment=VEC_BYTES_TAP_{tap_idx})"
+        if row_bound is not None:
+            lines.append(f"    if (row < {row_bound}) & (col_j + {(_s or 0) + width} <= N):")
+            lines.append(f"        {store}")
+        else:
+            lines.append(f"    {store}")
     return lines
 
 
@@ -627,6 +753,7 @@ def _emit_reduction_local_combine(
     red_idx: int,
     red: ReductionSpec,
     src: str,
+    vsize: int,
 ) -> tuple[list[str], str]:
     """Combine the vector's elements into one register value so a single
     atomic per vector covers the whole chunk (valid only when every element
@@ -655,22 +782,21 @@ def _emit_reduction_local_combine(
 
     lines = [f"{acc} = {init}"]
     start = 0 if combine in ("add", "mul") else 1
-    for i in range(start, 32):
-        lines.append(f"if cutlass.const_expr({i} < vsize):")
+    for i in range(start, vsize):
         if combine == "add":
-            lines.append(f"    {acc} = {acc} + {elem(i)}")
+            lines.append(f"{acc} = {acc} + {elem(i)}")
         elif combine == "mul":
             if red.mode == "mul_no_zeros":
-                lines.append(f"    if {src}[{i}] != cutlass.Float32(0.0):")
-                lines.append(f"        {acc} = {acc} * {src}[{i}]")
-            else:
+                lines.append(f"if {src}[{i}] != cutlass.Float32(0.0):")
                 lines.append(f"    {acc} = {acc} * {src}[{i}]")
+            else:
+                lines.append(f"{acc} = {acc} * {src}[{i}]")
         elif is_int:
             op = ">" if combine == "max" else "<"
-            lines.append(f"    if {elem(i)} {op} {acc}:")
-            lines.append(f"        {acc} = {elem(i)}")
+            lines.append(f"if {elem(i)} {op} {acc}:")
+            lines.append(f"    {acc} = {elem(i)}")
         else:
-            lines.append(f"    {acc} = cute.math.{combine}({acc}, {elem(i)})")
+            lines.append(f"{acc} = cute.math.{combine}({acc}, {elem(i)})")
     return lines, acc
 
 
@@ -680,6 +806,29 @@ def _emit_reduction_atomic(
     red: ReductionSpec,
     source_var: str,
     matmul: "MatmulSpec",
+    vsize: int,
+    row_bound: str | None = None,
+) -> list[str]:
+    """A reduction is an atomic RMW, so an out-of-extent element cannot be
+    clamped onto a valid one -- it has to be SKIPPED. The STG arm inherits
+    `row < M` / `col_j + vsize <= N` from the drain; the TMA arm has neither, so
+    it re-applies them here. `_output_chunk_ok` forces N % chunk == 0 whenever a
+    reduction is present, which is what makes the chunk-level column test exact:
+    a chunk is wholly inside N or wholly past it, so the fold over it never mixes
+    real columns with OOB ones."""
+    body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, matmul, vsize)
+    if row_bound is None:
+        return body
+    return [f"if (row < {row_bound}) & (col_j + {vsize} <= N):"] + [f"    {ln}" for ln in body]
+
+
+def _emit_reduction_atomic_body(
+    tap_idx: int,
+    red_idx: int,
+    red: ReductionSpec,
+    source_var: str,
+    matmul: "MatmulSpec",
+    vsize: int,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
@@ -696,7 +845,7 @@ def _emit_reduction_atomic(
             count = n_factor * (matmul.M if red.dim[1] == 1 else 1) * (matmul.batch if red.dim[0] == 1 else 1)
             lines.append(f"_red_{red_idx}_inv = cutlass.Float32({1.0 / count})")
     if red.dim[2] == 1:
-        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src)
+        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
         offset = _reduction_output_offset_expr(red_idx, red, "0")
         ptr = f"gC_tap_{tap_idx}_ptr + {offset}"
@@ -739,9 +888,7 @@ def _emit_reduction_atomic(
             val = f"{acc} * _red_{red_idx}_inv" if red.mode == "avg" else acc
             lines.append(f'nvvm.atomicrmw("add", {ptr}, {val}, mem_order="relaxed", syncscope="gpu")')
         return lines
-    for i in range(32):
-        # const_expr(i < vsize) keeps emitted code valid for every vsize, no dynamic index
-        lines.append(f"if cutlass.const_expr({i} < vsize):")
+    for i in range(vsize):
         val = f"{src}[{i}]"
         offset = _reduction_output_offset_expr(red_idx, red, str(i))
         ptr = f"gC_tap_{tap_idx}_ptr + {offset}"
@@ -756,26 +903,26 @@ def _emit_reduction_atomic(
                 op = red.mode
             else:
                 raise AssertionError(f"unhandled int32 reduction mode {red.mode!r}")
-            lines.append(f'    nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "amax":
-            lines.append(f"    cute.arch.atomic_fmax({ptr}, " f'cute.math.abs({val}), sign_bit=False, sem="relaxed", scope="gpu")')
+            lines.append(f"cute.arch.atomic_fmax({ptr}, " f'cute.math.abs({val}), sign_bit=False, sem="relaxed", scope="gpu")')
             continue
         if red.mode == "norm1":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, cute.math.abs({val}), mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, cute.math.abs({val}), mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "norm2":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, {val} * {val}, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, {val} * {val}, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode == "avg":
-            lines.append(f'    nvvm.atomicrmw("add", {ptr}, {val} * _red_{red_idx}_inv, mem_order="relaxed", syncscope="gpu")')
+            lines.append(f'nvvm.atomicrmw("add", {ptr}, {val} * _red_{red_idx}_inv, mem_order="relaxed", syncscope="gpu")')
             continue
         if red.mode in ("mul", "mul_no_zeros"):
             t = f"_red_{red_idx}_{i}"
-            pad = "    "
+            pad = ""
             if red.mode == "mul_no_zeros":
-                lines.append(f"    if {val} != cutlass.Float32(0.0):")
-                pad = "        "
+                lines.append(f"if {val} != cutlass.Float32(0.0):")
+                pad = "    "
             lines.extend(
                 [
                     f"{pad}{t}_mo = (({ptr})).load().bitcast(cutlass.Int32)",
@@ -791,24 +938,24 @@ def _emit_reduction_atomic(
             )
             continue
         if red.mode == "max":
-            lines.append(f'    cute.arch.atomic_fmax({ptr}, {val}, sem="relaxed", scope="gpu")')
+            lines.append(f'cute.arch.atomic_fmax({ptr}, {val}, sem="relaxed", scope="gpu")')
             continue
         if red.mode == "min":
             bits = f"_red_{red_idx}_{i}_bits"
             lines.extend(
                 [
-                    f"    {bits} = ({val}).bitcast(cutlass.Int32)",
-                    f"    if {bits} < cutlass.Int32(0):",
-                    f"        cute.arch.atomic_max({ptr}, cutlass.Uint32({bits}), " f'sem="relaxed", scope="gpu")',
-                    "    else:",
-                    f"        cute.arch.atomic_min({ptr}, {bits}, " f'sem="relaxed", scope="gpu")',
+                    f"{bits} = ({val}).bitcast(cutlass.Int32)",
+                    f"if {bits} < cutlass.Int32(0):",
+                    f"    cute.arch.atomic_max({ptr}, cutlass.Uint32({bits}), " f'sem="relaxed", scope="gpu")',
+                    "else:",
+                    f"    cute.arch.atomic_min({ptr}, {bits}, " f'sem="relaxed", scope="gpu")',
                 ]
             )
             continue
         else:
             assert red.mode == "add"
             op = "add"
-        lines.append(f'    nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
+        lines.append(f'nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
     return lines
 
 
@@ -832,6 +979,43 @@ def _quant_output_min(dtype: Dtype) -> str:
     raise ValueError(f"block quantize output dtype {dtype!r} is not supported by codegen")
 
 
+def _scale_store_dtype(scale_dtype: Dtype) -> str:
+    """The DSL type a quantized scale is STORED as — one source of truth for the
+    scale tap's element type, its zero-init, and the value written. E5M3 has no
+    DSL float type and a raw_ptr store to a Uint8 tensor is rejected, so it rides
+    the Int8 byte carrier (the same one packed FP4 data uses)."""
+    return "cutlass.Int8" if scale_dtype == "fp8_e5m3" else DTYPE_TO_CUTLASS[scale_dtype]
+
+
+def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
+    """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
+    value back as fp32 — the data is divided by what was actually written, not
+    by the pre-rounding scale, so a dequantize reproduces it exactly.
+
+    E4M3 round-trips through the DSL ``.to()``. The other two reach the cvt unit
+    through the helpers :func:`compiler._quant_device_imports` emits (which
+    documents why their ``.to()`` is not usable), and read the byte back as
+    ``byte << 23`` for ue8m0 — a bare exponent, so that IS the fp32, and byte 0
+    is 0.0 — or through the paired widening helper for ue5m3."""
+    scale_dtype = _scale_store_dtype(quant.scale_dtype)
+    if quant.scale_dtype == "fp8_e8m0":
+        return [
+            f"{p}_qb{sfx} = _frost_cvt_f32_to_e8m0_bits({src})",
+            f"{scale_var} = (({p}_qb{sfx}).to(cutlass.Int8)).bitcast({scale_dtype})",
+            f"{back_var} = ({p}_qb{sfx} << 23).bitcast(cutlass.Float32)",
+        ]
+    if quant.scale_dtype == "fp8_e5m3":
+        return [
+            f"{p}_qb{sfx} = _frost_cvt_f32_to_e5m3_bits({src})",
+            f"{scale_var} = ({p}_qb{sfx}).to({scale_dtype})",
+            f"{back_var} = _frost_e5m3_bits_to_f32({p}_qb{sfx})",
+        ]
+    return [
+        f"{scale_var} = ({src}).to({scale_dtype})",
+        f"{back_var} = ({scale_var}).to(cutlass.Float32)",
+    ]
+
+
 def _emit_block_quant_col(
     quant: BlockQuantizeSpec,
     quant_idx: int,
@@ -842,6 +1026,7 @@ def _emit_block_quant_col(
     batch_index_expr: str,
     matmul_m: int,
     vsize: int,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Emit M-axis (col) block quantize for one epilogue vector. A warp
     (block 32) or half-warp (block 16) of lanes holds one block of rows, so
@@ -849,11 +1034,15 @@ def _emit_block_quant_col(
     stores the scale byte(s) of column(s) ``col_j + k*G + l % G``. The
     compiler gates the row guards to be reduction-uniform."""
     p = f"_q{quant_idx}"
-    scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
+    scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
-    if vsize % G != 0 and vsize >= G:
-        raise NotImplementedError(f"col block-quantize: store vector {vsize} must be a multiple of the {G}-lane block group (or smaller than it)")
-    n_groups = max(vsize // G, 1)
+    if vsize % G != 0:
+        raise NotImplementedError(
+            f"col block-quantize: store vector {vsize} must be a multiple of the {G}-lane "
+            f"block group — every lane stores column `col_j + lane % {G}`, so a narrower "
+            f"chunk would store scales for columns it never computed"
+        )
+    n_groups = vsize // G
     lines: list[str] = [
         f"{p}_lane = tidx % 32",
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
@@ -885,24 +1074,7 @@ def _emit_block_quant_col(
                 lines.append(f'{p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", abs=True)')
         for i in cols:
             lines.append(f"{p}_s{i} = {p}_a{i} * {p}_rl")
-            if quant.scale_dtype == "fp8_e8m0":
-                # HW cvt (rp/satfinite) instead of the ~9-instruction emulated
-                # .to(E8M0); the widened value only feeds rcp, so byte<<23
-                # (0.0 for byte 0 -> rcp inf -> FLT_MAX clamp) is equivalent.
-                lines.extend(
-                    [
-                        f"{p}_qb{i} = _frost_cvt_f32_to_e8m0_bits({p}_s{i})",
-                        f"{p}_q{i} = (({p}_qb{i}).to(cutlass.Int8)).bitcast({scale_dtype})",
-                        f"{p}_u{i} = ({p}_qb{i} << 23).bitcast(cutlass.Float32)",
-                    ]
-                )
-            else:
-                lines.extend(
-                    [
-                        f"{p}_q{i} = ({p}_s{i}).to({scale_dtype})",
-                        f"{p}_u{i} = ({p}_q{i}).to(cutlass.Float32)",
-                    ]
-                )
+            lines.extend(_emit_scale_quantize(p, str(i), f"{p}_s{i}", f"{p}_q{i}", f"{p}_u{i}", quant))
             lines.extend(
                 [
                     f"{p}_i{i} = cute.math.min(cute.arch.rcp_approx({p}_u{i}), cutlass.Float32(3.402823466e38))",
@@ -913,7 +1085,7 @@ def _emit_block_quant_col(
             )
     lines.extend(
         [
-            f"{p}_vec = {p}_out.load()",
+            f"{p}_vec = {p}_out.load().to_vector()",
             (
                 f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
                 f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
@@ -951,7 +1123,16 @@ def _emit_block_quant_col(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"{p}_mb * quant_scale_stride_m_{quant_idx} + {p}_n{k} * quant_scale_stride_n_{quant_idx}"
             )
-        lines.append(f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine_{k}, alignment=1)")
+        # The scale byte is a SIDE STORE: the STG arm sits inside `row < M`,
+        # the TMA arm has no row bound of its own.
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine_{k}, alignment=1)"
+        if row_bound is None:
+            lines.append(_st)
+        else:
+            # `_quant_output_chunk_ok` forces N % chunk == 0, so a chunk is wholly
+            # inside N or wholly past it -- the chunk-level column test is exact.
+            lines.append(f"if (row < {row_bound}) & (col_j + {vsize} <= N):")
+            lines.append(f"    {_st}")
     return lines
 
 
@@ -965,6 +1146,7 @@ def _emit_block_quant(
     batch_index_expr: str = "tile_l",
     matmul_m: int = 0,
     vsize: int = 32,
+    row_bound: str | None = None,
 ) -> list[str]:
     """Emit block quantize for one epilogue vector, binding the quantized
     vector to ``out_var`` and storing the scale byte(s) through the
@@ -983,13 +1165,13 @@ def _emit_block_quant(
             batch_index_expr,
             matmul_m,
             vsize,
+            row_bound,
         )
     p = f"_q{quant_idx}"
     bs = quant.block_size
     if vsize % bs != 0:
         raise NotImplementedError(f"row block-quantize: store vector {vsize} must be a multiple of block_size {bs}")
     n_sub = vsize // bs
-    scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
     lines: list[str] = [
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
         f"{p}_abs = cute.math.abs({p}_src)",
@@ -1002,27 +1184,13 @@ def _emit_block_quant(
         for e in range(1, bs):
             lines.append(f"{p}_amax{k} = cute.math.max({p}_amax{k}, {p}_abs[{base + e}])")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
-        if quant.scale_dtype == "fp8_e8m0":
-            lines.extend(
-                [
-                    f"{p}_qb{k} = _frost_cvt_f32_to_e8m0_bits({p}_sf{k})",
-                    f"{p}_scale{k} = (({p}_qb{k}).to(cutlass.Int8)).bitcast({scale_dtype})",
-                    f"{p}_up{k} = ({p}_qb{k} << 23).bitcast(cutlass.Float32)",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    f"{p}_scale{k} = ({p}_sf{k}).to({scale_dtype})",
-                    f"{p}_up{k} = ({p}_scale{k}).to(cutlass.Float32)",
-                ]
-            )
+        lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
         lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
         for e in range(bs):
             lines.append(f"{p}_out[{base + e}] = {p}_src[{base + e}] * {p}_inv{k}")
     lines.extend(
         [
-            f"{p}_vec = {p}_out.load()",
+            f"{p}_vec = {p}_out.load().to_vector()",
             (
                 f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
                 f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
@@ -1053,7 +1221,16 @@ def _emit_block_quant(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"row * quant_scale_stride_m_{quant_idx} + {p}_scol{k} * quant_scale_stride_n_{quant_idx}"
             )
-        lines.append(f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)")
+        # The scale byte is a SIDE STORE: the STG arm sits inside `row < M`,
+        # the TMA arm has no row bound of its own.
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"
+        if row_bound is None:
+            lines.append(_st)
+        else:
+            # `_quant_output_chunk_ok` forces N % chunk == 0, so a chunk is wholly
+            # inside N or wholly past it -- the chunk-level column test is exact.
+            lines.append(f"if (row < {row_bound}) & (col_j + {vsize} <= N):")
+            lines.append(f"    {_st}")
     return lines
 
 
@@ -1153,22 +1330,17 @@ def generate(
     *,
     vec_bytes_epi: int = 32,
     output_elem_bytes: int = 2,
-    use_tma_store: bool = False,
+    tma_slots: "frozenset[int]" = frozenset(),
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
+    vsize = vec_bytes_epi // output_elem_bytes
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
     for aux in chain.aux_tensors:
-        if aux.grouped_by_moe and aux.bcast_mode == "per_col" and (aux.stride[0] * DTYPE_BYTES[aux.dtype]) % vec_bytes_epi != 0:
-            raise NotImplementedError(
-                f"per-group per-col aux {aux.name!r}: group stride "
-                f"{aux.stride[0]} x {DTYPE_BYTES[aux.dtype]} B must be a multiple of the "
-                f"epilogue vector width ({vec_bytes_epi} B) for aligned vector loads"
-            )
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
         if aux.bcast_mode == "scalar":
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
@@ -1179,7 +1351,25 @@ def generate(
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
     # epilogue snippet (interleaves op chain with tap stores)
-    body_lines: list[str] = []
+    # ANY slot on the TMA surface means the kernel renders the TMA arm, so the
+    # bounds the arm does not supply have to be emitted -- keying this on slot 0
+    # leaves them off whenever slot 0 is the one that fell back (an fp4 data
+    # output beside a bf16 one, say).
+    on_tma_arm = bool(tma_slots)
+    # The M-major TMA arm's `row` / `col_j` are the subtile base, not the
+    # fragment's coordinates -- everything that asks "which row / column am I"
+    # goes through `_elem_coord` there. See `_mmajor_elem_coord`.
+    mmajor_tma = on_tma_arm and chain.out_major == "m"
+    # The template binds `vec_f32_<g>` in the STG arm only, where the chunk is a
+    # slice of the subtile. The TMA arm takes the whole subtile, and when it is
+    # rendered the STG arm is deleted outright -- so emit the bindings here
+    # rather than adding a second template marker to all 8 parity groups.
+    tma_vec_bindings = [f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)] if on_tma_arm else []
+    # The TMA arm carries no row bound of its own; reuse the one its STG
+    # sibling applies -- the routed group's end on MoE, the problem M elsewhere.
+    store_row_bound = ("group_end" if chain.has_moe else "M") if on_tma_arm else None
+    _aux_pre = _mmajor_aux_prelude(chain, vsize) if mmajor_tma else (_bounded_aux_prelude(chain) if on_tma_arm else [])
+    body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
     result_var: dict[int, str] = {}
@@ -1204,7 +1394,7 @@ def generate(
     for i, op in enumerate(chain.ops):
         if op.op == "aux_load":
             aux_ref = chain.aux_by_name(op.aux)
-            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32')}")
+            body_lines.append(f"_op_{i} = {_aux_load_expr(aux_ref, op.compute_dtype, 'vec_f32', bounded=on_tma_arm, mmajor_tma=mmajor_tma)}")
             round_lines, cur = _emit_round(f"_op_{i}", op.out_dtype, str(i))
             body_lines.extend(round_lines)
             result_var[i] = cur
@@ -1213,7 +1403,7 @@ def generate(
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a")
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var) for aux in chain.aux_tensors}
+        aux_loads = {aux.name: _aux_load_expr(aux, op.compute_dtype, parent_var, bounded=on_tma_arm, mmajor_tma=mmajor_tma) for aux in chain.aux_tensors}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b")
@@ -1222,7 +1412,7 @@ def generate(
         if third_in_chain is not None:
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c")
             body_lines.extend(cast_lines)
-        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes)
+        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes, mmajor_tma=mmajor_tma)
         body_lines.extend(lines)
         # Round to the op's out_dtype (no-op for fp32) so every consumer —
         # downstream ops and outputs alike — sees the declared-dtype value.
@@ -1230,23 +1420,28 @@ def generate(
         body_lines.extend(round_lines)
         result_var[i] = cur
 
-    # Dense outputs, uniform in slot order. STG mode: every dense output rides
-    # a tap slot (dense spec i -> tap i; the template has no C output). TMA
-    # mode: spec 0 binds the template's ``vec_out`` (the TMA staging consumes
-    # it), specs 1.. -> taps i-1. A quant-carrying spec emits the
-    # block-quantize (quantized vector + scale byte) in place of a plain cast.
+    # Dense outputs, uniform in slot order. The store MODE is per slot: a slot
+    # in ``tma_slots`` binds the template's ``vec_out`` (the TMA staging consumes
+    # it) and occupies the trailing TMA-C parameter; every other output rides a
+    # tap slot. `_tap_of` is the ONE place that numbering is decided -- the tap
+    # index, the reduction index and the quant-scale index all read it, so they
+    # cannot drift apart. A quant-carrying spec emits the block-quantize
+    # (quantized vector + scale byte) in place of a plain cast.
     specs = chain.output_specs
     quant_batch_expr = "0" if chain.has_moe else "tile_l"
-    dense_tap_shift = -1 if use_tma_store else 0
-    n_dense_taps = max(len(specs) + dense_tap_shift, 0)
+    _tap_of: dict[int, int] = {}
+    for _oi in range(len(chain.outputs)):
+        if _oi not in tma_slots:
+            _tap_of[_oi] = len(_tap_of)
+    n_dense_taps = sum(1 for si in range(len(specs)) if si not in tma_slots)
 
     def _scale_tap_idx(qi: int) -> int:
-        return n_dense_taps + len(chain.reductions) + qi
+        return _tap_of[len(specs) + len(chain.reductions) + qi]
 
-    vsize = vec_bytes_epi // output_elem_bytes
     for si, spec in enumerate(specs):
         src = _parent_value(spec.source_ref)
-        if use_tma_store and si == 0:
+        if si in tma_slots:
+            _ov = tma_out_value(sorted(tma_slots).index(si))
             if spec.quant_idx is not None:
                 body_lines.extend(
                     _emit_block_quant(
@@ -1254,19 +1449,20 @@ def generate(
                         spec.quant_idx,
                         src,
                         spec.dtype,
-                        "vec_out",
+                        _ov,
                         _scale_tap_idx(spec.quant_idx),
                         quant_batch_expr,
                         chain.matmul.M,
                         vsize,
+                        store_row_bound,
                     )
                 )
             else:
-                body_lines.append(f"vec_out = {_store_cast_expr(src, spec.dtype)}")
+                body_lines.append(f"{_ov} = {_store_cast_expr(src, spec.dtype)}")
             continue
-        tap_idx = si + dense_tap_shift
+        tap_idx = _tap_of[si]
         if spec.major == "m":
-            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch))
+            body_lines.extend(_emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_bound=store_row_bound))
             continue
         offset_expr = _dense_store_offset(si, spec.dtype == "fp4_e2m1", chain.matmul.batch)
         if spec.quant_idx is not None:
@@ -1282,19 +1478,27 @@ def generate(
                     quant_batch_expr,
                     chain.matmul.M,
                     vsize,
+                    store_row_bound,
                 )
             )
-            if spec.dtype == "fp4_e2m1":
-                # packed 2-per-byte: the tap tensor is Int8 (B, M, N/2)
-                body_lines.append(f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment={max(vsize // 2, 4)})")
+            _align = max(vsize // 2, 4) if spec.dtype == "fp4_e2m1" else f"VEC_BYTES_TAP_{tap_idx}"
+            # fp4 is packed 2-per-byte, so its tap tensor is Int8 (B, M, N/2).
+            _st = f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment={_align})"
+            # A quant tap's DATA store does not go through `_emit_tap_store`, so it
+            # needs the arm's row bound applied here too. Without it a MoE tile,
+            # which overhangs its routed group into the NEXT one, writes rows that
+            # group's own tile also writes -- two tiles racing on the same bytes.
+            if store_row_bound is None:
+                body_lines.append(_st)
             else:
-                body_lines.append(f"(gC_tap_{tap_idx}_ptr + {offset_expr}).store({qv}, alignment=VEC_BYTES_TAP_{tap_idx})")
+                body_lines.append(f"if (row < {store_row_bound}) & (col_j + {vsize} <= N):")
+                body_lines.append(f"    {_st}")
         else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si))
+            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_bound=store_row_bound))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
-        body_lines.extend(_emit_reduction_atomic(n_dense_taps + red_idx, red_idx, red, red_source, chain.matmul))
+        body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_bound))
 
     epilogue = "\n".join(body_lines)
 
@@ -1302,27 +1506,30 @@ def generate(
     kernel_params = [f"{aux.name}: cute.Tensor" for aux in chain.aux_tensors]
     host_args = [aux.name for aux in chain.aux_tensors]
 
-    # tap plumbing (STG: every output; TMA: all but the first)
-    # STG mode: the tap list IS the full output list (dense, reductions,
-    # scales). TMA mode: outputs[0] rides the template's C params instead.
-    taps = list(chain.outputs) if not use_tma_store else chain.taps
+    # tap plumbing: every output that is NOT on the TMA-C surface, in tap order.
+    _slot_of = {t: o for o, t in _tap_of.items()}
+    taps = [chain.outputs[_slot_of[i]] for i in range(len(_tap_of))]
     tap_kernel_params = [f"mC_tap_{i}: cute.Tensor" for i in range(len(taps))]
     tap_host_params = [f"c_tap_{i}: cute.Tensor" for i in range(len(taps))]
     tap_host_pass = [f"c_tap_{i}" for i in range(len(taps))]
     tap_compile_fakes: list[str] = []
     # Per-slot true store alignment (matches _alignment_reject's contract); 16 is
     # a false claim for reduction / quant-scale / M-major taps.
-    _out_reqs = _output_align_reqs(chain, use_tma_store, vec_bytes=vec_bytes_epi)
+    _out_reqs = _output_align_reqs(chain, tma_slots, vec_bytes=vec_bytes_epi)
     for i, tap in enumerate(taps):
-        _fake_dt = "cutlass.Int8" if (not tap.is_reduction and not tap.is_quant_scale and tap.dtype == "fp4_e2m1") else DTYPE_TO_CUTLASS[tap.dtype]
+        # Byte-carrier taps: packed FP4 data, and an E5M3 scale (the DSL has no
+        # E5M3 float type, and a raw_ptr store to a Uint8 tensor is rejected —
+        # Int8 is the 8-bit carrier this package already uses for FP4).
+        _fp4_data_tap = not tap.is_reduction and not tap.is_quant_scale and tap.dtype == "fp4_e2m1"
+        _fake_dt = "cutlass.Int8" if _fp4_data_tap else _scale_store_dtype(tap.dtype) if tap.is_quant_scale else DTYPE_TO_CUTLASS[tap.dtype]
         # Every tap is consumed as a raw pointer (gC_tap_i_ptr) plus explicit
         # out_/red_/quant_scale_stride_* scalars, so the only genuine layout
         # contract is stride_n == 1 on an N-major DENSE tap (_dense_store_offset).
         # M-major dense scatters, and reductions / quant scales index purely by
         # runtime strides (and legitimately carry stride 0 for broadcast modes).
-        # Tap i is output slot i - dense_tap_shift; a slot outside chain.outputs
-        # would silently wrap the _out_reqs lookup.
-        _si = i - dense_tap_shift
+        # Tap i is output slot _slot_of[i]; a slot outside chain.outputs would
+        # silently wrap the _out_reqs lookup.
+        _si = _slot_of[i]
         assert 0 <= _si < len(_out_reqs), f"tap {i} maps to output slot {_si}, outside chain.outputs ({len(_out_reqs)})"
         _n_major_dense = (not tap.is_reduction) and (not tap.is_quant_scale) and _si < len(specs) and specs[_si].major == "n"
         _stride = "(cute.sym_int64(), 1, cute.sym_int64())" if _n_major_dense else "(cute.sym_int64(), cute.sym_int64(), cute.sym_int64())"

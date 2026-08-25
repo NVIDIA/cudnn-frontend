@@ -4,29 +4,27 @@
 """Execution engines for pygraph.
 
 Pluggable engines in one flat engine-id space with the cuDNN backend. At
-``create_execution_plans()`` the Router ranks the engines that claim the graph
+``create_execution_plans()`` the heuristics rank the engines that claim the graph
 against the backend's own recommendation into ONE list (``graph.plans``);
 ``build_plans()`` walks it. Graph construction stays engine-agnostic.
 
 Which engines exist is the library's own business: ``manifest.py`` is the static
 table this version ships, matched against a graph by a cheap node-type key
-before any engine module is imported. ``graph.register_backend()`` remains as
-the out-of-tree escape hatch.
+before any engine module is imported. It is the ONLY way a python engine
+exists -- there is no registration call, so an engine id always decodes back to
+a family and a slot.
 """
 
-from .base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig
 from .engine_ids import (
     BACKEND_ENGINE_ID_BASE,
     BACKEND_HEURISTIC_ENGINE_ID,
     CPP_OSS_ENGINE_ID_BASE,
-    OUT_OF_TREE_ID_BASE,
     PYTHON_ENGINE_ID_BASE,
     is_backend_engine,
     is_python_engine,
 )
-from .heuristics import heuristics_sort
-from .manifest import MANIFEST, EngineRow
-from .router import Router, decline_types, default_router
+from .manifest import MANIFEST, EngineFamily
 
 
 def __getattr__(name: str):
@@ -49,16 +47,12 @@ __all__ = [
     "CompiledPlan",
     "ExecutionContext",
     "PlanConfig",
-    "Router",
-    "default_router",
     "decline_types",
-    "heuristics_sort",
     "MANIFEST",
-    "EngineRow",
+    "EngineFamily",
     "BACKEND_ENGINE_ID_BASE",
     "CPP_OSS_ENGINE_ID_BASE",
     "PYTHON_ENGINE_ID_BASE",
-    "OUT_OF_TREE_ID_BASE",
     "BACKEND_HEURISTIC_ENGINE_ID",
     "is_python_engine",
     "is_backend_engine",

@@ -617,6 +617,11 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     if (ta.has_ragged_offset_multiplier()) {
         j["ragged_offset_multiplier"] = ta.ragged_offset_multiplier;
     }
+    // Emitted only when non-default so that graphs which never call set_alignment keep a
+    // byte-identical payload (and therefore an unchanged Graph::key()) across this change.
+    if (ta.alignment != Tensor_attributes::default_alignment) {
+        j["alignment"] = ta.alignment;
+    }
 }
 
 inline void
@@ -644,6 +649,8 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     if (j.contains("ragged_offset_multiplier")) {
         ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
     }
+    // Optional read, for backward compatibility with payloads that predate this key.
+    ta.alignment = j.value("alignment", Tensor_attributes::default_alignment);
 }
 
 NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,

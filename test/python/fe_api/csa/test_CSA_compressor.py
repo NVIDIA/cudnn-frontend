@@ -7,7 +7,7 @@ Ported with the kernels from Megatron-LM (https://github.com/NVIDIA/Megatron-LM/
 measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968). Covers:
 
   - numerics of the fused region vs an fp32-intermediate eager reference, per ratio
-    family: at ``ratio == 4`` ``dKV``/``dScore`` are bit-identical and the forward is
+    family: at ``ratio in {2, 4}`` ``dKV``/``dScore`` are bit-identical and the forward is
     within one bf16 rounding step on a tiny fraction of elements; at ``ratio == 128``
     the contract is faithfulness to the fp32 eager reference: all three match it
     within tolerance thresholds (differing elements <= max(1, 0.1%), max_abs <=
@@ -36,7 +36,8 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     data and a smaller device-side true row count, checked on all four outputs and
     bitwise against a direct call), and the loud error when the first call for a
     configuration would JIT under capture;
-  - ``check_support`` boundaries (validated envelope: CC 10.0; ratio 4 with coff
+  - ``check_support`` boundaries (validated envelope: compute-capability major >= 10;
+    ratio {2, 4} with coff
     {1, 2}, ratio 128 with coff {1, 2} x head_dim {128, 512}; BF16 kv/score, FP32 ape,
     int32 cu_seqlens and int32 flat-offset bounds).
 
@@ -66,11 +67,11 @@ def _import_compressor():
 
 
 def _require_sm100():
-    """Skip the test unless a CC 10.0 (Blackwell) CUDA GPU is available."""
+    """Skip the test unless an SM100-or-newer CUDA GPU is available."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("compute capability 10.0 GPU required")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("compute capability major >= 10 (SM100+) required")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +217,8 @@ def _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go):
 def _assert_grads_vs_fp32(gkv, gs, ref_kv, ref_s, ratio):
     """dKV/dScore vs the fp32-intermediate eager reference, per the ratio's contract.
 
-    ratio=4: bit-identical (the production bitwise contract, unchanged).
+    ratio {2, 4} (generic kernels): bit-identical (the production bitwise contract,
+    unchanged).
     ratio=128: deterministic tolerance contract — the fused backward reorders the
     den/S reductions (fixed chunk merge) and hoists 1/den, and some forward buckets
     use the ex2.approx fast exp, so dKV/dScore match eager within the forward-style
@@ -224,9 +226,9 @@ def _assert_grads_vs_fp32(gkv, gs, ref_kv, ref_s, ratio):
     distribution; they stay bitwise run-to-run, and the fp64-oracle parity assertion
     below keeps the accuracy honest on the tested finite-intermediate inputs).
     """
-    if ratio == 4:
-        assert torch.equal(gkv, ref_kv), "dKV must be bit-identical to the fp32 reference at ratio=4"
-        assert torch.equal(gs, ref_s), "dScore must be bit-identical to the fp32 reference at ratio=4"
+    if ratio in (2, 4):
+        assert torch.equal(gkv, ref_kv), f"dKV must be bit-identical to the fp32 reference at ratio={ratio}"
+        assert torch.equal(gs, ref_s), f"dScore must be bit-identical to the fp32 reference at ratio={ratio}"
         return
     for name, fused_t, ref_t in (("dKV", gkv, ref_kv), ("dScore", gs, ref_s)):
         diff = (fused_t.float() - ref_t.float()).abs()
@@ -253,6 +255,22 @@ _SHAPES = [
     pytest.param([3, 515, 1024, 129], 128, 4, 1, id="short-seg-d128-r4-coff1"),
     pytest.param([260], 65, 4, 1, id="b1-d65-odd-r4-coff1"),
     pytest.param([64, 0, 253, 3], 128, 4, 1, id="empty-seg-d128-r4-coff1"),
+    # ratio=2 (generic kernels; the compression ratio used in production training):
+    # the same shape classes as the ratio=4 rows above, both window forms. The
+    # short-seg pack leads with a 1-token segment so the seqlen < ratio class is
+    # still exercised at ratio=2.
+    pytest.param([2048], 128, 2, 2, id="b1-d128-r2"),
+    pytest.param([1023, 2048, 509], 128, 2, 2, id="ragged3-d128-r2"),
+    pytest.param([2048], 512, 2, 2, id="b1-d512-r2"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 2, id="short-seg-d128-r2"),
+    pytest.param([260], 65, 2, 2, id="b1-d65-odd-r2"),
+    pytest.param([64, 0, 253, 3], 128, 2, 2, id="empty-seg-d128-r2"),
+    pytest.param([2048], 128, 2, 1, id="b1-d128-r2-coff1"),
+    pytest.param([1023, 2048, 509], 128, 2, 1, id="ragged3-d128-r2-coff1"),
+    pytest.param([2048], 512, 2, 1, id="b1-d512-r2-coff1"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 1, id="short-seg-d128-r2-coff1"),
+    pytest.param([260], 65, 2, 1, id="b1-d65-odd-r2-coff1"),
+    pytest.param([64, 0, 253, 3], 128, 2, 1, id="empty-seg-d128-r2-coff1"),
     # ratio=128 (dedicated r128 kernels; coff {1, 2} x head_dim {128, 512}). The edge
     # pack covers zero-block segments (127, 3), a literal empty segment, an
     # exactly-one-block segment (128), a 1-token tail (129) and other tails.
@@ -274,7 +292,7 @@ _SHAPES = [
 @pytest.mark.L0
 @pytest.mark.parametrize("lens,d,ratio,coff", _SHAPES)
 def test_numerics_vs_references(lens, d, ratio, coff):
-    """Fused fwd+bwd vs fp32-eager (bitwise dKV/dScore at ratio=4, tolerance at
+    """Fused fwd+bwd vs fp32-eager (bitwise dKV/dScore at ratio {2, 4}, tolerance at
     ratio=128), upstream eager, and fp64 oracle."""
     _require_sm100()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
@@ -285,7 +303,7 @@ def test_numerics_vs_references(lens, d, ratio, coff):
     r_fp64 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp64")
 
     # vs fp32-intermediate eager reference (the fused kernels' numerics contract):
-    # dKV / dScore bit-identical at ratio=4 / within the forward-style tolerances at
+    # dKV / dScore bit-identical at ratio {2, 4} / within the forward-style tolerances at
     # ratio=128 (see _assert_grads_vs_fp32); forward within one bf16 rounding step on
     # a tiny fraction of elements; dAPE within fp32 atomics reorder noise.
     _assert_grads_vs_fp32(r_fused[1], r_fused[2], r_fp32[1], r_fp32[2], ratio)
@@ -303,8 +321,8 @@ def test_numerics_vs_references(lens, d, ratio, coff):
     # vs the fp64 oracle. ratio=128: the contract's fp64-parity gate — per tensor the
     # fused output must be at least as close to the oracle as the FP32-INTERMEDIATE
     # eager reference, the comparator the contract names (comparing against the
-    # bf16-weight upstream path instead would be materially looser). ratio=4 keeps its
-    # historical check against the upstream numerics it replaced (its contract pins
+    # bf16-weight upstream path instead would be materially looser). ratio {2, 4} keeps
+    # its historical check against the upstream numerics it replaced (its contract pins
     # dKV/dScore bitwise-to-fp32-eager above and has no fp64-parity clause).
     eager_ref = r_fp32 if ratio == 128 else r_up
     for i in range(4):
@@ -314,12 +332,13 @@ def test_numerics_vs_references(lens, d, ratio, coff):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("ratio", [2, 4])
 @pytest.mark.parametrize("coff", [1, 2])
-def test_replay_determinism(coff):
+def test_replay_determinism(ratio, coff):
     """Forward, dKV and dScore replay bitwise identically run to run (dAPE is exempt)."""
     _require_sm100()
-    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, 4, coff)
-    runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, coff, go) for _ in range(3)]
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, ratio, coff)
+    runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, ratio, 128, coff, go) for _ in range(3)]
     for other in runs[1:]:
         assert torch.equal(runs[0][0], other[0])
         assert torch.equal(runs[0][1], other[1])
@@ -356,7 +375,7 @@ def _r128_module():
 # Expected shipped schedules per (coff, d, nb_total) bucket — hardcoded on purpose: an
 # edit that silently changes any shipped launch geometry or bucket boundary must fail
 # here. Forward tuples are (vec, tchunks, threads_x, twophase, fastexp); backward
-# tuples are (vec, tchunks, threads_x, fastexp).
+# tuples are (vec, tchunks, threads_x, fastexp, goreuse).
 _FWD_BUCKETS = [
     (1, 128, 64, (2, 8, 32, False, False)),  # small
     (1, 128, 256, (2, 4, 32, False, False)),  # default
@@ -370,13 +389,13 @@ _FWD_BUCKETS = [
     (2, 512, 1024, (4, 4, 32, False, True)),  # large
 ]
 _BWD_BUCKETS = [
-    (1, 128, 64, (1, 8, 32, False)),  # small pack: vec=1, exact exp
-    (1, 128, 256, (2, 8, 32, True)),  # default (fast exp)
-    (2, 128, 64, (1, 8, 32, False)),  # small
-    (2, 128, 256, (2, 8, 32, True)),  # default
-    (1, 512, 256, (2, 4, 32, True)),  # default (tchunks=4 at coff=1, d>=512)
-    (2, 512, 64, (2, 8, 32, True)),  # no bwd small entry at d=512 -> default
-    (2, 512, 256, (2, 8, 32, True)),  # default
+    (1, 128, 64, (1, 8, 32, False, True)),  # small pack: vec=1, exact exp, grad_out reuse
+    (1, 128, 256, (2, 8, 32, True, False)),  # default (fast exp; goreuse measured slower here)
+    (2, 128, 64, (1, 8, 32, False, True)),  # small
+    (2, 128, 256, (2, 8, 32, True, True)),  # default
+    (1, 512, 256, (2, 4, 32, True, True)),  # default (tchunks=4 at coff=1, d>=512)
+    (2, 512, 64, (2, 8, 32, True, True)),  # no bwd small entry at d=512 -> default
+    (2, 512, 256, (2, 8, 32, True, True)),  # default
 ]
 
 
@@ -484,6 +503,16 @@ _PADDING_SHAPES = [
     ([1023, 2048, 509], 128, 4, 2, 8),
     ([3, 515, 1024, 129], 128, 4, 1, 8),
     ([1023, 2048, 509], 128, 4, 1, 8),
+    # ratio=2: same classes; the leading 1-token segment keeps the padding-row gather
+    # spanning a segment boundary (seqlen < ratio at ratio=2). The [1, 1] pack isolates
+    # the padding-only path (nb_valid == 0 with a positive static capacity): every
+    # output row is a padding row gathering from token 0.
+    ([1, 515, 1024, 129], 128, 2, 2, 8),
+    ([1023, 2048, 509], 128, 2, 2, 8),
+    ([1, 1], 128, 2, 2, 8),
+    ([1, 515, 1024, 129], 128, 2, 1, 8),
+    ([1023, 2048, 509], 128, 2, 1, 8),
+    ([1, 1], 128, 2, 1, 8),
 ]
 
 
@@ -619,6 +648,27 @@ _CANARY_SHAPES = [
     pytest.param([1023, 2048, 509], 128, 4, 1, 8, 0, id="ragged3-d128-padded-coff1"),
     pytest.param([1023, 2048, 509], 128, 4, 1, 0, 37, id="ragged3-d128-tokpad-coff1"),
     pytest.param([3, 515, 1024, 129], 128, 4, 1, 8, 21, id="short-seg-d128-padded-tokpad-coff1"),
+    # ratio=2 (generic kernels): the same never-consumed slot classes as the ratio=4
+    # rows above; the tiny-segment packs shrink to lengths 0-1 so the zero-block
+    # (seqlen < ratio) class is still hit at ratio=2.
+    pytest.param([2048], 128, 2, 2, 0, 0, id="b1-d128-r2"),
+    pytest.param([1023, 2048, 509], 128, 2, 2, 0, 0, id="ragged3-d128-r2"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 2, 0, 0, id="short-seg-d128-r2"),
+    pytest.param([1, 2, 3], 128, 2, 2, 0, 0, id="all-tiny-d128-r2"),
+    pytest.param([1023, 2048, 509], 512, 2, 2, 0, 0, id="ragged3-d512-r2"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 2, 8, 0, id="short-seg-d128-r2-padded"),
+    pytest.param([1023, 2048, 509], 128, 2, 2, 8, 0, id="ragged3-d128-r2-padded"),
+    pytest.param([1023, 2048, 509], 128, 2, 2, 0, 37, id="ragged3-d128-r2-tokpad"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 2, 8, 21, id="short-seg-d128-r2-padded-tokpad"),
+    pytest.param([2048], 128, 2, 1, 0, 0, id="b1-d128-r2-coff1"),
+    pytest.param([1023, 2048, 509], 128, 2, 1, 0, 0, id="ragged3-d128-r2-coff1"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 1, 0, 0, id="short-seg-d128-r2-coff1"),
+    pytest.param([1, 2, 3], 128, 2, 1, 0, 0, id="all-tiny-d128-r2-coff1"),
+    pytest.param([1023, 2048, 509], 512, 2, 1, 0, 0, id="ragged3-d512-r2-coff1"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 1, 8, 0, id="short-seg-d128-r2-padded-coff1"),
+    pytest.param([1023, 2048, 509], 128, 2, 1, 8, 0, id="ragged3-d128-r2-padded-coff1"),
+    pytest.param([1023, 2048, 509], 128, 2, 1, 0, 37, id="ragged3-d128-r2-tokpad-coff1"),
+    pytest.param([1, 515, 1024, 129], 128, 2, 1, 8, 21, id="short-seg-d128-r2-padded-tokpad-coff1"),
     # ratio=128: the zero classes are up to 127 tokens each (tails, zero-block
     # segments) plus the coff=2 last-block first-half (128 rows).
     pytest.param([1023, 2048, 509], 128, 128, 1, 0, 0, id="ragged3-d128-r128c1"),
@@ -684,7 +734,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
     assert torch.allclose(gape_nan, gape_ref, rtol=0, atol=1e-3)
 
     # And the zero-slot pattern matches autograd: never-consumed slots are exact zeros,
-    # exactly as the fp32 eager reference computes them (bitwise at ratio=4, tolerance
+    # exactly as the fp32 eager reference computes them (bitwise at ratio {2, 4}, tolerance
     # at ratio=128 — the zero slots themselves are exact in both). (The fused backward
     # ignores incoming gradients on static-capacity padding rows by design, so the
     # eager reference runs with those rows zeroed.)
@@ -1039,15 +1089,16 @@ def _meta_samples(
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("ratio", [2, 4])
 @pytest.mark.parametrize("coff", [1, 2])
-def test_check_support_accepts_envelope(coff):
+def test_check_support_accepts_envelope(ratio, coff):
     """Metadata-only samples inside the validated envelope pass check_support."""
     _require_sm100()
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
-        api = cls(**_meta_samples(coff=coff), ratio=4, coff=coff)
+        api = cls(**_meta_samples(ratio=ratio, coff=coff), ratio=ratio, coff=coff)
         assert api.check_support() is True
-        assert api.head_dim == 128 and api.total_tokens == 512 and api.total_comp == 128
+        assert api.head_dim == 128 and api.total_tokens == 512 and api.total_comp == 512 // ratio
 
 
 @pytest.mark.L0
@@ -1064,13 +1115,35 @@ def test_check_support_accepts_envelope_r128(d, coff):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_check_support_accepts_compute_capability_major_10_or_newer(monkeypatch, capability):
+    """The architecture gate admits SM100, SM103, and newer major families."""
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
+    assert api.check_support() is True
+
+
+@pytest.mark.L0
+def test_check_support_rejects_compute_capability_major_below_10(monkeypatch):
+    """The architecture gate still rejects pre-SM100 devices."""
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
+    with pytest.raises(RuntimeError, match="compute capability major >= 10"):
+        api.check_support()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "kwargs,ctor,match",
     [
         (dict(), dict(ratio=128, coff=3), "ratio=128 supports coff"),
-        (dict(), dict(ratio=8, coff=2), "ratio in \\{4, 128\\}"),
+        (dict(), dict(ratio=8, coff=2), "ratio in \\{2, 4, 128\\}"),
         (dict(coff=3), dict(ratio=4, coff=3), "coff in"),
         (dict(), dict(ratio=4, coff=0), "coff in"),
+        (dict(ratio=2, coff=3), dict(ratio=2, coff=3), "coff in"),
+        (dict(ratio=2), dict(ratio=2, coff=0), "coff in"),
         (dict(kv_dtype=torch.float16), dict(), "kv"),
         (dict(ape_dtype=torch.bfloat16), dict(), "ape"),
         (dict(cu_dtype=torch.int64), dict(), "cu_seqlens"),
@@ -1080,6 +1153,7 @@ def test_check_support_accepts_envelope_r128(d, coff):
         (dict(total=2**25, d=128), dict(), "int32 flat offsets"),
         (dict(total=4, d=8388482, total_comp=1), dict(), "head_dim"),
         (dict(total=2, total_comp=1), dict(), "requires at least ratio"),
+        (dict(total=1, total_comp=1, ratio=2), dict(ratio=2), "requires at least ratio"),
         (dict(kv_stride=(512, 2)), dict(), "contiguous"),
         (dict(total=1024, d=96, ratio=128, coff=1), dict(ratio=128, coff=1), "ratio=128 is validated for head_dim"),
     ],
@@ -1297,8 +1371,8 @@ def test_multi_device_launch():
     compressor = _import_compressor()
     if torch.cuda.device_count() < 2:
         pytest.skip("needs >= 2 visible GPUs")
-    if torch.cuda.get_device_capability(1) != (10, 0):
-        pytest.skip("second GPU is not CC 10.0")
+    if torch.cuda.get_device_capability(1)[0] < 10:
+        pytest.skip("second GPU is below SM100")
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1024], d, ratio, coff, device="cuda:1")
     total = kv.shape[0]

@@ -51,8 +51,9 @@ class PyGraph {
     // This Graph class is the sole structure which implicitly makes PyGraph own all tensors, nodes, and cudnn
     // descriptors.
     Graph_t graph;
-    cudnnHandle_t handle = nullptr;
-    bool is_handle_owner = false;
+    cudnnHandle_t handle                                                = nullptr;
+    bool is_handle_owner                                                = false;
+    std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties = nullptr;
 
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
@@ -75,12 +76,16 @@ class PyGraph {
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
 
-        // If device_properties is set, use it (consider it is an AoT compilation test).
         if (device_properties != nullptr) {
+            this->device_properties = device_properties;
             graph->set_device_properties(device_properties);
-        } else if (handle_.has_value()) {
+        }
+        // Store explicit handle independently of device_properties so that a caller
+        // who supplies both (devprop for deserialization, handle for execution) does
+        // not silently lose the handle.
+        if (handle_.has_value()) {
             handle = static_cast<cudnnHandle_t>((void*)(handle_.value()));
-        } else {
+        } else if (device_properties == nullptr) {
             detail::create_handle(&handle);
             is_handle_owner = true;
         }
@@ -553,7 +558,12 @@ class PyGraph {
                py::object const& generate_stats,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                bool const unfuse_fma,
-               cudnn_frontend::AttentionImplementation_t const& implementation);
+               cudnn_frontend::AttentionImplementation_t const& implementation,
+               bool const use_padding_mask,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& seq_len_kv,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute
@@ -730,15 +740,16 @@ class PyGraph {
         return graph->get_variant_pack_uids_sorted();
     }
 
-    void
-    execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs, std::intptr_t workspace, std::intptr_t exec_handle);
-
-    // Raw pointer version: takes a pointer to an array of device pointers (no pybind11 copy)
+    // Takes a pointer to a contiguous array of device pointers, ordered as
+    // get_variant_pack_uids_sorted() reports — no pybind11 container copy and no
+    // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
+    // -1 means the graph's own candidate.
     void
     execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
                           int64_t n_user,
                           std::intptr_t workspace,
-                          std::intptr_t exec_handle);
+                          std::intptr_t exec_handle,
+                          int64_t plan_index);
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();

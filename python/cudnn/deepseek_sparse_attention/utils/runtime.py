@@ -26,6 +26,10 @@ def maybe_contiguous(
         return x.contiguous()
 
 
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
 def validate_q_causal_offsets(
     q_causal_offsets: torch.Tensor | None,
     batch: int,

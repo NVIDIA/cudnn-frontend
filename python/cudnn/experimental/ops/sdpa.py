@@ -32,7 +32,6 @@ _logger = logging.getLogger(__name__)
 _cudnn_handles = {}
 _fprop_cache: Dict[tuple, tuple] = {}
 _bprop_cache: Dict[tuple, tuple] = {}
-_sdpa_oss_layout_copy_warned = False
 
 # Dtype mapping (module-level constant)
 _TORCH_DTYPE_TO_CUDNN = {
@@ -84,24 +83,6 @@ def _get_current_stream(device: torch.device):
     return torch.cuda.current_stream(device).cuda_stream
 
 
-def _device_supports_d256_oss(device: torch.device) -> bool:
-    """Return True when the d=256 OSS kernels can run on this device."""
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability(device)
-    return major * 10 + minor >= 100
-
-
-# cuDNN 9.23.0 added d=256 SDPA fprop and bprop support in the cuDNN backend.
-# From this version on the OSS (cuteDSL) kernels are no longer needed.
-_CUDNN_BACKEND_D256_VERSION = 92300
-
-
-def _cudnn_backend_supports_d256() -> bool:
-    """Return True when the linked cuDNN backend handles d=256 SDPA itself (no OSS kernel needed)."""
-    return cudnn.backend_version() >= _CUDNN_BACKEND_D256_VERSION
-
-
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return _TORCH_DTYPE_TO_CUDNN[dtype]
@@ -112,95 +93,6 @@ def _diagonal_alignment_enum(val: int):
     if val == 0:
         return cudnn.diagonal_alignment.TOP_LEFT
     return cudnn.diagonal_alignment.BOTTOM_RIGHT
-
-
-def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
-    """Return tensor dimensions ordered from fastest- to slowest-varying stride."""
-    return tuple(sorted(range(tensor.ndim), key=lambda dim: tensor.stride()[dim]))
-
-
-def _to_sdpa_oss_bhsd_layout(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    """Convert BHSD tensors to the stride pattern expected by the d=256 OSS kernels."""
-    global _sdpa_oss_layout_copy_warned
-
-    if tensor.ndim != 4:
-        raise NotImplementedError("d=256 OSS path currently supports only rank-4 BHSD tensors")
-    if _stride_order(tensor) == (3, 1, 2, 0):
-        return tensor
-    if not _sdpa_oss_layout_copy_warned:
-        _logger.warning(
-            "d=256 OSS path is copying tensor '%s' to normalize BHSD layout; this is a performance slow path",
-            name,
-        )
-        _sdpa_oss_layout_copy_warned = True
-    return tensor.transpose(1, 2).contiguous().transpose(1, 2)
-
-
-def _packed_bhsd_stride(shape: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-    """Return the packed BHSD stride used for ragged/token-packed tensors."""
-    b, h, s, d = shape
-    return (s * h * d, d, h * d, 1)
-
-
-def _get_variant_pack_uid_order(graph, present_uids):
-    if hasattr(graph, "_get_variant_pack_uids_sorted"):
-        return graph._get_variant_pack_uids_sorted()
-    return sorted(present_uids)
-
-
-def _validate_d256_oss_args(
-    is_causal: bool,
-    diagonal_alignment: int,
-    left_bound: int,
-    right_bound: int,
-    seq_len_q: Optional[torch.Tensor],
-    seq_len_kv: Optional[torch.Tensor],
-    cumulative_seq_len_q: Optional[torch.Tensor],
-    cumulative_seq_len_kv: Optional[torch.Tensor],
-) -> Tuple[int, int]:
-    """Validate the subset of SDPA-op features supported by the d=256 OSS custom-op paths."""
-    if diagonal_alignment != 0:
-        raise NotImplementedError("d=256 OSS path supports only TOP_LEFT diagonal alignment")
-    if seq_len_q is not None or seq_len_kv is not None:
-        raise NotImplementedError("d=256 OSS path does not support seq_len_q/seq_len_kv")
-    if cumulative_seq_len_q is not None or cumulative_seq_len_kv is not None:
-        raise NotImplementedError("d=256 OSS path does not support cumulative_seq_len_q/cumulative_seq_len_kv")
-
-    if not is_causal:
-        if left_bound != -1 or right_bound != -1:
-            raise NotImplementedError("d=256 OSS path supports only full-window non-causal attention")
-        return (-1, -1)
-
-    if right_bound not in (-1, 0):
-        raise NotImplementedError("d=256 OSS path supports only causal right_bound=0")
-    return (left_bound if left_bound >= 0 else -1, 0)
-
-
-def _can_use_d256_oss_path(
-    is_causal: bool,
-    diagonal_alignment: int,
-    left_bound: int,
-    right_bound: int,
-    seq_len_q: Optional[torch.Tensor],
-    seq_len_kv: Optional[torch.Tensor],
-    cumulative_seq_len_q: Optional[torch.Tensor],
-    cumulative_seq_len_kv: Optional[torch.Tensor],
-) -> bool:
-    """Return True when the d=256 OSS kernels support this SDPA configuration."""
-    try:
-        _validate_d256_oss_args(
-            is_causal,
-            diagonal_alignment,
-            left_bound,
-            right_bound,
-            seq_len_q,
-            seq_len_kv,
-            cumulative_seq_len_q,
-            cumulative_seq_len_kv,
-        )
-    except NotImplementedError:
-        return False
-    return True
 
 
 def _make_fprop_cache_key(
@@ -640,46 +532,6 @@ def _sdpa_impl(
     Returns:
         (O, Stats): Output tensor (B, H_q, S_q, D_v) and softmax stats (B, H_q, S_q, 1)
     """
-    is_d256 = q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256
-    can_use_d256_oss_fwd = is_d256 and _can_use_d256_oss_path(
-        is_causal,
-        diagonal_alignment,
-        left_bound,
-        right_bound,
-        seq_len_q,
-        seq_len_kv,
-        cumulative_seq_len_q,
-        cumulative_seq_len_kv,
-    )
-    device_supports_d256_oss = _device_supports_d256_oss(q.device)
-    cudnn_backend_supports_d256 = _cudnn_backend_supports_d256()
-    use_d256_oss_fwd = can_use_d256_oss_fwd and device_supports_d256_oss and not cudnn_backend_supports_d256
-    if can_use_d256_oss_fwd and not use_d256_oss_fwd:
-        _logger.debug(
-            "Routing d=256 forward through the cuDNN backend (cuDNN backend version %d, backend support=%s, OSS device support=%s, device=%s)",
-            cudnn.backend_version(),
-            cudnn_backend_supports_d256,
-            device_supports_d256_oss,
-            q.device,
-        )
-    if use_d256_oss_fwd:
-        try:
-            return sdpa_fwd_d256(
-                q,
-                k,
-                v,
-                attn_scale,
-                is_causal,
-                diagonal_alignment,
-                left_bound,
-                right_bound,
-                seq_len_q,
-                seq_len_kv,
-                cumulative_seq_len_q,
-                cumulative_seq_len_kv,
-            )
-        except ImportError as e:
-            _logger.warning("Falling back to cuDNN backend d=256 forward path because OSS dependencies are unavailable: %s", e)
 
     handle = _get_handle(q.device)
 
@@ -714,23 +566,9 @@ def _sdpa_impl(
             cumulative_seq_len_q,
             cumulative_seq_len_kv,
         )
-        uid_order = _get_variant_pack_uid_order(
-            graph,
-            [
-                int(_UIDs.Q),
-                int(_UIDs.K),
-                int(_UIDs.V),
-                int(_UIDs.O),
-                int(_UIDs.STATS),
-                *([int(_UIDs.SEQ_LEN_Q)] if seq_len_q is not None else []),
-                *([int(_UIDs.SEQ_LEN_KV)] if seq_len_kv is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_Q)] if cumulative_seq_len_q is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_KV)] if cumulative_seq_len_kv is not None else []),
-            ],
-        )
-        _fprop_cache[cache_key] = (graph, workspace_size, uid_order)
+        _fprop_cache[cache_key] = (graph, workspace_size)
 
-    graph, workspace_size, uid_order = _fprop_cache[cache_key]
+    graph, workspace_size = _fprop_cache[cache_key]
 
     # Allocate outputs and workspace (BHSD layout)
     # Workspace is per-call — PyTorch's caching allocator recycles the allocation.
@@ -757,11 +595,7 @@ def _sdpa_impl(
     if cumulative_seq_len_kv is not None:
         uid_to_tensor[int(_UIDs.CUM_SEQ_LEN_KV)] = cumulative_seq_len_kv
 
-    if hasattr(graph, "_execute_with_ptrs"):
-        ptrs = [uid_to_tensor[uid].data_ptr() for uid in uid_order]
-        graph._execute_with_ptrs(ptrs, workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
+    graph.execute(uid_to_tensor, workspace, handle=handle)
 
     return o_gpu, stats_gpu
 
@@ -789,160 +623,6 @@ def _sdpa_fake(
     O = torch.empty(B, H_q, S_q, D_v, dtype=q.dtype, device=q.device)
     Stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device)
     return O, Stats
-
-
-# ---------------------------------------------------------------------------
-# Specialized d=256 custom ops
-# ---------------------------------------------------------------------------
-
-
-@torch.library.custom_op("cudnn::sdpa_fwd_d256", mutates_args=())
-def sdpa_fwd_d256(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attn_scale: float,
-    is_causal: bool = False,
-    diagonal_alignment: int = 0,
-    left_bound: int = -1,
-    right_bound: int = -1,
-    seq_len_q: Optional[torch.Tensor] = None,
-    seq_len_kv: Optional[torch.Tensor] = None,
-    cumulative_seq_len_q: Optional[torch.Tensor] = None,
-    cumulative_seq_len_kv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """SDPA forward for d=256 via the SM100 FE OSS API."""
-
-    window_size = _validate_d256_oss_args(
-        is_causal,
-        diagonal_alignment,
-        left_bound,
-        right_bound,
-        seq_len_q,
-        seq_len_kv,
-        cumulative_seq_len_q,
-        cumulative_seq_len_kv,
-    )
-
-    from cudnn.sdpa import sdpa_fwd_wrapper_sm100_d256
-
-    q_fwd = _to_sdpa_oss_bhsd_layout(q, "q")
-    k_fwd = _to_sdpa_oss_bhsd_layout(k, "k")
-    v_fwd = _to_sdpa_oss_bhsd_layout(v, "v")
-
-    o, lse = sdpa_fwd_wrapper_sm100_d256(
-        q_tensor=q_fwd,
-        k_tensor=k_fwd,
-        v_tensor=v_fwd,
-        is_causal=is_causal,
-        window_size=window_size,
-        scale_softmax=attn_scale,
-        current_stream=_get_current_stream(q.device),
-    )
-
-    return o.contiguous(), lse.unsqueeze(-1).contiguous()
-
-
-@sdpa_fwd_d256.register_fake
-def _sdpa_fwd_d256_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attn_scale: float,
-    is_causal: bool = False,
-    diagonal_alignment: int = 0,
-    left_bound: int = -1,
-    right_bound: int = -1,
-    seq_len_q: Optional[torch.Tensor] = None,
-    seq_len_kv: Optional[torch.Tensor] = None,
-    cumulative_seq_len_q: Optional[torch.Tensor] = None,
-    cumulative_seq_len_kv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(q), torch.empty((*q.shape[:3], 1), dtype=torch.float32, device=q.device)
-
-
-@torch.library.custom_op("cudnn::sdpa_bwd_d256", mutates_args=())
-def sdpa_bwd_d256(
-    dO: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    stats: torch.Tensor,
-    attn_scale: float,
-    is_causal: bool = False,
-    diagonal_alignment: int = 0,
-    left_bound: int = -1,
-    right_bound: int = -1,
-    seq_len_q: Optional[torch.Tensor] = None,
-    seq_len_kv: Optional[torch.Tensor] = None,
-    cumulative_seq_len_q: Optional[torch.Tensor] = None,
-    cumulative_seq_len_kv: Optional[torch.Tensor] = None,
-    is_deterministic: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """SDPA backward for d=256 via the SM100 FE OSS API."""
-    del is_deterministic
-
-    window_size = _validate_d256_oss_args(
-        is_causal,
-        diagonal_alignment,
-        left_bound,
-        right_bound,
-        seq_len_q,
-        seq_len_kv,
-        cumulative_seq_len_q,
-        cumulative_seq_len_kv,
-    )
-
-    from cudnn.sdpa import sdpa_bwd_wrapper_sm100_d256
-
-    q_bwd = _to_sdpa_oss_bhsd_layout(q, "q")
-    k_bwd = _to_sdpa_oss_bhsd_layout(k, "k")
-    v_bwd = _to_sdpa_oss_bhsd_layout(v, "v")
-    o_bwd = _to_sdpa_oss_bhsd_layout(o, "o")
-    dO_bwd = _to_sdpa_oss_bhsd_layout(dO, "dO")
-    lse_bwd = stats.squeeze(-1).contiguous()
-    cum_q_bwd = None
-    cum_kv_bwd = None
-
-    dQ, dK, dV = sdpa_bwd_wrapper_sm100_d256(
-        q_tensor=q_bwd,
-        k_tensor=k_bwd,
-        v_tensor=v_bwd,
-        o_tensor=o_bwd,
-        do_tensor=dO_bwd,
-        lse_tensor=lse_bwd,
-        cum_seqlen_q_tensor=cum_q_bwd,
-        cum_seqlen_k_tensor=cum_kv_bwd,
-        is_causal=is_causal,
-        window_size=window_size,
-        scale_softmax=attn_scale,
-        current_stream=_get_current_stream(q.device),
-    )
-
-    return dQ.contiguous(), dK.contiguous(), dV.contiguous()
-
-
-@sdpa_bwd_d256.register_fake
-def _sdpa_bwd_d256_fake(
-    dO: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    stats: torch.Tensor,
-    attn_scale: float,
-    is_causal: bool = False,
-    diagonal_alignment: int = 0,
-    left_bound: int = -1,
-    right_bound: int = -1,
-    seq_len_q: Optional[torch.Tensor] = None,
-    seq_len_kv: Optional[torch.Tensor] = None,
-    cumulative_seq_len_q: Optional[torch.Tensor] = None,
-    cumulative_seq_len_kv: Optional[torch.Tensor] = None,
-    is_deterministic: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
 def _sdpa_bwd_impl(
@@ -1007,27 +687,9 @@ def _sdpa_bwd_impl(
             cumulative_seq_len_kv,
             is_deterministic,
         )
-        uid_order = _get_variant_pack_uid_order(
-            graph,
-            [
-                int(_UIDs.Q),
-                int(_UIDs.K),
-                int(_UIDs.V),
-                int(_UIDs.O),
-                int(_UIDs.DO),
-                int(_UIDs.STATS),
-                int(_UIDs.DQ),
-                int(_UIDs.DK),
-                int(_UIDs.DV),
-                *([int(_UIDs.SEQ_LEN_Q)] if seq_len_q is not None else []),
-                *([int(_UIDs.SEQ_LEN_KV)] if seq_len_kv is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_Q)] if cumulative_seq_len_q is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_KV)] if cumulative_seq_len_kv is not None else []),
-            ],
-        )
-        _bprop_cache[cache_key] = (graph, workspace_size, uid_order)
+        _bprop_cache[cache_key] = (graph, workspace_size)
 
-    graph, workspace_size, uid_order = _bprop_cache[cache_key]
+    graph, workspace_size = _bprop_cache[cache_key]
 
     # Allocate gradient outputs and workspace (same shapes as Q, K, V)
     dQ_gpu = torch.empty_like(q)
@@ -1056,11 +718,7 @@ def _sdpa_bwd_impl(
     if cumulative_seq_len_kv is not None:
         uid_to_tensor[int(_UIDs.CUM_SEQ_LEN_KV)] = cumulative_seq_len_kv
 
-    if hasattr(graph, "_execute_with_ptrs"):
-        ptrs = [uid_to_tensor[uid].data_ptr() for uid in uid_order]
-        graph._execute_with_ptrs(ptrs, workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
+    graph.execute(uid_to_tensor, workspace, handle=handle)
 
     return dQ_gpu, dK_gpu, dV_gpu
 
@@ -1142,8 +800,14 @@ def _sdpa_backward(ctx, dO, dStats):
         idx += 1
     cum_kv = saved[idx] if ctx.has_cum_kv else None
 
-    is_d256 = q.shape[-1] == 256
-    can_use_d256_oss_bwd = is_d256 and _can_use_d256_oss_path(
+    dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
+        dO,
+        q,
+        k,
+        v,
+        o,
+        stats,
+        ctx.attn_scale,
         ctx.is_causal,
         ctx.diagonal_alignment,
         ctx.left_bound,
@@ -1153,85 +817,6 @@ def _sdpa_backward(ctx, dO, dStats):
         cum_q,
         cum_kv,
     )
-    use_d256_oss_bwd = can_use_d256_oss_bwd and _device_supports_d256_oss(q.device) and not _cudnn_backend_supports_d256()
-
-    if is_d256:
-        if use_d256_oss_bwd:
-            try:
-                dQ, dK, dV = sdpa_bwd_d256(
-                    dO,
-                    q,
-                    k,
-                    v,
-                    o,
-                    stats,
-                    ctx.attn_scale,
-                    ctx.is_causal,
-                    ctx.diagonal_alignment,
-                    ctx.left_bound,
-                    ctx.right_bound,
-                    seq_len_q,
-                    seq_len_kv,
-                    cum_q,
-                    cum_kv,
-                )
-            except ImportError as e:
-                _logger.warning("Falling back to cuDNN backend d=256 backward path because OSS dependencies are unavailable: %s", e)
-                dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
-                    dO,
-                    q,
-                    k,
-                    v,
-                    o,
-                    stats,
-                    ctx.attn_scale,
-                    ctx.is_causal,
-                    ctx.diagonal_alignment,
-                    ctx.left_bound,
-                    ctx.right_bound,
-                    seq_len_q,
-                    seq_len_kv,
-                    cum_q,
-                    cum_kv,
-                )
-        elif can_use_d256_oss_bwd:
-            dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
-                dO,
-                q,
-                k,
-                v,
-                o,
-                stats,
-                ctx.attn_scale,
-                ctx.is_causal,
-                ctx.diagonal_alignment,
-                ctx.left_bound,
-                ctx.right_bound,
-                seq_len_q,
-                seq_len_kv,
-                cum_q,
-                cum_kv,
-            )
-        else:
-            raise NotImplementedError("d=256 backward path does not support seq_len_q/seq_len_kv/cum_q/cum_kv")
-    else:
-        dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
-            dO,
-            q,
-            k,
-            v,
-            o,
-            stats,
-            ctx.attn_scale,
-            ctx.is_causal,
-            ctx.diagonal_alignment,
-            ctx.left_bound,
-            ctx.right_bound,
-            seq_len_q,
-            seq_len_kv,
-            cum_q,
-            cum_kv,
-        )
 
     # Return gradients for: q, k, v, attn_scale, is_causal, diagonal_alignment,
     # left_bound, right_bound, seq_len_q, seq_len_kv, cum_q, cum_kv

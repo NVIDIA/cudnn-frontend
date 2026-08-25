@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-
 #pragma once
 
 #include <cstdlib>
@@ -141,6 +140,11 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     SDPANodeBase(SDPA_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP<DerivedT>(context), attributes(std::move(attributes_)) {}
+
+    SDPA_attributes const*
+    get_sdpa_attributes() const override {
+        return &attributes;
+    }
 
     bool
     is_paged_v() const {
@@ -442,6 +446,13 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
 
+            // Stats is always computed and stored in FP32, regardless of the io data type.
+            // Default an unset data type here instead of fill_from_context, which would
+            // wrongly assign the io data type.
+            if (stats->get_data_type() == DataType_t::NOT_SET) {
+                stats->set_data_type(DataType_t::FLOAT);
+            }
+
             if (stats_dim.empty()) {
                 // Fill properties of virtual tensors
                 auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
@@ -493,6 +504,36 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     }
 
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
+
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
+
+        // Stats is always computed and stored in FP32. A narrower declared type makes the kernel
+        // write FP32 values past the end of the user's buffer (silent corruption / IMA), so
+        // reject it loudly here. An unset data type is allowed: shape inference defaults it to
+        // FP32 (see infer_properties_node) rather than letting fill_from_context assign the io
+        // data type.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_stats && stats_out->second->get_data_type() != DataType_t::FLOAT &&
+                                           stats_out->second->get_data_type() != DataType_t::NOT_SET,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The Stats output of sdpa must be an FP32 tensor.");
+
+        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
 
 #undef CUDNN_FE_VALIDATE_STRIDE
 
@@ -1091,6 +1132,19 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::shared_ptr<Tensor_attributes> alibi_slopes;
     int64_t alibi_slopes_size = 0;
 
+    // Byte span of a workspace tensor packed (ragged) over the token axis: the sequence axis is
+    // bounded by max_total_seq_len instead of dim[2], every other axis contributes its own extent.
+    // Sizing from stride[2] alone under-allocates any layout whose per-token footprint is not
+    // stride[2] -- e.g. head-major [h, t] stats, where stride[2] == 1.
+    static int64_t
+    ragged_workspace_size(int64_t max_total_seq_len,
+                          std::vector<int64_t> const& dim,
+                          std::vector<int64_t> const& stride,
+                          int64_t elem_size) {
+        return ((max_total_seq_len - 1) * stride[2] + (dim[1] - 1) * stride[1] + (dim[3] - 1) * stride[3] + 1) *
+               elem_size;
+    }
+
     mutable bool has_workaround_padding_mask         = false;  // Will be edited in pre_validate_node()
     mutable int32_t s_q_for_workaround_padding_mask  = 0;      // Will be edited in pre_validate_node()
     mutable int32_t s_kv_for_workaround_padding_mask = 0;      // Will be edited in pre_validate_node()
@@ -1389,15 +1443,32 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
 
-        if(detail::get_backend_version() >= 91801) {
+        if (detail::get_backend_version() >= 91801) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-	    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
-	}
+        }
+
+        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
+        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
+        // once the backward path grows a SDPA_backward_attributes support surface there —
+        // today that file serves only the forward attributes.
+        if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
+            auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
+            auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
+            bool const stats_is_packed_bhsd = stats_stride[3] == 1 &&
+                                              stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!stats_is_packed_bhsd,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "For cuDNN version below 9.26.0, a non-ragged Stats input of sdpa_backward must be "
+                                        "a packed BHSD tensor.");
+        }
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,
@@ -1711,8 +1782,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             // sized TH1 softmax_sum
             softmax_sum->set_stride(attributes.inputs[input_names::Stats]->get_stride());
             softmax_sum->set_ragged_offset(attributes.inputs[input_names::Stats]->get_ragged_offset());
-            softmax_sum_size = attributes.max_total_seq_len_q.value() *
-                               (attributes.inputs[input_names::Stats]->get_stride())[2] * sizeof(float);
+            softmax_sum_size = ragged_workspace_size(attributes.max_total_seq_len_q.value(),
+                                                     softmax_sum->get_dim(),
+                                                     softmax_sum->get_stride(),
+                                                     sizeof(float));
         } else {
             // sized BHS1 softmax_sum
             softmax_sum->set_stride({h_q * s_q, s_q, 1, 1});
@@ -1921,7 +1994,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 dV_fullhead->set_ragged_offset(attributes.outputs[output_names::dV]->get_ragged_offset());
                 // non virtual dV full head
                 dV_fullhead->set_is_virtual(false);
-                dV_fullhead_size = attributes.max_total_seq_len_kv.value() * dV_fullhead_stride[2] * sizeof(float);
+                dV_fullhead_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_kv.value(), dV_fullhead->get_dim(), dV_fullhead_stride, sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dV_fullhead->set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
@@ -2033,7 +2107,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 dK_fullhead->set_ragged_offset(attributes.outputs[output_names::dK]->get_ragged_offset());
                 // non virtual dK full head
                 dK_fullhead->set_is_virtual(false);
-                dK_fullhead_size = attributes.max_total_seq_len_kv.value() * dK_fullhead_stride[2] * sizeof(float);
+                dK_fullhead_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_kv.value(), dK_fullhead->get_dim(), dK_fullhead_stride, sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dK_fullhead->set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
@@ -2070,8 +2145,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 // sized THD dQ_accum
                 dQ_accum->set_stride(attributes.outputs[output_names::dQ]->get_stride());
                 dQ_accum->set_ragged_offset(attributes.outputs[output_names::dQ]->get_ragged_offset());
-                dQ_accum_size = attributes.max_total_seq_len_q.value() *
-                                (attributes.outputs[output_names::dQ]->get_stride())[2] * sizeof(float);
+                dQ_accum_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_q.value(), dQ_accum->get_dim(), dQ_accum->get_stride(), sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dQ_accum->set_stride({h_q * s_q * d_qk, s_q * d_qk, d_qk, 1});

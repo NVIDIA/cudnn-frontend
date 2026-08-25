@@ -23,7 +23,7 @@ Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
 from importlib.metadata import PackageNotFoundError, version
-from typing import Type, Tuple, Optional
+from typing import Literal, Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -93,8 +93,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     ):
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -330,19 +332,13 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Public CUTLASS DSL 4.5 needs the packed-FP4 from_dlpack layout
         # workaround. Rubin and the internal DSL wheel consume the native
         # 4-bit layout directly.
-        needs_fp4_layout_workaround = (
-            self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
-        )
-        if cutlass.const_expr(
-            needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8
-        ):
+        needs_fp4_layout_workaround = self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
+        if cutlass.const_expr(needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
                 cute.recast_layout(mat_a.iterator.dtype.width, 8, mat_a.layout),
             )
-        if cutlass.const_expr(
-            needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8
-        ):
+        if cutlass.const_expr(needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8):
             mat_b = cute.make_tensor(
                 mat_b.iterator,
                 cute.recast_layout(mat_b.iterator.dtype.width, 8, mat_b.layout),
@@ -421,7 +417,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.a_dtype = a_gemm.element_type
         self.b_dtype = b_gemm.element_type
         self.c_dtype = c_gemm.element_type
-        self.sf_dtype = sfa_gemm.element_type
+        # Scale factors may arrive under a stand-in element type: FloatNV8E5M3FNU has
+        # no torch dtype and TVM-FFI cannot marshal it, so e5m3 scales are passed as
+        # Float8E4M3FN storage of the same width and reinterpreted here. This must
+        # happen before _setup_attributes(), which picks the MMA atom off sf_dtype.
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype = self.sf_dtype_override
+        else:
+            self.sf_dtype = sfa_gemm.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a_gemm).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b_gemm).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_gemm)
@@ -492,14 +495,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Blackwell's epilogue tile is an MLIR-backed layout and must be
         # created outside the isolated helper-kernel region. Rubin uses a
         # static tuple and rebuilds the C TMA metadata inside the helper.
-        if cutlass.const_expr(
-            self.weight_mode == MoEWeightMode.DISCRETE
-            and self.architecture != "sm_107"
-        ):
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE and self.architecture != "sm_107"):
             c_tma_op_helper = c_tma_op
-            epi_smem_layout_helper = cute.select(
-                self.c_smem_layout_staged, mode=[0, 1]
-            )
+            epi_smem_layout_helper = cute.select(self.c_smem_layout_staged, mode=[0, 1])
             epi_tile_helper = self.epi_tile
         else:
             c_tma_op_helper = None
@@ -672,10 +670,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Rubin requires C's TMA operation and static layout to be built in
         # the helper-kernel IR context. Blackwell receives host-built values
         # because its MLIR-backed epilogue tile cannot cross region isolation.
-        if cutlass.const_expr(
-            self.weight_mode == MoEWeightMode.DISCRETE
-            and self.architecture == "sm_107"
-        ):
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE and self.architecture == "sm_107"):
             if cutlass.const_expr(self.accumulate_on_output):
                 c_tma_op = cpasync.CopyReduceBulkTensorTileS2GOp()
             else:
@@ -1322,17 +1317,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                                 tCtAcc,
                             )
                         else:
-                            for sf_window_idx in cutlass.range_constexpr(
-                                self.num_sf_windows_per_ab_stage
-                            ):
-                                for window_k_block in cutlass.range_constexpr(
-                                    self.num_mma_instructions_per_sf_window
-                                ):
-                                    stage_k_block = (
-                                        sf_window_idx
-                                        * self.num_mma_instructions_per_sf_window
-                                        + window_k_block
-                                    )
+                            for sf_window_idx in cutlass.range_constexpr(self.num_sf_windows_per_ab_stage):
+                                for window_k_block in cutlass.range_constexpr(self.num_mma_instructions_per_sf_window):
+                                    stage_k_block = sf_window_idx * self.num_mma_instructions_per_sf_window + window_k_block
                                     s2t_source_coord = (
                                         None,
                                         None,
@@ -1357,14 +1344,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                                         tCtSFB_compact_s2t[s2t_destination_coord],
                                     )
 
-                                for window_k_block in cutlass.range_constexpr(
-                                    self.num_mma_instructions_per_sf_window
-                                ):
-                                    stage_k_block = (
-                                        sf_window_idx
-                                        * self.num_mma_instructions_per_sf_window
-                                        + window_k_block
-                                    )
+                                for window_k_block in cutlass.range_constexpr(self.num_mma_instructions_per_sf_window):
+                                    stage_k_block = sf_window_idx * self.num_mma_instructions_per_sf_window + window_k_block
                                     tiled_mma.set(
                                         tcgen05.Field.ACCUMULATE,
                                         k_tile != 0 if stage_k_block == 0 else True,

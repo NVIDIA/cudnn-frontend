@@ -10,8 +10,8 @@ Supports forward and backward passes with `torch.autograd` and `torch.compile`.
 
 ## Support
 
-- **Architectures**: Turing (SM75) or later
-- **Data types**: FP32, FP16, BF16
+- **Architectures**: Turing (SM75) and newer, subject to available dynamic shared memory
+- **Data types**: FP64, FP32, FP16, BF16
 - **Activations**: `identity` and `silu` for NHW and NWH; B2B uses fixed gating
 
 ### Kernel sizes
@@ -62,7 +62,7 @@ Where:
 - $L$ is the sequence length
 - $K$ is the kernel size
 
-See the [NHW forward notebook](../../samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](../../samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
+See the [NHW forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
 
 ### `cudnn.ops.causal_conv1d_nwh`
 
@@ -108,7 +108,7 @@ y = cudnn.ops.causal_conv1d_nwh(x, weight, bias=None, activation="identity")
 
 The API supports `torch.autograd` and `torch.compile` for forward and backward execution. Backward computes `dx` with shape $(B, L, D)$, `dweight` with shape $(K, D)$, and `dbias` with shape $(D,)$. The supported kernel-size range remains 2–128 for both directions.
 
-See the [NWH forward notebook](../../samples/python/62_causal_conv1d_nwh_forward.ipynb) and [NWH backward notebook](../../samples/python/63_causal_conv1d_nwh_backward.ipynb) for PyTorch references and numerical comparisons.
+See the [NWH forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/62_causal_conv1d_nwh_forward.ipynb) and [NWH backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/63_causal_conv1d_nwh_backward.ipynb) for PyTorch references and numerical comparisons.
 
 ### `cudnn.ops.b2b_causal_conv1d`
 
@@ -147,7 +147,7 @@ y_gated = cudnn.ops.b2b_causal_conv1d(x, weights_proj, weights_mixer, skip_bias)
 
 The API supports `torch.autograd` and `torch.compile` for forward and backward execution. Backward computes `dx` with shape $(B, 3D, L)$, `dweights_proj` with shape $(3D, K_{proj})$, `dweights_mixer` with shape $(D, K_{mixer})$, and `dskip_bias` with shape $(D,)$. The projection and mixer kernel-size ranges are unchanged for backward.
 
-See the [B2B forward notebook](../../samples/python/64_b2b_causal_conv1d_forward.ipynb) and [B2B backward notebook](../../samples/python/65_b2b_causal_conv1d_backward.ipynb) for decomposed PyTorch references and numerical comparisons.
+See the [B2B forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/64_b2b_causal_conv1d_forward.ipynb) and [B2B backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/65_b2b_causal_conv1d_backward.ipynb) for decomposed PyTorch references and numerical comparisons.
 
 ### Low-level bindings
 
@@ -171,3 +171,7 @@ B2B, requiring cuDNN 9.24.0 or later, with projection kernel size 2–32 and mix
 The low-level B2B forward binding writes both the mixer-plus-skip intermediate `y` and the final post-gated `y_gated`; the high-level API returns only `y_gated`.
 
 In most cases, use the corresponding `cudnn.ops` API, which handles autograd, `torch.compile`, and tensor management automatically.
+
+The backend accumulation buffers for `dweight` and `dbias` are FP32 for
+FP16, BF16, and FP32 inputs, and FP64 for FP64 inputs. The Python autograd
+results are returned in the corresponding input tensor dtype.

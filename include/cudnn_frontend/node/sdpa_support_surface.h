@@ -159,12 +159,12 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "Intermediate tensor data type needs to be set as internal tensors require it.");
 
+    // The Stats layout check (packed BHSD required prior to 9.26.0) lives in
+    // SDPANode::post_validate_node(), as it must run after shape inference has
+    // filled in the dim/stride of an unset Stats output.
+
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((prop_major == 12) && is_ragged,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "sdpa fp8 with THD not supported for sm120 yet.");
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,

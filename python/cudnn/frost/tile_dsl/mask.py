@@ -15,12 +15,13 @@ def apply_mask_chunk(
     q_abs,
     kv_col_base,
     seq_kv_len,
-    swa_window: int,
+    window_left: int,
     mask_flags: int,
     N: int = 64,
-    causal_bottom_right: int = 0,
+    bottom_right: int = 0,
     causal_diag=None,
     mask_value: float = _NEG_INF_BITS,
+    window_right: int = 0,
 ):
     # mask_value: what a masked score becomes.  Default is the legacy finite
     # sentinel; the f16 prefill kernels pass float("-inf") so a fully-masked
@@ -30,11 +31,22 @@ def apply_mask_chunk(
         return reg_S
 
     neg_inf = cutlass.Float32(mask_value)
-    q_minus_w = q_abs - cutlass.Int32(swa_window) if (mask_flags & MASK_SWA) else None
-    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and causal_bottom_right):
+    # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
+    # lower limit is q + (S_kv - S_q) - W — the same causal_diag offset the
+    # upper (causal) limit uses below. Top-left keeps the plain q - W.
+    q_minus_w = None
+    if mask_flags & MASK_SWA:
+        swa_base = (q_abs + causal_diag) if bottom_right else q_abs
+        q_minus_w = swa_base - cutlass.Int32(window_left)
+    # window_right is the compile-time diagonal-band right bound (cuDNN
+    # diagonal_band_right_bound): kv columns up to q + window_right (plus the
+    # bottom-right diagonal offset) stay unmasked. 0 = plain causal.
+    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and bottom_right):
         q_caus_lim = q_abs + causal_diag
     else:
         q_caus_lim = q_abs
+    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and window_right != 0):
+        q_caus_lim = q_caus_lim + cutlass.Int32(window_right)
 
     elems = []
     for i in range(N):

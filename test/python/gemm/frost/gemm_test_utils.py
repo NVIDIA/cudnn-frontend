@@ -26,12 +26,35 @@ def _active_sm() -> int | None:
 
 _SM = _active_sm()
 
+
+def _int8_mma_arch_ranges() -> tuple[tuple[int, int], ...]:
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES
+
+    return MMA_GPU_ARCH_SPECIAL_CASES[("sm100", ("int8", "int8", "int32"))]
+
+
 # Every e2e test in this suite JITs sm100-family templates, valid only on
 # 100 <= SM < 120 (see kernel_registry.PIPELINE_ARCH_RANGES) — gate on arch, not just
 # GPU presence, so wrong-arch machines skip instead of failing in the JIT.
 requires_sm100 = pytest.mark.skipif(
     _SM is None or not (100 <= _SM < 120),
     reason="needs a Blackwell-family GPU (100 <= SM < 120), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+# The int8 tcgen05 MMA is narrower than its family — SM 10.7 has no such
+# instruction, and NVVM fails to lower it rather than the JIT rejecting it.
+# Read the ranges off the registry so the suite never holds a second copy.
+INT8_SM_RANGES = _int8_mma_arch_ranges()
+requires_int8_mma = pytest.mark.skipif(
+    _SM is None or not any(lo <= _SM < hi for lo, hi in INT8_SM_RANGES),
+    reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
+# The sm107 templates render anywhere (the 64-byte-K mode is an idesc field, and
+# the OMMA descriptor is a host-side bit-pack); they RUN only on 107 <= SM < 110.
+requires_sm107 = pytest.mark.skipif(
+    _SM is None or not (107 <= _SM < 110),
+    reason="sm107 kernels run only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -43,9 +66,9 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+    def __init__(self, graph, config=None, cta_group=2, force_stg_epi=False):
         self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+        kw = dict(cta_group=cta_group, force_stg_epi=force_stg_epi)
         if config is not None:
             kw["config"] = config
         self._compiled = jit_from_cudnn_graph(graph, **kw)
@@ -53,26 +76,27 @@ class Plan:
         self.binding = self._compiled.binding
         self.block_scale = self.chain.has_block_scale
         self.aux_names = [t.name for t in self.chain.aux_tensors]
+        self.generated_path = self._compiled.generated_path
 
     def __call__(self, variant_pack):
         return self._compiled(variant_pack)
 
 
-LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
 
 
 def resolve(legacy_name):
-    """Legacy config-name (with _Nctamma/_static, kept as readable test IDs) ->
-    (pure-geometry config, cta_group, scheduler)."""
+    """Legacy config-name (with _Nctamma, kept as readable test IDs) ->
+    (pure-geometry config, cta_group)."""
     m = LEGACY_RE.match(legacy_name)
     assert m, legacy_name
-    return by_name(m.group(1)), int(m.group(2)), "static" if m.group(3) else "clc"
+    return by_name(m.group(1)), int(m.group(2))
 
 
 def kw(legacy_name):
     """resolve() packaged as jit/Plan kwargs."""
-    config, cta_group, scheduler = resolve(legacy_name)
-    return dict(config=config, cta_group=cta_group, scheduler=scheduler)
+    config, cta_group = resolve(legacy_name)
+    return dict(config=config, cta_group=cta_group)
 
 
 # --- variant packs ----------------------------------------------------------
@@ -158,12 +182,60 @@ def rand_e8m0(shape, dev):
     return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
 
 
+def e5m3_to_float(b: torch.Tensor) -> torch.Tensor:
+    """Decode E5M3 bytes: unsigned, 5-bit exponent (bias 15), 3-bit mantissa.
+
+    Exact over the whole 8-bit domain, matching the epilogue's decode:
+    ``E >= 1`` is the normal ``2^(E-15) * (1 + M/8)``; ``E == 0`` is subnormal
+    ``2^-14 * M/8 == M * 2^-17`` (so byte 0 is 0.0). ``E == 31`` is NOT inf/NaN —
+    the format is canonical-NaN-only, so only byte 255 is NaN and 248..254 are
+    finite (up to 114688); byte 255's value here is unused, since the hardware's
+    satfinite cvt never emits it."""
+    E = (b >> 3).to(torch.float32)
+    M = (b & 7).to(torch.float32)
+    normal = torch.pow(2.0, E - 15.0) * (1.0 + M / 8.0)
+    return torch.where(E >= 1, normal, M * (2.0**-17))
+
+
+def e5m3_finite_values(dev="cpu") -> torch.Tensor:
+    """The 255 finite E5M3 values, indexed by byte. Monotonically increasing
+    (the format is unsigned), so byte 254 = 114688 is the max finite and 255 is
+    the canonical NaN the hardware's satfinite cvt never emits."""
+    b = torch.arange(255, dtype=torch.float32, device=dev)
+    return e5m3_to_float(b.to(torch.int32))
+
+
+def e5m3_quant_ref(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> E5M3 byte, rounding UP, saturating to max finite — the reference
+    for what the epilogue's `cvt.rp.satfinite.ue5m3x2.f32` emits. Negative
+    inputs cannot occur (a scale is |amax| / output_max)."""
+    vals = e5m3_finite_values(x.device)
+    return torch.searchsorted(vals, x.clamp(min=0.0).contiguous(), right=False).clamp(max=254).to(torch.uint8)
+
+
+def rand_e5m3(shape, dev):
+    """Random E5M3 scale factors as raw bytes (torch has no E5M3 dtype, and the
+    kernel takes the SF blob as a base pointer anyway). Exponent field 13..17
+    keeps a scale PAIR inside FP32 while every value stays exactly
+    representable, so the torch reference is exact."""
+    return torch.randint(13 * 8, 18 * 8, shape, dtype=torch.uint8, device=dev)
+
+
 def block_quant_ref(x, block_size, out_dtype, scale_dtype):
-    """Torch reference for the block-quant epilogue: per-block amax scale
-    (E8M0 scales round toward +inf) + quantized output."""
+    """Torch reference for the block-quant epilogue: per-block amax scale +
+    quantized output. ``scale_dtype`` is a torch dtype, or the string
+    ``"e5m3"`` — torch has no E5M3, so that scale comes back as raw BYTES
+    (which is also what the kernel writes and what the test compares).
+
+    E8M0 and E5M3 scales round toward +inf; E4M3 scales round to nearest."""
     blocks = x.view(1, x.shape[0], x.shape[1] // block_size, block_size)
     output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
     scale_f = blocks.abs().amax(dim=-1) / output_max
+    if scale_dtype == "e5m3":
+        scale = e5m3_quant_ref(scale_f)
+        inv = torch.where(e5m3_to_float(scale.to(torch.int32)) > 0, e5m3_to_float(scale.to(torch.int32)).reciprocal(), 0.0)
+        q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
+        return q.to(out_dtype).view(1, x.shape[0], x.shape[1]), scale
     if scale_dtype is torch.float8_e8m0fnu:
         safe = torch.where(scale_f > 0, scale_f, 1.0)
         scale_f = torch.where(scale_f > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)

@@ -56,11 +56,27 @@ classifiers = [
 
 [project.optional-dependencies]
 cutedsl = [
+    # NOT pinned to the floor the FROST engines need (4.7.0): pinning it here
+    # would make this package incompatible with anything holding the DSL at an
+    # older version -- quack-kernels pins ==4.6.0, and vLLM and friends carry
+    # their own constraints. The engines check the version at support time and
+    # decline when it is too old, so an older DSL costs those engines and
+    # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
+    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
+    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
     "nvidia-cutlass-dsl[cu13]>=4.5.0",
     "cuda-python",
-    "torch",
     "apache-tvm-ffi>=0.1.11",
-    "torch-c-dlpack-ext",
+]
+cutile = [
+    # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
+    # extra pins cuda-toolkit>=13.2,<13.4, and that upper bound would cap the
+    # whole environment's toolkit and shut out CUDA 12 entirely. Without it,
+    # cuda.tile falls back to a system `tileiras`, the same way this package
+    # already leaves GPU wheels to the user. Engines that cannot import the
+    # runtime decline in check_support, so a missing compiler costs those
+    # engines and nothing else.
+    "cuda-tile>=1.4; python_version >= '3.10'",
 ]
 
 [dependency-groups]
@@ -73,6 +89,20 @@ dev = [
     "looseversion",
     "black==26.3.1",
     "clang-format==21.1.6",
+]
+# Per-framework groups for the type-erased CuTeDSL GEMM APIs (JAX is supported
+# by the dense fusions: amax, swiglu, srelu, dsrelu): install with
+# `pip install --group torch` / `pip install --group jax`. GPU wheels
+# (torch cuXX, jax[cuda12]/[cuda13]) are left to the user.
+torch = [
+    "torch",
+    "torch-c-dlpack-ext",
+]
+# The jax.jit-compatible XLA custom-call entry points (cudnn.jax, e.g.
+# gemm_amax_jax_sm100) build on the CuTeDSL JAX extensions (cutlass.jax,
+# shipped with nvidia-cutlass-dsl), which require jax >= 0.5.
+jax = [
+    "jax>=0.5",
 ]
 
 [build-system]

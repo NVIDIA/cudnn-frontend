@@ -170,14 +170,14 @@ class WgradNode : public NodeCRTP<WgradNode> {
                                                        1,
                                                        &conv_desc_ptr));
 
-        bool const is_double = (attributes.compute_data_type == DataType_t::DOUBLE);
+        bool const is_double                        = (attributes.compute_data_type == DataType_t::DOUBLE);
         cudnnBackendAttributeType_t const attr_type = is_double ? CUDNN_TYPE_DOUBLE : CUDNN_TYPE_FLOAT;
 
         double const alpha_d = 1.0, beta_d = 0.0;
-        float  const alpha_f = 1.0f, beta_f = 0.0f;
+        float const alpha_f = 1.0f, beta_f = 0.0f;
 
         void const* alpha = is_double ? static_cast<void const*>(&alpha_d) : static_cast<void const*>(&alpha_f);
-        void const* beta  = is_double ? static_cast<void const*>(&beta_d)  : static_cast<void const*>(&beta_f);
+        void const* beta  = is_double ? static_cast<void const*>(&beta_d) : static_cast<void const*>(&beta_f);
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
             wgrad_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, attr_type, 1, alpha));

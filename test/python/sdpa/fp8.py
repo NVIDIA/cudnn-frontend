@@ -41,7 +41,6 @@ class GraphFwdUid(IntEnum):
     o_scale = 10
     o = 3
     stats = 4
-    s_amax = 11
     o_amax = 12
     kv_seq_len = 13
     q_seq_len = 14
@@ -178,7 +177,9 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
     if diag_align is not None:
         sdpa_kwargs['diagonal_alignment'] = diag_align
-    o, stats, amax_s, amax_o = graph_fwd.sdpa_fp8(**sdpa_kwargs)
+    # Amax_S is not requested: nothing downstream consumes it, and the FROST
+    # engines no longer produce it (they decline graphs that declare it).
+    o, stats, _amax_s_unused, amax_o = graph_fwd.sdpa_fp8(**sdpa_kwargs)
 
     stride_o = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1)
     o.set_uid(GraphFwdUid.o).set_output(True).set_dim((b, h_q, s_qo, d_vo)).set_stride(stride_o).set_data_type(cudnn_otype)
@@ -193,7 +194,6 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         if is_ragged:
             stats.set_ragged_offset(stats_ragged_offset)
 
-    amax_s.set_uid(GraphFwdUid.s_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_uid(GraphFwdUid.o_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
 
     return graph_fwd
@@ -462,7 +462,6 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         o_gpu = torch.full((b, s_qo, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda")
         stats_gpu = torch.full((b, h_q, s_qo, 1), float('nan'), dtype=torch.float, device="cuda")
 
-    s_amax_gpu = torch.tensor([float('nan')], dtype=torch.float, device="cuda")
     o_amax_gpu = torch.tensor([float('nan')], dtype=torch.float, device="cuda")
 
     variant_pack = {
@@ -477,7 +476,6 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         int(GraphFwdUid.o_scale): o_scale_gpu,
         int(GraphFwdUid.o): o_gpu,
         int(GraphFwdUid.stats): stats_gpu,
-        int(GraphFwdUid.s_amax): s_amax_gpu,
         int(GraphFwdUid.o_amax): o_amax_gpu,
     }
 
@@ -703,7 +701,6 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     # Print hash and stats for determinism verification
     print_tensor_stats(o_gpu, tag="o_gpu")
-    print_tensor_stats(s_amax_gpu, tag="s_amax_gpu")
     print_tensor_stats(o_amax_gpu, tag="o_amax_gpu")
     if not cfg.is_infer:
         print_tensor_stats(stats_gpu, tag="stats_gpu")

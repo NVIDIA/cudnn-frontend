@@ -22,12 +22,13 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [Block Scaling (MXFP8/NVFP4 quantization)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/BlockScaling.md)
 - [RoPE](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/RoPE.md)
 - [Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/CausalConv1d.md)
+- [GNN simple aggregation](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/gnn/agg_simple.md)
+- [FFT Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/FFTCausalConv1d.md)
 - [Concatenate](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Concatenate.md), [Reshape](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Reshape.md), [Slice](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Slice.md), [Transpose](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Transpose.md), [Resampling](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Resampling.md)
 
 ## Open-source (frontend-only) kernel APIs
 
 - [FE OSS APIs overview — full catalog and usage pattern](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/overview.md)
-- [SDPA forward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_fwd_d256.md), [SDPA backward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_bwd_d256.md)
 - [Block-sparse attention (BSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/bsa.md), [DeepSeek sparse attention (DSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/dsa.md), [Native sparse attention (NSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/nsa.md)
 - [GEMM fusions (amax, SwiGLU, sReLU, grouped/discrete MoE variants)](https://github.com/NVIDIA/cudnn-frontend/tree/main/docs/fe-oss-apis/gemm_fusions)
 - [RMSNorm + RHT + Amax](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_rht_amax.md), [RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_silu.md)
@@ -46,7 +47,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 
 - [C++ samples (Catch2)](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp)
 - [Python notebook tutorials](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/python)
-- [SDPA training benchmark](https://github.com/NVIDIA/cudnn-frontend/tree/main/benchmark/sdpa_benchmark_training)
+- [SDPA training benchmark](https://github.com/NVIDIA/cudnn-frontend/tree/main/benchmark/attention_training)
 
 ## Optional
 

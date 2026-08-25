@@ -12,6 +12,12 @@ os.environ.setdefault(
     "expandable_segments:True,garbage_collection_threshold:0.6",
 )
 
+# The JAX interop tests (fe_api/**/test_*_jax.py) initialize XLA in the same pytest
+# process as the torch suites; XLA's default 75%-of-GPU preallocation starves later
+# torch tests of memory (CUDA_ERROR_OUT_OF_MEMORY at kernel-compile time). Must be set
+# before jax initializes its backend.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import sys
 import time
 import traceback

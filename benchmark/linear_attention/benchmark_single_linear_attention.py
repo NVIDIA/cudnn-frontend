@@ -36,9 +36,12 @@ _BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM = {
     "float16": 8192,
 }
 
-# Chunk size of the chunked linear attention algorithms (both backends tile
-# the sequence into 64-token chunks; the FLOPs model below depends on it).
-_CHUNK_SIZE = 64
+# Chunk size of the chunked linear attention algorithms per variant (the
+# FLOPs model below depends on it).
+_CHUNK_SIZE = {"gdn": 64, "kda": 16, "gdn2": 16}
+
+# Safe-gate lower bound for kda.
+_KDA_GATE_LOWER_BOUND = -5.0
 
 
 def _peak_flops_per_clock_per_sm(dtype_str):
@@ -177,13 +180,13 @@ def parse_args():
         "--variant",
         default="gdn",
         type=str,
-        help="Linear attention variant to use. Can be 'gdn' (scalar decay), 'kda' (per-key-channel decay), or 'gdn2' (channel-wise decay/erase/write gates, forward only).",
+        help="Linear attention variant to use. Can be 'gdn' (scalar decay), 'kda' (per-key-channel decay), or 'gdn2' (channel-wise decay/erase/write gates).",
         choices=["gdn", "kda", "gdn2"],
     )
     parser.add_argument(
         "--store_on",
         action="store_true",
-        help="Request the per-sequence final recurrent state from the forward pass (and feed its gradient in the backward pass)",
+        help="Dump the recurrent state every chunk plus the per-sequence final state from the forward pass (backends without a per-chunk state output are rejected; with backward, the final state's gradient feeds the backward pass)",
     )
     parser.add_argument(
         "--initial_state",
@@ -197,6 +200,8 @@ def parse_args():
         help="Linear attention backend to use",
         choices=[
             "fla",
+            "flash_qla",
+            "flash_kda",
             "cudnn",
         ],
     )
@@ -249,13 +254,13 @@ def run_benchmark(
         head_dim_qk: Head dimension for Q/K (optional, for asymmetric)
         head_dim_vo: Head dimension for V/O (optional, for asymmetric)
         data_type: Data type ("bfloat16", "float16")
-        backend: Backend name ("cudnn", "fla")
+        backend: Backend name ("cudnn", "fla", "flash_qla", "flash_kda")
         variant: Linear attention variant ("gdn", "kda", "gdn2")
         profile_pass: Which pass to profile ("fwd", "bwd", "both")
         num_iterations: Number of benchmark iterations
         num_warmup_iterations: Warmup iterations before measurement
         skip_ref: Skip reference validation
-        store_on: Request the final recurrent state from the forward pass
+        store_on: Dump per-chunk states plus the final recurrent state from the forward pass
         initial_state: Provide an initial recurrent state
         verbose: Print verbose output
 
@@ -263,6 +268,7 @@ def run_benchmark(
         Dict with keys:
             - time_ms: Median time of the requested pass in milliseconds
             - tflops: TFLOPS for the requested pass
+            - bw_tb_per_sec: DRAM bandwidth (TB/s) for the requested pass
             - max_diff: Maximum difference vs reference
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
@@ -334,7 +340,7 @@ def run_benchmark(
         raise RuntimeError(f"Benchmark failed with return code {result.returncode}.\n" f"stderr: {result.stderr}\n" f"stdout: {result.stdout}")
 
     # Parse CSV output
-    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters
+    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters,fwd_bw,bwd_bw
     output_line = result.stdout.strip().split("\n")[-1]
     parts = output_line.split(",")
 
@@ -360,13 +366,16 @@ def run_benchmark(
     if profile_pass == "fwd":
         time_ms = float(parts[8])
         tflops = float(parts[10])
+        bw_tb_per_sec = float(parts[14]) if len(parts) > 14 else 0.0
     else:  # "bwd"
         time_ms = float(parts[9])
         tflops = float(parts[11])
+        bw_tb_per_sec = float(parts[15]) if len(parts) > 15 else 0.0
 
     return {
         "time_ms": time_ms,
         "tflops": tflops,
+        "bw_tb_per_sec": bw_tb_per_sec,
         "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
@@ -430,12 +439,43 @@ else:
     # The gates, output, and recurrent state live at HO = max(q, v) heads:
     # GVA groups v-heads over q-heads, GQA (gdn only) the reverse.
     num_o_heads = max(num_q_heads, num_kv_heads)
-    if num_q_heads > num_kv_heads and args.variant != "gdn":
-        raise ValueError("GQA (num_q_heads > num_kv_heads) is only supported with the 'gdn' variant")
-    if args.variant == "gdn2" and run_bwd:
-        raise ValueError("gdn2 is forward only (the backward kernel is a stub); use --profile_pass fwd")
-    if args.variant == "gdn2" and args.la_backend == "fla":
-        raise ValueError("gdn2 is only supported with the 'cudnn' backend")
+    if num_q_heads > num_kv_heads and args.variant != "gdn" and args.la_backend != "cudnn":
+        raise ValueError(f"GQA (num_q_heads > num_kv_heads) with kda/gdn2 is only supported by the cudnn backend, not {args.la_backend}")
+    if args.variant == "gdn2" and args.la_backend == "fla" and num_q_heads != num_kv_heads:
+        raise ValueError("gdn2 with the 'fla' backend requires equal q/kv head counts")
+    if args.la_backend == "flash_qla":
+        if args.variant != "gdn":
+            raise ValueError("flash_qla only supports the 'gdn' variant")
+        if num_q_heads > num_kv_heads:
+            raise ValueError("flash_qla does not support GQA (num_q_heads > num_kv_heads)")
+    if args.la_backend == "flash_kda":
+        if args.variant != "kda":
+            raise ValueError("flash_kda only supports the 'kda' variant")
+        if num_q_heads != num_kv_heads:
+            raise ValueError("flash_kda requires equal q/kv head counts")
+        if head_dim_qk != 128 or head_dim_vo != 128:
+            raise ValueError("flash_kda requires head_dim 128 for both qk and vo")
+        if args.data_type != "bfloat16":
+            raise ValueError("flash_kda only supports bfloat16")
+        if run_bwd:
+            raise ValueError("flash_kda is forward only; use --profile_pass fwd")
+
+    if args.store_on:
+        if args.la_backend in ("flash_kda", "flash_qla"):
+            raise ValueError(f"--store_on dumps the state every chunk; {args.la_backend} only outputs the final state")
+        if args.la_backend == "fla" and args.variant == "gdn":
+            raise ValueError("--store_on dumps the state every chunk; fla's chunk_gated_delta_rule has no intermediate-state output")
+        if args.la_backend == "fla" and run_bwd:
+            raise ValueError("--store_on dumps the state every chunk; fla dumps intermediate states in inference mode only, use --profile_pass fwd")
+
+    # FlashKDA always fuses q/k l2norm in-kernel, so kda/gdn2 fuse it on
+    # every backend for apples-to-apples comparisons; gdn runs unfused.
+    use_qk_l2norm = args.variant in ("kda", "gdn2")
+
+    # Forward-only kda runs feed raw safe-gate/beta logits to every backend
+    # (the FlashKDA ABI); training runs keep post-activation gates (the
+    # cudnn/fla backwards then differentiate the same math).
+    kda_raw_gates = args.variant == "kda" and not run_bwd
 
     l2_flush_size_mb = 256
     l2_flush_size = l2_flush_size_mb * 1024 * 1024
@@ -466,9 +506,22 @@ else:
         ## boundaries. A dense batch is cu_seqlens = [0, T, 2T, ...].
         cu_seqlens = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen
 
-        def cudnn_linear_attention(query, key, value, gate, beta, write_gate, s0):
+        ## --store_on dumps the per-chunk state series alongside the final
+        ## state (the state_checkpoints output; one entry per kernel chunk).
+        ckpt_tokens = _CHUNK_SIZE[args.variant] if args.store_on else 0
+        kda_safe_gate_kwargs = {}
+        if kda_raw_gates:
+            kda_safe_gate_kwargs = dict(
+                use_beta_sigmoid_in_kernel=True,
+                safe_gate=True,
+                gate_lower_bound=_KDA_GATE_LOWER_BOUND,
+                a_log=torch.zeros(num_o_heads, dtype=torch.float32, device=device),
+                dt_bias=torch.zeros(num_o_heads, head_dim_qk, dtype=torch.float32, device=device),
+            )
+
+        def cudnn_linear_attention(query, key, value, gate, beta, write_gate, state0):
             if args.variant == "gdn":
-                return gated_delta_net(
+                out = gated_delta_net(
                     query,
                     key,
                     value,
@@ -476,11 +529,13 @@ else:
                     beta,
                     cu_seqlens,
                     scale=attn_scale,
-                    initial_state=s0,
+                    initial_state=state0,
                     output_final_state=args.store_on,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    checkpoint_every_n_tokens=ckpt_tokens,
                 )
             elif args.variant == "kda":
-                return kimi_delta_attention(
+                out = kimi_delta_attention(
                     query,
                     key,
                     value,
@@ -488,12 +543,14 @@ else:
                     beta,
                     cu_seqlens,
                     scale=attn_scale,
-                    initial_state=s0,
+                    initial_state=state0,
                     output_final_state=args.store_on,
-                    use_qk_l2norm_in_kernel=False,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    checkpoint_every_n_tokens=ckpt_tokens,
+                    **kda_safe_gate_kwargs,
                 )
             else:  # gdn2
-                return gated_delta_net_v2(
+                out = gated_delta_net_v2(
                     query,
                     key,
                     value,
@@ -502,13 +559,68 @@ else:
                     write_gate,
                     cu_seqlens,
                     scale=attn_scale,
-                    initial_state=s0,
+                    initial_state=state0,
                     output_final_state=args.store_on,
-                    use_qk_l2norm_in_kernel=False,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    checkpoint_every_n_tokens=ckpt_tokens,
                 )
+            return out[0], out[1]
+
+    if args.la_backend == "flash_qla":
+        attn_scale = head_dim_qk ** (-0.5)
+
+        from flash_qla import chunk_gated_delta_rule as fqla_chunk_gated_delta_rule
+
+        if args.verbose:
+            import flash_qla
+
+            print(f"[INFO] FlashQLA Version: {getattr(flash_qla, '__version__', 'unknown')}")
+
+        def flash_qla_linear_attention(query, key, value, gate, beta, write_gate, state0):
+            return fqla_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                scale=attn_scale,
+                initial_state=state0,
+                output_final_state=args.store_on,
+            )
+
+    if args.la_backend == "flash_kda":
+        attn_scale = head_dim_qk ** (-0.5)
+
+        import flash_kda
+
+        if args.verbose:
+            print(f"[INFO] FlashKDA Version: {getattr(flash_kda, '__version__', 'unknown')}")
+
+        fkda_a_log = torch.zeros(num_o_heads, dtype=torch.float32, device=device)
+        fkda_dt_bias = torch.zeros(num_o_heads, head_dim_qk, dtype=torch.float32, device=device)
+
+        def flash_kda_linear_attention(query, key, value, gate, beta, write_gate, state0):
+            out = torch.empty_like(value)
+            flash_kda.fwd(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                attn_scale,
+                out,
+                A_log=fkda_a_log,
+                dt_bias=fkda_dt_bias,
+                lower_bound=_KDA_GATE_LOWER_BOUND,
+                initial_state=state0,
+                final_state=None,
+            )
+            return out, None
 
     if args.la_backend == "fla" or (not args.skip_ref):
         attn_scale = head_dim_qk ** (-0.5)
+
+        os.environ.setdefault("FLA_DISABLE_BACKEND_DISPATCH", "1")
 
         if args.variant == "gdn":
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -516,12 +628,28 @@ else:
             try:
                 from fla.ops.kda import chunk_kda
             except ImportError as e:
-                raise RuntimeError(f"The installed fla does not provide KDA (fla.ops.kda): {e}")
+                raise RuntimeError(f"The installed fla does not provide KDA (fla.ops.kda): {e}") from e
         else:  # gdn2
-            raise ValueError("gdn2 is only supported with the 'cudnn' backend (no fla implementation, so no reference either); use --skip_ref")
+            try:
+                from fla.ops.gdn2 import chunk_gdn2
+            except ImportError as e:
+                raise RuntimeError(f"The installed fla does not provide GDN2 (fla.ops.gdn2): {e}") from e
 
-        ## FLA takes dense (B, T, H, D) tensors; g is the log-space decay.
-        def fla_linear_attention(query, key, value, gate, beta, write_gate, s0):
+        ## FLA takes dense (B, T, H, D) tensors; g is the log-space decay
+        ## (raw safe-gate logits in forward-only kda runs). --store_on adds
+        ## the per-chunk state dump (fla supports it in inference mode only).
+        fla_kda_kwargs = {}
+        if args.variant == "kda" and kda_raw_gates:
+            fla_kda_kwargs = dict(
+                use_gate_in_kernel=True,
+                safe_gate=True,
+                lower_bound=_KDA_GATE_LOWER_BOUND,
+                use_beta_sigmoid_in_kernel=True,
+                A_log=torch.zeros(num_o_heads, dtype=torch.float32, device=device),
+                dt_bias=torch.zeros(num_o_heads * head_dim_qk, dtype=torch.float32, device=device),
+            )
+
+        def fla_linear_attention(query, key, value, gate, beta, write_gate, state0):
             if args.variant == "gdn":
                 return chunk_gated_delta_rule(
                     query,
@@ -530,10 +658,27 @@ else:
                     gate,
                     beta,
                     scale=attn_scale,
-                    initial_state=s0,
+                    initial_state=state0,
                     output_final_state=args.store_on,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
                 )
-            else:  # kda
+            elif args.variant == "kda":
+                if args.store_on:
+                    with torch.inference_mode():
+                        o, fs, _state_checkpoints = chunk_kda(
+                            query,
+                            key,
+                            value,
+                            gate,
+                            beta,
+                            scale=attn_scale,
+                            initial_state=state0,
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm,
+                            return_intermediate_states=True,
+                            **fla_kda_kwargs,
+                        )
+                    return o, fs
                 return chunk_kda(
                     query,
                     key,
@@ -541,21 +686,55 @@ else:
                     gate,
                     beta,
                     scale=attn_scale,
-                    initial_state=s0,
+                    initial_state=state0,
                     output_final_state=args.store_on,
-                    use_qk_l2norm_in_kernel=False,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    **fla_kda_kwargs,
+                )
+            else:  # gdn2
+                if args.store_on:
+                    with torch.inference_mode():
+                        o, fs, _state_checkpoints = chunk_gdn2(
+                            query,
+                            key,
+                            value,
+                            gate,
+                            beta,
+                            write_gate,
+                            scale=attn_scale,
+                            initial_state=state0,
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm,
+                            return_intermediate_states=True,
+                        )
+                    return o, fs
+                return chunk_gdn2(
+                    query,
+                    key,
+                    value,
+                    gate,
+                    beta,
+                    write_gate,
+                    scale=attn_scale,
+                    initial_state=state0,
+                    output_final_state=args.store_on,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
                 )
 
     def get_linear_attention_function(backend):
         if backend == "fla":
             return fla_linear_attention
+        elif backend == "flash_qla":
+            return flash_qla_linear_attention
+        elif backend == "flash_kda":
+            return flash_kda_linear_attention
         elif backend == "cudnn":
             return cudnn_linear_attention
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
     # Util function for addressing different qkv formats for each backend
-    # (cudnn is THD [B*T, H, D]; fla is dense [B, T, H, D])
+    # (cudnn is THD [B*T, H, D]; fla and flash_qla are dense [B, T, H, D])
     def preprocess_qkv(query, key, value, backend):
         if backend == "cudnn":
             return (
@@ -563,20 +742,25 @@ else:
                 key.reshape(batch_size * seqlen, *key.shape[2:]),
                 value.reshape(batch_size * seqlen, *value.shape[2:]),
             )
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla", "flash_kda"):
             return query, key, value
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
     def preprocess_gates(gate, beta, write_gate, backend):
         if backend == "cudnn":
+            beta_t = beta.reshape(batch_size * seqlen, *beta.shape[2:])
+            if kda_raw_gates:
+                beta_t = beta_t.to(target_dtype)
             return (
                 gate.reshape(batch_size * seqlen, *gate.shape[2:]),
-                beta.reshape(batch_size * seqlen, *beta.shape[2:]),
+                beta_t,
                 write_gate.reshape(batch_size * seqlen, *write_gate.shape[2:]) if write_gate is not None else None,
             )
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla"):
             return gate, beta, write_gate
+        elif backend == "flash_kda":
+            return gate.to(target_dtype).contiguous(), beta.to(target_dtype).contiguous(), None
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
@@ -584,7 +768,7 @@ else:
     def postprocess_o(output, backend):
         if backend == "cudnn":
             return output.reshape(batch_size, seqlen, num_o_heads, head_dim_vo)
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla", "flash_kda"):
             return output
         else:
             raise ValueError(f"Invalid backend: {backend}")
@@ -600,13 +784,13 @@ else:
     ):
         assert mode in ["fwd", "bwd", "fwd_bwd"]
 
-        # Chunked linear attention BMM FLOPs per 64-token chunk per (batch,
+        # Chunked linear attention BMM FLOPs per chunk per (batch,
         # state head), chunk size C, dims K (qk) and V (vo):
         # Forward: 5 BMM classes =>
         #   intra scores + WY prep (2 x C*C*K), WY apply (C*C*K + C*C*V),
         #   intra output (C*C*V), inter output + state update (2 x C*K*V)
         # Backward: recompute + gradient chains, ~3x forward.
-        C = _CHUNK_SIZE
+        C = _CHUNK_SIZE[args.variant]
         num_chunks = ceil_div(seqlen, C)
         per_chunk = 2 * (3 * C * C * head_dim_qk + 2 * C * C * head_dim_vo + 2 * C * head_dim_qk * head_dim_vo)
         base = batch_size * num_kv_heads * num_chunks * per_chunk
@@ -638,6 +822,63 @@ else:
         )
         return f / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
 
+    # Util functions for calculating DRAM bytes moved and bandwidth achieved
+    def dram_bytes(
+        batch_size,
+        seqlen,
+        head_dim_qk,
+        head_dim_vo,
+        num_q_heads,
+        num_kv_heads,
+        num_o_heads,
+        mode="fwd",
+    ):
+        assert mode in ["fwd", "bwd"]
+        io_bytes = 2
+        f32_bytes = 4
+        tokens = batch_size * seqlen
+        q_bytes = tokens * num_q_heads * head_dim_qk * io_bytes
+        k_bytes = tokens * num_q_heads * head_dim_qk * io_bytes
+        v_bytes = tokens * num_kv_heads * head_dim_vo * io_bytes
+        o_bytes = tokens * num_o_heads * head_dim_vo * io_bytes
+        if args.variant == "gdn":
+            gate_bytes = tokens * num_o_heads * 2 * f32_bytes
+        elif args.variant == "kda":
+            gate_bytes = tokens * num_o_heads * (head_dim_qk + 1) * f32_bytes
+        else:  # gdn2
+            gate_bytes = tokens * num_o_heads * (head_dim_qk * f32_bytes + (head_dim_qk + head_dim_vo) * io_bytes)
+        num_chunks = ceil_div(seqlen, _CHUNK_SIZE[args.variant])
+        h_bytes = batch_size * num_o_heads * num_chunks * head_dim_qk * head_dim_vo * io_bytes
+        qkv_bytes = q_bytes + k_bytes + v_bytes
+        if mode == "fwd":
+            return qkv_bytes + gate_bytes + o_bytes
+        recompute_bytes = k_bytes + v_bytes + gate_bytes + h_bytes
+        return recompute_bytes + 2 * (qkv_bytes + gate_bytes) + o_bytes + h_bytes
+
+    def tb_per_sec(
+        batch_size,
+        seqlen,
+        head_dim_qk,
+        head_dim_vo,
+        num_q_heads,
+        num_kv_heads,
+        num_o_heads,
+        time,
+        mode="fwd",
+    ):
+        assert mode in ["fwd", "bwd"]
+        b = dram_bytes(
+            batch_size,
+            seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            num_q_heads,
+            num_kv_heads,
+            num_o_heads,
+            mode,
+        )
+        return b / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
+
     ## Gate generators per variant. Decays are LOG-space (alpha = exp(g)),
     ## drawn from ranges the kernels' io-dtype arithmetic is conditioned for.
     def generate_gates(io_dtype):
@@ -647,9 +888,15 @@ else:
             beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
             write_gate = None
         elif args.variant == "kda":
-            # per-key-channel decay [B, T, HO, K] fp32 + post-sigmoid scalar beta
+            # per-key-channel decay [B, T, HO, K] fp32 + post-sigmoid scalar
+            # beta; forward-only runs feed raw logits with the same effective
+            # distributions (the in-kernel activations invert them)
             gate = torch.empty(batch_size, seqlen, num_o_heads, head_dim_qk, device=device).uniform_(0.5, 1.0).log()
-            beta = torch.rand(batch_size, seqlen, num_o_heads, device=device).sigmoid()
+            beta = torch.rand(batch_size, seqlen, num_o_heads, device=device)
+            if kda_raw_gates:
+                gate = torch.special.logit((gate / _KDA_GATE_LOWER_BOUND).clamp(1e-7, 1 - 1e-7))
+            else:
+                beta = beta.sigmoid()
             write_gate = None
         else:  # gdn2
             # per-key decay/erase [B, T, HO, K] + per-value write gate [B, T, HO, V]
@@ -700,15 +947,20 @@ else:
             value.requires_grad_(True)
             gate.requires_grad_(True)
             beta.requires_grad_(True)
+            if write_gate is not None:
+                write_gate.requires_grad_(True)
 
-        # Per-sequence recurrent state ports (once-per-kernel I/O): the
-        # initial state seeds the recurrence; the final state is requested
-        # with --store_on and its gradient feeds the backward pass.
-        s0 = None
+        # Recurrent state ports: the initial state seeds the recurrence;
+        # --store_on dumps the per-chunk states plus the final state (whose
+        # gradient feeds the backward pass).
+        state0 = None
         if args.initial_state:
-            s0 = torch.randn(batch_size, num_o_heads, head_dim_qk, head_dim_vo, dtype=torch.float32, device=device) * 0.05
+            state0 = torch.randn(batch_size, num_o_heads, head_dim_qk, head_dim_vo, dtype=torch.float32, device=device) * 0.05
+            if args.la_backend == "flash_kda":
+                # FlashKDA state ports are V-major [B, H, V, K]
+                state0 = state0.transpose(-1, -2).contiguous()
             if run_bwd:
-                s0.requires_grad_(True)
+                state0.requires_grad_(True)
         if args.la_backend == "cudnn":
             dOutput = torch.randn(batch_size * seqlen, num_o_heads, head_dim_vo, dtype=target_dtype, device=device)
         else:
@@ -723,7 +975,7 @@ else:
         if run_fwd:
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("linear_attention.forward"):  # Custom marker
-                    output, final_state = la_function(query, key, value, gate, beta, write_gate, s0)
+                    output, final_state = la_function(query, key, value, gate, beta, write_gate, state0)
                 torch.cuda.synchronize()  # Ensure all kernels finish
 
             # Filter profiler results by kernel name prefix
@@ -734,6 +986,7 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or item.key.startswith("triton_")
                 or "chunk_" in item.key
+                or "_flash_kda_" in item.key
                 or "l2norm" in item.key
                 or "cutile" in item.key
                 or "_kernel" in item.key
@@ -745,7 +998,7 @@ else:
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
         else:
-            output, final_state = la_function(query, key, value, gate, beta, write_gate, s0)
+            output, final_state = la_function(query, key, value, gate, beta, write_gate, state0)
             torch.cuda.synchronize()
 
         if run_bwd:
@@ -783,6 +1036,7 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or item.key.startswith("triton_")
                 or "chunk_" in item.key
+                or "_flash_kda_" in item.key
                 or "l2norm" in item.key
                 or "cutile" in item.key
                 or "_kernel" in item.key
@@ -800,10 +1054,26 @@ else:
                 query_ref = query.detach().reshape(batch_size, seqlen, num_q_heads, head_dim_qk)
                 key_ref = key.detach().reshape(batch_size, seqlen, num_q_heads, head_dim_qk)
                 value_ref = value.detach().reshape(batch_size, seqlen, num_kv_heads, head_dim_vo)
-                gate_ref = gate.detach().reshape(batch_size, seqlen, *gate.shape[1:])
-                beta_ref = beta.detach().reshape(batch_size, seqlen, *beta.shape[1:])
-                s0_ref = s0.detach() if s0 is not None else None
-                output_ref, _ = fla_linear_attention(query_ref, key_ref, value_ref, gate_ref, beta_ref, None, s0_ref)
+                if args.la_backend == "cudnn":
+                    gate_ref = gate.detach().reshape(batch_size, seqlen, *gate.shape[1:])
+                    beta_ref = beta.detach().reshape(batch_size, seqlen, *beta.shape[1:])
+                elif args.la_backend == "flash_kda":
+                    # raw logits pass through; the fla reference applies the
+                    # same in-kernel activations
+                    gate_ref = gate.detach().float()
+                    beta_ref = beta.detach().float()
+                else:
+                    gate_ref = gate.detach()
+                    beta_ref = beta.detach()
+                state0_ref = state0.detach() if state0 is not None else None
+                if state0_ref is not None and args.la_backend == "flash_kda":
+                    state0_ref = state0_ref.transpose(-1, -2).contiguous()
+                wg_ref = None
+                if write_gate is not None:
+                    wg_ref = write_gate.detach()
+                    if args.la_backend == "cudnn":
+                        wg_ref = wg_ref.reshape(batch_size, seqlen, *write_gate.shape[1:])
+                output_ref, _ = fla_linear_attention(query_ref, key_ref, value_ref, gate_ref, beta_ref, wg_ref, state0_ref)
 
                 torch.testing.assert_close(output.detach(), output_ref, rtol=1e-2, atol=1e-2)
                 forward_diffs.append(torch.max(torch.abs(output.detach() - output_ref.detach())).item())
@@ -818,7 +1088,7 @@ else:
         else:
             forward_diffs.append(0.0)
 
-        del query, key, value, gate, beta, write_gate, output, final_state, s0, dOutput, dFinal
+        del query, key, value, gate, beta, write_gate, output, final_state, state0, dOutput, dFinal
 
     _clock_sampler.stop()
 
@@ -827,6 +1097,7 @@ else:
         np.median(np.array(forward_times[5:])) if len(forward_times) > 5 else (np.median(np.array(forward_times)) if len(forward_times) > 0 else 0.0)
     )
     fwd_tflops = 0.0
+    fwd_bw = 0.0
     if run_fwd and fwd_median_time > 0:
         fwd_tflops = tflops_per_sec(
             args.batch_size,
@@ -837,17 +1108,40 @@ else:
             fwd_median_time,
             "fwd",
         )
+        fwd_bw = tb_per_sec(
+            args.batch_size,
+            args.seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            args.num_q_heads,
+            args.num_kv_heads,
+            num_o_heads,
+            fwd_median_time,
+            "fwd",
+        )
 
     bwd_median_time = (
         np.median(np.array(backward_times[5:])) if len(backward_times) > 5 else (np.median(np.array(backward_times)) if len(backward_times) > 0 else 0.0)
     )
     bwd_tflops = 0.0
+    bwd_bw = 0.0
     if run_bwd and bwd_median_time > 0:
         bwd_tflops = tflops_per_sec(
             args.batch_size,
             args.seqlen,
             head_dim_qk,
             head_dim_vo,
+            num_o_heads,
+            bwd_median_time,
+            "bwd",
+        )
+        bwd_bw = tb_per_sec(
+            args.batch_size,
+            args.seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            args.num_q_heads,
+            args.num_kv_heads,
             num_o_heads,
             bwd_median_time,
             "bwd",
@@ -868,16 +1162,21 @@ else:
     fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
     bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
 
+    backend_tag = f"{args.la_backend}_state_on" if (args.store_on and args.la_backend == "cudnn") else args.la_backend
     if args.format_output:
         print(
-            f"{args.case_tag},{args.la_backend},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters}"
+            f"{args.case_tag},{backend_tag},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{fwd_bw:.2f},{bwd_bw:.2f}"
         )
     else:
         if run_fwd and run_bwd:
             print(
-                f"{args.la_backend}/{args.variant}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
+                f"{args.la_backend}/{args.variant}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}, {fwd_bw:.2f} TB/s), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str}, {bwd_bw:.2f} TB/s)"
             )
         elif run_fwd:
-            print(f"{args.la_backend}/{args.variant}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
+            print(
+                f"{args.la_backend}/{args.variant}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}, {fwd_bw:.2f} TB/s)"
+            )
         elif run_bwd:
-            print(f"{args.la_backend}/{args.variant}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")
+            print(
+                f"{args.la_backend}/{args.variant}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str}, {bwd_bw:.2f} TB/s)"
+            )

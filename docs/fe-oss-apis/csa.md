@@ -48,12 +48,13 @@ gradients on such padding rows.
 All arithmetic is fp32 with one final bf16 rounding; `mul.rn.f32` / `fma.rn.f32` are
 pinned in PTX so results do not depend on compiler FMA contraction. The numerics
 contract is **per ratio family** (the two families intentionally differ — do not
-assume the ratio=4 guarantees at ratio=128):
+assume the ratio {2, 4} guarantees at ratio=128):
 
-- **`ratio == 4`** (production, unchanged): against an fp32-intermediate eager
-  reference (same op order, fp32 throughout), `dKV`/`dScore` are **bit-identical**
-  and the forward matches within one bf16 rounding step on a tiny fraction of
-  elements.
+- **`ratio in {2, 4}`** (generic kernels; the bitwise contract — ratio=4 as originally
+  validated, ratio=2 added on the same terms): against an
+  fp32-intermediate eager reference (same op order, fp32 throughout), `dKV`/`dScore`
+  are **bit-identical** and the forward matches within one bf16 rounding step on a
+  tiny fraction of elements.
 - **`ratio == 128`** (deterministic tolerance contract): the kernels are
   **deterministic and faithful to the fp32-intermediate eager reference** (the
   same eager region computed with fp32 intermediates and one final bf16 rounding —
@@ -130,10 +131,11 @@ that need a fully deterministic backward must use an eager implementation.
 
 ### Support surface (`check_support`)
 
-- Compute capability **10.0** (the only validated architecture so far; the kernels use
-  no arch-specific features, wider enablement is possible after validation)
-- `ratio == 4`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
-  `coff == 1` the own-block window form) — served by the generic kernels, which are
+- Compute-capability major **>= 10** (SM100 and newer; the kernels use no
+  architecture-specific features beyond the SM100 baseline)
+- `ratio in {2, 4}`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
+  `coff == 1` the own-block window form; `ratio == 2` is the configuration used in
+  production training) — served by the generic kernels, which are
   generic over `(ratio, head_dim, coff in {1, 2})` but keep the whole pooling window in
   registers (register-bound beyond `ratio = 32`)
 - `ratio == 128`, `coff in {1, 2}`, `head_dim in {128, 512}` — served by dedicated
@@ -338,7 +340,7 @@ never-consumed slots and fp32-atomic `dAPE`, exactly as at ratio=4. The backward
 defaults to the same fast exp outside the d=128 small-pack (vec=1) buckets.
 
 **The ratio=128 numerics contract is the deterministic tolerance contract described in
-[Numerics](#numerics), NOT the ratio=4 bitwise-`dKV`/`dScore` contract.** The
+[Numerics](#numerics), NOT the generic-family (ratio {2, 4}) bitwise-`dKV`/`dScore` contract.** The
 reduction orders (forward chunk merge, backward `den`/`S` partial merge), the
 backward's hoisted reciprocal, and the fast-exp buckets all differ from the eager op
 order by design, each adopted on a measured same-GPU win and gated on tolerance +
@@ -347,14 +349,21 @@ stays bitwise run-to-run: fixed chunk boundaries and merge orders, no atomics in
 forward/`dKV`/`dScore`.
 
 Both kernels are register-flat in the window length (ptxas sm_100a: forward 32-51
-registers, backward 48-128 registers, 0 spill / 0 stack across every shipped
+registers, backward 64-128 registers, 0 spill / 0 stack across every shipped
 (config, schedule) kernel — 16 kernels total; reproduce the per-kernel table with
 `benchmark/csa/reg_probe_csa_compressor_r128.py`) and JIT in ~0.4-1.0 s per
 configuration.
 The backward picks its `rows_per_cta` at launch time (a runtime argument — no
 recompile) so the grid fits one resident wave; the static row capacity fixes it under
 CUDA-graph capture. Small packs (`nb_total <= 192`, d=128) switch the backward to a
-vec=1 schedule bucket (also precompiled) for grid-fill.
+vec=1 schedule bucket (also precompiled) for grid-fill. Every backward bucket except
+the c1d128 default additionally loads `grad_out` once per row and keeps the register
+vec live across the phase barriers (the `goreuse` schedule field): adopted per bucket
+on measured pure-kernel wins — up to ~26% on the vec=1 small buckets, whose small
+grids underfill the machine, so the +16/+1 register cost is not the binding
+constraint — while the c1d128 default measured ~1.3% slower with it at 131k tokens
+and keeps the phase-4 reload. `dKV`/`dScore` are bitwise-identical with and without
+the field (the same read-only values move into registers).
 
 Measured on 1x B200 (CC 10.0, driver 590.48.01), torch 2.13.0 / CUDA 13.3 /
 `nvidia-cutlass-dsl` 4.6.1; eager baseline = the fp32-intermediate reference region of
@@ -371,9 +380,9 @@ forward at long context):
 
 | config | tokens | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd | fused fwd+bwd total |
 |---|---|---|---|---|---|---|---|---|
-| coff 1, d 128 | 8192 | 84.7 us | 5.7 us | **15.0x** | 127.3 us | 8.4 us | **15.2x** | 15.1 us |
+| coff 1, d 128 | 8192 | 84.7 us | 5.7 us | **15.0x** | 127.3 us | 6.3 us | **20.2x** | 13.0 us |
 | coff 1, d 128 | 131072 | 451.8 us | 14.9 us | **30.2x** | 471.9 us | 63.7 us | **7.4x** | 82.5 us |
-| coff 2, d 128 | 8192 | 187.1 us | 6.4 us | **29.1x** | 246.2 us | 11.2 us | **21.9x** | 18.9 us |
+| coff 2, d 128 | 8192 | 187.1 us | 6.4 us | **29.1x** | 246.2 us | 10.5 us | **23.4x** | 18.1 us |
 | coff 2, d 128 | 65536 | 726.3 us | 16.4 us | **44.4x** | 960.0 us | 61.2 us | **15.7x** | 76.7 us |
 | coff 1, d 512 | 65536 | 641.1 us | 48.4 us | **13.2x** | 795.0 us | 104.2 us | **7.6x** | 150.0 us |
 | coff 2, d 512 | 65536 | 2315.2 us | 78.8 us | **29.4x** | 3261.9 us | 205.8 us | **15.9x** | 287.7 us |
@@ -386,9 +395,9 @@ kernels):
 
 | config | tokens | fused fwd | fused bwd |
 |---|---|---|---|
-| coff 1, d 128 | 8192 | 14.1 us | 24.3 us |
+| coff 1, d 128 | 8192 | 14.1 us | 20.8 us |
 | coff 1, d 128 | 131072 | 24.4 us | 82.1 us |
-| coff 2, d 128 | 8192 | 15.2 us | 26.3 us |
+| coff 2, d 128 | 8192 | 15.2 us | 25.3 us |
 | coff 2, d 128 | 65536 | 25.5 us | 75.6 us |
 | coff 1, d 512 | 65536 | 56.3 us | 118.9 us |
 | coff 2, d 512 | 65536 | 88.1 us | 220.8 us |
@@ -408,7 +417,7 @@ committed scripts `benchmark/csa/gate_csa_compressor_r128.py` and
 ```
 
 The tests validate numerics against an fp32-intermediate eager reference (bitwise
-`dKV`/`dScore` at ratio=4; the deterministic tolerance contract at ratio=128, with
+`dKV`/`dScore` at ratio {2, 4}; the deterministic tolerance contract at ratio=128, with
 fp64-oracle parity on finite-intermediate inputs), the upstream eager numerics, plus ragged packs, static-capacity
 padding, kernel-side zero-writes into uninitialized gradient buffers (NaN-canary with
 exact-zero assertions on every never-consumed slot class, and the `total_comp == 0`

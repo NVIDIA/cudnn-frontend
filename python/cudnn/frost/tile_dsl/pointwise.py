@@ -3,6 +3,7 @@
 
 
 import inspect
+from typing import Type
 
 import cutlass
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
@@ -33,13 +34,11 @@ def _packed_f32x2(op, vec_a, vec_b):
 
 def tmem_load_max_reduction(tmem_addr, num: cutlass.Constexpr = 64):
     """tcgen05.ld.red.sync.aligned.32x32b.x{num}.f32.max — fused TMEM
-    load + HW row-max reduction (LDTM.STAT).  Mirrors C++ templated
-    ``tile::tmem_load_max_reduction<N>``.  ``num`` is the elements-per-
+    load + HW row-max reduction (LDTM.STAT).  ``num`` is the elements-per-
     thread count (= TILE_N/2 for the current dual-MMA softmax path).
     """
     _data_ops = ", ".join("{$w%d}" % i for i in range(num))
-    _ptx = ("tcgen05.ld.red.sync.aligned.32x32b.x%d.f32.max "
-            "{" + _data_ops + "}, {$w%d}, [{$r0}];") % (num, num)
+    _ptx = ("tcgen05.ld.red.sync.aligned.32x32b.x%d.f32.max " "{" + _data_ops + "}, {$w%d}, [{$r0}];") % (num, num)
     outs = inline_ptx(
         _ptx,
         write_only_types=[cutlass.Int32] * (num + 1),
@@ -125,9 +124,14 @@ def fp32_to_fp16(lo, hi, *, dtype=cutlass.Float16):
     )
 
 
-def fp32_to_fp8_pack(values, *, dtype_tag: str):
+def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     assert len(values) == 16, f"fp32_to_fp8_pack: expected 16 input values, got {len(values)}"
-    assert dtype_tag in ("e4m3", "e5m2"), f"fp32_to_fp8_pack: dtype_tag must be 'e4m3' or 'e5m2', got {dtype_tag!r}"
+    if dtype == cutlass.Float8E4M3FN:
+        dtype_tag = "e4m3"
+    elif dtype == cutlass.Float8E5M2:
+        dtype_tag = "e5m2"
+    else:
+        raise TypeError(f"fp32_to_fp8_pack: dtype must be Float8E4M3FN or Float8E5M2, got {dtype}")
 
     u0, u1, u2, u3 = inline_ptx(
         "{ .reg .b16 lo, hi;\n"
@@ -147,6 +151,29 @@ def fp32_to_fp8_pack(values, *, dtype_tag: str):
         read_only_args=list(values),
     )
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
+
+
+@cute.jit
+def fp32_to_fp8x2(lo: cutlass.Float32, hi: cutlass.Float32, *, dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float8E4M3FN) -> cutlass.Uint16:
+    """Pack two fp32 into fp8 bytes: low byte = fp8(lo), byte 1 = fp8(hi)."""
+    if cutlass.const_expr(dtype != cutlass.Float8E4M3FN and dtype != cutlass.Float8E5M2):
+        raise TypeError(f"Invalid FP8 dtype: {dtype}")
+    cvt_tag = "e4m3x2" if cutlass.const_expr(dtype == cutlass.Float8E4M3FN) else "e5m2x2"
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 fa, fb; mov.b32 fa, {$r0}; mov.b32 fb, {$r1}; " + f"cvt.rn.satfinite.{cvt_tag}.f32 " + "{$w0}, fa, fb; }",
+        write_only_types=[cutlass.Uint16],
+        read_only_args=[hi.bitcast(cutlass.Int32), lo.bitcast(cutlass.Int32)],
+    )
+
+
+@cute.jit
+def pack_fp8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.Int32:
+    """Two fp8x2 halves into one 32-bit MMA A/B operand (pair0 = low half)."""
+    return cute.arch.inline_ptx(
+        "mov.b32 $0, {$1, $2};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[pair0, pair1],
+    )
 
 
 def vec_scale_pair(vec, scalar, N):
@@ -282,9 +309,124 @@ def mul_f16x2(lhs: cutlass.Int32, rhs: cutlass.Int32, input_dtype: cutlass.Const
 @cute.jit
 def sigmoid_f16x2(logit_pair: cutlass.Int32, input_dtype: cutlass.Constexpr):
     """Sigmoid of a packed 16-bit logit pair, returned as two fp32 values."""
-
     logit_vec_f32 = cutlass.Vector.from_elements((logit_pair,), cutlass.Int32).bitcast(input_dtype).to(cutlass.Float32)
+    return sigmoid2(logit_vec_f32[0], logit_vec_f32[1])
+
+
+L2_NORM_EPS = 1.0e-12
+
+
+@cute.jit
+def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cutlass.Float32:
+    """Sum ``value`` across a power-of-two group of consecutive lanes via
+    butterfly shuffles (every lane ends up holding the group total)."""
+    offset = lanes // 2
+    while offset >= 1:
+        value = value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, value, offset, 31, kind=nvvm.Shfl.BFLY))
+        offset = offset // 2
+    return value
+
+
+@cute.jit
+def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
+    """Inverse L2 norm with the shared epsilon floor: rows at or below the
+    floor normalize by ``1 / L2_NORM_EPS`` instead of dividing by zero."""
+    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
+    return cute.math.rsqrt(cute.math.max(sum_sq, norm_floor_sq), fastmath=True)
+
+
+@cute.jit
+def sigmoid(x: cutlass.Float32) -> cutlass.Float32:
+    """sigmoid(x) via the tanh identity (single MUFU on Blackwell)."""
     half = cutlass.Float32(0.5)
-    value0 = cute.math.tanh(logit_vec_f32[0] * half, approx=True) * half + half
-    value1 = cute.math.tanh(logit_vec_f32[1] * half, approx=True) * half + half
-    return value0, value1
+    return cute.math.tanh(x * half, approx=True) * half + half
+
+
+@cute.jit
+def sigmoid2(x_lo, x_hi):
+    """``(sigmoid(x_lo), sigmoid(x_hi))`` via the tanh identity, with the
+    halving and the scale-bias folded into one FMUL2 and one FFMA2."""
+    half = opaque_f32_zero() + cutlass.Float32(0.5)
+    scaled_lo, scaled_hi = fmul2(x_lo, x_hi, half, half)
+    tanh_lo = cute.math.tanh(scaled_lo, approx=True)
+    tanh_hi = cute.math.tanh(scaled_hi, approx=True)
+    return ffma2(tanh_lo, tanh_hi, half, half, half, half)
+
+
+@cute.jit
+def softplus(x: cutlass.Float32) -> cutlass.Float32:
+    """log(1 + exp(x)) with the linear tail (x > 20 returns x: exp saturates
+    fp32 there and log1p(exp(x)) == x to fp32 precision)."""
+    result = x
+    if x < cutlass.Float32(20.0):
+        result = cute.math.log(cutlass.Float32(1.0) + cute.math.exp(x, fastmath=True), fastmath=True)
+    return result
+
+
+@cute.jit
+def softplus2(x_lo, x_hi):
+    """``(softplus(x_lo), softplus(x_hi))`` with the ``1 + exp`` step packed
+    into one FADD2 and the linear tail applied as a select."""
+    one = cutlass.Float32(1.0)
+    tail = cutlass.Float32(20.0)
+    exp_lo = cute.math.exp(x_lo, fastmath=True)
+    exp_hi = cute.math.exp(x_hi, fastmath=True)
+    sum_lo, sum_hi = fadd2(exp_lo, exp_hi, one, one)
+    log_lo = cute.math.log(sum_lo, fastmath=True)
+    log_hi = cute.math.log(sum_hi, fastmath=True)
+    return (log_lo if x_lo < tail else x_lo), (log_hi if x_hi < tail else x_hi)
+
+
+@cute.jit
+def ex2_f16x2(pair: cutlass.Int32, *, dtype=cutlass.Float16) -> cutlass.Int32:
+    """Packed-pair ``exp2`` in ONE MUFU op: ``ex2.approx.f16x2`` (fp16) or
+    ``ex2.approx.ftz.bf16x2`` (bf16).
+
+    PTX/target contract (ISA 9.4, 9.7.4.10):
+
+    - ``.f16x2``: PTX ISA 7.0, sm_75+. Max relative error 2^-9.9; subnormal
+      inputs are supported.
+    - ``.ftz.bf16x2``: PTX ISA 7.8, sm_90+. Max relative error 2^-7; ``ftz``
+      is mandatory for bf16 — subnormal inputs and results flush to
+      sign-preserving zero (so +/-subnormal -> +1.0; -Inf -> +0.0;
+      NaN -> NaN).
+    """
+    if cutlass.const_expr(dtype != cutlass.Float16 and dtype != cutlass.BFloat16):
+        raise TypeError(f"ex2_f16x2: dtype must be Float16 or BFloat16, got {dtype}")
+    op = "ex2.approx.f16x2" if cutlass.const_expr(dtype == cutlass.Float16) else "ex2.approx.ftz.bf16x2"
+    return inline_ptx(
+        f"{op} $0, $1;",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[pair],
+    )
+
+
+@cute.jit
+def f16x2x2_to_fp8_word(lo_pair: cutlass.Int32, hi_pair: cutlass.Int32, dtype_tag: cutlass.Constexpr, *, dtype=cutlass.Float16) -> cutlass.Int32:
+    """Two packed half-pair words (elems 0..3 in order) into one 4-byte FP8 word.
+
+    ``cvt.rn.satfinite.{e4m3,e5m2}x2.{f16x2,bf16x2}`` converts a packed pair
+    directly (no f32 round-trip): byte 0 = fp8(lo of lo_pair) ... byte 3 =
+    fp8(hi of hi_pair), matching :func:`fp32_to_fp8_pack`'s element order.
+    ``satfinite`` semantics: NaN converts to NaN in the destination format;
+    |x| > MAX_NORM saturates to sign-preserved MAX_NORM (448 e4m3 / 57344
+    e5m2) — never Inf.
+
+    PTX/target contract (ISA 9.4, 9.7.10.24):
+
+    - ``.f16x2`` source: PTX ISA 7.8, sm_90+ (sm_89 from ISA 8.1).
+    - ``.bf16x2`` source: PTX ISA 9.1, family-specific targets only
+      (sm_100f/sm_110f/sm_120f or higher in family) — a CUDA 13.1+
+      toolchain floor.
+    """
+    if cutlass.const_expr(dtype != cutlass.Float16 and dtype != cutlass.BFloat16):
+        raise TypeError(f"f16x2x2_to_fp8_word: dtype must be Float16 or BFloat16, got {dtype}")
+    if cutlass.const_expr(dtype_tag != "e4m3" and dtype_tag != "e5m2"):
+        raise ValueError(f"f16x2x2_to_fp8_word: dtype_tag must be 'e4m3' or 'e5m2', got {dtype_tag}")
+    src = "f16x2" if cutlass.const_expr(dtype == cutlass.Float16) else "bf16x2"
+    dst = "e4m3x2" if cutlass.const_expr(dtype_tag == "e4m3") else "e5m2x2"
+    return inline_ptx(
+        f"{{ .reg .b16 lo, hi; cvt.rn.satfinite.{dst}.{src} lo, $1; cvt.rn.satfinite.{dst}.{src} hi, $2; mov.b32 $0, {{lo, hi}}; }}",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[lo_pair, hi_pair],
+    )

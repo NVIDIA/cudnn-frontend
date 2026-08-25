@@ -324,9 +324,9 @@ def _reordering_name(t: Any) -> "str | None":
 
 
 def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
-    """Translate one native-IR ``Node`` into a :class:`_RecordedOp`, or None for a
-    node type outside the GEMM family (ignored — the analyzer only consumes the
-    matmul / pointwise / block-scale / MoE / reduction ops)."""
+    """Translate one native-IR ``Node`` into a :class:`_RecordedOp`, or None when
+    this family has no lowering for that node type. The caller must DECLINE on
+    None — never skip the node."""
     node_type = node.node_type.name
     name = node.name
     compute = _map_dtype(node.compute_data_type)
@@ -492,8 +492,14 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
     ops: list[_RecordedOp] = []
     for node in nodes:
         recorded = _node_to_recorded_op(node)
-        if recorded is not None:
-            ops.append(recorded)
+        if recorded is None:
+            # Declining beats ignoring. Dropping an unrecognized node compiled a
+            # SUBGRAPH and then asked the caller for buffers it never bound
+            # (matmul -> reshape died in execute with "missing buffers for
+            # ['mm::C']"), and because the engine had already claimed the graph
+            # there was no backend left to fall back to.
+            raise NotImplementedError(f"frost_gemm: no lowering for node type {node.node_type.name}")
+        ops.append(recorded)
 
     for op in ops:
         if op.cudnn_name == "block_scale_dequantize":
@@ -556,32 +562,10 @@ def build_gemm_plan(graph: cudnn.pygraph):
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import jit_from_cudnn_graph
-    from .tile_config import select_config
+    from .compiler import jit_from_cudnn_graph, plan_config
 
-    chain = analyze(graph)
-    tile_m = chain.matmul.M
-    if chain.moe is not None:
-        groups = chain.moe.num_groups
-        tile_m = (chain.matmul.M + groups - 1) // groups
-    from .dtypes import DTYPE_BYTES
-
-    # Only plain (non-mainloop-fusion, non-MoE) matmul has a static-scheduler template;
-    # asking for "static" anywhere else fails template lookup outright. Selection itself
-    # is one path for every graph type -- this flag only gates the scheduler.
-    supports_static = chain.moe is None and not chain.has_mainloop_fusion
-
-    config, cta_group, scheduler = select_config(
-        tile_m,
-        chain.matmul.N,
-        chain.num_gemms,
-        K=chain.matmul.K,
-        block_scale=chain.has_block_scale,
-        b_n_major=chain.matmul.b_major == "n",
-        b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
-        supports_static=supports_static,
-    )
-    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+    config, cta_group = plan_config(analyze(graph))
+    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
 
 
 # Analyzer

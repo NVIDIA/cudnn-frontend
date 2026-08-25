@@ -2,6 +2,7 @@
 
 - [ ] I agree to license this contribution under the terms of [LICENSE.txt](https://github.com/NVIDIA/cudnn-frontend/blob/develop/LICENSE.txt).
 - [ ] I ran `pre-commit run` and committed any formatting changes.
+- [ ] I added GitHub labels: one `cat-*`, one or more `mod-*`, and one `orig-*` (see [label list](https://github.com/NVIDIA/cudnn-frontend/labels)).
 
 ## Affected area
 

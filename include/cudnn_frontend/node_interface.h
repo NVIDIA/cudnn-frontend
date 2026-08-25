@@ -407,6 +407,14 @@ class INode {
     virtual Type
     getType() = 0;
 
+    // Returns this node's SDPA attributes if it is an SDPA node, nullptr otherwise.
+    // Provides an RTTI-free alternative to dynamic_cast for SDPA node discovery so that
+    // these headers compile under -fno-rtti (GCC/Clang) and /GR- (MSVC).
+    virtual SDPA_attributes const*
+    get_sdpa_attributes() const {
+        return nullptr;
+    }
+
     virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         return {-1, {}};

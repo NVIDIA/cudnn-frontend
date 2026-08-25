@@ -28,6 +28,24 @@ _CASES = (
 )
 
 
+def _active_sm() -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+def _int8_mma_unavailable() -> str | None:
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES
+
+    ranges = MMA_GPU_ARCH_SPECIAL_CASES[("sm100", ("int8", "int8", "int32"))]
+    sm = _active_sm()
+    if sm is not None and any(lo <= sm < hi for lo, hi in ranges):
+        return None
+    where = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in ranges)
+    return f"int8 MMA exists only on {where}, have " + ("no GPU" if sm is None else f"sm_{sm}")
+
+
 # E2M1 (FP4) 4-bit code -> value lookup (low nibble first within a byte).
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
@@ -175,6 +193,11 @@ def _block_scale_case(combo: str, M: int, N: int, K: int) -> None:
 
 def main(M: int = 256, N: int = 256, K: int = 256) -> None:
     for label, io_dt, out_dt, compute_dt, torch_in, torch_out, rng in _CASES:
+        if torch_in is torch.int8:
+            why = _int8_mma_unavailable()
+            if why is not None:
+                print(f"[00] SKIP  {label:16s} {why}")
+                continue
         a, b = _mkdata(M, N, K, torch_in, rng)
 
         g, A, B, C = _build_matmul_graph(M, N, K, io_dt, out_dt, compute_dt)

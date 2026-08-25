@@ -4,8 +4,8 @@
 """Frontend integration: the GEMM engine ``frost_gemm`` joins the ONE ranked
 plan list the graph API builds at create_execution_plans() — discovered from
 ``cudnn/engines/manifest.py``, no registration call and no environment variable.
-Exercises its presence in the list, select_plan/deselect_engines, the build walk
-falling through a declining plan, ineligible graphs, and the wrapper.Graph path.
+Exercises its presence in the list, select_plan, ineligible graphs, and the
+wrapper.Graph path.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch
 from gemm_test_utils import requires_sm100
 
 import cudnn
-from cudnn.engines import MANIFEST, OUT_OF_TREE_ID_BASE, PlanConfig, Router, is_backend_engine, is_python_engine
+from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 pytestmark = pytest.mark.L0
 
@@ -95,7 +95,8 @@ def test_engine_is_in_the_manifest():
     library's job, not a registration call the user has to make."""
     (row,) = [r for r in MANIFEST if r.name == _FROST]
     assert is_python_engine(row.engine_id)
-    assert row.module == "cudnn.gemm.frost.engine" and row.factory == "FrostGemmEngine"
+    assert row.module == "cudnn.gemm.frost.engine" and row.factory == "FrostGemmEngines"
+    assert list(row.slots) == [_FROST], "the manifest assigns this engine its id"
 
 
 @_GPU
@@ -228,11 +229,11 @@ def test_misaligned_buffer_rejected():
 
 
 @_GPU
-@pytest.mark.parametrize("route", ["default", "frost", "deselected"])
+@pytest.mark.parametrize("route", ["default", "frost"])
 def test_ranked_list_routes_and_all_routes_agree(route):
     """The same graph runs on whichever entry of the ranked list is selected:
-    the default, the FROST entry pinned by select_plan, or the backend after
-    deselect_engines bars FROST. All three produce the right numbers.
+    the default, or the FROST entry pinned by select_plan. Both produce the
+    right numbers.
 
     The default route asserts nothing about WHICH engine served it — that is
     the placeholder in engines/heuristics.py, and a cost model will change it."""
@@ -241,8 +242,6 @@ def test_ranked_list_routes_and_all_routes_agree(route):
     _plan(g)
     if route == "frost":
         _pin_frost(g)
-    elif route == "deselected":
-        g.deselect_engines([_FROST])
     g.check_support()
     g.build_plans()
     if route == "frost":
@@ -251,51 +250,6 @@ def test_ranked_list_routes_and_all_routes_agree(route):
         # scratch from the caller (its TMA-descriptor buffer is a one-time,
         # plan-owned allocation) — not a blanket FROST 0.
         assert g.get_workspace_size() == 0
-    elif route == "deselected":
-        assert g.selected_engine is None  # FROST barred -> the backend served it
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
-
-
-@_GPU
-def test_build_walk_falls_through_a_declining_plan(caplog):
-    """A plan that declines at build time is logged and the walk moves to the
-    next entry — here a python engine ranked ahead of the backend, so the graph
-    still builds and executes natively with no exception reaching the user
-    (a select_plan pin is strict instead; see build_plans)."""
-    import logging
-
-    from cudnn.engines import BaseEngine
-
-    class Boom(BaseEngine):
-        name = "frost_fake_always_fails"
-        engine_id = OUT_OF_TREE_ID_BASE + 1
-
-        def build_plan(self, graph, plan, ctx=None):
-            raise NotImplementedError("frost build boom")
-
-        def execute(self, graph, tensor_data, ctx=None):
-            raise AssertionError("should never run")
-
-    boom = Boom()
-
-    class BoomFirst(Router):
-        def plan(self, graph, engines):
-            return [PlanConfig(boom.engine_id)] + graph.backend_plan_entries()
-
-    a, b, bias_t, ref = _operands()
-    g, A, B, bias, Y = _build_matmul_bias_relu()
-    g.set_router(BoomFirst()).register_backend(boom)
-    _plan(g)
-    assert g.get_plan_name_at_index(0) == "frost_fake_always_fails"
-    g.check_support()
-    with caplog.at_level(logging.INFO, logger="cudnn.pygraph"):
-        g.build_plans()  # entry 0 declines -> the walk lands on the backend
-    assert any("declined at build time" in r.getMessage() for r in caplog.records)
-    assert g.selected_engine is None and is_backend_engine(g.plans[g._plan_index].engine_id)
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
@@ -313,71 +267,6 @@ def test_frost_is_one_entry_of_the_ranked_list():
     assert names.count(_FROST) == 1
     assert g.get_execution_plan_count() == len(names)
     assert sum(1 for p in g.plans if is_python_engine(p.engine_id)) == 1
-
-
-class _LoweredSpy:
-    """Records deselect_engines calls reaching the lowered C++ graph, forwarding
-    everything else untouched."""
-
-    def __init__(self, real):
-        self._real = real
-        self.deselected = []
-
-    def __getattr__(self, name):
-        attr = getattr(self._real, name)
-        if name != "deselect_engines":
-            return attr
-
-        def _record(names, *args, **kwargs):
-            self.deselected.append(list(names))
-            return attr(names, *args, **kwargs)
-
-        return _record
-
-
-def _spy_on_lowered(g):
-    spy = _LoweredSpy(g.__dict__["_lowered_graph"])
-    g.__dict__["_lowered_graph"] = spy
-    return spy
-
-
-def _native_engine_token(g):
-    """The cuDNN engine name (e.g. "eng0") of the leading NATIVE plan."""
-    return g.get_plan_name_at_index(_first_backend_index(g)).split("_")[0]
-
-
-@_GPU
-def test_deselect_native_engine_reaches_cudnn():
-    """deselect_engines is the classic API and stays a passthrough to the
-    lowered C++ graph — pygraph bars the name across the whole ranked list AND
-    forwards it, so a backend engine name still reaches cuDNN itself."""
-    g, *_ = _build_matmul_bias_relu()
-    _plan(g)
-    native = _native_engine_token(g)
-    spy = _spy_on_lowered(g)
-    assert g.deselect_engines([native]) is g  # fluent, like the other setters
-    assert spy.deselected == [[native]]
-
-
-@_GPU
-def test_deselect_mixed_frost_and_native():
-    """A mixed list bars the python engine locally AND forwards to cuDNN; the
-    barred FROST entry is skipped by the build walk."""
-    a, b, bias_t, ref = _operands()
-    g, A, B, bias, Y = _build_matmul_bias_relu()
-    _plan(g)
-    native = _native_engine_token(g)
-    spy = _spy_on_lowered(g)
-    g.deselect_engines([_FROST, native])
-    assert _FROST in g._barred_names
-    assert spy.deselected == [[_FROST, native]]
-    g.build_plans()
-    assert g.selected_engine is None  # FROST barred -> a backend plan serves it
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
 def _build_moe(S=512, N=256, K=256, E=4):
@@ -470,6 +359,71 @@ def test_ineligible_graph_not_listed():
     assert not any(is_python_engine(p.engine_id) for p in g.plans)
 
 
+def _bf16_graph(m, n, k, *, epi=None, out_dt=None, b_major="k", ntap=0):
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    bs = [k * n, 1, k] if b_major == "k" else [k * n, n, 1]
+    B = g.tensor(name="B", dim=[1, k, n], stride=bs)
+    C = g.matmul(A=A, B=B, name="mm")
+    if ntap:
+        C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    T = getattr(g, epi)(input=C, name="e") if epi else C
+    T.set_output(True).set_data_type(out_dt or cudnn.data_type.BFLOAT16)
+    return g
+
+
+def _moe_graph(s, n, k, e, *, token_major="k"):
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    ts = [s * k, k, 1] if token_major == "k" else [s * k, 1, s]
+    tok = g.tensor(name="token", dim=[1, s, k], stride=ts, data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[e, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    return g
+
+
+_AGREEMENT_GRAPHS = {
+    "plain": lambda: _bf16_graph(256, 256, 256),
+    "relu": lambda: _bf16_graph(256, 256, 256, epi="relu"),
+    "tap": lambda: _bf16_graph(256, 256, 256, epi="relu", ntap=1),
+    "fp32_out": lambda: _bf16_graph(256, 256, 256, out_dt=cudnn.data_type.FLOAT),
+    "b_n_major": lambda: _bf16_graph(256, 256, 256, b_major="n"),
+    "tall_narrow": lambda: _bf16_graph(4096, 64, 256),
+    "moe": lambda: _moe_graph(2048, 256, 256, 8),
+    "moe_token_m_major": lambda: _moe_graph(2048, 256, 256, 8, token_major="m"),
+}
+
+
+@_GPU
+@pytest.mark.parametrize("name", sorted(_AGREEMENT_GRAPHS))
+def test_probe_and_build_agree(name):
+    """``probe_gemm_plan`` is what puts frost_gemm in the ranked list, and
+    ``build_gemm_plan`` is what has to honour it. When the probe is the more
+    permissive of the two, the engine is listed, ``build_plans`` drops it and
+    native cuDNN silently serves the graph -- a rejection with NO test failure.
+    This pins them equal, which is the only regression signal the epilogue gates
+    have on the public path."""
+    from cudnn.gemm.frost.graph_analyzer import build_gemm_plan, probe_gemm_plan
+
+    g = _AGREEMENT_GRAPHS[name]()
+    probed = probe_gemm_plan(g)
+    try:
+        build_gemm_plan(_AGREEMENT_GRAPHS[name]())
+        built, why = True, ""
+    except (NotImplementedError, ValueError) as exc:
+        built, why = False, str(exc)
+    assert probed == built, f"probe={probed} but build={built}" + (f" ({why})" if why else "")
+
+
 @_GPU
 def test_wrapper_graph_path():
     """wrapper.Graph(heuristics=[A]) plans and executes the fused graph."""
@@ -510,3 +464,64 @@ def test_wrapper_graph_path():
     g({A: a, B: b, bias: bias_t, Y: y})
     torch.cuda.synchronize()
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
+
+
+# Override shape is a BACKEND feature: `is_override_shape_enabled=True` is rejected
+# by build_operation_graph(), before create_execution_plans() ever probes an engine.
+# So this gate is on the backend regardless of which plan ends up serving the graph.
+@pytest.mark.skipif(
+    cudnn.backend_version() < 92100,
+    reason="override shape requires cuDNN backend 9.21.0+",
+)
+@_GPU
+def test_override_shape_inside_a_max_allocation_matches_the_backend():
+    """The case override shape is FOR: allocate once at a cache shape, name the
+    live shape per call.
+
+    A caller does not pick the plan, so the two paths have to answer the same
+    question. FROST reads its M/N/K off the operands, so this only works if
+    ``execute`` applies the overrides to what it hands the engine -- and in the
+    axis order the operand already uses, since ``override_shapes`` speaks the
+    graph's declaration (B is ``[batch, K, N]``) while the buffer is allocated
+    ``(batch, N, K)``. Getting that wrong reads N as K and the kernel rejects
+    the launch, or worse runs the whole allocation.
+    """
+    mb, nb, kb = 256, 256, 128
+    m, n, k = 128, 192, 64
+    a = torch.empty(1, mb, kb, dtype=torch.int32).random_(-2, 2).to(torch.bfloat16).cuda()
+    b = torch.empty(1, nb, kb, dtype=torch.int32).random_(-2, 2).to(torch.bfloat16).cuda()
+    ref = torch.einsum("bmk,bnk->bmn", a[:, :m, :k].float(), b[:, :n, :k].float()).to(torch.bfloat16)
+
+    uids = [1, 2, 3]
+    shapes = [[1, m, k], [1, k, n], [1, m, n]]
+    strides = [[mb * kb, kb, 1], [nb * kb, 1, kb], [mb * nb, nb, 1]]
+
+    results = {}
+    for want_frost in (False, True):
+        g = cudnn.pygraph(
+            io_data_type=cudnn.data_type.BFLOAT16,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+            is_dynamic_shape_enabled=True,
+            is_override_shape_enabled=True,
+        )
+        A = g.tensor(name="A", uid=1, dim=[1, mb, kb], stride=[mb * kb, kb, 1], data_type=cudnn.data_type.BFLOAT16)
+        B = g.tensor(name="B", uid=2, dim=[1, kb, nb], stride=[kb * nb, 1, kb], data_type=cudnn.data_type.BFLOAT16)
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_uid(3)
+        _plan(g)
+        index = _index_of(g, _FROST) if want_frost else _first_backend_index(g)
+        g.select_plan(index)
+        g.check_support()
+        g.build_plans()
+
+        h = cudnn.create_handle()
+        wsz = g.get_workspace_size_plan_at_index(index, h, uids, shapes, strides)
+        ws = torch.empty(max(wsz, 1), device="cuda", dtype=torch.uint8)
+        c = torch.zeros(1, mb, nb, dtype=torch.bfloat16, device="cuda")
+        g.execute({1: a, 2: b, 3: c}, ws, handle=h, override_uids=uids, override_shapes=shapes, override_strides=strides)
+        torch.cuda.synchronize()
+        results[g.get_plan_name_at_index(index)] = c[:, :m, :n].clone()
+
+    for name, got in results.items():
+        torch.testing.assert_close(got, ref, atol=0, rtol=0, msg=lambda s, name=name: f"{name} ran the wrong shape\n{s}")

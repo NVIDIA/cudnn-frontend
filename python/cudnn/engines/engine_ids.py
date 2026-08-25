@@ -28,13 +28,17 @@ CPP_OSS_ENGINE_ID_BASE = 10_000
 # learned about them in this change — so there is nothing recorded to migrate.
 PYTHON_ENGINE_ID_BASE = 20_000
 
-# Python families. A family owns a contiguous block so one family can expose
-# several ids (per kernel / per cell) without stepping on its neighbours.
-LINEAR_ATTENTION_ID_BASE = PYTHON_ENGINE_ID_BASE + 100  # 20_100..20_199
-FROST_GEMM_ID_BASE = PYTHON_ENGINE_ID_BASE + 200  # 20_200..20_299
-FROST_SDPA_FWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 300  # 20_300..20_399
-FROST_SDPA_BWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 400  # reserved
-OUT_OF_TREE_ID_BASE = PYTHON_ENGINE_ID_BASE + 10_000  # 30_000+, register_backend()
+# One block per FAMILY, FAMILY_BLOCK ids wide. A family is a kind of graph (see
+# engines/manifest.py); every engine that serves that kind draws its id from
+# that family's block, taking the next free slot. A family never opens a second
+# block, so engine_id alone identifies the family and the two cannot disagree.
+FAMILY_BLOCK = 100
+GDN_ID_BASE = PYTHON_ENGINE_ID_BASE + 100  # 20_100..20_199
+KDA_ID_BASE = PYTHON_ENGINE_ID_BASE + 200  # 20_200..20_299
+GDN2_ID_BASE = PYTHON_ENGINE_ID_BASE + 300  # 20_300..20_399
+FROST_GEMM_ID_BASE = PYTHON_ENGINE_ID_BASE + 400  # 20_400..20_499
+FROST_SDPA_FWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 500  # 20_500..20_599
+FROST_SDPA_BWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 600  # 20_600..20_699
 
 # The delegating entry: the backend picks among candidates it holds but does not
 # expose as plans (heur_mode.OPENSOURCE). It has no C++ plan index and no

@@ -627,6 +627,12 @@ def dense_indexer_score_recompute_wrapper(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     q_causal_offsets: Optional[torch.Tensor] = None,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
@@ -637,6 +643,34 @@ def dense_indexer_score_recompute_wrapper(
         max_seqlen_q,
         max_seqlen_k,
     )
+    precision = precision.lower()
+    if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+        major, _ = torch.cuda.get_device_capability()
+        if major == 9:
+            raise NotImplementedError("Dense indexer score FP8/MXFP8 is SM100-only")
+        o, d = _iface_sm100.dense_indexer_score_recompute(
+            q,
+            k,
+            weights,
+            qhead_per_kv_head=qhead_per_kv_head,
+            out=out,
+            denom_out=denom_out,
+            sm_scale=sm_scale,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q if is_thd else max_seqlen_q,
+            max_seqlen_k=max_k if is_thd else max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            current_stream=stream,
+        )
+        return TupleDict(out=o, denom=d)
     key = (
         q.dtype,
         q.shape,
@@ -838,6 +872,12 @@ def dense_attn_score_recompute_wrapper(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     q_causal_offsets: Optional[torch.Tensor] = None,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
@@ -848,6 +888,34 @@ def dense_attn_score_recompute_wrapper(
         max_seqlen_q,
         max_seqlen_k,
     )
+    precision = precision.lower()
+    if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+        major, _ = torch.cuda.get_device_capability()
+        if major == 9:
+            raise NotImplementedError("Dense attention score MXFP8 is SM100-only")
+        o, d = _iface_sm100.dense_attn_score_recompute(
+            q,
+            k,
+            lse,
+            softmax_scale,
+            qhead_per_kv_head=qhead_per_kv_head,
+            out=out,
+            denom_out=denom_out,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q if is_thd else max_seqlen_q,
+            max_seqlen_k=max_k if is_thd else max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            current_stream=stream,
+        )
+        return TupleDict(out=o, denom=d)
     key = (
         q.dtype,
         q.shape,

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Callable
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
@@ -24,10 +23,12 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
+from benchmark_utils import add_sweep_args, ceil_div, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms, to_blocked
 
-def _build_plan(g, cfg, cta_group, sched):
+
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
@@ -74,19 +75,6 @@ _E2M1 = [
 ]
 
 
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _to_blocked(x):
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
 def _unpack_fp4(u8, lut):
     lo = lut[(u8 & 0xF).long()]
     hi = lut[(u8 >> 4).long()]
@@ -127,6 +115,9 @@ def _graph(B, M, N, K, bs=16):
 
 
 def _mkdata(B, M, N, K, bs=16):
+    """One independent input set: the per-GEMM ((a, sfa), (b, sfb)) pairs (A shared
+    by both GEMMs), the dequantized fp32 operands the reference/baseline read, and
+    its own fused / baseline output buffers."""
     dev = "cuda"
     sf_k = K // bs
     lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -141,7 +132,8 @@ def _mkdata(B, M, N, K, bs=16):
 
     def _sf(rows):
         log = torch.randint(1, 4, (B, rows, sf_k), device=dev).to(torch.float8_e4m3fn)
-        blk = torch.stack([_to_blocked(log[b]) for b in range(B)]).view(B, rows, sf_k)
+        # to_blocked pads to whole 128-row x 4-SF-K atoms — view the PADDED dims.
+        blk = torch.stack([to_blocked(log[b]) for b in range(B)]).view(B, ceil_div(rows, 128) * 128, ceil_div(sf_k, 4) * 4)
         return log, blk
 
     sfa_log, sfa_b = _sf(M)
@@ -152,7 +144,20 @@ def _mkdata(B, M, N, K, bs=16):
     b0_s = b0_deq * sfb0_log.float().repeat_interleave(bs, 2)
     b1_s = b1_deq * sfb1_log.float().repeat_interleave(bs, 2)
     pairs = [((a_rt, sfa_b), (b0_rt, sfb0_b)), ((a_rt, sfa_b), (b1_rt, sfb1_b))]
-    return pairs, (a_s, b0_s, b1_s)
+    out = torch.zeros(B, M, N, dtype=torch.float32, device=dev)
+    out_bl = torch.empty_like(out)
+    return SimpleNamespace(
+        pairs=pairs,
+        deq=(a_s, b0_s, b1_s),
+        out=out,
+        out_bl=out_bl,
+        tensors=(a_rt, sfa_b, b0_rt, sfb0_b, b1_rt, sfb1_b, a_s, b0_s, b1_s, out, out_bl),
+    )
+
+
+def _mkdata_pool(B, M, N, K, nbuf):
+    """`nbuf` independent input sets at distinct GMEM addresses."""
+    return [_mkdata(B, M, N, K) for _ in range(nbuf)]
 
 
 def _reference(a_s, b0_s, b1_s):
@@ -169,35 +174,17 @@ def _unfused_launch(a_s, b0_s, b1_s, out):
     out.copy_(torch.nn.functional.silu(c0.float()) * c1.float())
 
 
-# --- Timing (delayed / events) ---
-def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
-    for _ in range(warmup):
-        timed_fn()
-    torch.cuda.synchronize()
-    if delayed:
-        torch.cuda._sleep(max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6)))
-        for _ in range(max(5, warmup)):
-            timed_fn()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        timed_fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 def _build_spec_map():
-    """Label CONFIG_..._Nctamma[_static] -> (cfg, cta_group, scheduler) for every
+    """Label CONFIG_..._Nctamma -> (cfg, cta_group) for every
     multi-GEMM-capable sm100 block-scale strategy. Pins cta_tile_n=128 (SF 128x4
     swizzle + dual-GEMM TMEM: 256 overflows, 64/32 break the swizzle)."""
     chain = analyze(_graph(1, 256, 128, 512)[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_m != 128 or cfg.cta_tile_n != 128:
+        if cfg.pipeline not in ("sm100", "sm107") or cfg.mma_inst_m != 128 or cfg.cta_tile_n != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -207,10 +194,7 @@ _SPEC_MAP = _build_spec_map()
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--shape", default="1,4096,4096,4096", help="B,M,N,K")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
-    p.add_argument("--configs", default=None)
-    p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
+    add_sweep_args(p, nsys=False)
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -221,55 +205,64 @@ def main() -> int:
     if len(parts) != 4:
         sys.exit("--shape must be B,M,N,K")
     B, M, N, K = parts
-    delayed = args.timing == "delayed"
     flops = 2 * (2 * B * M * N * K)
     print(f"\n=== block-scale SwiGLU dual-matmul (nvfp4)  B={B} {M}x{N}x{K}  " f"(~{flops / 1e9:.1f} GFLOP, 2 GEMMs) ===")
-    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]\n")
+    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]")
 
-    pairs, (a_s, b0_s, b1_s) = _mkdata(B, M, N, K)
-    ref = _reference(a_s, b0_s, b1_s)
-    out = torch.zeros(B, M, N, dtype=torch.float32, device="cuda")
+    wset = _mkdata(B, M, N, K)
+    per_set = set_bytes(wset.tensors)
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
+    report_pool(nbuf, per_set)
+    print()
+    pool = _mkdata_pool(B, M, N, K, nbuf)
+    ref = _reference(*wset.deq)
 
-    out_bl = torch.empty_like(out)
-    bl_ms = _time_ms(
-        lambda: _unfused_launch(a_s, b0_s, b1_s, out_bl),
+    if args.stream:
+        print("  ▶ running unfused baseline ...", flush=True)
+    bl_ms = time_ms(
+        rotating(lambda s: _unfused_launch(*s.deq, s.out_bl), pool),
+        lambda: _unfused_launch(*wset.deq, wset.out_bl),
         warmup=args.warmup,
         iters=args.iters,
-        delayed=delayed,
+        timing=args.timing,
     )
     print(f"  {'unfused dequant+2xcuBLAS+pointwise':52s} " f"{flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  {bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
+    config_names = select_configs(args.configs, _SPEC_MAP)
 
     best = None
     for name in config_names:
-        if name not in _SPEC_MAP:
+        spec = spec_for(name, _SPEC_MAP)
+        if spec is None:
             print(f"  {name:62s} UNKNOWN (not a sweepable block-scale strategy)")
             continue
-        cfg, cta_group, sched = _SPEC_MAP[name]
+        cfg, cta_group = spec
+        if args.stream:
+            print(f"  ▶ running {name} ...", flush=True)
         try:
             g, h = _graph(B, M, N, K)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError) as e:
             print(f"  {name:62s} SKIP: {str(e)[:42]}")
             continue
         try:
-            plan(_vp_bs_mg(h, pairs, out))
+            plan(_vp_bs_mg(h, wset.pairs, wset.out))
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {name:62s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
-        ok = torch.allclose(out.float(), ref.float(), rtol=2e-2, atol=2e-1)  # swish: fast approx
-        err = (out.float() - ref.float()).abs().max().item()
-        ms = _time_ms(
-            lambda: plan(_vp_bs_mg(h, pairs, out)),
+        ok = torch.allclose(wset.out.float(), ref.float(), rtol=2e-2, atol=2e-1)  # swish: fast approx
+        err = (wset.out.float() - ref.float()).abs().max().item()
+        ms = time_ms(
+            rotating(lambda s, _plan=plan, _h=h: _plan(_vp_bs_mg(_h, s.pairs, s.out)), pool),
+            lambda _plan=plan, _h=h: _plan(_vp_bs_mg(_h, wset.pairs, wset.out)),
             warmup=args.warmup,
             iters=args.iters,
-            delayed=delayed,
+            timing=args.timing,
         )
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"
-        print(f"  {name:62s} {flops / (ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{ms:8.3f} ms   {ratio:>7.2f}×{flag}")
+        print(f"  {name:62s} {flops / (ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{ms:8.3f} ms   {ratio:>7.2f}×{flag}", flush=True)
         if ok and (best is None or ms < best[1]):
             best = (name, ms, flops / (ms * 1e-3) / 1e12, ratio)
 

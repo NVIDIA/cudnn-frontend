@@ -11,6 +11,12 @@ Install the optional CuTe DSL dependencies before importing either API:
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The block-scaled backend's layouts are not expressible as JAX arrays and raise a clear error. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). Under tracing the per-group offsets *values* cannot be host-validated; the external buffers must stay alive and unmoved across every execution of the traced computation.
+
 ## Operation
 
 For expert `e`, let `begin = 0` for the first expert and

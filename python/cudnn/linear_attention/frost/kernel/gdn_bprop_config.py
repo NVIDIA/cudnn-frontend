@@ -34,32 +34,33 @@ class Cfg:
     D_V: int = 128  # value head dim
 
     # --- TMA descriptor pool ---
-    BYTES_PER_TENSORMAP: int = 128
 
-    # --- warp assignments (12 warps total) ---
+    # --- warp assignments (16 warps total) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse / parts
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # dH prep / dV-dK-dQ epilogues / dq dot
-    MMA_WARP_ID: int = 8
-    TMA_QKV_WARP_ID: int = 9
-    LOAD_GATE_BETA_WARP_ID: int = 10
-    EPILOGUE_WARP_ID: int = 11
+    COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dK inter rescale / attn read / dGate K parts / dK fold
+    TCGEN05_MMA_WARP_ID: int = 12
+    TMA_QKV_WARP_ID: int = 13
+    LOAD_GATE_BETA_WARP_ID: int = 14
+    EPILOGUE_WARP_ID: int = 15
 
     # --- register split ---
-    NUM_REGS_COMPUTE_GROUP_0: int = 224
-    NUM_REGS_COMPUTE_GROUP_1: int = 256
-    NUM_REGS_OTHER: int = 24
+    NUM_REGS_COMPUTE_GROUP_0: int = 208
+    NUM_REGS_COMPUTE_GROUP_1: int = 144
+    NUM_REGS_COMPUTE_GROUP_2: int = 128
+    NUM_REGS_OTHER: int = 32
 
     THREADS_PER_WARP: int = 32
 
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
-    SMEM_SCHED_STAGES: int = 2
+    SMEM_SCHEDULER_STAGES: int = 2
 
     # --- SMEM stage counts ---
     SMEM_Q_STAGES: int = 1
     SMEM_K_STAGES: int = 2
     SMEM_V_STAGES: int = 1
-    SMEM_AINV_STAGES: int = 1
-    SMEM_QK_STAGES: int = 1
+    SMEM_T_INV_STAGES: int = 1
+    SMEM_A_STAGES: int = 1
 
     # --- TMEM stage counts ---
     TMEM_DH_ACC_STAGES: int = 1

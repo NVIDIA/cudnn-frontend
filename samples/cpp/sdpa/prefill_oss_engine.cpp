@@ -30,10 +30,13 @@ namespace fe = cudnn_frontend;
 // ---------------------------------------------------------------------------
 // Helper: returns true if the current GPU is Hopper (SM90) or Blackwell
 // (SM100), i.e. any architecture supported by the OSS prefill engines.
+// The engine kernels are compiled with --gpu-architecture=sm_90a/sm_100a,
+// which are architecture-specific binaries: other SM10x parts (sm_101,
+// sm_103, ...) cannot load them, so they must skip, not run.
 // ---------------------------------------------------------------------------
 static bool
 is_oss_supported_arch() {
-    return is_hopper_arch() || is_blackwell_computing_arch();
+    return is_hopper_arch() || get_compute_capability() == 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,12 +1130,12 @@ TEST_CASE("SM100 Prefill OSS Engine Direct API", "[graph][sdpa][sm100][oss][dire
     // ---- Build engine once ----
     fe::experimental::Sm100SdpaPrefillEngine engine;
 
-    if (is_blackwell_computing_arch()) {
+    if (get_compute_capability() == 100) {
         REQUIRE(engine.check_support(shape, static_cast<int>(sm_version)).is_good());
         REQUIRE(engine.build().is_good());
     } else {
         REQUIRE(engine.check_support(shape, static_cast<int>(sm_version)).is_bad());
-        SKIP("Test requires Blackwell (SM10X) architecture");
+        SKIP("Test requires Blackwell (SM100) architecture");
         return;
     }
 

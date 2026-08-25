@@ -4,6 +4,10 @@
 # Ported Cutlass code from C++ to Python:
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/mma_traits_sm100.hpp
+#
+# `make_blockscaled_instr_desc` mirrors the SM100 tcgen05 blockscaled
+# MXF8/F6/F4 idesc layout used by CUTLASS/CuTe for
+# `tcgen05.mma.kind::mxf8f6f4.block_scale`.
 
 from enum import IntEnum
 
@@ -78,9 +82,13 @@ def to_UMMA_format(cutlass_type) -> int:
         return F16F32Format.BF16
     if cutlass_type is cutlass.TFloat32:
         return F16F32Format.TF32
-    if cutlass_type is cutlass.FloatE4M3FN:
+    if cutlass_type is getattr(cutlass, "FloatE4M3FN", None):
         return MXF8F6F4Format.E4M3
-    if cutlass_type is cutlass.FloatE5M2:
+    if cutlass_type is getattr(cutlass, "Float8E4M3FN", None):
+        return MXF8F6F4Format.E4M3
+    if cutlass_type is getattr(cutlass, "FloatE5M2", None):
+        return MXF8F6F4Format.E5M2
+    if cutlass_type is getattr(cutlass, "Float8E5M2", None):
         return MXF8F6F4Format.E5M2
     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
 
@@ -143,6 +151,57 @@ def make_instr_desc(
     return desc & 0xFFFF_FFFF
 
 
+def make_blockscaled_instr_desc(
+    a_type,
+    b_type,
+    M: int,
+    N: int,
+    a_major: Major,
+    b_major: Major,
+    a_sf_id: int = 0,
+    b_sf_id: int = 0,
+    scale_format: int = 1,
+    is_sparse: bool = False,
+) -> int:
+    """Build the idesc used by SM100 blockscaled MXF8/F6/F4 UMMA.
+
+    ``a_sf_id`` and ``b_sf_id`` select the per-K-slice scale-factor registers
+    for operand A and B. The MXFP8 forward kernel uses the same id for both
+    operands because K/SFA and Q/SFB occupy matching TMEM scale slots.
+    """
+    a_fmt = int(to_UMMA_format(a_type))
+    b_fmt = int(to_UMMA_format(b_type))
+
+    if M not in (128, 256):
+        raise ValueError("Blockscaled M must be 128 or 256")
+    if N < 8 or N > 256 or (N & 7):
+        raise ValueError("N must be a multiple of 8 in the range 8-256")
+    if a_sf_id < 0 or a_sf_id > 3 or b_sf_id < 0 or b_sf_id > 3:
+        raise ValueError("Blockscaled scale factor IDs must be in [0, 3]")
+
+    m_dim = M >> 4
+    n_dim = N >> 3
+
+    desc = 0
+    desc |= (0 & 0x3) << 0
+    desc |= (int(is_sparse) & 0x1) << 2
+    desc |= (0 & 0x1) << 3
+    desc |= (int(b_sf_id) & 0x3) << 4
+    desc |= (0 & 0x1) << 6
+    desc |= (a_fmt & 0x7) << 7
+    desc |= (b_fmt & 0x7) << 10
+    desc |= (0 & 0x1) << 13
+    desc |= (0 & 0x1) << 14
+    desc |= (int(a_major) & 0x1) << 15
+    desc |= (int(b_major) & 0x1) << 16
+    desc |= (n_dim & 0x3F) << 17
+    desc |= (int(scale_format) & 0x1) << 23
+    desc |= (m_dim & 0x1F) << 24
+    desc |= (int(a_sf_id) & 0x3) << 29
+    desc |= (0 & 0x1) << 31
+    return desc & 0xFFFF_FFFF
+
+
 def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     return make_instr_desc(
         op.a_dtype,
@@ -152,6 +211,19 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.shape_mnk[1],
         Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
         Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+    )
+
+
+def blockscaled_mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp, sf_id: int):
+    return make_blockscaled_instr_desc(
+        op.a_dtype,
+        op.b_dtype,
+        op.shape_mnk[0],
+        op.shape_mnk[1],
+        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        a_sf_id=sf_id,
+        b_sf_id=sf_id,
     )
 
 

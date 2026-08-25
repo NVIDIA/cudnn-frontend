@@ -8,7 +8,9 @@ import torch
 import cudnn
 
 from test_utils import torch_fork_set_rng
+from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
+    _skip_unless_e5m3_supported,
     grouped_gemm_wgrad_init,
     with_grouped_gemm_wgrad_params_fp4,
     with_grouped_gemm_wgrad_params_fp8,
@@ -64,6 +66,7 @@ def _test_grouped_gemm_wgrad_dense_compile_execute(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override=None,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -75,6 +78,12 @@ def _test_grouped_gemm_wgrad_dense_compile_execute(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so inputs["ref_result"] stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
     wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg)
 
     op = cudnn.GroupedGemmWgradSm100(
@@ -90,6 +99,7 @@ def _test_grouped_gemm_wgrad_dense_compile_execute(
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
     try:
         assert op.check_support()
@@ -121,6 +131,7 @@ def test_grouped_gemm_wgrad_dense_compile_execute_fp4(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_wgrad_dense_compile_execute(
         ab_dtype=ab_dtype,
@@ -130,6 +141,7 @@ def test_grouped_gemm_wgrad_dense_compile_execute_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
 
@@ -169,6 +181,7 @@ def _test_grouped_gemm_wgrad_dense_wrapper(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override=None,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -180,6 +193,12 @@ def _test_grouped_gemm_wgrad_dense_wrapper(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so inputs["ref_result"] stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
     try:
         for _ in range(2):  # Run twice to test caching path
             result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
@@ -196,6 +215,7 @@ def _test_grouped_gemm_wgrad_dense_wrapper(
                 mma_tiler_mn=cfg["mma_tiler_mn"],
                 cluster_shape_mn=cfg["cluster_shape_mn"],
                 sf_vec_size=cfg["sf_vec_size"],
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
             )
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
@@ -214,6 +234,7 @@ def test_grouped_gemm_wgrad_dense_wrapper_fp4(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_wgrad_dense_wrapper(
         ab_dtype=ab_dtype,
@@ -223,6 +244,7 @@ def test_grouped_gemm_wgrad_dense_wrapper_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
 
@@ -263,6 +285,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
     sf_vec_size,
     sf_dtype,
     accumulate_on_output=False,
+    sf_fp8_dtype_override=None,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -274,6 +297,12 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so inputs["ref_result"] stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
     wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg, accumulate_on_output=accumulate_on_output)
     expected = inputs["ref_result"]
     if accumulate_on_output:
@@ -297,6 +326,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         accumulate_on_output=accumulate_on_output,
     )
     try:
@@ -329,6 +359,7 @@ def test_grouped_gemm_wgrad_discrete_compile_execute_fp4(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_wgrad_discrete_compile_execute(
         ab_dtype=ab_dtype,
@@ -338,6 +369,7 @@ def test_grouped_gemm_wgrad_discrete_compile_execute_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
 
@@ -375,6 +407,7 @@ def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp4(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_wgrad_discrete_compile_execute(
         ab_dtype=ab_dtype,
@@ -384,6 +417,7 @@ def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         accumulate_on_output=True,
     )
 
@@ -425,6 +459,7 @@ def _test_grouped_gemm_wgrad_discrete_wrapper(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override=None,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -436,6 +471,12 @@ def _test_grouped_gemm_wgrad_discrete_wrapper(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so inputs["ref_result"] stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
     try:
         for _ in range(2):  # Run twice to test caching path
             result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
@@ -452,6 +493,7 @@ def _test_grouped_gemm_wgrad_discrete_wrapper(
                 mma_tiler_mn=cfg["mma_tiler_mn"],
                 cluster_shape_mn=cfg["cluster_shape_mn"],
                 sf_vec_size=cfg["sf_vec_size"],
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
             )
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
@@ -470,6 +512,7 @@ def test_grouped_gemm_wgrad_discrete_wrapper_fp4(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_wgrad_discrete_wrapper(
         ab_dtype=ab_dtype,
@@ -479,6 +522,7 @@ def test_grouped_gemm_wgrad_discrete_wrapper_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
 
@@ -607,7 +651,11 @@ def test_grouped_gemm_wgrad_dynamic_tokens_compile_execute_fp4(
     sf_vec_size,
     sf_dtype,
     output_mode,
+    sf_fp8_dtype_override,  # noqa: ARG001
 ):
+    if sf_fp8_dtype_override is not None:
+        pytest.skip("Skip e5m3 test. This test is not for numerical correctness and covering e5m3's gain is marginal.")
+
     _test_grouped_gemm_wgrad_dynamic_tokens_compile_execute(
         ab_dtype=ab_dtype,
         wgrad_dtype=wgrad_dtype,
@@ -790,3 +838,113 @@ def test_grouped_gemm_wgrad_dense_wrapper_tensor_ragged_fp4():
 
     torch.cuda.synchronize()
     check_ref_grouped_gemm_wgrad(result["wgrad_tensor"], inputs["ref_result"], cfg["tolerance"])
+
+
+def _wgrad_nvfp4_inputs(sf_vec_size=16, sf_dtype=torch.float8_e4m3fn, ab_dtype=torch.float4_e2m1fn_x2):
+    cfg = grouped_gemm_wgrad_init(
+        ab_dtype=ab_dtype,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+    )
+    return cfg, allocate_grouped_gemm_wgrad_tensors(cfg)
+
+
+def _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override):
+    """Call the wrapper directly; the harnesses turn ValueError into a skip."""
+    return cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        offsets_tensor=inputs["offsets_tensor"],
+        output_mode="dense",
+        global_scale_a=inputs["global_scale_a"],
+        global_scale_b=inputs["global_scale_b"],
+        acc_dtype=cfg["acc_dtype"],
+        wgrad_dtype=cfg["wgrad_dtype"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "sf_fp8_dtype_override,overrides,expected",
+    [
+        pytest.param("e5m3", dict(sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu), "requires the NVFP4 recipe", id="mxfp4_e8m0_carrier"),
+        pytest.param(
+            "e5m3",
+            dict(ab_dtype=torch.float8_e4m3fn, sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu),
+            "requires the NVFP4 recipe",
+            id="fp8_ab",
+        ),
+        pytest.param("e4m3", {}, "sf_fp8_dtype_override must be", id="e4m3_is_not_an_override"),
+        pytest.param("e5m2", {}, "sf_fp8_dtype_override must be", id="unknown_format"),
+    ],
+)
+def test_grouped_gemm_wgrad_rejects_unsupported_sf_fp8_dtype(sf_fp8_dtype_override, overrides, expected):
+    """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
+    cfg, inputs = _wgrad_nvfp4_inputs(**overrides)
+    with pytest.raises(ValueError, match=expected):
+        _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_wgrad_e5m3_is_not_cached_as_e4m3():
+    """sf_fp8_dtype_override must take part in the compile cache key.
+
+    Identical scale-factor bytes decode differently under E4M3 and UE5M3, so if
+    the override were missing from the key the second call would reuse the first
+    kernel and silently return E4M3 results.
+    """
+    _skip_unless_e5m3_supported()
+    cfg, inputs = _wgrad_nvfp4_inputs()
+    w_e4m3 = _run_wgrad_wrapper(cfg, inputs, None)["wgrad_tensor"].float().clone()
+    w_e5m3 = _run_wgrad_wrapper(cfg, inputs, "e5m3")["wgrad_tensor"].float().clone()
+    torch.cuda.synchronize()
+    assert not torch.equal(
+        w_e4m3, w_e5m3
+    ), "e5m3 and e4m3 produced identical output from identical scale-factor bytes; sf_fp8_dtype_override is likely missing from the compile cache key"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
+    """The BF16 backend has no scale factors, so any explicit override is an error.
+
+    The None case is the important one: wgrad forwards **kwargs to both backends,
+    so merely adding the parameter once broke every BF16 call with a TypeError,
+    which a rejection-only test would not have caught.
+    """
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
+    problem = make_grouped_gemm_wgrad_bf16_problem(discrete=False)
+    kwargs = dict(
+        a_tensor=problem["a"],
+        b_tensor=problem["b"],
+        sfa_tensor=None,
+        sfb_tensor=None,
+        offsets_tensor=problem["offsets"],
+        output_mode="dense",
+        wgrad_tensor=problem["output"],
+        wgrad_ptrs=problem["output_ptrs"],
+        acc_dtype=torch.float32,
+        wgrad_dtype=problem["output_dtype"],
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        input_order=problem["input_order"],
+    )
+    # None is accepted and dispatches to BF16 as usual.
+    cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override=None)
+    with pytest.raises(ValueError, match="BF16 forbids scale control sf_fp8_dtype_override"):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override="e5m3")

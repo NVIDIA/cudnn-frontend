@@ -41,6 +41,11 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
     return tuple(strides)
 
 
+def packed_token_capacity(seq_lens):
+    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
+    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+
+
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
     """Compute strides for a given layout string (e.g. 'bshd', 'bhsd')."""
     assert "".join(sorted(layout)) == "bdhs", f"wrong layout '{layout}'"
@@ -58,12 +63,20 @@ def compute_default_BHSD_strides(shape):
     return tuple(strides)
 
 
-def compute_packed_strides(shape):
-    """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1)."""
+def compute_packed_strides(shape, token_gap=0):
+    """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1).
+
+    ``token_gap`` widens the token stride to ``h*d + token_gap`` elements —
+    the layout of a tensor VIEW into a larger per-token record. With
+    ``token_gap == h*d`` this is exactly a K or V view of a kv-interleaved
+    ``[T, 2, H, D]`` buffer (token stride ``2*h*d``), the layout
+    ``torch.nn.attention.varlen`` users produce by slicing a fused KV
+    projection."""
     if shape is None:
         return None
-    b, h, s, d = shape
-    return (s * h * d, d, h * d, 1)
+    _, h, s, d = shape
+    token_stride = h * d + token_gap
+    return (s * token_stride, d, token_stride, 1)
 
 
 @dataclass
@@ -96,6 +109,9 @@ class ExecConfig:
     # cu_seq_len_kv). The mixed forms require cuDNN 9.25+.
     cu_seq_len_sides: str = "both"
     is_ragged: bool = None
+    # "token_major" ([t, h, 1], sequence stride h_q) or "head_major" ([h, t], sequence stride 1).
+    # None when not ragged.
+    ragged_stats_layout: str = None
     is_dropout: bool = None
     is_determin: bool = None
     is_mxfp8: bool = False
@@ -106,6 +122,21 @@ class ExecConfig:
     with_unfuse_fma: bool = False
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
+    # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
+    # stride of 1-4 whole tokens (gap = n*h*d, n in 0..3, seeded from
+    # rng_geom_seed): n=0 is the plain packed case, n=1 is exactly a view of
+    # an interleaved [T, 2, H, D] buffer (the layout
+    # torch.nn.attention.varlen users produce by slicing a fused KV
+    # projection), n=2 a [T, 3, H, D] QKV-interleave, and so on. Whole-token
+    # gaps keep every ragged base address in the packed layout's alignment
+    # class by construction (sub-token gaps can violate the graph API's
+    # 16-byte pointer-alignment contract — an odd-element gap is illegal for
+    # every engine). Default True: every ragged config fuzzes its layouts.
+    # fill_derived_fields auto-falls-back to packed where a gap is not yet
+    # expressible or handled: cu / offset-multiplier forms (#538) and the
+    # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
+    # unaffected (the gap only fills strides left None).
+    with_ragged_token_gap: bool = True
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -175,16 +206,55 @@ class ExecConfig:
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
-        # Compute strides if not provided (packed for ragged, default BHSD otherwise)
+        # Compute strides if not provided (packed for ragged, default BHSD otherwise).
+        # with_ragged_token_gap (default True): per-tensor token-stride gaps,
+        # re-derived deterministically from rng_geom_seed (so
+        # serialize/deserialize repro reproduces the same strides). Auto-packed
+        # where a gap is not yet expressible or handled:
+        #  - cu / offset-multiplier forms bind offsets as cu (x multiplier)
+        #    and cannot declare a token gap (#538);
+        #  - the fp8/mxfp8 harnesses (1-byte data_type) allocate assuming
+        #    packed strides (#537).
+        _gap_applicable = (
+            self.is_ragged
+            and self.with_ragged_token_gap
+            and not self.is_cu_seq_len
+            and not self.with_ragged_offset_multiplier
+            and not (self.data_type is not None and self.data_type.itemsize == 1)
+        )
+        if _gap_applicable:
+            _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
+            # Draw ALL FOUR gaps up front, in fixed Q/K/V/O order: an
+            # explicitly provided stride must not shift the gaps the
+            # remaining tensors get (same rng_geom_seed -> same per-tensor
+            # layouts regardless of which strides were overridden).
+            _gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
+
+            def _make_gap_fn(gap_tokens):
+                def _gapped(shape):
+                    if shape is None:
+                        return None
+                    h, d = shape[1], shape[3]
+                    return compute_packed_strides(shape, gap_tokens * h * d)
+
+                return _gapped
+
+            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_gaps[n]) for n in ("q", "k", "v", "o"))
+        elif self.is_ragged:
+            gap_q = gap_k = gap_v = gap_o = compute_packed_strides
+        else:
+            gap_q = gap_k = gap_v = gap_o = compute_default_BHSD_strides
         stride_fn = compute_packed_strides if self.is_ragged else compute_default_BHSD_strides
         if self.stride_q is None and self.shape_q is not None:
-            self.stride_q = stride_fn(self.shape_q)
+            self.stride_q = gap_q(self.shape_q)
         if self.stride_k is None and self.shape_k is not None:
-            self.stride_k = stride_fn(self.shape_k)
+            self.stride_k = gap_k(self.shape_k)
         if self.stride_v is None and self.shape_v is not None:
-            self.stride_v = stride_fn(self.shape_v)
+            self.stride_v = gap_v(self.shape_v)
         if self.stride_o is None and self.shape_o is not None:
-            self.stride_o = stride_fn(self.shape_o)
+            self.stride_o = gap_o(self.shape_o)
+        # stats keeps the packed default — its layout is fuzzed separately
+        # via ragged_stats_layout.
         if self.stride_stats is None and self.shape_stats is not None:
             self.stride_stats = stride_fn(self.shape_stats)
 
@@ -285,11 +355,7 @@ class RandomizationContext:
             # ~10% chance of 0-length sequence for each batch
             randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
             # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
-            randoms_.seq_len_kv = [
-                # 0 if rng.random() < 0.1 else rng.randint(randoms_.seq_len_q[i], randoms_.s_kv) for i in range(randoms_.batches)
-                rng.randint(1, randoms_.s_kv)
-                for i in range(randoms_.batches)
-            ]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_kv) for i in range(randoms_.batches)]
 
         # Decide the left and right bounds for the sliding window mask (None = no bound)
         randoms_.left_bound = None
@@ -318,24 +384,34 @@ class RandomizationContext:
         if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
             randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
             randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
+            if randoms_.ragged_stats_layout == "head_major":
+                # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
+                # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
+                # token-major one its sequence stride is 1 instead of h_q.
+                t_q = packed_token_capacity(randoms_.seq_len_q)
+                randoms_.stride_stats = (randoms_.h_q * t_q, t_q, 1, 1)
+            else:
+                randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
         else:
+            randoms_.ragged_stats_layout = None
             indices = [0, 1, 2]
             rng.shuffle(indices)
             indices.append(3)
             gaps_q = [0, 0, 0, 0]
             gaps_o = [0, 0, 0, 0]
+            gaps_stats = [0, 0, 0, 0]
 
             if rng.randint(0, 1) == 0:  # 50% chance of gaps
                 gaps_q = [rng.randint(0, 8) for _ in range(3)]
                 gaps_o = [rng.randint(0, 8) for _ in range(3)]
+                gaps_stats = [rng.randint(0, 8) for _ in range(3)]
                 gaps_q.append(elem_align * rng.randint(0, 2))
                 gaps_o.append(elem_align * rng.randint(0, 2))
+                gaps_stats.append(elem_align * rng.randint(0, 2))
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
-            # TODO: Randomize stride_stats once all layouts are supported correctly.
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bhsd")
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
 
         # Decide K, V
         randoms_.shape_k = (
@@ -604,6 +680,7 @@ def test_randomization_context(seed):
             }
         ),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
+        ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
     ) as ctx:
         return ctx
 

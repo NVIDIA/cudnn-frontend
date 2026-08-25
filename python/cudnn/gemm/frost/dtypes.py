@@ -7,6 +7,7 @@ Shared dtype conversion tables for the GEMM engine (single source of truth).
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import cudnn
@@ -24,6 +25,11 @@ DTYPE_TO_CUTLASS: dict[Dtype, str] = {
     "fp8_e4m3": "cutlass.Float8E4M3FN",
     "fp8_e5m2": "cutlass.Float8E5M2",
     "fp8_e8m0": "cutlass.Float8E8M0FNU",
+    # E5M3 only ever appears as a scale factor, which the kernel takes as a base
+    # pointer — the format lives in the MMA descriptor, not the tensor type. So
+    # it rides an opaque byte (cutlass.FloatNV8E5M3FNU exists but TVM-FFI cannot
+    # marshal it, and torch has no E5M3 dtype for the runtime buffer either).
+    "fp8_e5m3": "cutlass.Uint8",
     "fp4_e2m1": "cutlass.Float4E2M1FNx2",
     "uint8": "cutlass.Uint8",
     "int32": "cutlass.Int32",
@@ -39,6 +45,7 @@ DTYPE_BYTES: dict[Dtype, int] = {
     "fp8_e4m3": 1,
     "fp8_e5m2": 1,
     "fp8_e8m0": 1,
+    "fp8_e5m3": 1,
     "fp4_e2m1": 1,
     "uint8": 1,
     "int32": 4,
@@ -48,6 +55,29 @@ DTYPE_BYTES: dict[Dtype, int] = {
 # Element width in BITS. Only sub-byte dtypes differ from DTYPE_BYTES * 8 — fp4
 # is stored packed 2/byte, so DTYPE_BYTES reads 1 and cannot tell fp4 from fp8.
 DTYPE_BITS: dict[Dtype, int] = {**{dt: nbytes * 8 for dt, nbytes in DTYPE_BYTES.items()}, "fp4_e2m1": 4}
+
+DTYPE_GPU_ARCH_RANGES: dict[Dtype, tuple[tuple[int, int], ...]] = {
+    "fp8_e5m3": ((107, 110),),
+}
+
+
+def _fmt_ranges(ranges: tuple[tuple[int, int], ...]) -> str:
+    return " or ".join(f"{lo} <= SM < {hi}" for lo, hi in ranges)
+
+
+def dtype_arch_reject(chain: FusionChain, arch: "int | None") -> "str | None":
+    """Why the active GPU cannot run this chain's dtypes, or ``None``.
+
+    ``arch`` is ``None`` when no GPU is visible (render-only / CI), which skips
+    the check the same way the other arch gates do."""
+    if arch is None:
+        return None
+    for dtype in sorted(chain.dtypes_used()):
+        ranges = DTYPE_GPU_ARCH_RANGES.get(dtype)
+        if ranges is not None and not any(lo <= arch < hi for lo, hi in ranges):
+            return f"dtype {dtype!r} exists only on {_fmt_ranges(ranges)}, but the active GPU is sm_{arch}"
+    return None
+
 
 # input dtype -> tcgen05 MMA kind.
 DTYPE_TO_MMA_KIND: dict[Dtype, str] = {
@@ -67,6 +97,7 @@ DTYPE_FROM_CUDNN: dict[Any, Dtype] = {
     cudnn.data_type.FP8_E4M3: "fp8_e4m3",
     cudnn.data_type.FP8_E5M2: "fp8_e5m2",
     cudnn.data_type.FP8_E8M0: "fp8_e8m0",
+    cudnn.data_type.FP8_E5M3: "fp8_e5m3",
     cudnn.data_type.FP4_E2M1: "fp4_e2m1",
     cudnn.data_type.UINT8: "uint8",
     cudnn.data_type.INT32: "int32",
@@ -82,6 +113,12 @@ CUDNN_FROM_DTYPE: dict[Dtype, Any] = {v: k for k, v in DTYPE_FROM_CUDNN.items()}
 # of three sub-alignments; 32 is the cap (the widest HW memory access).
 
 MAX_MEM_ACCESS_BYTES = 32
+
+# Widest STG epilogue chunk in ELEMENTS (not bytes). Only the STG arm is capped
+# here -- the TMA-store arm's chunk is the staged subtile (`epi_n`), which
+# reaches 64. A chunk CAN span more than MAX_MEM_ACCESS_BYTES: every output
+# splits it into its own <= MAX_MEM_ACCESS_BYTES-wide stores.
+MAX_EPI_CHUNK_ELEMS = 32
 
 
 def _pow2_floor(x: int, cap: int = MAX_MEM_ACCESS_BYTES) -> int:
@@ -106,15 +143,25 @@ def tensor_alignment(shape, stride, elem_bytes: int, ptr: "int | None" = None, c
       one with ``stride==1 and shape!=1``; no such dim -> ``elem_bytes`` (nothing
       is contiguous, so only a single element can be moved at a time).
     """
-    a = cap
+    a = _layout_alignment(tuple(shape), tuple(stride), elem_bytes, cap)
     if ptr is not None:
         a = min(a, _pow2_floor(int(ptr), cap))
+    return a
 
+
+@functools.lru_cache(maxsize=256)
+def _layout_alignment(shape: tuple, stride: tuple, elem_bytes: int, cap: int) -> int:
+    """``min(A_stride, A_shape)`` -- the half the pointer does not enter.
+
+    Memoized because it is a function of values, not of objects: the same layout
+    recurs on every execute, and the set of shapes a caller cycles through under
+    dynamic shape is small. Only the pointer half is recomputed per call, and
+    that is one power-of-two floor.
+    """
     stride_align = cap
     for sh, st in zip(shape, stride):
         if sh != 1 and st != 1:
             stride_align = min(stride_align, _pow2_floor(int(st) * elem_bytes, cap))
-    a = min(a, stride_align)
 
     shape_align = None
     for sh, st in zip(shape, stride):
@@ -123,8 +170,7 @@ def tensor_alignment(shape, stride, elem_bytes: int, ptr: "int | None" = None, c
             break
     if shape_align is None:
         shape_align = min(elem_bytes, cap)
-    a = min(a, shape_align)
-    return a
+    return min(stride_align, shape_align)
 
 
 def allowed_store_vsize(dim, stride, dtype: str) -> int:
@@ -175,6 +221,12 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     block size; otherwise vsize = the min over every dense output's widest
     allowed store. M-major output → elem_bytes (scalar / TMA store).
 
+    The chunk is a shared ELEMENT count, not one memory access — every output
+    reads/writes the same columns but splits the chunk into its own
+    ``MAX_MEM_ACCESS_BYTES``-wide accesses (``epilogue_codegen._tap_store_elems``).
+    So a 2-byte output co-materialized with a 32-element block quant keeps the
+    32-element chunk the quant needs and stores it as 2 x 32 B.
+
     ``tile_cols`` (the per-CTA epilogue drain width in accumulator columns, when
     the tile config is known) additionally clamps the chunk so it divides every
     power-of-2 subtile span the epilogue decomposes the tile into — i.e. vsize
@@ -190,10 +242,10 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
             (_allowed_vsize(chain, spec.dtype, spec.dim, spec.stride) for spec in chain.output_specs if spec.dtype != "fp4_e2m1"),
             default=_allowed_vsize(chain, chain.output_dtype),
         )
-    vec_bytes = vsize * elem_bytes
+    vsize = min(vsize, MAX_EPI_CHUNK_ELEMS)
     if tile_cols is not None:
-        vec_bytes = min(vec_bytes, _pow2_floor(tile_cols * elem_bytes))
-    return vec_bytes
+        vsize = min(vsize, _pow2_floor(tile_cols, cap=MAX_EPI_CHUNK_ELEMS))
+    return vsize * elem_bytes
 
 
 def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
@@ -215,12 +267,12 @@ def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
     return reqs
 
 
-def _output_align_reqs(chain: FusionChain, use_tma_store: bool, vec_bytes: "int | None" = None) -> "list[int]":
+def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_bytes: "int | None" = None) -> "list[int]":
     """Per-output required byte alignment, one per ``chain.outputs`` slot (dense
     specs, then reductions, then quant scales) = the width its store uses
     (matches the epilogue): reduction / quant-scale side outputs store scalar
-    (1); an M-major dense output uses 16 on the TMA path, else a scalar scatter;
-    the TMA-store dense output needs 16; fp4 data packs 2/byte; everything else
+    (1); a slot on the TMA-C surface needs 16 (M-major included); every other
+    slot uses its own store width -- fp4 data packs 2/byte, and everything else
     stores ``vsize`` elements. Major is read per slot — ``chain.out_major`` only
     governs the shared epilogue chunk, and a tap may carry the other major.
     ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
@@ -234,8 +286,8 @@ def _output_align_reqs(chain: FusionChain, use_tma_store: bool, vec_bytes: "int 
         if out.is_reduction or out.is_quant_scale:
             reqs.append(1)
         elif chain.output_specs[i].major == "m":
-            reqs.append(16 if use_tma_store else eb)
-        elif use_tma_store and i == 0:
+            reqs.append(16 if i in tma_slots else eb)
+        elif i in tma_slots:
             reqs.append(16)
         elif out.dtype == "fp4_e2m1":
             reqs.append(max(vsize // 2, 4))

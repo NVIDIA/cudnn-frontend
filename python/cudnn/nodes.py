@@ -42,13 +42,6 @@ class Node:
         self.outputs: Dict[str, Tensor] = {}
         self.params: Dict[str, Any] = {}
 
-    def __setattr__(self, name, value):
-        # attribute writes freeze with the owning graph; the port/param dicts
-        # themselves become MappingProxy views at freeze time
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError(f"cannot set Node.{name}: the owning graph is frozen after lowering/planning")
-        object.__setattr__(self, name, value)
-
     def validate(self) -> None:
         """Validate node configuration."""
         for port_name, tensor in self.inputs.items():
@@ -63,6 +56,16 @@ class Node:
 
     def infer_properties(self, context: "GraphContext") -> None:
         """Infer unset tensor properties from context and inputs."""
+        # SDPA Stats is always computed and stored in FP32, so an unset dtype must
+        # not inherit a narrower io dtype: the kernel would write 4-byte rows past
+        # the end of a buffer the caller sized from the declared dtype.
+        if self.node_type in (NodeType.SDPA, NodeType.SDPA_FP8, NodeType.SDPA_MXFP8):
+            stats = self.outputs.get("Stats")
+            if stats is not None and stats.data_type is None:
+                from ._compiled_module import data_type as _cudnn_data_type
+
+                stats.data_type = _cudnn_data_type.FLOAT
+
         # Fill data types from context
         for tensor in self.inputs.values():
             if tensor and tensor.data_type is None:

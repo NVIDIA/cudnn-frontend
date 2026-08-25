@@ -13,6 +13,86 @@ from .swizzle import swizzle_xor_128b, swizzle_lin_128b
 
 
 @cute.jit
+def mma_m16n8k16_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """``mma.sync.aligned.m16n8k16.row.col.f32.{f16|bf16}.{f16|bf16}.f32``."""
+    if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    ab_tag = "f16" if cutlass.const_expr(ab_dtype == cutlass.Float16) else "bf16"
+    return cute.arch.inline_ptx(
+        f"mma.sync.aligned.m16n8k16.row.col.f32.{ab_tag}.{ab_tag}.f32 {{$0,$1,$2,$3}}, {{$4,$5,$6,$7}}, {{$8,$9}}, {{$10,$11,$12,$13}};",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[a0, a1, a2, a3, b0, b1, c0, c1, c2, c3],
+    )
+
+
+@cute.jit
+def mma_m16n8k32_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """``mma.sync.aligned.m16n8k32.row.col.f32.{e4m3|e5m2}.{e4m3|e5m2}.f32``.
+
+    The C operands travel as ``Int32`` bit patterns and are ``mov.b32``'d into
+    ``.f32`` temps inside the asm block: cutlass-dsl 4.7.0's ``inline_ptx``
+    fails in libNVVM when a compile-time-constant ``Float32`` reaches
+    ``read_only_args``, and an accumulator's zero-init can fold to a constant.
+    """
+    if cutlass.const_expr(ab_dtype != cutlass.Float8E4M3FN and ab_dtype != cutlass.Float8E5M2):
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    ab_tag = "e4m3" if cutlass.const_expr(ab_dtype == cutlass.Float8E4M3FN) else "e5m2"
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 fc<4>; "
+        "mov.b32 fc0, {$r6}; mov.b32 fc1, {$r7}; mov.b32 fc2, {$r8}; mov.b32 fc3, {$r9}; "
+        f"mma.sync.aligned.m16n8k32.row.col.f32.{ab_tag}.{ab_tag}.f32 "
+        "{{$w0},{$w1},{$w2},{$w3}}, {{$r0},{$r1},{$r2},{$r3}}, {{$r4},{$r5}}, {fc0,fc1,fc2,fc3}; }",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[
+            a0,
+            a1,
+            a2,
+            a3,
+            b0,
+            b1,
+            c0.bitcast(cutlass.Int32),
+            c1.bitcast(cutlass.Int32),
+            c2.bitcast(cutlass.Int32),
+            c3.bitcast(cutlass.Int32),
+        ],
+    )
+
+
+@cute.jit
 def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=None, accumulate: bool = False, k_start: int = 0, k_count=None):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1
@@ -363,6 +443,55 @@ def mma_step(
                     a3,
                     b0,
                     b1,
+                    acc[s_off + 0],
+                    acc[s_off + 1],
+                    acc[s_off + 2],
+                    acc[s_off + 3],
+                ],
+            )
+            acc[s_off + 0] = c0
+            acc[s_off + 1] = c1
+            acc[s_off + 2] = c2
+            acc[s_off + 3] = c3
+
+
+@cute.jit
+def mma_step_k8(
+    acc,
+    a_frag,
+    b_frag,
+    *,
+    k_step: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float16,
+):
+    if cutlass.const_expr(M % 16 != 0):
+        raise ValueError(f"mma_step_k8: M must be a multiple of 16, got M={M}")
+    if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
+        raise TypeError(f"mma_step_k8: ab_dtype must be Float16 or BFloat16, got {ab_dtype}")
+    M_BLOCKS = M // 16
+    N_FRAGS = N // 8
+    a_stride = len(a_frag) // M_BLOCKS
+
+    ab_tag = "f16" if cutlass.const_expr(ab_dtype == cutlass.Float16) else "bf16"
+    mma_ptx = f"mma.sync.aligned.m16n8k8.row.col.f32.{ab_tag}.{ab_tag}.f32" " {$0,$1,$2,$3}, {$4,$5}, {$6}, {$7,$8,$9,$10};"
+
+    for m_block in cutlass.range_constexpr(M_BLOCKS):
+        a_off = m_block * a_stride + k_step * 2
+        a0 = a_frag[a_off + 0]
+        a1 = a_frag[a_off + 1]
+        acc_base = m_block * N_FRAGS * 4
+        for n_frag in cutlass.range_constexpr(N_FRAGS):
+            b0 = b_frag[n_frag]
+            s_off = acc_base + n_frag * 4
+            c0, c1, c2, c3 = inline_ptx(
+                mma_ptx,
+                write_only_types=[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32],
+                read_only_args=[
+                    a0,
+                    a1,
+                    b0,
                     acc[s_off + 0],
                     acc[s_off + 1],
                     acc[s_off + 2],

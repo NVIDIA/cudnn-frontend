@@ -7,8 +7,7 @@ from .dense_blockscaled_gemm_persistent_amax import (
 
 from cuda.bindings import driver as cuda
 import os
-import torch
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -16,18 +15,36 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, is_power_of_2, ceil_div
+from cudnn.tensor_adapter import (
+    canonicalize_unit_dim_strides,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_shape,
+    get_strides,
+)
 
 
 class GemmAmaxSm100(APIBase):
+    """Blockscaled GEMM with amax epilogue for SM100.
+
+    Tensor parameters are type-erased: torch tensors and JAX arrays are both accepted
+    (any DLPack-capable tensor with .shape/.dtype works for metadata). torch is only
+    imported when torch tensors/dtypes are passed; likewise for JAX. Dtype parameters
+    accept torch dtypes, numpy/ml_dtypes dtypes, or cutlass types.
+    """
+
     def __init__(
         self,
-        sample_a: torch.Tensor,
-        sample_b: torch.Tensor,
-        sample_sfa: torch.Tensor,
-        sample_sfb: torch.Tensor,
-        sample_c: torch.Tensor,
-        sample_amax: torch.Tensor,
-        acc_dtype: torch.dtype = torch.float32,
+        sample_a: Any,
+        sample_b: Any,
+        sample_sfa: Any,
+        sample_sfb: Any,
+        sample_c: Any,
+        sample_amax: Any,
+        acc_dtype: Any = cutlass.Float32,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Tuple[int, int] = (1, 1),
         sf_vec_size: int = 32,
@@ -37,14 +54,14 @@ class GemmAmaxSm100(APIBase):
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
+        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True)
 
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.cluster_shape_mn = cluster_shape_mn
         self.sf_vec_size = sf_vec_size
@@ -61,13 +78,65 @@ class GemmAmaxSm100(APIBase):
             f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_sfa {self.sfa_desc.shape}, sample_sfb {self.sfb_desc.shape}, sample_c {self.c_desc.shape}, sample_amax {self.amax_desc.shape}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sf_vec_size {sf_vec_size}"
         )
 
+    def _check_sf_shape(self, sf_desc: TensorDesc, l: int, name: str) -> Tuple[int, int]:
+        """Validate a scale-factor tensor shape and return (mn_div_atom_m0_m1, sf_k_div_atom_k).
+
+        SF tensors are accepted in either of two equivalent forms (byte-identical memory):
+        - the torch-style logical atom view (Atom_M0, Atom_M1, MN', Atom_K, K', L), i.e. a
+          C-contiguous (L, MN', K', Atom_M0, Atom_M1, Atom_K) allocation permuted by
+          (3, 4, 1, 5, 2, 0), or
+        - that physical C-contiguous shape (L, MN', K', Atom_M0, Atom_M1, Atom_K) directly,
+          for frameworks such as JAX that cannot express the permuted (strided) view.
+
+        The kernel rebuilds the SF layout from the A/B shapes and consumes only the SF base
+        pointer, so the memory must be exactly the C-contiguous physical allocation in both
+        forms: strides are validated too (a shape-matching but differently-strided tensor
+        would silently produce wrong results).
+        """
+        shape = sf_desc.shape
+        self._value_error_if(len(shape) != 6, f"{name} tensor must be 6-D, got shape {shape}")
+        atom_m0, atom_m1, atom_k = self.atom_m[0], self.atom_m[1], self.atom_k
+        atom_elems = atom_m0 * atom_m1 * atom_k
+        if shape[0] == atom_m0 and shape[1] == atom_m1 and shape[3] == atom_k:
+            mn_div_atom_m0_m1, sf_k_div_atom_k = shape[2], shape[4]
+            atom_shape = (atom_m0, atom_m1, mn_div_atom_m0_m1, atom_k, sf_k_div_atom_k, l)
+            self._check_tensor_shape(sf_desc, atom_shape, name)
+            _ = self._check_tensor_stride(
+                sf_desc,
+                stride=[
+                    canonicalize_unit_dim_strides(
+                        atom_shape,
+                        (atom_m1 * atom_k, atom_k, sf_k_div_atom_k * atom_elems, 1, atom_elems, mn_div_atom_m0_m1 * sf_k_div_atom_k * atom_elems),
+                    )
+                ],
+                name=name,
+                extra_error_msg=f"{name} atom view must be the (3, 4, 1, 5, 2, 0) permutation of a C-contiguous physical allocation",
+            )
+        else:
+            mn_div_atom_m0_m1, sf_k_div_atom_k = shape[1], shape[2]
+            physical_shape = (l, mn_div_atom_m0_m1, sf_k_div_atom_k, atom_m0, atom_m1, atom_k)
+            self._check_tensor_shape(sf_desc, physical_shape, name)
+            _ = self._check_tensor_stride(
+                sf_desc,
+                stride=[
+                    canonicalize_unit_dim_strides(
+                        physical_shape,
+                        (mn_div_atom_m0_m1 * sf_k_div_atom_k * atom_elems, sf_k_div_atom_k * atom_elems, atom_elems, atom_m1 * atom_k, atom_k, 1),
+                    )
+                ],
+                name=name,
+                extra_error_msg=f"{name} in the physical (L, MN', K', Atom_M0, Atom_M1, Atom_K) form must be C-contiguous",
+            )
+        return mn_div_atom_m0_m1, sf_k_div_atom_k
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking dtypes and sf_vec_size")
+        # Tensor descriptors are canonical (cutlass dtypes), so validation is framework-neutral.
         ab_dtype = self._check_dtype(
             self.a_desc,
-            dtype=[torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn],
+            dtype=[cutlass.Float4E2M1FN, cutlass.Uint8, cutlass.Float8E5M2, cutlass.Float8E4M3FN],
             name="A",
         )
         self._check_dtype(
@@ -76,7 +145,7 @@ class GemmAmaxSm100(APIBase):
             name="B",
             extra_error_msg="A and B tensor dtypes must match",
         )
-        if ab_dtype == torch.uint8:
+        if ab_dtype is cutlass.Uint8:
             self._logger.warning("Uint8 ab_dtype will be interpreted as packed fp4, not as native uint8")
 
         self._value_error_if(
@@ -86,7 +155,7 @@ class GemmAmaxSm100(APIBase):
 
         sf_dtype = self._check_dtype(
             self.sfa_desc,
-            dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn, torch.int8],
+            dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.Int8],
             name="sfa",
         )
         self._check_dtype(
@@ -95,21 +164,21 @@ class GemmAmaxSm100(APIBase):
             name="sfb",
             extra_error_msg="sfa and sfb tensor dtypes must match",
         )
-        if sf_dtype == torch.int8:
+        if sf_dtype is cutlass.Int8:
             self._logger.warning("Int8 sf_dtype will be interpreted as float8_e8m0fnu, not as native int8")
 
         self._value_error_if(
-            sf_dtype == torch.float8_e4m3fn and self.sf_vec_size == 32,
+            sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 32,
             "Unsupported sf_dtype and sf_vec_size combination: float8_e4m3fn and 32 is not supported",
         )
         self._value_error_if(
-            ab_dtype in {torch.float8_e5m2, torch.float8_e4m3fn} and self.sf_vec_size == 16,
+            ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and self.sf_vec_size == 16,
             f"Unsupported ab_dtype and sf_vec_size combination: {{float8_e5m2, float8_e4m3fn}} and 16 is not supported",
         )
 
         c_dtype = self._check_dtype(
             self.c_desc,
-            dtype=[torch.float32, torch.float16, torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.uint8],
+            dtype=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16, cutlass.Float8E5M2, cutlass.Float8E4M3FN, cutlass.Float4E2M1FN, cutlass.Uint8],
             name="C",
         )
         self._value_error_if(
@@ -122,7 +191,7 @@ class GemmAmaxSm100(APIBase):
         )
         self._check_dtype(
             self.acc_dtype,
-            dtype=torch.float32,
+            dtype=cutlass.Float32,
             name="Accumulator",
             extra_error_msg="Accumulator must be float32",
         )
@@ -133,21 +202,15 @@ class GemmAmaxSm100(APIBase):
         self._logger.debug("Checking tensor layout")
         m, k, l = self.a_desc.shape
         n, _, _ = self.b_desc.shape
-        _, _, m_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfa_desc.shape
-        _, _, n_div_atom_m0_m1, _, sf_k_div_atom_k, _ = self.sfb_desc.shape
 
         self._check_tensor_shape(self.a_desc, (m, k, l), "A")
         self._check_tensor_shape(self.b_desc, (n, k, l), "B")
         self._check_tensor_shape(self.c_desc, (m, n, l), "C")
-        self._check_tensor_shape(
-            self.sfa_desc,
-            (self.atom_m[0], self.atom_m[1], m_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
-            "sfa",
-        )
-        self._check_tensor_shape(
-            self.sfb_desc,
-            (self.atom_m[0], self.atom_m[1], n_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
-            "sfb",
+        m_div_atom_m0_m1, sf_k_div_atom_k = self._check_sf_shape(self.sfa_desc, l, "sfa")
+        n_div_atom_m0_m1, sfb_k_div_atom_k = self._check_sf_shape(self.sfb_desc, l, "sfb")
+        self._value_error_if(
+            sf_k_div_atom_k != sfb_k_div_atom_k,
+            f"sfa and sfb tensor K' mismatch: got {sf_k_div_atom_k} and {sfb_k_div_atom_k}",
         )
         self.amax_desc = self._pad_tensor_to_ndim(self.amax_desc, 3, "amax")
         self._check_tensor_shape(self.amax_desc, (1, 1, 1), "amax")
@@ -216,8 +279,8 @@ class GemmAmaxSm100(APIBase):
             "Illegal cluster shape",
         )
         self._not_implemented_error_if(
-            self.mma_tiler_mn == (128, 256) and self.sf_vec_size == 16 and c_dtype in {torch.float32, torch.float16, torch.bfloat16},
-            "mma_tiler_mn (128, 256), sf_vec_size 16, c_dtype {torch.float32, torch.float16, torch.bfloat16} fails to launch",
+            self.mma_tiler_mn == (128, 256) and self.sf_vec_size == 16 and c_dtype in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16},
+            "mma_tiler_mn (128, 256), sf_vec_size 16, c_dtype {float32, float16, bfloat16} fails to launch",
         )
 
         # Special cluster shape check for scale factor multicasts.
@@ -252,13 +315,12 @@ class GemmAmaxSm100(APIBase):
         )
 
         self._logger.debug("Checking environment")
-        self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        self._runtime_error_if(not cuda_is_available(), "CUDA is not available")
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         self._runtime_error_if(
             compute_capability < 100,
-            f"GemmAmax requires SM100+ compute capability, but found SM{compute_capability} on device {device}",
+            f"GemmAmax requires SM100+ compute capability, but found SM{compute_capability} on the current device",
         )
 
         self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
@@ -267,12 +329,9 @@ class GemmAmaxSm100(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self) -> None:
-        self._logger.debug("Entering compile")
+    def _compile_kernel(self):
+        """Compile the kernel and return the raw TVM-FFI callable."""
         self._ensure_support_checked()
-        if self._compiled_kernel is not None:
-            self._logger.debug("Kernel already compiled; skipping recompilation")
-            return
 
         gemm_amax = self._kernel(
             sf_vec_size=self.sf_vec_size,
@@ -296,7 +355,7 @@ class GemmAmaxSm100(APIBase):
         amax_cute = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        _compiled_kernel = cute.compile(
+        return cute.compile(
             gemm_amax,
             a_tensor=a_cute,
             b_tensor=b_cute,
@@ -309,17 +368,28 @@ class GemmAmaxSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
+    def compile(self) -> None:
+        self._logger.debug("Entering compile")
+        self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
+
+        _compiled_kernel = self._compile_kernel()
+
         def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            amax_tensor: torch.Tensor,
+            a_tensor: Any,
+            b_tensor: Any,
+            sfa_tensor: Any,
+            sfb_tensor: Any,
+            c_tensor: Any,
+            amax_tensor: Any,
             stream: cuda.CUstream,
         ):
             amax_tensor = self._pad_tensor_to_ndim(amax_tensor, 3, "amax")
 
+            # The TVM-FFI callable converts any DLPack-capable tensor itself
+            # (C fast path for torch, __dlpack__ protocol otherwise).
             return _compiled_kernel(
                 a_tensor,
                 b_tensor,
@@ -340,16 +410,19 @@ class GemmAmaxSm100(APIBase):
 
     def execute(
         self,
-        a_tensor: torch.Tensor,
-        b_tensor: torch.Tensor,
-        sfa_tensor: torch.Tensor,
-        sfb_tensor: torch.Tensor,
-        c_tensor: torch.Tensor,
-        amax_tensor: torch.Tensor,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        c_tensor: Any,
+        amax_tensor: Any,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._logger.debug("Entering execute")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
 
         self._runtime_error_if(
             self._compiled_kernel is None,
@@ -376,13 +449,13 @@ _cache_of_GemmAmaxSm100Objects = {}
 
 
 def gemm_amax_wrapper_sm100(
-    a_tensor: torch.Tensor,
-    b_tensor: torch.Tensor,
-    sfa_tensor: torch.Tensor,
-    sfb_tensor: torch.Tensor,
+    a_tensor: Any,
+    b_tensor: Any,
+    sfa_tensor: Any,
+    sfb_tensor: Any,
     c_major: str = "n",
-    c_dtype: torch.dtype = torch.float32,
-    acc_dtype: torch.dtype = torch.float32,
+    c_dtype: Any = cutlass.Float32,
+    acc_dtype: Any = cutlass.Float32,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     sf_vec_size: int = 32,
@@ -391,30 +464,53 @@ def gemm_amax_wrapper_sm100(
 
     _logger.debug("gemm_amax_wrapper_sm100: Creating empty output tensors c and amax")
 
-    m, _, l = a_tensor.shape
-    n, _, l = b_tensor.shape
-    c_tensor = None
-    if c_major == "m":
-        c_tensor = torch.empty_strided((m, n, l), (1, m, m * n), dtype=c_dtype, device=a_tensor.device)
-    elif c_major == "n":
-        c_tensor = torch.empty_strided((m, n, l), (n, 1, m * n), dtype=c_dtype, device=a_tensor.device)
-    else:
+    framework = detect_framework(a_tensor)
+    c_dtype = _convert_to_cutlass_data_type(c_dtype)
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
+
+    m, _, l = get_shape(a_tensor)
+    n, _, l = get_shape(b_tensor)
+    if c_major not in ("m", "n"):
         raise ValueError(f"c_major must be either 'm' or 'n', got {c_major}")
-    amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
+
+    if framework == "torch":
+        import torch
+
+        if c_major == "m":
+            c_tensor = torch.empty_strided((m, n, l), (1, m, m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+        else:
+            c_tensor = torch.empty_strided((m, n, l), (n, 1, m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+        amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
+    elif framework == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        if c_major == "m":
+            raise ValueError("JAX arrays are row-major; only c_major='n' is supported for JAX inputs")
+        if l != 1:
+            raise ValueError("JAX inputs must have batch dim L == 1; batch-outermost (L-major) layouts are not expressible as JAX arrays")
+        device = a_tensor.device
+        c_tensor = jnp.empty((m, n, l), dtype=framework_dtype(c_dtype, "jax"), device=device)
+        amax_tensor = jnp.full((1, 1, 1), -float("inf"), dtype=jnp.float32, device=device)
+        # The kernel writes into these buffers on the launch stream; make sure XLA has
+        # finished materializing them before the kernel runs.
+        jax.block_until_ready((c_tensor, amax_tensor))
+    else:
+        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_amax_wrapper_sm100; pass torch tensors or JAX arrays")
 
     cache_key = (
-        a_tensor.shape,
-        b_tensor.shape,
-        sfa_tensor.shape,
-        sfb_tensor.shape,
-        a_tensor.dtype,
-        b_tensor.dtype,
-        sfa_tensor.dtype,
-        sfb_tensor.dtype,
-        a_tensor.stride(),
-        b_tensor.stride(),
-        sfa_tensor.stride(),
-        sfb_tensor.stride(),
+        get_shape(a_tensor),
+        get_shape(b_tensor),
+        get_shape(sfa_tensor),
+        get_shape(sfb_tensor),
+        _convert_to_cutlass_data_type(a_tensor.dtype),
+        _convert_to_cutlass_data_type(b_tensor.dtype),
+        _convert_to_cutlass_data_type(sfa_tensor.dtype),
+        _convert_to_cutlass_data_type(sfb_tensor.dtype),
+        canonicalize_unit_dim_strides(get_shape(a_tensor), get_strides(a_tensor)),
+        canonicalize_unit_dim_strides(get_shape(b_tensor), get_strides(b_tensor)),
+        canonicalize_unit_dim_strides(get_shape(sfa_tensor), get_strides(sfa_tensor)),
+        canonicalize_unit_dim_strides(get_shape(sfb_tensor), get_strides(sfb_tensor)),
         c_major,
         c_dtype,
         acc_dtype,

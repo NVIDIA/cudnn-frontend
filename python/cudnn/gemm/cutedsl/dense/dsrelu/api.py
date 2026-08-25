@@ -5,16 +5,25 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    canonicalize_unit_dim_strides,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_shape,
+    get_strides,
+)
 
 from .dense_blockscaled_gemm_persistent_dsrelu_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
@@ -30,21 +39,29 @@ def _major_from_stride_order(stride_order: Tuple[int, ...], mode0_label: str, mo
 
 
 class GemmDsreluSm100(APIBase):
+    """Blockscaled GEMM + dsReLU (sReLU backward) for SM100.
+
+    Tensor parameters are type-erased: torch tensors and JAX arrays are both accepted
+    (the compiled kernels consume tensors via DLPack). torch is only imported when
+    torch tensors/dtypes are passed; likewise for JAX. Dtype parameters accept torch
+    dtypes, numpy/ml_dtypes dtypes, dtype name strings, or cutlass types.
+    """
+
     def __init__(
         self,
-        sample_a: torch.Tensor,
-        sample_b: torch.Tensor,
-        sample_c: torch.Tensor,
-        sample_d: torch.Tensor,
-        sample_dprob: torch.Tensor,
-        sample_sfa: torch.Tensor,
-        sample_sfb: torch.Tensor,
-        sample_prob: torch.Tensor,
-        sample_sfd: Optional[torch.Tensor] = None,
-        sample_amax: Optional[torch.Tensor] = None,
-        sample_norm_const: Optional[torch.Tensor] = None,
+        sample_a: Any,
+        sample_b: Any,
+        sample_c: Any,
+        sample_d: Any,
+        sample_dprob: Any,
+        sample_sfa: Any,
+        sample_sfb: Any,
+        sample_prob: Any,
+        sample_sfd: Optional[Any] = None,
+        sample_amax: Optional[Any] = None,
+        sample_norm_const: Optional[Any] = None,
         alpha: float = 1.0,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Any = cutlass.Float32,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -54,24 +71,24 @@ class GemmDsreluSm100(APIBase):
 
         self._warn_experimental_api()
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
-        self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
-        self.sfd_desc = self._make_tensor_desc(sample_sfd, name="sample_sfd")
-        self.amax_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_amax, name="sample_amax"), 1, "amax")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
+        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
+        self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
+        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
+        self.sfd_desc = self._make_tensor_desc(sample_sfd, name="sample_sfd", canonical=True)
+        self.amax_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True), 1, "amax")
         self.norm_const_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
+            self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True),
             1,
             "norm_const",
         )
 
         self.alpha = alpha
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.cluster_shape_mn = cluster_shape_mn if cluster_shape_mn is not None else ((2, 1) if mma_tiler_mn[0] == 256 else (1, 1))
         self.sf_vec_size = sf_vec_size
@@ -91,48 +108,55 @@ class GemmDsreluSm100(APIBase):
         self._check_tensor_shape(self.prob_desc, (m, 1, l), "prob")
         self._check_tensor_shape(self.dprob_desc, (m, 1, l), "dprob")
 
+        # SF tensors are accepted in the torch-style logical atom view or the
+        # byte-identical physical C-contiguous shape (L, MN', K', 32, 4, 4) --
+        # frameworks with row-major-only layouts (e.g. JAX) cannot express the
+        # permuted logical view.
+        def sf_shapes(mn_div, k_div):
+            return [(32, 4, mn_div, 4, k_div, l), (l, mn_div, k_div, 32, 4, 4)]
+
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(m, 128), 4, rest_k, l), "SFA")
-        self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+        self._check_tensor_shape(self.sfa_desc, sf_shapes(ceil_div(m, 128), rest_k), "SFA")
+        self._check_tensor_shape(self.sfb_desc, sf_shapes(ceil_div(n, 128), rest_k), "SFB")
 
         if self.sfd_desc is not None:
             rest_n = ceil_div(ceil_div(n, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sfd_desc, (32, 4, ceil_div(m, 128), 4, rest_n, l), "SFD")
+            self._check_tensor_shape(self.sfd_desc, sf_shapes(ceil_div(m, 128), rest_n), "SFD")
 
         self._check_tensor_shape(self.amax_desc, (1,), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
 
         self.ab_dtype = self._check_dtype(
             self.a_desc,
-            dtype=[torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2],
+            dtype=[cutlass.Float4E2M1FN, cutlass.Uint8, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
             name="A",
         )
         self._check_dtype(self.b_desc, dtype=self.ab_dtype, name="B", extra_error_msg="A and B must have the same dtype")
         self.c_dtype = self._check_dtype(
             self.c_desc,
-            dtype=[torch.float16, torch.bfloat16, torch.float32],
+            dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32],
             name="C",
         )
         self.d_dtype = self._check_dtype(
             self.d_desc,
-            dtype=[torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn, torch.float8_e5m2],
+            dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
             name="D",
         )
-        self._check_dtype(self.prob_desc, dtype=torch.float32, name="prob")
-        self._check_dtype(self.dprob_desc, dtype=torch.float32, name="dprob")
+        self._check_dtype(self.prob_desc, dtype=cutlass.Float32, name="prob")
+        self._check_dtype(self.dprob_desc, dtype=cutlass.Float32, name="dprob")
 
-        self.sf_dtype = self._check_dtype(self.sfa_desc, dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn], name="SFA")
+        self.sf_dtype = self._check_dtype(self.sfa_desc, dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN], name="SFA")
         self._check_dtype(self.sfb_desc, dtype=self.sf_dtype, name="SFB", extra_error_msg="SFB must have the same dtype as SFA")
         self._check_dtype(self.sfd_desc, dtype=self.sf_dtype, name="SFD", extra_error_msg="SFD must have the same dtype as SFA")
 
-        self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Accumulator")
+        self._check_dtype(self.acc_dtype, dtype=cutlass.Float32, name="Accumulator")
 
         self._value_error_if(self.sf_vec_size not in {16, 32}, f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
         self._value_error_if(
             self._is_fp8(self.d_desc) and (self.sfd_desc is None or self.norm_const_desc is None), "sfd and norm_const are required when D is FP8"
         )
         self._value_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.d_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}, "FP4 input with FP8 output is not supported"
+            self._is_fp4x2(self.ab_dtype) and self.d_dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}, "FP4 input with FP8 output is not supported"
         )
 
         a_major = _major_from_stride_order(self.a_desc.stride_order, "m", "k")
@@ -156,8 +180,8 @@ class GemmDsreluSm100(APIBase):
             f"Invalid cluster shape {self.cluster_shape_mn}",
         )
 
-        self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        self._runtime_error_if(not cuda_is_available(), "CUDA is not available")
+        major, minor = get_compute_capability()
         self._runtime_error_if(major * 10 + minor < 100, f"GemmDsreluSm100 requires SM100+, found SM{major}{minor}")
 
         self._value_error_if(
@@ -371,17 +395,17 @@ class GemmDsreluSm100(APIBase):
         )
 
         def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            c_tensor: torch.Tensor,
-            d_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
-            amax_tensor: Optional[torch.Tensor],
-            sfd_tensor: Optional[torch.Tensor],
-            norm_const_tensor: Optional[torch.Tensor],
+            a_tensor: Any,
+            b_tensor: Any,
+            sfa_tensor: Any,
+            sfb_tensor: Any,
+            c_tensor: Any,
+            d_tensor: Any,
+            prob_tensor: Any,
+            dprob_tensor: Any,
+            amax_tensor: Optional[Any],
+            sfd_tensor: Optional[Any],
+            norm_const_tensor: Optional[Any],
             alpha: float,
             stream: cuda.CUstream,
         ) -> None:
@@ -405,22 +429,25 @@ class GemmDsreluSm100(APIBase):
 
     def execute(
         self,
-        a_tensor: torch.Tensor,
-        b_tensor: torch.Tensor,
-        c_tensor: torch.Tensor,
-        d_tensor: torch.Tensor,
-        dprob_tensor: torch.Tensor,
-        sfa_tensor: torch.Tensor,
-        sfb_tensor: torch.Tensor,
-        prob_tensor: torch.Tensor,
-        sfd_tensor: Optional[torch.Tensor] = None,
-        amax_tensor: Optional[torch.Tensor] = None,
-        norm_const_tensor: Optional[torch.Tensor] = None,
+        a_tensor: Any,
+        b_tensor: Any,
+        c_tensor: Any,
+        d_tensor: Any,
+        dprob_tensor: Any,
+        sfa_tensor: Any,
+        sfb_tensor: Any,
+        prob_tensor: Any,
+        sfd_tensor: Optional[Any] = None,
+        amax_tensor: Optional[Any] = None,
+        norm_const_tensor: Optional[Any] = None,
         alpha: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._runtime_error_if(self._compiled_kernel is None, "GemmDsreluSm100 kernel not compiled; call compile() first")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
         self._compiled_kernel(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -444,7 +471,9 @@ _DENSE_GEMM_DYNAMIC_M_ENV = "CUDNN_FE_GEMM_DYNAMIC_M"
 _DENSE_GEMM_DYNAMIC_MNKL_ENV = "CUDNN_FE_GEMM_DYNAMIC_MNKL"
 
 
-def _allocate_dense_output(shape: Tuple[int, int, int], major: str, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _allocate_dense_output(shape: Tuple[int, int, int], major: str, dtype: Any, device: Any) -> Any:
+    import torch
+
     m, n, l = shape
     if major == "m":
         return torch.empty_strided((m, n, l), (1, m, m * n), dtype=dtype, device=device)
@@ -454,74 +483,118 @@ def _allocate_dense_output(shape: Tuple[int, int, int], major: str, dtype: torch
 
 
 def gemm_dsrelu_wrapper_sm100(
-    a_tensor: torch.Tensor,
-    b_tensor: torch.Tensor,
-    c_tensor: torch.Tensor,
-    sfa_tensor: torch.Tensor,
-    sfb_tensor: torch.Tensor,
-    prob_tensor: torch.Tensor,
+    a_tensor: Any,
+    b_tensor: Any,
+    c_tensor: Any,
+    sfa_tensor: Any,
+    sfb_tensor: Any,
+    prob_tensor: Any,
     alpha: float = 1.0,
     d_major: str = "n",
-    d_dtype: torch.dtype = torch.bfloat16,
-    acc_dtype: torch.dtype = torch.float32,
+    d_dtype: Any = cutlass.BFloat16,
+    acc_dtype: Any = cutlass.Float32,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
-    norm_const_tensor: Optional[torch.Tensor] = None,
+    norm_const_tensor: Optional[Any] = None,
     sf_vec_size: int = 16,
     vector_f32: bool = False,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    m, k, l = a_tensor.shape
-    n, _, _ = b_tensor.shape
+    framework = detect_framework(a_tensor)
+    d_dtype = _convert_to_cutlass_data_type(d_dtype)
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
+    ab_cutlass_dtype = _convert_to_cutlass_data_type(a_tensor.dtype)
 
-    d_tensor = _allocate_dense_output((m, n, l), d_major, d_dtype, a_tensor.device)
-    dprob_tensor = torch.zeros((m, 1, l), dtype=torch.float32, device=a_tensor.device)
+    m, k, l = get_shape(a_tensor)
+    n, _, _ = get_shape(b_tensor)
 
-    sfd_tensor = None
-    if d_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-        sf_k = ceil_div(n, sf_vec_size)
-        mma_shape = (
-            l,
-            ceil_div(m, 128),
-            ceil_div(sf_k, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_tensor = torch.empty(mma_shape, dtype=sfa_tensor.dtype, device=a_tensor.device).permute(3, 4, 1, 5, 2, 0)
+    if framework == "torch":
+        import torch
 
-    amax_tensor = None
-    if a_tensor.dtype in {torch.float4_e2m1fn_x2, torch.uint8} and d_dtype in {torch.bfloat16, torch.float16, torch.float32}:
-        amax_tensor = torch.full((1,), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+        d_tensor = _allocate_dense_output((m, n, l), d_major, framework_dtype(d_dtype, "torch"), a_tensor.device)
+        dprob_tensor = torch.zeros((m, 1, l), dtype=torch.float32, device=a_tensor.device)
+
+        sfd_tensor = None
+        if d_dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}:
+            sf_k = ceil_div(n, sf_vec_size)
+            mma_shape = (
+                l,
+                ceil_div(m, 128),
+                ceil_div(sf_k, 4),
+                32,
+                4,
+                4,
+            )
+            sfd_tensor = torch.empty(mma_shape, dtype=sfa_tensor.dtype, device=a_tensor.device).permute(3, 4, 1, 5, 2, 0)
+
+        amax_tensor = None
+        if ab_cutlass_dtype in {cutlass.Float4E2M1FN, cutlass.Uint8} and d_dtype in {cutlass.BFloat16, cutlass.Float16, cutlass.Float32}:
+            amax_tensor = torch.full((1,), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+    elif framework == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        if d_major == "m":
+            raise ValueError("JAX arrays are row-major; only d_major='n' is supported for JAX inputs")
+        if d_major != "n":
+            raise ValueError(f"major must be 'm' or 'n', got {d_major}")
+        if l != 1:
+            raise ValueError("JAX inputs must have batch dim L == 1; batch-outermost (L-major) layouts are not expressible as JAX arrays")
+        device = a_tensor.device
+        d_tensor = jnp.empty((m, n, l), dtype=framework_dtype(d_dtype, "jax"), device=device)
+        dprob_tensor = jnp.zeros((m, 1, l), dtype=jnp.float32, device=device)
+        outputs_to_sync = [d_tensor, dprob_tensor]
+
+        sfd_tensor = None
+        if d_dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}:
+            # SFD in the physical C-contiguous atom shape; the torch path's permuted
+            # logical view is byte-identical in memory
+            sf_k = ceil_div(n, sf_vec_size)
+            sfd_tensor = jnp.empty(
+                (l, ceil_div(m, 128), ceil_div(sf_k, 4), 32, 4, 4),
+                dtype=framework_dtype(_convert_to_cutlass_data_type(sfa_tensor.dtype), "jax"),
+                device=device,
+            )
+            outputs_to_sync.append(sfd_tensor)
+
+        amax_tensor = None
+        if ab_cutlass_dtype in {cutlass.Float4E2M1FN, cutlass.Uint8} and d_dtype in {cutlass.BFloat16, cutlass.Float16, cutlass.Float32}:
+            amax_tensor = jnp.full((1,), -float("inf"), dtype=jnp.float32, device=device)
+            outputs_to_sync.append(amax_tensor)
+        # The kernel writes into these buffers on the launch stream; make sure XLA has
+        # finished materializing them before the kernel runs.
+        jax.block_until_ready(outputs_to_sync)
+    else:
+        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_dsrelu_wrapper_sm100; pass torch tensors or JAX arrays")
 
     use_full_dynamic = os.environ.get(_DENSE_GEMM_DYNAMIC_MNKL_ENV) is not None
     use_dynamic_m = not use_full_dynamic and os.environ.get(_DENSE_GEMM_DYNAMIC_M_ENV) is not None
 
-    def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
+    def stride_order(tensor: Any) -> Tuple[int, ...]:
+        return tuple(i for i, s in sorted(enumerate(get_strides(tensor)), key=lambda x: x[1]))
 
-    def tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+    def tensor_signature(tensor: Optional[Any]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Any]]:
         if tensor is None:
             return None, None, None
-        return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
+        return get_shape(tensor), canonicalize_unit_dim_strides(get_shape(tensor), get_strides(tensor)), _convert_to_cutlass_data_type(tensor.dtype)
 
-    def dynamic_compact_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+    def dynamic_compact_signature(tensor: Optional[Any]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Any]]:
         if tensor is None:
             return None, None, None
-        return tuple(tensor.shape[1:]), stride_order(tensor), tensor.dtype
+        return get_shape(tensor)[1:], stride_order(tensor), _convert_to_cutlass_data_type(tensor.dtype)
 
-    def dynamic_tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+    def dynamic_tensor_signature(tensor: Optional[Any]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Any]]:
         if tensor is None:
             return None, None, None
-        return None, stride_order(tensor), tensor.dtype
+        return None, stride_order(tensor), _convert_to_cutlass_data_type(tensor.dtype)
 
     def dynamic_m_tensor_signature(
-        tensor: Optional[torch.Tensor], static_shape_suffix: Optional[Tuple[int, ...]], dynamic_stride_dims: Tuple[int, ...] = ()
-    ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+        tensor: Optional[Any], static_shape_suffix: Optional[Tuple[int, ...]], dynamic_stride_dims: Tuple[int, ...] = ()
+    ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Any]]:
         if tensor is None:
             return None, None, None
-        stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
-        return static_shape_suffix, stride_signature, tensor.dtype
+        stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(get_strides(tensor)))
+        return static_shape_suffix, stride_signature, _convert_to_cutlass_data_type(tensor.dtype)
 
     cache_key = (
         use_full_dynamic,
@@ -540,7 +613,7 @@ def gemm_dsrelu_wrapper_sm100(
             dynamic_tensor_signature(sfa_tensor)
             if use_full_dynamic
             else (
-                dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], sfa_tensor.shape[5]), dynamic_stride_dims=(5,))
+                dynamic_m_tensor_signature(sfa_tensor, (get_shape(sfa_tensor)[4], get_shape(sfa_tensor)[5]), dynamic_stride_dims=(5,))
                 if use_dynamic_m
                 else tensor_signature(sfa_tensor)
             )
@@ -551,9 +624,9 @@ def gemm_dsrelu_wrapper_sm100(
             if use_full_dynamic
             else dynamic_compact_signature(prob_tensor) if use_dynamic_m else tensor_signature(prob_tensor)
         ),
-        norm_const_tensor.shape if norm_const_tensor is not None else None,
-        norm_const_tensor.stride() if norm_const_tensor is not None else None,
-        norm_const_tensor.dtype if norm_const_tensor is not None else None,
+        get_shape(norm_const_tensor) if norm_const_tensor is not None else None,
+        canonicalize_unit_dim_strides(get_shape(norm_const_tensor), get_strides(norm_const_tensor)) if norm_const_tensor is not None else None,
+        _convert_to_cutlass_data_type(norm_const_tensor.dtype) if norm_const_tensor is not None else None,
         alpha,
         acc_dtype,
         mma_tiler_mn,

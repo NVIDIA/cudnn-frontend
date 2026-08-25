@@ -7,6 +7,8 @@ Contains test configuration fixtures, tensor creation, and reference implementat
 """
 
 import torch
+import functools
+
 import pytest
 from typing import Optional, Tuple, List, Dict, Any
 from fe_api.test_fe_api_utils import (
@@ -97,22 +99,39 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP8 = (
     ]
 )
 
-GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = (
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE = (
     GROUPED_GEMM_DSWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_DSWIGLU_COMMON_MARKS
     + [
-        pytest.mark.parametrize(
-            "sf_vec_size,sf_dtype",
-            [
-                (16, torch.float8_e8m0fnu),
-                (16, torch.float8_e4m3fn),
-                (32, torch.float8_e8m0fnu),
-                (32, torch.float8_e4m3fn),
-            ],
-        ),
         pytest.mark.parametrize("discrete_col_sfd", [False]),
     ]
 )
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_WITH_E5M3 = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
+        [
+            (16, torch.float8_e8m0fnu, None),
+            (16, torch.float8_e4m3fn, None),
+            (32, torch.float8_e8m0fnu, None),
+            (32, torch.float8_e4m3fn, None),
+            (16, torch.float8_e4m3fn, "e5m3"),
+        ],
+        ids=["v16_e8m0", "v16_e4m3", "v32_e8m0", "v32_e4m3", "v16_e5m3"],
+    ),
+]
+
+GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4 = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype",
+        [
+            (16, torch.float8_e8m0fnu),
+            (16, torch.float8_e4m3fn),
+            (32, torch.float8_e8m0fnu),
+            (32, torch.float8_e4m3fn),
+        ],
+    ),
+]
 
 GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP8 = (
     GROUPED_GEMM_DSWIGLU_FP8_TYPE_MARKS
@@ -140,9 +159,12 @@ GROUPED_GEMM_DSWIGLU_PARAM_MARKS_DBIAS_FP4 = (
 )
 
 
-def with_grouped_gemm_dswiglu_params_fp4(func):
+def with_grouped_gemm_dswiglu_params_fp4(func=None, *, with_e5m3: bool = False):
     """Decorator to apply grouped GEMM dSwiGLU FP4 test parameters."""
-    for mark in reversed(GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4):
+    if func is None:
+        return functools.partial(with_grouped_gemm_dswiglu_params_fp4, with_e5m3=with_e5m3)
+    param_marks = GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4_WITH_E5M3 if with_e5m3 else GROUPED_GEMM_DSWIGLU_PARAM_MARKS_FP4
+    for mark in reversed(param_marks):
         func = mark(func)
     return func
 
@@ -353,8 +375,11 @@ def run_grouped_gemm_dswiglu_ref(
     d_dtype: torch.dtype = torch.float32,
     sf_vec_size: int = 16,
     sf_dtype: torch.dtype = torch.float8_e8m0fnu,
+    act_func: str = "dswiglu",
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
 ) -> Dict[str, torch.Tensor]:
-    """Run reference implementation for grouped GEMM dSwiGLU backward.
+    """Run reference implementation for grouped GEMM dGLU backward.
 
     Based on the reference in continugous_blockscaled_grouped_gemm_dswiglu_quant_fusion.py
 
@@ -385,6 +410,9 @@ def run_grouped_gemm_dswiglu_ref(
     :param d_dtype: Output D tensor dtype
     :param sf_vec_size: Scale factor vector size
     :param sf_dtype: Scale factor dtype
+    :param act_func: Activation function (``"dswiglu"`` or ``"dsituglu"``)
+    :param situ_beta1: Gate tanh scale for dSiTU-GLU
+    :param situ_beta2: Up-branch tanh scale for dSiTU-GLU
     :return: Dictionary of reference tensors
     """
     n, k, l = b_ref.shape
@@ -432,18 +460,29 @@ def run_grouped_gemm_dswiglu_ref(
     c_input = c_full.index_select(dim=1, index=dest_idx_ab)  # shape [M, N, L]
     c_gate = c_full.index_select(dim=1, index=dest_idx_glu)  # shape [M, N, L]
     sig = torch.sigmoid(c_gate)
-    swish = c_gate * sig
+    if act_func == "dsituglu":
+        gate_tanh = torch.tanh(c_gate / situ_beta1)
+        up_tanh = torch.tanh(c_input / situ_beta2)
+        gate_value = situ_beta1 * gate_tanh * sig
+        up_value = situ_beta2 * up_tanh
+        gate_grad = (1.0 - gate_tanh.square()) * sig
+        gate_grad = gate_grad + situ_beta1 * gate_tanh * sig * (1.0 - sig)
+        up_grad = 1.0 - up_tanh.square()
+        ref_dprob = gate_value * up_value * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * gate_value * up_grad
+        dswiglu = ref * prob * up_value * gate_grad
+    else:
+        swish = c_gate * sig
+        ref_dprob = swish * c_input * ref
+        prob = prob_tensor.expand(-1, n, -1)
+        ab = ref * prob * swish
+        dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
     # Step 3: Compute dprob reference
-    ref_dprob = swish * c_input * ref
     chunk_sums = [torch.sum(chunk, dim=1, keepdim=True) for chunk in torch.split(ref_dprob, 32, dim=1)]
     ref_dprob = torch.sum(torch.cat(chunk_sums, dim=1), dim=1, keepdim=True)  # (m, 1, l)
     ref_tensors["dprob_ref"] = ref_dprob
-
-    # Step 4: Compute dSwiGLU formulas
-    prob = prob_tensor.expand(-1, n, -1)
-    ab = ref * prob * swish
-    dswiglu = ref * prob * c_input * sig * (1 + c_gate * (1 - sig))
 
     # Step 5: Interleave [dswiglu, ab] back into swizzled [M, N, 1] by 32-wide blocks
     ref_d = torch.empty_like(c_full)
@@ -539,6 +578,9 @@ def check_ref_grouped_gemm_dswiglu(
         d_dtype=cfg["d_dtype"],
         sf_vec_size=cfg["sf_vec_size"],
         sf_dtype=cfg["sf_dtype"],
+        act_func=cfg.get("act_func", "dswiglu"),
+        situ_beta1=cfg.get("situ_beta1", 4.0),
+        situ_beta2=cfg.get("situ_beta2", 25.0),
     )
 
     torch.cuda.synchronize()

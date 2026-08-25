@@ -5,7 +5,7 @@
 
 A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
 MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
-``static_sched`` / ``ab_stages`` — those are execution strategy chosen by the
+``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
 Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>``.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -22,14 +22,16 @@ from cudnn.frost.occupancy import MAX_CLUSTER_SIZE as _FROST_MAX_CLUSTER_SIZE
 
 @functools.lru_cache(maxsize=None)
 def _sm_smem_budget_bytes_of(device: int) -> int:
-    from cudnn.frost.device import device_name, is_available, shared_memory_per_block_optin
+    """Largest per-CTA SMEM the device gives a CTA — the oversized carveout where the
+    part has one, else the opt-in limit."""
+    from cudnn.frost.device import device_name, is_available, oversized_shared_memory_per_block, shared_memory_per_block_optin
 
     if not is_available():
         raise RuntimeError("cannot size the SMEM pipeline: no CUDA device is visible to query MaxSharedMemoryPerBlockOptin")
     optin = shared_memory_per_block_optin(device)
     if not optin:
         raise RuntimeError(f"the driver did not report MaxSharedMemoryPerBlockOptin for device {device_name(device)!r}; cannot size the SMEM pipeline")
-    return int(optin)
+    return max(int(optin), oversized_shared_memory_per_block(device))
 
 
 def _sm_smem_budget_bytes(device=None) -> int:
@@ -38,15 +40,17 @@ def _sm_smem_budget_bytes(device=None) -> int:
     return _sm_smem_budget_bytes_of(resolve_device(device))
 
 
-# Per-CTA SMEM held back off the top when sizing the ab/acc pipeline, keyed by
-# the kernel template's pipeline: the CLC ring, smem barriers, the TMEM base-address
-_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048}
+# Per-CTA SMEM held back off the top when sizing the ab pipeline: the scheduler ring,
+# every smem barrier, the TMEM base address and — on the MoE templates — the per-CTA TMA
+# tensormap scratch. The ab pipeline itself only counts the operand tensors, so these
+# fragments are budgeted once here instead of being modelled stage by stage.
+_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048}
+_SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096, "sm107": 4096}
 
 
-def _sm_smem_ab_budget_bytes(pipeline: str, device=None) -> int:
-    if pipeline not in _SMEM_FIXED_RESERVE_BY_PIPELINE:
-        raise NotImplementedError(f"SMEM fixed reserve not known for pipeline {pipeline!r}")
-    return _sm_smem_budget_bytes(device) - _SMEM_FIXED_RESERVE_BY_PIPELINE[pipeline]
+def _sm_smem_ab_budget_bytes(pipeline: str, device=None, *, moe: bool = False) -> int:
+    table = _SMEM_FIXED_RESERVE_MOE_BY_PIPELINE if moe else _SMEM_FIXED_RESERVE_BY_PIPELINE
+    return _sm_smem_budget_bytes(device) - _pipeline_fact(table, pipeline, "SMEM fixed reserve")
 
 
 _L2_RETENTION_DIVISOR = 3
@@ -73,14 +77,31 @@ def l2_swizzle_budget_bytes(device=None) -> int:
 
 _CTA_TILE_M_MAX = 128
 _CTA_TILE_N_MAX = 256
-_CTA_TILE_K_BYTES_MAX = 128  # SWIZZLE_128B: SMEM row width = 128 bytes
 _MAX_CLUSTER_SIZE = _FROST_MAX_CLUSTER_SIZE
-_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384}
+_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm107": 128}
 
 # MMA-inst K in bytes
 _MMA_INST_K_BYTES = 32
+_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": 32, "sm103": 48, "sm107": 64}
 
-_AB_STAGES_CAP = 8  # cap even if SMEM permits more
+
+def _pipeline_fact(table: dict, pipeline: str, what: str):
+    """A per-pipeline hardware fact, by EXPLICIT membership. Every table keyed by
+    pipeline goes through here so a family added without an entry raises instead
+    of silently inheriting another family's value."""
+    if pipeline not in table:
+        raise NotImplementedError(f"{what} not known for pipeline {pipeline!r}; known: {sorted(table)}")
+    return table[pipeline]
+
+
+# MMA instructions the CTA tile spans along M. N is deliberately NOT an axis:
+# it measured within noise of a single instruction (0.96x vs 0.97x cuBLAS at
+# 4096^3), cuBLAS does not split N either, and neither the 2-CTA nor the
+# block-scale pipeline can express it (the pair already splits B's N; the SF
+# words are indexed per 128-column block).
+_NUM_MMA_MAX = 2
+
+_AB_STAGES_CAP = 16  # cap even if SMEM permits more
 
 
 def smem_max_ab_stages(
@@ -89,16 +110,15 @@ def smem_max_ab_stages(
     cta_tile_k_bytes: int,
     *,
     cta_group: int = 1,
-    acc_stages: int = 2,
     extra_smem_bytes: int = 0,
     extra_per_stage_bytes: int = 0,
     pipeline: str,
+    moe: bool = False,
     device=None,
 ) -> int:
     smem_b_n = cta_tile_n // cta_group
-    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes + 2 * 8
-    fixed = 2 * acc_stages * 8 + 8
-    avail = _sm_smem_ab_budget_bytes(pipeline, device) - fixed - extra_smem_bytes
+    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes
+    avail = _sm_smem_ab_budget_bytes(pipeline, device, moe=moe) - extra_smem_bytes
     if avail < per_stage:
         raise ValueError(
             f"tile ({cta_tile_m},{cta_tile_n},K={cta_tile_k_bytes}B) "
@@ -113,9 +133,15 @@ def smem_max_ab_stages(
 class TileConfig:
     """One pure-geometry tile config. Dtype- AND execution-independent.
 
-    NOT here (template strategy, not geometry): cta_group, static_sched,
+    NOT here (template strategy, not geometry): cta_group,
     ab_stages — those, plus K-in-elements, the SMEM tile, and the hardware MMA
     shape, are derived per (dtype, cta_group) at render time.
+
+    The CTA tile may span SEVERAL MMA instructions along M:
+    ``num_mma_m = cta_tile_m / mma_inst_m``. The whole CTA tile is still
+    TMA-loaded in one go; the MMA warp issues one instruction per M sub-block
+    into its own TMEM accumulator region. N is never split
+    (``mma_inst_n == cta_tile_n``).
     """
 
     cta_tile_m: int
@@ -141,25 +167,21 @@ class TileConfig:
         m, n, kb = self.cta_tile_m, self.cta_tile_n, self.cta_tile_k_bytes
         cm, cn = self.cgrp_size_m, self.cgrp_size_n
 
-        # Per-CTA tile hardware bounds. M is pinned to the two TMEM row layouts
-        # the templates implement (128 = full lanes, 64 = packed half-lanes).
-        if m not in (64, 128):
-            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_m={m} — supported values " f"are 64 and 128")
-        if n < 8 or n > _CTA_TILE_N_MAX or n % 8 != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_n={n} — supported range " f"is 8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8")
-        kb_max = _CTA_TILE_K_BYTES_MAX_BY_PIPELINE.get(self.pipeline, _CTA_TILE_K_BYTES_MAX)
-        if kb <= 0 or kb > kb_max or kb % _MMA_INST_K_BYTES != 0:
+        kb_max = _pipeline_fact(_CTA_TILE_K_BYTES_MAX_BY_PIPELINE, self.pipeline, "max cta_tile_k_bytes")
+        if kb <= 0 or kb > kb_max:
+            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"positive, ≤ {kb_max} for pipeline {self.pipeline}")
+        # sm103's K-tile is not free geometry either (K-tile = lcm(128, 48)).
+        if self.pipeline == "sm103" and kb != 384:
+            raise NotImplementedError(f"TileConfig {self.name!r}: sm103 fixes cta_tile_k_bytes=384 " f"(K-tile = lcm(128, 48)); got {kb}")
+        # A pipeline whose MMA instruction fixes its K width owns that axis — it
+        # is not free geometry (sm103 K=48B UTCOMMA, sm107 K=64B), and the K-tile
+        # walks that instruction, so it is a multiple of the SAME width.
+        mkb_want = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, self.pipeline, "MMA-inst K width")
+        if self.mma_inst_k_bytes != mkb_want:
+            raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} fixes " f"mma_inst_k_bytes={mkb_want}; got {self.mma_inst_k_bytes}")
+        if kb % mkb_want != 0:
             raise NotImplementedError(
-                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be "
-                f"a positive multiple of {_MMA_INST_K_BYTES}, ≤ {kb_max} for "
-                f"pipeline {self.pipeline}"
-            )
-        # sm103 K axes are NOT free geometry
-        if self.pipeline == "sm103" and (kb != 384 or self.mma_inst_k_bytes != 48):
-            raise NotImplementedError(
-                f"TileConfig {self.name!r}: sm103 fixes cta_tile_k_bytes=384 and "
-                f"mma_inst_k_bytes=48 (K=48B UTCOMMA); got kb={kb}, "
-                f"mma_inst_k_bytes={self.mma_inst_k_bytes}"
+                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"a multiple of {self.pipeline}'s mma_inst_k_bytes={mkb_want}"
             )
 
         # CGRP size sanity. (cta_group-specific constraints — e.g. cgrp_size_m
@@ -181,6 +203,29 @@ class TileConfig:
             raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} must be positive " f"and divide cta_tile_n={n}")
         if mkb <= 0 or kb % mkb != 0:
             raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_k_bytes={mkb} must be " f"positive and divide cta_tile_k_bytes={kb}")
+        # The M/N hardware bounds. These have always been the MMA INSTRUCTION's;
+        # they read as the CTA tile's only while one instruction covered it.
+        # M = the two TMEM row layouts (128 full lanes / 64 packed half-lanes);
+        # N = the idesc n_dim, encoded with its 3 LSBs dropped.
+        if mm not in (64, _CTA_TILE_M_MAX):
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: mma_inst_m={mm} (= cta_tile_m {m} / " f"num_mma_m {self.num_mma_m}) — supported values are 64 and {_CTA_TILE_M_MAX}"
+            )
+        if mn < 8 or mn > _CTA_TILE_N_MAX or mn % 8 != 0:
+            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} — supported range is " f"8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8")
+        # The one NEW axis: how many instructions the CTA tile spans along M. K is
+        # not an instruction-count axis (the mainloop already walks
+        # cta_tile_k / mma_inst_k), and N is not one at all.
+        if self.num_mma_m > _NUM_MMA_MAX:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: num_mma_m={self.num_mma_m} — at most " f"{_NUM_MMA_MAX} MMA instructions per CTA tile along M"
+            )
+        if mn != n:
+            raise NotImplementedError(f"TileConfig {self.name!r}: N is not split across MMA instructions — " f"mma_inst_n must equal cta_tile_n={n}; got {mn}")
+        # The epilogue drains one MMA-M block at a time, so its subtile height
+        # is the instruction's M, not the CTA tile's.
+        if self.epi_tile_mn[0] != mm:
+            raise NotImplementedError(f"TileConfig {self.name!r}: epi_tile_mn[0]={self.epi_tile_mn[0]} " f"must equal mma_inst_m={mm}")
 
     @property
     def geometry_name(self) -> str:
@@ -194,13 +239,18 @@ class TileConfig:
     @property
     def name(self) -> str:
         """Canonical identifier ``CONFIG_<pipeline>_<geometry_name>`` — pure geometry
-        (cta_group/static/ab_stages are the template's, not in the name)."""
+        (cta_group/ab_stages are the template's, not in the name)."""
         return f"CONFIG_{self.pipeline}_{self.geometry_name}"
 
     @property
     def cta_tile_mn(self) -> tuple[int, int]:
         """Per-CTA logical output tile (M, N) in elements."""
         return (self.cta_tile_m, self.cta_tile_n)
+
+    @property
+    def num_mma_m(self) -> int:
+        """MMA instructions the CTA tile spans along M."""
+        return self.cta_tile_m // self.mma_inst_m
 
     @property
     def cgrp_size_mn(self) -> tuple[int, int]:
@@ -260,6 +310,7 @@ class TileConfig:
         *,
         extra_smem_bytes: int = 0,
         extra_per_stage_bytes: int = 0,
+        moe: bool = False,
     ) -> int:
         """Largest SMEM pipeline depth under ``cta_group`` (2-CTA MMA halves B's
         SMEM N, so it fits more stages)."""
@@ -268,10 +319,10 @@ class TileConfig:
             self.cta_tile_n,
             self.cta_tile_k_bytes,
             cta_group=cta_group,
-            acc_stages=self.acc_stages,
             extra_smem_bytes=extra_smem_bytes,
             extra_per_stage_bytes=extra_per_stage_bytes,
             pipeline=self.pipeline,
+            moe=moe,
         )
 
     # -- multicast model -----------------------------------------------------
@@ -313,9 +364,17 @@ class ConfigSm103(TileConfig):
     axes match :class:`ConfigSm100`. Type marker; callers pass ``pipeline="sm103"``."""
 
 
+class ConfigSm107(TileConfig):
+    """sm107 geometry — identical to :class:`ConfigSm100` except
+    ``mma_inst_k_bytes`` is 64 (the SM 10.7 block-scale MMA reads a 64-byte K
+    per instruction, twice sm100's 32). Type marker; callers pass
+    ``pipeline="sm107"``."""
+
+
 _CONFIG_CLASS_BY_PIPELINE: dict[str, type[TileConfig]] = {
     "sm100": ConfigSm100,
     "sm103": ConfigSm103,
+    "sm107": ConfigSm107,
 }
 
 
@@ -328,13 +387,19 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 
 
 # ---------------------------------------------------------------------------
-# Catalog — pure-geometry enumeration. cta_group / static / mainloop are NOT
+# Catalog — pure-geometry enumeration. cta_group / mainloop are NOT
 # enumerated here; the registry expands each geometry across accepting templates.
-# Axes: cta_m ∈ {128,64}, cta_n ∈ {8..256 step 8}, K_bytes ∈ {128,64}, cluster ∈
-# _CLUSTERS. N < 8 / N % 8 rejected by __post_init__ (tcgen05 idesc n_dim is a
-# multiple of 8). 2-CTA templates accept only cgrp_size_m % 2 == 0 (registry
-# predicate).
+# Axes: M ∈ _M_AXES (the UTCMMA instruction M and how many of them the CTA tile
+# spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
+# K_bytes ∈ {128,64}, cluster ∈ _CLUSTERS. N < 8 / N % 8 rejected by
+# __post_init__ (tcgen05 idesc n_dim is a multiple of 8). 2-CTA templates accept
+# only cgrp_size_m % 2 == 0 (registry predicate).
 # ---------------------------------------------------------------------------
+
+# (mma_inst_m, num_mma_m) — the UTCMMA instruction M and how many of them one CTA
+# tile spans; cta_tile_m is their product. num_mma_m == 1 first, so a lookup like
+# `next(c for c in CATALOG if c.cta_tile_m == 128)` still lands on the unsplit tile.
+_M_AXES: tuple[tuple[int, int], ...] = ((128, 1), (64, 1), (128, 2), (64, 2))
 
 _CLUSTERS: tuple[tuple[int, int], ...] = (
     (1, 1),
@@ -355,15 +420,17 @@ _CLUSTERS: tuple[tuple[int, int], ...] = (
 )
 
 
-def _geom_sm100(cta_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
-    """Build one sm100 pure-geometry config."""
+def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
+    """Build one sm100 pure-geometry config from the MMA-instruction M and the
+    number of them the CTA tile spans."""
     return ConfigSm100(
-        cta_tile_m=cta_m,
+        cta_tile_m=mma_m * num_mma_m,
         cta_tile_n=cta_n,
         cta_tile_k_bytes=k_bytes,
         cgrp_size_m=cgrp_m,
         cgrp_size_n=cgrp_n,
-        epi_tile_mn=(cta_m, 32),
+        mma_inst_m=mma_m,
+        epi_tile_mn=(mma_m, 32),
         threads_per_cta=256,
         pipeline="sm100",
         acc_stages=2,
@@ -386,19 +453,45 @@ def _geom_sm103(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm103
     )
 
 
+def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
+    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours).
+    mma_inst_m is pinned to 128 — the block-scale F8_128x4 SF swizzle needs
+    mma_inst_m % 128 == 0, so 64 is not an axis here."""
+    return ConfigSm107(
+        cta_tile_m=_CTA_TILE_M_MAX * num_mma_m,
+        cta_tile_n=cta_n,
+        cta_tile_k_bytes=128,
+        cgrp_size_m=cgrp_m,
+        cgrp_size_n=cgrp_n,
+        mma_inst_m=_CTA_TILE_M_MAX,
+        epi_tile_mn=(_CTA_TILE_M_MAX, 32),
+        threads_per_cta=256,
+        pipeline="sm107",
+        acc_stages=2,
+        mma_inst_k_bytes=64,
+    )
+
+
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
-    for cta_m in (128, 64):
+    for mma_m, num_mma_m in _M_AXES:
         for cta_n in range(256, 0, -8):
             for k_bytes in (128, 64):
                 for cgrp_m, cgrp_n in _CLUSTERS:
-                    cfgs.append(_geom_sm100(cta_m, cta_n, k_bytes, cgrp_m, cgrp_n))
+                    cfgs.append(_geom_sm100(mma_m, num_mma_m, cta_n, k_bytes, cgrp_m, cgrp_n))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
     # rank-decomposition multicast masks for data + SF).
     for cta_n in (256, 128):
         for cgrp_m, cgrp_n in _CLUSTERS:
             cfgs.append(_geom_sm103(128, cta_n, cgrp_m, cgrp_n))
+    # sm107 block-scale geometries: the sm100 axes narrowed to what the F8_128x4
+    # SF swizzle admits (M/N multiples of 128, K-tile 128 B) — the rest of the
+    # sm100 enumeration would only be rejected by validate_block_scale_config.
+    for num_mma_m in (1, 2):
+        for cta_n in (256, 128):
+            for cgrp_m, cgrp_n in _CLUSTERS:
+                cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
     return tuple(cfgs)
 
 
@@ -432,17 +525,19 @@ def _synthesize_config(name: str) -> TileConfig:
     pipeline = m.group("pipeline")
     cls = config_class_for_pipeline(pipeline)  # KeyError for unknown pipelines
     cta_m = int(m.group("cta_m"))
+    mma_m = int(m.group("mma_m"))
     cfg = cls(
         cta_tile_m=cta_m,
         cta_tile_n=int(m.group("cta_n")),
         cta_tile_k_bytes=int(m.group("k_bytes")),
         cgrp_size_m=int(m.group("cgrp_m")),
         cgrp_size_n=int(m.group("cgrp_n")),
-        epi_tile_mn=(cta_m, 32),
+        # The epilogue drains one MMA-M block per pass.
+        epi_tile_mn=(mma_m, 32),
         threads_per_cta=256,
         pipeline=pipeline,
         acc_stages=2,
-        mma_inst_m=int(m.group("mma_m")),
+        mma_inst_m=mma_m,
         mma_inst_n=int(m.group("mma_n")),
         mma_inst_k_bytes=int(m.group("mma_k_bytes")),
     )
@@ -473,12 +568,16 @@ _DEFAULT_SM_COUNT = 148
 
 
 def _sm_count() -> int:
-    """SM count of the active device, with a B200-shaped fallback for CPU-only use."""
-    try:
-        import torch
+    """SM count of the active device, with a B200-shaped fallback for CPU-only use.
 
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    Queried through frost's device layer (not torch) so it honours a
+    ``build_device()`` scope — i.e. follows the handle's GPU during a build, like
+    every other device-derived constant."""
+    from cudnn.frost.device import is_available, multiprocessor_count, resolve_device
+
+    try:
+        if is_available():
+            return multiprocessor_count(resolve_device(None))
     except Exception:
         pass
     return _DEFAULT_SM_COUNT
@@ -538,20 +637,21 @@ def select_config(
     block_scale: bool = False,
     b_n_major: bool = False,
     b_elem_bytes: int = 2,
-    supports_static: bool = False,
     sm_count: int | None = None,
-) -> tuple[TileConfig, int, str]:
-    """Pick (TileConfig, cta_group, scheduler) from problem geometry.
+) -> tuple[TileConfig, int]:
+    """Pick (TileConfig, cta_group) from problem geometry.
 
-    One selection path for every graph type frost supports. The tile, the cluster and
-    the scheduler are each chosen by an analytic score over (M, N, K, tile geometry,
+    One selection path for every graph type frost supports. The tile and the cluster
+    are each chosen by an analytic score over (M, N, K, tile geometry,
     SM count) -- integer ceil-divisions plus one sqrt, no measured timings and no fitted
     coefficients. The support constraints that used to sit around the old N-bucket rule
     (multi-GEMM N-tile budget, block-scale 128-multiples, N-major swizzle groups) are
     applied to the scored result, so they hold exactly as before.
 
     ``K`` is optional only for callers that do not have it to hand; without it the
-    small-K bias is neutral and everything else is unchanged.
+    small-K bias is neutral and everything else is unchanged. The pick is an sm100
+    geometry; a caller building for another template family passes it through
+    :func:`as_pipeline`.
     """
     sm = sm_count if sm_count is not None else _sm_count()
     x = max(1, num_gemms)
@@ -560,7 +660,7 @@ def select_config(
 
     cta_m = 128
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
-    # 1ctamma CLC template (see compiler._check_multi_gemm), so it stays at 1.
+    # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
     cta_group = 1 if x > 1 else (2 if M > cta_m else 1)
 
     # --- tile ---------------------------------------------------------------
@@ -604,21 +704,40 @@ def select_config(
     # --- cluster ------------------------------------------------------------
     pool = [g for g in _CLUSTERS_1D + _CLUSTERS_2D if not _hang_prone(cta_m, cta_n, g[0], g[1])]
     if cta_group == 2:
-        pool = [g for g in pool if g[0] % 2 == 0]        # 2-CTA needs cgrp_size_m % 2 == 0
+        pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cgrp_size_m % 2 == 0
     if not pool:
         pool = [(2, 1)] if cta_group == 2 else [(1, 1)]
     cgrp_m, cgrp_n = max(pool, key=lambda g: _cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm))
 
-    # --- scheduler ----------------------------------------------------------
-    # Previously always "clc". The static scheduler wins for plain matmul above one
-    # M-tile; block-scaled graphs stay on "clc", where the two are within noise of each
-    # other and clc measured slightly better. `supports_static` is False unless the
-    # caller has confirmed a static template exists for this graph type -- mainloop
-    # fusion, MoE and multi-GEMM have none and would fail template lookup.
-    scheduler = "static" if (supports_static and x == 1 and M > 128 and not block_scale) else "clc"
+    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x{_MMA_INST_K_BYTES}_cluster{cgrp_m}x{cgrp_n}"
+    return by_name(name), cta_group
 
-    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}"
-    return by_name(name), cta_group, scheduler
+
+def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
+    """The same geometry as a ``pipeline``-family config — only the family-fixed
+    MMA-inst K width moves. A family whose K axes this geometry cannot satisfy
+    (sm103 fixes a 384-byte K-tile) raises from the config's ``__post_init__``,
+    so the invariant stays in one place."""
+    if cfg.pipeline == pipeline:
+        return cfg
+    cls = config_class_for_pipeline(pipeline)
+    return cls(
+        cta_tile_m=cfg.cta_tile_m,
+        cta_tile_n=cfg.cta_tile_n,
+        cta_tile_k_bytes=cfg.cta_tile_k_bytes,
+        cgrp_size_m=cfg.cgrp_size_m,
+        cgrp_size_n=cfg.cgrp_size_n,
+        epi_tile_mn=cfg.epi_tile_mn,
+        threads_per_cta=cfg.threads_per_cta,
+        pipeline=pipeline,
+        acc_stages=cfg.acc_stages,
+        tile_swizzle_n=cfg.tile_swizzle_n,
+        mma_inst_m=cfg.mma_inst_m,
+        mma_inst_n=cfg.mma_inst_n,
+        mma_inst_k_bytes=_pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, pipeline, "MMA-inst K width"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Block-scaled matmul config validation (geometry-only; cta_group lives on the
 # template). The F8_128x4 SF swizzle + 32x128b.warpx4 utccp atom impose:
@@ -630,13 +749,21 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
     """Raise if ``cfg``'s GEOMETRY cannot run a block-scaled matmul.
     ``cta_tile_k_elems`` is the K-tile in *elements* (FP4: 256 on sm100 / 768
     on sm103; FP8: 128)."""
-    if cfg.cta_tile_m % 128 != 0:
+    # The SF 128x4 swizzle gives one scale-factor word per 128-row / 128-column
+    # block, and the rule is that EACH MMA INSTRUCTION must land on whole blocks —
+    # so it applies to the instruction tile, not the CTA tile. They coincide at
+    # num_mma == 1, which is why this used to read cta_tile_m/n.
+    if cfg.mma_inst_m % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires cta_tile_m % 128 == 0 (SF 128x4 " f"swizzle); config {cfg.name!r} has cta_tile_m={cfg.cta_tile_m}"
+            f"block-scaled matmul requires mma_inst_m % 128 == 0 (SF 128x4 swizzle: "
+            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
+            f"has cta_tile_m={cfg.cta_tile_m} / num_mma_m={cfg.num_mma_m} = {cfg.mma_inst_m}"
         )
-    if cfg.cta_tile_n % 128 != 0:
+    if cfg.mma_inst_n % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires cta_tile_n % 128 == 0 (SF 128x4 " f"swizzle); config {cfg.name!r} has cta_tile_n={cfg.cta_tile_n}"
+            f"block-scaled matmul requires mma_inst_n % 128 == 0 (SF 128x4 swizzle: "
+            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
+            f"has mma_inst_n={cfg.mma_inst_n}"
         )
     # K-tile bytes: sm100 = one 128-B swizzled SMEM row; sm103 = 384 B
     kb_want = 384 if cfg.pipeline == "sm103" else 128

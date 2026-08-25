@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -201,7 +199,9 @@ def gemm_proj_rope_mxfp8_kernel(
 
     epilogue_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads_in_epilogue)
     tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
-    tmem = utils.TmemAllocator(storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
+    tmem = utils.TmemAllocator(
+        storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False
+    )
 
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,
@@ -512,6 +512,8 @@ def gemm_proj_rope_mxfp8_host(
 # PyTorch reference (oracle) for the fused kernel above.
 # ---------------------------------------------------------------------------
 def gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=False):
+    import torch
+
     E8M0_BIAS = 127
     tokens = x.shape[0]
     # Heads derived from the weight's projected dimension (matches the kernel's Constexpr).

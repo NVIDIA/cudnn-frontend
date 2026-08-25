@@ -267,11 +267,11 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
             }
         }
 
-        bool const is_double = (attributes.compute_data_type == DataType_t::DOUBLE);
+        bool const is_double                        = (attributes.compute_data_type == DataType_t::DOUBLE);
         cudnnBackendAttributeType_t const attr_type = is_double ? CUDNN_TYPE_DOUBLE : CUDNN_TYPE_FLOAT;
 
         double const alpha1_d = 1.0, alpha2_d = 1.0;
-        float  const alpha1_f = 1.0f, alpha2_f = 1.0f;
+        float const alpha1_f = 1.0f, alpha2_f = 1.0f;
 
         void const* alpha1 = is_double ? static_cast<void const*>(&alpha1_d) : static_cast<void const*>(&alpha1_f);
         void const* alpha2 = is_double ? static_cast<void const*>(&alpha2_d) : static_cast<void const*>(&alpha2_f);

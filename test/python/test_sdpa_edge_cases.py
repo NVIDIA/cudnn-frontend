@@ -162,9 +162,7 @@ def test_sdpa_col_all_inf(request, cudnn_handle):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
-)
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_sdpa_slightly_negative_row_max(data_type, request, cudnn_handle):
     cfg = make_edge_config(data_type=data_type)
     exec_sdpa(
