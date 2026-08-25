@@ -105,49 +105,67 @@ def _to_bf16_f32(v):
     return v.to(cutlass.BFloat16).to(cutlass.Float32)
 
 
-# ---- Native BF16 scalar ops ----
-# cute.arch exposes packed-f32x2 arithmetic but no bf16 arithmetic, so these go through inline
-# PTX.  The mnemonics are exactly the ones rotary_fwd_q_kernel compiles to (scripts/rope_ptx.py).
-# fma.rn.bf16 is the load-bearing one: it forms its product exactly and rounds the sum once,
-# which is what an fp32 fma followed by a narrow cannot reproduce.
+# ---- Native BF16 rope, packed ----
+# cute.arch exposes packed-f32x2 arithmetic but no bf16 arithmetic, so this goes through inline
+# PTX.  Two details are load-bearing:
 #
-# The operands are declared Int16 rather than BFloat16.  A bf16 MLIR type on an inline-asm
-# operand makes the NVVM backend fail to compile with no usable diagnostic; the registers are
-# the same .b16 either way, so passing the bit pattern sidesteps it at no cost.
+#   fma.rn.bf16x2 forms its products exactly and rounds each half once, which is what an fp32
+#   fma followed by a narrow cannot reproduce.  Its per-half rounding is identical to the scalar
+#   fma.rn.bf16 that rotary_fwd_q_kernel emits, so the packed form is not an approximation of
+#   the scalar one -- it is the same function, verified elementwise in scripts/probe_bf16_ptx.py.
+#
+#   The whole pair goes in *one* asm block.  A first cut used one block per instruction, six per
+#   pair, and cost 5.2x on the kernel (README T24).  Halving the instruction count by packing is
+#   the small part of the win: an inline_ptx block is opaque to ptxas, so six of them per pair
+#   with BLOCK=32 unrolled put up to 192 barriers through an epilogue that has to overlap this
+#   arithmetic with the quantize, the amax reduction and the stores.
+#
+# Operands are raw bit patterns, not BFloat16: a bf16 MLIR type on an inline-asm operand makes
+# the NVVM backend fail to compile with no usable diagnostic.  Everything arrives as a 16-bit
+# value and gets packed here; an earlier version fetched the adjacent cos/sin as one 32-bit load
+# instead, which saves two loads but reintroduces that same silent compile failure.
+_ROPE_PROLOGUE = (
+    "{\n"
+    " .reg .b32 pp, qq, cc, ss, tq;\n"
+    " .reg .b16 h0, h1;\n"
+    " mov.b32 pp, {{$r0}, {$r1}};\n"
+    " mov.b32 qq, {{$r2}, {$r3}};\n"
+    " mov.b32 cc, {{$r4}, {$r5}};\n"
+    " mov.b32 ss, {{$r6}, {$r7}};\n"
+)
+_ROPE_EPILOGUE = (
+    " mov.b32 {h0, h1}, pp;\n"
+    " cvt.f32.bf16 {$w0}, h0;\n"
+    " cvt.f32.bf16 {$w1}, h1;\n"
+    "}\n"
+)
 
 
 @cute.jit
-def _mul_bf16(a, b):
-    r = cute.arch.inline_ptx(
-        "mul.bf16 {$w0}, {$r0}, {$r1};",
-        write_only_types=[cutlass.Int16],
-        read_only_args=[a.bitcast(cutlass.Int16), b.bitcast(cutlass.Int16)],
+def _rope_lo_bf16(p0, p1, q0, q1, c0, c1, s0, s1):
+    """Low rotated half: v_k = fma.rn.bf16(p_k, c_k, -mul.bf16(q_k, s_k)), two features at once."""
+    return cute.arch.inline_ptx(
+        _ROPE_PROLOGUE
+        + " mul.bf16x2 tq, qq, ss;\n"
+        + " neg.bf16x2 tq, tq;\n"
+        + " fma.rn.bf16x2 pp, pp, cc, tq;\n"
+        + _ROPE_EPILOGUE,
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[p0, p1, q0, q1, c0, c1, s0, s1],
     )
-    return r.bitcast(cutlass.BFloat16)
 
 
 @cute.jit
-def _fma_bf16(a, b, c):
-    r = cute.arch.inline_ptx(
-        "fma.rn.bf16 {$w0}, {$r0}, {$r1}, {$r2};",
-        write_only_types=[cutlass.Int16],
-        read_only_args=[
-            a.bitcast(cutlass.Int16),
-            b.bitcast(cutlass.Int16),
-            c.bitcast(cutlass.Int16),
-        ],
+def _rope_hi_bf16(p0, p1, q0, q1, c0, c1, s0, s1):
+    """High rotated half: v_k = fma.rn.bf16(p_k, s_k, mul.bf16(q_k, c_k)), two features at once."""
+    return cute.arch.inline_ptx(
+        _ROPE_PROLOGUE
+        + " mul.bf16x2 tq, qq, cc;\n"
+        + " fma.rn.bf16x2 pp, pp, ss, tq;\n"
+        + _ROPE_EPILOGUE,
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[p0, p1, q0, q1, c0, c1, s0, s1],
     )
-    return r.bitcast(cutlass.BFloat16)
-
-
-@cute.jit
-def _neg_bf16(a):
-    r = cute.arch.inline_ptx(
-        "neg.bf16 {$w0}, {$r0};",
-        write_only_types=[cutlass.Int16],
-        read_only_args=[a.bitcast(cutlass.Int16)],
-    )
-    return r.bitcast(cutlass.BFloat16)
 
 
 @cute.struct
@@ -537,16 +555,16 @@ def gemm_proj_rope_mxfp8_kernel(
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         if cutlass.const_expr(ROPE_BF16_FMA):
-                            v0 = _fma_bf16(
-                                sACC[tok0 + r, pcol0],
-                                ts[0],
-                                _mul_bf16(sACC[tok0 + r, pcol0 + 1], tc[0]),
-                            ).to(cutlass.Float32)
-                            v1 = _fma_bf16(
-                                sACC[tok0 + r, pcol1],
-                                ts[1],
-                                _mul_bf16(sACC[tok0 + r, pcol1 + 1], tc[1]),
-                            ).to(cutlass.Float32)
+                            v0, v1 = _rope_hi_bf16(
+                                sACC[tok0 + r, pcol0].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol0 + 1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1 + 1].bitcast(cutlass.Int16),
+                                tc[0].bitcast(cutlass.Int16),
+                                tc[1].bitcast(cutlass.Int16),
+                                ts[0].bitcast(cutlass.Int16),
+                                ts[1].bitcast(cutlass.Int16),
+                            )
                         else:
                             p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
                             q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
@@ -557,7 +575,11 @@ def gemm_proj_rope_mxfp8_kernel(
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
                             qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
+                            qc0 = _to_bf16_f32(qc0)
+                            qc1 = _to_bf16_f32(qc1)
                             v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
+                            v0 = _to_bf16_f32(v0)
+                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -569,16 +591,16 @@ def gemm_proj_rope_mxfp8_kernel(
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         if cutlass.const_expr(ROPE_BF16_FMA):
-                            v0 = _fma_bf16(
-                                sACC[tok0 + r, pcol0],
-                                tc[0],
-                                _neg_bf16(_mul_bf16(sACC[tok0 + r, pcol0 + 1], ts[0])),
-                            ).to(cutlass.Float32)
-                            v1 = _fma_bf16(
-                                sACC[tok0 + r, pcol1],
-                                tc[1],
-                                _neg_bf16(_mul_bf16(sACC[tok0 + r, pcol1 + 1], ts[1])),
-                            ).to(cutlass.Float32)
+                            v0, v1 = _rope_lo_bf16(
+                                sACC[tok0 + r, pcol0].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol0 + 1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1 + 1].bitcast(cutlass.Int16),
+                                tc[0].bitcast(cutlass.Int16),
+                                tc[1].bitcast(cutlass.Int16),
+                                ts[0].bitcast(cutlass.Int16),
+                                ts[1].bitcast(cutlass.Int16),
+                            )
                         else:
                             p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
                             q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
@@ -589,7 +611,11 @@ def gemm_proj_rope_mxfp8_kernel(
                             c1 = tc[1].to(cutlass.Float32)
                             s1 = ts[1].to(cutlass.Float32)
                             qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
+                            qs0 = _to_bf16_f32(qs0)
+                            qs1 = _to_bf16_f32(qs1)
                             v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
+                            v0 = _to_bf16_f32(v0)
+                            v1 = _to_bf16_f32(v1)
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
