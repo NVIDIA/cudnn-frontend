@@ -84,13 +84,54 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 # --- KV split (see choose_split_kv) ----------------------------------------
-# Largest split considered; past this the reduction outgrows the parallelism.
-_SPLIT_KV_MAX = 16
 # A split thinner than this is prologue/epilogue dominated.
 _SPLIT_KV_MIN_TILES = 2
 # What a CTA-tile costs beyond its KV loop (Q load, prologue, epilogue), in
 # units of one KV tile. Empirical: re-measure if the per-tile fixed cost moves.
 _SPLIT_KV_CTA_COST = 21.0
+# What ONE split's partials cost the combine pass, per wave of combine blocks,
+# in units of one KV tile of main-kernel work. The combine's own occupancy
+# (blocks/SM of split_combine_sm100) is ABSORBED into this coefficient: it is
+# one fixed kernel, so blocks/SM is a constant, and folding it in keeps a
+# cuOccupancy query -- which would need a compiled CUfunction -- off the
+# planning path. Empirical: re-measure if split_combine_sm100 changes.
+_SPLIT_KV_COMBINE_COST = 0.2
+
+
+def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
+    """The splits worth scoring on this device, ascending, always starting at 1.
+
+    THE single split-KV list -- what a row can BUILD is a separate boolean
+    (``Capabilities.split_kv_supported``), so this is free to be device-derived
+    rather than a hand-maintained per-row literal.
+
+    Powers of two from 1 up to ``2**ceil(log2(sm_count))``: you never need more
+    CTA-tiles than the machine has SMs, so that is where the occupancy argument
+    for splitting runs out. Rounding UP rather than down offers the first
+    over-subscribing point and lets the cost model reject it on the wave term,
+    instead of the bound pre-judging it. Powers of two because ``split_kv`` is a
+    TemplateParams field and so a kernel-module cache key -- an unrestricted
+    choice mints a compiled specialization per shape.
+
+    Also bounded by ``kv_tiles // _SPLIT_KV_MIN_TILES``. The chunking hands the
+    remainder to the LEADING splits, so the thinnest gets ``floor(kv_tiles/s)``
+    tiles, and ``floor(kv_tiles/s) >= m`` is exactly ``s <= floor(kv_tiles/m)``.
+    On a short KV that bound binds first.
+
+    No workspace bound here: the partial slabs grow with s, but so does the
+    combine term in :func:`choose_split_kv`, and it grows with the Q rows --
+    which is what makes the slabs big in the first place. The model self-limits;
+    a caller needing a hard ceiling has ``deselect_workspace_greater_than``.
+    """
+    if sm_count <= 0 or kv_tiles <= 0:
+        return [1]
+    hi = 1 << max(0, (sm_count - 1).bit_length())  # 2**ceil(log2(sm_count))
+    hi = min(hi, max(1, kv_tiles // _SPLIT_KV_MIN_TILES))
+    out, s = [], 1
+    while s <= hi:
+        out.append(s)
+        s <<= 1
+    return out
 
 
 def choose_split_kv(
@@ -100,8 +141,9 @@ def choose_split_kv(
     batch: int,
     kv_tiles: int,
     sm_count: int,
+    combine_rows: int,
     ctas_per_tile: int = 1,
-    max_split: int = _SPLIT_KV_MAX,
+    candidates: Optional[List[int]] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -111,48 +153,63 @@ def choose_split_kv(
     and divides each tile's KV work by it, then pays one reduction over the
     partials.
 
-    A CTA holds its tile for the whole loop, so a launch costs whole WAVES.
-    Minimise, over powers of two:
+    Splitting runs TWO kernels, so the model is two LATENCIES summed -- each one
+    (sequential rounds) x (what one round costs).  Both terms must be latency:
+    mixing in an aggregate-work term would double-count the parallelism the wave
+    factor has already divided out.
 
-        waves(s) = ceil(base_ctas * s / sm_count)
-        cost(s)  = waves(s) * (ceil(kv_tiles / s) + CTA_COST)
+        waves(s)      = ceil(base_ctas * s / sm_count)      # main grid
+        combine_waves = ceil(combine_rows / sm_count)       # combine grid, NO s
+        cost(s)       = waves(s)      * (ceil(kv_tiles / s) + CTA_COST)
+                      + combine_waves * (s * COMBINE_COST)
 
-    CTA_COST is what a tile re-pays whatever its loop length, so it sits inside
-    the wave term -- once per CTA-tile, not once per split.
+    CTA_COST is what a tile re-pays whatever its loop length, so it sits INSIDE
+    the wave term -- once per CTA-tile, not once per split.  COMBINE_COST is
+    outside it: the combine is a separate launch whose grid is ``(S_q, H, B)``
+    (split_combine_sm100), one block per output row and independent of ``s`` --
+    only the per-block work grows with ``s``, since each block reduces ``s``
+    partials.  Hence ``combine_rows`` (= S_q * H_q * B) and not ``base_ctas``.
+
+    Why the combine term matters: ``s`` reaches the first term ONLY through
+    ``waves(s)``, a step function.  Between wave boundaries a larger split is
+    free there while the loop term keeps falling, so without a second term the
+    model always takes the largest split that fits the current wave.  That is
+    harmless while the candidate list stops at 4 and a runaway once it does not.
 
     What falls out: an under-full launch splits until the wave is full; an
     over-full one with a partial-wave tail splits FINER to smooth it, even past
     the SM count; an exactly balanced one (base_ctas = k * sm_count) has no tail
-    and never splits.
-
-    Powers of two only, because ``split_kv`` is a TemplateParams field and so a
-    kernel-module cache key -- an unrestricted choice mints a compiled
-    specialization per shape.
+    and never splits; and a long-S_q chunk splits less than a short one, because
+    its combine has more rows to reduce.
 
     Returns 1 when there is nothing to split or nothing beats not splitting.
-    Bounded by ``max_split``, by ``kv_tiles`` (more splits than tiles would
-    leave some provably empty) and by ``_SPLIT_KV_MIN_TILES``.
+    ``candidates`` defaults to :func:`split_kv_candidates` for the device.
     """
     if min(q_tiles, heads_q, batch, kv_tiles, sm_count, ctas_per_tile) <= 0:
         return 1
     base_ctas = q_tiles * heads_q * batch * ctas_per_tile
     if kv_tiles <= 1:
         return 1
+    if candidates is None:
+        candidates = split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles)
+    # The combine reads every partial of every output row, so its grid is sized
+    # by the rows; max(1, ...) because a decode-shaped launch has fewer rows
+    # than SMs and still pays one wave.
+    combine_waves = max(1, _ceil_div(max(0, combine_rows), sm_count))
 
-    best_split = 1
-    best_cost = float(_ceil_div(base_ctas, sm_count) * (kv_tiles + _SPLIT_KV_CTA_COST))
-    split = 2
-    while split <= min(max_split, kv_tiles):
+    best_split, best_cost = 1, None
+    for split in candidates:
+        if split < 1 or split > kv_tiles:
+            continue
         # Every split must stay thick enough to amortise its own prologue and
         # epilogue. The chunking hands the remainder to the leading splits, so
         # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
-        if kv_tiles // split < _SPLIT_KV_MIN_TILES:
-            break
+        if split > 1 and kv_tiles // split < _SPLIT_KV_MIN_TILES:
+            continue
         waves = _ceil_div(base_ctas * split, sm_count)
-        cost = waves * (_ceil_div(kv_tiles, split) + _SPLIT_KV_CTA_COST)
-        if cost < best_cost:
+        cost = waves * (_ceil_div(kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine_waves * split * _SPLIT_KV_COMBINE_COST
+        if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
-        split <<= 1
     return best_split
 
 
@@ -324,10 +381,9 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
     can still reach the unsplit plan. Emitting it the other way round meant the
     default build never used the split the model had just computed.
     """
-    domain = caps.split_kvs
-    if len(domain) <= 1:
-        return [_sole(domain)]
-    no_split = 1 if 1 in domain else min(domain)
+    no_split = 1
+    if not caps.split_kv_supported:
+        return [no_split]
     if facts.thd or facts.has_sink or facts.padded or facts.seq_q_trim:
         return [no_split]
     if caps.skv_tail_via_padding and facts.s_kv % (caps.skv_tile or 128) != 0 and not _band_covers_kv_tail(facts):
@@ -348,14 +404,16 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
         batch=facts.b,
         kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
         sm_count=sm_count,
+        # The combine's grid is (S_q, H, B) — the REAL head count, not the
+        # packed one: packing folds heads into Q rows for the main kernel, but
+        # the combine still reduces one block per (row, head, batch) of the
+        # graph's own output.
+        combine_rows=facts.s_q * facts.h_q * facts.b,
         ctas_per_tile=cga or 1,
-        max_split=max(domain),
     )
-    # Snap the model's power-of-two answer down into the declared domain.
-    usable = [s for s in sorted(domain) if 1 < s <= split]
-    if not usable:
+    if split <= 1:
         return [no_split]
-    return [usable[-1], no_split]
+    return [split, no_split]
 
 
 def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
@@ -475,7 +533,7 @@ def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
         tile_n=min(caps.tile_ns, default=None),
         cga=_sole(caps.cgas),
         pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
-        split_kv=1 if 1 in caps.split_kvs else _sole(caps.split_kvs),
+        split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
         softmax_precision=_sole(caps.softmax_precisions),
     )
 
