@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 """The FROST SM120 SDPA backward kernel chain around the fused main pass:
-``dot`` (delta preprocess), the det_2kernel dQ GEMM, the dQ / dBias
-convert kernels, the GQA dK/dV group reduce, and ``dsink``. The main
-kernel and its per-shape ``compile()`` live in ``bprop_f16_sm120.py``."""
+``dot`` (delta preprocess), the deterministic two-kernel dQ GEMM, the
+dQ / dBias convert kernels, the GQA dK/dV group reduce, and ``dsink``."""
 
 from typing import Optional, Type
 
@@ -29,7 +28,7 @@ from cudnn.sdpa.bwd.kernels._common_sm120 import (
 
 
 class SM120DetDqGemmKernel:
-    """Deterministic dQ GEMM over the det_2kernel dS workspace.
+    """Deterministic dQ GEMM over the main kernel's dS workspace.
 
     Q-stationary: one CTA per ``q_tile`` rows (grid ``(num_q_tiles, H_q,
     B)``), streaming (K tile, dS panel) pairs in ascending kv order through
@@ -58,11 +57,11 @@ class SM120DetDqGemmKernel:
         self.kv_tile = kv_tile
         self.ws_q_tile = ws_q_tile
         if kv_tile % 64:
-            raise ValueError(f"det_2kernel dQ kv_tile must be a multiple of 64; got {kv_tile}")
+            raise ValueError(f"deterministic dQ GEMM: kv_tile must be a multiple of 64; got {kv_tile}")
         if q_tile % 16:
-            raise ValueError(f"det_2kernel dQ q_tile must be a multiple of 16; got {q_tile}")
+            raise ValueError(f"deterministic dQ GEMM: q_tile must be a multiple of 16; got {q_tile}")
         if q_tile % ws_q_tile or ws_q_tile % 16:
-            raise ValueError(f"det_2kernel dQ q_tile ({q_tile}) must be a multiple of ws_q_tile ({ws_q_tile}), ws_q_tile a multiple of 16")
+            raise ValueError(f"deterministic dQ GEMM: q_tile ({q_tile}) must be a multiple of ws_q_tile ({ws_q_tile}), ws_q_tile a multiple of 16")
         self.use_pdl = bool(use_pdl)
         self.chunk_elems = 64 if head_dim % 64 == 0 else 32
         self.ds_chunk_elems = 64  # chunk width along kv (kv_tile is a multiple of 64)
@@ -80,7 +79,7 @@ class SM120DetDqGemmKernel:
         smem_bytes = self.stages * (self.k_tile_elems + self.ds_tile_elems) * in_dtype.bytes + self.stages * 8
         cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
         if smem_bytes > cap:
-            raise ValueError(f"det_2kernel dQ smem {smem_bytes} bytes exceeds the sm_120 cap of {cap} bytes")
+            raise ValueError(f"deterministic dQ GEMM: smem {smem_bytes} bytes exceeds the sm_120 cap of {cap} bytes")
         self.min_blocks = 1
 
     @cute.jit
@@ -125,7 +124,7 @@ class SM120DetDqGemmKernel:
     def kernel(
         self,
         k: cute.Tensor,  # [B, S_KV, H_KV, D] io dtype
-        ds_ws: cute.Tensor,  # [B, H_Q, S_Q, SKV_pad] io dtype (main-kernel dS, unscaled)
+        ds_ws: cute.Tensor,  # [B, H_Q, S_Q, S_KV_r128] io dtype (main-kernel dS, unscaled)
         dq: cute.Tensor,  # [B, S_Q, H_Q, D] io dtype out
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_ds_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -164,11 +163,11 @@ class SM120DetDqGemmKernel:
                 diag_off = cutlass.Int32(0)
             else:
                 diag_off = S_KV - S_Q
-            kv_hi = cute.math.min(cutlass.Int32(S_KV), q_base + Q_TILE + diag_off + self.right_slack)
-            kv_hi = cute.math.max(kv_hi, cutlass.Int32(0))
+            kv_end = cute.math.min(cutlass.Int32(S_KV), q_base + Q_TILE + diag_off + self.right_slack)
+            kv_end = cute.math.max(kv_end, cutlass.Int32(0))
         else:
-            kv_hi = cutlass.Int32(S_KV)
-        num_kv_blocks = (kv_hi + KV_TILE - 1) // KV_TILE
+            kv_end = cutlass.Int32(S_KV)
+        num_kv_blocks = ceil_div(kv_end, KV_TILE)
 
         sK = cutlass.Array(io_dtype, self.k_tile_elems * STAGES, space=cutlass.AddressSpace.smem, alignment=128)
         sDS = cutlass.Array(io_dtype, self.ds_tile_elems * STAGES, space=cutlass.AddressSpace.smem, alignment=128)
@@ -188,24 +187,24 @@ class SM120DetDqGemmKernel:
             # before the first TMA touches the workspace.
             if cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_wait()
-            jp = cutlass.Int32(0)
-            while (jp < cutlass.Int32(STAGES)) & (jp < num_kv_blocks):
-                self.load_stage(sK, sDS, tma_mbar, tma_k_desc, tma_ds_desc, batch, kv_head, q_head, jp % STAGES, jp * KV_TILE, q_base)
-                jp += 1
+            issue = cutlass.Int32(0)
+            while (issue < cutlass.Int32(STAGES)) & (issue < num_kv_blocks):
+                self.load_stage(sK, sDS, tma_mbar, tma_k_desc, tma_ds_desc, batch, kv_head, q_head, issue % STAGES, issue * KV_TILE, q_base)
+                issue += 1
             if num_kv_blocks > 0:
                 while not prims.mbarrier_try_wait_parity(tma_mbar.subview(0), cutlass.Int32(0)):
                     pass
-            jw = cutlass.Int32(1)
-            jc = cutlass.Int32(0)
-            while jc < num_kv_blocks:
+            ready = cutlass.Int32(1)
+            done = cutlass.Int32(0)
+            while done < num_kv_blocks:
                 cute.arch.barrier(barrier_id=2, number_of_threads=self.threads_pipeline)
-                if jw < num_kv_blocks:
-                    if jw >= STAGES:
-                        self.load_stage(sK, sDS, tma_mbar, tma_k_desc, tma_ds_desc, batch, kv_head, q_head, jw % STAGES, jw * KV_TILE, q_base)
-                    while not prims.mbarrier_try_wait_parity(tma_mbar.subview(jw % STAGES), (jw // STAGES) & cutlass.Int32(1)):
+                if ready < num_kv_blocks:
+                    if ready >= STAGES:
+                        self.load_stage(sK, sDS, tma_mbar, tma_k_desc, tma_ds_desc, batch, kv_head, q_head, ready % STAGES, ready * KV_TILE, q_base)
+                    while not prims.mbarrier_try_wait_parity(tma_mbar.subview(ready % STAGES), (ready // STAGES) & cutlass.Int32(1)):
                         pass
-                    jw += 1
-                jc += 1
+                    ready += 1
+                done += 1
 
         elif warp < self.load_warp_id:  # compute warps
             row0 = warp * 16  # this warp's q rows within the tile
@@ -215,27 +214,27 @@ class SM120DetDqGemmKernel:
 
             if cutlass.const_expr(self.is_causal and self.ws_q_tile != Q_TILE):
                 ws_end = q_base + (row0 // self.ws_q_tile + 1) * self.ws_q_tile
-                kv_hi_w = cute.math.min(cutlass.Int32(S_KV), ws_end + diag_off + self.right_slack)
-                kv_hi_w = cute.math.max(kv_hi_w, cutlass.Int32(0))
-                # _w: this warp's kv-block count, causal-trimmed at ws_q_tile granularity.
-                num_kv_blocks_w = (kv_hi_w + KV_TILE - 1) // KV_TILE
+                kv_end_warp = cute.math.min(cutlass.Int32(S_KV), ws_end + diag_off + self.right_slack)
+                kv_end_warp = cute.math.max(kv_end_warp, cutlass.Int32(0))
+                # This warp's kv-block count, causal-trimmed at ws_q_tile granularity.
+                num_kv_blocks_warp = ceil_div(kv_end_warp, KV_TILE)
             else:
-                num_kv_blocks_w = num_kv_blocks
+                num_kv_blocks_warp = num_kv_blocks
 
-            jj = cutlass.Int32(0)
-            while jj < num_kv_blocks:
-                stage = jj % STAGES
+            kv_block = cutlass.Int32(0)
+            while kv_block < num_kv_blocks:
+                stage = kv_block % STAGES
                 sK_stage = sK.subview(stage * self.k_tile_elems)
                 sDS_stage = sDS.subview(stage * self.ds_tile_elems)
                 cute.arch.barrier(barrier_id=2, number_of_threads=self.threads_pipeline)
-                if jj < num_kv_blocks_w:
-                    for kc in cutlass.range_constexpr(KV_CHUNKS):
-                        af = load_a_frag(sDS_stage, kc, row0, lane, rows=Q_TILE, chunk_elems=DS_CHUNK_ELEMS)
+                if kv_block < num_kv_blocks_warp:
+                    for k_chunk in cutlass.range_constexpr(KV_CHUNKS):
+                        a_frag = load_a_frag(sDS_stage, k_chunk, row0, lane, rows=Q_TILE, chunk_elems=DS_CHUNK_ELEMS)
                         mma_bstream(
                             acc_dq,
-                            [af[0], af[1], af[2], af[3]],
+                            [a_frag[0], a_frag[1], a_frag[2], a_frag[3]],
                             sK_stage,
-                            b_k_step=kc,
+                            b_k_step=k_chunk,
                             M=16,
                             N=D,
                             b_trans=True,
@@ -244,7 +243,7 @@ class SM120DetDqGemmKernel:
                             lane=lane,
                             ab_dtype=io_dtype,
                         )
-                jj += 1
+                kv_block += 1
 
             if cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
@@ -281,7 +280,7 @@ class SM120DetDqGemmKernel:
         tma_k_desc = cuda.create_tensor_map_tiled_from_view(k, box_dims=box_k, stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle)
         box_ds = (1, 1, self.q_tile, self.ds_chunk_elems)
         tma_ds_desc = cuda.create_tensor_map_tiled_from_view(ds_ws, box_dims=box_ds, stride_order=(3, 2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-        n_q_tiles = cute.ceil_div(dq.shape[1], self.q_tile)
+        n_q_tiles = ceil_div(dq.shape[1], self.q_tile)
         self.kernel(k, ds_ws, dq, tma_k_desc, tma_ds_desc, attn_scale).launch(
             grid=(n_q_tiles, dq.shape[2], dq.shape[0]),
             block=(self.threads, 1, 1),
@@ -298,14 +297,14 @@ class SM120DetDqGemmKernel:
 
 @cute.kernel
 def dot_do_o_kernel(
-    o: cute.Tensor,  # [B, S_Q, H, DV]
-    do: cute.Tensor,  # [B, S_Q, H, DV]
+    o: cute.Tensor,  # [B, S_Q, H, D_V]
+    do: cute.Tensor,  # [B, S_Q, H, D_V]
     delta: cute.Tensor,  # [B, H, S_Q_r128] fp32 out
-    dq_accum: Optional[cute.Tensor],  # [B*S_Q_r128*H*D_QK] fp32 (zeroed here); None in det_2kernel mode (nothing to zero)
+    dq_accum: Optional[cute.Tensor],  # [B*S_Q_r128*H*D_QK] fp32 (zeroed here); None on the two-kernel dQ path
     dq_sem: Optional[cute.Tensor],  # [B*H*num_q_tiles] int32 relay turn counters (zeroed here when deterministic)
     q_tile: cutlass.Constexpr[int],
-    D_QK: cutlass.Constexpr[int],  # D_QK: dq_accum's head dim
-    D_V: cutlass.Constexpr[int],  # D_V: O/dO's head dim
+    D_QK: cutlass.Constexpr[int],  # dq_accum's head dim
+    D_V: cutlass.Constexpr[int],  # O/dO's head dim
     chunk_elems: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     deterministic: cutlass.Constexpr[bool],
@@ -352,7 +351,7 @@ def dot_do_o_kernel(
                 do_off = do_base + row * do_seq_stride + col0
                 for chunk in cutlass.range_constexpr(n_chunks):
                     if cutlass.const_expr(o.shape[3] != D_V):
-                        # Envelope: rows are only o.shape[3] wide
+                        # Head dim is padded: gmem rows are only o.shape[3] wide.
                         if col0 + chunk * chunk_elems < o.shape[3]:
                             ov = (o_ptr + o_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
                             dov = (do_ptr + do_off + chunk * chunk_elems).load(count=_COPY_ELEMS)
@@ -410,7 +409,7 @@ def dot_do_o_kernel(
         # Reset this q-tile's relay turn counter (PDL-ordered before the main
         # kernel's first acquire, like the dq_accum zeroing above).
         if tidx == 0:
-            num_q_tiles = (S_Q + Q_TILE - 1) // Q_TILE
+            num_q_tiles = ceil_div(S_Q, Q_TILE)
             dq_sem_ptr = dq_sem.iterator.raw_ptr()
             (dq_sem_ptr + (batch * H + head) * num_q_tiles + q_block).store(cutlass.Int32(0))
 
@@ -430,7 +429,7 @@ def dot_do_o_host(
     deterministic: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
-    q_blocks = cute.ceil_div(o.shape[1], q_tile)
+    q_blocks = ceil_div(o.shape[1], q_tile)
     dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, D_QK, D_V, chunk_elems, use_pdl, deterministic).launch(
         grid=(q_blocks, o.shape[2], o.shape[0]),
         block=(256, 1, 1),
@@ -473,34 +472,34 @@ def convert_dq_kernel(
     DQ_ROW_BLOCKS = Q_TILE // (16 * WM_DQ)
     DQ_COLS = D_QK * WM_DQ // 8
     DQ_COL_FRAGS = DQ_COLS // 8
-    wq = warp % WM_DQ
-    wd_q = warp // WM_DQ
+    wm_dq = warp % WM_DQ
+    wn_dq = warp // WM_DQ
 
     dq_accum_ptr = dq_accum.iterator.raw_ptr()
     dq_ptr = dq.iterator.raw_ptr()
 
     sdQ = cutlass.Array(io_dtype, Q_TILE * D_QK, space=cutlass.AddressSpace.smem, alignment=128)
 
-    t_r = tidx // 32
-    t_c = tidx % 32
+    t_row = tidx // 32
+    t_col = tidx % 32
     dq_accum_base = ((batch * S_Q_R + q_block * Q_TILE) * H + head) * D_QK
     for row_blk in cutlass.range_constexpr(DQ_ROW_BLOCKS):
         for col_frag in cutlass.range_constexpr(DQ_COL_FRAGS):
             frag = cutlass.Array(cutlass.Float32, 4)
-            for hv in cutlass.range_constexpr(2):
-                i_pair = hv + row_blk * 2 + col_frag * 2 * DQ_ROW_BLOCKS
+            for hf in cutlass.range_constexpr(2):
+                i_pair = hf + row_blk * 2 + col_frag * 2 * DQ_ROW_BLOCKS
                 if cutlass.const_expr(D_QK >= 64):
-                    jm = i_pair % (Q_TILE // 8)
-                    jn = i_pair // (Q_TILE // 8)
-                    addr = dq_accum_base + (t_r + jm * 8) * (H * D_QK) + t_c * 2 + jn * 64
+                    pair_row = i_pair % (Q_TILE // 8)
+                    pair_col = i_pair // (Q_TILE // 8)
+                    addr = dq_accum_base + (t_row + pair_row * 8) * (H * D_QK) + t_col * 2 + pair_col * 64
                 else:
-                    addr = dq_accum_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * D_QK) + (t_c % 16) * 2
-                pv = (dq_accum_ptr + addr).load(count=2)
-                frag[hv * 2 + 0] = pv[0] * attn_scale
-                frag[hv * 2 + 1] = pv[1] * attn_scale
-            r0 = wq * 16 + row_blk * 16 * WM_DQ + g_lane
+                    addr = dq_accum_base + (t_row + (t_col // 16) * 8 + i_pair * 16) * (H * D_QK) + (t_col % 16) * 2
+                pair = (dq_accum_ptr + addr).load(count=2)
+                frag[hf * 2 + 0] = pair[0] * attn_scale
+                frag[hf * 2 + 1] = pair[1] * attn_scale
+            r0 = wm_dq * 16 + row_blk * 16 * WM_DQ + g_lane
             r8 = r0 + 8
-            c0 = wd_q * DQ_COLS + col_frag * 8 + 2 * p_lane
+            c0 = wn_dq * DQ_COLS + col_frag * 8 + 2 * p_lane
             tile_ptr(sdQ, r0, c0, chunk_elems=chunk_elems, rows=Q_TILE).store(pack_half2(frag[0], frag[1], io_dtype), alignment=4)
             tile_ptr(sdQ, r8, c0, chunk_elems=chunk_elems, rows=Q_TILE).store(pack_half2(frag[2], frag[3], io_dtype), alignment=4)
     prims.barrier_cta_sync(0)
@@ -515,7 +514,7 @@ def convert_dq_kernel(
         col = (chunk % chunks_per_row) * _COPY_ELEMS
         if row < q_left:
             if cutlass.const_expr(dq.shape[3] != D_QK):
-                # Envelope: dQ is only dq.shape[3] wide (pad columns are zero).
+                # Head dim is padded: dQ is only dq.shape[3] wide (pad columns are zero).
                 if col < dq.shape[3]:
                     copy16_smem_to_gmem(
                         tile_ptr(sdQ, row, col, chunk_elems=chunk_elems, rows=Q_TILE),
@@ -541,7 +540,7 @@ def convert_dq_host(
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
-    q_blocks = cute.ceil_div(dq.shape[1], q_tile)
+    q_blocks = ceil_div(dq.shape[1], q_tile)
     convert_dq_kernel(dq_accum, dq, q_tile, D_QK, chunk_elems, warps_m_dq, attn_scale, io_dtype, use_pdl).launch(
         grid=(q_blocks, dq.shape[2], dq.shape[0]),
         block=(256, 1, 1),
@@ -584,7 +583,7 @@ def convert_dbias_host(
     stream: cuda_driver.CUstream,
 ):
     convert_dbias_kernel(dbias_accum, dbias, out_dtype, use_pdl).launch(
-        grid=(cute.ceil_div(dbias.shape[0], 256), 1, 1),
+        grid=(ceil_div(dbias.shape[0], 256), 1, 1),
         block=(256, 1, 1),
         stream=stream,
         use_pdl=use_pdl,
@@ -601,8 +600,8 @@ def _reduce_group_vec(
     ws_ptr,
     out_ptr,
     idx,
-    hkv,
-    hq,
+    h_kv,
+    h_q,
     *,
     D: cutlass.Constexpr[int],
     group: cutlass.Constexpr[int],
@@ -618,22 +617,22 @@ def _reduce_group_vec(
     VEC = 8  # 8 elements per vector (16 bytes)
     pos = idx * VEC
     col = pos % D
-    rowh = pos // D  # (b*S_KV + s)*H_KV + kv_head
-    kh = rowh % hkv
-    bs = rowh // hkv
-    in0 = (bs * hq + kh * group) * D + col
+    row = pos // D  # (b*S_KV + s)*H_KV + kv_head
+    kv_head = row % h_kv
+    b_seq = row // h_kv
+    ws_base = (b_seq * h_q + kv_head * group) * D + col
     acc = cutlass.Array(cutlass.Float32, VEC)
     for e in cutlass.range_constexpr(VEC):
         acc[e] = cutlass.Float32(0.0)
     for g in cutlass.range_constexpr(group):
-        w = (ws_ptr + in0 + g * D).load(count=VEC)
+        part = (ws_ptr + ws_base + g * D).load(count=VEC)
         for e in cutlass.range_constexpr(VEC):
-            acc[e] = acc[e] + w[e].to(cutlass.Float32)
+            acc[e] = acc[e] + part[e].to(cutlass.Float32)
     vec = cutlass.Vector.from_elements(tuple(acc[e].to(io_dtype) for e in range(VEC)), io_dtype)
     if cutlass.const_expr(out_strided):
-        s_row = bs % skv
-        b_idx = bs // skv
-        (out_ptr + b_idx * out_batch_stride + s_row * out_seq_stride + kh * out_head_stride + col).store(vec, alignment=16)
+        s_row = b_seq % skv
+        b_idx = b_seq // skv
+        (out_ptr + b_idx * out_batch_stride + s_row * out_seq_stride + kv_head * out_head_stride + col).store(vec, alignment=16)
     else:
         (out_ptr + pos).store(vec, alignment=16)
 
@@ -643,8 +642,8 @@ def _reduce_group_vec_guarded(
     ws_ptr,
     out_ptr,
     idx,
-    hkv,
-    hq,
+    h_kv,
+    h_q,
     *,
     D: cutlass.Constexpr[int],
     D_OUT: cutlass.Constexpr[int],
@@ -656,17 +655,17 @@ def _reduce_group_vec_guarded(
     out_strided: cutlass.Constexpr[bool],
     skv: cutlass.Constexpr[int],
 ):
-    """_reduce_group_vec, skipping the pad-column vectors when the output is
-    narrower than the padded ws rows (envelope: those columns are zero and
-    the user tensor has no room for them)."""
+    """``_reduce_group_vec``, skipping the pad-column vectors when the output
+    head dim is narrower than the padded workspace rows (those columns are
+    zero)."""
     if cutlass.const_expr(D_OUT != D):
         if (idx * 8) % D < D_OUT:
             _reduce_group_vec(
                 ws_ptr,
                 out_ptr,
                 idx,
-                hkv,
-                hq,
+                h_kv,
+                h_q,
                 D=D,
                 group=group,
                 io_dtype=io_dtype,
@@ -681,8 +680,8 @@ def _reduce_group_vec_guarded(
             ws_ptr,
             out_ptr,
             idx,
-            hkv,
-            hq,
+            h_kv,
+            h_q,
             D=D,
             group=group,
             io_dtype=io_dtype,
@@ -706,7 +705,8 @@ def dkv_reduce_kernel(
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
     use_pdl: cutlass.Constexpr[bool],
 ):
-    # one thread per 16 B output vector, serial fp32 accumulation over the group's q-head slices (fixed order -> deterministic).
+    # One thread per 16 B output vector; serial fp32 accumulation over the
+    # group's q-head slices (fixed order -> deterministic).
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
@@ -817,12 +817,12 @@ def dkv_reduce_host(
     stream: cuda_driver.CUstream,
 ):
     if cutlass.const_expr(D_QK == D_V):
-        out_vecs = cute.ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * D_QK, 8)
+        out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * D_QK, 8)
     else:
         # Split index space: one thread per dK vector plus one per dV vector.
-        out_vecs = cute.ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (D_QK + D_V), 8)
+        out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (D_QK + D_V), 8)
     dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl).launch(
-        grid=(cute.ceil_div(out_vecs, 256), 1, 1),
+        grid=(ceil_div(out_vecs, 256), 1, 1),
         block=(256, 1, 1),
         stream=stream,
         use_pdl=use_pdl,
@@ -831,7 +831,7 @@ def dkv_reduce_host(
 
 @cute.kernel
 def dsink_kernel(
-    lse: cute.Tensor,  # [B, H_Q, S_Q] fp32 (natural-log, sink folded in by the fwd)
+    lse: cute.Tensor,  # [B, H_Q, S_Q] fp32 (natural log, sink folded in by the forward pass)
     delta: cute.Tensor,  # [B, H_Q, S_Q_r128] fp32 (dot_do_o output)
     sink: cute.Tensor,  # [H_Q] fp32 sink logits
     dsink: cute.Tensor,  # [H_Q] fp32 out
@@ -857,7 +857,6 @@ def dsink_kernel(
     inf = cutlass.Float32(float("inf"))
     acc = cutlass.Float32(0.0)
     batch = cutlass.Int32(0)
-    # batch loop
     while batch < B:
         lse_base = batch * lse_batch_stride + head * lse_head_stride
         delta_base = (batch * H_Q + head) * S_Q_R
@@ -867,7 +866,7 @@ def dsink_kernel(
         q = cutlass.Int32(tidx)
         while q < q_bound:
             lv = (lse_ptr + lse_base + q * lse_seq_stride).load()
-            # Padded / trimmed rows carry LSE = -inf: skip them, exp(sink + inf) * 0 = NaN
+            # Padded / trimmed rows carry LSE = -inf: skip them (exp(sink - lse) overflows and inf * 0 = NaN).
             if lv > -inf and lv < inf:
                 dd = (delta_ptr + delta_base + q).load()
                 acc = acc + cute.math.exp2((s_val - lv) * cutlass.Float32(_LOG2E), fastmath=True) * dd

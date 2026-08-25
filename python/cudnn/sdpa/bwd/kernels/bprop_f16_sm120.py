@@ -95,10 +95,6 @@ validate_params(PARAMS)
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
 
-def ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 def largest_warp_partition(m_dim: int, *n_dims: int) -> int:
     """Largest valid 2-D warp-partition factor A for one GEMM's (M, N) pair.
 
@@ -158,16 +154,16 @@ def _bwd_gemm4_dq(
     """GEMM 4: acc_dq = dS @ K^T (reads only sdS/sK, never sQ)."""
     for i in cutlass.range_constexpr(DQ_ROW_BLOCKS * DQ_COL_FRAGS * 4):
         acc_dq[i] = cutlass.Float32(0.0)
-    for kc in cutlass.range_constexpr(KV_CHUNKS):
-        af = []
+    for k_chunk in cutlass.range_constexpr(KV_CHUNKS):
+        a_frag = []
         for row_blk in cutlass.range_constexpr(DQ_ROW_BLOCKS):
-            sf = load_a_frag(sdS, kc, wm_dq * 16 + row_blk * 16 * WM_DQ, lane, rows=Q_TILE, chunk_elems=DS_CHUNK_ELEMS)
-            af = af + [sf[0], sf[1], sf[2], sf[3]]
+            sf = load_a_frag(sdS, k_chunk, wm_dq * 16 + row_blk * 16 * WM_DQ, lane, rows=Q_TILE, chunk_elems=DS_CHUNK_ELEMS)
+            a_frag = a_frag + [sf[0], sf[1], sf[2], sf[3]]
         mma_bstream(
             acc_dq,
-            af,
+            a_frag,
             sK,
-            b_k_step=kc,
+            b_k_step=k_chunk,
             M=16 * DQ_ROW_BLOCKS,
             N=DQ_COLS,
             b_trans=True,
@@ -193,19 +189,19 @@ def _bwd_dq_scatter(
     D_QK: cutlass.Constexpr[int],
 ):
     """dQ accumulate into the scrambled dq_accum workspace."""
-    t_r = math_tidx // 32
-    t_c = math_tidx % 32
+    t_row = math_tidx // 32
+    t_col = math_tidx % 32
     for row_blk in cutlass.range_constexpr(DQ_ROW_BLOCKS):
         for col_frag in cutlass.range_constexpr(DQ_COL_FRAGS):
-            for hv in cutlass.range_constexpr(2):
-                i_pair = hv + row_blk * 2 + col_frag * 2 * DQ_ROW_BLOCKS
+            for hf in cutlass.range_constexpr(2):
+                i_pair = hf + row_blk * 2 + col_frag * 2 * DQ_ROW_BLOCKS
                 if cutlass.const_expr(D_QK >= 64):
-                    jm = i_pair % (Q_TILE // 8)
-                    jn = i_pair // (Q_TILE // 8)
-                    addr = dq_accum_base + (t_r + jm * 8) * (H * D_QK) + t_c * 2 + jn * 64
+                    pair_row = i_pair % (Q_TILE // 8)
+                    pair_col = i_pair // (Q_TILE // 8)
+                    addr = dq_accum_base + (t_row + pair_row * 8) * (H * D_QK) + t_col * 2 + pair_col * 64
                 else:
-                    addr = dq_accum_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * D_QK) + (t_c % 16) * 2
-                poff = (row_blk * DQ_COL_FRAGS + col_frag) * 4 + hv * 2
+                    addr = dq_accum_base + (t_row + (t_col // 16) * 8 + i_pair * 16) * (H * D_QK) + (t_col % 16) * 2
+                poff = (row_blk * DQ_COL_FRAGS + col_frag) * 4 + hf * 2
                 _red_add_f32x2(dq_accum_ptr + addr, acc_dq[poff + 0], acc_dq[poff + 1])
 
 
@@ -228,23 +224,23 @@ def _bwd_gemm5_dk(
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
 ):
     """GEMM 5: acc_dk += dS^T @ Q (the iteration's last sQ reader)."""
-    for kc in cutlass.range_constexpr(Q_CHUNKS):
-        af = []
+    for k_chunk in cutlass.range_constexpr(Q_CHUNKS):
+        a_frag = []
         for row_blk in cutlass.range_constexpr(DKV_ROW_BLOCKS):
             sf = load_a_frag_transposed(
                 sdS,
-                kc,
+                k_chunk,
                 wm_dkv * 16 + row_blk * 16 * WM_DKV,
                 lane,
                 rows=Q_TILE,
                 chunk_elems=DS_CHUNK_ELEMS,
             )
-            af = af + [sf[0], sf[2], sf[1], sf[3]]
+            a_frag = a_frag + [sf[0], sf[2], sf[1], sf[3]]
         mma_bstream(
             acc_dk,
-            af,
+            a_frag,
             sQ_stage,
-            b_k_step=kc,
+            b_k_step=k_chunk,
             M=16 * DKV_ROW_BLOCKS,
             N=DK_COLS,
             b_trans=True,
@@ -586,7 +582,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             or self.bias_present
         )
 
-        q_block_max = (seqlen_q + Q_TILE - 1) // Q_TILE
+        q_block_max = ceil_div(seqlen_q, Q_TILE)
         if cutlass.const_expr(self.is_causal or self.window_size_left is not None):
             if cutlass.const_expr(self.is_causal and not self.causal_top_left):
                 # The diagonal anchors at the actual lengths.
@@ -602,7 +598,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             # q <= k - diag_off + W
             last_q_row = kv_base + KV_TILE - 1 - diag_off + self.window_size_left
             rows_hi = cute.math.max(last_q_row + 1, cutlass.Int32(0))
-            q_block_max = cute.math.min(q_block_max, (rows_hi + Q_TILE - 1) // Q_TILE)
+            q_block_max = cute.math.min(q_block_max, ceil_div(rows_hi, Q_TILE))
         num_q_blocks = cute.math.max(q_block_max - q_block_min, cutlass.Int32(0))
         if cutlass.const_expr(self.seq_kv_lens_present):
             # Fully-padded KV tile: skip the loop; the epilogue writes zero dK/dV.
@@ -646,7 +642,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             lse_base = (batch * H_Q + q_head) * S_Q
         delta_base = (batch * H_Q + q_head) * S_Q_R
         if cutlass.const_expr(self.deterministic and not self.det_2k):
-            relay_sem = dq_sem_ptr + (batch * H_Q + q_head) * ((S_Q + Q_TILE - 1) // Q_TILE)
+            relay_sem = dq_sem_ptr + (batch * H_Q + q_head) * ceil_div(S_Q, Q_TILE)
 
         if warp == self.load_warp_id:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
@@ -795,17 +791,17 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
             # V -> registers.
             v_persist = cutlass.Array(cutlass.Int32, D_V_CHUNKS * V_ROW_BLOCKS * 4, alignment=16)
-            for kc in cutlass.range_constexpr(D_V_CHUNKS):
+            for k_chunk in cutlass.range_constexpr(D_V_CHUNKS):
                 for v_row_blk in cutlass.range_constexpr(V_ROW_BLOCKS):
                     n_frag = v_row_blk * 2
                     row = wn_sdp * SDP_COLS + (n_frag + lane // 16) * 8 + lane % 8
-                    col = kc * 16 + ((lane // 8) % 2) * 8
+                    col = k_chunk * 16 + ((lane // 8) % 2) * 8
                     vf = prims.ldmatrix(
                         tile_ptr(sV, row, col, chunk_elems=CHUNK_ELEMS, rows=KV_TILE),
                         4,
                         prims.MMALayout.ROW,
                     )
-                    v_off = (kc * V_ROW_BLOCKS + v_row_blk) * 4
+                    v_off = (k_chunk * V_ROW_BLOCKS + v_row_blk) * 4
                     v_persist[v_off + 0] = vf[0]
                     v_persist[v_off + 1] = vf[1]
                     v_persist[v_off + 2] = vf[2]
@@ -866,23 +862,23 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # GEMM 1: acc_s = Q @ K^T.
                 for i in cutlass.range_constexpr(SDP_ROW_BLOCKS * SDP_COL_FRAGS * 4):
                     acc_s[i] = cutlass.Float32(0.0)
-                for kc in cutlass.range_constexpr(D_QK_CHUNKS):
-                    af = []
+                for k_chunk in cutlass.range_constexpr(D_QK_CHUNKS):
+                    a_frag = []
                     for row_blk in cutlass.range_constexpr(SDP_ROW_BLOCKS):
                         qf = load_a_frag(
                             sQ_stage,
-                            kc,
+                            k_chunk,
                             wm_sdp * 16 + row_blk * 16 * WM_SDP,
                             lane,
                             rows=Q_TILE,
                             chunk_elems=CHUNK_ELEMS,
                         )
-                        af = af + [qf[0], qf[1], qf[2], qf[3]]
+                        a_frag = a_frag + [qf[0], qf[1], qf[2], qf[3]]
                     mma_bstream(
                         acc_s,
-                        af,
+                        a_frag,
                         sK,
-                        b_k_step=kc,
+                        b_k_step=k_chunk,
                         M=16 * SDP_ROW_BLOCKS,
                         N=SDP_COLS,
                         b_trans=False,
@@ -999,23 +995,23 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # GEMM 2: acc_dp = dO @ V^T (V in registers).
                 for i in cutlass.range_constexpr(SDP_ROW_BLOCKS * SDP_COL_FRAGS * 4):
                     acc_dp[i] = cutlass.Float32(0.0)
-                for kc in cutlass.range_constexpr(D_V_CHUNKS):
-                    af = []
+                for k_chunk in cutlass.range_constexpr(D_V_CHUNKS):
+                    a_frag = []
                     for row_blk in cutlass.range_constexpr(SDP_ROW_BLOCKS):
                         dof = load_a_frag(
                             sdO_stage,
-                            kc,
+                            k_chunk,
                             wm_sdp * 16 + row_blk * 16 * WM_SDP,
                             lane,
                             rows=Q_TILE,
                             chunk_elems=CHUNK_ELEMS,
                         )
-                        af = af + [dof[0], dof[1], dof[2], dof[3]]
+                        a_frag = a_frag + [dof[0], dof[1], dof[2], dof[3]]
                     mma_abregs(
                         acc_dp,
-                        af,
+                        a_frag,
                         v_persist,
-                        b_k_step=kc,
+                        b_k_step=k_chunk,
                         M=16 * SDP_ROW_BLOCKS,
                         N=SDP_COLS,
                         ab_dtype=io_dtype,
@@ -1084,23 +1080,23 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             prims.cp_async_bulk_commit_group()
 
                 # GEMM 3: acc_dv += P^T @ dO.
-                for kc in cutlass.range_constexpr(Q_CHUNKS):
-                    af = []
+                for k_chunk in cutlass.range_constexpr(Q_CHUNKS):
+                    a_frag = []
                     for row_blk in cutlass.range_constexpr(DKV_ROW_BLOCKS):
                         pf = load_a_frag_transposed(
                             sP,
-                            kc,
+                            k_chunk,
                             wm_dkv * 16 + row_blk * 16 * WM_DKV,
                             lane,
                             rows=Q_TILE,
                             chunk_elems=DS_CHUNK_ELEMS,
                         )
-                        af = af + [pf[0], pf[2], pf[1], pf[3]]
+                        a_frag = a_frag + [pf[0], pf[2], pf[1], pf[3]]
                     mma_bstream(
                         acc_dv,
-                        af,
+                        a_frag,
                         sdO_stage,
-                        b_k_step=kc,
+                        b_k_step=k_chunk,
                         M=16 * DKV_ROW_BLOCKS,
                         N=DV_COLS,
                         b_trans=True,
@@ -1441,7 +1437,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             # dS workspace store map: one (q_tile x 64) chunk_elems per issue, same swizzle as dq2k's load side.
             box_ds = (1, 1, self.q_tile, 64)
             tma_dsws_desc = cuda.create_tensor_map_tiled_from_view(ds_ws, box_dims=box_ds, stride_order=(3, 2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-        kv_blocks = cute.ceil_div(k.shape[1], self.kv_tile)
+        kv_blocks = ceil_div(k.shape[1], self.kv_tile)
         self.kernel(
             q,
             k,

@@ -46,7 +46,7 @@ def pack_half2(lo, hi, dtype: cutlass.Constexpr[Type[cutlass.Numeric]]):
 @cute.jit
 def load_a_frag(
     sbuf,
-    kc: cutlass.Constexpr[int],
+    k_chunk: cutlass.Constexpr[int],
     row0,
     lane,
     *,
@@ -55,14 +55,14 @@ def load_a_frag(
 ):
     """ldmatrix.x4 one (16 x 16) row-major A fragment."""
     row = row0 + lane % 16
-    col = kc * 16 + (lane // 16) * 8
+    col = k_chunk * 16 + (lane // 16) * 8
     return prims.ldmatrix(tile_ptr(sbuf, row, col, chunk_elems=chunk_elems, rows=rows), 4, prims.MMALayout.ROW)
 
 
 @cute.jit
 def load_a_frag_transposed(
     sbuf,
-    kc: cutlass.Constexpr[int],
+    k_chunk: cutlass.Constexpr[int],
     col0,
     lane,
     *,
@@ -70,7 +70,7 @@ def load_a_frag_transposed(
     chunk_elems: cutlass.Constexpr[int],
 ):
     """ldmatrix.trans.x4: A[M, K] from a tile stored physically [K, M]."""
-    row = kc * 16 + lane % 16
+    row = k_chunk * 16 + lane % 16
     col = col0 + (lane // 16) * 8
     return prims.ldmatrix(tile_ptr(sbuf, row, col, chunk_elems=chunk_elems, rows=rows), 4, prims.MMALayout.COL)
 
@@ -102,8 +102,8 @@ def mma_bstream(
     """One k=16 step of an (M x N) MMA, B streamed from smem via
     ldmatrix.x4 (2 adjacent 8-column n-frags per fetch).
 
-    acc:    ``(M//16) * (N//8) * 4`` fp32, m-rep major then n-frag.
-    a_frag: ``(M//16) * 4`` Int32 (one 16x16 A fragment per m-rep).
+    acc:    ``(M//16) * (N//8) * 4`` fp32, m-block major then n-frag.
+    a_frag: ``(M//16) * 4`` Int32 (one 16x16 A fragment per m-block).
     """
     M_BLOCKS = M // 16
     N_FRAGS = N // 8
