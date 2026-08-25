@@ -468,12 +468,12 @@ def test_sm120_epi_vec_clamp_and_stg_only() -> None:
         c = by_name(name)
         v = _epi_vec_bytes(chain, c, 1)
         assert v == 16, name  # 8-element bf16 run (template: 8 % _STG_V == 0)
-        assert _use_tma_store_epi(chain, c, v, 1) is False, name
+        assert _use_tma_store_epi(chain, c, 1) is False, name
 
     # the sm100 chunk derivation and its TMA-store gate are untouched
     cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
     v100 = _epi_vec_bytes(chain, cfg100, 1)
-    assert v100 >= 16 and _use_tma_store_epi(chain, cfg100, v100, 1) is True
+    assert v100 >= 16 and _use_tma_store_epi(chain, cfg100, 1) is True
 
     # 8B-aligned output rows (N=100 bf16) narrow the chunk to 4 elements
     narrow = analyze(_build_graph(256, 100, 256))
@@ -496,14 +496,15 @@ def test_sm120_render_smoke() -> None:
     ):
         cfg = by_name(name)
         vec = _epi_vec_bytes(chain, cfg, 1)
-        snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2, use_tma_store=False)
+        snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2)  # empty tma_slots == STG everywhere
         src = _render_template(chain, snippets, cfg, 1)
         assert "@@" not in src, "leftover injection markers"
         ast.parse(src)
         assert "cudnn_frost_sm120_matmul_" in src
         assert "threads_per_cta = 384" in src
         assert f"vec_bytes_epi = {vec}" in src
-        assert "use_tma_store_epi = False" in src
+        assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"
+        assert "tma_c_desc" not in src, "TMA-store arm must be stripped"
 
 
 # =============================================================================

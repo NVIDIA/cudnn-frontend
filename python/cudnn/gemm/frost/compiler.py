@@ -2999,6 +2999,10 @@ def _smem_d_bytes(cfg, chain, cta_group: int) -> int:
 def _output_store_mode(out, chain, cfg, cta_group: int) -> str:
     """Store mode for ONE output, from the output itself plus the geometry it is
     stored with -- never from what the others need."""
+    # Families whose templates render the TMA-store arm at all; the sm120 warp
+    # kernel always takes its transposed-STG path.
+    if cfg.pipeline not in _TMA_STORE_EPI_PIPELINES:
+        return "stg"
     # TMA addresses its contiguous dim in 16-byte units, and truncates. The next
     # two rejections are that granule at a different extent.
     epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
@@ -3188,8 +3192,8 @@ def _check_executable(chain: FusionChain) -> None:
 
 
 def plan_config(chain: FusionChain) -> "tuple[TileConfig, int]":
-    from .kernel_registry import preferred_pipeline
-    from .tile_config import as_pipeline, select_config
+    from .kernel_registry import preferred_strategy
+    from .tile_config import select_config
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
@@ -3203,14 +3207,16 @@ def plan_config(chain: FusionChain) -> "tuple[TileConfig, int]":
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
     )
-    return as_pipeline(config, preferred_pipeline(chain)), cta_group
+    # Re-target at the preferred family AND clamp cta_group to a group that
+    # family has a template for (sm120 is warp-scoped MMA, 1-CTA only).
+    return preferred_strategy(chain, config, cta_group)
 
 
 def _precheck_plain(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
     from .kernel_registry import select_template
 
     _check_supported(chain, config)
-    _arch_reason = select_template(chain, config, cta_group).active_reject(config)
+    _arch_reason = select_template(chain, config, cta_group).active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)

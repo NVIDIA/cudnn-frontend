@@ -74,10 +74,13 @@ _ACC_REGS = _M_FRAGS * _N_FRAGS * 4
 
 _EPI_N = epi_tile_mn[1]
 
-# SMEM K-row swizzle: the TMA s{128,64,32}b pattern == cutlass.Swizzle(b, 4, 3)
-# with b = log2(row_bytes / 16). ldmatrix addresses below apply the same XOR
+# SMEM K-row swizzle: the K-row width IS the swizzle span (the renderer derives
+# ab_tma_swizzle from cta_tile_k_bytes; cross-checked against it below). The TMA
+# s{128,64,32}b pattern == cutlass.Swizzle(b, 4, 3) with b = log2(row_bytes / 16).
+# ldmatrix addresses below apply the same XOR
 # (fort: swizzled_bank_id = bank ^ ((bank / 8) % SWIZZLE_SCALE)).
-_AB_SW_BBITS = (ab_smem_swizzle_bytes // 16).bit_length() - 1
+_AB_SMEM_SWIZZLE_BYTES = _CTA_K_ELEMS * _ELEM_BYTES
+_AB_SW_BBITS = (_AB_SMEM_SWIZZLE_BYTES // 16).bit_length() - 1
 _AB_SWIZZLE = cutlass.Swizzle(_AB_SW_BBITS, 4, 3)
 # Epilogue staging tile swizzle — matches the s64b TMA-store descriptor.
 _EPI_SWIZZLE = cutlass.Swizzle(2, 4, 3)
@@ -91,30 +94,32 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
-if not use_tma_store_epi:
-    _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-    _AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
-    ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
-    assert ab_stages >= 1, "transposed STG epilogue: staging stream cannot be funded from the AB pipeline"
+# @@STG_ONLY:BEGIN@@
+_STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
+_AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
+ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
+assert ab_stages >= 1, "transposed STG epilogue: staging stream cannot be funded from the AB pipeline"
+# @@STG_ONLY:END@@
 
 # ---- v1 scope guards (fail at render/import, not at runtime) ---------------
 assert cluster_shape_mnk == (1, 1, 1), "sm120 has no thread-block clusters (CC 12.0): cluster_shape must be (1,1,1)"
 assert threads_per_cta == NUM_WARPS * 32, f"sm120 template is a fixed 12-warp kernel (384 threads), got {threads_per_cta}"
 assert not multicast_a and not multicast_b, "sm120 has no TMA multicast (no clusters)"
 assert not a_is_m_major and not b_is_n_major, "sm120 template v1 supports K-major A and K-major B only (TN GEMM)"
-assert not cd_out_is_m_major, "sm120 template v1 supports N-major output only"
+# N-major, non-fp4 output only in v1 — enforced upstream by Sm120KernelTemplate._extra_reject.
 assert num_gemms == 1 and num_a_operands == 1 and num_b_operands == 1, "sm120 template v1 is single-GEMM only"
-assert cd_fake_n_div == 1, "sm120 template v1 does not support fp4 output"
 assert cta_tile_mnk[0] % WARPS_M == 0 and _WARP_TILE_M % 16 == 0, f"cta_tile_m={cta_tile_mnk[0]} must be a multiple of {WARPS_M * 16}"
 assert cta_tile_mnk[1] % WARPS_N == 0 and _WARP_TILE_N % 8 == 0, f"cta_tile_n={cta_tile_mnk[1]} must be a multiple of {WARPS_N * 8}"
-assert ab_smem_swizzle_bytes == _CTA_K_ELEMS * _ELEM_BYTES, "SMEM K-row width must equal the swizzle span"
+_TMA_SWIZZLE_BY_BYTES = {32: _tma.TensorMapSwizzle.s32b, 64: _tma.TensorMapSwizzle.s64b, 128: _tma.TensorMapSwizzle.s128b}
+assert ab_tma_swizzle == _TMA_SWIZZLE_BY_BYTES.get(_AB_SMEM_SWIZZLE_BYTES), "SMEM K-row width must equal the swizzle span"
 assert _NUM_K_BLOCKS * _K_BLK_ELEMS == _CTA_K_ELEMS, "cta_tile_k must be a multiple of 32 bytes"
-if use_tma_store_epi:
-    assert vec_bytes_epi * 8 == 2 * cd_dtype.width, "sm120 TMA-store epilogue drains one (n, n+1) accumulator pair per thread"
-else:
-    assert _STG_V >= 2 and _STG_V % 2 == 0 and 8 % _STG_V == 0, "transposed STG epilogue: the store vector must be whole pairs tiling the 8-column row run"
-if use_tma_store_epi:
-    assert cta_tile_mnk[1] % _EPI_N == 0, "TMA-store epilogue needs cta_tile_n to be a whole number of epi subtiles"
+# @@TMA_STORE_ONLY:BEGIN@@
+assert vec_bytes_epi * 8 == 2 * cd_dtype.width, "sm120 TMA-store epilogue drains one (n, n+1) accumulator pair per thread"
+assert cta_tile_mnk[1] % _EPI_N == 0, "TMA-store epilogue needs cta_tile_n to be a whole number of epi subtiles"
+# @@TMA_STORE_ONLY:END@@
+# @@STG_ONLY:BEGIN@@
+assert _STG_V >= 2 and _STG_V % 2 == 0 and 8 % _STG_V == 0, "transposed STG epilogue: the store vector must be whole pairs tiling the 8-column row run"
+# @@STG_ONLY:END@@
 
 # ---------------------------------------------------------------------------
 # The warp MMA instruction, resolved from the injected MMA dtypes.
@@ -806,17 +811,17 @@ def _host(
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_LISTS@@
     c = _tma_c_outputs[0]
-    # N-major output only (asserted at render time).
+    # N-major output only (enforced by Sm120KernelTemplate._extra_reject).
     tma_c_desc = _tma.create_tensor_map_tiled(
         global_address=c.iterator.toint(),
-        dtype=cd_tma_dtype,
+        dtype=cd_dtype,
         global_dims=[n, m, batch],
         global_strides=[
             out_stride_m_0 * cd_dtype.width // 128,
             out_stride_l_0 * cd_dtype.width // 128,
         ],
         box_dims=[epi_tile_mn[1], cta_tile_mnk[0], 1],
-        swizzle=(_tma.TensorMapSwizzle.s64b if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
+        swizzle=_tma.TensorMapSwizzle.s64b,
     )
     tma_c_desc_list = [tma_c_desc]
     # @@TMA_STORE_ONLY:END@@
@@ -886,11 +891,11 @@ def compile() -> Callable:
         )
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    def _make_fake_c():
+    def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
-            cd_dtype,
-            (sym_m, sym_n // cd_fake_n_div, sym_l),
-            stride_order=(0, 1, 2) if cd_out_is_m_major else (1, 0, 2),
+            _dt,
+            (sym_m, sym_n // _div, sym_l),
+            stride_order=(0, 1, 2) if _mm else (1, 0, 2),
             assumed_align=16,
         )
 
