@@ -785,9 +785,9 @@ def indexer_backward_wrapper(
 
     ``index_score`` contains the predict softmax aligned slot-for-slot with
     ``topk_indices``; the fused softmax returned by compressed indexer forward
-    can be passed directly. ``attn_score`` and ``index_score`` are consumed
-    in-place: the kernel overwrites ``attn_score`` with ``grad_signal`` and
-    ``index_score`` with ``sum_grad`` during the score-grad precompute stage.
+    can be passed directly. The kernel overwrites ``attn_score`` with
+    ``grad_signal`` during the score-grad precompute stage and treats
+    ``index_score`` as read-only.
 
     Args:
         topk_indices_global: whether ``topk_indices`` already contains global
@@ -801,7 +801,7 @@ def indexer_backward_wrapper(
         index_score: FP32 predict probabilities over the selected indexer
             logits. The caller must use the same valid-slot mask when
             constructing ``attn_score`` so target and predict describe
-            identical slots. This buffer is overwritten in-place.
+            identical slots. This buffer is preserved.
         grad_loss: single-element float32 tensor on the same CUDA device as
             ``index_q``. The kernel reads its value at runtime, including on
             CUDA Graph replay.

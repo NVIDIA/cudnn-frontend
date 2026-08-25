@@ -124,9 +124,9 @@ def test_DSA_indexer_backward_wrapper(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # The kernel mutates attn_score + index_score in-place during its
-    # score-grad stage. Keep pre-call copies so the reference can consume the
-    # same inputs the kernel was given.
+    # The score-grad stage overwrites attn_score but treats index_score as
+    # read-only. Keep pre-call copies for both reference input and the
+    # preservation check.
     attn_score_ref = attn_score.clone()
     index_score_ref = index_score.clone()
     torch_stream.wait_stream(torch.cuda.current_stream())
@@ -147,6 +147,8 @@ def test_DSA_indexer_backward_wrapper(
     except (ValueError, NotImplementedError, RuntimeError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
     torch_stream.synchronize()
+
+    assert torch.equal(index_score, index_score_ref)
 
     d_index_q = result["d_index_q"]
     d_weights = result["d_weights"]
@@ -2220,3 +2222,56 @@ def test_DSA_indexer_backward_wrapper_legacy_positional_call(
     assert torch.isfinite(d_index_q.float()).all()
     assert torch.isfinite(d_weights.float()).all()
     assert torch.isfinite(d_index_k.float()).all()
+@pytest.mark.L1
+def test_DSA_indexer_backward_sm100_local_oob_id_is_padding():
+    """A positive out-of-range local id must not alias the next batch."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    batch, seqlen_q, seqlen_k, heads, head_dim, topk = 2, 2048, 512, 64, 128, 512
+    index_q = torch.ones(batch, seqlen_q, heads, head_dim, device=device, dtype=torch.bfloat16)
+    index_k = torch.ones(batch, seqlen_k, head_dim, device=device, dtype=torch.bfloat16)
+    weights = torch.ones(batch, seqlen_q, heads, device=device, dtype=torch.bfloat16)
+    grad_signal = torch.ones(batch, seqlen_q, topk, device=device, dtype=torch.float32)
+    padding_ids = torch.full((batch, seqlen_q, topk), -1, device=device, dtype=torch.int32)
+    oob_ids = padding_ids.clone()
+    # Without the upper-bound check, this local batch-0 id becomes flat row
+    # ``seqlen_k`` and aliases batch 1's first K row.
+    oob_ids[0, :, 0] = seqlen_k
+
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=head_dim**-0.5,
+        block_I=128,
+        topk_indices_global=False,
+    )
+
+    def run(topk_ids):
+        d_index_q = torch.zeros_like(index_q)
+        d_weights = torch.zeros_like(weights)
+        d_index_k = torch.zeros_like(index_k, dtype=torch.float32)
+        kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, topk_ids)
+        torch.cuda.synchronize()
+        return d_index_q, d_index_k, d_weights
+
+    padding_grads = run(padding_ids)
+    oob_grads = run(oob_ids)
+    for name, actual, expected in zip(("dQ", "dK", "dW"), oob_grads, padding_grads):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=0.0,
+            atol=0.0,
+            msg=lambda msg, name=name: f"positive OOB local id changed {name}: {msg}",
+        )

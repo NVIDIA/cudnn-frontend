@@ -331,11 +331,11 @@ d_index_q, d_weights, d_index_k = (
 
 When compressed forward returns its fused `softmax`, backward can skip both
 indexer Q@K score recompute and the separate logits softmax. Pass `softmax`
-directly as `index_score`; backward consumes and overwrites this buffer, so
-pass `softmax.clone()` if it must be preserved. `attn_score` must use the same
-valid-slot mask. Because compressed forward returns global indices by default,
-also pass `topk_indices_global=True` unless forward used
-`topk_indices_global=False`. The public sparse `indexer_backward_wrapper` has a
+directly as `index_score`; backward treats this buffer as read-only.
+`attn_score` must use the same valid-slot mask. Because compressed forward
+returns global indices by default, also pass `topk_indices_global=True` unless
+forward used `topk_indices_global=False`. The public sparse
+`indexer_backward_wrapper` has a
 BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
 the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8 and MXFP8 indexer backward are not currently supported because
