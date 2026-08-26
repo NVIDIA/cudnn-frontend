@@ -341,6 +341,97 @@ the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8 and MXFP8 indexer backward are not currently supported because
 the backward wrapper requires BF16 Q/K/W inputs.
 
+#### SM100 sparse backward v2 (opt-in)
+
+`backend="sm100_v2"` on `IndexerBackward` / `indexer_backward_wrapper`
+selects an alternative kernel-2 (GEMM stage) implementation. `backend` is a
+string enum, one of `{"default", "sm100_v2"}` (default `"default"`; an
+unknown value raises `ValueError`). The semantics are
+**request-or-fail**: outside the envelope below the wrapper raises
+`ValueError` (or `RuntimeError` off SM100) and never silently falls back to
+the default backend.
+
+- **What it computes differently** — weights are upcast to fp32 in-register
+  (exact) and the fp32 per-slot gradient matrix is split into a two-term BF16
+  expansion (`hi + lo`) before the MMAs, so each individual product in the
+  dQ/dK contractions is exact in the fp32 accumulator when it is finite
+  there (~675x lower
+  gradient-matrix representation error than the default single-BF16 rounding,
+  measured as an aggregate over 1e6 random values; individual values gain
+  less when their `lo` term is small). `lo` is ~2^-9 of `hi`, so it starts to
+  underflow for gradient-matrix magnitudes below ~1e-35 (measured 518x at
+  1e-35, 63x at 1e-36, and no advantage left at 1e-38), and the FP32->BF16
+  conversion is non-saturating, so a magnitude at or above BF16's
+  round-to-nearest overflow threshold (`2^128 - 2^119` ~= 3.3962e38, itself
+  above BF16's 3.3895e38 maximum) becomes an infinity in `hi` and the opposite
+  infinity in `lo`, which sum to NaN rather than being clamped. `d_weights` is reduced deterministically — `d_weights` and
+  `d_index_q` are bitwise run-to-run stable; `d_index_k` stays in the same
+  fp32-atomic summation-order class as the default backend.
+- **Output dtype selects output precision** — `d_weights` and `d_index_k`
+  accept FP32 buffers, which receive the fp32 accumulators directly; **the
+  headline accuracy gains require caller-supplied FP32 buffers.** The default
+  wrapper-allocated outputs keep the input dtypes (BF16), which rounds the
+  extra accuracy back to the BF16 representation floor (~1.7e-3 relative).
+  FP32 `d_index_k` is zeroed internally (no caller pre-zero contract).
+  `d_index_q` is always BF16.
+- **Envelope** (validated by `check_support` when a plan is created, and
+  re-validated against the real tensors on every execute -- cache hits
+  included -- before any buffer is mutated) —
+  SM100 (10, 0) only; `H == 64`, `D == 128`, `block_I == 128`;
+  `topk % 128 == 0` with `128 <= topk <= 2048`; `sm_scale > 0`; contiguous
+  same-device tensors; `attn_score`/`index_score`/`topk_indices` shaped
+  `(B, S_q, topk)`. `sm_scale` folds into the gradient in kernel 2 while the
+  relu gate reads the *unscaled* score, which is equivalent for any positive
+  scale except at the underflow-to-zero boundary: for a slot whose scaled
+  score `sm_scale * S` rounds to zero the default backend drops the slot and
+  this backend keeps it, and because the gate is a step function that slot's
+  full dQ/dK contribution (`g' * w`, not scaled by `S`) is what differs. The
+  default backend's multiply preserves subnormals, so reaching it takes an
+  exact `sm_scale * S` below `2^-150` (~7.0e-46).
+- **Scratch / workspace behavior** — `attn_score`/`index_score` are consumed
+  in place exactly like the default backend (`attn_score` is left holding
+  kernel 1's `grad_signal`; `sm_scale` folds inside kernel 2 without touching
+  the buffer). The backend owns one piece of per-plan workspace — the
+  dynamic-ticket counter — allocated on first execute and reused by every
+  later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
+  accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
+  `S_k`); that one comes from PyTorch's caching allocator on every call, which
+  is a pool hit in steady state — it has to be re-zeroed per call anyway, and
+  this way it stays reclaimable via `torch.cuda.empty_cache()` instead of
+  staying pinned for as long as the plan is cached. The wrapper still
+  allocates any output buffer you do not pass in.
+- **Concurrency** — executions sharing one plan must not overlap on the
+  device (the ticket counter is per-plan workspace). One plan serves one
+  device: the workspace is device-resident, and execution rejects tensors on
+  any other device before touching the score buffers. The wrapper keys its
+  plan cache on the CUDA device and on the **resolved** stream (`stream` when
+  given, otherwise `torch.cuda.current_stream()` at call time), so calls that
+  differ in device or stream get a private plan and private workspace; calls
+  that land on the same cache entry must not be allowed to overlap. The key
+  is the integer stream handle, plus the calling thread's id for the one handle
+  CUDA does not make unique across host threads: `cudaStreamPerThread`
+  is the value 2 in every thread and means "the calling thread's own stream",
+  so two threads that pass it explicitly get a private plan each. Users
+  driving `IndexerBackward` objects directly must use one object per device,
+  and one per stream wherever those streams' executions can overlap; a single
+  object may target any stream if its executions are serialized.
+- **Local top-k ids** (`topk_indices_global=False`) are masked against the
+  per-batch `S_k` before the batch offset is applied, in-kernel: ids `< 0` or
+  `>= S_k` contribute nothing and can never alias a neighbouring batch.
+
+```python
+# fp32 output buffers unlock the full accuracy gain
+d_weights = torch.empty(B, S_q, H, dtype=torch.float32, device="cuda")
+d_index_k = torch.empty(B, S_k, D, dtype=torch.float32, device="cuda")
+result = DSA.indexer_backward_wrapper(
+    index_q, weights, index_k,
+    attn_score, index_score, topk_indices,
+    grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128,
+    backend="sm100_v2",
+    d_weights=d_weights, d_index_k=d_index_k,
+)
+```
+
 ### 9. Dense Indexer Backward
 
 Full-KV counterpart to Indexer Backward. It consumes raw dense score tensors
