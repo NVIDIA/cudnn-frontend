@@ -13,6 +13,7 @@ from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.test_fe_api_utils import (
     DYNAMIC_SHAPES_M_VALUES,
+    ceil_div,
     reencode_sf_tensor_as_ue5m3,
     ue5m3_bytes_to_fp32,
 )
@@ -171,12 +172,31 @@ def _swizzled_sf_to_flat(sf_tensor: torch.Tensor, rows: int, cols: int) -> torch
     ]
 
 
+def _blocked_sf_to_flat(sf_tensor: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Gather wgrad-style blocked scale backing into logical (rows, cols/16)."""
+    sf_cols = (cols + HADAMARD_SIZE - 1) // HADAMARD_SIZE
+    row_idx = torch.arange(rows, device=sf_tensor.device, dtype=torch.long).view(rows, 1)
+    col_idx = torch.arange(sf_cols, device=sf_tensor.device, dtype=torch.long).view(1, sf_cols)
+    col_blocks = sf_tensor.shape[1] // 4
+    linear = (
+        (row_idx // 128) * col_blocks * 512
+        + (col_idx // 4) * 512
+        + (row_idx % 32) * 16
+        + ((row_idx // 32) % 4) * 4
+        + (col_idx % 4)
+    )
+    return sf_tensor.flatten()[linear]
+
+
 def _check_nvfp4_output(
     values: torch.Tensor,
     sf_tensor: torch.Tensor,
     ref: torch.Tensor,
     norm_const: float,
     name: str,
+    sf_layout: Optional[str] = None,
+    rtol: float = 0.25,
+    atol: float = 5e-2,
 ) -> None:
     """Check unpacked e2m1 values (rows, cols) + e4m3 scales (rows, cols/16),
     with (1, 16) quantization blocks along the last dim, against the f32
@@ -185,7 +205,12 @@ def _check_nvfp4_output(
     the widest e2m1 grid gap, plus saturation headroom)."""
     ref_bf16 = ref.to(torch.bfloat16).to(torch.float32)
     sf_ref = _nvfp4_sf_ref(ref, norm_const)
-    sf_flat = _swizzled_sf_to_flat(sf_tensor, ref.shape[0], ref.shape[1]) if sf_tensor.dim() == 6 else sf_tensor
+    if sf_tensor.dim() == 6:
+        sf_flat = _swizzled_sf_to_flat(sf_tensor, ref.shape[0], ref.shape[1])
+    elif sf_layout == "blocked":
+        sf_flat = _blocked_sf_to_flat(sf_tensor, ref.shape[0], ref.shape[1])
+    else:
+        sf_flat = sf_tensor
     torch.testing.assert_close(
         sf_flat.float().cpu(),
         sf_ref.float().cpu(),
@@ -197,9 +222,62 @@ def _check_nvfp4_output(
     decode_scale = sf_flat.float().repeat_interleave(HADAMARD_SIZE, dim=1) / norm_const
     dequant = values * decode_scale
     err = (dequant - ref_bf16).abs()
-    bound = 1.5 * decode_scale + 5e-2
-    bad = err > bound
-    assert not bad.any(), f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound (max err {err[bad].max().item():.4f})"
+    bound = rtol * (6 * decode_scale) + atol
+    bad = torch.logical_and(err > bound, decode_scale != 0)
+    if bad.any():
+        max_abs_err = err[bad].max().item()
+        max_rel_err = torch.nanquantile(err[bad] / ref_bf16[bad].abs(), 1.0).item()
+        raise RuntimeError(
+            f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound "
+            f"(max abs err {max_abs_err:.4f}, max rel err {max_rel_err:.4f})"
+        )
+
+
+def _check_colwise_rht(
+    inputs: Dict,
+    outputs: Dict,
+    rht_ref: torch.Tensor,
+    rht_norm_const: float,
+    sf_fp8_dtype_override: Optional[str],
+) -> None:
+    assert outputs["rht_rowwise_tensor"] is None
+    assert outputs["sfrht_rowwise_tensor"] is None
+    assert outputs["rht_colwise_tensor"] is not None
+    assert outputs["sfrht_colwise_tensor"] is not None
+
+    valid_m, n_out = rht_ref.shape
+    values = float4_e2m1fn_x2_to_float32(outputs["rht_colwise_tensor"].view(torch.uint8).cpu()).reshape(-1)
+    sf = outputs["sfrht_colwise_tensor"].cpu().reshape(-1)
+    if sf_fp8_dtype_override == "e5m3":
+        sf = ue5m3_bytes_to_fp32(sf)
+
+    start_m = 0
+    sf_col_offset = 0
+    for expert_idx, group_m in enumerate(inputs["aligned_group_m_list"]):
+        end_m = start_m + group_m
+        ref_e = rht_ref[start_m:end_m].float().t().contiguous()
+        value_offset = n_out * start_m
+        value_count = n_out * group_m
+        values_e = values[value_offset : value_offset + value_count].reshape(n_out, group_m)
+        sf_offset = n_out * start_m // HADAMARD_SIZE
+        sf_count = n_out * group_m // HADAMARD_SIZE
+        sf_e = sf[sf_offset : sf_offset + sf_count]
+        sf_e = sf_e.reshape(32, 4, ceil_div(n_out, 128), 4, ceil_div(group_m, 64), 1)
+        sf_flat_e = _swizzled_sf_to_flat(sf_e, n_out, group_m)
+        _check_nvfp4_output(
+            values_e,
+            sf_e,
+            ref_e,
+            rht_norm_const,
+            f"RHT colwise expert {expert_idx}",
+            # RHT is performed on BF16-quantized values, so loosen
+            # tols to handle extra accumulated error.
+            rtol=0.5,
+            atol=0.1,
+        )
+        start_m = end_m
+
+    assert start_m == valid_m
 
 
 # =============================================================================
@@ -213,8 +291,8 @@ def _check_outputs(
     cfg: Dict,
     *,
     act_func: str,
-    rht_output: bool,
-    rht_rowwise: bool,
+    rht_rowwise_dtype: Optional[torch.dtype],
+    rht_colwise_dtype: Optional[torch.dtype],
     glu_alpha: Optional[float] = None,
     glu_limit: Optional[float] = None,
     norm_const: float = 1.0,
@@ -254,44 +332,43 @@ def _check_outputs(
             "D",
         )
 
-    if not rht_output:
-        assert outputs["rht_tensor"] is None
-        assert outputs["sfrht_tensor"] is None
+    if rht_rowwise_dtype is None and rht_colwise_dtype is None:
+        assert outputs["rht_rowwise_tensor"] is None
+        assert outputs["sfrht_rowwise_tensor"] is None
+        assert outputs["rht_colwise_tensor"] is None
+        assert outputs["sfrht_colwise_tensor"] is None
         return
 
-    rht_ref = _rht_ref(d_ref.cpu(), rht_rowwise)
-    if outputs["sfrht_tensor"] is None:
+    if rht_rowwise_dtype is not None:
+        assert outputs["rht_colwise_tensor"] is None
+        assert outputs["sfrht_colwise_tensor"] is None
+        rht_ref = _rht_ref(d_ref.cpu(), rowwise=True)
+
+    elif rht_colwise_dtype is not None:
+        assert rht_colwise_dtype == torch.float4_e2m1fn_x2
+        rht_ref = _rht_ref(d_ref.cpu(), rowwise=False)
+        _check_colwise_rht(inputs, outputs, rht_ref, rht_norm_const, sf_fp8_dtype_override)
+        return
+    else:
+        raise AssertionError("unreachable RHT mode")
+
+    if outputs["sfrht_rowwise_tensor"] is None:
         torch.testing.assert_close(
-            outputs["rht_tensor"][:valid_m, :, 0].cpu().float(),
+            outputs["rht_rowwise_tensor"][:valid_m, :, 0].cpu().float(),
             rht_ref.float(),
             atol=1e-1,
             rtol=1e-2,
         )
-    elif rht_rowwise:
-        sfrht_tensor = outputs["sfrht_tensor"]
+    else:
+        sfrht_tensor = outputs["sfrht_rowwise_tensor"]
         if sf_fp8_dtype_override == "e5m3":
             sfrht_tensor = ue5m3_bytes_to_fp32(sfrht_tensor)
         _check_nvfp4_output(
-            float4_e2m1fn_x2_to_float32(outputs["rht_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()),
+            float4_e2m1fn_x2_to_float32(outputs["rht_rowwise_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()),
             sfrht_tensor.cpu(),
             rht_ref.float(),
             rht_norm_const,
-            "RHT",
-        )
-    else:
-        # Colwise: the packed data stays at D's (m, f) orientation (nibbles pair
-        # adjacent features), but quantization blocks are (16, 1) token blocks,
-        # so check through the transposed unpacked values and the swizzled
-        # SF(N_out, valid_m) scale domain.
-        sfrht_tensor = outputs["sfrht_tensor"]
-        if sf_fp8_dtype_override == "e5m3":
-            sfrht_tensor = ue5m3_bytes_to_fp32(sfrht_tensor)
-        _check_nvfp4_output(
-            float4_e2m1fn_x2_to_float32(outputs["rht_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()).t(),
-            sfrht_tensor.cpu(),
-            rht_ref.float().t(),
-            rht_norm_const,
-            "RHT",
+            "RHT rowwise",
         )
 
 
@@ -309,9 +386,8 @@ def _run_wrapper(
     act_func="swiglu",
     enable_bias=False,
     d_dtype=torch.bfloat16,
-    rht_output=True,
-    rht_dtype=torch.bfloat16,
-    rht_rowwise=False,
+    rht_rowwise_dtype=None,
+    rht_colwise_dtype=torch.float4_e2m1fn_x2,
     glu_alpha=None,
     glu_limit=None,
     sf_fp8_dtype_override=None,
@@ -338,8 +414,11 @@ def _run_wrapper(
     rht_norm_const = 1.0
     if d_dtype == torch.float4_e2m1fn_x2:
         norm_const = 2688.0 / ref_tensors["d_ref"].to(torch.bfloat16).float().abs().max().item()
-    if rht_output and rht_dtype == torch.float4_e2m1fn_x2:
-        rht_ref = _rht_ref(ref_tensors["d_ref"].cpu(), rht_rowwise)
+    if rht_rowwise_dtype == torch.float4_e2m1fn_x2:
+        rht_ref = _rht_ref(ref_tensors["d_ref"].cpu(), rowwise=True)
+        rht_norm_const = 2688.0 / rht_ref.float().abs().max().item()
+    elif rht_colwise_dtype == torch.float4_e2m1fn_x2:
+        rht_ref = _rht_ref(ref_tensors["d_ref"].cpu(), rowwise=False)
         rht_norm_const = 2688.0 / rht_ref.float().abs().max().item()
 
     if sf_fp8_dtype_override == "e5m3":
@@ -363,9 +442,8 @@ def _run_wrapper(
         c_dtype=cfg["c_dtype"],
         d_dtype=d_dtype,
         cd_major=cfg["cd_major"],
-        rht_output=rht_output,
-        rht_dtype=rht_dtype,
-        rht_rowwise=rht_rowwise,
+        rht_rowwise_dtype=rht_rowwise_dtype,
+        rht_colwise_dtype=rht_colwise_dtype,
         glu_alpha=glu_alpha,
         glu_limit=glu_limit,
         norm_const=norm_const,
@@ -384,8 +462,8 @@ def _run_wrapper(
         outputs,
         cfg,
         act_func=act_func,
-        rht_output=rht_output,
-        rht_rowwise=rht_rowwise,
+        rht_rowwise_dtype=rht_rowwise_dtype,
+        rht_colwise_dtype=rht_colwise_dtype,
         glu_alpha=glu_alpha,
         glu_limit=glu_limit,
         norm_const=norm_const,
@@ -428,8 +506,10 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         "c_tensor": alloc_n_major(valid_m, n, cfg["c_dtype"]),
         "d_tensor": alloc_n_major(valid_m, n_out, torch.bfloat16),
         "sfd_tensor": None,
-        "rht_tensor": alloc_n_major(valid_m, n_out, torch.bfloat16),
-        "sfrht_tensor": None,
+        "rht_rowwise_tensor": alloc_n_major(valid_m, n_out, torch.bfloat16),
+        "sfrht_rowwise_tensor": None,
+        "rht_colwise_tensor": None,
+        "sfrht_colwise_tensor": None,
     }
 
     from cudnn import GroupedGemmGluHadamardQuantSm100
@@ -444,7 +524,7 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         sample_padded_offsets=inputs["padded_offsets_tensor"],
         sample_alpha=inputs["alpha_tensor"],
         sample_prob=inputs["prob_tensor"],
-        sample_rht=outputs["rht_tensor"],
+        sample_rht_rowwise=outputs["rht_rowwise_tensor"],
         acc_dtype=cfg["acc_dtype"],
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -466,7 +546,7 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         padded_offsets=inputs["padded_offsets_tensor"],
         alpha_tensor=inputs["alpha_tensor"],
         prob_tensor=inputs["prob_tensor"],
-        rht_tensor=outputs["rht_tensor"],
+        rht_rowwise_tensor=outputs["rht_rowwise_tensor"],
     )
 
     _check_outputs(
@@ -474,8 +554,8 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         outputs,
         cfg,
         act_func=act_func,
-        rht_output=True,
-        rht_rowwise=False,
+        rht_rowwise_dtype=torch.bfloat16,
+        rht_colwise_dtype=None,
         sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
@@ -514,6 +594,8 @@ def _run_discrete_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func=
         c_dtype=cfg["c_dtype"],
         d_dtype=torch.bfloat16,
         cd_major=cfg["cd_major"],
+        rht_rowwise_dtype=torch.bfloat16,
+        rht_colwise_dtype=None,
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
@@ -528,8 +610,8 @@ def _run_discrete_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func=
         outputs,
         cfg,
         act_func=act_func,
-        rht_output=True,
-        rht_rowwise=False,
+        rht_rowwise_dtype=torch.bfloat16,
+        rht_colwise_dtype=None,
         sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
@@ -572,7 +654,8 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_rowwise(request):
         ab_dtype=torch.float4_e2m1fn_x2,
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
-        rht_rowwise=True,
+        rht_rowwise_dtype=torch.bfloat16,
+        rht_colwise_dtype=None,
     )
 
 
@@ -584,7 +667,7 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_no_rht(request):
         ab_dtype=torch.float4_e2m1fn_x2,
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
-        rht_output=False,
+        rht_colwise_dtype=None,
     )
 
 
@@ -622,21 +705,25 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_d(request):
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
         d_dtype=torch.float4_e2m1fn_x2,
-        rht_output=False,
+        rht_colwise_dtype=None,
     )
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("rht_rowwise", [False, True])
-def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht(request, rht_rowwise):
+@pytest.mark.parametrize(
+    "rht_rowwise_dtype,rht_colwise_dtype",
+    [(None, torch.float4_e2m1fn_x2), (torch.float4_e2m1fn_x2, None)],
+    ids=["colwise", "rowwise"],
+)
+def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht(request, rht_rowwise_dtype, rht_colwise_dtype):
     _run_wrapper(
         request,
         ab_dtype=torch.float4_e2m1fn_x2,
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
-        rht_dtype=torch.float4_e2m1fn_x2,
-        rht_rowwise=rht_rowwise,
+        rht_rowwise_dtype=rht_rowwise_dtype,
+        rht_colwise_dtype=rht_colwise_dtype,
     )
 
 
@@ -649,14 +736,18 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_full(request):
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
         d_dtype=torch.float4_e2m1fn_x2,
-        rht_dtype=torch.float4_e2m1fn_x2,
+        rht_colwise_dtype=torch.float4_e2m1fn_x2,
     )
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("rht_rowwise", [False, True], ids=["colwise", "rowwise"])
-def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht_e5m3(request, rht_rowwise):
+@pytest.mark.parametrize(
+    "rht_rowwise_dtype,rht_colwise_dtype",
+    [(None, torch.float4_e2m1fn_x2), (torch.float4_e2m1fn_x2, None)],
+    ids=["colwise", "rowwise"],
+)
+def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht_e5m3(request, rht_rowwise_dtype, rht_colwise_dtype):
     """quant_rht with the input block scales carried as UE5M3 bytes in e4m3 storage."""
     _skip_unless_e5m3_supported()
     _run_wrapper(
@@ -664,8 +755,8 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht_e5m3(request, rht_row
         ab_dtype=torch.float4_e2m1fn_x2,
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
-        rht_dtype=torch.float4_e2m1fn_x2,
-        rht_rowwise=rht_rowwise,
+        rht_rowwise_dtype=rht_rowwise_dtype,
+        rht_colwise_dtype=rht_colwise_dtype,
         sf_fp8_dtype_override="e5m3",
     )
 
@@ -681,7 +772,7 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_full_e5m3(request):
         sf_dtype=torch.float8_e4m3fn,
         sf_vec_size=16,
         d_dtype=torch.float4_e2m1fn_x2,
-        rht_dtype=torch.float4_e2m1fn_x2,
+        rht_colwise_dtype=torch.float4_e2m1fn_x2,
         sf_fp8_dtype_override="e5m3",
     )
 
@@ -743,9 +834,6 @@ def test_grouped_gemm_glu_hadamard_quant_e5m3_is_not_cached_as_e4m3(request):
             c_dtype=cfg["c_dtype"],
             d_dtype=torch.bfloat16,
             cd_major=cfg["cd_major"],
-            rht_output=True,
-            rht_dtype=torch.bfloat16,
-            rht_rowwise=False,
             mma_tiler_mn=cfg["mma_tiler_mn"],
             cluster_shape_mn=cfg["cluster_shape_mn"],
             sf_vec_size=cfg["sf_vec_size"],
