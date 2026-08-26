@@ -699,7 +699,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # Split partials reduce in half precision, so mismatch()'s
             # facts x knobs gate additionally requires a bf16/fp16 O on the
             # quantized rows; split_d_shapes pins it to the d128 flavor.
-            split_kv_supported=not rubin_row,
+            split_kv_supported=True,
             split_d_shapes=frozenset({(128, 128)}),
             pack_gqas=frozenset({False, True}),
         ),
