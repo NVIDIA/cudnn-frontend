@@ -178,13 +178,7 @@ def _blocked_sf_to_flat(sf_tensor: torch.Tensor, rows: int, cols: int) -> torch.
     row_idx = torch.arange(rows, device=sf_tensor.device, dtype=torch.long).view(rows, 1)
     col_idx = torch.arange(sf_cols, device=sf_tensor.device, dtype=torch.long).view(1, sf_cols)
     col_blocks = sf_tensor.shape[1] // 4
-    linear = (
-        (row_idx // 128) * col_blocks * 512
-        + (col_idx // 4) * 512
-        + (row_idx % 32) * 16
-        + ((row_idx // 32) % 4) * 4
-        + (col_idx % 4)
-    )
+    linear = (row_idx // 128) * col_blocks * 512 + (col_idx // 4) * 512 + (row_idx % 32) * 16 + ((row_idx // 32) % 4) * 4 + (col_idx % 4)
     return sf_tensor.flatten()[linear]
 
 
@@ -228,8 +222,7 @@ def _check_nvfp4_output(
         max_abs_err = err[bad].max().item()
         max_rel_err = torch.nanquantile(err[bad] / ref_bf16[bad].abs(), 1.0).item()
         raise RuntimeError(
-            f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound "
-            f"(max abs err {max_abs_err:.4f}, max rel err {max_rel_err:.4f})"
+            f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound (max abs err {max_abs_err:.4f}, max rel err {max_rel_err:.4f})"
         )
 
 
