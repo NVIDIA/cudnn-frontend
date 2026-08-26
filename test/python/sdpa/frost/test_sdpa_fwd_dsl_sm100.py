@@ -792,7 +792,7 @@ def test_dsl_sm100_pack_gqa_features(mask):
     o, lse = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, sink=sink, pack_gqa=True, return_stats=True)
     o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **ref)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
@@ -820,7 +820,7 @@ def test_dsl_sm100_pack_gqa_qtrim():
         o_ref[i, :, ql:, :] = 0.0
         lse_ref[i, :, ql:] = float("-inf")
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
