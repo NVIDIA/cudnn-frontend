@@ -125,3 +125,23 @@ def make_dense_stats(batch: int, heads: int, sequence: int, layout: str):
         assert not stats.is_contiguous()
         return stats
     raise ValueError(f"unknown dense Stats layout {layout!r}")
+
+
+def make_dense_bias(heads: int, query_sequence: int, kv_sequence: int, dtype, layout: str):
+    """Allocate additive bias in compact or permuted-and-gapped H/Q storage."""
+    import torch
+
+    if layout == "contiguous":
+        return torch.randn(1, heads, query_sequence, kv_sequence, dtype=dtype, device="cuda") * 0.25
+    if layout == "strided":
+        storage = torch.full(
+            (query_sequence + 7, heads + 2, kv_sequence + 3),
+            float("nan"),
+            dtype=dtype,
+            device="cuda",
+        )
+        bias = storage[:query_sequence, :heads, :kv_sequence].permute(1, 0, 2).unsqueeze(0)
+        bias.normal_().mul_(0.25)
+        assert not bias.is_contiguous() and bias.stride(-1) == 1
+        return bias
+    raise ValueError(f"unknown dense bias layout {layout!r}")

@@ -75,6 +75,7 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams()
 validate_params(PARAMS)
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+_LOG2E = 1.4426950408889634
 
 # ---------------------------------------------------------------------------
 # PTX and layout helpers.
@@ -209,6 +210,8 @@ class SM120FusedMultiHeadAttentionForward:
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
         has_sink: bool = False,
+        has_bias: bool = False,
+        bias_is_fp32: bool = False,
         thd_varlen: bool = False,
         split_kv: int = 1,
         thd_batch: int = 1,
@@ -271,6 +274,10 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must divide q_tile ({q_tile}) when pack_gqa is enabled")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
+        if has_bias and thd_varlen:
+            raise ValueError("attention bias is dense-only")
+        if bias_is_fp32 and not has_bias:
+            raise ValueError("bias_is_fp32 requires has_bias")
         if thd_varlen and thd_batch < 1:
             raise ValueError("thd_varlen requires thd_batch >= 1")
         self.in_dtype = in_dtype
@@ -289,6 +296,8 @@ class SM120FusedMultiHeadAttentionForward:
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
+        self.has_bias = has_bias
+        self.bias_is_fp32 = bias_is_fp32
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
         self.thd_lse_head_major = thd_lse_head_major
@@ -579,6 +588,9 @@ class SM120FusedMultiHeadAttentionForward:
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
         softmax_scale_log2 = softmax_params.softmax_scale_log2
+        if cutlass.const_expr(self.has_bias):
+            bias = basic_params.bias
+            bias_arr = cutlass.make_array_view(bias)
 
         # Each lane owns four S registers split across two Q rows after Q@K^T.
         for row_half in cutlass.range_constexpr(2):
@@ -590,6 +602,13 @@ class SM120FusedMultiHeadAttentionForward:
             # Resolve mask bounds for this query row. ``valid_cols`` is an
             # exclusive upper bound; ``first_valid_col`` is inclusive.
             q_position = basic_params.q_seq_idx + (q_row_in_cta if cutlass.const_expr(not self.pack_gqa) else q_row_in_cta // self.qh_per_kh)
+            if cutlass.const_expr(self.has_bias):
+                bias_q = cute.math.min(q_position, cutlass.Int32(bias.shape[2] - 1))
+                bias_head = (
+                    basic_params.q_head_base
+                    if cutlass.const_expr(not self.pack_gqa)
+                    else basic_params.q_head_base + q_row_in_cta % cutlass.Int32(self.qh_per_kh)
+                )
             diagonal_offset = cutlass.Int32(0)
             if cutlass.const_expr(self.bottom_right):
                 diagonal_offset = basic_params.seqlen_k - basic_params.seqlen_q
@@ -617,9 +636,14 @@ class SM120FusedMultiHeadAttentionForward:
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + s_reg_idx_lo]
                 s1 = s_regs[s_off + s_reg_idx_hi]
+                k_col0 = kv_seq_idx + k_frag * 8 + 2 * (lane % 4)
+                k_col1 = k_col0 + 1
+                if cutlass.const_expr(self.has_bias):
+                    bias_k0 = cute.math.min(k_col0, cutlass.Int32(bias.shape[3] - 1))
+                    bias_k1 = cute.math.min(k_col1, cutlass.Int32(bias.shape[3] - 1))
+                    s0 = s0 * softmax_scale_log2 + cutlass.Float32(bias_arr[cutlass.Int32(0), bias_head, bias_q, bias_k0]) * cutlass.Float32(_LOG2E)
+                    s1 = s1 * softmax_scale_log2 + cutlass.Float32(bias_arr[cutlass.Int32(0), bias_head, bias_q, bias_k1]) * cutlass.Float32(_LOG2E)
                 if cutlass.const_expr(in_mask_steps):
-                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * (lane % 4)
-                    k_col1 = k_col0 + 1
                     valid0 = k_col0 >= first_valid_col and k_col0 < valid_cols
                     valid1 = k_col1 >= first_valid_col and k_col1 < valid_cols
                     if not valid0:
@@ -644,10 +668,13 @@ class SM120FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(in_mask_steps):
                     need_correct = new_max > -cutlass.Float32.inf
                 if need_correct:
-                    old_scale = cute.math.exp2(
-                        (row_max_prev - new_max) * softmax_scale_log2,
-                        fastmath=True,
-                    )
+                    if cutlass.const_expr(self.has_bias):
+                        old_scale = cute.math.exp2(row_max_prev - new_max, fastmath=True)
+                    else:
+                        old_scale = cute.math.exp2(
+                            (row_max_prev - new_max) * softmax_scale_log2,
+                            fastmath=True,
+                        )
             row_max[row_half] = new_max
 
             # Compute P, accumulate the per-lane partial sum, and stage P.
@@ -655,17 +682,21 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            neg_exp_max_scaled = -(exp_max if cutlass.const_expr(self.has_bias) else exp_max * softmax_scale_log2)
             tile_sum = cutlass.Float32(0.0)
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + s_reg_idx_lo]
                 s1 = s_regs[s_off + s_reg_idx_hi]
-                in0, in1 = fma2(
-                    (s0, s1),
-                    (softmax_scale_log2, softmax_scale_log2),
-                    (neg_exp_max_scaled, neg_exp_max_scaled),
-                )
+                if cutlass.const_expr(self.has_bias):
+                    in0 = s0 + neg_exp_max_scaled
+                    in1 = s1 + neg_exp_max_scaled
+                else:
+                    in0, in1 = fma2(
+                        (s0, s1),
+                        (softmax_scale_log2, softmax_scale_log2),
+                        (neg_exp_max_scaled, neg_exp_max_scaled),
+                    )
                 p0 = cute.math.exp2(in0, fastmath=True)
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum = tile_sum + (p0 + p1)
@@ -826,6 +857,7 @@ class SM120FusedMultiHeadAttentionForward:
         v: cute.Tensor,
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
+        bias: Optional[cute.Tensor],
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
@@ -844,6 +876,8 @@ class SM120FusedMultiHeadAttentionForward:
             token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
             ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
             compile the LSE store out (the DSL specializes on ``None``).
+        :param bias: Dense additive attention bias, or ``None`` when the
+            kernel is configured without ``has_bias``.
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
             kernel is configured without ``has_sink``.
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
@@ -1126,6 +1160,7 @@ class SM120FusedMultiHeadAttentionForward:
                 head_idx=head_idx,
                 q_seq_idx=q_seq_idx,
                 q_head_off=q_head_off,
+                q_head_base=q_head_base,
                 q_seq_stride=q_seq_stride,
                 q_head_stride=q_head_stride,
                 q_warp_row0=q_warp_row0,
@@ -1133,6 +1168,7 @@ class SM120FusedMultiHeadAttentionForward:
                 lane_div8=lane_div8,
                 lane_mod8=lane_mod8,
                 lane_div16=lane_div16,
+                bias=bias,
                 tma_k_desc=tma_k_desc,
                 tma_v_desc=tma_v_desc,
                 k_tma_mbar=k_tma_mbar,
@@ -1243,7 +1279,7 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
-                row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
+                row_max_nat = row_max[row_half] * LN2 if cutlass.const_expr(self.has_bias) else row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):
                     sinks_arr = cutlass.make_array_view(sinks)
                     _sink_head = (
@@ -1383,6 +1419,7 @@ class SM120FusedMultiHeadAttentionForward:
         v: cute.Tensor,
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
+        bias: Optional[cute.Tensor],
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
@@ -1403,6 +1440,8 @@ class SM120FusedMultiHeadAttentionForward:
             token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
             ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
             compile the LSE store out entirely (no dummy buffer needed).
+        :param bias: Dense additive attention bias, or ``None`` when the
+            kernel is configured without ``has_bias``.
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; must be ``None``
             exactly when the kernel is configured without ``has_sink``.
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
@@ -1458,6 +1497,13 @@ class SM120FusedMultiHeadAttentionForward:
                     f"and non-overlapping seq/head strides that are multiples of 8 elements "
                     f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
                 )
+        if cutlass.const_expr(self.has_bias != (bias is not None)):
+            raise ValueError("bias must be provided exactly when the kernel is configured with has_bias")
+        if cutlass.const_expr(bias is not None):
+            if cutlass.const_expr(bias.shape != (1, q.shape[2], q.shape[1], k.shape[1])):
+                raise ValueError("bias must have shape (1, H_q, S_q, S_kv)")
+            if cutlass.const_expr(bias.shape[3] != 1 and bias.stride[3] != 1):
+                raise ValueError("bias must be contiguous along S_kv")
         if cutlass.const_expr(lse is not None):
             if cutlass.const_expr(self.thd_varlen):
                 # The packed token total (q.shape[1]) is DYNAMIC under THD, so
@@ -1570,6 +1616,7 @@ class SM120FusedMultiHeadAttentionForward:
             v,
             o,
             lse,
+            bias,
             sinks,
             seq_q_lens,
             seq_kv_lens,
@@ -1603,6 +1650,7 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple[int, int, int, int]] = None,
     o_stride: Optional[tuple[int, int, int, int]] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
+    bias_stride: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1640,6 +1688,8 @@ def compile(  # noqa: A001
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
+        has_bias=PARAMS.has_bias,
+        bias_is_fp32=PARAMS.bias_is_fp32,
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
@@ -1655,6 +1705,8 @@ def compile(  # noqa: A001
         raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
     if lse_stride is not None and (PARAMS.thd_varlen or PARAMS.split_kv > 1):
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
+    if bias_stride is not None and not PARAMS.has_bias:
+        raise ValueError("bias_stride requires a bias-enabled kernel")
     fake_batch = 1 if PARAMS.thd_varlen else b
     if PARAMS.thd_varlen:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and
@@ -1680,6 +1732,16 @@ def compile(  # noqa: A001
     fake_k = _fake_bshd((fake_batch, skv, kh, d_qk), k_stride)
     fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
     fake_o = _fake_bshd((o_fake_batch, sq, qh, d_v), o_stride)
+    bias_dtype = cutlass.Float32 if PARAMS.bias_is_fp32 else STORAGE_DTYPE
+    fake_bias = (
+        (
+            cute.runtime.make_fake_tensor(bias_dtype, (1, qh, sq, skv), bias_stride, assumed_align=4)
+            if bias_stride is not None
+            else cute.runtime.make_fake_compact_tensor(bias_dtype, (1, qh, sq, skv), stride_order=(3, 2, 1, 0), assumed_align=4)
+        )
+        if PARAMS.has_bias
+        else None
+    )
     if PARAMS.thd_varlen:
         fake_lse_shape = (qh, lse_head_stride) if lse_head_major else (sq, qh)
     else:
@@ -1740,6 +1802,7 @@ def compile(  # noqa: A001
         fake_v,
         fake_o,
         fake_lse,
+        fake_bias,
         fake_sinks,
         fake_seq_q_lens,
         fake_seq_kv_lens,

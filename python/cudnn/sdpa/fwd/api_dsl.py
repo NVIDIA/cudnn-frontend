@@ -282,6 +282,7 @@ class SdpaFwdDsl(APIBase):
         sample_v: torch.Tensor | TensorDesc,
         sample_o: torch.Tensor | TensorDesc,
         sample_lse: Optional[torch.Tensor | TensorDesc] = None,
+        sample_bias: Optional[torch.Tensor | TensorDesc] = None,
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
@@ -321,6 +322,8 @@ class SdpaFwdDsl(APIBase):
         self.v_desc = self._make_tensor_desc(sample_v, name="v")
         self.o_desc = self._make_tensor_desc(sample_o, name="o")
         self.lse_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_lse, name="lse"), 3, "lse")
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="bias")
+        self._bias_stride: Optional[tuple[int, int, int, int]] = None
 
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
@@ -595,6 +598,24 @@ class SdpaFwdDsl(APIBase):
             self._dummy_cache[cache_key] = tensor
         return tensor
 
+    def _check_bias_desc(self, h_q: int, s_q: int, s_kv: int) -> None:
+        if self.bias_desc is None:
+            return
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+        self._check_dtype(self.bias_desc, [self.dtype, torch.float32], name="bias")
+        self._check_tensor_shape(self.bias_desc, (1, h_q, s_q, s_kv), name="bias")
+        self._value_error_if(
+            not dense_layout_ok(self.bias_desc.shape, self.bias_desc.stride),
+            "bias must use a dense-compatible H/Q permutation or padded layout "
+            f"with contiguous K and non-broadcast, non-overlapping-by-span strides; got {self.bias_desc.stride}",
+        )
+        self._value_error_if(
+            self.bias_desc.device != self.q_desc.device,
+            f"bias must be on device {self.q_desc.device}; got {self.bias_desc.device}",
+        )
+        self._bias_stride = None if self.bias_desc.is_contiguous() else tuple(int(stride) for stride in self.bias_desc.stride)
+
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided LSE buffer and return the kernel's (B, H_q, S_q) view.
 
@@ -652,6 +673,32 @@ class SdpaFwdDsl(APIBase):
             "sinks must be contiguous (bound to the kernel as a flat (H_q,) view)",
         )
         return sinks.reshape(-1)
+
+    def _checked_bias(self, bias_tensor: torch.Tensor) -> torch.Tensor:
+        """Validate bias storage and return the view declared at compile time.
+
+        Graph variant-pack entries are raw storage: their PyTorch metadata
+        need not match the graph tensor descriptor. Rebuild that descriptor's
+        view here so graph and standalone callers share one normalization
+        path. ``as_strided`` is a view and therefore does not allocate on the
+        execute hot path.
+        """
+        self._value_error_if(
+            bias_tensor.dtype != self.bias_desc.dtype,
+            f"bias dtype must match the compiled specialization ({self.bias_desc.dtype}); got {bias_tensor.dtype}",
+        )
+        self._value_error_if(
+            bias_tensor.device != self.bias_desc.device,
+            f"bias must be on device {self.bias_desc.device}; got {bias_tensor.device}",
+        )
+        shape, stride = self.bias_desc.shape, self.bias_desc.stride
+        if tuple(bias_tensor.shape) != shape or tuple(bias_tensor.stride()) != stride:
+            storage_offset = bias_tensor.storage_offset()
+            try:
+                bias_tensor = bias_tensor.as_strided(shape, stride, storage_offset)
+            except RuntimeError as exc:
+                raise ValueError(f"bias backing storage is too small for declared shape {shape}, stride {stride}, and storage_offset {storage_offset}") from exc
+        return bias_tensor
 
     def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
         """Validate caller-provided per-batch lengths and return the kernel's (B,) int32 view.
@@ -775,6 +822,7 @@ class SdpaFwdDsl(APIBase):
         v_tensor: torch.Tensor,
         o_tensor: torch.Tensor,
         lse_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         seq_q_lens: Optional[torch.Tensor] = None,
         seq_kv_lens: Optional[torch.Tensor] = None,
@@ -855,6 +903,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._thd_check_strides_packed()
             else:
                 self._thd_check_strides_native()
+            self._not_implemented_error_if(
+                self.bias_desc is not None,
+                "attention bias is dense-only (THD has no single [1, H_q, S_q, S_kv] bias shape)",
+            )
 
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -895,6 +947,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # d128 only, DTYPE_O independent — typically BF16/FP16).
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        self._not_implemented_error_if(
+            self._fp8 and self.bias_desc is not None,
+            "attention bias is not supported by the FP8/MXFP8 SDPA kernels",
+        )
+        self._check_bias_desc(h_qo, s_qo, s_kv)
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor,
             "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
@@ -1067,7 +1124,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # covers direct construction.
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1172,6 +1229,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             window_left=self.window_left,
             window_right=template_window_right,
             bottom_right=self.causal_bottom_right,
+            has_bias=self.bias_desc is not None,
+            bias_is_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
@@ -1237,6 +1296,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_v=self.head_dim_v,
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
                 lse_stride=None if self.split_kv > 1 else self._lse_stride,
+                bias_stride=self._bias_stride,
             )
         self._combine_kernel = None
         if self.split_kv > 1:
@@ -1310,6 +1370,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         v_tensor: torch.Tensor,
         o_tensor: torch.Tensor,
         lse_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         seq_q_lens: Optional[torch.Tensor] = None,
         seq_kv_lens: Optional[torch.Tensor] = None,
@@ -1367,6 +1428,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
+        )
+        self._value_error_if(
+            (self.bias_desc is not None) != (bias_tensor is not None),
+            "bias presence must match the compiled specialization",
         )
         if self.thd:
             pass  # bound in _execute_thd (declared packed layout)
@@ -1440,6 +1505,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
 
         device = q_tensor.device
+        bias_t = self._checked_bias(bias_tensor) if bias_tensor is not None else None
         sinks_t = (
             self._checked_sinks_1d(sinks)
             if sinks is not None
@@ -1478,6 +1544,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 V,
                 o_partial,
                 lse_partial,
+                bias_t,
                 sinks_t,
                 seq_kv_t,
                 o_desc_dummy,
@@ -1504,6 +1571,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 V,
                 o_arg,
                 lse_arg,
+                bias_t,
                 sinks_t,
                 seq_kv_t,
                 o_desc_dummy,
@@ -1756,6 +1824,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack.V,
             pack.O,
             LSE,
+            None,
             pack.sinks_t,
             pack.meta,
             pack.o_desc,
@@ -2409,6 +2478,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
             self.seq_kv_lens_present = True
+            self._not_implemented_error_if(
+                self.bias_desc is not None,
+                "attention bias is dense-only (THD has no single [1, H_q, S_q, S_kv] bias shape)",
+            )
         self._not_implemented_error_if(
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
@@ -2505,6 +2578,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        self._not_implemented_error_if(
+            self._fp8 and self.bias_desc is not None,
+            "attention bias is not supported by the FP8 SDPA kernel",
+        )
+        self._check_bias_desc(h_q, s_q, s_kv)
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self.thd,
@@ -2676,6 +2754,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
+            has_bias=self.bias_desc is not None,
+            bias_is_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             has_sink=self.has_sink,
@@ -2696,7 +2776,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
             self._logger.debug("compile completed (THD, dynamic token extents)")
             return
-        self._compiled_kernel = self._k_mod.compile(
+        compile_kwargs = dict(
             compute_capability=self.compute_capability,
             b=self.batch_size,
             qh=self.h_q,
@@ -2711,6 +2791,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             has_lse=(self.lse_desc is not None) or self.split_kv > 1,
             lse_stride=None if self.split_kv > 1 else self._lse_stride,
         )
+        if not self._fp8:
+            compile_kwargs["bias_stride"] = self._bias_stride
+        self._compiled_kernel = self._k_mod.compile(**compile_kwargs)
         self._combine_kernel = None
         if self.split_kv > 1:
             # The recombine pass compiles at PLAN time; execute() only rebinds
@@ -2738,6 +2821,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         v_tensor: torch.Tensor,
         o_tensor: torch.Tensor,
         lse_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         seq_q_lens: Optional[torch.Tensor] = None,
         seq_kv_lens: Optional[torch.Tensor] = None,
@@ -2773,6 +2857,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._value_error_if(
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
+        )
+        self._value_error_if(
+            (self.bias_desc is not None) != (bias_tensor is not None),
+            "bias presence must match the compiled specialization",
         )
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         if self._fp8:
@@ -2816,6 +2904,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
             return
         lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+        bias_t = self._checked_bias(bias_tensor) if bias_tensor is not None else None
         sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         seq_q_lens = (
             self._checked_seq_lens(seq_q_lens, "seq_q_lens")
@@ -2860,6 +2949,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             v,
             o_dst,
             lse_dst,
+            bias_t,
             sinks_t,
             seq_q_lens,
             seq_kv_lens,
@@ -3260,6 +3350,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.V,
             pack.O,
             lse,
+            None,
             sinks_t,
             pack.seq_q_dummy,
             pack.meta,
@@ -3581,10 +3672,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     caller buffers to the cached artifact (a compile-cache miss at execute is
     a bug by contract).
 
-    SM80-only compile axes that have no home in the shared constructor arrive
-    as extra keyword-only arguments (``bias_present`` / ``bias_fp32`` /
-    ``rope_max_s``); the engine lowering forwards them only when the graph
-    declares the operands. ALiBi, block_mask and the score-stat side outputs
+    The SM80-only RoPE compile axis arrives as ``rope_max_s``; dense attention
+    bias uses the shared adapter contract. ALiBi, block_mask and score-stat outputs
     are deliberately NOT served: the capability row declines such graphs and
     the backend takes them.
 
@@ -3595,14 +3684,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     are rescaled to log2 units with one (H,)-element multiply per execute.
     """
 
-    def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
+    def __init__(self, *args, scheduler: Optional[str] = None, rope_max_s: int = 0, **kwargs) -> None:
         # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
         # token override for standalone callers; the graph path leaves it None
         # and carries the heuristic's explicit sched_policy knob instead
         # (None = derive via "auto", explicit ints map to their tokens).
         self._scheduler_token = scheduler
-        self._bias_present = bool(bias_present)
-        self._bias_fp32 = bool(bias_fp32)
         self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
 
@@ -3662,12 +3749,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
         self._value_error_if(
             d_qk > max_d_qk or d_v > max_d_v,
-            f"SM80 SDPA: head dim (D_QK={d_qk}, D_V={d_v}) exceeds "
-            f"supported envelope (D_QK<={max_d_qk}, D_V<={max_d_v}).  "
-            f"Larger heads are not yet ported.",
+            f"SM80 SDPA: head dim (D_QK={d_qk}, D_V={d_v}) exceeds supported envelope (D_QK<={max_d_qk}, D_V<={max_d_v}).  Larger heads are not yet ported.",
         )
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
+        self._check_bias_desc(h_qo, s_qo, s_kv)
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             self._check_dtype(
                 desc,
@@ -3691,7 +3777,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
+            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; sdpa_fwd_wrapper_sm80's varlen path launches them directly",
         )
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,
@@ -3813,8 +3899,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             has_seq_kv_lens=self.seq_kv_lens_present,
             has_seq_q_lens=self.seq_q_lens_present,
             has_sink=self.has_sink,
-            has_bias=self._bias_present,
-            bias_is_fp32=self._bias_fp32,
+            has_bias=self.bias_desc is not None,
+            bias_is_fp32=self.bias_desc is not None and self.bias_desc.dtype == torch.float32,
             has_rope=self._rope_max_s > 0,
             thd_varlen=False,
             sched_policy=_sm80_sched_policy_int(self.sched_token),
@@ -3836,6 +3922,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             swa_window=int(self.swa_window_runtime),
             rope_max_s=self._rope_max_s,
             lse_stride=self._lse_stride,
+            bias_stride=self._bias_stride,
         )
         self._logger.debug("compile completed")
 
@@ -3850,13 +3937,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         v_tensor: torch.Tensor,
         o_tensor: torch.Tensor,
         lse_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         seq_q_lens: Optional[torch.Tensor] = None,
         seq_kv_lens: Optional[torch.Tensor] = None,
         scale_softmax: Optional[float] = None,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-        bias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute")
@@ -3939,16 +4026,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             else:
                 sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             if bias_tensor is not None:
-                self._value_error_if(
-                    bias_tensor.dtype != (torch.float32 if p.bias_is_fp32 else q_tensor.dtype),
-                    f"bias dtype must match the compiled specialization; got {bias_tensor.dtype}",
-                )
-                self._value_error_if(
-                    tuple(bias_tensor.shape[-3:]) != (self.h_q, self.s_q_max, self.s_k_max),
-                    f"bias trailing dims must be (H, SQ, SKV) = ({self.h_q}, {self.s_q_max}, {self.s_k_max}); got {tuple(bias_tensor.shape)}",
-                )
-                bias_b = bias_tensor[:1] if bias_tensor.shape[0] != 1 else bias_tensor
-                self._value_error_if(not bias_b.is_contiguous(), "bias must be contiguous")
+                bias_b = self._checked_bias(bias_tensor)
             else:
                 bias_dt = q_tensor.dtype
                 bias_b = self._dummy(f"one_{bias_dt}", device, lambda: torch.ones(1, dtype=bias_dt, device=device))
@@ -4203,8 +4281,7 @@ def sdpa_fwd_wrapper_sm80(
         seq_kv_lens is not None,
         seq_len_q is not None,
         sinks is not None,
-        bias_tensor is not None,
-        (bias_tensor.dtype if bias_tensor is not None else None),
+        _optional_tensor_signature(bias_tensor),
         rope_max_s,
         q_tensor.device,
     )
@@ -4216,6 +4293,7 @@ def sdpa_fwd_wrapper_sm80(
             sample_v=v_tensor,
             sample_o=o_tensor,
             sample_lse=lse_tensor,
+            sample_bias=bias_tensor,
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=(wl if wl >= 0 else None),
@@ -4225,8 +4303,6 @@ def sdpa_fwd_wrapper_sm80(
             seq_q_lens_present=seq_len_q is not None,
             has_sink=sinks is not None,
             scheduler=scheduler,
-            bias_present=bias_tensor is not None,
-            bias_fp32=(bias_tensor is not None and bias_tensor.dtype == torch.float32),
             rope_max_s=rope_max_s,
         )
         api.check_support()
@@ -4238,12 +4314,12 @@ def sdpa_fwd_wrapper_sm80(
         v_tensor=v_tensor,
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
+        bias_tensor=bias_tensor,
         sinks=sinks,
         seq_q_lens=seq_len_q,
         seq_kv_lens=seq_kv_lens,
         scale_softmax=scale_softmax,
         current_stream=current_stream,
-        bias_tensor=bias_tensor,
         rope_freqs=rope_freqs,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)

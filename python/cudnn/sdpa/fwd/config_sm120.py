@@ -64,6 +64,8 @@ class TemplateParams:
     window_left: int | None = None
     window_right: int | None = None
     bottom_right: bool = False
+    has_bias: bool = False
+    bias_is_fp32: bool = False
     seq_q_lens_present: bool = False
     seq_kv_lens_present: bool = False
     has_sink: bool = False
@@ -133,5 +135,9 @@ def validate_params(
             raise ValueError("SM120 SDPA: thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
             raise ValueError("SM120 SDPA: seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+        if params.has_bias:
+            raise ValueError("SM120 SDPA: attention bias is dense-only (THD has no single [1, H_q, S_q, S_kv] bias shape)")
+    if params.bias_is_fp32 and not params.has_bias:
+        raise ValueError("SM120 SDPA: bias_is_fp32 requires has_bias")
     if params.pack_gqa and params.thd_varlen:
         raise ValueError("SM120 SDPA: pack_gqa is not supported with thd_varlen")

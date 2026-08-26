@@ -19,7 +19,7 @@ from typing import NamedTuple, Optional
 import pytest
 import torch
 
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import make_dense_bias, requires_pre_rubin_blackwell, requires_dsl
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -92,6 +92,7 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False):
         v,
         o_p,
         lse_p,
+        None,
         torch.zeros(H, dtype=torch.float32, device=dev),  # sinks (ABI slot)
         torch.zeros(B, dtype=torch.int32, device=dev),  # seq_kv_lens (unused)
         torch.zeros(1, dtype=torch.int64, device=dev),  # o_desc (THD only)
@@ -422,6 +423,7 @@ def test_empty_splits_every_flavor(flavor):
         v,
         o_p,
         lse_p,
+        None,
         torch.zeros(H, dtype=torch.float32, device=dev),
         torch.zeros(B, dtype=torch.int32, device=dev),
         torch.zeros(1, dtype=torch.int64, device=dev),
@@ -642,6 +644,7 @@ def test_combine_lse_matches_reference(splits):
         v,
         o_p,
         lse_p,
+        None,
         torch.zeros(H, dtype=torch.float32, device=dev),
         torch.zeros(B, dtype=torch.int32, device=dev),
         torch.zeros(1, dtype=torch.int64, device=dev),
@@ -712,6 +715,7 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
         v,
         o_p,
         lse_p,
+        None,
         torch.zeros(H, dtype=torch.float32, device=dev),
         torch.zeros(B, dtype=torch.int32, device=dev),
         torch.zeros(1, dtype=torch.int64, device=dev),
@@ -739,8 +743,26 @@ def test_even_splits_every_flavor_batched(flavor, dtype):
 # suite uses to model this kernel's exact mask semantics.
 
 
-def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_kv_lens=None, seq_q_lens=None, dtype=torch.float16, cta_mma=2):
-    """Launch split kernel + combine under an arbitrary mask; returns (got, q, k, v, scale)."""
+def _run_masked(
+    kfile,
+    d_qk,
+    d_v,
+    splits,
+    *,
+    B,
+    H,
+    KH,
+    SQ,
+    SKV,
+    tp_kwargs,
+    seq_kv_lens=None,
+    seq_q_lens=None,
+    dtype=torch.float16,
+    bias_dtype=None,
+    bias_layout="contiguous",
+    cta_mma=2,
+):
+    """Launch a masked split kernel and return its output and reference inputs."""
     import os as _os
 
     import cutlass
@@ -757,11 +779,29 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
     q = torch.randn(B, SQ, H, d_qk, device=dev, dtype=dtype)
     k = torch.randn(B, SKV, KH, d_qk, device=dev, dtype=dtype)
     v = torch.randn(B, SKV, KH, d_v, device=dev, dtype=dtype)
+    bias = make_dense_bias(H, SQ, SKV, bias_dtype, bias_layout) if bias_dtype is not None else None
 
     path = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels", kfile)
-    params = TemplateParams(dtype_qkv=3 if dtype == torch.float16 else 2, split_kv=splits, cta_mma=cta_mma, **tp_kwargs)
+    params = TemplateParams(
+        dtype_qkv=3 if dtype == torch.float16 else 2,
+        split_kv=splits,
+        cta_mma=cta_mma,
+        has_bias=bias is not None,
+        bias_is_fp32=bias_dtype == torch.float32,
+        **tp_kwargs,
+    )
     mod = load_template(path, params, tag=f"mask_{kfile[:16]}_{splits}_{cta_mma}_{sorted(tp_kwargs.items())}")
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=SQ, skv=SKV, d_qk=d_qk, d_v=d_v, has_lse=True)
+    fn = mod.compile(
+        b=B,
+        qh=H,
+        kh=KH,
+        sq=SQ,
+        skv=SKV,
+        d_qk=d_qk,
+        d_v=d_v,
+        has_lse=True,
+        bias_stride=tuple(bias.stride()) if bias is not None and not bias.is_contiguous() else None,
+    )
 
     o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=dtype)
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
@@ -773,6 +813,7 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
         v,
         o_p,
         lse_p,
+        bias,
         torch.zeros(H, dtype=torch.float32, device=dev),
         skv_t,
         torch.zeros(1, dtype=torch.int64, device=dev),
@@ -784,13 +825,13 @@ def _run_masked(kfile, d_qk, d_v, splits, *, B, H, KH, SQ, SKV, tp_kwargs, seq_k
     )
     if splits == 1:
         torch.cuda.synchronize()
-        return o_p.float(), q, k, v, scale
+        return o_p.float(), q, k, v, bias, scale
     o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=dtype)
     cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=False)
     cfn(o_p, lse_p, o_out, None, None, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN under mask+split"
-    return o_out.float(), q, k, v, scale
+    return o_out.float(), q, k, v, bias, scale
 
 
 def _bhsd(t):
@@ -805,11 +846,11 @@ def test_split_kv_swa_causal(splits):
 
     W = 256
     B, H, SQ, SKV = 1, 4, 1024, 1024
-    got, q, k, v, scale = _run_masked(
+    output, q, k, v, _, scale = _run_masked(
         "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, window_left=W)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, swa_window=W)
-    assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
+    assert (output - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
@@ -819,11 +860,91 @@ def test_split_kv_bottom_right_causal(splits):
     from test_sdpa_fwd_dsl_sm100 import _ref_sdpa_full
 
     B, H, SQ, SKV = 1, 4, 128, 2048
-    got, q, k, v, scale = _run_masked(
+    output, q, k, v, _, scale = _run_masked(
         "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0, bottom_right=True)
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True, bottom_right=True)
-    assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
+    assert (output - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32], ids=["bias-fp16", "bias-fp32"])
+def test_split_kv_attention_bias_uses_absolute_kv_columns(bias_dtype):
+    """Every split reads its bias slice at the global, not split-local, KV offset."""
+
+    _check_split_kv_attention_bias("d128", bias_dtype)
+
+
+@pytest.mark.L0
+def test_split_kv_attention_bias_gqa_causal():
+    """Unpacked GQA composes bias, causal masking, and split-KV."""
+
+    _check_split_kv_attention_bias("d128", torch.float32, mask_kind="causal", pack_gqa=False)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("mask_kind", ["causal", "bottom_right", "swa", "padded"], ids=["causal", "bottom-right", "swa", "padded"])
+def test_split_kv_attention_bias_mask_combinations(mask_kind):
+    """Split-KV bias composes with packed GQA and each supported mask shape."""
+
+    _check_split_kv_attention_bias("d128", torch.float32, mask_kind=mask_kind)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("flavor", ["d192", "d256", "d512"])
+def test_split_kv_attention_bias_other_flavors(flavor):
+    """Every independently compiled SM100 flavor uses absolute bias columns."""
+
+    _check_split_kv_attention_bias(flavor, torch.float32)
+
+
+def _check_split_kv_attention_bias(flavor, bias_dtype, *, mask_kind="none", pack_gqa=True):
+    """Check one flavor's split-KV bias coordinates and optional masking."""
+
+    from test_sdpa_fwd_dsl_sm100 import _ref_sdpa_full
+
+    kmod, d_qk, d_v = _F16_FLAVORS[flavor]
+    B, H, KH = 2, 4, 2
+    SQ, SKV = 96, 1024
+    tp_kwargs = dict(pack_gqa=pack_gqa, qh_per_kh=H // KH)
+    ref_kwargs = {}
+    seq_kv_lens = None
+    if mask_kind == "causal":
+        SQ = 384
+        tp_kwargs["window_right"] = 0
+        ref_kwargs["is_causal"] = True
+    elif mask_kind == "bottom_right":
+        tp_kwargs.update(window_right=0, bottom_right=True)
+        ref_kwargs.update(is_causal=True, bottom_right=True)
+    elif mask_kind == "swa":
+        SQ, SKV = 512, 512
+        window = 128
+        tp_kwargs.update(window_right=0, window_left=window)
+        ref_kwargs.update(is_causal=True, swa_window=window)
+    elif mask_kind == "padded":
+        tp_kwargs["seq_kv_lens_present"] = True
+        seq_kv_lens = torch.tensor([SKV, 731], dtype=torch.int32, device="cuda")
+        ref_kwargs["seq_kv_lens"] = seq_kv_lens
+    elif mask_kind != "none":
+        raise ValueError(f"unknown split-KV attention-bias mask kind: {mask_kind}")
+
+    output, q, k, v, bias, scale = _run_masked(
+        kmod,
+        d_qk,
+        d_v,
+        4,
+        B=B,
+        H=H,
+        KH=KH,
+        SQ=SQ,
+        SKV=SKV,
+        tp_kwargs=tp_kwargs,
+        seq_kv_lens=seq_kv_lens,
+        bias_dtype=bias_dtype,
+        bias_layout="strided",
+    )
+    ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, bias=bias, **ref_kwargs)
+    assert (output - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 3e-2
 
 
 @pytest.mark.L0
@@ -834,11 +955,11 @@ def test_split_kv_padded_kv(splits):
 
     B, H, SQ, SKV = 2, 4, 128, 2048
     lens = torch.tensor([2048, 1531], dtype=torch.int32, device="cuda")  # 2nd ends mid-tile
-    got, q, k, v, scale = _run_masked(
+    output, q, k, v, _, scale = _run_masked(
         "prefill_d128_f16_sm100.py", 128, 128, splits, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(seq_kv_lens_present=True), seq_kv_lens=lens
     )
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=lens)
-    assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
+    assert (output - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
@@ -849,9 +970,9 @@ def test_split_kv_causal_other_flavors(flavor):
 
     kmod, d_qk, d_v = _F16_FLAVORS[flavor]
     B, H, SQ, SKV = 1, 4, 1024, 1024
-    got, q, k, v, scale = _run_masked(kmod, d_qk, d_v, 4, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0))
+    output, q, k, v, _, scale = _run_masked(kmod, d_qk, d_v, 4, B=B, H=H, KH=H, SQ=SQ, SKV=SKV, tp_kwargs=dict(window_right=0))
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, is_causal=True)
-    assert (got - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
+    assert (output - ref.float().permute(0, 2, 1, 3)).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0
@@ -874,7 +995,7 @@ def test_split_kv_padded_q_trim(flavor, splits):
     B, H, SQ, SKV = 2, 4, 1024, 2048
     kv_lens = torch.tensor([2048, 2048], dtype=torch.int32, device="cuda")
     q_lens = torch.tensor([1024, 137], dtype=torch.int32, device="cuda")  # 2nd trims mid-tile
-    got, q, k, v, scale = _run_masked(
+    output, q, k, v, _, scale = _run_masked(
         kmod,
         d_qk,
         d_v,
@@ -891,11 +1012,11 @@ def test_split_kv_padded_q_trim(flavor, splits):
     ref = _ref_sdpa_full(_bhsd(q), _bhsd(k), _bhsd(v), scale=scale, seq_kv_lens=kv_lens)
     ref = ref.float().permute(0, 2, 1, 3)  # -> BSHD
     # Rows past the per-batch Q length must be exactly zero.
-    rows = torch.arange(SQ, device=got.device).view(1, SQ, 1, 1)
+    rows = torch.arange(SQ, device=output.device).view(1, SQ, 1, 1)
     dead = rows >= q_lens.view(B, 1, 1, 1)
-    assert got[dead.expand_as(got)].abs().max().item() == 0.0, "trimmed Q rows are not zero"
+    assert output[dead.expand_as(output)].abs().max().item() == 0.0, "trimmed Q rows are not zero"
     live = ~dead
-    assert (got - ref)[live.expand_as(got)].abs().max().item() <= 2e-2
+    assert (output - ref)[live.expand_as(output)].abs().max().item() <= 2e-2
 
 
 # --- the adapter honors the heuristic's split knob ---------------------------
