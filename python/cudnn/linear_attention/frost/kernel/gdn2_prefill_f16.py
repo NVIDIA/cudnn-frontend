@@ -1021,7 +1021,7 @@ def epilogue_warp(
                     tma_store_wait(0)
                     bars.mb_o_tmastg_done[o_stage].arrive()
 
-        # ---- last computed chunk store (always owned: it is wend - 1) ----------------
+        # ---- last computed chunk store -----------------------------------------------
         if num_tile_chunks > 0:
             output_chunk = write_end - cutlass.Int32(1)
             last_global_chunk = global_chunk_base + num_tile_chunks - cutlass.Int32(1)
@@ -1255,7 +1255,7 @@ def compute0_warp_group(
                 q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
                 k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
-            # ---- beta guard ------------------------------------------------------------
+            # ---- beta guard ----------------------------------------------------------
             if cutlass.const_expr(cfg.beta_guard):
                 beta_guard(cfg, raw_beta_regs, raw_k_regs, k_inv_norm, sGate_ptr, decay_row, lane_in_row_group)
 

@@ -1000,7 +1000,7 @@ def epilogue_warp(
                     tma_store_wait(0)
                     bars.mb_o_tmastg_done[o_stage].arrive()
 
-        # ---- last computed chunk store (always owned: it is wend - 1) ----------------
+        # ---- last computed chunk store -----------------------------------------------
         if num_chunks_tile > 0:
             output_chunk = write_end - cutlass.Int32(1)
             last_cum_chunk = cum_chunk_base + num_chunks_tile - cutlass.Int32(1)

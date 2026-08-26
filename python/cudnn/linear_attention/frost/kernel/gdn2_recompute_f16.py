@@ -1018,7 +1018,7 @@ def compute0_warp_group(
                 norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
                 k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
-            # ---- beta guard ------------------------------------------------------------
+            # ---- beta guard ----------------------------------------------------------
             if cutlass.const_expr(cfg.beta_guard):
                 beta_guard(cfg, raw_beta_regs, raw_k_regs, k_inv_norm, sGate_ptr, decay_row, lane_in_row_group)
 
@@ -1411,8 +1411,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_state_input_ready.arrive()
 
-            # ---- checkpoint: post-publish f32 fragment read, ordered after the decay
-            # GEMM ---------------------------------------------------------------------
+            # ---- checkpoint: post-publish f32 fragment read --------------------------
             if cutlass.const_expr(cfg.enable_checkpoints):
                 if do_checkpoint:
                     checkpoint_stage = checkpoint_done_index.idx

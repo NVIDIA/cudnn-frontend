@@ -818,7 +818,7 @@ def tcgen05_mma_warp(
         )
         n_local = write_end - compute_start
 
-        # ---- fused KK^T/QK^T pair 0: each member issued ahead of the loop ------------
+        # ---- fused KK^T/QK^T pair 0 --------------------------------------------------
         if n_local > 0:
             cg0_acc_idx = cg0_acc_index.idx
             bars.mb_cg0_acc_done[cg0_acc_idx].wait(cg0_acc_index.phase)
