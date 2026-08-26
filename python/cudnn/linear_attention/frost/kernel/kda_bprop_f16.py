@@ -2631,7 +2631,12 @@ def compute2_warp_group(
                         for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
                             t = half * (cfg.b_t // 2) + 2 * tt2
                             p_pair = cutlass.Vector.from_elements((p_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                            gp_lo, gp_hi = fmul2(sProj_raw[grad_base + t * cfg.cg2_threads], sProj_raw[grad_base + (t + 1) * cfg.cg2_threads], p_pair[0].to(cutlass.Float32), p_pair[1].to(cutlass.Float32))
+                            gp_lo, gp_hi = fmul2(
+                                sProj_raw[grad_base + t * cfg.cg2_threads],
+                                sProj_raw[grad_base + (t + 1) * cfg.cg2_threads],
+                                p_pair[0].to(cutlass.Float32),
+                                p_pair[1].to(cutlass.Float32),
+                            )
                             dots[t], dots[t + 1] = fmul2(gp_lo, gp_hi, sNorm_raw[norm_base + inv_off + t], sNorm_raw[norm_base + inv_off + t + 1])
                     for off in cutlass.range_constexpr(5):
                         step = cutlass.const_expr(1 << off)
