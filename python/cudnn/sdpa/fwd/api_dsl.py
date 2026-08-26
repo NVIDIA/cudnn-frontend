@@ -3069,7 +3069,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 lse,
                 # float32 here, unlike the main kernel's int32 bitcast: the combine
                 # writes the amax normally, it does not atomicMax into it.
-                amax_o_buf if amax_o is not None else None,
+                # Unconditional: compile() set has_amax from _fp8, not from
+                # whether the caller passed one, so the compiled kernel always
+                # expects a tensor -- _amax_slot hands back a cached dummy when
+                # the caller supplied nothing. Same as the SM100 arms.
+                amax_o_buf,
                 (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
