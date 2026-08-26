@@ -306,7 +306,6 @@ class TestSdpaVarlen:
         assert (v.grad.float() - rdv).abs().max().item() < TOL
 
     @pytest.mark.L0
-    @pytest.mark.xfail(reason="#613: the zero-host-read THD extents (#606) under-claim non-packed views on the FROST route", strict=False)
     def test_thd_kv_packed_views(self):
         """K/V as views of a kv-interleaved [T, 2, H, D] buffer (token stride
         2*H*D) — the layout torch.nn.attention.varlen users produce. Must be
