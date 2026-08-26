@@ -10,8 +10,12 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
-import cudnn
 import pytest
+
+try:
+    import cudnn
+except ImportError:
+    cudnn = None
 
 
 def _active_sm():
@@ -44,7 +48,7 @@ requires_blackwell_geforce = pytest.mark.skipif(
 
 
 requires_cudnn_9_24 = pytest.mark.skipif(
-    cudnn.backend_version() < 92400,
+    cudnn is None or cudnn.backend_version() < 92400,
     reason="cu_seq_len_q/kv graphs require cuDNN backend >= 9.24",
 )
 
