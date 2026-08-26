@@ -626,7 +626,6 @@ def _epi_tile_cols(config: TileConfig, cta_group: int) -> int:
 _EPI_CHUNK_ELEMS_BY_PIPELINE = {
     "sm100": MAX_EPI_CHUNK_ELEMS,
     "sm103": MAX_EPI_CHUNK_ELEMS,
-    "sm107": MAX_EPI_CHUNK_ELEMS,
     "sm120": 8,
 }
 
@@ -684,6 +683,12 @@ def _render_tile_constants(
     dtype-agnostic (K in bytes); resolved to element counts via the chain's A
     dtype. Dtype constants derive from chain.matmul.{a,b}_dtype + output_dtype.
     """
+    # The 64-byte MMA-inst K exists only for the BLOCK-SCALE MMA; plain matmul
+    # has no such instruction, so a geometry carrying it has no template here.
+    if cfg.mma_inst_k_bytes != 32:
+        raise NotImplementedError(
+            f"plain matmul renders one 32-byte MMA-inst K; config {cfg.name!r} " f"has mma_inst_k_bytes={cfg.mma_inst_k_bytes} (block-scale only)"
+        )
     # a_dt/b_dt: GMEM dtypes (what TMA loads). mma_a_dt/mma_b_dt: the MMA
     # instruction dtype — equal to the GMEM dtype (no implicit cast).
     a_dt = chain.matmul.a_dtype
@@ -759,6 +764,7 @@ def _render_tile_constants(
     lines = [
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_inst_mnk(elem_bytes, cta_group)}",
+        f"cta_group = {cta_group}",
         f"cgrp_tile_mnk = {cfg.cgrp_tile_mnk(elem_bytes)}",
         # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
         # 2-CTA MMA), NOT the logical per-CTA tile from TileConfig.
@@ -903,6 +909,13 @@ def _render_tile_constants(
     use_tma = _use_tma_store_epi(chain, cfg, cta_group)
     lines.append(f"n_tma_outputs = {len(_tma_slots_for(chain, cfg, cta_group))}")
     lines.append(f"epi_slot_widen = {_epi_slot_widen(chain, cfg, cta_group)}")
+    # The three drain layouts, decided host-side so the templates can key on the
+    # LAYOUT rather than re-deriving it from the mode: packed lane<16 (hardware
+    # M=64 under 1-CTA MMA, foot-gun #18), the 2-CTA 2x2-DP split, or the plain
+    # thread-per-row one. Spelling them out is what lets one drain body serve a
+    # 1ctamma, a 2ctamma and a merged template unchanged.
+    lines.append(f"epi_packed_lanes = {_epi_packed_lanes(cfg, cta_group)}")
+    lines.append(f"epi_dp22 = {_epi_dp22(cfg, cta_group)}")
     lines.append(f"epi_stage_rows = {_epi_stage_rows(cfg, cta_group)}")
     lines.append(f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, cta_group, use_tma)}")
     # Final ab_stages override: account for the TMA-D SMEM buffer (fixed, when
@@ -1246,7 +1259,9 @@ def _render_block_scale_tile_constants(
     assert bs is not None
     is_fp4 = bs.is_fp4
     is_sm103 = cfg.pipeline == "sm103"
-    is_sm107 = cfg.pipeline == "sm107"
+    # The 64-byte block-scale MMA. A pipeline no longer implies it: sm100
+    # configs carry both widths and the ACTIVE arch decides (validate_block_scale_config).
+    mma_k64 = cfg.mma_inst_k_bytes == 64
     if is_sm103 and not is_fp4:
         raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
 
@@ -1497,9 +1512,9 @@ def _render_block_scale_tile_constants(
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)
 
     # Instruction-descriptor operand dtype. On sm100 the fp4 MMA rides
-    # Tcgen05MxInstrDesc with the E5M2 piggy-back; the K=64B sm107 fp4 MMA is an
+    # Tcgen05MxInstrDesc with the E5M2 piggy-back; the K=64B fp4 MMA is an
     # OMMA and takes the real fp4 dtype. fp8 always uses its real dtype.
-    if is_fp4 and not is_sm107:
+    if is_fp4 and not mma_k64:
         idesc_a = idesc_b = "cutlass.Float8E5M2"
     elif is_fp4:
         idesc_a = idesc_b = "cutlass.Float4E2M1FN"
@@ -1512,6 +1527,7 @@ def _render_block_scale_tile_constants(
 
     lines = [
         f"# Block-scale config: {cfg.name} data={bs.a_dtype}x{bs.b_dtype} sf={bs.sf_dtype} block={bs.block_size}",
+        f"cta_group = {cta_group}",
         f"cta_tile_mnk = ({cta_m}, {cta_n // cta_group}, {cta_k_elems})",
         # MMA instruction M = mma_inst_m × cta_group (256 for the 2-CTA pair).
         # MMA instructions the CTA tile spans along M.
@@ -1669,18 +1685,16 @@ def _render_block_scale_tile_constants(
             f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks))}",
             f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * mma_nb_n for j in range(num_kblocks))}",
         ]
-    if is_sm107:
-        # SM 10.7 block-scale MMA: K = 64 bytes per instruction (2x sm100), so
-        # one MMA consumes sf_scales_per_inst scales — 8 for nvfp4, which spans
-        # word_atoms = 2 of the 4-scale 128x4 utccp atoms. fp4 is an OMMA
-        # (K-mode 2 = 128 fp4 elements); mxfp8 stays on the MX descriptor
-        # (K-mode 1 = 64 fp8 elements).
-        lines += [
-            "",
-            f"# sm107 K=64B block-scale MMA: {num_kblocks} MMAs per K-tile",
-            f"idesc_is_omma = {is_fp4}",
-            f"mma_k_dim_mode = {2 if is_fp4 else 1}",
-        ]
+    # Instruction-descriptor K mode. The MX descriptor's k_dim is 0 for a 32-byte
+    # K and 1 for 64; fp4 at 64 leaves it for the OMMA descriptor, whose k_dim 2
+    # means 128 fp4 elements. At 32 fp4 rides the MX descriptor's E5M2
+    # piggy-back, so it is NOT an OMMA there.
+    lines += [
+        "",
+        f"# block-scale MMA: {num_kblocks} MMAs per K-tile at mma_inst_k_bytes={cfg.mma_inst_k_bytes}",
+        f"idesc_is_omma = {is_fp4 and mma_k64}",
+        f"mma_k_dim_mode = {(2 if is_fp4 else 1) if mma_k64 else 0}",
+    ]
     # MoE grouped block-scale: grouped persistent scheduler launches a FIXED
     # cluster count (≈ NUM_SMS / cluster_size); host grid and stride share it.
     # first_token_offset dtype (int32/int64) drives the compile() fake.
@@ -1693,6 +1707,16 @@ def _render_block_scale_tile_constants(
     lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
+
+
+_CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")
+
+
+def _template_stem(file: str) -> str:
+    """Template stem with any ``_<N>ctamma`` token removed -- the kernel symbol
+    spells cta_group itself, so a template that still encodes it in its filename
+    must not spell it twice."""
+    return _CTAMMA_SUFFIX.sub("", file.removesuffix(".py"))
 
 
 def _resolve_path_blocks(src: str, use_tma_store_epi: bool) -> str:
@@ -1910,7 +1934,7 @@ def _render_template(
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}_{cta_group}ctamma")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
     return src
@@ -2111,7 +2135,7 @@ def _render_block_scale_template(
 
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}_{cta_group}ctamma")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
     return src
 
@@ -2931,7 +2955,7 @@ _EPI_N_MAX = 64  # per-lane fp32 registers the drain can hold
 
 # Families whose templates the compiler renders with the TMA-store epilogue;
 # the sm120 warp kernel always takes its transposed-STG path.
-_TMA_STORE_EPI_PIPELINES = ("sm100", "sm103", "sm107")
+_TMA_STORE_EPI_PIPELINES = ("sm100", "sm103")
 
 
 def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
@@ -3251,7 +3275,7 @@ def _precheck_block_scale(chain: FusionChain, config: TileConfig, cta_group: int
 
     _check_block_scale_supported(chain, config.pipeline)
     _check_input_alignment(chain)
-    _epi_pipelines = ("sm100", "sm107")
+    _epi_pipelines = ("sm100",)
     if chain.reductions:
         if config.pipeline not in _epi_pipelines:
             raise NotImplementedError(f"block-scale reduction is not supported on {config.pipeline} templates")

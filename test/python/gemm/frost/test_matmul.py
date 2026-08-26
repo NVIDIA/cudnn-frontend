@@ -2467,10 +2467,10 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     sm100 = [c for c in CATALOG if c.pipeline == "sm100"]
     assert {(c.mma_inst_m, c.num_mma_m) for c in sm100} == set(_M_AXES)
     assert all(c.cta_tile_m == c.mma_inst_m * c.num_mma_m for c in CATALOG)
-    # sm103 / sm107 pin the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
-    # mma_inst_m % 128 == 0); sm107 still splits, sm103 does not (supports_multi_mma_m=False).
+    # sm103 pins the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
+    # mma_inst_m % 128 == 0) and does not split (supports_multi_mma_m=False).
     assert {c.mma_inst_m for c in CATALOG if c.pipeline != "sm100"} == {128}
-    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm107"} == {1, 2}
+    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2}
     assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm103"} == {1}
     # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
     assert next(c for c in sm100 if c.cta_tile_m == 128).num_mma_m == 1

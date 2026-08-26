@@ -64,8 +64,8 @@ def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
 _GEOMETRIES = [
     ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2),
     ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
-    pytest.param("CONFIG_sm107_128x128x128_128x128x64_cluster2x1", 2, marks=requires_sm107),
-    pytest.param("CONFIG_sm107_128x128x128_128x128x64_cluster1x1", 1, marks=requires_sm107),
+    pytest.param("CONFIG_sm100_128x128x128_128x128x64_cluster2x1", 2, marks=requires_sm107),
+    pytest.param("CONFIG_sm100_128x128x128_128x128x64_cluster1x1", 1, marks=requires_sm107),
 ]
 
 

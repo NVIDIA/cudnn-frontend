@@ -234,7 +234,7 @@ def _build_spec_map():
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline not in ("sm100", "sm107") or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
             continue
         label = f"{cfg.name}_{t.cta_group}ctamma"
         m[label] = (cfg, t.cta_group)

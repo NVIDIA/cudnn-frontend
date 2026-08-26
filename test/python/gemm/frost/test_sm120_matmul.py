@@ -427,7 +427,7 @@ def test_sm120_template_routing() -> None:
         select_template(chain, cfg, 2)
     # sm100 configs keep routing to the sm100 family
     cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    assert select_template(chain, cfg100, 1).file == "sm100_matmul_1ctamma.py"
+    assert select_template(chain, cfg100, 1).file == "sm100_matmul.py"
 
 
 def test_sm120_scope_gates() -> None:

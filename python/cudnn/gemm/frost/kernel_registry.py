@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
-from .tile_config import CATALOG, TileConfig, as_pipeline, config_class_for_pipeline
+from .tile_config import CATALOG, TileConfig, as_mma_inst_k, as_pipeline, config_class_for_pipeline
 
 
 def _pipeline_from_file(template_file: str) -> str:
@@ -45,9 +45,14 @@ def _pipeline_from_file(template_file: str) -> str:
 PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm100": ((100, 120),),
     "sm103": ((103, 110),),
-    "sm107": ((107, 110),),
     "sm120": ((100, 130),),
 }
+
+# SM ranges whose block-scale MMA issues a 64-byte K per instruction (half the
+# instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
+# kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
+# TMEM. Read by preferred_mma_inst_k_bytes and validate_block_scale_config.
+MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
 _SUPPORTED_MAINLOOP_OPS: frozenset[str] = frozenset(UNARY_OPS) | frozenset(BINARY_OPS)
@@ -196,9 +201,6 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
             }
         ),
     },
-    "sm107": {
-        GraphType.BLOCK_SCALE_MATMUL: _BLOCK_SCALE_CASES,
-    },
     # sm120 carries ONLY the graph types it has templates for. No block-scale
     # row until an sm120 block-scale template lands: a row here without its
     # MMA_GPU_ARCH_SPECIAL_CASES narrowing would accept descriptor-less combos
@@ -221,9 +223,6 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
 }
 
 
@@ -483,16 +482,16 @@ def _mm(
 
 TEMPLATES: tuple[KernelTemplate, ...] = (
     # plain matmul
-    _mm("sm100_matmul_1ctamma.py", cta_group=1),
-    _mm("sm100_matmul_2ctamma.py", cta_group=2),
+    _mm("sm100_matmul.py", cta_group=1),
+    _mm("sm100_matmul.py", cta_group=2),
     # block-scaled matmul
     _mm(
-        "sm100_block_scale_matmul_1ctamma.py",
+        "sm100_block_scale_matmul.py",
         cta_group=1,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     _mm(
-        "sm100_block_scale_matmul_2ctamma.py",
+        "sm100_block_scale_matmul.py",
         cta_group=2,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
@@ -504,64 +503,44 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     # launch-fail, hence the gate. See CLAUDE.md for what was ruled out.
     # Multi-GEMM has never been validated on this pipeline either — same gate.
     _mm(
-        "sm103_block_scale_matmul_1ctamma.py",
+        "sm103_block_scale_matmul.py",
         cta_group=1,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         supports_multi_mma_m=False,
     ),
     _mm(
-        "sm103_block_scale_matmul_2ctamma.py",
+        "sm103_block_scale_matmul.py",
         cta_group=2,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
         supports_multi_gemm=False,
         supports_multi_mma_m=False,
-    ),
-    _mm(
-        "sm107_block_scale_matmul_1ctamma.py",
-        cta_group=1,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    _mm(
-        "sm107_block_scale_matmul_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     # mainloop-fusion matmul (no block-scale variant yet)
     # The mainloop templates have no per-GEMM operand indexing (no gemm_a_idx /
     # gemm_b_idx in the MMA warp), so a second GEMM's accumulator would never be
     # written. The analyzer also only detects mainloop at len(matmuls) == 1.
-    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, mainloop=True, supports_multi_gemm=False),
-    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, mainloop=True, supports_multi_gemm=False),
+    _mm("sm100_matmul_mainloop.py", cta_group=1, mainloop=True, supports_multi_gemm=False),
+    _mm("sm100_matmul_mainloop.py", cta_group=2, mainloop=True, supports_multi_gemm=False),
     # MoE grouped matmul fwd (own grouped persistent scheduler).
     _mm(
-        "sm100_moe_grouped_matmul_fwd_1ctamma.py",
+        "sm100_moe_grouped_matmul_fwd.py",
         cta_group=1,
         graph_type=GraphType.MOE,
     ),
     _mm(
-        "sm100_moe_grouped_matmul_fwd_2ctamma.py",
+        "sm100_moe_grouped_matmul_fwd.py",
         cta_group=2,
         graph_type=GraphType.MOE,
     ),
     # MoE grouped matmul with block-scaled (FP4/FP8 + SF) inputs.
     _mm(
-        "sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
+        "sm100_moe_grouped_block_scale_matmul_fwd.py",
         cta_group=1,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
-        "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.MOE_BLOCK_SCALE,
-    ),
-    _mm(
-        "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
-        cta_group=1,
-        graph_type=GraphType.MOE_BLOCK_SCALE,
-    ),
-    _mm(
-        "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
+        "sm100_moe_grouped_block_scale_matmul_fwd.py",
         cta_group=2,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
@@ -582,7 +561,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
 # select_config's geometry ladder, so it stays an explicit-config pipeline.
 # sm120 is last: it serves the GPUs (SM 12.x) the tcgen05 families cannot, and
 # never outranks them where both run.
-_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm107", "sm100", "sm120")
+_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm100", "sm120")
 
 
 def preferred_pipeline(chain: FusionChain) -> str:
@@ -597,12 +576,26 @@ def preferred_pipeline(chain: FusionChain) -> str:
     return _AUTO_PIPELINE_ORDER[-1]
 
 
+def preferred_mma_inst_k_bytes(chain: FusionChain, config: TileConfig) -> int:
+    """MMA-inst K width the auto path should build ``chain`` with. The 64-byte
+    block-scale MMA halves the instruction count at a wide tile, so take it
+    whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
+    asks the arch and not the config family. Everything else stays at 32."""
+    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE):
+        return 32
+    from . import compiler as C
+
+    arch = C._current_arch()
+    return 64 if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) else 32
+
+
 def preferred_strategy(chain: FusionChain, config: TileConfig, cta_group: int) -> tuple[TileConfig, int]:
     """Re-target an auto pick at the family :func:`preferred_pipeline` chooses:
     the geometry crosses via ``as_pipeline``, and ``cta_group`` survives only
     if the family has a template for it (else the smallest it does have —
     sm120 is warp-scoped MMA, 1-CTA only)."""
     pipeline = preferred_pipeline(chain)
+    config = as_mma_inst_k(config, preferred_mma_inst_k_bytes(chain, config))
     if pipeline == config.pipeline:
         return config, cta_group
     groups = {t.cta_group for t in TEMPLATES if t.pipeline == pipeline}

@@ -50,11 +50,12 @@ requires_int8_mma = pytest.mark.skipif(
     reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
-# The sm107 templates render anywhere (the 64-byte-K mode is an idesc field, and
-# the OMMA descriptor is a host-side bit-pack); they RUN only on 107 <= SM < 110.
-requires_sm107 = pytest.mark.skipif(
+# A K=64 block-scale geometry RENDERS anywhere (the width is an idesc field and
+# the OMMA descriptor is a host-side bit-pack); it RUNS only on 107 <= SM < 110,
+# which is what validate_block_scale_config gates on.
+requires_mma_k64 = pytest.mark.skipif(
     _SM is None or not (107 <= _SM < 110),
-    reason="sm107 kernels run only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    reason="the 64-byte block-scale MMA runs only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -308,3 +309,7 @@ FULL_EXPERT_REDUCE_OFFSETS = [
     1800,
     1900,
 ]
+
+
+# Retired name; the gate is about the MMA-inst K width, not a pipeline family.
+requires_sm107 = requires_mma_k64

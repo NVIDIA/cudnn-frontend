@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from cudnn.frost.occupancy import MAX_CLUSTER_SIZE as _FROST_MAX_CLUSTER_SIZE
 
@@ -44,8 +44,8 @@ def _sm_smem_budget_bytes(device=None) -> int:
 # every smem barrier, the TMEM base address and — on the MoE templates — the per-CTA TMA
 # tensormap scratch. The ab pipeline itself only counts the operand tensors, so these
 # fragments are budgeted once here instead of being modelled stage by stage.
-_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048, "sm120": 2048}
-_SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096, "sm107": 4096}
+_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm120": 2048}
+_SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096}
 
 
 def _sm_smem_ab_budget_bytes(pipeline: str, device=None, *, moe: bool = False) -> int:
@@ -78,11 +78,14 @@ def l2_swizzle_budget_bytes(device=None) -> int:
 _CTA_TILE_M_MAX = 128
 _CTA_TILE_N_MAX = 256
 _MAX_CLUSTER_SIZE = _FROST_MAX_CLUSTER_SIZE
-_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm107": 128, "sm120": 128}
+_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm120": 128}
 
 # MMA-inst K in bytes
 _MMA_INST_K_BYTES = 32
-_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": 32, "sm103": 48, "sm107": 64, "sm120": 32}
+# The MMA-inst K widths a pipeline can issue. sm100 carries BOTH: 64 bytes is a
+# property of the SILICON (SM 10.7+ block-scale MMA), not of the pipeline, so it
+# is gated on the ACTIVE arch in validate_block_scale_config -- not by a family.
+_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": (32, 64), "sm103": (48,), "sm120": (32,)}
 
 
 def _pipeline_fact(table: dict, pipeline: str, what: str):
@@ -174,15 +177,13 @@ class TileConfig:
         if self.pipeline == "sm103" and kb != 384:
             raise NotImplementedError(f"TileConfig {self.name!r}: sm103 fixes cta_tile_k_bytes=384 " f"(K-tile = lcm(128, 48)); got {kb}")
         # A pipeline whose MMA instruction fixes its K width owns that axis — it
-        # is not free geometry (sm103 K=48B UTCOMMA, sm107 K=64B), and the K-tile
+        # is not free geometry (sm103 K=48B UTCOMMA), and the K-tile
         # walks that instruction, so it is a multiple of the SAME width.
-        mkb_want = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, self.pipeline, "MMA-inst K width")
-        if self.mma_inst_k_bytes != mkb_want:
-            raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} fixes " f"mma_inst_k_bytes={mkb_want}; got {self.mma_inst_k_bytes}")
-        if kb % mkb_want != 0:
-            raise NotImplementedError(
-                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"a multiple of {self.pipeline}'s mma_inst_k_bytes={mkb_want}"
-            )
+        mkb_ok = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, self.pipeline, "MMA-inst K widths")
+        if self.mma_inst_k_bytes not in mkb_ok:
+            raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} issues mma_inst_k_bytes " f"{sorted(mkb_ok)}; got {self.mma_inst_k_bytes}")
+        if kb % self.mma_inst_k_bytes != 0:
+            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"a multiple of mma_inst_k_bytes={self.mma_inst_k_bytes}")
 
         # CGRP size sanity. (cta_group-specific constraints — e.g. cgrp_size_m
         # even for 2-CTA MMA — live on the 2ctamma template in the registry.)
@@ -354,7 +355,10 @@ class TileConfig:
 
 
 class ConfigSm100(TileConfig):
-    """sm100 geometry — every axis is free (the original pure-geometry config).
+    """sm100 geometry — every axis is free (the original pure-geometry config),
+    including ``mma_inst_k_bytes`` ∈ {32, 64}. The 64-byte block-scale MMA is
+    SM 10.7+ SILICON, so which of the two a given GPU may issue is decided by
+    :func:`validate_block_scale_config`, not by the config family.
     Type marker for template pairing; callers pass ``pipeline="sm100"``."""
 
 
@@ -362,13 +366,6 @@ class ConfigSm103(TileConfig):
     """sm103 geometry — ``cta_tile_k_bytes`` (384) and ``mma_inst_k_bytes``
     (48) are fixed by the fp4 K=48B UTCOMMA (K-tile = lcm(128, 48)); the other
     axes match :class:`ConfigSm100`. Type marker; callers pass ``pipeline="sm103"``."""
-
-
-class ConfigSm107(TileConfig):
-    """sm107 geometry — identical to :class:`ConfigSm100` except
-    ``mma_inst_k_bytes`` is 64 (the SM 10.7 block-scale MMA reads a 64-byte K
-    per instruction, twice sm100's 32). Type marker; callers pass
-    ``pipeline="sm107"``."""
 
 
 class ConfigSm120(TileConfig):
@@ -399,7 +396,6 @@ class ConfigSm120(TileConfig):
 _CONFIG_CLASS_BY_PIPELINE: dict[str, type[TileConfig]] = {
     "sm100": ConfigSm100,
     "sm103": ConfigSm103,
-    "sm107": ConfigSm107,
     "sm120": ConfigSm120,
 }
 
@@ -446,7 +442,7 @@ _CLUSTERS: tuple[tuple[int, int], ...] = (
 )
 
 
-def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
+def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int, mma_k_bytes: int = _MMA_INST_K_BYTES) -> ConfigSm100:
     """Build one sm100 pure-geometry config from the MMA-instruction M and the
     number of them the CTA tile spans."""
     return ConfigSm100(
@@ -460,6 +456,7 @@ def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: in
         threads_per_cta=256,
         pipeline="sm100",
         acc_stages=2,
+        mma_inst_k_bytes=mma_k_bytes,
     )
 
 
@@ -476,25 +473,6 @@ def _geom_sm103(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm103
         pipeline="sm103",
         acc_stages=2,
         mma_inst_k_bytes=48,
-    )
-
-
-def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
-    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours).
-    mma_inst_m is pinned to 128 — the block-scale F8_128x4 SF swizzle needs
-    mma_inst_m % 128 == 0, so 64 is not an axis here."""
-    return ConfigSm107(
-        cta_tile_m=_CTA_TILE_M_MAX * num_mma_m,
-        cta_tile_n=cta_n,
-        cta_tile_k_bytes=128,
-        cgrp_size_m=cgrp_m,
-        cgrp_size_n=cgrp_n,
-        mma_inst_m=_CTA_TILE_M_MAX,
-        epi_tile_mn=(_CTA_TILE_M_MAX, 32),
-        threads_per_cta=256,
-        pipeline="sm107",
-        acc_stages=2,
-        mma_inst_k_bytes=64,
     )
 
 
@@ -518,21 +496,17 @@ def _build_catalog() -> tuple[TileConfig, ...]:
     for mma_m, num_mma_m in _M_AXES:
         for cta_n in range(256, 0, -8):
             for k_bytes in (128, 64):
-                for cgrp_m, cgrp_n in _CLUSTERS:
-                    cfgs.append(_geom_sm100(mma_m, num_mma_m, cta_n, k_bytes, cgrp_m, cgrp_n))
+                for mma_k_bytes in (32, 64):
+                    if k_bytes % mma_k_bytes:
+                        continue
+                    for cgrp_m, cgrp_n in _CLUSTERS:
+                        cfgs.append(_geom_sm100(mma_m, num_mma_m, cta_n, k_bytes, cgrp_m, cgrp_n, mma_k_bytes))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
     # rank-decomposition multicast masks for data + SF).
     for cta_n in (256, 128):
         for cgrp_m, cgrp_n in _CLUSTERS:
             cfgs.append(_geom_sm103(128, cta_n, cgrp_m, cgrp_n))
-    # sm107 block-scale geometries: the sm100 axes narrowed to what the F8_128x4
-    # SF swizzle admits (M/N multiples of 128, K-tile 128 B) — the rest of the
-    # sm100 enumeration would only be rejected by validate_block_scale_config.
-    for num_mma_m in (1, 2):
-        for cta_n in (256, 128):
-            for cgrp_m, cgrp_n in _CLUSTERS:
-                cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
     # sm120 warp-MMA geometries: no cluster axis (fixed 1x1); M ∈ {128, 64}
     # (the MMA-inst M bounds, and the 4x2 warp grid needs cta_m % 64 == 0).
     for cta_m in (128, 64):
@@ -756,6 +730,24 @@ def select_config(
     return by_name(name), cta_group
 
 
+def as_mma_inst_k_bytes(k_bytes: int, pipeline: str) -> int:
+    """The MMA-inst K width ``pipeline`` issues closest to ``k_bytes``: itself
+    when the family can issue it, else the family's narrowest. A family that
+    fixes the axis (sm103's 48-byte UTCOMMA) therefore always wins."""
+    ok = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, pipeline, "MMA-inst K widths")
+    return k_bytes if k_bytes in ok else min(ok)
+
+
+def as_mma_inst_k(cfg: TileConfig, k_bytes: int) -> TileConfig:
+    """The same geometry at a different MMA-inst K width. A no-op when the width
+    already matches or the config's family cannot issue the requested one, so
+    callers need no arch or family knowledge."""
+    ok = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, cfg.pipeline, "MMA-inst K widths")
+    if cfg.mma_inst_k_bytes == k_bytes or k_bytes not in ok or cfg.cta_tile_k_bytes % k_bytes:
+        return cfg
+    return replace(cfg, mma_inst_k_bytes=k_bytes)
+
+
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
     """The same geometry as a ``pipeline``-family config — only the family-fixed
     MMA-inst K width moves (a family that fixes MORE axes pins them in its own
@@ -779,7 +771,7 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
         tile_swizzle_n=cfg.tile_swizzle_n,
         mma_inst_m=cfg.mma_inst_m,
         mma_inst_n=cfg.mma_inst_n,
-        mma_inst_k_bytes=_pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, pipeline, "MMA-inst K width"),
+        mma_inst_k_bytes=as_mma_inst_k_bytes(cfg.mma_inst_k_bytes, pipeline),
     )
 
 
@@ -810,6 +802,17 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
             f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
             f"has mma_inst_n={cfg.mma_inst_n}"
         )
+    # The 64-byte MMA-inst K is SM 10.7+ SILICON, not a pipeline property, so it
+    # is gated on the ACTIVE GPU here rather than by a config family. No GPU
+    # visible (render-only / CI) leaves it open, like every other arch gate.
+    if cfg.mma_inst_k_bytes == 64:
+        from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+        from . import compiler as _C
+
+        arch = _C._current_arch()
+        if arch is not None and not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+            spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+            raise NotImplementedError(f"block-scaled matmul at mma_inst_k_bytes=64 needs {spans}, but the " f"active GPU is sm_{arch}; config {cfg.name!r}")
     # K-tile bytes: sm100 = one 128-B swizzled SMEM row; sm103 = 384 B
     kb_want = 384 if cfg.pipeline == "sm103" else 128
     if cfg.cta_tile_k_bytes != kb_want:
