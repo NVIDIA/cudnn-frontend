@@ -25,8 +25,8 @@ separate: a request may be valid for `MoeEp` but unavailable in this backend.
 - `hidden_size` must be divisible by 128, and `intermediate_size` must be
   divisible by 256.
 - `top_k` must not exceed 32.
-- Forward EP size must not exceed 16 because the validated peer-mapper ABI
-  carries a fixed 128-byte by-value offset table.
+- EP sizes above 16 use a generated vector peer-offset table; EP sizes through
+  16 use the fixed 128-byte by-value table.
 
 These are backend limits, not additional public `MoeEp` semantics. They remain
 precise, product-specific capability gates rather than hidden padding or a
@@ -37,9 +37,9 @@ silent numerical fallback.
 `MoeEp.backward` has a validated backend seam and requires a forward stash from
 `generate_c=True`. In the default `backward_wgrad_mode="none"`, the restricted
 Rubin MXFP8 path returns
-`(grad_activation, grad_topk_weights)` for EP1/EP2/EP4 with BF16 or MXFP8
-combine, BF16 output, `apply_topk_in_fc1=True`, optional `gate_up_clamp`, and
-eager execution. It uses `fc1_c` and `route_metadata` to reconstruct an
+`(grad_activation, grad_topk_weights)` for any positive EP size with BF16 or
+MXFP8 combine, BF16 output, `apply_topk_in_fc1=True`, optional
+`gate_up_clamp`, and eager execution. It uses `fc1_c` and `route_metadata` to reconstruct an
 external pool-layout `fc1_preact` tensor and converts `grad_output` to FP32
 before re-dispatching it for semantic dprob. The kernel's source-domain dprob
 plane is symmetric and reset before every launch; the public router-weight
@@ -103,7 +103,7 @@ stashes from different forwards.
 
 This mode only produces operands; it does not launch grouped wgrad or return
 dense `dW1`/`dW2`. It remains eager-only and inherits the restricted Rubin
-MXFP8 backward gates (SM107, EP1/EP2/EP4, BF16 output,
+MXFP8 backward gates (SM107, BF16 output,
 `apply_topk_in_fc1=True`, and BF16/MXFP8 combine). End-to-end operand
 production still requires SM107 acceptance. Direct FC1/FC2 consumer execution
 has been validated separately on SM100 with reference-generated operands.
@@ -111,8 +111,8 @@ has been validated separately on SM100 with reference-generated operands.
 The dGLU product emits BF16 `grad_activation`; the backend converts it to FP32
 for the public return. This is a documented BF16-rounded numerical limitation,
 not strict FP32 dgrad parity. `apply_topk_in_fc1=False`, NVFP4 operands or
-combine, non-BF16 output, backward CUDA Graph capture, and EP sizes outside
-1/2/4 remain capability-gated.
+combine, non-BF16 output, and backward CUDA Graph capture remain
+capability-gated.
 
 ## Validation boundary
 
@@ -132,4 +132,5 @@ PASS for EP12 and EP16; EP7 and EP15 remain pending.
 End-to-end device forward/backward parity requires SM107 hardware and the
 `moe_ep` optional runtime dependencies, including a CuTeDSL installation that
 provides `cutlass.utils.rubin_helpers`. Backward acceptance remains limited to
-EP1/EP2/EP4 and is not expanded by the multi-node forward suite.
+EP1/EP2/EP4; larger EP sizes are enabled but not covered by current backward
+hardware acceptance.

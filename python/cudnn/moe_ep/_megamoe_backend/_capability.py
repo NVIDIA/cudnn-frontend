@@ -125,11 +125,6 @@ def validate_config(config: ForwardConfig) -> None:
         raise NotImplementedError(
             "MoeEp SM107 MXFP8 dispatch currently requires top_k <= 32"
         )
-    if config.ep_size > 16:
-        raise NotImplementedError(
-            "MoeEp SM107 MXFP8 execution supports at most EP16 because the "
-            "validated peer-mapper ABI uses a 128-byte by-value offset table"
-        )
     if not config.apply_topk_in_fc1:
         raise NotImplementedError(
             "MoeEp Rubin training MegaMoE requires apply_topk_in_fc1=True"
@@ -163,10 +158,6 @@ def validate_backward_request(request: ValidatedBackwardRequest) -> None:
     if config.output_format != MoeFormat.BF16.value:
         raise NotImplementedError(
             "MoeEp MXFP8 backward currently requires output_format='bf16'"
-        )
-    if config.ep_size not in (1, 2, 4):
-        raise NotImplementedError(
-            "MoeEp MXFP8 backward currently supports EP1/EP2/EP4"
         )
     if not config.apply_topk_in_fc1:
         raise NotImplementedError(

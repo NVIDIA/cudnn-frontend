@@ -1412,6 +1412,31 @@ def test_resolve_runtime_world_revalidates_ordered_membership(monkeypatch):
 
 
 @pytest.mark.L0
+def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend._capability import validate_config
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(**_forward_config()) as op:
+        config = replace(
+            op._forward_config,
+            num_experts=32,
+            experts_per_rank=1,
+            ep_size=32,
+            ep_rank=31,
+            ep_group=object(),
+            ep_global_ranks=tuple(range(32)),
+        )
+
+    validate_config(config)
+    kernel_config = Mxfp8KernelConfig.from_forward_config(config)
+    assert kernel_config.world_size == 32
+    assert kernel_config.local_rank == 31
+
+
+@pytest.mark.L0
 def test_megamoe_capability_accepts_nonworld_subgroup_config():
     from cudnn.moe_ep._contracts import ForwardConfig
     from cudnn.moe_ep._megamoe_backend._capability import validate_config

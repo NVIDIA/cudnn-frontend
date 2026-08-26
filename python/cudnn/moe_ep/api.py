@@ -440,7 +440,8 @@ class MoeEp:
         ``backward_wgrad_mode="operands"``, ``wgrad_forward_stash`` is
         required and the return tuple has a third ``MoeEpWgradOperands`` item.
         The Rubin MXFP8 device path supports BF16/MXFP8 combine and BF16 output
-        on EP1/EP2/EP4 under its documented capability gates. Forward and
+        for any positive EP size under its documented capability gates.
+        Backward has hardware acceptance coverage at EP1/EP2/EP4. Forward and
         backward both quantize each FP32 route accumulator directly to MXFP8
         before top-k reduction.
         """

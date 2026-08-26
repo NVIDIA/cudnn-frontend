@@ -5,7 +5,7 @@ owners, and executable PyTorch reference. The current device target is the
 Rubin training `fwd_glu` kernel plus the restricted `bwd_dglu` path on exactly
 SM107 (compute capability 10.7). It accepts MXFP8 E4M3/E8M0 operands or plain
 BF16/FP16/FP32 operands staged to MXFP8, supports BF16 or MXFP8 combine with
-BF16 output, EP1 through EP16 forward, and EP1/EP2/EP4 backward. Unsupported
+BF16 output, and any positive EP size for forward and backward. Unsupported
 combinations fail explicitly rather than returning uncomputed storage.
 
 The design removes workspace pointers, peer pointer mappers, streams, and
@@ -65,14 +65,15 @@ executable CuTeDSL backend. Its deliberately narrow capability is:
   `backward_wgrad_mode="operands"` requires 256-row alignment and additionally
   returns caller-owned MXFP8 grouped-wgrad operands. Training execution does
   not support CUDA Graph capture; the restricted device backward returns
-  activation and router-weight gradients for EP1/EP2/EP4;
+  activation and router-weight gradients; backward hardware acceptance
+  currently covers EP1/EP2/EP4;
 - forward and backward support optional `gate_up_clamp`; Rubin training
   execution requires `apply_topk_in_fc1=True`;
 - `max_tokens_per_rank` must be explicitly positive; `top_k <= 32`,
   `H % 128 == 0`, and `I % 256 == 0`;
 - `ep_group=None` remains explicit single-rank execution. Distributed execution
   accepts any initialized `torch.distributed.ProcessGroup`, including
-  non-contiguous global-rank membership, with EP2 through EP16. The public
+  non-contiguous global-rank membership, with any positive EP size. The public
   contract requires `top_k <= num_experts` and the device path additionally
   requires `top_k <= 32`; `top_k` may exceed `experts_per_rank`. Expert
   ownership, peer tables, and route metadata use dense group-relative EP ranks;
@@ -367,8 +368,8 @@ does not change its output structure across calls.
 
 `backward` requires the operator to be constructed with `generate_c=True`; the
 production entry point is `MoeEp.backward`, while `MoeEpReference.backward`
-defines its executable semantic oracle. The restricted Rubin MXFP8 device path
-supports BF16/MXFP8 combine, BF16 output, EP1/EP2/EP4,
+defines its executable semantic oracle. The Rubin MXFP8 device path supports
+BF16/MXFP8 combine, BF16 output, any positive EP size,
 `apply_topk_in_fc1=True`, and optional `gate_up_clamp`. It is a collective:
 every rank in `ep_group` must call it because gradients re-dispatch along the
 identical forward routes.
@@ -837,7 +838,7 @@ The status below applies specifically to the production Rubin device backend.
 - Multi-node eager forward parity has passed for EP12/WORLD12 (three nodes,
   four PEs per node) and EP16/WORLD16 (four nodes, four PEs per node), with
   BF16 and MXFP8 combine and all-`-1` route behavior.
-- Restricted MXFP8 backward has passed for EP1, EP2, and EP4 with BF16 and
+- MXFP8 backward has passed for EP1, EP2, and EP4 with BF16 and
   MXFP8 combine. It checks activation and router-weight gradients against the
   executable reference; EP1 additionally covers repeated calls and explicitly
   reordered forward stashes.
@@ -848,8 +849,10 @@ The status below applies specifically to the production Rubin device backend.
 
 ### Supported but awaiting hardware validation
 
-- Forward capability accepts every EP size from EP1 through EP16. EP5, EP6,
-  EP8 through EP11, EP13, and EP14 have no current hardware acceptance case.
+- Forward capability accepts every positive EP size. EP5, EP6, EP8 through
+  EP11, EP13, EP14, and sizes above EP16 have no current hardware acceptance
+  case. Sizes above EP16 use the generated vector peer-offset path instead of
+  the fixed 128-byte by-value table used through EP16.
 - EP7/WORLD14 is defined as a seven-node subgroup with one EP PE per node, and
   EP15/WORLD20 is defined as a five-node subgroup with three EP PEs per node.
   Both acceptance cases remain pending on allocations with the required node
@@ -866,14 +869,14 @@ The status below applies specifically to the production Rubin device backend.
 
 ### Currently unsupported by the device backend
 
-- Devices other than SM107, EP sizes above 16, non-positive or unspecified
-  `max_tokens_per_rank`, `hidden_size` not divisible by 128,
+- Devices other than SM107, non-positive or unspecified `max_tokens_per_rank`,
+  `hidden_size` not divisible by 128,
   `intermediate_size` not divisible by 256, and `top_k > 32`.
 - Native NVFP4 operands or combine, any non-BF16 public output, and plain
   operand dtypes other than BF16/FP16/FP32. MXFP8 operands and BF16/MXFP8
   combine with BF16 output are supported.
-- Backward outside EP1/EP2/EP4, execution with
-  `apply_topk_in_fc1=False`, non-BF16 output, or backward CUDA Graph capture.
+- Backward execution with `apply_topk_in_fc1=False`, non-BF16 output, or
+  backward CUDA Graph capture.
 - Wgrad operand mode with padding other than 256, without `generate_c=True`,
   or outside the restricted Rubin MXFP8 backward configuration. The mode
   returns operands only; dense `dW1`/`dW2` computation remains an explicit

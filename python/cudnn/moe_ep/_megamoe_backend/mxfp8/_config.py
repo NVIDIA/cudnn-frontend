@@ -62,10 +62,8 @@ class Mxfp8KernelConfig:
 
     @classmethod
     def from_forward_config(cls, config: ForwardConfig) -> "Mxfp8KernelConfig":
-        if config.ep_size < 1 or config.ep_size > 16:
-            raise NotImplementedError(
-                "MXFP8 execution supports EP subgroup sizes from 1 through 16"
-            )
+        if config.ep_size < 1:
+            raise ValueError("MXFP8 execution requires a positive EP size")
         if config.ep_rank < 0 or config.ep_rank >= config.ep_size:
             raise ValueError(
                 f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}"

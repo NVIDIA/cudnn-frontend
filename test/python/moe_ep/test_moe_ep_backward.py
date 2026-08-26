@@ -889,7 +889,6 @@ def test_moe_ep_backward_requires_generate_c():
     ("overrides", "message"),
     [
         ({"output_format": "mxfp8"}, "output_format='bf16'"),
-        ({"ep_size": 8}, "supports EP1/EP2/EP4"),
         ({"apply_topk_in_fc1": False}, "apply_topk_in_fc1=True"),
     ],
 )
@@ -924,6 +923,27 @@ def test_mxfp8_backward_capability_rejects_unsupported_config(
 @pytest.mark.L0
 def test_mxfp8_backward_capability_accepts_gate_up_clamp(monkeypatch):
     config = _config(gate_up_clamp=1.0)
+    args = _inputs()
+    request = _validate_backward(
+        config,
+        torch.randn(2, 128),
+        args,
+        torch.randn(3, 512, dtype=torch.bfloat16),
+        torch.zeros(3, 4, dtype=torch.int32),
+    )
+    monkeypatch.setattr(_capability, "_validate_device", lambda device: None)
+    monkeypatch.setattr(
+        _capability,
+        "_is_cuda_stream_capturing",
+        lambda device: False,
+    )
+
+    _capability.validate_backward_request(request)
+
+
+@pytest.mark.L0
+def test_mxfp8_backward_capability_accepts_ep_above_16(monkeypatch):
+    config = _config(ep_size=32, ep_rank=31)
     args = _inputs()
     request = _validate_backward(
         config,
