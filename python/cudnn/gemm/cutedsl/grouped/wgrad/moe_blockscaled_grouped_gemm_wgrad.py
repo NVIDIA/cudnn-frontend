@@ -70,9 +70,7 @@ def _using_internal_cutlass_dsl() -> bool:
 def _cutlass_dsl_needs_fp4_layout_workaround() -> bool:
     # Public cutlass-dsl wheels before 4.8 interpret packed sub-byte
     # from_dlpack layouts in byte units, so the FP4 A/B layouts must be
-    # recast to element units. 4.8+ public wheels adopted the internal
-    # wheel's native sub-byte layout semantics, where the recast would
-    # double-correct and corrupt the layout the MMA consumes.
+    # recast to element units.
     if _using_internal_cutlass_dsl():
         return False
     match = re.match(r"(\d+)\.(\d+)", getattr(cutlass, "__version__", "") or "")
