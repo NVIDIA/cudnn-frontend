@@ -52,6 +52,7 @@ moe_desc_slots = num_a_operands + n_tma_outputs
 
 
 SCHED_STAGES = 2
+SCHED_BCAST_STAGES = 2
 SCHED_SLOT_WORDS = 8
 
 # Programmatic Dependent Launch (PDL, sm_90+).
@@ -136,7 +137,11 @@ def _kernel(
     m_rank = cta_rank_in_cluster % cluster_m
     n_rank = cta_rank_in_cluster // cluster_m
 
-    cluster_linear_init = bidx // cluster_m
+    sched_counter_ptr = cute.make_ptr(
+        cutlass.Int32,
+        (a_tma_workspace.iterator.raw_ptr() + grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
+        mem_space=cute.AddressSpace.generic,
+    )
 
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
@@ -186,6 +191,9 @@ def _kernel(
     )
     sched_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
     sched_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
+    sched_bcast_slot = cutlass.Array(cutlass.Int32, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
+    sched_bcast_full_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
+    sched_bcast_empty_mbar_ptr = cutlass.Array(cutlass.Int64, SCHED_BCAST_STAGES, space=cutlass.AddressSpace.smem, alignment=8)
 
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
@@ -258,6 +266,11 @@ def _kernel(
                 nvvm.mbarrier_init(sched_full_mbar_ptr.subview(i), 1)
             if elect_one:
                 nvvm.mbarrier_init(sched_empty_mbar_ptr.subview(i), sched_empty_count)
+        for i in range(SCHED_BCAST_STAGES):
+            if elect_one:
+                nvvm.mbarrier_init(sched_bcast_full_mbar_ptr.subview(i), 1)
+            if elect_one:
+                nvvm.mbarrier_init(sched_bcast_empty_mbar_ptr.subview(i), cluster_size)
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
         nvvm.barrier_cluster_arrive_relaxed()
@@ -308,7 +321,10 @@ def _kernel(
         gemm_s = cutlass.Int32(M)
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
-        linear_idx = cutlass.Int32(cluster_linear_init)
+        bcast_stage = cutlass.Int32(0)
+        bcast_full_phase = cutlass.Int32(0)
+        bcast_empty_phase = cutlass.Int32(1)
+        linear_idx = cutlass.Int32(0)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
         scan_base = cutlass.Int32(0)
@@ -318,6 +334,44 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
+            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
+            # tile index and broadcasts it, so the clusters live at any instant
+            # sit in one contiguous window of tile space and share L2. Static
+            # striding lets them drift apart and share nothing.
+            if cta_rank_in_cluster == 0:
+                while not nvvm.mbarrier_try_wait_parity(
+                    sched_bcast_empty_mbar_ptr.subview(bcast_stage),
+                    bcast_empty_phase,
+                    time_limit=10_000_000,
+                ):
+                    pass
+                claimed = cutlass.Int32(0)
+                if lane == 0:
+                    claimed = nvvm.atomicrmw(
+                        "add",
+                        sched_counter_ptr,
+                        cutlass.Int32(1),
+                        mem_order="relaxed",
+                        syncscope="gpu",
+                    )
+                claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
+                if lane < cluster_size:
+                    (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
+                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
+            while not nvvm.mbarrier_try_wait_parity(
+                sched_bcast_full_mbar_ptr.subview(bcast_stage),
+                bcast_full_phase,
+                time_limit=10_000_000,
+            ):
+                pass
+            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+            if lane == 0:
+                nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
+            bcast_stage += 1
+            if bcast_stage == SCHED_BCAST_STAGES:
+                bcast_stage = cutlass.Int32(0)
+                bcast_full_phase = bcast_full_phase ^ 1
+                bcast_empty_phase = bcast_empty_phase ^ 1
             if linear_idx >= start_linear_idx + total_tiles:
                 is_search_live = cutlass.Int32(1)
                 while is_search_live != 0:
@@ -386,7 +440,6 @@ def _kernel(
                     _moe_auto_swizzle_w(group_nt_m * cgrp_tile_mnk[0], N, k, clusters_along_n),
                 )
                 coord_expert = group_idx % num_experts
-                linear_idx += grid_num_clusters
 
             while not nvvm.mbarrier_try_wait_parity(
                 sched_empty_mbar_ptr.subview(sched_stage),
@@ -1076,7 +1129,7 @@ def compile() -> Callable:
     grid_ctas = grid_num_clusters * cluster_m * cluster_n
     fake_a_tma_workspace = make_fake_compact_tensor(
         cutlass.Int64,
-        (grid_ctas * moe_desc_slots * 16,),
+        (grid_ctas * moe_desc_slots * 16 + 16,),
         stride_order=(0,),
         assumed_align=128,
     )
