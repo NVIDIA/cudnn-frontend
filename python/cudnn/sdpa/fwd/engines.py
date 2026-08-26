@@ -630,9 +630,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
-    - split_kv_supported / split_d_shapes: only the SM100 d128 kernel wires
-      SplitHelpers; the SM107 sibling has no split path yet, and the
-      d192x128 file forks its own scheduler and has none either.
+    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers
+      (the SM107 sibling carries the same plumbing as its SM100 twin), so both
+      rows advertise the split; the d192x128 file forks its own scheduler and
+      has none, which is what split_d_shapes pins.
     - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
       sibling (issue #653); {NATURAL} keeps requests honest AND routes the
       graph path around the un-ported derivation (place() hands the adapter
