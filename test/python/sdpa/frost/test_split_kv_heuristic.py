@@ -285,6 +285,7 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm120",
+        "sdpa_fwd_prefill_sm120_fp8",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
 
 

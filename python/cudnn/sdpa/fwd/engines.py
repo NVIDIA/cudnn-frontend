@@ -1152,6 +1152,10 @@ def _sm120_fp8_spec() -> EngineSpec:
             # back for O; zero-copy when already BSHD-physical).
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking (same shape as the f16 sibling) + the
+            # shared split_combine pass. Under a split the kernel stands its amax
+            # down and the combine reports the amax of the RECOMBINED O.
+            split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
