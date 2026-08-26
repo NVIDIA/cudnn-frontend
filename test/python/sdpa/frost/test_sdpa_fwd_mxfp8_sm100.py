@@ -33,7 +33,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_cudnn_9_24, requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import make_dense_stats, requires_cudnn_9_24, requires_cudnn_9_26, requires_pre_rubin_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -317,6 +317,7 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 
 @pytest.mark.L0
+@requires_cudnn_9_26
 @torch_fork_set_rng(seed=59)
 def test_mxfp8_strided_stats():
     """The block-scaled FP8 L0 flavor preserves dense Stats strides."""

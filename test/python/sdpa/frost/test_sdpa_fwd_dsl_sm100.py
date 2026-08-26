@@ -12,7 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_cudnn_9_24, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_cudnn_9_24, requires_cudnn_9_26, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -257,6 +257,7 @@ def _check_dsl_sm100_strided_stats(d_qk, d_v):
 
 
 @pytest.mark.L0
+@requires_cudnn_9_26
 @torch_fork_set_rng(seed=59)
 def test_dsl_sm100_strided_stats():
     """The SM100 half L0 flavor writes permuted, gapped LSE directly."""

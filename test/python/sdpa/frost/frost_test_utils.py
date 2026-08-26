@@ -52,6 +52,11 @@ requires_cudnn_9_24 = pytest.mark.skipif(
     reason="cu_seq_len_q/kv graphs require cuDNN backend >= 9.24",
 )
 
+requires_cudnn_9_26 = pytest.mark.skipif(
+    cudnn is None or cudnn.backend_version() < 92600,
+    reason="a non-packed dense Stats output requires cuDNN backend >= 9.26",
+)
+
 
 def _dsl_usable():
     """``(usable, why_not)`` for the DSL these engines lower through.
