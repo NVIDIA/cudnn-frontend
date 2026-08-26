@@ -212,7 +212,7 @@ def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
     assert effective["effective_group_hint"] == 768
     assert effective["fc2_in_kernel_topk_reduce"] is True
     assert effective["launch_cluster_count"] == 123
-    assert effective["drop_on_overflow"] is True
+    assert effective["drop_on_overflow"] is False
     assert effective["enable_col_quant"] is False
     assert "output_format" not in effective
 
@@ -270,6 +270,29 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
     assert default_config.compile_key(*key_args) != enabled_config.compile_key(
         *key_args
     )
+
+
+@pytest.mark.L0
+def test_bounded_receive_capacity_propagates_to_kernel_config():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend.mxfp8._config import (
+        Mxfp8KernelConfig,
+    )
+
+    with MoeEp(
+        **_forward_config(),
+        max_recv_size_per_rank=7,
+        drop_on_overflow=False,
+    ) as op:
+        config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
+
+    assert config.max_recv_size_per_rank == 7
+    assert config.drop_on_overflow is False
+
+    with pytest.raises(ValueError, match="max_recv_size_per_rank"):
+        MoeEp(**_forward_config(), max_recv_size_per_rank=0)
+    with pytest.raises(ValueError, match="drop_on_overflow"):
+        MoeEp(**_forward_config(), drop_on_overflow=1)
 
 
 @pytest.mark.L0

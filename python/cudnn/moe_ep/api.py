@@ -112,6 +112,8 @@ class MoeEp:
         top_k: int,
         ep_group: Optional[dist.ProcessGroup] = None,
         max_tokens_per_rank: Optional[int] = None,
+        max_recv_size_per_rank: Optional[int] = None,
+        drop_on_overflow: bool = False,
         output_format: Union[MoeFormat, str] = MoeFormat.BF16,
         combine_format: Union[MoeFormat, str] = MoeFormat.BF16,
         apply_topk_in_fc1: bool = True,
@@ -141,6 +143,16 @@ class MoeEp:
             raise ValueError(
                 "max_tokens_per_rank must be a non-negative integer or None"
             )
+        if max_recv_size_per_rank is not None and (
+            isinstance(max_recv_size_per_rank, bool)
+            or not isinstance(max_recv_size_per_rank, int)
+            or max_recv_size_per_rank <= 0
+        ):
+            raise ValueError(
+                "max_recv_size_per_rank must be a positive integer or None"
+            )
+        if not isinstance(drop_on_overflow, bool):
+            raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
             raise ValueError("apply_topk_in_fc1 must be a bool")
         if not isinstance(generate_c, bool):
@@ -208,6 +220,8 @@ class MoeEp:
         self.ep_global_ranks = ep_global_ranks
         self.experts_per_rank = num_experts // ep_size
         self.max_tokens_per_rank = max_tokens_per_rank
+        self.max_recv_size_per_rank = max_recv_size_per_rank
+        self.drop_on_overflow = drop_on_overflow
         self.output_format = _parse_format(output_format)
         self.combine_format = _parse_format(combine_format)
         self.apply_topk_in_fc1 = apply_topk_in_fc1
@@ -246,6 +260,8 @@ class MoeEp:
             ep_group=self.ep_group,
             ep_global_ranks=self.ep_global_ranks,
             max_tokens_per_rank=self.max_tokens_per_rank,
+            max_recv_size_per_rank=self.max_recv_size_per_rank,
+            drop_on_overflow=self.drop_on_overflow,
             output_format=self.output_format.value,
             combine_format=self.combine_format.value,
             apply_topk_in_fc1=self.apply_topk_in_fc1,

@@ -70,8 +70,13 @@ class Mxfp8KernelConfig:
             )
         if config.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
-        max_recv_size_per_rank = (
+        worst_case_recv_size = (
             config.ep_size * config.max_tokens_per_rank * config.top_k
+        )
+        max_recv_size_per_rank = (
+            worst_case_recv_size
+            if config.max_recv_size_per_rank is None
+            else min(config.max_recv_size_per_rank, worst_case_recv_size)
         )
         if max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
@@ -87,6 +92,7 @@ class Mxfp8KernelConfig:
             gate_up_clamp=config.gate_up_clamp,
             generate_c=config.generate_c,
             max_recv_size_per_rank=max_recv_size_per_rank,
+            drop_on_overflow=config.drop_on_overflow,
             combine_format=combine_wire_format(config.combine_format),
             enable_col_quant=(
                 config.backward_wgrad_mode == "operands"

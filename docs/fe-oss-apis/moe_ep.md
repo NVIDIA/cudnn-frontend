@@ -210,6 +210,8 @@ class MoeEp:
         top_k: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         max_tokens_per_rank: Optional[int] = None,
+        max_recv_size_per_rank: Optional[int] = None,
+        drop_on_overflow: bool = False,
         output_format: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
         combine_format: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
         apply_topk_in_fc1: bool = True,
@@ -293,6 +295,8 @@ The context-manager form is preferred when deterministic release matters.
 | `top_k` | Fixed routing width `K`, with `1 <= K <= E`. |
 | `ep_group` | Process group whose group-relative rank determines expert ownership. |
 | `max_tokens_per_rank` | Maximum local input tokens `T`; optional in the reference and constructor, but the current device capability gate requires an explicit positive value on first execution. |
+| `max_recv_size_per_rank` | Optional bound on routed rows received by one EP rank. The default is the conservative `ep_size * max_tokens_per_rank * top_k`; a smaller bound reduces workspace size. |
+| `drop_on_overflow` | If `True`, truncate routed rows beyond `max_recv_size_per_rank`; if `False` (default), overflow traps instead of silently changing results. |
 | `output_format` | Encoding returned after top-k reduction. |
 | `combine_format` | Encoding/rounding of each route contribution before top-k reduction. |
 | `apply_topk_in_fc1` | Multiply the post-SwiGLU intermediate by the router weight before FC2; otherwise multiply the combine-rounded FC2 route contribution in the standalone top-k reducer. |
@@ -611,8 +615,10 @@ the combine plane.
 Ranks may have different `T`. Zero-token ranks and zero-count peer splits must
 participate in all collectives. A production workspace must reserve enough
 inbound assignments for its documented capacity policy. The conservative bound
-is `ep_size * max_tokens_per_rank * top_k`; a smaller bound requires an explicit
-router capacity/drop contract.
+is `ep_size * max_tokens_per_rank * top_k`. `max_recv_size_per_rank` selects a
+smaller static workspace bound; callers must provide a router capacity contract
+or accept `drop_on_overflow=True`. With `drop_on_overflow=False`, exceeding the
+bound fails explicitly.
 
 ## Mapping to the MegaMoE interface
 

@@ -27,6 +27,9 @@ separate: a request may be valid for `MoeEp` but unavailable in this backend.
 - `top_k` must not exceed 32.
 - EP sizes above 16 use a generated vector peer-offset table; EP sizes through
   16 use the fixed 128-byte by-value table.
+- `max_recv_size_per_rank` may bound per-rank routed rows below the conservative
+  `EP * max_tokens_per_rank * top_k` workspace size. Overflow traps by default
+  or truncates only when `drop_on_overflow=True`.
 
 These are backend limits, not additional public `MoeEp` semantics. They remain
 precise, product-specific capability gates rather than hidden padding or a

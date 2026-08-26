@@ -148,14 +148,10 @@ def prepare_backward_kernel(
         local_rank=0,
         num_topk=config.top_k,
         max_tokens_per_rank=config.max_tokens_per_rank,
-        max_recv_size_per_rank=(
-            config.world_size
-            * config.max_tokens_per_rank
-            * config.top_k
-        ),
+        max_recv_size_per_rank=config.max_recv_size_per_rank,
         hidden=config.hidden,
         launch_cluster_count=launch_cluster_count,
-        drop_on_overflow=True,
+        drop_on_overflow=config.drop_on_overflow,
         fc2_in_kernel_topk_reduce=False,
         token_back_mode="epi_warps",
         epi_flag_batch=config.epi_flag_batch,
