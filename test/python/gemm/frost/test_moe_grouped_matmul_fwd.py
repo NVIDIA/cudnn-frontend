@@ -561,6 +561,57 @@ def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
     torch.testing.assert_close(output[0], _ref_f32(token, weight_k, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@pytest.mark.parametrize("cta_group", (1, 2))
+def test_moe_m_major_output(cta_group: int) -> None:
+    """A routed MoE output may be M-major. It takes STG: TMA would clip D to
+    `group_end` on the INNERMOST dim of a transposed descriptor, whose extent TMA
+    requires to be 16-byte aligned, and routed group bounds are runtime data --
+    a group ending at row 100 (200 B) faults, 104 (208 B) does not."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.tile_config import by_name
+
+    S, N, K, E = 512, 256, 128, 3
+    bounds = [0, 100, 300]  # neither tile- nor 16-byte-aligned
+    BF = cudnn.data_type.BFLOAT16
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if cta_group == 1 else "CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
+
+    def build():
+        g = cudnn.pygraph(io_data_type=BF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=BF)
+        w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=BF)
+        fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+        out.set_data_type(BF).set_output(True)
+        out.set_stride([S * N, 1, S])
+        return g, tok, w, fto, out
+
+    g, _, _, _, _ = build()
+    chain = analyze(g)
+    assert chain.out_major == "m"
+    assert _store_modes(chain, cfg, cta_group) == ("stg",)
+
+    torch.manual_seed(0)
+    tk = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)
+    wt = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
+    ft = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+    slack = 4096
+    raw = torch.full((2 * S * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+    out = raw.view(torch.bfloat16)[: S * N].view(1, N, S).transpose(1, 2)
+    out.zero_()
+    tail = raw[2 * S * N :].clone()
+    gg, tt, ww, ff, oo = build()
+    jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group)({tt: tk, ww: wt, ff: ft, oo: out})
+    torch.cuda.synchronize()
+
+    ref = torch.zeros(1, S, N, device="cuda", dtype=torch.float32)
+    b = bounds + [S]
+    for gi in range(E):
+        ref[0, b[gi] : b[gi + 1]] = tk[0, b[gi] : b[gi + 1]].float() @ wt[gi].float().T
+    assert torch.equal(raw[2 * S * N :], tail), "the store ran past the output"
+    assert (out.float() - ref).abs().max().item() < 0.5
+
+
 def test_moe_grouped_matmul_fwd_rejects_m_major_token() -> None:
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 

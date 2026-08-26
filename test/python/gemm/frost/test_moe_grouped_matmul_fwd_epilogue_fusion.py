@@ -877,7 +877,7 @@ def test_per_group_per_col_aux_group_stride_need_not_divide_the_chunk() -> None:
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
     # `_N` is 256 here, so assert on the rule's shape rather than on this N:
     # nothing in the gate may consult a per-group aux's stride.
-    assert _use_tma_store_epi(chain, cfg, 16, 1) is True
-    src = inspect.getsource(compiler._tma_store_n_major_ok)
+    assert _use_tma_store_epi(chain, cfg, 1) is True
+    src = inspect.getsource(compiler._output_store_mode)
     for probe in ("grouped_by_moe", "bcast_mode", "aux_tensors"):
         assert probe not in src, f"{probe}: an aux load's alignment is a pointwise concern, not a store rule"

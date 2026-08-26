@@ -130,6 +130,7 @@ def make_fprop_cache_key(
     use_qk_l2norm,
     batch_invariant,
     use_beta_sigmoid,
+    beta_guard,
     safe_gate,
     gate_lower_bound,
     has_initial_state,
@@ -157,6 +158,7 @@ def make_fprop_cache_key(
         bool(use_qk_l2norm),
         bool(batch_invariant),
         bool(use_beta_sigmoid),
+        bool(beta_guard),
         bool(safe_gate),
         float(gate_lower_bound) if gate_lower_bound is not None else None,
         bool(has_initial_state),
@@ -188,6 +190,7 @@ def make_bprop_cache_key(
     use_qk_l2norm,
     batch_invariant,
     use_beta_sigmoid,
+    beta_guard,
     safe_gate,
     gate_lower_bound,
     device,
@@ -216,6 +219,7 @@ def make_bprop_cache_key(
         bool(use_qk_l2norm),
         bool(batch_invariant),
         bool(use_beta_sigmoid),
+        bool(beta_guard),
         bool(safe_gate),
         float(gate_lower_bound) if gate_lower_bound is not None else None,
         device,
@@ -249,6 +253,7 @@ def build_fprop_graph(
     gate_lower_bound,
     checkpoint,
     use_beta_sigmoid=False,
+    beta_guard=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -283,6 +288,7 @@ def build_fprop_graph(
         use_qk_l2norm=use_qk_l2norm,
         batch_invariant=batch_invariant,
         use_beta_sigmoid=use_beta_sigmoid or None,
+        beta_guard=beta_guard or None,
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
         checkpoint_every_n_tokens=checkpoint,
@@ -325,6 +331,7 @@ def gdn2_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
+    beta_guard: bool = False,
     safe_gate: bool = False,
     gate_lower_bound: Optional[float] = None,
     a_log: Optional[torch.Tensor] = None,
@@ -401,6 +408,7 @@ def gdn2_fwd(
         use_qk_l2norm_in_kernel,
         batch_invariant,
         use_beta_sigmoid_in_kernel,
+        beta_guard,
         safe_gate,
         gate_lower_bound,
         state0 is not None,
@@ -430,6 +438,7 @@ def gdn2_fwd(
             float(gate_lower_bound) if gate_lower_bound is not None else None,
             checkpoint,
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
+            beta_guard=bool(beta_guard),
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -479,6 +488,7 @@ def gdn2_fwd_fake(
     use_qk_l2norm_in_kernel=False,
     batch_invariant=False,
     use_beta_sigmoid_in_kernel=False,
+    beta_guard=False,
     safe_gate=False,
     gate_lower_bound=None,
     a_log=None,
@@ -531,6 +541,7 @@ def build_bprop_graph(
     use_qk_l2norm,
     batch_invariant,
     use_beta_sigmoid=False,
+    beta_guard=False,
     safe_gate=False,
     gate_lower_bound=None,
 ):
@@ -576,6 +587,7 @@ def build_bprop_graph(
         use_qk_l2norm=use_qk_l2norm,
         batch_invariant=batch_invariant,
         use_beta_sigmoid=use_beta_sigmoid or None,
+        beta_guard=beta_guard or None,
         safe_gate=safe_gate or None,
         gate_lower_bound=gate_lower_bound,
         name="gdn2_bwd",
@@ -628,6 +640,7 @@ def gdn2_bwd(
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
+    beta_guard: bool = False,
     safe_gate: bool = False,
     gate_lower_bound: Optional[float] = None,
     a_log: Optional[torch.Tensor] = None,
@@ -719,6 +732,7 @@ def gdn2_bwd(
         use_qk_l2norm_in_kernel,
         batch_invariant,
         use_beta_sigmoid_in_kernel,
+        beta_guard,
         safe_gate,
         gate_lower_bound,
         device,
@@ -744,6 +758,7 @@ def gdn2_bwd(
             bool(use_qk_l2norm_in_kernel),
             bool(batch_invariant),
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
+            beta_guard=bool(beta_guard),
             safe_gate=bool(safe_gate),
             gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
         )
@@ -814,6 +829,7 @@ def gdn2_bwd_fake(
     use_qk_l2norm_in_kernel=False,
     batch_invariant=False,
     use_beta_sigmoid_in_kernel=False,
+    beta_guard=False,
     safe_gate=False,
     gate_lower_bound=None,
     a_log=None,
@@ -858,6 +874,7 @@ def gdn2_setup_context(ctx, inputs, output):
         use_qk_l2norm_in_kernel,
         batch_invariant,
         use_beta_sigmoid_in_kernel,
+        beta_guard,
         safe_gate,
         gate_lower_bound,
         a_log,
@@ -878,6 +895,7 @@ def gdn2_setup_context(ctx, inputs, output):
     ctx.batch_invariant = batch_invariant
     ctx.plan_name = plan_name
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
+    ctx.beta_guard = bool(beta_guard)
     ctx.safe_gate = bool(safe_gate)
     ctx.gate_lower_bound = gate_lower_bound
     ctx.set_materialize_grads(False)
@@ -914,6 +932,7 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
         batch_invariant=ctx.batch_invariant,
         use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
+        beta_guard=ctx.beta_guard,
         safe_gate=ctx.safe_gate,
         gate_lower_bound=ctx.gate_lower_bound,
         a_log=a_log,
@@ -930,6 +949,7 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         None,
         dstate0 if initial_state is not None else None,
+        None,
         None,
         None,
         None,
@@ -969,6 +989,7 @@ def gated_delta_net_v2(
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
+    beta_guard: bool = False,
     safe_gate: bool = False,
     gate_lower_bound: Optional[float] = None,
     a_log: Optional[torch.Tensor] = None,
@@ -1009,6 +1030,11 @@ def gated_delta_net_v2(
             disables split-K load balancing).
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel;
             the backward returns the raw-logit beta gradient.
+        beta_guard: apply the erase-side beta safeguard: rows whose per-channel
+            beta contrast would make the (decayed) erase step expansive are
+            shrunk toward the key-weighted mean beta before use. The backward
+            is straight-through (the guard is recomputed, not differentiated).
+            Requires ``use_qk_l2norm_in_kernel=True``.
         safe_gate: interpret ``g`` through the safe-gate transform
             ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``.
             Requires ``a_log`` and ``dt_bias``; the backward returns the
@@ -1048,6 +1074,7 @@ def gated_delta_net_v2(
         use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
         batch_invariant=bool(batch_invariant),
         use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
+        beta_guard=bool(beta_guard),
         safe_gate=bool(safe_gate),
         gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
         a_log=a_log,

@@ -2618,38 +2618,6 @@ def test_tma_arm_never_writes_past_the_output_rows() -> None:
         assert touched == 0, f"{o.source}: the epilogue wrote {touched} bytes past its {rows} rows"
 
 
-@pytest.mark.parametrize("out_major,want", (("n", True), ("m", False)))
-def test_extra_dense_outputs_take_the_tma_store_only_when_n_major(out_major: str, want: bool) -> None:
-    """Extra dense outputs land through the STG emitters, which read `row` /
-    `col_j`. The N-major TMA arm hands them the same coordinates the STG arm
-    does, so they only need bounding. Under an M-major slot 0 they are the
-    subtile base and the drain runs the snippet twice — a scatter there would
-    double-fire at the wrong coordinates, so that stays on STG."""
-    from cudnn.gemm.frost.compiler import _use_tma_store_epi
-    from cudnn.gemm.frost.graph_analyzer import analyze
-
-    M = N = K = 256
-    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
-    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    C = g.matmul(A=A, B=B, name="mm")
-    # Every non-virtual output carries the same layout, so vary them together;
-    # the gate keys on SLOT 0's majorness because that is the arm the kernel
-    # renders.
-    R = g.relu(input=C, name="r")
-    Y = g.gelu_approx_tanh(input=R, name="ge")
-    for t in (R, Y):
-        if out_major == "m":
-            t.set_stride([M * N, 1, M])
-        t.set_output(True)
-
-    chain = analyze(g)
-    assert len(chain.output_specs) == 2
-    assert chain.out_major == out_major
-    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    assert _use_tma_store_epi(chain, cfg, 16, 1) is want
-
-
 @pytest.mark.parametrize("name", ["CONFIG_sm100_128x16x128_128x16x32_cluster2x1", "CONFIG_sm100_128x32x128_128x32x32_cluster2x1"])
 def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None:
     """`cta_group == 2 and cta_tile_n < 64` used to fall back to STG on the
@@ -2665,28 +2633,59 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     g.matmul(A=A, B=B, name="mm").set_output(True)
     cfg = by_name(name)
     assert cfg.cta_tile_n < 64
-    assert _use_tma_store_epi(analyze(g), cfg, 16, 2) is True
+    assert _use_tma_store_epi(analyze(g), cfg, 2) is True
 
 
 @pytest.mark.parametrize(
-    "name",
+    "name,cta_group",
     [
-        "CONFIG_sm100_256x128x128_128x128x32_cluster1x1",
-        "CONFIG_sm100_128x128x128_64x128x32_cluster1x1",
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
     ],
 )
-def test_tma_store_gate_follows_the_mma_block_height(name: str) -> None:
-    """The TMA-store epilogue stages one MMA-M block of rows, so its gate is on
-    mma_inst_m — an M=64 MMA block drains through the packed lane<16 layout."""
-    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+@pytest.mark.parametrize("shape", [(4096, 4096, 512), (255, 256, 240)])
+def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: tuple) -> None:
+    """`mma_inst_m` is 64 or 128 by construction, and the TMA-store epilogue
+    stages all three drain layouts: the full thread->row one at 128, the 1-CTA
+    packed `lane < 16` one at 64 (half the lanes carry nothing, so the staging
+    indexes by `row` and the side effects carry `row_active`), and the 2-CTA
+    2x2-DP one at 64 (two column halves per stage, one TMA box each)."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
     from cudnn.gemm.frost.graph_analyzer import analyze
 
-    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
-    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
-    g.matmul(A=A, B=B, name="mm").set_output(True)
+    M, N, K = shape
     cfg = by_name(name)
-    assert _use_tma_store_epi(analyze(g), cfg, 16, 1) == (cfg.mma_inst_m == 128)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(_BF16)
+        return g, A, B, C
+
+    g, _, _, _ = build()
+    assert _store_modes(analyze(g), cfg, cta_group) == ("tma",)
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        slack = 4096
+        raw = torch.full((2 * M * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+        c = raw.view(torch.bfloat16)[: M * N].view(1, M, N)
+        c.zero_()
+        tail = raw[2 * M * N :].clone()
+        gg, aa, bb, cc = build()
+        jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group, force_stg_epi=force_stg)({aa: a, bb: b, cc: c})
+        torch.cuda.synchronize()
+        assert torch.equal(raw[2 * M * N :], tail), "the store ran past the output"
+        return c.clone()
+
+    assert torch.equal(run(False).view(torch.uint8), run(True).view(torch.uint8))
 
 
 @pytest.mark.parametrize(
@@ -2705,13 +2704,25 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
     attained at odd tidx. It was a hardcoded 64, which over-claims at
     cta_tile_n=16 (a 32-byte row) and under-claims at epi_n=64 / 4-byte output.
     `store_swizzled` forwards it as `assumed_align`, so an over-claim is a false
-    promise the backend may exploit."""
-    from cudnn.gemm.frost.compiler import _epi_n, _epi_swizzle_lines
+    promise the backend may exploit. It is per OUTPUT, not shared: `epi_n` is a
+    column count and only the element width differs."""
+    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
     from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.graph_analyzer import analyze
 
     cfg = by_name(name)
-    assert _epi_n(cfg, cta_group, out_dt) * DTYPE_BYTES[out_dt] == want
-    assert f"epi_smem_row_bytes = {want}" in _epi_swizzle_lines(cfg, cta_group, out_dt)
+    epi_n = _epi_n(cfg, cta_group, out_dt)
+    assert epi_n * DTYPE_BYTES[out_dt] == want
+
+    # The width is no longer a shared constant -- it is per output, so it is a
+    # literal in the store sequence the renderer unrolls.
+    M, N, K = 256, cfg.cta_tile_n, 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True).set_data_type(_CUDNN_DTYPE.get(out_dt, cudnn.data_type.FLOAT))
+    seq = _tma_store_sequence(analyze(g), cfg, cta_group, frozenset({0}), epi_n)
+    assert f"alignment={want}" in seq, seq
 
 
 def test_no_template_hardcodes_the_staging_alignment() -> None:
@@ -2778,34 +2789,130 @@ def test_epilogue_chunk_is_the_width_the_arm_hands_the_snippet(name: str, cta_gr
 
 
 @pytest.mark.parametrize(
-    "name,want_tma",
+    "name,cta_group",
     [
-        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1", False),
-        ("CONFIG_sm100_128x16x128_128x16x32_cluster1x1", True),
-        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", True),
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x16x128_128x16x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+        # the two `mma_inst_m == 64` drains: 1-CTA packed and 2-CTA 2x2-DP
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
     ],
 )
-def test_m_major_tma_store_needs_a_whole_stmatrix_block(name: str, want_tma: bool) -> None:
-    """The M-major arm transposes with `for _blk in range(epi_n // 16)` over
-    4-register stmatrix tiles, so `epi_n < 16` emits ZERO stores and the output
-    keeps whatever the buffer held. It is silent -- nothing faults, the shapes
-    are right, the values are stale. Found by the full suite the day
-    `_epi_swizzle_lines` stopped raising and this geometry started rendering."""
-    from cudnn.gemm.frost.compiler import _epi_n, _use_tma_store_epi
+def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> None:
+    """The M-major store stages an M-contiguous column with one scalar store per
+    drain column, so a narrow `epi_n` is just fewer stores. The arm it replaced
+    walked `range(epi_n // 16)` stmatrix blocks and emitted ZERO of them below
+    16 -- silent, not a fault -- which is what this geometry used to be rejected
+    for."""
+    from cudnn.gemm.frost.compiler import _store_modes, jit_from_cudnn_graph
     from cudnn.gemm.frost.graph_analyzer import analyze
 
     m, n, k = 256, 256, 256
-    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
-    B = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
-    C = g.matmul(A=A, B=B, name="mm")
-    C.set_output(True).set_data_type(_BF16)
-    C.set_stride([m * n, 1, m])
+    cfg = by_name(name)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+        B = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(_BF16)
+        C.set_stride([m * n, 1, m])
+        return g, A, B, C
+
+    g, _, _, _ = build()
     chain = analyze(g)
     assert chain.out_major == "m"
-    cfg = by_name(name)
-    assert _use_tma_store_epi(chain, cfg, 16, 1) is want_tma
-    assert (_epi_n(cfg, 1, "bf16") >= 16) is want_tma
+    assert _store_modes(chain, cfg, cta_group) == ("tma",)
+
+    torch.manual_seed(0)
+    a = torch.randn(1, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, n, k, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        slack = 4096
+        raw = torch.full((2 * n * m + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+        c = raw.view(torch.bfloat16)[: n * m].view(1, n, m).transpose(1, 2)
+        tail = raw[2 * n * m :].clone()
+        gg, aa, bb, cc = build()
+        jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group, force_stg_epi=force_stg)({aa: a, bb: b, cc: c})
+        torch.cuda.synchronize()
+        assert torch.equal(raw[2 * n * m :], tail), "store ran past the output"
+        return c.contiguous()
+
+    assert torch.equal(run(False).view(torch.uint8), run(True).view(torch.uint8))
+
+
+@pytest.mark.parametrize("N,want_chunk", [(4096, 32), (384, 32), (40, 8), (24, 8), (8, 8)])
+def test_m_major_chunk_follows_n(N: int, want_chunk: int) -> None:
+    """An M-major output stores one element per chunk column through its own
+    strides, so its allowed store width does not bound the chunk -- N does. The
+    chunk walks N and the baked `sym_n` divisibility IS the chunk, so it must be
+    a power of two dividing N. An M-major output's own alignment measures the M
+    extent and says nothing about N, which is why it cannot supply this.
+
+    It used to be pinned at one element, which is always legal but costs ~1.5x on
+    the STG arm (4096^3 bf16 `64x128` 1ctamma: 160.5 -> 105.7 us)."""
+    from cudnn.gemm.frost.compiler import _epi_chunk_elems
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    M, K = 256, 256
+    cfg = by_name("CONFIG_sm100_64x128x128_64x128x32_cluster1x1")
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(_BF16)
+    C.set_stride([M * N, 1, M])
+    chain = analyze(g)
+    assert chain.out_major == "m"
+    # the STG chunk specifically -- `_epi_chunk_elems(..., use_tma=False)` -- which
+    # is what an M-major scatter walks, whichever arm this config ends up on.
+    assert _epi_chunk_elems(chain, cfg, 1, False) == want_chunk
+
+
+def test_epi_n_divides_the_drain_width() -> None:
+    """`epi_n` is the TMA arm's subtile width, and an N-tile that is not a whole
+    number of subtiles would store a box past the tile edge into its neighbour
+    (TMA clamps only at the GLOBAL extent). So it must DIVIDE the drain width --
+    which is why it is a power of two dividing `cols`, not the power-of-two floor
+    OF `cols`. Flooring by value rejected every 8-multiple that is not a
+    32-multiple (48 -> 32, and 48 % 32 != 0), i.e. 65 % of the catalog."""
+    from cudnn.gemm.frost.compiler import _epi_n, _epi_tile_cols
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    seen_non_pow2_tile = False
+    for cfg in CATALOG:
+        for cta_group in (1, 2):
+            if cta_group == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_n % 16 or cfg.mma_inst_n % 16):
+                continue
+            cols = _epi_tile_cols(cfg, cta_group)
+            seen_non_pow2_tile |= cols & (cols - 1) != 0
+            for dt in ("bf16", "fp32", "fp8_e4m3", "fp4_e2m1"):
+                n = _epi_n(cfg, cta_group, dt)
+                assert n > 0 and n & (n - 1) == 0, (cfg.name, cta_group, dt, n)
+                assert cols % n == 0, f"{cfg.name} cta_group={cta_group} {dt}: epi_n {n} does not divide {cols}"
+    assert seen_non_pow2_tile, "the catalog no longer carries a non-power-of-2 drain width — the test is vacuous"
+
+
+def test_the_auto_path_never_picks_a_non_power_of_two_tile() -> None:
+    """`select_config` scores N only over {32,64,128,256}, so the widths the
+    divisor rule newly admits are reachable through a forced config, not through
+    the engine's own choice."""
+    from cudnn.gemm.frost.tile_config import select_config
+
+    widths = set()
+    for M in (64, 128, 512, 4096, 16384):
+        for N in (64, 128, 512, 4096, 11008):
+            for num_gemms in (1, 2, 3):
+                for block_scale in (False, True):
+                    try:
+                        widths.add(select_config(M, N, num_gemms=num_gemms, block_scale=block_scale)[0].cta_tile_n)
+                    except NotImplementedError:
+                        pass
+    assert widths, "select_config produced nothing — the sweep is vacuous"
+    assert all(w & (w - 1) == 0 for w in widths), sorted(widths)
 
 
 def test_templates_take_the_chunk_from_the_rendered_constant() -> None:

@@ -2720,6 +2720,7 @@ _STRUCTURED_OPS = {
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
             "use_beta_sigmoid",
+            "beta_guard",
             "safe_gate",
             "gate_lower_bound",
             "batch_invariant",
@@ -2735,7 +2736,7 @@ _STRUCTURED_OPS = {
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "beta_guard", "safe_gate", "gate_lower_bound", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,

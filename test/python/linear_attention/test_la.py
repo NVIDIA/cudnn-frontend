@@ -33,7 +33,7 @@ import torch.nn.functional as F  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, rms_ratio  # noqa: E402
-from .reference_gdn2 import gdn2_reference  # noqa: E402
+from .reference_gdn2 import beta_guard_reference, gdn2_reference  # noqa: E402
 from .reference_kda import kda_reference  # noqa: E402
 
 pytestmark = [
@@ -254,7 +254,7 @@ def run_fwd(backend, case, *, cu=None, **kw):
         return pinned_op(backend, case.variant)(*op_args(case, cu=cu), **kw)
 
 
-def reference(case, *, scale=None, initial_state=None, l2norm=False, cu=None):
+def reference(case, *, scale=None, initial_state=None, l2norm=False, cu=None, beta_guard=False):
     fn = {"gdn": gdn_reference, "kda": kda_reference, "gdn2": gdn2_reference}[case.variant]
     q, k = case.q, case.k
     if l2norm:
@@ -264,6 +264,8 @@ def reference(case, *, scale=None, initial_state=None, l2norm=False, cu=None):
     if case.variant == "gdn2":
         args.append(case.gates["w"])
     kwargs = dict(scale=scale, initial_state=initial_state)
+    if beta_guard:
+        kwargs["beta_guard"] = True
     if case.varlen or cu is not None:
         kwargs["cu_seqlens"] = case.cu if cu is None else cu
     with torch.no_grad():
@@ -277,13 +279,16 @@ def assert_rms_close(name, out, want, tol):
     assert r < tol, f"{name} rms ratio {r:.4g} >= {tol}"
 
 
-def assert_fwd_parity(backend, case, *, scale=None, use_initial_state=False, l2norm=False, seed=SEED + 1):
+def assert_fwd_parity(backend, case, *, scale=None, use_initial_state=False, l2norm=False, beta_guard=False, seed=SEED + 1):
     set_seed(seed)
     state0 = None
     if use_initial_state:
         state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
-    o, fs = run_fwd(backend, case, scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
-    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm)
+    op_kw = dict(scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+    if beta_guard:
+        op_kw["beta_guard"] = True
+    o, fs = run_fwd(backend, case, **op_kw)
+    o_ref, fs_ref = reference(case, scale=scale, initial_state=state0, l2norm=l2norm, beta_guard=beta_guard)
     assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
     if fs is not None and fs.numel():
         assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype])
@@ -525,7 +530,7 @@ def test_fwd_output_contract(backend, variant):
 # ---------------------------------------------------------------------------
 
 
-def assert_bwd_parity(backend, case, *, scale=None, use_initial_state=False, use_dfs=False, l2norm=False, gate_grad_tol=None, seed=SEED + 1):
+def assert_bwd_parity(backend, case, *, scale=None, use_initial_state=False, use_dfs=False, l2norm=False, beta_guard=False, gate_grad_tol=None, seed=SEED + 1):
     variant, tol = case.variant, BWD_TOL[case.dtype]
     tensors = {"q": case.q, "k": case.k, "v": case.v, "g": case.gates["g"], "beta": case.gates["beta"]}
     if variant == "gdn2":
@@ -544,7 +549,10 @@ def assert_bwd_parity(backend, case, *, scale=None, use_initial_state=False, use
         if variant == "gdn2":
             args.append(op_leaves["w"])
         args.append(case.cu)
-        o, fs = pinned_op(backend, variant)(*args, scale=scale, initial_state=state0_op, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+        op_kw = dict(scale=scale, initial_state=state0_op, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+        if beta_guard:
+            op_kw["beta_guard"] = True
+        o, fs = pinned_op(backend, variant)(*args, **op_kw)
         dO = torch.randn_like(o)
         outputs, grad_outputs = [o], [dO]
         dFS = None
@@ -563,6 +571,8 @@ def assert_bwd_parity(backend, case, *, scale=None, use_initial_state=False, use
     if variant == "gdn2":
         ref_args.append(ref_leaves["w"])
     ref_kwargs = dict(scale=scale, initial_state=state0_ref)
+    if beta_guard:
+        ref_kwargs["beta_guard"] = True
     if case.varlen:
         ref_kwargs["cu_seqlens"] = case.cu
     o_ref, fs_ref = ref_fn(*ref_args, **ref_kwargs)
@@ -1050,6 +1060,164 @@ def test_beta_sigmoid_backward(backend, variant):
     scale = ident.abs().max().item()
     assert scale > 1e-3, "dbeta is ~0, the comparison would be vacuous"
     assert (got - ident).abs().max().item() / scale < 2e-2
+
+
+# ---------------------------------------------------------------------------
+# GDN-2 beta guard (erase-side safeguard)
+# ---------------------------------------------------------------------------
+
+
+def beta_guard_trip_fraction(case):
+    """Reference sensor trip/fallback fractions on a case with H == HV == HO
+    (no head expansion) and log-space gates (no safe_gate)."""
+    kn = F.normalize(case.k.float(), dim=-1).double()
+    _, unsafe, fallback = beta_guard_reference(kn, case.gates["beta"].double(), case.gates["g"].double().exp(), case.dtype)
+    return unsafe.double().mean().item(), fallback.double().mean().item()
+
+
+def test_beta_guard_fwd(backend):
+    """Guard on: parity vs the fp64 guarded reference; the sensor must
+    actually fire on this data or the parity is vacuous."""
+    case = make_case("gdn2", torch.bfloat16, T=256)
+    trip, _ = beta_guard_trip_fraction(case)
+    assert trip > 0.01, f"beta guard sensor never fires on this case (trip={trip:.4f})"
+    assert_fwd_parity(backend, case, l2norm=True, beta_guard=True)
+
+
+def test_beta_guard_fwd_mixed_headroom(backend):
+    """Tokens with real decay headroom must pass through untouched next to
+    tripping tokens (exercises the safe path and the per-token gate recovery
+    at chunk rows 0 and interior rows)."""
+    case = make_case("gdn2", torch.bfloat16, T=256)
+    g = case.gates["g"].clone()
+    g[:, ::2] += math.log(0.5)
+    case = case.clone(gates=dict(case.gates, g=g))
+    trip, _ = beta_guard_trip_fraction(case)
+    assert 0.01 < trip < 0.99, f"want a mixed safe/unsafe population, got trip={trip:.4f}"
+    assert_fwd_parity(backend, case, l2norm=True, beta_guard=True)
+
+
+@pytest.mark.parametrize("seq_lens", [[64, 192], [31, 63, 93, 123]], ids=["two", "ragged"])
+def test_beta_guard_fwd_varlen(backend, seq_lens):
+    assert_fwd_parity(backend, make_case("gdn2", torch.bfloat16, seq_lens=seq_lens), l2norm=True, beta_guard=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_beta_guard_bwd(backend, dtype):
+    assert_bwd_parity(backend, make_case("gdn2", dtype, T=128), l2norm=True, beta_guard=True)
+
+
+def test_beta_guard_bwd_varlen(backend):
+    assert_bwd_parity(backend, make_case("gdn2", torch.bfloat16, seq_lens=[31, 63, 93, 123]), l2norm=True, beta_guard=True)
+
+
+def test_beta_guard_bwd_initial_state(backend):
+    assert_bwd_parity(backend, make_case("gdn2", torch.bfloat16, T=128), l2norm=True, beta_guard=True, use_initial_state=True)
+
+
+def test_beta_guard_recompute_matches_checkpoints(backend):
+    """Prefill (checkpoint dump) and recompute must apply the same guard: the
+    gradient gap between the checkpoint-reuse and recompute backward paths
+    with the guard on must stay at the scale of the guard-off gap."""
+    case = make_case("gdn2", torch.bfloat16, T=256)
+    tensors = (case.q, case.k, case.v, case.gates["g"], case.gates["beta"], case.gates["w"])
+
+    def path_gap(beta_guard):
+        grads = {}
+        dO = None
+        for ckpt in (16, 0):
+            leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors]
+            kw = dict(use_qk_l2norm_in_kernel=True, checkpoint_every_n_tokens=ckpt)
+            if beta_guard:
+                kw["beta_guard"] = True
+            with waive_unsupported(backend, "gdn2"):
+                out = pinned_op(backend, "gdn2")(*leaves, case.cu, **kw)
+            o = out[0]
+            if dO is None:
+                set_seed(SEED + 23)
+                dO = torch.randn_like(o)
+            grads[ckpt] = torch.autograd.grad([o], leaves, [dO])
+        return max(rms_ratio(a, b.float()) for a, b in zip(grads[16], grads[0]))
+
+    assert path_gap(True) <= max(4.0 * path_gap(False), 1.0e-3)
+
+
+def test_beta_guard_with_sigmoid_fwd(backend):
+    """Guard on top of the in-kernel sigmoid: io-dtype logits must match the
+    post-activation io beta path."""
+    case = make_case("gdn2", torch.bfloat16, T=256)
+    set_seed(SEED + 17)
+    braw = torch.randn_like(case.gates["beta"].float()).to(case.dtype)
+    raw_case = case.clone(gates=dict(case.gates, beta=braw))
+    eff_case = case.clone(gates=dict(case.gates, beta=torch.sigmoid(braw.float()).to(case.dtype)))
+    kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True, beta_guard=True)
+    o_raw, fs_raw = run_fwd(backend, raw_case, use_beta_sigmoid_in_kernel=True, **kw)
+    o_eff, fs_eff = run_fwd(backend, eff_case, **kw)
+    assert_rms_close("o", o_raw, o_eff.double(), 2e-2)
+    assert rms_ratio(fs_raw, fs_eff) < 2e-2
+
+
+def test_beta_guard_with_sigmoid_backward(backend):
+    """Straight-through under the in-kernel sigmoid: dbeta wrt the logits must
+    equal the post-activation path's dbeta times s*(1-s) at the io-rounded s
+    (the Jacobian the kernel reads back from the original logits)."""
+    case = make_case("gdn2", torch.bfloat16, T=256)
+    set_seed(SEED + 19)
+    braw = torch.randn_like(case.gates["beta"].float()).to(case.dtype)
+    s_io = torch.sigmoid(braw.float()).to(case.dtype)
+
+    def dbeta(beta, **kw):
+        leaf = to_thd(beta).detach().clone().requires_grad_(True)
+        args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), leaf, to_thd(case.gates["w"])]
+        with waive_unsupported(backend, "gdn2"):
+            o, _ = pinned_op(backend, "gdn2")(*args, case.cu, use_qk_l2norm_in_kernel=True, beta_guard=True, **kw)
+            o.sum().backward()
+        return leaf.grad.double()
+
+    got = dbeta(braw, use_beta_sigmoid_in_kernel=True)
+    s = to_thd(s_io).double()
+    ident = dbeta(s_io) * s * (1 - s)
+    scale = ident.abs().max().item()
+    assert scale > 1e-3, "dbeta is ~0, the comparison would be vacuous"
+    assert (got - ident).abs().max().item() / scale < 2e-2
+
+
+def test_beta_guard_multi_tile(backend):
+    """B*H well above the SM count with the guard on: several (b, h) tiles per
+    CTA exercise the moved beta/q stage releases across tile boundaries."""
+    case = make_case("gdn2", torch.bfloat16, B=8, T=192, H=64)
+    assert_fwd_parity(backend, case, l2norm=True, beta_guard=True)
+
+
+def test_beta_guard_bwd_determinism(backend):
+    """Guard-on backward must stay bitwise repeatable (the FROST determinism
+    contract) across the relocated mb_beta_done / mb_q_done releases."""
+    case = make_case("gdn2", torch.bfloat16, seq_lens=[96, 32, 160, 1])
+    tensors = (case.q, case.k, case.v, case.gates["g"], case.gates["beta"], case.gates["w"])
+    dO = None
+    baseline = None
+    for _ in range(4):
+        leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors]
+        with waive_unsupported(backend, "gdn2"):
+            o, _ = pinned_op(backend, "gdn2")(*leaves, case.cu, use_qk_l2norm_in_kernel=True, beta_guard=True)
+        if dO is None:
+            set_seed(SEED + 29)
+            dO = torch.randn_like(o)
+        grads = torch.autograd.grad([o], leaves, [dO])
+        if baseline is None:
+            baseline = grads
+        else:
+            for name, a, b in zip(("q", "k", "v", "g", "beta", "w"), baseline, grads):
+                assert torch.equal(a, b), f"d{name} not bitwise repeatable under beta_guard"
+
+
+def test_beta_guard_requires_l2norm(backend):
+    """The engine must decline beta_guard without the in-kernel l2 norm."""
+    case = make_case("gdn2", torch.bfloat16, T=64)
+    if not backend.engines["gdn2"]:
+        pytest.skip(f"the {backend.name} backend has no gdn2 engine")
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        pinned_op(backend, "gdn2")(*op_args(case), beta_guard=True)
 
 
 @pytest.mark.parametrize("H", (40, 160))

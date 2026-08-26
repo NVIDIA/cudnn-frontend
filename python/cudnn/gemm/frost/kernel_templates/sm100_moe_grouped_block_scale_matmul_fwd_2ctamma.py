@@ -140,9 +140,7 @@ def _kernel(
     tidx = cute.arch.thread_idx()[0]
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
-    bidz = cute.arch.block_idx()[2]
     gridx = cute.arch.grid_dim()[0]
-    gridy = cute.arch.grid_dim()[1]
 
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
@@ -226,7 +224,9 @@ def _kernel(
 
     # @@TMA_STORE_ONLY:BEGIN@@
     # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    epi_subtile_elems = epi_tile_mn[0] * epi_tile_mn[1] * epi_slot_widen
+    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
+    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
+    epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
         epi_subtile_elems * EPI_SMEM_STAGES,
@@ -330,7 +330,6 @@ def _kernel(
 
     # @@INJECT_TAP_PTRS@@
 
-    VEC_BYTES = vec_bytes_epi
     vsize = epi_chunk_elems
 
     M = m
@@ -821,7 +820,6 @@ def _kernel(
             sfa_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfa_col_bases[i]) for i in range(num_a_operands)]
             sfb_tmem_bases = [(base_row_id << 16) | (base_col_id_root + sfb_col_bases[j]) for j in range(num_b_operands)]
             s2t_shape, s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
-            sfa_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfa_tmem_bases]
             sfb_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfb_tmem_bases]
             sfa_dst_ptrs = [
                 [nvvm.make_tmem_ptr(sfa_tmem_bases[i] + m * registers_per_block, cutlass.Float32) for m in range(num_mma_m)] for i in range(num_a_operands)
@@ -1522,11 +1520,11 @@ def compile() -> Callable:
     # @@INJECT_COMPILE_TAP_FAKES@@
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    def _make_fake_c(_dt=None, _div=None):
+    def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
-            cd_dtype if _dt is None else _dt,
-            (sym_m, sym_n // (cd_fake_n_div if _div is None else _div), 1),
-            stride_order=(1, 0, 2),
+            _dt,
+            (sym_m, sym_n // _div, 1),
+            stride_order=(0, 1, 2) if _mm else (1, 0, 2),
             assumed_align=16,
         )
 
