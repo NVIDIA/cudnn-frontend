@@ -60,7 +60,7 @@ def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
 
     return tensor
 
-def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16):
+def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16, head_axis=1):
     """
     Overwrite a random subset of q rows (at least one) so their attention
     scores against every k row are deeply negative — below the fp32 exp
@@ -83,6 +83,9 @@ def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.
     rotation mixes u across positions — which is fine: the data stays valid,
     those tests just may not exercise the negative regime.)
 
+    GQA/MQA: inject only into the first q-head of each kv-head group — otherwise the large
+    u-aligned dK/dV partials cancel in the cross-head reduce, amplifying its staging rounding.
+
     Args:
         q, k: tensors whose innermost dim is d; a "row" is one index of
             q.shape[:-1] (works for bhsd, bshd and packed thd layouts alike).
@@ -91,7 +94,8 @@ def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.
             magnitude lands past the underflow cliff after scaling.
         k_shift: integer amplitude of the common k component.
         target: desired post-scale score for the selected rows.
-        row_fraction: fraction of q rows to overwrite (min 1 row).
+        row_fraction: fraction of eligible q rows to overwrite (min 1 row).
+        head_axis: which dim of q/k is the head (1 for bhsd/thd, 2 for bshd).
     """
     d = q.shape[-1]
     assert k.shape[-1] == d
@@ -100,8 +104,12 @@ def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.
     k.add_((k_shift * u).to(k.dtype))
     lead = q.shape[:-1]
     n_rows = math.prod(lead)
-    count = max(1, int(n_rows * row_fraction))
-    sel = torch.randperm(n_rows, generator=rng, device=q.device)[:count]
+    rows = torch.arange(n_rows, device=q.device)
+    heads_per_group = q.shape[head_axis] // max(1, k.shape[head_axis])
+    if heads_per_group > 1:
+        rows = rows[torch.unravel_index(rows, lead)[head_axis] % heads_per_group == 0]
+    count = max(1, int(rows.numel() * row_fraction))
+    sel = rows[torch.randperm(rows.numel(), generator=rng, device=q.device)[:count]]
     q[torch.unravel_index(sel, lead)] = (-m * u).to(q.dtype)
 
 def create_sparse_int_tensor(shape, dtype, rng, *, device='cuda', sparsity=0.8, abs_max=2, memory_format=None):

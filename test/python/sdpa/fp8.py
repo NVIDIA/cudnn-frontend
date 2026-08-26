@@ -400,7 +400,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     v_gen = create_sparse_int_tensor((b, s_kv, h_v, d_vo), torch.float, rng_data)
     # keep at least a few q rows in the deeply-negative-score regime (see
     # inject_negative_score_rows); must run before the amax/descale computation
-    inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale)
+    inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale, head_axis=2)  # bshd
 
     q_amax = q_gen.abs().max().item()
     k_amax = k_gen.abs().max().item()

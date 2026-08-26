@@ -776,8 +776,13 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                 score_sum_exp_gpu[i, :, m:, :] = 0
 
     if cfg.is_train:
+        # Use the O the bwd kernel actually consumes for D = rowsum(dO * O): a separately
+        # rounded o_ref shifts D, which injected negative-score rows amplify into dK/dQ.
+        o_bwd_ref = o_gpu.detach().float()
+        if cfg.is_ragged:
+            o_bwd_ref = convert_packed_to_uniform(o_bwd_ref, seq_len_q_ref, cfg.s_q)
         bwd_ret = compute_ref_backward(
-            q_ref, k_ref, v_ref, o_ref, dO_ref,
+            q_ref, k_ref, v_ref, o_bwd_ref, dO_ref,
             attn_scale=attn_scale,
             bias=bias_ref,
             is_alibi=cfg.is_alibi,
