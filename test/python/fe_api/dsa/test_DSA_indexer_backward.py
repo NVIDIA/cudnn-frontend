@@ -1173,9 +1173,10 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
     request,
 ):
     """Non-unit sm_scale: (a) the gradients match a strict fp64 recompute that
-    folds the scale into the grad signal -- an autograd-reference check alone
-    does not catch a mis-applied scale here, since its own bf16 noise floor
-    (rms_rel ~0.29) is larger than a 1.2x scale error; (b) both in-place score
+    folds the scale into the grad signal -- an autograd-reference check
+    alone historically could not catch a mis-applied scale here (its noise
+    floor has since dropped to rms_rel <= 0.005, but the fp64 recompute stays
+    the authoritative scale check); (b) both in-place score
     buffers are left bitwise identical to the default backend's, i.e. the
     scratch holds exactly kernel 1's grad_signal and ``index_score`` is
     consumed the same way (the scale folds inside kernel 2, no host-side
