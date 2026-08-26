@@ -47,6 +47,9 @@ create_sdpa_forward_graph(int64_t const b,
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
+    // Dim order is always BHSD. Strides describe the memory layout and may differ
+    // across tensors. Q/K/V below use a head-major layout:
+    //   stride = {h * s * d, s * d, d, 1}
     auto Q = graph->tensor(fe::graph::Tensor_attributes()
                                .set_name("Q")
                                .set_uid(Q_UID)
@@ -93,6 +96,10 @@ create_sdpa_forward_graph(int64_t const b,
 
     auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_options);
 
+    // O keeps BHSD dims but intentionally uses a different valid layout than Q/K/V:
+    //   stride = {h * d, d, b * h * d, 1}
+    // Matching Q/K/V ({h * s * d, s * d, d, 1}) is also valid; pick strides to match
+    // how the caller allocates O (see issue #184).
     O->set_output(true).set_dim({b, h_q, s_q, d_v}).set_stride({h_q * d_v, d_v, b * h_q * d_v, 1}).set_uid(O_UID);
 
     if (generate_stats) {
