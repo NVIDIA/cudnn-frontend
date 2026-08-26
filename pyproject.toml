@@ -54,6 +54,9 @@ classifiers = [
 "Bug Tracker" = "https://github.com/NVIDIA/cudnn-frontend/issues"
 "Release Notes" = "https://github.com/NVIDIA/cudnn-frontend/releases"
 
+[project.scripts]
+cudnn-repro = "cudnn.repro:main"
+
 [project.optional-dependencies]
 cutedsl = [
     # NOT pinned to the floor the FROST engines need (4.7.0): pinning it here

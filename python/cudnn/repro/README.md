@@ -13,13 +13,8 @@ This is useful for debugging failures, reproducing CI issues locally, or creatin
 
 ## Installation
 
-```bash
-# Install globally (recommended)
-uv tool install --editable tools/cudnn_repro
-
-# Or install in venv
-pip install -e tools/cudnn_repro
-```
+Ships with the `cudnn` package — nothing extra to install. Invoke it as
+`python -m cudnn.repro`, or through the `cudnn-repro` console script.
 
 ## Quick Start
 
@@ -30,7 +25,7 @@ export CUDNN_FRONTEND_LOG_FILE=/tmp/sdpa.log
 pytest test/python/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]
 
 # 2. Generate repro command
-cudnn-repro /tmp/sdpa.log
+python -m cudnn.repro /tmp/sdpa.log
 
 # 3. Run the repro
 # (copy-paste the output command)
@@ -40,16 +35,19 @@ cudnn-repro /tmp/sdpa.log
 
 ```bash
 # Process a log file
-cudnn-repro /path/to/log
+python -m cudnn.repro /path/to/log
+
+# Write the command to a file instead of stdout
+python -m cudnn.repro /path/to/log repro.sh
 
 # Read from stdin
-cat log | cudnn-repro -
+cat log | python -m cudnn.repro -
 
 # Process all entries (not just last)
-cudnn-repro --all log
+python -m cudnn.repro --all log
 
 # Debug mode - saves parsed payload and command output
-CUDNN_DEBUG_REPRO=1 cudnn-repro log
+CUDNN_DEBUG_REPRO=1 python -m cudnn.repro log
 ```
 
 ## How it works
@@ -77,8 +75,12 @@ The tool auto-detects SDPA operation tags and routes to the appropriate handler:
 ## Testing
 
 ```bash
-pytest tools/cudnn_repro/tests/ -vv
+# Unit tests (L0, no GPU)
+pytest test/python/repro/ -vv
 
-# Control test targets
-CUDNN_REPRO_TARGETS="test1,test2" pytest tools/cudnn_repro/tests/
+# Closed-loop tests (L1, needs a GPU): generate a log, replay it, diff the JSON
+pytest test/python/repro/ -m L1 -vv
+
+# Control closed-loop test targets
+CUDNN_REPRO_TARGETS="test1,test2" pytest test/python/repro/ -m L1
 ```

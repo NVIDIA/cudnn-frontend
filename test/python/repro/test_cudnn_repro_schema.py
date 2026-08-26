@@ -3,11 +3,13 @@
 
 import pytest
 
-import cudnn_repro.operations as operations
-import cudnn_repro.repro_command as repro_command
-import cudnn_repro.sdpa_fwd as sdpa_fwd
+import cudnn.repro.operations as operations
+import cudnn.repro.repro_command as repro_command
+import cudnn.repro.sdpa_fwd as sdpa_fwd
 
 from .helpers import tensor_list
+
+pytestmark = pytest.mark.L0
 
 
 def fwd_payload(*, gid=1, unfuse_fma=False):

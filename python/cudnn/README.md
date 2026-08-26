@@ -31,6 +31,8 @@ python/cudnn/
 │   └── api.py                      # High-level API implementation
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
 ├── gemm/                           # The GEMM operation family (see below)
+├── collect_env.py                  # `python -m cudnn.collect_env` environment report
+├── repro/                          # `python -m cudnn.repro` SDPA log -> pytest repro command
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
 ```
