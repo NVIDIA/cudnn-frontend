@@ -17,7 +17,7 @@ import torch
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
 from cudnn.engines import MANIFEST, is_python_engine
-from frost_test_utils import select_engine
+from frost_test_utils import make_dense_bias, select_engine
 
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as engines_bwd_sm80
@@ -135,6 +135,58 @@ def test_fwd_engine_end_to_end():
     ref = torch.nn.functional.scaled_dot_product_attention(q_buf.float(), k_buf.float(), v_buf.float(), is_causal=True, scale=_SCALE).to(torch.float16)
     torch.testing.assert_close(o_buf, ref, rtol=1e-2, atol=4e-3)
     assert torch.isfinite(stats_buf).all()
+
+
+def _check_fwd_engine_attention_bias(d, bias_dtype, bias_layout):
+    torch.manual_seed(67)
+    bias_values = make_dense_bias(H, S, S, bias_dtype, bias_layout)
+    g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = _bshd_stride(B, H, S, d)
+    q = g.tensor(name="q", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    k = g.tensor(name="k", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    v = g.tensor(name="v", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    bias_type = cudnn.data_type.FLOAT if bias_dtype == torch.float32 else _HALF
+    bias = g.tensor(name="bias", dim=(1, H, S, S), stride=bias_values.stride(), data_type=bias_type)
+    scale = 1.0 / math.sqrt(d)
+    o, stats = g.sdpa(q=q, k=k, v=v, bias=bias, attn_scale=scale, use_causal_mask=True, generate_stats=True)
+    o.set_output(True).set_dim((B, H, S, d)).set_stride(st).set_data_type(_HALF)
+    stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    _native_then_pin(g, _FWD)
+
+    q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
+    bias_buf = bias_values.view(-1) if bias_values.is_contiguous() else bias_values
+    o_buf = torch.empty_like(q_buf)
+    stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
+    g.execute({q: q_buf, k: k_buf, v: v_buf, bias: bias_buf, o: o_buf, stats: stats_buf}, None)
+    torch.cuda.synchronize()
+
+    scores = torch.matmul(q_buf.float(), k_buf.float().transpose(-1, -2)) * scale + bias_values.float()
+    causal_mask = torch.ones(S, S, dtype=torch.bool, device="cuda").triu(diagonal=1)
+    masked_scores = scores.masked_fill(causal_mask, float("-inf"))
+    ref = torch.matmul(torch.softmax(masked_scores, dim=-1), v_buf.float()).to(torch.float16)
+    torch.testing.assert_close(o_buf, ref, rtol=1e-2, atol=4e-3)
+    torch.testing.assert_close(stats_buf.squeeze(-1), torch.logsumexp(masked_scores, dim=-1), rtol=3e-2, atol=5e-2)
+
+
+@_SM80
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("bias_dtype", "bias_layout"),
+    [(torch.float16, "contiguous"), (torch.float32, "contiguous"), (torch.float16, "strided")],
+    ids=["bias-fp16", "bias-fp32", "bias-fp16-strided"],
+)
+def test_fwd_engine_attention_bias(bias_dtype, bias_layout):
+    """The shared adapter views raw bias storage through its graph descriptor."""
+
+    _check_fwd_engine_attention_bias(128, bias_dtype, bias_layout)
+
+
+@_SM80
+@pytest.mark.L1
+def test_fwd_engine_strided_attention_bias_d256():
+    """The separate SM80 D256 kernel reads a permuted, gapped bias directly."""
+
+    _check_fwd_engine_attention_bias(256, torch.float32, "strided")
 
 
 def _check_fwd_engine_strided_stats(d):

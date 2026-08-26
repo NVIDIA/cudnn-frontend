@@ -77,6 +77,8 @@ class TemplateParams:
     window_left: Optional[int] = None
     window_right: Optional[int] = None
     bottom_right: bool = False
+    has_bias: bool = False
+    bias_is_fp32: bool = False
     has_sink: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
@@ -160,6 +162,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
     if k.thd_varlen and not k.seq_kv_lens_present:
         raise ValueError(f"{flavor}: THD/varlen requires SEQ_KV_LENS_PRESENT (per-sequence padded masking)")
+    if k.thd_varlen and k.has_bias:
+        raise ValueError(f"{flavor}: attention bias is dense-only (THD has no single [1, H_q, S_q, S_kv] bias shape)")
+    if k.bias_is_fp32 and not k.has_bias:
+        raise ValueError(f"{flavor}: bias_is_fp32 requires has_bias")
     if k.seq_q_lens_present:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")

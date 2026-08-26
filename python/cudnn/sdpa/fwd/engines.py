@@ -25,7 +25,6 @@ engines may share one template. Neither direction is 1:1.
 
 from __future__ import annotations
 
-import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -431,6 +430,19 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         bias_dt = facts.bias_t.get_data_type()
         if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
             return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
+        if facts.thd:
+            return "attention bias is dense-only (THD has no single [1, H_q, S_q, S_kv] bias shape)"
+        bias_dim = tuple(facts.bias_t.get_dim())
+        expected_dim = (1, facts.h_q, facts.s_q, facts.s_kv)
+        if bias_dim != expected_dim:
+            return f"bias must be [1, H_q, S_q, S_kv] = {expected_dim}; got {bias_dim}"
+        bias_stride = tuple(facts.bias_t.get_stride())
+        if not ga.dense_layout_ok(bias_dim, bias_stride):
+            return (
+                "bias must use a dense-compatible H/Q permutation or padded layout "
+                "with contiguous K and non-broadcast, non-overlapping-by-span strides; "
+                f"got {bias_stride}"
+            )
 
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
@@ -517,6 +529,7 @@ def _sm100_spec() -> EngineSpec:
             phase="prefill",
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            bias=True,
             causal=True,
             bottom_right=True,
             right_band_widening=True,
@@ -763,6 +776,7 @@ def _sm120_spec() -> EngineSpec:
             # native shapes are the cross product of the supported tiles.
             d_shapes=frozenset((tq, tv) for tq in SUPPORTED_HEAD_TILES for tv in SUPPORTED_HEAD_TILES),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            bias=True,
             causal=True,
             bottom_right=True,
             swa=True,
@@ -861,6 +875,7 @@ def lower_dsl_prefill(
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
         sample_o=ga.tensor_desc_from_ir(facts.o_t, name="o"),
         sample_lse=ga.tensor_desc_from_ir(facts.stats_t, "lse") if facts.stats_t is not None else None,
+        sample_bias=ga.tensor_desc_from_ir(facts.bias_t, "bias") if facts.bias_t is not None else None,
         # A right-widened band lowers as the causal mask with a BAND_RIGHT
         # diagonal offset (facts.causal is False when right_bound > 0).
         is_causal=facts.causal or facts.right_band_widening,
@@ -895,18 +910,6 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=knobs.softmax_precision if knobs is not None else None,
-        # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
-        # specializations of that template): forwarded only to adapters whose
-        # constructor declares them — every other row's mismatch gated the
-        # operands off already.
-        **(
-            {
-                "bias_present": facts.bias_t is not None,
-                "bias_fp32": facts.bias_t is not None and facts.bias_t.get_data_type() == cudnn.data_type.FLOAT,
-            }
-            if "bias_present" in inspect.signature(_adapter(api_type).__init__).parameters
-            else {}
-        ),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -924,13 +927,6 @@ def lower_dsl_prefill(
     synth_kv_bytes = ws_align(facts.b * 4) if synth_kv_padding else 0
     api_scratch_bytes = api.scratch_workspace_bytes()
     total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
-
-    # SM80-only feature operand (bias): the row's capability gate admitted it,
-    # and the adapter's execute() declares the matching optional keyword —
-    # forwarded below only when both hold. ALiBi / block_mask / score-stats
-    # graphs never reach a FROST row (every capability row declines them, so
-    # the backend serves them).
-    _extra_exec_keys = {"bias_tensor"} & set(inspect.signature(type(api).execute).parameters)
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -993,9 +989,9 @@ def lower_dsl_prefill(
         # lse_optional (the kernel compiles the LSE store out) — no dummy.
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
-        # bias flows only to adapters declaring the keyword (the SM80 row);
-        # every other feature operand is gated off by mismatch for all rows.
+        # Every other feature operand is gated off by mismatch for all rows.
         feature_ops = ga.resolve_feature_operands(facts, resolved)
+        bias_buf = feature_ops.bias
         sinks_buf = feature_ops.sinks
         seq_kv_buf = feature_ops.seq_kv_lens
         if synth_kv_padding and seq_kv_buf is None:
@@ -1033,6 +1029,7 @@ def lower_dsl_prefill(
             v_tensor=v_buf,
             o_tensor=o_buf,
             lse_tensor=lse_buf,
+            bias_tensor=bias_buf,
             scale_softmax=facts.scale,
             sinks=sinks_buf,
             seq_kv_lens=seq_kv_buf,
@@ -1052,10 +1049,6 @@ def lower_dsl_prefill(
                 descale_v=dv_buf,
                 scale_o=so_buf,
             )
-        if _extra_exec_keys:
-            # SM80 feature operand (mismatch admitted it for this row).
-            if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:
-                execute_kwargs["bias_tensor"] = feature_ops.bias
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
         api.execute(**execute_kwargs)

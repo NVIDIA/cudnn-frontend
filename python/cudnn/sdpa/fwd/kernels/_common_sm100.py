@@ -13,8 +13,10 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_tile_coords,
     lpt_l2_tile_coords,
 )
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
+from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA, apply_mask_chunk
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
+
+_LOG2E = 1.4426950408889634
 
 
 class Bars(NamedTuple):
@@ -825,3 +827,105 @@ def make_sdpa_helpers(
         thd_tma_offsets=_thd_tma_offsets,
         thd_sf_tile_bases=_thd_sf_tile_bases,
     )
+
+
+@cute.jit
+def load_attention_bias_chunk(
+    bias_tensor: cute.Tensor,
+    head_idx,
+    q_idx,
+    kv_col_base,
+    chunk_size: cutlass.Constexpr[int],
+):
+    """Load one score-row chunk from key-contiguous ``[1, H, Sq, Skv]`` bias.
+
+    Rows and columns outside the logical tail clamp to the last physical
+    element. The attention mask overwrites those lanes with ``-inf`` before
+    softmax, so the clamped values are never observed. Keeping every GMEM
+    address in bounds lets arbitrary Sq/Skv tails use the same specialization.
+    """
+
+    bias = cutlass.make_array_view(bias_tensor)
+    sq = cutlass.Int32(bias_tensor.shape[2])
+    skv = cutlass.Int32(bias_tensor.shape[3])
+    q_safe = cutlass.Int32(arith.select((q_idx < sq).ir_value(), q_idx.ir_value(), (sq - cutlass.Int32(1)).ir_value()))
+
+    def _load(i: int):
+        col = kv_col_base + cutlass.Int32(i)
+        col_safe = cutlass.Int32(arith.select((col < skv).ir_value(), col.ir_value(), (skv - cutlass.Int32(1)).ir_value()))
+        return cutlass.Float32(bias[cutlass.Int32(0), head_idx, q_safe, col_safe])
+
+    return cutlass.Vector.from_elements(tuple(_load(i) for i in range(chunk_size)), cutlass.Float32)
+
+
+@cute.jit
+def add_attention_bias_log2(
+    scores,
+    bias_tensor: cute.Tensor,
+    head_idx,
+    q_idx,
+    kv_col_base,
+    scale_log2,
+    tile_n: cutlass.Constexpr[int],
+):
+    """Return ``QK * scale_log2 + bias * log2(e)``."""
+
+    from cudnn.frost.tile_dsl.regtile import vec_concat
+
+    chunk = 64
+    bias_chunks = [
+        load_attention_bias_chunk(
+            bias_tensor,
+            head_idx,
+            q_idx,
+            kv_col_base + cutlass.Int32(i * chunk),
+            chunk,
+        )
+        for i in range(tile_n // chunk)
+    ]
+    return scores * scale_log2 + vec_concat(bias_chunks) * cutlass.Float32(_LOG2E)
+
+
+@cute.jit
+def apply_attention_mask(
+    scores,
+    q_idx,
+    kv_col_base,
+    seq_kv_len,
+    window_left: cutlass.Constexpr[int],
+    mask_flags: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+    bottom_right: cutlass.Constexpr[int] = 0,
+    causal_diag=None,
+    window_right: cutlass.Constexpr[int] = 0,
+):
+    """Apply the attention mask to already scaled and biased scores.
+
+    Bias must precede masking so masked lanes stay ``-inf`` even when their
+    bias values are nonfinite. The helper also returns the masked row max used
+    by the online softmax update.
+    """
+
+    from cudnn.frost.tile_dsl.pointwise import row_max_reduction
+    from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
+
+    chunk = 64
+    score_tile = RegTile(scores, size=tile_n)
+    masked_chunks = [
+        apply_mask_chunk(
+            score_tile[i * chunk : (i + 1) * chunk].vec,
+            q_idx,
+            kv_col_base + cutlass.Int32(i * chunk),
+            seq_kv_len,
+            window_left,
+            mask_flags,
+            N=chunk,
+            bottom_right=bottom_right,
+            causal_diag=causal_diag,
+            mask_value=float("-inf"),
+            window_right=window_right,
+        )
+        for i in range(tile_n // chunk)
+    ]
+    masked = vec_concat(masked_chunks)
+    return masked, row_max_reduction(masked)

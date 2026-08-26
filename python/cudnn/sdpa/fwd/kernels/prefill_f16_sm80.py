@@ -411,15 +411,17 @@ def _sdpa_kernel(
     heads_per_kv = H // H_kv  # Python int — folds at trace time
     kv_head_idx = head_idx if heads_per_kv == 1 else (head_idx // cutlass.Int32(heads_per_kv))
 
-    # Additive-bias per-head base pointer (element-addressed).  bias is
-    # [1, H, SQ, SKV] (broadcast over batch): head stride = SQ*SKV, q stride =
-    # SKV, col stride = 1.  Materialize the per-head ELEMENT base here; the
+    # Additive-bias per-head base pointer (element-addressed).  Bias is
+    # [1, H, SQ, SKV] (broadcast over batch); its compile-time tensor layout
+    # carries padded/permuted H/Q strides while SKV stays contiguous.  The
     # mainloop loads the per-lane tile frag (overlapped with the QK mma) and
     # the softmax injects it pre-scale.  bias_dt selects the GMEM load width.
     bias_dt = cutlass.Float32 if cutlass.const_expr(bias_is_fp32) else io_dtype
     if cutlass.const_expr(has_bias):
         _bias_ptr0 = cutlass.make_array_view(bias).data_ptr()
-        bias_head_e = cutlass.Int64(head_idx) * cutlass.Int64(SQ) * cutlass.Int64(SKV)
+        bias_head_e = cutlass.Int64(head_idx) * cutlass.Int64(bias.stride[1])
+        bias_q_stride_e = cutlass.Int64(bias.stride[2])
+        bias_k_stride_e = cutlass.Int64(bias.stride[3])
         bias_base = _bias_ptr0 + bias_head_e  # per-head element ptr
 
     # RoPE (cos, sin) table base — shared by all heads/batches (position-only).
@@ -1029,16 +1031,16 @@ def _sdpa_kernel(
                 if cutlass.const_expr(not is_even_mn):
                     bq_top = _imin_i32(bq_top, sq_runtime - cutlass.Int32(1))
                     bq_bot = _imin_i32(bq_bot, sq_runtime - cutlass.Int32(1))
-                bq_top64 = cutlass.Int64(bq_top) * cutlass.Int64(SKV)
-                bq_bot64 = cutlass.Int64(bq_bot) * cutlass.Int64(SKV)
+                bq_top64 = cutlass.Int64(bq_top) * bias_q_stride_e
+                bq_bot64 = cutlass.Int64(bq_bot) * bias_q_stride_e
                 for k in cutlass.range_constexpr(QK_N_FRAGS):
                     bca = bias_kv_col_base + cutlass.Int32(k * 8) + cutlass.Int32(2) * p_lane
                     bcb = bca + cutlass.Int32(1)
                     if cutlass.const_expr(not is_even_mn):
                         bca = _imin_i32(bca, skv_runtime - cutlass.Int32(1))
                         bcb = _imin_i32(bcb, skv_runtime - cutlass.Int32(1))
-                    bca64 = cutlass.Int64(bca)
-                    bcb64 = cutlass.Int64(bcb)
+                    bca64 = cutlass.Int64(bca) * bias_k_stride_e
+                    bcb64 = cutlass.Int64(bcb) * bias_k_stride_e
                     bias_frag[bbase + k * 4 + 0] = bias_pp[bq_top64 + bca64].to(cutlass.Float32) * inv_softmax_scale
                     bias_frag[bbase + k * 4 + 1] = bias_pp[bq_top64 + bcb64].to(cutlass.Float32) * inv_softmax_scale
                     bias_frag[bbase + k * 4 + 2] = bias_pp[bq_bot64 + bca64].to(cutlass.Float32) * inv_softmax_scale
@@ -1693,6 +1695,7 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     rope_max_s: int = 0,
     n_batch_logical: int = 0,
     lse_stride: Optional[tuple[int, int, int]] = None,
+    bias_stride: Optional[tuple[int, int, int, int]] = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1721,6 +1724,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     p = PARAMS
     if p.thd_varlen and p.has_bias:
         raise ValueError("sm80: bias + THD is not supported (varlen has no single [1,H,SQ,SKV] bias shape)")
+    if bias_stride is not None and not p.has_bias:
+        raise ValueError("bias_stride requires a bias-enabled kernel")
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
     mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
     sched_l2_bytes = p.sched_l2_mib * 1024 * 1024
@@ -1799,12 +1804,14 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the 
     )
     # Additive bias [1, H, SQ, SKV] in io_dtype or fp32 (or a 1-elem dummy).
     bias_io_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype
-    fake_bias = cute.runtime.make_fake_compact_tensor(
-        bias_io_dtype,
-        ((1, h, sq, skv) if p.has_bias else (1,)),
-        stride_order=((3, 2, 1, 0) if p.has_bias else (0,)),
-        assumed_align=16,
-    )
+    if p.has_bias:
+        fake_bias = (
+            cute.runtime.make_fake_tensor(bias_io_dtype, (1, h, sq, skv), bias_stride, assumed_align=16)
+            if bias_stride is not None
+            else cute.runtime.make_fake_compact_tensor(bias_io_dtype, (1, h, sq, skv), stride_order=(3, 2, 1, 0), assumed_align=16)
+        )
+    else:
+        fake_bias = cute.runtime.make_fake_compact_tensor(bias_io_dtype, (1,), stride_order=(0,), assumed_align=16)
     # THD cumulative seqlens [B_logical + 1] int32 (or 1-elem dummies).
     _cu_len = (n_batch_logical + 1) if p.thd_varlen else 1
     fake_cu_q = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_len,), stride_order=(0,), assumed_align=4)

@@ -12,7 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_bias, make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -108,7 +108,20 @@ _THD_SENTINEL = 2048.0
 
 
 def _ref_sdpa_full(
-    q, k, v, *, scale, is_causal=False, bottom_right=False, band_right=0, swa_window=None, seq_q_lens=None, seq_kv_lens=None, sinks=None, return_stats=False
+    q,
+    k,
+    v,
+    *,
+    scale,
+    is_causal=False,
+    bottom_right=False,
+    band_right=0,
+    swa_window=None,
+    seq_q_lens=None,
+    seq_kv_lens=None,
+    sinks=None,
+    bias=None,
+    return_stats=False,
 ):
     """fp32 reference matching the SM100 DSL kernel's mask + sink semantics.
     q/k/v are BHSD; GQA (h_q > h_kv) is handled by expanding K/V. Bottom-right
@@ -124,6 +137,8 @@ def _ref_sdpa_full(
     k_ref = k.repeat_interleave(g, dim=1).float()
     v_ref = v.repeat_interleave(g, dim=1).float()
     scores = torch.matmul(q.float(), k_ref.transpose(-1, -2)) * scale
+    if bias is not None:
+        scores = scores + bias.float()
 
     q_lens = seq_q_lens.flatten().to(device=dev, dtype=torch.int64) if seq_q_lens is not None else torch.full((b,), s_q, dtype=torch.int64, device=dev)
     kv_lens = seq_kv_lens.flatten().to(device=dev, dtype=torch.int64) if seq_kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=dev)
@@ -180,6 +195,7 @@ def _run_dsl_graph(
     seq_len_kv=None,
     seq_len_q=None,
     sink=None,
+    bias=None,
     pack_gqa=None,
     return_stats=False,
     stats_layout="contiguous",
@@ -212,6 +228,10 @@ def _run_dsl_graph(
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
+    if bias is not None:
+        bt = g.tensor_like(bias)
+        kw["bias"] = bt
+        vp[bt] = bias
     kw.update(sdpa_kwargs)
     o, stats = g.sdpa(**kw)
     o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
@@ -288,6 +308,147 @@ def test_dsl_sm100_d192_d128(dtype, is_causal):
     o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=is_causal))
     o_ref = _ref_sdpa(q, k, v, is_causal=is_causal, scale=scale)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+def _check_dsl_sm100_attention_bias(d_qk, d_v, dtype, bias_dtype, bias_layout="contiguous", *, pack_gqa=True, mask_kind="causal"):
+    _require_dsl()
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves only the per-tensor FP8 d128 forward path")
+    b, h_q, h_kv, s_q = 2, 4, 2, 96
+    s_kv = 256 if mask_kind in ("dense", "padded") else 144
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h_q, s_q, d_qk, dtype)
+    k = _bhsd(b, h_kv, s_kv, d_qk, dtype)
+    v = _bhsd(b, h_kv, s_kv, d_v, dtype)
+    bias = make_dense_bias(h_q, s_q, s_kv, bias_dtype, bias_layout)
+
+    sdpa_kwargs = {}
+    ref_kwargs = {}
+    seq_len_kv = None
+    if mask_kind == "causal":
+        sdpa_kwargs["use_causal_mask"] = True
+        ref_kwargs["is_causal"] = True
+    elif mask_kind == "band_right":
+        band_right = 8
+        sdpa_kwargs["diagonal_band_right_bound"] = band_right
+        ref_kwargs.update(is_causal=True, band_right=band_right)
+    elif mask_kind == "swa":
+        window = 32
+        sdpa_kwargs.update(use_causal_mask=True, sliding_window_length=window + 1)
+        ref_kwargs.update(is_causal=True, swa_window=window)
+    elif mask_kind == "padded":
+        seq_len_kv = torch.tensor([s_kv, 197], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        ref_kwargs["seq_kv_lens"] = seq_len_kv
+    elif mask_kind != "dense":
+        raise ValueError(f"unknown attention-bias mask kind: {mask_kind}")
+
+    o, stats = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=sdpa_kwargs,
+        seq_len_kv=seq_len_kv,
+        bias=bias,
+        pack_gqa=pack_gqa,
+        return_stats=True,
+    )
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, bias=bias, return_stats=True, **ref_kwargs)
+    torch.testing.assert_close(o, o_ref, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_dsl_sm100_attention_bias():
+    """The SM100 half L0 flavor adds broadcast-batch attention bias."""
+
+    _check_dsl_sm100_attention_bias(128, 128, torch.float16, torch.float16)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=68)
+def test_dsl_sm100_strided_attention_bias():
+    """The SM100 L0 flavor reads a permuted, gapped fp32 bias directly."""
+
+    _check_dsl_sm100_attention_bias(128, 128, torch.float16, torch.float32, bias_layout="strided")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("pack_gqa", "mask_kind"),
+    [
+        (False, "dense"),
+        (False, "swa"),
+        (True, "band_right"),
+        (True, "padded"),
+    ],
+    ids=["gqa-dense", "gqa-swa", "pack-gqa-band-right", "pack-gqa-padded"],
+)
+@torch_fork_set_rng(seed=69)
+def test_dsl_sm100_attention_bias_gqa_mask_combinations(pack_gqa, mask_kind):
+    """Bias composes with ordinary/packed GQA and distinct mask geometries."""
+
+    _check_dsl_sm100_attention_bias(
+        128,
+        128,
+        torch.float16,
+        torch.float32,
+        bias_layout="strided",
+        pack_gqa=pack_gqa,
+        mask_kind=mask_kind,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("d_qk", "d_v", "dtype", "bias_dtype"),
+    [
+        (192, 128, torch.bfloat16, torch.float32),
+        (256, 256, torch.float16, torch.float32),
+        (512, 512, torch.bfloat16, torch.bfloat16),
+    ],
+    ids=["d192-bias-fp32", "d256-bias-fp32", "d512-bf16"],
+)
+@torch_fork_set_rng(seed=67)
+def test_dsl_sm100_attention_bias_other_flavors(d_qk, d_v, dtype, bias_dtype):
+    """The remaining SM100 half/BF16 flavors add attention bias."""
+
+    _check_dsl_sm100_attention_bias(d_qk, d_v, dtype, bias_dtype, bias_layout="strided")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=71)
+def test_dsl_sm100_attention_mask_overrides_nonfinite_bias():
+    """Masked bias values cannot turn authoritative ``-inf`` scores into NaNs."""
+
+    _require_dsl()
+    b, h, s_q, s_kv, d = 1, 2, 96, 144, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h, s_q, d, torch.float16)
+    k = _bhsd(b, h, s_kv, d, torch.float16)
+    v = _bhsd(b, h, s_kv, d, torch.float16)
+    bias = torch.randn(1, h, s_q, s_kv, dtype=torch.float32, device="cuda") * 0.25
+    row = torch.arange(s_q, device="cuda").view(1, 1, s_q, 1)
+    col = torch.arange(s_kv, device="cuda").view(1, 1, 1, s_kv)
+    masked = col > row
+    bias.masked_fill_(masked & (col % 2 == 0), float("inf"))
+    bias.masked_fill_(masked & (col % 2 == 1), float("nan"))
+
+    output, stats = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=torch.float16,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        bias=bias,
+        return_stats=True,
+    )
+    expected, expected_stats = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bias=bias, return_stats=True)
+    torch.testing.assert_close(output, expected, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(stats.squeeze(-1), expected_stats, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0

@@ -199,13 +199,51 @@ def test_probe_rejects_wrong_device_family(monkeypatch):
     assert not _eligible(g)
 
 
-def test_probe_rejects_bias():
+@pytest.mark.parametrize(
+    ("cc", "engine"),
+    [
+        ((8, 0), engines.engine_name(arch="sm80")),
+        ((10, 0), engines.engine_name()),
+        ((12, 0), engines.engine_name(arch="sm120")),
+    ],
+    ids=["sm80", "sm100", "sm120"],
+)
+def test_probe_accepts_dense_attention_bias(monkeypatch, cc, engine):
+    monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g)
+    q, k, v, dims, strides = _mk_qkv(g, d=128)
     bias = g.tensor(dim=(1, H, S, S), stride=(H * S * S, S * S, S, 1), data_type=cudnn.data_type.FLOAT, name="bias")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, bias=bias)
     _finish_output(o, dims, strides)
-    assert not _eligible(g)
+    assert engine in _eligible(g)
+
+
+@pytest.mark.parametrize(
+    ("cc", "engine"),
+    [
+        ((8, 0), engines.engine_name(arch="sm80")),
+        ((10, 0), engines.engine_name()),
+        ((12, 0), engines.engine_name(arch="sm120")),
+    ],
+    ids=["sm80", "sm100", "sm120"],
+)
+def test_probe_accepts_strided_attention_bias(monkeypatch, cc, engine):
+    monkeypatch.setattr(ga, "_device_cc", lambda: cc)
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g, d=128)
+    bias = g.tensor(dim=(1, H, S, S), stride=(H * S * (S + 1), S * (S + 1), S + 1, 1), data_type=cudnn.data_type.FLOAT, name="bias")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, bias=bias)
+    _finish_output(o, dims, strides)
+    assert engine in _eligible(g)
+
+
+def test_probe_rejects_overlapping_attention_bias():
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    bias = g.tensor(dim=(1, H, S, S), stride=(H * S * S, S * S, S - 1, 1), data_type=cudnn.data_type.FLOAT, name="bias")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, bias=bias)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name() not in _eligible(g)
 
 
 def test_probe_rejects_alibi():

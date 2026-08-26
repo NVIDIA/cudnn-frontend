@@ -137,6 +137,8 @@ else:
 
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
+    add_attention_bias_log2,
+    apply_attention_mask,
     make_split_helpers,
     make_classic_bars,
     row_max_for_exp2,
@@ -343,6 +345,7 @@ def _kernel(
     tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_o_desc: cutlass.GridConstant[tmap.TensorMap],
     lse_tensor: Optional[cute.Tensor],
+    bias_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -513,6 +516,7 @@ def _kernel(
             sQ=sQ,
             bars=bars,
             sched=sched,
+            bias_tensor=bias_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             seq_q_lens_tensor=seq_q_lens_tensor,
             n_q_supers=n_q_supers,
@@ -534,6 +538,7 @@ def _kernel(
             sQ=sQ,
             bars=bars,
             sched=sched,
+            bias_tensor=bias_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             seq_q_lens_tensor=seq_q_lens_tensor,
             n_q_supers=n_q_supers,
@@ -1431,13 +1436,15 @@ def _softmax_kv_body(
     bmm1_phase,
     stat_empty_phase,
     leader_cta_id,
+    bias_tensor,
+    row_head_idx,
 ):
     """Per-iter kv body for the softmax warp group.
 
-    Compile-time apply_mask (Python bool) picks the load+max strategy:
-    apply_mask=False uses manual tcgen05.ld + software row-max;
-    apply_mask=True uses tcgen05.ld + apply_mask_chunk + software row-max
-    (HW max can't observe NEG_INFINITY written after the load).
+    Without bias, compile-time apply_mask (Python bool) picks whether the raw
+    scores are masked before their row max is computed. With bias, the raw
+    scores are scaled and biased first, then masked once before computing the
+    final row max so the mask remains authoritative for nonfinite bias values.
 
     total_max runs in scaled (log2) units and starts at -inf; total_max_safe
     is its 0-substituted companion (see row_max_for_exp2), carried so alpha
@@ -1452,20 +1459,13 @@ def _softmax_kv_body(
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
-    if cutlass.const_expr(apply_mask):
-        kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
-        # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
-        # CFG.BOTTOM_RIGHT is 0 - top-left masking is unchanged).
-        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
-
     _wait_mbarrier(bars.mb_bmm1_done[sub_tile_id], bmm1_phase)
     bmm1_phase = bmm1_phase ^ 1
 
-    # apply_mask is a Python bool — wrap in cutlass.const_expr so the DSL folds
-    # at trace time instead of staging cf.if (the two arms produce Vectors
-    # built via different MLIR op sequences and the tracer would error).
-    if cutlass.const_expr(apply_mask):
-        # Python comprehensions (not for+append) so the tracer sees fully-formed lists.
+    from cudnn.frost.tile_dsl.regtile import vec_concat
+
+    kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+    if cutlass.const_expr(apply_mask or CFG.MASK_FLAGS == MASK_NONE):
         raw_chunks = [
             nvvm.tcgen05_ld(
                 "32x32b",
@@ -1474,84 +1474,98 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
-            chunks_S = [
-                _apply_top_left_causal_mask_chunk(
-                    raw_chunks[c],
-                    q_abs,
-                    kv_col_base + cutlass.Int32(c * CHUNK),
-                    N=CHUNK,
-                )
-                for c in range(N_CHUNKS)
-            ]
-        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
-            chunks_S = [
-                _apply_bottom_right_causal_mask_chunk(
-                    raw_chunks[c],
-                    q_abs,
-                    kv_col_base + cutlass.Int32(c * CHUNK),
-                    causal_diag,
-                    N=CHUNK,
-                )
-                for c in range(N_CHUNKS)
-            ]
-        else:
-            chunks_S = [
-                apply_mask_chunk(
-                    raw_chunks[c],
-                    q_abs,
-                    kv_col_base + cutlass.Int32(c * CHUNK),
-                    eff_seqlen_kv,
-                    CFG.WINDOW_LEFT,
-                    CFG.MASK_FLAGS,
-                    N=CHUNK,
-                    bottom_right=CFG.BOTTOM_RIGHT,
-                    causal_diag=causal_diag,
-                    mask_value=float("-inf"),
-                    window_right=CFG.WINDOW_RIGHT,
-                )
-                for c in range(N_CHUNKS)
-            ]
-        chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
-        from cudnn.frost.tile_dsl.regtile import vec_concat
-
-        # vec_concat handles single-element lists too; keeps tracer Vector type uniform across N_CHUNKS.
-        reg_S_vec = vec_concat(chunks_S)
-        current_max_unscaled = chunks_max[0]
-        for m in chunks_max[1:]:
-            current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
-        # SM100: manual row-max (no LDTM.STAT / tmem_load_max_reduction_tile).
-        # Pure MASK_NONE avoids the x32 lowering, which spills under DSL 4.7.
-        # Causal kernels retain x32 for their unmasked middle segment.
-        from cudnn.frost.tile_dsl.regtile import vec_concat
-
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
-            raw_chunks = [
-                nvvm.tcgen05_ld(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32),
-                    num=CHUNK,
-                )
-                for c in range(N_CHUNKS)
-            ]
-        else:
-            LOAD_CHUNK = 32
-            raw_chunks = [
-                nvvm.tcgen05_ld(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * LOAD_CHUNK), cutlass.Float32),
-                    num=LOAD_CHUNK,
-                )
-                for c in range(CFG.TILE_N // LOAD_CHUNK)
-            ]
+        LOAD_CHUNK = 32
+        raw_chunks = [
+            nvvm.tcgen05_ld(
+                "32x32b",
+                nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * LOAD_CHUNK), cutlass.Float32),
+                num=LOAD_CHUNK,
+            )
+            for c in range(CFG.TILE_N // LOAD_CHUNK)
+        ]
+    if cutlass.const_expr(PARAMS.has_bias):
         reg_S_vec = vec_concat(raw_chunks)
-        current_max_unscaled = row_max_reduction(reg_S_vec)
-
-    # Pass size=CFG.TILE_N explicitly — Vector.shape[0] is an MLIR value
-    # (not Python int) for vec_concat-built vectors, so auto-detect can't recover the length.
-    reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-    current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
+        adjusted_scores = add_attention_bias_log2(
+            reg_S_vec,
+            bias_tensor,
+            row_head_idx,
+            q_abs,
+            kv_col_base,
+            scale_log2,
+            CFG.TILE_N,
+        )
+        reg_S = RegTile(adjusted_scores, size=CFG.TILE_N)
+        if cutlass.const_expr(apply_mask):
+            causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+            masked_scores, current_max = apply_attention_mask(
+                reg_S.vec,
+                q_abs,
+                kv_col_base,
+                eff_seqlen_kv,
+                CFG.WINDOW_LEFT,
+                CFG.MASK_FLAGS,
+                CFG.TILE_N,
+                bottom_right=CFG.BOTTOM_RIGHT,
+                causal_diag=causal_diag,
+                window_right=CFG.WINDOW_RIGHT,
+            )
+            reg_S = RegTile(masked_scores, size=CFG.TILE_N)
+        else:
+            current_max = row_max_reduction(reg_S.vec)
+    else:
+        if cutlass.const_expr(apply_mask):
+            # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out
+            # when CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
+            causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+            if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
+                score_chunks = [
+                    _apply_top_left_causal_mask_chunk(
+                        raw_chunks[c],
+                        q_abs,
+                        kv_col_base + cutlass.Int32(c * CHUNK),
+                        N=CHUNK,
+                    )
+                    for c in range(N_CHUNKS)
+                ]
+            elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
+                score_chunks = [
+                    _apply_bottom_right_causal_mask_chunk(
+                        raw_chunks[c],
+                        q_abs,
+                        kv_col_base + cutlass.Int32(c * CHUNK),
+                        causal_diag,
+                        N=CHUNK,
+                    )
+                    for c in range(N_CHUNKS)
+                ]
+            else:
+                score_chunks = [
+                    apply_mask_chunk(
+                        raw_chunks[c],
+                        q_abs,
+                        kv_col_base + cutlass.Int32(c * CHUNK),
+                        eff_seqlen_kv,
+                        CFG.WINDOW_LEFT,
+                        CFG.MASK_FLAGS,
+                        N=CHUNK,
+                        bottom_right=CFG.BOTTOM_RIGHT,
+                        causal_diag=causal_diag,
+                        mask_value=float("-inf"),
+                        window_right=CFG.WINDOW_RIGHT,
+                    )
+                    for c in range(N_CHUNKS)
+                ]
+            chunks_max = [row_max_reduction(score_chunks[c]) for c in range(N_CHUNKS)]
+            reg_S = RegTile(vec_concat(score_chunks), size=CFG.TILE_N)
+            current_max_unscaled = chunks_max[0]
+            for m in chunks_max[1:]:
+                current_max_unscaled = cute.math.max(current_max_unscaled, m)
+        else:
+            reg_S_vec = vec_concat(raw_chunks)
+            reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
+            current_max_unscaled = row_max_reduction(reg_S_vec)
+        current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
 
     cute.arch.inline_ptx('.pragma "set knob SchedResBusyXU64=1";')
 
@@ -1588,7 +1602,10 @@ def _softmax_kv_body(
     bars.mb_stat_full[sub_tile_id].arrive()
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
-    reg_S = reg_S * scale_log2 - total_max_safe
+    if cutlass.const_expr(PARAMS.has_bias):
+        reg_S = reg_S - total_max_safe
+    else:
+        reg_S = reg_S * scale_log2 - total_max_safe
 
     # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].
@@ -1651,6 +1668,7 @@ def _softmax_warp_group(
     sQ,
     bars,
     sched,
+    bias_tensor: Optional[cute.Tensor],
     seq_kv_lens_tensor,
     seq_q_lens_tensor,
     n_q_supers,
@@ -1732,6 +1750,7 @@ def _softmax_warp_group(
         # token share it.
         q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
         q_abs = q_row_coord + cutlass.Int32(sub_tile_id * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
+        row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
         # 3-segment kv loop: LEFT-masked / fully-unmasked / RIGHT-masked.
         # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
@@ -1754,6 +1773,8 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    bias_tensor,
+                    row_head_idx,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
@@ -1775,6 +1796,8 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    bias_tensor,
+                    row_head_idx,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
@@ -1795,6 +1818,8 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    bias_tensor,
+                    row_head_idx,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
@@ -1815,6 +1840,8 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    bias_tensor,
+                    row_head_idx,
                 )
 
         if cutlass.const_expr(not CAN_HAVE_EMPTY_KV) or (bounds.right > bounds.left):
@@ -2168,6 +2195,7 @@ def _host(
     v_tensor: cute.Tensor,
     o_tensor: cute.Tensor,
     lse_tensor: Optional[cute.Tensor],
+    bias_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -2291,6 +2319,7 @@ def _host(
         tma_v_desc,
         tma_o_desc,
         lse_tensor,
+        bias_tensor,
         sinks_tensor,
         seq_kv_lens_tensor,
         o_desc_words,
@@ -2327,6 +2356,7 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple] = None,
     o_stride: Optional[tuple] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
+    bias_stride: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
@@ -2358,6 +2388,8 @@ def compile(  # noqa: A001
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
     if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
         raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
+    if bias_stride is not None and not PARAMS.has_bias:
+        raise ValueError("bias_stride requires a bias-enabled kernel")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and
@@ -2388,6 +2420,16 @@ def compile(  # noqa: A001
     fake_k = _fake_bshd((_fake_batch, skv, kh, d_qk), k_stride)
     fake_v = _fake_bshd((_fake_batch, skv, kh, d_v), v_stride)
     fake_o = _fake_bshd((_o_batch, sq, qh, d_v), o_stride, dtype=STORAGE_DTYPE)
+    bias_dtype = cutlass.Float32 if PARAMS.bias_is_fp32 else STORAGE_DTYPE
+    fake_bias = (
+        (
+            cute.runtime.make_fake_tensor(bias_dtype, (1, qh, sq, skv), bias_stride, assumed_align=4)
+            if bias_stride is not None
+            else cute.runtime.make_fake_compact_tensor(bias_dtype, (1, qh, sq, skv), stride_order=(3, 2, 1, 0), assumed_align=4)
+        )
+        if PARAMS.has_bias
+        else None
+    )
     if not has_lse:
         # No Stats output: the LSE argument is None-specialized and the store
         # is compiled out entirely — no dummy buffer exists at any level.
@@ -2495,6 +2537,7 @@ def compile(  # noqa: A001
         fake_v,
         fake_o,
         fake_lse,
+        fake_bias,
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,

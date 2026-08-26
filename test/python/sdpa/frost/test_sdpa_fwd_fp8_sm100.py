@@ -68,6 +68,28 @@ class _RunWithStatsResult(NamedTuple):
     reference_stats: torch.Tensor
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("pertensor_fp8", [False, True], ids=["mxfp8", "fp8"])
+def test_fp8_standalone_attention_bias_is_declined(pertensor_fp8):
+    """The direct adapter must not silently discard an FP8 bias specialization."""
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    q = torch.zeros(1, 2, 64, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    o = torch.empty(1, 2, 64, 128, dtype=torch.float16, device="cuda")
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=q,
+        sample_v=q,
+        sample_o=o,
+        sample_bias=torch.zeros(1, 2, 64, 64, dtype=torch.float32, device="cuda"),
+        dtype_o=torch.float16,
+        pertensor_fp8=pertensor_fp8,
+    )
+    with pytest.raises(NotImplementedError, match="attention bias is not supported"):
+        api.check_support()
+
+
 def _quant(x, in_key):
     fp8, fmax = _FP8[in_key], _FP8_MAX[in_key]
     dq = (x.abs().amax().clamp_min(1e-8) / fmax).item()
