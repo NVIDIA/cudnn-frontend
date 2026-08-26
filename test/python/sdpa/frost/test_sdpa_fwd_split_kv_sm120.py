@@ -46,6 +46,8 @@ def _expected_split(api):
         kv_tiles=-(-api.s_k_max // api.kv_tile),
         sm_count=device_info(torch.cuda.current_device()).sm_count,
         ctas_per_tile=1,
+        # The combine's grid is (S_q, H, B) — see choose_split_kv.
+        combine_rows=api.batch_size * api.h_q * api.s_q_max,
     )
 
 
