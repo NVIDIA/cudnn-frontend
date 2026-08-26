@@ -199,8 +199,11 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # dequant scales, no block-scale SF).  Gated by CFG.THD_VARLEN (folds out:
 # _thd_tma_offsets is (0, 0, batch_idx) dense — TMA coords byte-identical).
 # TILES_Q=2: q_seq_off applies to BOTH Q slabs + both O-store slabs.
-# seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
+# seq_kv_lens overloaded as the THD metadata buffer (int32 len 4B+4):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
+#   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
+# The decode walks batch_remap on EVERY THD flavor, so the setup kernel must
+# fill it; the trailing two words are read only by the persistent schedulers.
 # The setup kernel builds it DEVICE-side from the caller's length tensors and
 # the adapter launches the plan-time envelope grid (issue #552) — no length
 # ever reaches the host.
@@ -2177,7 +2180,7 @@ def _host(
             thd_q_lens_tensor,
             thd_kv_lens_tensor,
             thd_lens_form,
-            cutlass.Int32(QH),
+            cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
@@ -2353,8 +2356,9 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     # Always part of the ABI; unread when CFG.SEQ_KV_LENS_PRESENT == 0.  THD
-    # overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)] (len 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|batch_remap(B)|
+    # live|ctr] (len 4B+4).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

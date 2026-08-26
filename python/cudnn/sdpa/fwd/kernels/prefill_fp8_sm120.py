@@ -73,7 +73,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
@@ -1046,11 +1046,17 @@ class SM120FusedMultiHeadAttentionForward:
         q_row_base = cutlass.Int32(0)
         kv_row_base = cutlass.Int32(0)
         if cutlass.const_expr(self.thd_varlen):
-            # THD: seq_kv_lens is the metadata tensor [seq_kv(B) | cu_q(B+1) | cu_k(B+1)].
+            # THD: seq_kv_lens is the metadata tensor
+            # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr].
             # Per-sequence lengths come from the prefix sums; the bases offset
             # every packed (1, T, H, D) access below.
-            n_batch = (seq_kv_lens.shape[0] - 2) // 3
+            n_batch = (seq_kv_lens.shape[0] - 4) // 4
             meta = cutlass.make_array_view(seq_kv_lens)
+            # Longest sequences first: blockIdx.y indexes the remap rather than
+            # the batch directly, so long sequences take the low CTA ids and
+            # dispatch first. The ragged tail of the launch is then short
+            # sequences, whose over-length tiles retire without work.
+            batch_idx = cutlass.Int32(meta[3 * n_batch + 2 + batch_idx])
             q_row_base = cutlass.Int32(meta[n_batch + batch_idx])
             seqlen_q = cutlass.Int32(meta[n_batch + batch_idx + 1]) - q_row_base
             kv_row_base = cutlass.Int32(meta[2 * n_batch + 1 + batch_idx])
@@ -1596,6 +1602,7 @@ class SM120FusedMultiHeadAttentionForward:
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
         thd_lens_form: Optional[cutlass.Int32],
+        thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
     ) -> None:
         """Launch the SM120 per-tensor FP8 FMHA kernel.
@@ -1690,8 +1697,8 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.thd_varlen):
             if cutlass.const_expr(q.shape[0] != 1):
                 raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-            if cutlass.const_expr(seq_kv_lens.shape != (3 * self.thd_batch + 2,)):
-                raise ValueError("THD seq_kv_lens must be the (3*B+2,) metadata tensor")
+            if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
+                raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
 
         # Exact head dims: split D into I contiguous C-element chunks while
         # preserving the compact (B, S, H, D) global-memory address
@@ -1724,16 +1731,19 @@ class SM120FusedMultiHeadAttentionForward:
         tma_k_desc = kv_tma_desc(k, head_dim_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems, head_dim_qk != self.head_tile_qk)
         tma_v_desc = kv_tma_desc(v, head_dim_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems, head_dim_v != self.head_tile_v)
         if cutlass.const_expr(self.thd_varlen):
-            # Build the [kv|cu_q|cu_k] metadata buffer DEVICE-side from the
-            # caller's length tensors (no host cumsum, no H2D — issue #552);
-            # the main kernel launched after it on this stream reads it.
+            # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
+            # from the caller's length tensors (no host cumsum, no H2D — issue
+            # #552); the main kernel launched after it on this stream reads it.
             _build_thd_meta_kernel(
                 seq_kv_lens,
                 thd_q_lens,
                 thd_kv_lens,
                 thd_lens_form,
                 cutlass.Int32(self.thd_batch),
-            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+                cutlass.Int32(q.shape[2]),
+                cutlass.Int32(self.q_tile),
+                thd_n_ctas,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
         # sequence's length drain without work. NOTE thd_max_sq is a __call__
@@ -1908,7 +1918,7 @@ def compile(  # noqa: A001
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (3 * b + 2,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) ]
+        (4 * b + 4,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr ]
         stride_order=(0,),
         assumed_align=4,
     )
@@ -1962,6 +1972,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        cutlass.Int32(0),  # thd_n_ctas: unused on this path (no persistent grid)
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
