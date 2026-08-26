@@ -72,6 +72,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
 &nbsp;&nbsp; **Ragged Offset Multiplier (cuDNN 9.24+, UNIFIED forward only):**
 - `tensor.set_ragged_offset_multiplier(value)` lets the ragged offsets be stored in coarser units; the engine multiplies each offset by `value` to recover element offsets.
+- `max_total_seq_len_q` / `max_total_seq_len_kv` declare the **packed token totals** of the ragged Q and K/V. A ragged tensor's dims stay `(B, H, S_max, D)` and the per-sequence starts live in a device-side offset tensor, so the packed total is not otherwise expressible in the graph. Supplying it lets the implementation bound the token axis exactly rather than inferring an upper bound from the bound buffers' extents — which matters when a buffer is allocated larger than the tokens it holds, since rows past the real total are masked but still take part in `P @ V` and so must be finite. The values only ever tighten the inferred bound, never widen it, and are accepted only on a ragged layout. `sdpa_backward` has taken the same two arguments since cuDNN 9.6.
 - Example: with a multiplier of $H \times D$, a token-unit cumulative-sequence-length tensor (e.g. `cu_seq_len_q`) can be bound directly as the ragged offset, avoiding a conversion pass.
 
 &nbsp;&nbsp; **Memory Layout visualization:**
@@ -305,6 +306,8 @@ graph.sdpa(
     paged_attention_k_table=None,         # Page table for K container
     paged_attention_v_table=None,         # Page table for V container
     paged_attention_max_seq_len_kv=None,  # Max KV sequence length for paged attention
+    max_total_seq_len_q=None,             # Packed token total for Q (ragged tensors)
+    max_total_seq_len_kv=None,            # Packed token total for KV (ragged tensors)
     generate_stats=None,                  # Output softmax stats for training (True/False)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation

@@ -63,11 +63,13 @@ def test_recommend_emits_multiple_complete_sets_per_engine():
 
 @pytest.mark.L0
 def test_recommend_primary_reproduces_the_derived_scheduler():
-    # Behavior preservation: the first set carries exactly what the adapter's
-    # internal derivation historically chose (causal + small working set ->
-    # LPT_L2; mask-free -> NATURAL with no sched runners).
-    causal = recommend("A", _facts(), _OFFERED)
-    assert causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
+    # Behavior preservation on the UNSPLIT leg: the first set carries exactly
+    # what the adapter's internal derivation historically chose (causal + small
+    # working set -> LPT_L2; mask-free -> NATURAL with no sched runners). A
+    # grid that fills the machine never splits, so it reads the derivation
+    # straight off the primary.
+    causal = recommend("A", _facts(s_q=8192), _OFFERED)
+    assert causal[0].knobs.split_kv == 1 and causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
     dense = recommend("A", _facts(causal=False), _OFFERED)
     dense_f16 = [p for p in dense if p.engine_id == 20500]
     assert dense_f16[0].knobs.sched_policy == 0  # SCHED_NATURAL
@@ -75,10 +77,29 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
 
 
 @pytest.mark.L0
-def test_recommend_split_is_a_runner_up_and_respects_structure():
+def test_split_and_scheduler_stay_coupled_whichever_leads():
+    """A split set rides the plain scheduler — structural, so it must bind the
+    PRIMARY too, not just the runner-ups. config_sm120 raises outright on
+    split_kv > 1 under an LPT remap, so an LPT+split set is unbuildable there.
+    Regression: flipping the split to lead once let it inherit the derived
+    LPT_L2 policy on causal graphs."""
+    for f in (_facts(), _facts(causal=False), _facts(s_q=8192), _facts(h_q=1, h_kv=1)):
+        for p in recommend("A", f, _OFFERED):
+            if (p.knobs.split_kv or 1) > 1:
+                assert p.knobs.sched_policy == 0, f"split set on a non-plain scheduler: {p.knobs}"
+
+
+@pytest.mark.L0
+def test_recommend_split_leads_and_respects_structure():
+    # A split the wave-cost model asks for is what a plain build_plans() runs,
+    # with no-split behind it for autotune / select_plan. Sweep justifying the
+    # lead (B300, ar_dit chunked prefill, bf16 B1xH9xD128, S_kv=62208, no mask):
+    #   S_q=985   0.955 ms -> 0.556 ms (split 4, 1.72x)
+    #   S_q=2048  0.960 ms -> 0.722 ms (split 2, 1.33x)
+    #   S_q>=4096 unchanged (model declines to split a full grid)
     plans = [p for p in recommend("A", _facts(), _OFFERED) if p.engine_id == 20500]
-    assert plans[0].knobs.split_kv == 1, "no-split stays the default winner until sweeps flip it"
-    assert any(p.knobs.split_kv > 1 for p in plans), "underfilled decode-ish grid must offer a split runner"
+    assert plans[0].knobs.split_kv > 1, "an underfilled grid runs the split the model chose"
+    assert any(p.knobs.split_kv == 1 for p in plans), "no-split must stay reachable as the runner-up"
     for bad in (dict(has_sink=True), dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
         got = [p for p in recommend("A", _facts(**bad), _OFFERED) if p.engine_id == 20500]
         assert all(p.knobs.split_kv == 1 for p in got), f"split emitted under {bad}"

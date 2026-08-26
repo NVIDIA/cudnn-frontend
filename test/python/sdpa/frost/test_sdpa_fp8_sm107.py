@@ -82,8 +82,8 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm107.softmax_precisions == frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
 
     # The SM107 sibling has no split path and no LPT remap yet (issue #653).
-    assert sm107.split_kvs == frozenset({1})
-    assert sm100.split_kvs == frozenset({1, 2, 4})
+    assert sm107.split_kv_supported is False
+    assert sm100.split_kv_supported is True
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
