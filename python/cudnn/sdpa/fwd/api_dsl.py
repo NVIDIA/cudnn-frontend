@@ -779,7 +779,18 @@ class SdpaFwdDsl(APIBase):
     def _combine_dtype_tag(self) -> str:
         # The combine reduces INTO the O dtype: the graph's dtype_o on the
         # quantized rows (half-gated by check_support), Q's dtype elsewhere.
-        o_dtype = self.dtype_o if (self._fp8 and self.dtype_o is not None) else self.dtype
+        # self.dtype is the fp8 INPUT type on those rows, so falling back to it
+        # would compile an f16 combine for a bf16 output; not every arch's
+        # check_support populates dtype_o, so read the O descriptor when it does
+        # not (SM100 sets it and is unaffected).
+        # Read the O DESCRIPTOR, not self.dtype_o: the latter is a cudnn.data_type
+        # enum on some rows (SM120 fp8) and a torch dtype on others, so comparing
+        # it against torch.bfloat16 silently yields "f16" and compiles a
+        # half-precision combine for a bf16 output. self.dtype is the fp8 INPUT
+        # type on the quantized rows, so it cannot stand in either.
+        o_dtype = getattr(self.o_desc, "dtype", None) if self._fp8 else self.dtype
+        if o_dtype is None:
+            o_dtype = self.dtype_o if self.dtype_o is not None else self.dtype
         return "bf16" if o_dtype == torch.bfloat16 else "f16"
 
     def _split_partials(self, workspace, o_like, device, current_stream=None):
@@ -2677,7 +2688,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # backstop additionally bars a split under the LPT remaps —
             # validated at compile via make_cfg, and the heuristic's split
             # sets ride SCHED_NATURAL.
-            self._not_implemented_error_if(self._fp8, "SM120 split_kv > 1 is f16/bf16-only (the fp8 kernel has no split path)")
+            self._value_error_if(
+                self._fp8 and self.o_desc.dtype not in (torch.float16, torch.bfloat16),
+                "split_kv > 1 on a quantized graph requires a bf16/fp16 O (the combine reduces half-precision partials)",
+            )
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             self._value_error_if(
@@ -2786,7 +2800,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 splits=self.split_kv,
                 dtype_o=self._combine_dtype_tag(),
                 has_lse=self.lse_desc is not None,
-                has_amax=False,
+                # The quantized rows stand their in-kernel amax down under a split,
+                # so the combine owns the amax of the RECOMBINED O.
+                has_amax=self._fp8,
                 lse_stride=self._lse_stride,
             )
         self._logger.debug("compile completed")
@@ -3069,6 +3085,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        # Split-KV: the kernel writes split-major partials and stands its own
+        # amax down (a max over partials over-reports the recombined O); the
+        # combine below owns both the reduction and the amax.
+        o_dst, lse_dst = o, lse
+        if self.split_kv > 1:
+            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
+
         fn = self._compiled_kernel
         if pack is not None:
             # PLAN-TIME-ONLY compile key (issue #552): this lru-cached call
@@ -3079,8 +3102,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.Q if pack is not None else q,
             pack.K if pack is not None else k,
             pack.V if pack is not None else v,
-            pack.O if pack is not None else o,
-            lse,
+            pack.O if pack is not None else o_dst,
+            lse_dst,
             sinks_t,
             pack.seq_q_dummy if pack is not None else seq_q_t,
             pack.meta if pack is not None else seq_kv_t,
@@ -3100,6 +3123,23 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         # Both of these consume what the kernel just wrote, so they belong on
         # the launch stream for the same reason the resets above do.
+        if self.split_kv > 1:
+            self._combine_kernel(
+                o_dst,
+                lse_dst,
+                o,
+                lse,
+                # float32 here, unlike the main kernel's int32 bitcast: the combine
+                # writes the amax normally, it does not atomicMax into it.
+                # Unconditional: compile() set has_amax from _fp8, not from
+                # whether the caller passed one, so the compiled kernel always
+                # expects a tensor -- _amax_slot hands back a cached dummy when
+                # the caller supplied nothing. Same as the SM100 arms.
+                amax_o_buf,
+                (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         with _torch_stream_context(current_stream, device):
             if o_needs_copy_back:
                 o_view.copy_(o_scratch)
