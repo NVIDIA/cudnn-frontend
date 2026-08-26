@@ -535,6 +535,19 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 "tensor.");
         }
 
+        // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
+        {
+            bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                                   attributes.outputs.at(output_names::O)->get_ragged_offset();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) &&
+                    !is_ragged,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
+        }
+
 #undef CUDNN_FE_VALIDATE_STRIDE
 
         return {error_code_t::OK, ""};

@@ -5,12 +5,8 @@
 
 Output modes are dtype driven, mirroring the kernel:
   - D is bf16, or NVFP4 (packed e2m1 data + e4m3/ue5m3 block scales in ``sfd``)
-  - The optional RHT output is bf16, or NVFP4 (packed e2m1 data + e4m3/ue5m3
-    block scales in ``sfrht``)
-
-The RHT data is always stored at D's own (m, f) orientation — only the SCALE grid
-follows the transform orientation: swizzled scale factors for logical (m, f)
-when ``rht_rowwise``, and swizzled scale factors for logical (f, m) otherwise.
+  - Optional rowwise RHT is bf16, or NVFP4 with swizzled rowwise scales
+  - Optional colwise RHT is NVFP4 in wgrad-compatible per-expert ragged order
 """
 
 from __future__ import annotations
@@ -85,8 +81,10 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         b_dtype: Optional[torch.dtype] = None,
         b_major: str = "k",
         sample_sfd: Optional[torch.Tensor] = None,
-        sample_rht: Optional[torch.Tensor] = None,
-        sample_sfrht: Optional[torch.Tensor] = None,
+        sample_rht_rowwise: Optional[torch.Tensor] = None,
+        sample_sfrht_rowwise: Optional[torch.Tensor] = None,
+        sample_rht_colwise: Optional[torch.Tensor] = None,
+        sample_sfrht_colwise: Optional[torch.Tensor] = None,
         sample_bias: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
@@ -97,7 +95,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         m_aligned: int = 256,
         act_func: str = "swiglu",
         use_dynamic_sched: bool = False,
-        rht_rowwise: bool = False,
         glu_alpha: Optional[float] = None,
         glu_limit: Optional[float] = None,
     ):
@@ -114,7 +111,16 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._sample_a_tensor = sample_a
         self._sample_b_tensor = sample_b
         self._sample_d_tensor = sample_d
-        self._sample_rht_tensor = sample_rht
+        self.generate_rht_rowwise = sample_rht_rowwise is not None
+        self.generate_rht_colwise = sample_rht_colwise is not None
+        if self.generate_rht_rowwise and self.generate_rht_colwise:
+            raise NotImplementedError("Request at most one of rowwise or colwise RHT output")
+        if sample_sfrht_rowwise is not None and sample_rht_rowwise is None:
+            raise ValueError("sample_sfrht_rowwise requires sample_rht_rowwise")
+        if sample_sfrht_colwise is not None and sample_rht_colwise is None:
+            raise ValueError("sample_sfrht_colwise requires sample_rht_colwise")
+        self.rht_rowwise = self.generate_rht_rowwise
+        self.rht_per_expert = self.generate_rht_colwise
 
         if sample_b is not None and num_experts is None:
             self.weight_mode = MoEWeightMode.DENSE
@@ -135,8 +141,12 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
         self.sfd_desc = self._make_tensor_desc(sample_sfd, name="sample_sfd")
-        self.rht_desc = self._make_tensor_desc(sample_rht, name="sample_rht", interpret_uint8_as_fp4x2=False)
-        self.sfrht_desc = self._make_tensor_desc(sample_sfrht, name="sample_sfrht")
+        self.rht_rowwise_desc = self._make_tensor_desc(sample_rht_rowwise, name="sample_rht_rowwise", interpret_uint8_as_fp4x2=False)
+        self.sfrht_rowwise_desc = self._make_tensor_desc(sample_sfrht_rowwise, name="sample_sfrht_rowwise")
+        self.rht_colwise_desc = self._make_tensor_desc(sample_rht_colwise, name="sample_rht_colwise", interpret_uint8_as_fp4x2=False)
+        self.sfrht_colwise_desc = self._make_tensor_desc(sample_sfrht_colwise, name="sample_sfrht_colwise")
+        self.rht_desc = self.rht_rowwise_desc if self.generate_rht_rowwise else self.rht_colwise_desc
+        self.sfrht_desc = self.sfrht_rowwise_desc if self.generate_rht_rowwise else self.sfrht_colwise_desc
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
         if self.weight_mode == MoEWeightMode.DENSE:
             self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False)
@@ -167,7 +177,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self.m_aligned = m_aligned
         self.act_func = act_func
         self.use_dynamic_sched = use_dynamic_sched
-        self.rht_rowwise = rht_rowwise
         self.glu_alpha = glu_alpha
         self.glu_limit = glu_limit
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmGluHadamardQuantKernel
@@ -190,6 +199,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         _, n_c, _ = self._tensor_shape(self.c_desc, name="sample_c")
         _, n_d, _ = self._tensor_shape(self.d_desc, name="sample_d")
         n_out = n if self.act_func == "srelu" else n // 2
+        self.n_out = n_out
 
         self._value_error_if(l != self.expert_cnt, f"B L dimension ({l}) must match expert_cnt ({self.expert_cnt})")
         self._value_error_if(n % 64 != 0, f"N must be divisible by 64, got {n}")
@@ -197,7 +207,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
 
         # ---- Output / dump modes (dtype driven, mirroring the kernel) ----
         self.d_quant = self._is_fp4x2(self.d_desc)
-        self.generate_rht = self.rht_desc is not None
+        self.generate_rht = self.generate_rht_rowwise or self.generate_rht_colwise
         self.rht_quant = self.generate_rht and self._is_fp4x2(self.rht_desc)
         self._value_error_if(
             self.d_quant != (self.sfd_desc is not None),
@@ -206,6 +216,10 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._value_error_if(
             self.rht_quant != (self.sfrht_desc is not None),
             "NVFP4 sample_rht and sample_sfrht must be passed together",
+        )
+        self._value_error_if(
+            self.generate_rht_colwise and not self.rht_quant,
+            "Colwise RHT output is supported only as NVFP4; pass sample_rht_colwise with dtype torch.float4_e2m1fn_x2",
         )
         self._value_error_if(
             (self.d_quant or self.rht_quant) and n_out % (8 * HADAMARD_SIZE) != 0,
@@ -230,13 +244,13 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._check_tensor_shape(self.bias_desc, (n, l), "bias")
         if self.d_quant:
             self._check_tensor_shape(self.sfd_desc, _sf_layout_shape(tensor_m, n_out, self.sf_vec_size), "SFD")
-        if self.generate_rht:
-            self._check_tensor_shape(self.rht_desc, (tensor_m, n_out, 1), "RHT")
-        if self.rht_quant:
-            if self.rht_rowwise:
-                self._check_tensor_shape(self.sfrht_desc, _sf_layout_shape(tensor_m, n_out, self.sf_vec_size), "SFRHT")
-            else:
-                self._check_tensor_shape(self.sfrht_desc, _sf_layout_shape(n_out, tensor_m, self.sf_vec_size), "SFRHT")
+        if self.generate_rht_rowwise:
+            self._check_tensor_shape(self.rht_rowwise_desc, (tensor_m, n_out, 1), "RHT rowwise")
+            if self.rht_quant:
+                self._check_tensor_shape(self.sfrht_rowwise_desc, _sf_layout_shape(tensor_m, n_out, self.sf_vec_size), "SFRHT rowwise")
+        if self.generate_rht_colwise:
+            self._check_tensor_shape(self.rht_colwise_desc, (tensor_m * n_out,), "RHT colwise")
+            self._check_tensor_shape(self.sfrht_colwise_desc, (tensor_m * n_out // self.sf_vec_size,), "SFRHT colwise")
 
         self._check_tensor_stride(self.a_desc, stride=[(k, 1, tensor_m * k)], name="A", extra_error_msg="A must have k-major layout")
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -244,8 +258,21 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._check_tensor_stride(self.c_desc, stride=[(n_c, 1, tensor_m * n_c)], name="C", extra_error_msg="C must have n-major layout")
         self._check_tensor_stride(self.d_desc, stride=[(n_d, 1, tensor_m * n_d)], name="D", extra_error_msg="D must have n-major layout")
         self._check_tensor_stride(self.bias_desc, stride=[(1, n)], name="bias")
-        if self.generate_rht:
-            self._check_tensor_stride(self.rht_desc, stride=[(n_d, 1, tensor_m * n_d)], name="RHT", extra_error_msg="RHT must have n-major layout")
+        if self.generate_rht_rowwise:
+            self._check_tensor_stride(
+                self.rht_rowwise_desc,
+                stride=[(n_d, 1, tensor_m * n_d)],
+                name="RHT rowwise",
+                extra_error_msg="RHT rowwise must have n-major layout",
+            )
+        if self.generate_rht_colwise:
+            self._check_tensor_stride(self.rht_colwise_desc, stride=[(1,)], name="RHT colwise", extra_error_msg="RHT colwise must be flat")
+            self._check_tensor_stride(
+                self.sfrht_colwise_desc,
+                stride=[(1,)],
+                name="SFRHT colwise",
+                extra_error_msg="SFRHT colwise must be flat per-expert swizzled scale storage",
+            )
 
         self.ab_dtype = self._check_dtype(
             self.a_desc,
@@ -268,10 +295,23 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._check_dtype(self.bias_desc, dtype=[torch.float16, torch.bfloat16, torch.float32], name="bias")
         if self.d_quant:
             self._check_dtype(self.sfd_desc, dtype=self.sf_dtype, name="SFD", extra_error_msg="SFD must match SFA dtype")
-        if self.generate_rht:
-            self._check_dtype(self.rht_desc, dtype=[torch.bfloat16, torch.float4_e2m1fn_x2], name="RHT")
-        if self.rht_quant:
-            self._check_dtype(self.sfrht_desc, dtype=self.sf_dtype, name="SFRHT", extra_error_msg="SFRHT must match SFA dtype")
+        if self.generate_rht_rowwise:
+            self._check_dtype(self.rht_rowwise_desc, dtype=[torch.bfloat16, torch.float4_e2m1fn_x2], name="RHT rowwise")
+            if self.rht_quant:
+                self._check_dtype(
+                    self.sfrht_rowwise_desc,
+                    dtype=torch.float8_e4m3fn,
+                    name="SFRHT rowwise",
+                    extra_error_msg="SFRHT rowwise must use NVFP4 scale storage dtype torch.float8_e4m3fn",
+                )
+        if self.generate_rht_colwise:
+            self._check_dtype(self.rht_colwise_desc, dtype=torch.float4_e2m1fn_x2, name="RHT colwise")
+            self._check_dtype(
+                self.sfrht_colwise_desc,
+                dtype=torch.float8_e4m3fn,
+                name="SFRHT colwise",
+                extra_error_msg="SFRHT colwise must use NVFP4 scale storage dtype torch.float8_e4m3fn",
+            )
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="acc_dtype")
 
         self._value_error_if(self.sf_vec_size != 16, f"sf_vec_size must be 16, got {self.sf_vec_size}")
@@ -369,6 +409,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             act_func=self.act_func,
             enable_bias=self.bias_desc is not None,
             rht_rowwise=self.rht_rowwise if self.generate_rht else False,
+            rht_per_expert=self.rht_per_expert if self.generate_rht else False,
             glu_alpha=self.glu_alpha,
             glu_limit=self.glu_limit,
         )
@@ -420,30 +461,34 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             )
         rht_cute_arg = None
         if self.generate_rht:
-            rht_cute_arg = self._make_fake_cute_compact_tensor(
-                dtype=self.rht_desc.dtype,
-                shape=(valid_m, self.rht_desc.shape[1], 1),
-                stride_order=self.rht_desc.stride_order,
-                dynamic_mode=self.rht_desc.stride_order[0],
-                divisibility=8 if self._is_f16(self.rht_desc) else 32,
-            )
+            if self.generate_rht_colwise:
+                rht_cute_arg = self._make_fake_cute_tensor(
+                    dtype=self.rht_colwise_desc.dtype,
+                    shape=(valid_m * self.n_out,),
+                    stride=(1,),
+                )
+            else:
+                rht_cute_arg = self._make_fake_cute_compact_tensor(
+                    dtype=self.rht_rowwise_desc.dtype,
+                    shape=(valid_m, self.rht_rowwise_desc.shape[1], 1),
+                    stride_order=self.rht_rowwise_desc.stride_order,
+                    dynamic_mode=self.rht_rowwise_desc.stride_order[0],
+                    divisibility=8 if self._is_f16(self.rht_rowwise_desc) else 32,
+                )
         sfrht_cute_arg = None
         if self.rht_quant:
             if self.rht_rowwise:
                 stride_sfrht_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
                 sfrht_cute_arg = self._make_fake_cute_tensor(
-                    dtype=self.sfrht_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfrht_desc.shape[4], 1),
-                    stride=(16, 4, self.sfrht_desc.stride[2], 1, 512, stride_sfrht_tensor_m_128),
+                    dtype=self.sfrht_rowwise_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfrht_rowwise_desc.shape[4], 1),
+                    stride=(16, 4, self.sfrht_rowwise_desc.stride[2], 1, 512, stride_sfrht_tensor_m_128),
                 )
             else:
-                sfrht_rest_m = cute.sym_int()
-                stride_sfrht_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                stride_sfrht_l = cute.sym_int(divisibility=32 * 4 * 4)
                 sfrht_cute_arg = self._make_fake_cute_tensor(
-                    dtype=self.sfrht_desc.dtype,
-                    shape=(32, 4, self.sfrht_desc.shape[2], 4, sfrht_rest_m, 1),
-                    stride=(16, 4, stride_sfrht_rest_m, 1, 512, stride_sfrht_l),
+                    dtype=self.sfrht_colwise_desc.dtype,
+                    shape=(valid_m * (self.n_out // self.sf_vec_size),),
+                    stride=(1,),
                 )
         prob_cute_fake = self._make_fake_cute_tensor(
             dtype=self.prob_desc.dtype,
@@ -622,8 +667,10 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         b_ptrs: Optional[torch.Tensor] = None,
         sfb_ptrs: Optional[torch.Tensor] = None,
         sfd_tensor: Optional[torch.Tensor] = None,
-        rht_tensor: Optional[torch.Tensor] = None,
-        sfrht_tensor: Optional[torch.Tensor] = None,
+        rht_rowwise_tensor: Optional[torch.Tensor] = None,
+        sfrht_rowwise_tensor: Optional[torch.Tensor] = None,
+        rht_colwise_tensor: Optional[torch.Tensor] = None,
+        sfrht_colwise_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         norm_const: float = 1.0,
         rht_norm_const: float = 1.0,
@@ -640,10 +687,22 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             current_stream = cuda.CUstream(torch.cuda.current_stream(a_tensor.device).cuda_stream)
         if self.d_quant and sfd_tensor is None:
             raise ValueError("sfd_tensor must be provided when D is NVFP4")
-        if self.generate_rht and rht_tensor is None:
-            raise ValueError("rht_tensor must be provided when the RHT output is enabled")
-        if self.rht_quant and sfrht_tensor is None:
-            raise ValueError("sfrht_tensor must be provided when the RHT output is NVFP4")
+        rht_tensor = None
+        sfrht_tensor = None
+        if self.generate_rht_rowwise:
+            if rht_rowwise_tensor is None:
+                raise ValueError("rht_rowwise_tensor must be provided when rowwise RHT output is enabled")
+            if self.rht_quant and sfrht_rowwise_tensor is None:
+                raise ValueError("sfrht_rowwise_tensor must be provided when rowwise RHT output is NVFP4")
+            rht_tensor = rht_rowwise_tensor
+            sfrht_tensor = sfrht_rowwise_tensor
+        elif self.generate_rht_colwise:
+            if rht_colwise_tensor is None:
+                raise ValueError("rht_colwise_tensor must be provided when colwise RHT output is enabled")
+            if sfrht_colwise_tensor is None:
+                raise ValueError("sfrht_colwise_tensor must be provided when colwise RHT output is enabled")
+            rht_tensor = rht_colwise_tensor
+            sfrht_tensor = sfrht_colwise_tensor
 
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or sfb_tensor is None:
@@ -711,9 +770,8 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
     c_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
-    rht_output: bool = True,
-    rht_dtype: Optional[torch.dtype] = None,
-    rht_rowwise: bool = False,
+    rht_rowwise_dtype: Optional[torch.dtype] = None,
+    rht_colwise_dtype: Optional[torch.dtype] = None,
     glu_alpha: Optional[float] = None,
     glu_limit: Optional[float] = None,
     norm_const: float = 1.0,
@@ -730,9 +788,10 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU forward fusion with fused RHT output.
 
-    Output modes are dtype driven: ``d_dtype``/``rht_dtype`` of
-    ``torch.float4_e2m1fn_x2`` emit packed NVFP4 data plus e4m3/ue5m3 block scales
-    (``sfd_tensor``/``sfrht_tensor``); ``torch.bfloat16`` emits plain bf16.
+    Output modes are dtype driven. ``d_dtype`` or ``rht_rowwise_dtype`` of
+    ``torch.float4_e2m1fn_x2`` emit packed NVFP4 data plus block scales.
+    ``rht_colwise_dtype`` is NVFP4-only and returns flat per-expert ragged data
+    plus flat per-expert ragged scale storage.
     ``sf_fp8_dtype_override="e5m3"`` reinterprets ``torch.float8_e4m3fn``
     SFA/SFB storage as UE5M3 input scale factors on Rubin.
     ``norm_const``/``rht_norm_const`` are the NVFP4 global encode scales
@@ -750,8 +809,8 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         c_dtype = torch.bfloat16
     if d_dtype is None:
         d_dtype = torch.bfloat16
-    if rht_dtype is None:
-        rht_dtype = torch.bfloat16
+    if rht_rowwise_dtype is not None and rht_colwise_dtype is not None:
+        raise NotImplementedError("Request at most one of rht_rowwise_dtype or rht_colwise_dtype")
     if a_tensor.dtype == torch.uint8:
         raise ValueError("a_tensor dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
     if b_tensor is not None and b_tensor.dtype == torch.uint8:
@@ -760,8 +819,14 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         raise ValueError("b_dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
     if d_dtype == torch.uint8:
         raise ValueError("d_dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
-    if rht_dtype == torch.uint8:
-        raise ValueError("rht_dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
+    if rht_rowwise_dtype == torch.uint8:
+        raise ValueError("rht_rowwise_dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
+    if rht_colwise_dtype == torch.uint8:
+        raise ValueError("rht_colwise_dtype torch.uint8 is not supported as packed FP4 for this fusion; use torch.float4_e2m1fn_x2")
+    if rht_rowwise_dtype is not None and rht_rowwise_dtype not in (torch.bfloat16, torch.float4_e2m1fn_x2):
+        raise ValueError(f"rht_rowwise_dtype must be torch.bfloat16, torch.float4_e2m1fn_x2, or None; got {rht_rowwise_dtype}")
+    if rht_colwise_dtype is not None and rht_colwise_dtype != torch.float4_e2m1fn_x2:
+        raise NotImplementedError("Only NVFP4 colwise RHT output is supported; use rht_colwise_dtype=torch.float4_e2m1fn_x2")
 
     valid_m = a_tensor.shape[0]
     is_dense = b_tensor is not None
@@ -793,35 +858,45 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
     d_quant = d_dtype == torch.float4_e2m1fn_x2
-    rht_quant = rht_output and rht_dtype == torch.float4_e2m1fn_x2
+    rht_rowwise_quant = rht_rowwise_dtype == torch.float4_e2m1fn_x2
     device = a_tensor.device
 
     def alloc_n_major(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty_strided((rows, cols, 1), (cols, 1, rows * cols), dtype=dtype, device=device)
 
-    def alloc_swizzled_sf(rows: int, cols: int) -> torch.Tensor:
+    def alloc_swizzled_sf(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
         shape = (1, ceil_div(rows, 128), ceil_div(ceil_div(cols, sf_vec_size), 4), 32, 4, 4)
-        return torch.empty(shape, dtype=sfa_tensor.dtype, device=device).permute(3, 4, 1, 5, 2, 0)
+        return torch.empty(shape, dtype=dtype, device=device).permute(3, 4, 1, 5, 2, 0)
 
     c_tensor = alloc_n_major(valid_m, n_full, c_dtype)
     if d_quant:
         d_tensor = alloc_n_major(valid_m, n_out // 2, d_dtype)
-        sfd_tensor = alloc_swizzled_sf(valid_m, n_out)
+        sfd_tensor = alloc_swizzled_sf(valid_m, n_out, sfa_tensor.dtype)
     else:
         d_tensor = alloc_n_major(valid_m, n_out, d_dtype)
         sfd_tensor = None
-    rht_tensor = None
-    sfrht_tensor = None
-    if rht_output:
-        rht_tensor = alloc_n_major(valid_m, n_out // 2 if rht_quant else n_out, rht_dtype)
-        if rht_quant:
-            if rht_rowwise:
-                sfrht_tensor = alloc_swizzled_sf(valid_m, n_out)
-            else:
-                sfrht_tensor = alloc_swizzled_sf(n_out, valid_m)
+    rht_rowwise_tensor = None
+    sfrht_rowwise_tensor = None
+    rht_colwise_tensor = None
+    sfrht_colwise_tensor = None
+    if rht_rowwise_dtype is not None:
+        rht_rowwise_tensor = alloc_n_major(valid_m, n_out // 2 if rht_rowwise_quant else n_out, rht_rowwise_dtype)
+        if rht_rowwise_quant:
+            sfrht_rowwise_tensor = alloc_swizzled_sf(valid_m, n_out, torch.float8_e4m3fn)
+    if rht_colwise_dtype is not None:
+        rht_colwise_tensor = torch.empty_strided((valid_m * n_out // 2,), (1,), dtype=rht_colwise_dtype, device=device)
+        sfrht_colwise_tensor = torch.empty_strided((valid_m * n_out // sf_vec_size,), (1,), dtype=torch.float8_e4m3fn, device=device)
 
     if valid_m == 0:
-        return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, sfd_tensor=sfd_tensor, rht_tensor=rht_tensor, sfrht_tensor=sfrht_tensor)
+        return TupleDict(
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            sfd_tensor=sfd_tensor,
+            rht_rowwise_tensor=rht_rowwise_tensor,
+            sfrht_rowwise_tensor=sfrht_rowwise_tensor,
+            rht_colwise_tensor=rht_colwise_tensor,
+            sfrht_colwise_tensor=sfrht_colwise_tensor,
+        )
 
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
         return tuple(i for i, _ in sorted(enumerate(tensor.stride()), key=lambda item: item[1]))
@@ -852,9 +927,8 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         b_tensor.dtype if is_dense else b_dtype,
         c_tensor.dtype,
         d_tensor.dtype,
-        rht_output,
-        rht_dtype if rht_output else None,
-        rht_rowwise if rht_output else None,
+        rht_rowwise_dtype,
+        rht_colwise_dtype,
         glu_alpha,
         glu_limit,
         stride_order(a_tensor),
@@ -889,8 +963,10 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             sample_alpha=alpha_tensor,
             sample_prob=prob_tensor,
             sample_sfd=sfd_tensor,
-            sample_rht=rht_tensor,
-            sample_sfrht=sfrht_tensor,
+            sample_rht_rowwise=rht_rowwise_tensor,
+            sample_sfrht_rowwise=sfrht_rowwise_tensor,
+            sample_rht_colwise=rht_colwise_tensor,
+            sample_sfrht_colwise=sfrht_colwise_tensor,
             sample_bias=bias_tensor,
             acc_dtype=acc_dtype,
             mma_tiler_mn=mma_tiler_mn,
@@ -901,7 +977,6 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             m_aligned=m_aligned,
             act_func=act_func,
             use_dynamic_sched=use_dynamic_sched,
-            rht_rowwise=rht_rowwise,
             glu_alpha=glu_alpha,
             glu_limit=glu_limit,
         )
@@ -931,8 +1006,10 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             alpha_tensor=alpha_tensor,
             prob_tensor=prob_tensor,
             sfd_tensor=sfd_tensor,
-            rht_tensor=rht_tensor,
-            sfrht_tensor=sfrht_tensor,
+            rht_rowwise_tensor=rht_rowwise_tensor,
+            sfrht_rowwise_tensor=sfrht_rowwise_tensor,
+            rht_colwise_tensor=rht_colwise_tensor,
+            sfrht_colwise_tensor=sfrht_colwise_tensor,
             bias_tensor=bias_tensor,
             norm_const=norm_const,
             rht_norm_const=rht_norm_const,
@@ -950,11 +1027,21 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             alpha_tensor=alpha_tensor,
             prob_tensor=prob_tensor,
             sfd_tensor=sfd_tensor,
-            rht_tensor=rht_tensor,
-            sfrht_tensor=sfrht_tensor,
+            rht_rowwise_tensor=rht_rowwise_tensor,
+            sfrht_rowwise_tensor=sfrht_rowwise_tensor,
+            rht_colwise_tensor=rht_colwise_tensor,
+            sfrht_colwise_tensor=sfrht_colwise_tensor,
             bias_tensor=bias_tensor,
             norm_const=norm_const,
             rht_norm_const=rht_norm_const,
             current_stream=current_stream,
         )
-    return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, sfd_tensor=sfd_tensor, rht_tensor=rht_tensor, sfrht_tensor=sfrht_tensor)
+    return TupleDict(
+        c_tensor=c_tensor,
+        d_tensor=d_tensor,
+        sfd_tensor=sfd_tensor,
+        rht_rowwise_tensor=rht_rowwise_tensor,
+        sfrht_rowwise_tensor=sfrht_rowwise_tensor,
+        rht_colwise_tensor=rht_colwise_tensor,
+        sfrht_colwise_tensor=sfrht_colwise_tensor,
+    )

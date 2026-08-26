@@ -614,7 +614,7 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False):
+def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
     import cudnn
@@ -758,6 +758,9 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
+    if declare_totals:
+        # Packed token totals: exact THD extents instead of buffer-inferred.
+        kw.update(max_total_seq_len_q=sum(seq_lens_q), max_total_seq_len_kv=sum(seq_lens_kv))
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     o.set_output(True).set_dim([B, H_q, S_max_q, D]).set_stride(list(stride_q)).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     o.set_ragged_offset(oro)
@@ -802,6 +805,30 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     o_out = o_stor[: T_q * H_q * D].reshape(T_q, H_q, D)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
     return o_out, o_ref, amax, lse_out
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_declared_totals():
+    """The MXFP8 THD path accepts ``sdpa_mxfp8(max_total_seq_len_q/kv=...)``.
+
+    A ragged graph cannot express its packed token total (dims stay
+    ``(B, H, S_max, D)`` with the per-sequence starts in a device offset
+    tensor), so the execute path otherwise infers an upper bound from the
+    bound buffers. Declaring the totals binds exact extents; results must be
+    unchanged."""
+    scale = 1.0 / math.sqrt(128)
+    seq_q, seq_kv = [200, 150], [200, 150]
+
+    def _run(declare):
+        torch.manual_seed(0)  # each call draws its own inputs -- pin them so the two runs are comparable
+        return _run_thd(seq_q, seq_kv, 8, 8, _INS[0], torch.float16, scale=scale, declare_totals=declare)
+
+    o_dec, ref_dec, amax_dec, _ = _run(True)
+    o_inf, _, _, _ = _run(False)
+    _check(o_dec, ref_dec, torch.float16, _INS[0])
+    assert abs(amax_dec.item() - ref_dec.abs().max().item()) <= 0.03
+    assert torch.equal(o_dec, o_inf), "declaring the packed totals must not change O"
 
 
 @pytest.mark.L0
