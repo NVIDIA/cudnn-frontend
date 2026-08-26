@@ -1708,7 +1708,15 @@ def _build_cute_dsl_kernel(
         )
 
         if dIndexK.dtype == torch.float32:
-            # Caller already provides f32 buffer (e.g., __init__.py); write directly
+            # fp32 output: the dK epilogue reduce-/atomic-adds into this
+            # buffer, so it must start zeroed. Zero it internally on the
+            # selected stream (cheap; removes the fragile caller pre-zero
+            # contract) rather than trusting the caller to pass a zeroed
+            # buffer. This is a promised stage of the execute pipeline and
+            # mirrors the SM100 backend and the DenseIndexerBackward fp32
+            # path.
+            with _torch_stream_context(current_stream):
+                dIndexK.zero_()
             _run_gemm_only(
                 IndexQ,
                 Weights,

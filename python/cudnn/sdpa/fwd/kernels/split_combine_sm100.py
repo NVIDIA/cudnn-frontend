@@ -125,8 +125,7 @@ def _combine_kernel(
             lo = cutlass.make_array_view(lse_out)
             lse_val = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             lse_val = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(NEG_INF).ir_value(), lse_val.ir_value()))
-            lse_row_out = lo[batch, head, :]
-            lse_row_out[q_row] = lse_val
+            lo[batch, head, q_row] = lse_val
 
 
 @cute.jit
@@ -166,6 +165,7 @@ def compile(  # noqa: A001
     splits: int,
     dtype_o: str = "f16",
     has_lse: bool = False,
+    lse_stride: Optional[tuple[int, int, int]] = None,
     has_amax: bool = False,
 ) -> Callable:
     """Compile the combine pass for one concrete (B, H, S_q, d_v, splits) shape.
@@ -175,14 +175,24 @@ def compile(  # noqa: A001
     — the pass is bandwidth-bound, so unrolling it buys nothing.  ``has_lse``
     controls whether the recombined LSE is written at all; with ``False`` the
     store is None-specialized out of the traced code.  ``has_amax`` does the
-    same for the FP8-family amax of the recombined O.
+    same for the FP8-family amax of the recombined O.  ``lse_stride`` describes
+    the caller-visible LSE output; the per-split LSE input workspace remains
+    compact regardless of that final layout.
     """
     elem = {"f16": cutlass.Float16, "bf16": cutlass.BFloat16}[dtype_o]
 
     fake_o_partial = cute.runtime.make_fake_compact_tensor(elem, (splits * b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fake_lse_partial = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (splits * b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
     fake_o_out = cute.runtime.make_fake_compact_tensor(elem, (b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fake_lse_out = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, h, sq), stride_order=(2, 1, 0), assumed_align=16) if has_lse else None
+    fake_lse_out = (
+        (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (b, h, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
+        )
+        if has_lse
+        else None
+    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_amax else None
 
     return cute.compile(

@@ -1666,8 +1666,15 @@ def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_glo
         score_grad(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=current_stream)
 
         if dIndexK.dtype == torch.float32:
-            # Caller provided a pre-zeroed f32 buffer; write directly (no extra
-            # alloc + cast). This matches the SM90 _run fast path.
+            # fp32 output: the dK epilogue atomic-adds into this buffer, so it
+            # must start zeroed. Zero it internally on the selected stream
+            # (cheap; removes the fragile caller pre-zero contract) rather than
+            # trusting the caller. This zero-init is a promised stage of the
+            # execute pipeline (see the IndexerBackward docstring) and mirrors
+            # the SM90 backend and the DenseIndexerBackward fp32 paths, which
+            # zero their fp32 dK buffer the same way.
+            with _torch_stream_context(current_stream):
+                dIndexK.zero_()
             _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, TopkIndices, current_stream=current_stream)
         else:
             # Need a separate f32 buffer for atomicAdd, then cast back to output dtype.

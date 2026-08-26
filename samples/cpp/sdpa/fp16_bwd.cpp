@@ -193,6 +193,11 @@ TEST_CASE("Toy sdpa backward", "[graph][sdpa][flash][backward]") {
         return;
     }
 
+    if (is_blackwell_arch() && cudnnGetVersion() < 91800 && is_deterministic) {
+        SKIP("Deterministic SDPA backward requires cuDNN 9.18.0+ on Blackwell");
+        return;
+    }
+
     // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;

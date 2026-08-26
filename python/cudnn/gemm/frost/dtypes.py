@@ -219,7 +219,9 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     """Epilogue chunk width in bytes of the first dense output's dtype. The
     chunk ELEMENT count (vsize) is order-independent: a quant pins vsize to its
     block size; otherwise vsize = the min over every dense output's widest
-    allowed store. M-major output → elem_bytes (scalar / TMA store).
+    allowed store. An M-major output is bounded by N instead: the chunk walks N
+    and the baked ``sym_n`` divisibility IS the chunk, while its own alignment
+    measures the M extent.
 
     The chunk is a shared ELEMENT count, not one memory access — every output
     reads/writes the same columns but splits the chunk into its own
@@ -233,16 +235,19 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     never exceeds the lowest set bit of ``tile_cols``. Without it a chunk wider
     than the N-tile would make interior tiles store into their neighbours."""
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
-    if chain.out_major == "m":
-        return elem_bytes
+    widths = [_allowed_vsize(chain, spec.dtype, spec.dim, spec.stride) for spec in chain.output_specs if spec.dtype != "fp4_e2m1"]
     if chain.quants:
         vsize = max(q.block_size for q in chain.quants)
+    elif chain.out_major == "m" or not widths:
+        # No dense store width to give (M-major scatters, fp4 packs, an
+        # amax-only chain has no dense output). N is the only bound --
+        # `chain.output_dtype` would size it off a FABRICATED bf16 output.
+        vsize = MAX_EPI_CHUNK_ELEMS
     else:
-        vsize = min(
-            (_allowed_vsize(chain, spec.dtype, spec.dim, spec.stride) for spec in chain.output_specs if spec.dtype != "fp4_e2m1"),
-            default=_allowed_vsize(chain, chain.output_dtype),
-        )
+        vsize = min(widths)
     vsize = min(vsize, MAX_EPI_CHUNK_ELEMS)
+    if chain.out_major == "m" or not widths:
+        vsize = min(vsize, _pow2_floor(chain.matmul.N, cap=MAX_EPI_CHUNK_ELEMS))
     if tile_cols is not None:
         vsize = min(vsize, _pow2_floor(tile_cols, cap=MAX_EPI_CHUNK_ELEMS))
     return vsize * elem_bytes
@@ -273,13 +278,13 @@ def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_byte
     (matches the epilogue): reduction / quant-scale side outputs store scalar
     (1); a slot on the TMA-C surface needs 16 (M-major included); every other
     slot uses its own store width -- fp4 data packs 2/byte, and everything else
-    stores ``vsize`` elements. Major is read per slot — ``chain.out_major`` only
-    governs the shared epilogue chunk, and a tap may carry the other major.
+    stores ``vsize`` elements. Major is read per slot; a tap may carry the other
+    major.
     ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
     value the kernel was rendered with)."""
     if vec_bytes is None:
         vec_bytes = _compute_output_vec_bytes(chain)
-    vsize = 1 if chain.out_major == "m" else vec_bytes // DTYPE_BYTES[chain.output_dtype]
+    vsize = vec_bytes // DTYPE_BYTES[chain.output_dtype]
     reqs = []
     for i, out in enumerate(chain.outputs):
         eb = DTYPE_BYTES[out.dtype]

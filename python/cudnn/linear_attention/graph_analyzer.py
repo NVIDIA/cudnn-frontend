@@ -107,6 +107,7 @@ class LaGraphFacts:
     use_qk_l2norm: bool = False
     safe_gate: bool = False
     use_beta_sigmoid: bool = False
+    beta_guard: bool = False
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
     batch_invariant: bool = False
@@ -236,6 +237,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
         safe_gate=safe_gate,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
+        beta_guard=bool(params.get("beta_guard", False)),
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=bool(params.get("batch_invariant", False)),

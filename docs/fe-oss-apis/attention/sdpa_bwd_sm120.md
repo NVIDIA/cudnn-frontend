@@ -18,10 +18,12 @@ Two integration surfaces are provided:
   selected from the ranked plan list (`graph.plans` /
   `graph.select_plan(i)`) with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`.
 
-The kernel lives at `python/cudnn/sdpa/bwd/kernels/bprop_f16_sm120.py`
-(one fused five-GEMM main kernel, plus a `dot` preprocess and a `cvt`
-dQ-finalize kernel per call; GQA/MQA adds a fourth `reduce` kernel that sums
-the per-q-head dK/dV partials).
+The kernels live in `python/cudnn/sdpa/bwd/kernels/`: the fused five-GEMM
+main kernel and its per-shape `compile()` in `bprop_f16_sm120.py`, the rest
+of the launch chain (`dot` preprocess, the det_2kernel dQ GEMM, the dQ /
+dBias convert kernels, the GQA `reduce`, `dsink`) in
+`bprop_chain_f16_sm120.py`, and the shared warp-level primitives in
+`_common_sm120.py`.
 
 ## Requirements
 
@@ -47,6 +49,9 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     seq_kv_lens=None,        # (B,) int32 per-batch KV lengths (padding mask)
     sink_token=None,         # fp32 (1, H_q, 1, 1) sink logits; adds dsink_tensor
                              # to the result
+    bias_tensor=None,        # (1|B, H_q, S_q, S_kv) additive bias (io dtype or
+                             # fp32, contiguous); adds fp32 dbias_tensor to the
+                             # result
 )
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
@@ -71,13 +76,26 @@ the KV tile (`kv_tile`).
 
 By default the dQ accumulation across KV tiles uses fp32 atomics, so the result
 can be bitwise non-deterministic when a q-tile receives contributions from
-multiple KV-tile CTAs. `deterministic=True` serializes the per-`(batch, head,
-q_tile)` additions in ascending KV-tile order through a GMEM turn-counter
-array (the FlashAttention-style ordered-reduction relay). dK/dV are
-deterministic in both modes — including under GQA, where the group reduction
-runs in a fixed q-head order. This maps to the graph API's
-`use_deterministic_algorithm` and costs a shape-dependent slowdown of the main
-kernel while keeping the workspace linear in sequence length.
+multiple KV-tile CTAs. `deterministic=True` (the graph API's
+`use_deterministic_algorithm`) picks one of two bitwise-reproducible routes
+per shape; dK/dV are deterministic in both modes and on both routes —
+including under GQA, where the group reduction runs in a fixed q-head order.
+
+- **Two-kernel split** (dense/causal; `d_qk` exactly 128, 192, or 256 —
+  `d_v` may pad — giving `128/128`, `192/128` (MLA), or `256/256`): the
+  main kernel streams the I/O-dtype dS
+  tiles to a `[B, H_q, S_q, S_kv]` workspace instead of scattering dQ —
+  GEMM 4, the atomics, and the relay disappear — and a dedicated
+  Q-stationary kernel computes `dQ = attn_scale * dS @ K` with register
+  accumulation over an ascending kv walk. No recompute, no atomics, no fp32
+  workspace, no convert kernel; the cost is one `S_q x S_kv` write + read,
+  which pays off at these head dims (15-24% faster than the relay) but not
+  at `D = 64`. The workspace matches cuDNN's deterministic engine; shapes
+  whose buffer cannot fit in device memory fall back to the relay.
+- **Ordered-reduction relay** (all other shapes and features): serializes the
+  per-`(batch, head, q_tile)` dq_accum additions in ascending KV-tile order
+  through a GMEM turn-counter array, keeping the workspace linear in sequence
+  length at the price of a shape-dependent slowdown of the main kernel.
 
 ## Kernel design and optimizations
 
@@ -88,11 +106,17 @@ programmatic dependent launch (PDL) so each kernel's prologue runs under its
 predecessor's tail:
 
 ```text
-dot     delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
+dot     delta = rowsum(O ∘ dO); zeroes dq_accum (and, when relay-deterministic, the relay
+        counters; nothing on the two-kernel route, which has neither buffer)
 main    the fused five-GEMM pass; writes dK/dV into dk_ws/dv_ws (aliased to the dk/dv
         outputs for MHA, per-q-head partial buffers for GQA); accumulates dQ into dq_accum
+        (two-kernel deterministic route: streams dS to the workspace instead)
 reduce  GQA only: dK/dV = fixed-order sum of each KV head's group of q-head partials
 cvt     dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
+dq2k    two-kernel deterministic route only, replacing cvt: dQ = attn_scale * dS @ K,
+        one CTA per q tile streaming (K tile, dS panel) pairs in ascending kv order
+dbias_cvt  io-dtype dBias graphs only: the fp32 dBias accumulator -> the io dtype
+        (an fp32 dBias accumulates into the output directly and skips this)
 dsink   dSink_token graphs only, summing over every batch b and query row q:
         dsink[h] = -sum_{b,q} exp(sink[h] - LSE[b,h,q]) * delta[b,h,q]
 ```
@@ -234,7 +258,19 @@ needs no extra workspace either way.
 ### Deterministic vs. non-deterministic dQ
 
 The default path's relaxed atomics make the fp32 add order — hence the
-bitwise result — scheduling-dependent. Deterministic mode serializes each
+bitwise result — scheduling-dependent. Deterministic mode picks between two
+routes (see [Determinism](#determinism)).
+
+On the two-kernel route, the main kernel mirrors the sdS pack to the gmem
+dS workspace (unscaled, masked entries exact 0, out-of-range rows TMA
+zero-fill), and `dq2k` — one CTA per q tile: a TMA-double-buffered producer
+warp plus one compute warp per 16 q rows — accumulates `dS @ K` in
+registers over an ascending kv walk and stores dQ directly in the I/O
+dtype. At `D_qk <= 128` the q tile is 128 rows, halving the K re-reads;
+under causal masks each warp bounds its kv walk to the band the main
+kernel actually stored.
+
+On the relay route, deterministic mode serializes each
 (batch, head, q-tile)'s adds in ascending KV-tile order through an int32
 turn-counter array: one elected lane spins on an acquire load until the
 counter equals the CTA's turn, a math-warps-only barrier releases the scatter,
@@ -267,10 +303,24 @@ only the unused relay operand remains in the kernel ABI.
   denominator); the `dSink_token` output adds one tiny `dsink` reduce kernel
   (`dsink[h] = -sum p_sink * delta`, fixed order — bitwise deterministic in
   both modes)
-- No dropout / bias / ALiBi / softcap / THD
-- Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
-  scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
-  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·d_qk_padded` and
-  `B·S_kv·H_q·d_v_padded` elements, where `d_*_padded` are the adapter's
-  zero-padded head dimensions); use `scratch_workspace_bytes()` for the exact
-  total
+- Bias: additive `(1|B, H_q, S_q, S_kv)` bias (post-scale, pre-softmax;
+  contiguous, io dtype or fp32) with an optional `dBias` output of the same
+  dims. The main kernel folds `bias * log2(e)` into the softmax-recompute
+  exponent and accumulates `dBias = dS'` (the unscaled softmax VJP) into an
+  fp32 workspace with `red.global.add.f32`; a batch-1 bias thereby reduces
+  over B for free, which also makes `dBias` bitwise NON-deterministic when
+  `B > 1` (dQ/dK/dV determinism is unaffected) — deterministic mode
+  therefore requires a per-batch bias when `B > 1` and a `dBias` output is
+  requested. An fp32 `dBias` output is
+  that accumulator itself (no extra workspace, no convert kernel); an
+  io-dtype output adds the `dbias_cvt` cast.
+- No dropout / ALiBi / softcap / THD
+- Workspace (carved from the caller's buffer): fp32 `delta` scratch, plus
+  fp32 `dq_accum` and int32 relay-counter storage (non-deterministic and
+  relay-deterministic modes) or the io-dtype `B·H_q·S_q·S_kv_r128` dS buffer
+  (two-kernel deterministic route); an io-dtype dBias output adds the fp32
+  accumulator (`(1|B)·H_q·S_q·S_kv` elements; an fp32 dBias needs none);
+  GQA adds the io-dtype `dk_ws`/`dv_ws`
+  partials buffers (`B·S_kv·H_q·d_qk_padded` and `B·S_kv·H_q·d_v_padded`
+  elements, where `d_*_padded` are the adapter's zero-padded head
+  dimensions); use `scratch_workspace_bytes()` for the exact total

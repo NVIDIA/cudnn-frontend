@@ -52,6 +52,10 @@ _FLOPS_PER_CLOCK_PER_SM = {
     # Hopper (sm90): H100 SXM lists 989.5 dense BF16 TFLOPS (FP32 accumulate;
     # 1979 is the sparsity figure) = 132 SMs x 1.83 GHz x 4096 FLOPs/clk/SM;
     # FP8 dense is 2x. (No mxfp8 entry: Hopper has no MXFP8 datapath.)
+    # Ampere (sm80): A100 lists 312 dense BF16/FP16 TFLOPS (FP32 accumulate;
+    # 624 is the sparsity figure) = 108 SMs x 1.41 GHz x 2048 FLOPs/clk/SM.
+    # (No fp8/mxfp8 entries: Ampere has neither datapath.)
+    8: {"bfloat16": 2048, "float16": 2048},
     9: {"bfloat16": 4096, "float16": 4096, "fp8": 8192},
     10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384},
     12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048},

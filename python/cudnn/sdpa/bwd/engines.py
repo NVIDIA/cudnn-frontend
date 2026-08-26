@@ -255,6 +255,24 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             expect_stride = (facts.h_q * facts.s_q, facts.s_q, 1, 1)
             if s_stride != expect_stride:
                 return f"stats must be contiguous {expect_stride}; got stride {s_stride}"
+
+    if facts.has_dbias and not facts.has_bias:
+        return "dBias output requires a bias input"
+    for bias_like_t, label in ((facts.bias_t if facts.has_bias else None, "bias"), (facts.dbias_t if facts.has_dbias else None, "dBias")):
+        if bias_like_t is None:
+            continue
+        dim = tuple(bias_like_t.get_dim())
+        if dim not in ((1, facts.h_q, facts.s_q, facts.s_kv), (facts.b, facts.h_q, facts.s_q, facts.s_kv)):
+            return f"{label} must be (1|B, H_q, S_q, S_kv) = (1|{facts.b}, {facts.h_q}, {facts.s_q}, {facts.s_kv}); got {dim}"
+        expect_bias_stride = (facts.h_q * facts.s_q * facts.s_kv, facts.s_q * facts.s_kv, facts.s_kv, 1)
+        if tuple(bias_like_t.get_stride()) != expect_bias_stride:
+            return f"{label} must be contiguous {expect_bias_stride}; got stride {tuple(bias_like_t.get_stride())}"
+        if bias_like_t.get_data_type() not in (facts.dtype, cudnn.data_type.FLOAT):
+            return f"{label} must be fp32 or match the io dtype {facts.dtype}; got {bias_like_t.get_data_type()}"
+    if facts.has_dbias and tuple(facts.dbias_t.get_dim()) != tuple(facts.bias_t.get_dim()):
+        return f"dBias dims must match the bias dims {tuple(facts.bias_t.get_dim())}; got {tuple(facts.dbias_t.get_dim())}"
+    if facts.has_dbias and facts.deterministic and facts.b > 1 and tuple(facts.bias_t.get_dim())[0] == 1:
+        return "deterministic dBias requires a per-batch bias when B > 1 (a broadcast bias reduces over B through unordered atomics)"
     return None
 
 
@@ -285,6 +303,8 @@ def _sm120_spec() -> EngineSpec:
             padded=True,
             sink=True,
             dsink=True,
+            bias=True,
+            dbias=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             strided_stats=True,
             deterministic=True,
@@ -360,6 +380,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
     sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
     dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
+    bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
+    dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
     api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
@@ -373,6 +395,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         sample_dv=_desc(dv_geom, facts.dtype, "dV"),
         sample_sink=_desc(sink_geom, facts.sink_t.get_data_type(), "sink") if sink_geom is not None else None,
         sample_dsink=_desc(dsink_geom, facts.dsink_t.get_data_type(), "dSink") if dsink_geom is not None else None,
+        sample_bias=_desc(bias_geom, facts.bias_t.get_data_type(), "bias") if bias_geom is not None else None,
+        sample_dbias=_desc(dbias_geom, facts.dbias_t.get_data_type(), "dBias") if dbias_geom is not None else None,
         is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
@@ -407,6 +431,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         seq_len_q=seq_q_t,
         sink_token=facts.sink_t if facts.has_sink else None,
         dsink=facts.dsink_t if facts.has_dsink else None,
+        bias=facts.bias_t if facts.has_bias else None,
+        dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
     def _canonical_view(buf, geom):
@@ -429,6 +455,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         seq_q_buf = resolved.get(id(binding.seq_len_q)) if binding.seq_len_q is not None else None
         sink_buf = _canonical_view(resolved[id(binding.sink_token)], sink_geom) if binding.sink_token is not None else None
         dsink_buf = _canonical_view(resolved[id(binding.dsink)], dsink_geom) if binding.dsink is not None else None
+        bias_buf = _canonical_view(resolved[id(binding.bias)], bias_geom) if binding.bias is not None else None
+        dbias_buf = _canonical_view(resolved[id(binding.dbias)], dbias_geom) if binding.dbias is not None else None
         api.execute(
             q_tensor=_canonical_view(resolved[id(binding.q)], q_geom),
             k_tensor=_canonical_view(resolved[id(binding.k)], k_geom),
@@ -443,6 +471,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             seq_kv_lens=seq_kv_buf,
             sink_tensor=sink_buf,
             dsink_tensor=dsink_buf,
+            bias_tensor=bias_buf,
+            dbias_tensor=dbias_buf,
             scale_softmax=facts.scale,
             # Scratch comes from the CALLER's workspace (never allocated
             # here): the dispatch sized/validated it against workspace_bytes;

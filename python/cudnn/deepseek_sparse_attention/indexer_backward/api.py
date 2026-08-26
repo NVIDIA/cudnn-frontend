@@ -9,8 +9,9 @@ Combines backend-specific CuTe-DSL kernels:
 * IndexerBackwardSm90 or IndexerBackwardSm100 -- warp-specialized backward (kernel 2).
 * DenseIndexerBackward uses the dense full-KV score-grad + GEMM factories.
 
-A pure-torch dtype cast for ``dIndexK`` (FP32 → output dtype) finishes the
-pipeline (kernel 3).
+When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
+(FP32 accumulator → bf16) finishes the pipeline (kernel 3); an fp32
+``dIndexK`` buffer receives the accumulator directly, with no cast.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
@@ -127,7 +129,7 @@ def _dense_shapes(
 
 
 class IndexerBackward(APIBase):
-    """End-to-end indexer backward (3 fused stages).
+    """End-to-end indexer backward (staged pipeline).
 
     Given the forward-computed ``AttnScore`` (target distribution) and
     ``IndexScore`` (predict distribution) along with the sparse top-K indices,
@@ -138,6 +140,22 @@ class IndexerBackward(APIBase):
     multiplicative factors inside the score-grad precompute. Neither is
     part of the compile cache, so changing them across iterations reuses
     the same compiled kernel.
+
+    Staged pipeline that ``execute`` runs, in order:
+
+    1. Runtime signature re-validation of the tensors against the descriptors
+       captured at plan-build time (dtype, shape, and stride/layout),
+       *before* any kernel launch — kernel 1 mutates the score buffers in
+       place, so a mismatched reuse of an exported plan must raise here to
+       avoid a fail-dirty.
+    2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score`` and
+       ``index_score``).
+    3. (conditional) fp32 ``d_index_k`` zero-init — when the ``d_index_k``
+       output buffer is fp32, ``execute`` zeroes it on the selected stream
+       before the GEMM, because the dK epilogue atomic-adds into it. This is a
+       promised stage, not a hidden op; a bf16 ``d_index_k`` buffer instead
+       gets an internally-allocated zeroed fp32 scratch + trailing cast.
+    4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
     """
 
     def __init__(
@@ -145,9 +163,9 @@ class IndexerBackward(APIBase):
         sample_index_q: torch.Tensor,  # (B, S_q, H, D) BF16
         sample_weights: torch.Tensor,  # (B, S_q, H) BF16
         sample_index_k: torch.Tensor,  # (B, S_k, D) BF16
-        sample_d_index_q: torch.Tensor,  # same shape/dtype as index_q
-        sample_d_weights: torch.Tensor,  # same shape/dtype as weights
-        sample_d_index_k: torch.Tensor,  # same shape/dtype as index_k
+        sample_d_index_q: torch.Tensor,  # (B, S_q, H, D); bf16 only
+        sample_d_weights: torch.Tensor,  # (B, S_q, H); bf16 only (the kernel's dW store rounds to bf16)
+        sample_d_index_k: torch.Tensor,  # (B, S_k, D); bf16 or fp32 (both arches)
         sample_attn_score: torch.Tensor,  # (B, S_q, topk) FP32 — target
         sample_index_score: torch.Tensor,  # (B, S_q, topk) FP32 — predict
         sample_topk_indices: torch.Tensor,  # (B, S_q, topk) INT32
@@ -166,6 +184,20 @@ class IndexerBackward(APIBase):
         self.idx_score_desc = self._make_tensor_desc(sample_index_score, name="sample_index_score")
         self.topk_desc = self._make_tensor_desc(sample_topk_indices, name="sample_topk_indices")
 
+        # Validate ranks explicitly before deriving the plan dimensions below,
+        # so a wrong-rank tensor surfaces as a clean ValueError instead of a
+        # cryptic tuple-unpack/indexing error. The remaining tensors' ranks are
+        # covered by the semantic shape validation in ``check_support``
+        # (``_validate_plan_shapes_and_layout``).
+        if sample_index_q.ndim != 4:
+            raise ValueError(f"IndexerBackward sample_index_q must be 4D (B, S_q, H, D), got {sample_index_q.ndim}D shape {tuple(sample_index_q.shape)}")
+        if sample_index_k.ndim != 3:
+            raise ValueError(f"IndexerBackward sample_index_k must be 3D (B, S_k, D), got {sample_index_k.ndim}D shape {tuple(sample_index_k.shape)}")
+        if sample_topk_indices.ndim != 3:
+            raise ValueError(
+                f"IndexerBackward sample_topk_indices must be 3D (B, S_q, topk), got {sample_topk_indices.ndim}D shape {tuple(sample_topk_indices.shape)}"
+            )
+
         b, s_q, h, d = sample_index_q.shape
         s_k = sample_index_k.shape[1]
         topk = sample_topk_indices.shape[-1]
@@ -179,6 +211,64 @@ class IndexerBackward(APIBase):
         self.block_I = int(block_I)
         self.topk_indices_global = bool(topk_indices_global)
 
+    def _validate_plan_shapes_and_layout(self) -> None:
+        """Semantic shape + layout validation of the plan's tensor descriptors.
+
+        Runs before kernel 1 mutates the score buffers in place.
+        ``check_support`` otherwise only checks dtypes and ``execute``'s
+        signature check only compares each runtime tensor against the recorded
+        descriptor, so without this a directly-built / first-call plan whose
+        ``d_weights`` / ``d_index_q`` / ``d_index_k`` / score / top-k shape is
+        already inconsistent with ``index_q`` would pass validation, kernel 1
+        would corrupt the scores, and only the GEMM would fault or corrupt
+        memory. The relationships enforced (per the API contract):
+
+          index_q      (B, S_q, H, D)      weights   (B, S_q, H)
+          index_k      (B, S_k, D)         d_index_q == index_q.shape
+          d_weights   == weights.shape     d_index_k == index_k.shape
+          attn_score / index_score / topk_indices == (B, S_q, topk)
+
+        Non-compact (non-contiguous) layouts are also rejected here: the SM100
+        kernel flattens ``index_k`` / ``d_index_k`` to ``(B*S_k, D)`` with a
+        hard-coded ``(D, 1)`` stride and the backend GEMM/score-grad caches do
+        not key the layout, so a consistently non-contiguous plan would be
+        addressed as if it were compact. This is validated on the descriptors,
+        which are re-checked against the runtime tensors by
+        ``_check_execute_signature`` (dtype/shape/stride).
+        """
+        b, s_q, h, d = self.batch, self.seqlen, self.heads, self.head_dim
+        s_k, topk = self.seqlen_k, self.topk
+        q_shape = (b, s_q, h, d)
+        w_shape = (b, s_q, h)
+        k_shape = (b, s_k, d)
+        score_shape = (b, s_q, topk)
+
+        def _require_shape(desc, name, expected):
+            actual = tuple(desc.shape)
+            if actual != tuple(expected):
+                raise ValueError(f"IndexerBackward {name} shape mismatch: expected {tuple(expected)}, got {actual}")
+
+        checks = (
+            (self.iq_desc, "index_q", q_shape),
+            (self.w_desc, "weights", w_shape),
+            (self.ik_desc, "index_k", k_shape),
+            (self.diq_desc, "d_index_q", q_shape),
+            (self.dw_desc, "d_weights", w_shape),
+            (self.dik_desc, "d_index_k", k_shape),
+            (self.attn_desc, "attn_score", score_shape),
+            (self.idx_score_desc, "index_score", score_shape),
+            (self.topk_desc, "topk_indices", score_shape),
+        )
+        for desc, name, expected in checks:
+            _require_shape(desc, name, expected)
+        for desc, name, _ in checks:
+            if not desc.is_contiguous():
+                raise ValueError(
+                    f"IndexerBackward requires contiguous (compact row-major) tensors; {name} has shape "
+                    f"{tuple(desc.shape)} with non-compact stride {tuple(desc.stride)}. The kernel addresses "
+                    "index_k/d_index_k with a hard-coded compact (D, 1) stride and the backend caches do not key the layout."
+                )
+
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
@@ -191,6 +281,33 @@ class IndexerBackward(APIBase):
         self._check_dtype(self.attn_desc, torch.float32, name="attn_score")
         self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
         self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
+        # Output-dtype contract, validated here — before compile()/execute(),
+        # i.e. before kernel 1 mutates attn_score/index_score in place (no
+        # fail-dirty on a bad output dtype). ``d_index_q`` is bf16-only (TMA
+        # store of the input dtype). ``d_index_k`` accepts bf16 or fp32 on both
+        # arches (the GEMM accumulates dK in fp32; a bf16 buffer gets a
+        # trailing cast). ``d_weights`` is bf16-only on both arches: the
+        # kernel's dW store rounds the fp32 accumulator to bf16, so an fp32
+        # buffer cannot be produced faithfully and is rejected rather than
+        # silently filled with bf16-precision values.
+        self._check_dtype(self.diq_desc, torch.bfloat16, name="d_index_q")
+        self._check_dtype(
+            self.dw_desc,
+            torch.bfloat16,
+            name="d_weights",
+            extra_error_msg="the kernel's dW store rounds to bf16; fp32 output is not supported",
+        )
+        self._check_dtype(
+            self.dik_desc,
+            [torch.bfloat16, torch.float32],
+            name="d_index_k",
+            extra_error_msg="fp32 buffers receive the fp32 accumulator directly",
+        )
+        # Semantic shape relationships + compact-layout requirement, validated
+        # here (before compile()/execute(), i.e. before kernel 1 mutates the
+        # score buffers). Guards a directly-built / first-call plan whose output
+        # or score shapes are inconsistent, or whose layout is non-compact.
+        self._validate_plan_shapes_and_layout()
         self._is_supported = True
         return True
 
@@ -217,6 +334,36 @@ class IndexerBackward(APIBase):
             topk_indices_global=self.topk_indices_global,
         )
 
+    def _check_execute_signature(self, *entries) -> None:
+        """Validate runtime tensors against the descriptors captured at
+        plan-build time, before any kernel launch.
+
+        Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
+        directly-built/exported plan with a tensor whose dtype, shape, or
+        stride/layout differs from what it was compiled for — kernel 1
+        mutates the score buffers in place, so a mismatch must raise *before*
+        the pipeline starts (no fail-dirty).
+        """
+        for tensor, desc, name in entries:
+            if desc is None:
+                continue
+            if tensor.dtype != desc.dtype:
+                raise ValueError(
+                    f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use indexer_backward_wrapper) for a different signature."
+                )
+            tensor_shape = tuple(self._tensor_shape(tensor, name=name))
+            desc_shape = tuple(desc.shape)
+            if tensor_shape != desc_shape:
+                raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
+            # Compare layouts with the same unit-dim canonicalization the
+            # framework uses for compile-equality (extent-1 dims carry an
+            # unobservable stride): the compiled kernel bakes in the sample
+            # stride/layout, so a different stride would run the kernel against
+            # a layout it was not compiled for.
+            tensor_stride = tuple(self._tensor_stride(tensor, name=name))
+            if canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(desc_shape, tuple(desc.stride)):
+                raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
+
     def execute(
         self,
         index_q: torch.Tensor,
@@ -233,6 +380,32 @@ class IndexerBackward(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._logger.debug("Entering execute")
+        # Stage 1: runtime signature re-validation against the descriptors
+        # captured at plan-build time, BEFORE any kernel launch. The plan is
+        # specialized to the sample dtypes and shapes. Kernel 1
+        # mutates ``attn_score`` / ``index_score`` in place before the GEMM
+        # runs, so reusing an exported plan with a mismatched signature would
+        # otherwise fail (or corrupt memory) only after the scores were
+        # already mutated. Raise a clean ValueError here — no fail-dirty. The
+        # signature-keyed wrapper cache never hits this, but a directly-
+        # built/exported plan can.
+        #
+        # First re-assert the plan's own descriptors are semantically
+        # consistent + compact (idempotent with check_support; also covers a
+        # directly-built plan whose owner skipped check_support), then verify
+        # each runtime tensor matches the descriptor it was compiled for.
+        self._validate_plan_shapes_and_layout()
+        self._check_execute_signature(
+            (index_q, self.iq_desc, "index_q"),
+            (weights, self.w_desc, "weights"),
+            (index_k, self.ik_desc, "index_k"),
+            (d_index_q, self.diq_desc, "d_index_q"),
+            (d_weights, self.dw_desc, "d_weights"),
+            (d_index_k, self.dik_desc, "d_index_k"),
+            (attn_score, self.attn_desc, "attn_score"),
+            (index_score, self.idx_score_desc, "index_score"),
+            (topk_indices, self.topk_desc, "topk_indices"),
+        )
         # ``grad_scale`` is forwarded as a runtime ``Float32`` arg; the
         # compiled kernel is reused when loss_coeff changes for the same
         # cached tensor shape.
@@ -465,6 +638,17 @@ def indexer_backward_wrapper(
             ``index_q``. The kernel reads its value at runtime, including on
             CUDA Graph replay.
     """
+    # Validate ranks explicitly before any allocation or the dimension
+    # derivation below, so a wrong-rank tensor surfaces as a clean ValueError
+    # instead of a cryptic tuple-unpack/indexing error (or a mis-shaped
+    # ``empty_like`` allocation). The remaining tensors' ranks are covered by
+    # the plan's semantic shape validation in ``check_support``.
+    if index_q.ndim != 4:
+        raise ValueError(f"indexer_backward index_q must be 4D (B, S_q, H, D), got {index_q.ndim}D shape {tuple(index_q.shape)}")
+    if index_k.ndim != 3:
+        raise ValueError(f"indexer_backward index_k must be 3D (B, S_k, D), got {index_k.ndim}D shape {tuple(index_k.shape)}")
+    if topk_indices.ndim != 3:
+        raise ValueError(f"indexer_backward topk_indices must be 3D (B, S_q, topk), got {topk_indices.ndim}D shape {tuple(topk_indices.shape)}")
     with _torch_stream_context(stream):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
@@ -481,11 +665,16 @@ def indexer_backward_wrapper(
     # into the score-grad kernel as a runtime ``Float32``), so it is not
     # part of the cache key — same compiled kernel reused across calls
     # with different loss_coeff for the same tensor shape. Shape
-    # changes still get their own cache entries.
+    # changes still get their own cache entries. The output dtypes are keyed
+    # (``d_index_q``/``d_weights``/``d_index_k``) so ``check_support``'s
+    # output-dtype validation cannot be skipped on a cache hit (no fail-dirty).
     key = (
         index_q.dtype,
         weights.dtype,
         index_k.dtype,
+        d_index_q.dtype,
+        d_weights.dtype,
+        d_index_k.dtype,
         b,
         s_q,
         s_k,

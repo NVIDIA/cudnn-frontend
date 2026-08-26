@@ -1219,8 +1219,7 @@ def _compute_warp_group(
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     lse_batch = _partial_batch(batch_idx, split_idx, n_batch)
-                    lse_row = lse_arr[lse_batch, row_head_idx, :]
-                    lse_row[q_row_global] = lse
+                    lse_arr[lse_batch, row_head_idx, q_row_global] = lse
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0)).load())
@@ -2034,6 +2033,7 @@ def compile(  # noqa: A001
     k_stride: Optional[tuple] = None,
     v_stride: Optional[tuple] = None,
     o_stride: Optional[tuple] = None,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = full
     TILE_K / TILE_O). TMA descriptors carry these extents while the tile box
@@ -2055,6 +2055,8 @@ def compile(  # noqa: A001
         raise ValueError(f"d512 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
+        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and
@@ -2119,12 +2121,16 @@ def compile(  # noqa: A001
             )
     else:
         if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+            raise ValueError("lse_head_major / lse_head_stride are THD-only")
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_lse_batch, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
