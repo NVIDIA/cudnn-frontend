@@ -293,6 +293,8 @@ class SdpaFwdDsl(APIBase):
         cu_seq_kv_lens: bool = False,
         has_sink: bool = False,
         thd: bool = False,
+        max_total_seq_len_q: Optional[int] = None,
+        max_total_seq_len_kv: Optional[int] = None,
         dtype_o: Optional[torch.dtype] = None,
         pertensor_fp8: bool = False,
         sched_policy: Optional[int] = None,
@@ -353,6 +355,14 @@ class SdpaFwdDsl(APIBase):
         self.cu_seq_kv_lens = bool(cu_seq_kv_lens)
         self.has_sink = bool(has_sink)
         self.thd = bool(thd)
+        # Caller-declared packed token totals. These only ever TIGHTEN the
+        # execute-time token extents (they are min'd against the capacity the
+        # bound buffers can address), so a wrong or stale value cannot make a
+        # launch address memory the caller does not own -- it can only make it
+        # address less. None = not declared; the extent falls back to the
+        # buffer-derived capacity.
+        self.max_total_seq_len_q = None if max_total_seq_len_q is None else int(max_total_seq_len_q)
+        self.max_total_seq_len_kv = None if max_total_seq_len_kv is None else int(max_total_seq_len_kv)
         # MXFP8: FP8 (E4M3/E5M2) Q/K/V in, half (BF16/FP16) O out. dtype_o overrides
         # the output dtype; None inherits Q's dtype. _fp8 is set in check_support once
         # Q's dtype is known.
@@ -464,6 +474,56 @@ class SdpaFwdDsl(APIBase):
                 not packed,
                 f"{desc.name}: non-packed THD strides {tuple(desc.stride)} are not supported by the FP8 path yet",
             )
+
+    def _thd_capacity(self, buf: torch.Tensor, desc: TensorDesc, packed: bool = False) -> int:
+        """Token CAPACITY of a THD buffer under the strides the view will
+        bind: the largest T whose final token's ROW still fits inside the
+        buffer's own element SPAN (``1 + sum((size_i - 1) * stride_i)``).
+
+        Why the span, and not numel or the untyped storage (issue #613):
+
+        - ``numel() // token_stride`` halves non-packed VIEWS — a K/V slice
+          of a kv-interleaved ``[T, 2, H, D]`` record holds T tokens but only
+          ``T*H*D`` of the record's elements — silently truncating the TMA
+          extent (half the tokens never load).
+        - The untyped storage over-claims into ALLOCATOR SLACK. That is not
+          benign: rows between the real packed total and the extent are
+          masked but still multiplied (``P == 0`` times V), so they must be
+          FINITE — TMA zero-fill only covers rows at or beyond the extent.
+          A slack row carrying NaN bit patterns poisons whole sequences
+          through ``0 * NaN``.
+
+        The span is exact on both edges: every row below the returned
+        capacity lies fully inside caller-provided (finite) elements, and
+        every row at or beyond it is TMA-clipped to zeros."""
+        h, d = desc.shape[1], desc.shape[3]
+        if packed:
+            ts, hs, es = h * d, d, 1
+        else:
+            (ts, hs, es), _ = self._thd_declared(desc)
+        if buf.numel() == 0:
+            return 0
+        span = 1 + sum((size - 1) * stride for size, stride in zip(buf.shape, buf.stride()))
+        row = (h - 1) * hs + (d - 1) * es + 1
+        return 0 if span < row else (span - row) // ts + 1
+
+    def _thd_declared_total(self, cap: int, declared: Optional[int]) -> int:
+        """Tighten a buffer-derived token capacity with the caller's declared
+        packed total (``sdpa(max_total_seq_len_q/kv=...)``).
+
+        A ragged graph declares ``(B, H, S_max, D)`` plus device ragged
+        offsets, so the packed total is not expressible as a dim and
+        ``_thd_capacity`` has to infer an upper bound from buffer geometry.
+        That bound is safe but loose: rows between the real total and the
+        capacity are masked, yet still multiplied (``P == 0`` times V), so
+        they must be finite -- an over-allocated buffer whose tail was never
+        written is a hazard (issue #624). Declaring the total makes the TMA
+        extent exact, which puts that tail out of reach entirely.
+
+        Always a MIN: the declaration can only tighten the capacity, never
+        exceed it, so a stale or wrong value cannot push an access outside the
+        caller's own allocation."""
+        return cap if declared is None else min(cap, max(int(declared), 0))
 
     def _thd_view(self, buf: torch.Tensor, desc: TensorDesc, tokens: int) -> torch.Tensor:
         """The declared-stride ``(1, T, H, D)`` view over a THD buffer's storage.
@@ -1549,9 +1609,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
 
-        (q_ts, _, _), _ = self._thd_declared(self.q_desc)
-        (o_ts, _, _), _ = self._thd_declared(self.o_desc)
-        t_q = min(q_buf.numel() // q_ts, o_buf.numel() // o_ts)
+        t_q = min(self._thd_capacity(q_buf, self.q_desc), self._thd_capacity(o_buf, self.o_desc))
+        t_q = self._thd_declared_total(t_q, self.max_total_seq_len_q)
         if lse_tokens_cap is not None:
             t_q = min(t_q, lse_tokens_cap)
         if t_q == 0:
@@ -1572,9 +1631,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         Q = self._thd_view(q_buf, self.q_desc, t_q)
         O = self._thd_view(o_buf, self.o_desc, t_q)
-        (k_ts, _, _), _ = self._thd_declared(self.k_desc)
-        (v_ts, _, _), _ = self._thd_declared(self.v_desc)
-        t_kv = min(k_buf.numel() // k_ts, v_buf.numel() // v_ts)
+        t_kv = min(self._thd_capacity(k_buf, self.k_desc), self._thd_capacity(v_buf, self.v_desc))
+        t_kv = self._thd_declared_total(t_kv, self.max_total_seq_len_kv)
         if t_kv == 0:
             # No KV storage at all:
             # every query row is dead — served by the KERNEL's own dead-row
@@ -3065,15 +3123,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         def _cap(buf, desc, heads, d):
             # Token CAPACITY under the strides the view will bind: declared
             # (f16, TMA-expressible by check_support) or packed (FP8).
-            ts = self._thd_declared(desc)[0][0] if declared_views else heads * d
-            return buf.numel() // ts
+            return self._thd_capacity(buf, desc, packed=not declared_views)
 
         # Q/O (and a token-major LSE) bind ONE dynamic token symbol; K/V the
         # other — shared floors.
         t_q = min(_cap(q_buf, self.q_desc, qh, d_qk), _cap(o_buf, self.o_desc, qh, d_v))
+        t_q = self._thd_declared_total(t_q, self.max_total_seq_len_q)
         if lse_tokens_cap is not None:
             t_q = min(t_q, lse_tokens_cap)
         t_kv = min(_cap(k_buf, self.k_desc, kh, d_qk), _cap(v_buf, self.v_desc, kh, d_v))
+        t_kv = self._thd_declared_total(t_kv, self.max_total_seq_len_kv)
 
         if t_q == 0:
             return None

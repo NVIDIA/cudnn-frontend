@@ -1693,6 +1693,172 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     _check([64, 33])
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
+    """``sdpa(max_total_seq_len_q/kv=...)`` makes the THD token extent EXACT.
+
+    A ragged graph declares ``(B, H, S_max, D)`` plus device ragged offsets, so
+    the packed total is not expressible as a dim: without the attribute the
+    execute path infers an upper bound from buffer geometry. That bound is
+    memory-safe but loose, and the rows between the real total and the capacity
+    are masked yet still multiplied (``P == 0`` times V), so they must be
+    FINITE. A caller that over-allocates and leaves the tail unwritten
+    therefore poisons whole tiles through ``0 * NaN`` (issue #624).
+
+    Declaring the total clamps the TMA extent to the packed total, putting that
+    tail out of reach. Same graph, same data, only the tail fill differs: with
+    the declaration a NaN tail must be inert."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H, d = 8, 128
+    dtype = torch.bfloat16
+    seq_lens = [200, 150, 47]  # total 397 -- deliberately not a TILE_N multiple
+    B, S_max, T = len(seq_lens), max(seq_lens), sum(seq_lens)
+    CAP = 640  # > T: rows [T, CAP) are the over-allocated, unwritten tail
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d)
+
+    q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    k_live = torch.randn(T, H, d, device=dev, dtype=dtype)
+    v_live = torch.randn(T, H, d, device=dev, dtype=dtype)
+
+    def _run(tail_value, declare_total):
+        k_buf = torch.full((CAP, H, d), tail_value, device=dev, dtype=dtype)
+        v_buf = torch.full((CAP, H, d), tail_value, device=dev, dtype=dtype)
+        k_buf[:T], v_buf[:T] = k_live, v_live
+
+        stride = (S_max * H * d, d, H * d, 1)
+        io = cudnn.data_type.BFLOAT16
+        g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="q")
+        tk = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="k")
+        tv = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="v")
+        slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+        cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+        ro = (cu_t * H * d).view(B + 1, 1, 1, 1)
+        sq, skv = g.tensor_like(slq), g.tensor_like(slq)
+        qro, kro, vro, oro = (g.tensor_like(ro) for _ in range(4))
+        tq.set_ragged_offset(qro)
+        tk.set_ragged_offset(kro)
+        tv.set_ragged_offset(vro)
+        totals = dict(max_total_seq_len_q=T, max_total_seq_len_kv=T) if declare_total else {}
+        o, _ = g.sdpa(
+            name="sdpa",
+            q=tq,
+            k=tk,
+            v=tv,
+            generate_stats=False,
+            attn_scale=scale,
+            use_causal_mask=True,
+            use_padding_mask=True,
+            seq_len_q=sq,
+            seq_len_kv=skv,
+            **totals,
+        )
+        o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(stride))
+        o.set_ragged_offset(oro)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        _select_engine(g, engine_name())
+        g.check_support()
+        g.build_plans()
+        o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
+        vp = {tq: q_pk, tk: k_buf, tv: v_buf, o: o_buf, sq: slq, skv: slq, qro: ro, kro: ro, vro: ro, oro: ro}
+        g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+        torch.cuda.synchronize()
+        return o_buf
+
+    declared_nan = _run(float("nan"), declare_total=True)
+    declared_zero = _run(0.0, declare_total=True)
+    assert not torch.isnan(declared_nan).any(), (
+        f"declared max_total_seq_len must clamp the TMA extent to the packed total, but the "
+        f"unwritten capacity tail still reached P@V: {int(torch.isnan(declared_nan).sum())} NaNs in O"
+    )
+    assert torch.equal(declared_nan, declared_zero), "O must not depend on the capacity tail once the total is declared"
+
+    # Control: the tail is genuinely reachable without the declaration, so the
+    # assertions above are testing the clamp rather than a benign shape.
+    undeclared_nan = _run(float("nan"), declare_total=False)
+    assert torch.isnan(undeclared_nan).any(), (
+        "expected the undeclared path to read the capacity tail (issue #624); if this no longer "
+        "holds the extent is exact by other means and this test needs rethinking"
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_interleaved_kv_views():
+    """THD K/V bound as strided VIEWS of one fused [T, 2, H, D] record — the
+    layout torch.nn.attention.varlen users produce by slicing a fused KV
+    projection (declared token stride 2*H*D, V at element offset H*D).
+
+    Regression for issue #613: the execute-time token capacity must come from
+    the view's element SPAN. numel()-derived extents HALVE for these views
+    (the TMA descriptors then cut off half the tokens — silently wrong O),
+    and storage-derived extents over-claim into allocator slack, whose NaN
+    bit patterns poison masked rows through P(=0) * V."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H, d = 8, 128
+    dtype = torch.bfloat16
+    seq_lens = [200, 150, 47]
+    B, S_max, T = len(seq_lens), max(seq_lens), sum(seq_lens)
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d)
+
+    q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    kv_rec = torch.randn(T, 2, H, d, device=dev, dtype=dtype)  # fused record
+    k_view, v_view = kv_rec[:, 0], kv_rec[:, 1]  # token stride 2*H*d, V offset H*d
+
+    def _graph_run(k_buf, v_buf, kv_token_stride):
+        q_stride = (S_max * H * d, d, H * d, 1)
+        kv_stride = (S_max * kv_token_stride, d, kv_token_stride, 1)
+        io = cudnn.data_type.BFLOAT16
+        g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        tq = g.tensor(dim=[B, H, S_max, d], stride=list(q_stride), data_type=io, name="q")
+        tk = g.tensor(dim=[B, H, S_max, d], stride=list(kv_stride), data_type=io, name="k")
+        tv = g.tensor(dim=[B, H, S_max, d], stride=list(kv_stride), data_type=io, name="v")
+        slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+        cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+        ro_q = (cu_t * H * d).view(B + 1, 1, 1, 1)
+        ro_kv = (cu_t * kv_token_stride).view(B + 1, 1, 1, 1)
+        sq, skv = g.tensor_like(slq), g.tensor_like(slq)
+        qro, kro, vro, oro = (g.tensor_like(ro_q) for _ in range(4))
+        tq.set_ragged_offset(qro)
+        tk.set_ragged_offset(kro)
+        tv.set_ragged_offset(vro)
+        o, _ = g.sdpa(
+            name="sdpa", q=tq, k=tk, v=tv, generate_stats=False, attn_scale=scale, use_causal_mask=True, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv
+        )
+        o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(q_stride))
+        o.set_ragged_offset(oro)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        _select_engine(g, engine_name())
+        g.check_support()
+        g.build_plans()
+        o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
+        vp = {tq: q_pk, tk: k_buf, tv: v_buf, o: o_buf, sq: slq, skv: slq, qro: ro_q, kro: ro_kv, vro: ro_kv, oro: ro_q}
+        g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+        torch.cuda.synchronize()
+        return o_buf
+
+    o_views = _graph_run(k_view, v_view, 2 * H * d)
+    o_packed = _graph_run(k_view.contiguous(), v_view.contiguous(), H * d)
+    assert torch.equal(o_views, o_packed), f"interleaved K/V views diverge from packed binding: max|diff|={(o_views - o_packed).abs().max().item()}"
+
+
 @pytest.mark.L1
 @torch_fork_set_rng(seed=40)
 def test_dsl_sm100_thd_kv_zero_capacity_clamp():

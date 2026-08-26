@@ -232,6 +232,13 @@ class SdpaGraphFacts:
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
     thd: bool = False  # ragged (THD) Q/K/V
+    # Caller-declared packed token totals (sdpa(max_total_seq_len_q/kv=...)).
+    # Ragged graphs describe extents as (B, H, S_max, D) plus device ragged
+    # offsets, so the packed total is not otherwise expressible; when supplied
+    # it bounds the token axis EXACTLY instead of being inferred from buffer
+    # geometry. None = not declared (infer).
+    max_total_seq_len_q: Optional[int] = None
+    max_total_seq_len_kv: Optional[int] = None
     # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+): (B+1,) prefix sums, a
     # contract of their own — neither seq_len_* nor ragged_offset. A fact,
     # not a verdict: engines that don't consume the form must decline (reading
@@ -587,6 +594,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         seq_q_trim=seq_q_trim,
         padded=padded,
         thd=thd,
+        max_total_seq_len_q=rec.get("max_total_seq_len_q"),
+        max_total_seq_len_kv=rec.get("max_total_seq_len_kv"),
         has_cu_seq_len=has_cu_seq_len,
         has_sink=sink_token is not None,
         wants_stats=wants_stats,

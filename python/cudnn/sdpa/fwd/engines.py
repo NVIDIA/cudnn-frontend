@@ -873,6 +873,12 @@ def lower_dsl_prefill(
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
         thd=facts.thd,
+        # Caller-declared packed token totals (issue #624): when present the
+        # adapter binds EXACT token extents instead of the buffer-derived
+        # capacity, putting an over-allocated buffer's uninitialized tail out
+        # of TMA reach. Only ever tightens (see _thd_declared_total).
+        max_total_seq_len_q=facts.max_total_seq_len_q,
+        max_total_seq_len_kv=facts.max_total_seq_len_kv,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
         sched_policy=knobs.sched_policy if knobs is not None else None,
