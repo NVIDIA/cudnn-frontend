@@ -178,13 +178,7 @@ def _blocked_sf_to_flat(sf_tensor: torch.Tensor, rows: int, cols: int) -> torch.
     row_idx = torch.arange(rows, device=sf_tensor.device, dtype=torch.long).view(rows, 1)
     col_idx = torch.arange(sf_cols, device=sf_tensor.device, dtype=torch.long).view(1, sf_cols)
     col_blocks = sf_tensor.shape[1] // 4
-    linear = (
-        (row_idx // 128) * col_blocks * 512
-        + (col_idx // 4) * 512
-        + (row_idx % 32) * 16
-        + ((row_idx // 32) % 4) * 4
-        + (col_idx % 4)
-    )
+    linear = (row_idx // 128) * col_blocks * 512 + (col_idx // 4) * 512 + (row_idx % 32) * 16 + ((row_idx // 32) % 4) * 4 + (col_idx % 4)
     return sf_tensor.flatten()[linear]
 
 
