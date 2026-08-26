@@ -757,15 +757,25 @@ def make_sdpa_helpers(
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
         done = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
+        # Sequences are visited LONGEST FIRST through batch_remap (built by the
+        # THD setup launch), so the ragged tail of the grid is short sequences.
+        remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
+        for i in cutlass.range(0, n_batch, 1, unroll=1):
+            b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
             cb = (s_i + cutlass.Int32(cga_tile_m - 1)) // cutlass.Int32(cga_tile_m)
             units_b = cb * n_qh
+            # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
+            # in_rng is false and the quotient is discarded — but arith.select
+            # evaluates BOTH arms, so divide by a clamped copy to keep the dead
+            # arm defined. units_b keeps the true cb (thd_decode_unit's tb_nz).
+            cb_nz = cute.math.max(cb, cutlass.Int32(1))
             in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
             local = u - acc
+            # Natural order within a sequence (head-major, ascending rows).
             f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb).ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb).ir_value(), f_qc.ir_value()))
+            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb_nz).ir_value(), f_head.ir_value()))
+            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb_nz).ir_value(), f_qc.ir_value()))
             done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
             acc = acc + units_b
         q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair

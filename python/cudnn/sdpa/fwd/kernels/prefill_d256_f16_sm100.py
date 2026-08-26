@@ -121,7 +121,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -1775,10 +1775,12 @@ def _host(
             thd_q_lens_tensor,
             thd_kv_lens_tensor,
             thd_lens_form,
-            cutlass.Int32(QH),
+            cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+            n_thd_units,  # CLC path: envelope units; the counter goes unused
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # KV split rides the BATCH axis: z = batch + split*B.  The decode
@@ -1937,7 +1939,7 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

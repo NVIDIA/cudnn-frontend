@@ -289,6 +289,14 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     domain = caps.sched_policies
     if len(domain) <= 1:
         return [_sole(domain)]
+    if facts.thd and SCHED_NATURAL in domain:
+        # A ragged batch carries its own scheduler: it walks the LIVE units
+        # through batch_remap over a machine-sized grid. The LPT decodes map a
+        # linear tile id onto a dense rectangular tile space, so ranking them
+        # here would hand THD a decode built for a geometry it does not have --
+        # and spend autotune slots on it. Same exclusion the adapters apply to
+        # their standalone-wrapper derivation.
+        return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
         # SM80's measured choices (see the adapter's flavor table): causal
