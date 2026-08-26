@@ -354,17 +354,17 @@ def _kernel(
     else:
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
         # Per-CTA output rows one MMA-M block covers (the pair splits M).
-        epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
+        epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
         if cutlass.const_expr(epi_rows_per_mma_m == 64):
             # cluster-MMA m=128: the pair also splits N, so each CTA drains N/2.
             epi_cols_per_mma_m = pair_n_size // 2
         else:
             epi_cols_per_mma_m = pair_n_size
         # N is NOT a sub-block axis (the CTA tile is never split along N).
-    cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
+    cols_per_acc_stage = mma_size_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
     if cutlass.const_expr(cta_group == 1):
-        epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
+        epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
 
@@ -792,7 +792,7 @@ def _kernel(
                                 6,
                                 cutlass.Int32,
                             )
-                            for mi in range(num_mma_m)
+                            for mi in range(mma_size_m)
                         ]
                         for g in range(num_gemms)
                     ]
@@ -814,7 +814,7 @@ def _kernel(
                             for g in cutlass.range_constexpr(num_gemms):
                                 desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                 desc_b_k = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
-                                for mi in cutlass.range_constexpr(num_mma_m):
+                                for mi in cutlass.range_constexpr(mma_size_m):
                                     # The M sub-block offset is a whole SMEM swizzle atom,
                                     # so the descriptor's swizzle phase is preserved.
                                     desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
@@ -941,7 +941,7 @@ def _kernel(
                                     6,
                                     cutlass.Int32,
                                 )
-                                for mi in range(num_mma_m)
+                                for mi in range(mma_size_m)
                             ]
                             for g in range(num_gemms)
                         ]
@@ -963,7 +963,7 @@ def _kernel(
                                 for g in cutlass.range_constexpr(num_gemms):
                                     desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                     desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
-                                    for mi in cutlass.range_constexpr(num_mma_m):
+                                    for mi in cutlass.range_constexpr(mma_size_m):
                                         # The M sub-block offset is a whole SMEM swizzle atom, so the
                                         # descriptor's swizzle phase is preserved. B is shared.
                                         desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
@@ -1164,7 +1164,7 @@ def _kernel(
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            for mi in cutlass.range_constexpr(num_mma_m):
+            for mi in cutlass.range_constexpr(mma_size_m):
                 coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * cols_per_acc_stage) for g in range(num_gemms)]
@@ -1196,7 +1196,7 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
-                    if mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1:
+                    if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:

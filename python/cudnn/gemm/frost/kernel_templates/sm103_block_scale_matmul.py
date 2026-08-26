@@ -159,11 +159,11 @@ def _b_collector_op(mi):
     first MMA fills the B collector and the rest read it back instead of
     re-fetching the same operand from SMEM. `.collector::b::*` is silicon-gated
     (sm_107a only), hence `b_collector_ok`."""
-    if cutlass.const_expr(not b_collector_ok or num_mma_m == 1):
+    if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
         return None
     if cutlass.const_expr(mi == 0):
         return nvvm.Tcgen05MMACollectorOp.FILL
-    if cutlass.const_expr(mi == num_mma_m - 1):
+    if cutlass.const_expr(mi == mma_size_m - 1):
         return nvvm.Tcgen05MMACollectorOp.LASTUSE
     return nvvm.Tcgen05MMACollectorOp.USE
 
@@ -482,7 +482,7 @@ def _kernel(
         pair_n_size = logical_cta_tile_n_c
         # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
         # the per-CTA mma_inst_m — half the instruction's hardware M.
-    epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
+    epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
 
@@ -1067,7 +1067,7 @@ def _kernel(
                             (base_row_id << 16) | (acc_base_col + g * acc_gemm_stride + mi * epi_cols_per_mma_m),
                             cutlass.Float32,
                         )
-                        for mi in range(num_mma_m)
+                        for mi in range(mma_size_m)
                     ]
                     for g in range(num_gemms)
                 ]
@@ -1096,7 +1096,7 @@ def _kernel(
                                 desc_a_roots[i].advance_start_address(a_chunk_bytes * slot_stages[c]).advance_start_address(a_smem_m_step_bytes * mi)
                                 for c in range(chunks_per_ktile)
                             ]
-                            for mi in range(num_mma_m)
+                            for mi in range(mma_size_m)
                         ]
                         for i in range(num_a_operands)
                     ]
@@ -1124,7 +1124,7 @@ def _kernel(
                                 _ai = gemm_a_idx[g]
                                 _bj = gemm_b_idx[g]
                                 desc_b = _sm103_make_circular_mma_desc(desc_b_circ[_bj][_kc], _ph, desc_b_next[_bj][_kn])
-                                for mi in cutlass.range_constexpr(num_mma_m):
+                                for mi in cutlass.range_constexpr(mma_size_m):
                                     # B and its SF are shared by every M block; A's SF word block
                                     # follows the M block (SF words are one per 128 rows, packed
                                     # M-fastest, one utccp 128x4 atom apart -- registers_per_ATOM,
@@ -1221,7 +1221,7 @@ def _kernel(
                         _ai = gemm_a_idx[g]
                         _bj = gemm_b_idx[g]
                         desc_b = _sm103_make_circular_mma_desc(desc_b_circ[_bj][_kc], _ph, desc_b_next[_bj][_kn])
-                        for mi in cutlass.range_constexpr(num_mma_m):
+                        for mi in cutlass.range_constexpr(mma_size_m):
                             # B and its SF are shared by every M block; A's SF word block
                             # follows the M block (SF words are one per 128 rows, packed
                             # M-fastest, one utccp 128x4 atom apart -- registers_per_ATOM,
@@ -1404,9 +1404,9 @@ def _kernel(
                 acc_buf_parity = cutlass.Int32(0)
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            for mi in cutlass.range_constexpr(num_mma_m):
-                if cutlass.const_expr(use_acc_overlap and num_mma_m > 1):
-                    _mi = mi + (1 - acc_buf_parity) * (num_mma_m - 1 - 2 * mi)
+            for mi in cutlass.range_constexpr(mma_size_m):
+                if cutlass.const_expr(use_acc_overlap and mma_size_m > 1):
+                    _mi = mi + (1 - acc_buf_parity) * (mma_size_m - 1 - 2 * mi)
                 else:
                     _mi = mi
                 coord_m = coord_m_tile + _mi * epi_rows_per_mma_m
@@ -1434,7 +1434,7 @@ def _kernel(
                     c_rmem_vec = c_rmem_vecs[0]
 
                     if cutlass.const_expr(not use_acc_overlap):
-                        if cutlass.const_expr(mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1):
+                        if cutlass.const_expr(mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1):
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                             if elect_one:

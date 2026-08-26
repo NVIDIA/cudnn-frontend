@@ -7,7 +7,7 @@ A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
 constants) and then exec'd from the kernel cache under a synthetic module
 name, so it cannot use relative imports and this module is never rendered.
 Everything here therefore takes what it needs as ARGUMENTS -- a helper that
-reads an injected constant (`num_mma_m`, `tile_swizzle_n`, `ab_dtype`, ...)
+reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
 has to stay in the template, or be re-signed to receive it.
 """
 

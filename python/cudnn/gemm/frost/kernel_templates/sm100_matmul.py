@@ -10,7 +10,7 @@ Serves both MMA modes; ``cta_group`` is an injected tile constant.
   cta_group=2  2-CTA MMA cluster pair — the leader CTA issues the MMA while the
                follower CLC-consumes only; both CTAs load their operand slice.
 
-The CTA tile may span several MMA instructions along M (``num_mma_m``, each
+The CTA tile may span several MMA instructions along M (``mma_size_m``, each
 ``mma_inst_shape_mnk``): the TMA still loads the whole tile in one go, the MMA
 warp issues one instruction per (M, N) sub-block into its own TMEM column
 region, and the epilogue drains one MMA-M block per pass.
@@ -357,7 +357,7 @@ def _kernel(
         num_tma_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
 
     # One descriptor for every MMA instruction of the tile — the CTA tile spans
-    # num_mma_m of them, all the same shape.
+    # mma_size_m of them, all the same shape.
     idesc = cutlass.experimental.primitives.Tcgen05InstrDesc.build(
         a_dtype=mma_a_dtype,
         b_dtype=mma_b_dtype,
@@ -375,7 +375,7 @@ def _kernel(
     pair_n_size = logical_cta_tile_n
     # Per-CTA output rows one MMA-M block covers. A 2-CTA pair splits M, so this
     # is the per-CTA mma_inst_m — half the instruction's hardware M.
-    epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
+    epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     # TMEM accumulator layout, per acc stage: gemm g, M block mi -> columns
     # [g*cols_per_acc_stage + mi*epi_cols_per_mma_m, +epi_cols_per_mma_m), all at
     # TMEM lane base 0. N is NOT split across instructions, so the epilogue drains
@@ -385,7 +385,7 @@ def _kernel(
         epi_cols_per_mma_m = pair_n_size // 2
     else:
         epi_cols_per_mma_m = pair_n_size
-    cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
+    cols_per_acc_stage = mma_size_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
 
@@ -815,7 +815,7 @@ def _kernel(
                             6,
                             cutlass.Int32,
                         )
-                        for mi in range(num_mma_m)
+                        for mi in range(mma_size_m)
                     ]
                     for g in range(num_gemms)
                 ]
@@ -837,7 +837,7 @@ def _kernel(
                         for g in cutlass.range_constexpr(num_gemms):
                             desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                             desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
-                            for mi in cutlass.range_constexpr(num_mma_m):
+                            for mi in cutlass.range_constexpr(mma_size_m):
                                 # The M sub-block offset is a whole SMEM swizzle atom
                                 # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
                                 # swizzle phase is preserved. B is shared by every M block.
@@ -1011,7 +1011,7 @@ def _kernel(
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            for mi in cutlass.range_constexpr(num_mma_m):
+            for mi in cutlass.range_constexpr(mma_size_m):
                 coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * cols_per_acc_stage) for g in range(num_gemms)]
@@ -1043,7 +1043,7 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
-                    if mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1:
+                    if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:

@@ -645,7 +645,6 @@ def _emit_tap_store(
     stride,
     vsize: int,
     offset_expr: str = "linear_idx",
-    spec_idx: int = 0,
     *,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -1434,7 +1433,7 @@ def generate(
                 body_lines.append(f"if ({store_row_pred}) & (col_j + {vsize} <= N):")
                 body_lines.append(f"    {_st}")
         else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_pred=store_row_pred))
+            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)

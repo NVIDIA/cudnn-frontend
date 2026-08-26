@@ -49,6 +49,12 @@ _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
 ]
 
+# sm120 is warp-scoped MMA: the accumulators are already in registers, so there
+# is no LDTM shape, no TMEM row base and no span list to share -- and its store
+# is transposed-STG only. It shares no epilogue region with the tcgen05
+# families, so it is its own family here rather than a member of one.
+_SM120 = [("sm120_matmul.py", 1)]
+
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
 # the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA
 # mode. The plain pipeline is on that form, so it has ONE setup for both modes.
@@ -61,6 +67,7 @@ _SETUP_GROUPS = {
     "moe_2ctamma": _MOE_PLAIN_2,
     "block_scale_1ctamma": _BS_1 + _MOE_BS_1,
     "block_scale_2ctamma": _BS_2 + _MOE_BS_2,
+    "sm120": _SM120,
 }
 
 # DRAIN additionally splits on MoE: no TMA-store half, no mixed CGA, and the
@@ -73,6 +80,7 @@ _DRAIN_GROUPS = {
     "moe_2ctamma": _MOE_PLAIN_2,
     "moe_block_scale_1ctamma": _MOE_BS_1,
     "moe_block_scale_2ctamma": _MOE_BS_2,
+    "sm120": _SM120,
 }
 
 _BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2}
@@ -153,6 +161,8 @@ def test_every_template_is_assigned_to_exactly_one_group(region, groups):
 )
 def test_the_region_is_identical_within_its_group(region, group):
     names = (_SETUP_GROUPS if region == "SETUP" else _DRAIN_GROUPS)[group]
+    if {n for n, _ in names} <= _STANDALONE:
+        pytest.skip(f"{group} is a family of one -- it shares no region to compare")
     d = _template_dir()
     ref_name, ref_group = names[0]
     ref = _region(d / ref_name, region, ref_group)
@@ -203,7 +213,7 @@ def test_the_retired_fixed_width_drain_name_is_gone():
 
 
 def test_cols_per_acc_stage_has_one_meaning():
-    """It briefly named two different quantities: `num_mma_m * epi_cols_per_mma_m`
+    """It briefly named two different quantities: `mma_size_m * epi_cols_per_mma_m`
     in the plain pipeline and `epi_cols_per_mma_m` in block-scale."""
     bad_def, bad_use = [], []
     for path in _templates():
@@ -213,10 +223,10 @@ def test_cols_per_acc_stage_has_one_meaning():
         if path.name in _BLOCK_SCALE:
             bad_use.append(path.name)
             continue
-        if "cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m" not in src:
+        if "cols_per_acc_stage = mma_size_m * epi_cols_per_mma_m" not in src:
             bad_def.append(path.name)
     assert not bad_use, f"block-scale means epi_cols_per_mma_m -- say so: {bad_use}"
-    assert not bad_def, f"cols_per_acc_stage must be num_mma_m * epi_cols_per_mma_m: {bad_def}"
+    assert not bad_def, f"cols_per_acc_stage must be mma_size_m * epi_cols_per_mma_m: {bad_def}"
 
 
 def test_the_overlap_arm_never_indexes_the_span_list():
@@ -241,6 +251,7 @@ def test_the_markers_do_not_break_the_template_parse():
 
 _MIXED_CGA = {f for f, _ in _PLAIN_1 + _PLAIN_2 + _BS_1 + _BS_2}
 _MOE = {f for f, _ in _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2}
+_STANDALONE = {f for f, _ in _SM120}
 
 
 def _call_endswith(node, suffix):
@@ -277,6 +288,8 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
     for path, cta_group, src in _template_variants():
         tree = ast.parse(src)
         calls = [node for node in ast.walk(tree) if _call_endswith(node, "_l2_swizzle_tile")]
+        if path.name in _STANDALONE:
+            continue  # its own in-file raster; no mixed CGA to specialize for
         if path.name not in _MIXED_CGA:
             if calls:
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
@@ -298,7 +311,7 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
     tile/K loops.  Pin both the full template inventory and the root shape so
     deleting a build cannot make the no-build-in-a-loop check pass vacuously."""
 
-    assert {path.name for path in _templates()} == _MIXED_CGA | _MOE
+    assert {path.name for path in _templates()} == _MIXED_CGA | _MOE | _STANDALONE
     total_builds = 0
     total_expected = 0
     offenders = []
@@ -311,13 +324,19 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
 
         builds = [node for node in ast.walk(tree) if _call_endswith(node, "Tcgen05SmemDesc.build")]
         total_builds += len(builds)
-        if path.name in _BLOCK_SCALE:
+        if path.name in _STANDALONE:
+            # warp-scoped MMA reads SMEM through ldmatrix, not an SMEM descriptor.
+            expected_bases = []
+        elif path.name in _BLOCK_SCALE:
             expected_bases = sorted(("smem_a_list[i]", "smem_b_list[j]", "smem_sfa_list[i]", "smem_sfb_list[j]"))
         elif "mainloop" in path.name:
             expected_bases = ["smem_a", "smem_b"]
         else:
             expected_bases = ["smem_a_list[i]", "smem_b_list[j]"]
-        total_expected += len(expected_bases)
+        # The MoE ctamma merge left the MMA warp arm-split -- the 2-CTA arm's
+        # pair leader carries its own copy of the roots -- so those templates
+        # hold one full set per MMA mode. Everything else unified to one.
+        total_expected += len(expected_bases) * (2 if path.name in _MOE else 1)
 
         actual_bases = []
         for build in builds:
@@ -336,6 +355,8 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
             if in_runtime_loop or not target_names or not all("root" in name for name in target_names):
                 offenders.append(f"{path.name}:{build.lineno}")
 
+        if path.name in _MOE:
+            expected_bases = sorted(expected_bases * 2)
         if sorted(actual_bases) != expected_bases:
             offenders.append(f"{path.name}: descriptor bases {sorted(actual_bases)!r}, expected {expected_bases!r}")
 
@@ -346,6 +367,8 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
                 "desc_sfa_roots": {"mma_sf_stage"},
                 "desc_sfb_roots": {"mma_sf_stage"},
             }
+        elif path.name in _STANDALONE:
+            expected_root_stages = {}
         else:
             expected_root_stages = {
                 ("desc_a_root" if "mainloop" in path.name else "desc_a_roots"): {"stage"},

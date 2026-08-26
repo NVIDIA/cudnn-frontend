@@ -393,7 +393,7 @@ def _kernel(
     pair_n_size = logical_cta_tile_n
     # Per-CTA output rows one MMA-M block covers. A 2-CTA pair splits M, so this
     # is the per-CTA mma_inst_m — half the instruction's hardware M.
-    epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
+    epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     # TMEM accumulator layout, per acc stage: gemm g, M block mi -> columns
     # [g*cols_per_acc_stage + mi*epi_cols_per_mma_m, +epi_cols_per_mma_m), all at
     # TMEM lane base 0. N is NOT split across instructions, so the epilogue drains
@@ -403,7 +403,7 @@ def _kernel(
         epi_cols_per_mma_m = pair_n_size // 2
     else:
         epi_cols_per_mma_m = pair_n_size
-    cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
+    cols_per_acc_stage = mma_size_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
@@ -895,7 +895,7 @@ def _kernel(
 
                 acc_col_id = base_col_id_root + acc_stage * cols_per_acc_stage
                 # One accumulator per M block, all at TMEM lane base 0.
-                tmem_addr_mmas = [cutlass.inttoptr((base_row_id << 16) | (acc_col_id + mi * epi_cols_per_mma_m), 6, cutlass.Int32) for mi in range(num_mma_m)]
+                tmem_addr_mmas = [cutlass.inttoptr((base_row_id << 16) | (acc_col_id + mi * epi_cols_per_mma_m), 6, cutlass.Int32) for mi in range(mma_size_m)]
 
                 scale_d = cutlass.Boolean(False)
                 for k_tile_idx in range(num_k_tiles):
@@ -932,7 +932,7 @@ def _kernel(
                     for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         desc_a_k = desc_a_base.advance_start_address(a_smem_k_step_bytes * k_block_idx)
                         desc_b = desc_b_base.advance_start_address(b_smem_k_step_bytes * k_block_idx)
-                        for mi in cutlass.range_constexpr(num_mma_m):
+                        for mi in cutlass.range_constexpr(mma_size_m):
                             # The M sub-block offset is a whole SMEM swizzle atom, so the
                             # descriptor's swizzle phase is preserved. B is shared.
                             desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
@@ -1308,7 +1308,7 @@ def _kernel(
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
 
-            for mi in cutlass.range_constexpr(num_mma_m):
+            for mi in cutlass.range_constexpr(mma_size_m):
                 coord_m = coord_m_tile + mi * epi_rows_per_mma_m
                 mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * cols_per_acc_stage) for g in range(num_gemms)]
@@ -1340,7 +1340,7 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
-                    if mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1:
+                    if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:

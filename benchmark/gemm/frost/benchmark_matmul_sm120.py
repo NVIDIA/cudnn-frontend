@@ -73,7 +73,7 @@ def setup_frost(M: int, N: int, K: int, data, args):
     B = g.tensor(name="B", dim=[1, K, N], stride=[N * K, 1, K])
     C = g.matmul(A=A, B=B, name="mm")
     C.set_output(True)
-    compiled = jit_from_cudnn_graph(g, by_name(args.frost_config), cta_group=1)
+    compiled = jit_from_cudnn_graph(g, by_name(args.frost_config))
     a, b, c = data
     bd = compiled.binding
     pack = {bd.a_operands[0]: a, bd.b_operands[0]: b, bd.outputs[0]: c}
