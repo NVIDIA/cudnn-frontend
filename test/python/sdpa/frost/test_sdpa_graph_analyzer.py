@@ -1088,11 +1088,15 @@ def test_sm120_knob_domains(monkeypatch):
     # remap); a value outside the vocabulary still declines.
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # split_kv: the SM120 row serves {1, 2, 4} (inline chunking + the shared
-    # combine); a value outside the domain still declines.
+    # split_kv: the SM120 row WIRES the split path (inline chunking + the
+    # shared combine), which is a boolean gate — the kernel has no upper bound
+    # on the split count, so 8 is admissible too. WHICH splits get proposed is
+    # split_kv_candidates' device-derived ladder, not a per-row domain. A
+    # non-count still declines.
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=1))
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=4))
-    assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
+    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
+    assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=0))
 
 
 # ---------------------------------------------------------------------------

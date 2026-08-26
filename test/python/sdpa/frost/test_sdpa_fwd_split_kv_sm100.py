@@ -915,6 +915,8 @@ def _expected_split(b, h_q, s_q, s_kv, *, rows_per_tile=512, ctas_per_tile=2, kv
         kv_tiles=-(-s_kv // kv_tile),
         sm_count=device_info(torch.cuda.current_device()).sm_count,
         ctas_per_tile=ctas_per_tile,
+        # The combine's grid is (S_q, H, B) — see choose_split_kv.
+        combine_rows=b * h_q * s_q,
     )
 
 

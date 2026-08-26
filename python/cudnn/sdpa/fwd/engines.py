@@ -242,10 +242,14 @@ class Capabilities:
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
     pack_gqas: frozenset[bool] = frozenset({False})
-    # Split-KV domain. {1} = the axis exists but only "off" is served; rows
-    # whose kernels wire the split path AND whose adapter launches the combine
-    # widen this (the SM100 f16 rows today).
-    split_kvs: frozenset[int] = frozenset({1})
+    # Does this row's lowering wire the KV-split path (kernel SplitHelpers +
+    # adapter carving the partial slabs + launching the combine)? A GATE, not a
+    # domain: WHICH splits are worth trying is a device-derived search space
+    # (heuristics.split_kv_candidates), not a per-row constant. Fail-closed —
+    # a row that accepts split_kv > 1 without the plumbing leaves untouched
+    # partial slots at lse_partial = 0, which corrupt the combine's
+    # log-sum-exp rather than raising.
+    split_kv_supported: bool = False
     # Shapes whose kernel flavors wire SplitHelpers. None = every flavor in
     # d_shapes does (f16/SM120). A set = split_kv > 1 is honored only when
     # the graph's dims are covered by a member (the quantized families wire
@@ -297,7 +301,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
             (knobs.cga, capabilities.cgas, "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
-            (knobs.split_kv, capabilities.split_kvs, "split_kv"),
             (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
             if value is not None and value not in domain:
@@ -305,7 +308,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # members (softmax_precision), and the pybind enum defines no
                 # ordering of its own.
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
+        if knobs.split_kv is not None and knobs.split_kv < 1:
+            return f"requested split_kv={knobs.split_kv} is not a split count (1 = off)"
         if knobs.split_kv is not None and knobs.split_kv > 1:
+            if not capabilities.split_kv_supported:
+                return "split_kv > 1 is not wired in this engine's lowering"
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
@@ -540,7 +547,7 @@ def _sm100_spec() -> EngineSpec:
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
             # carves the partial slabs + launches split_combine_sm100 when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
-            split_kvs=frozenset({1, 2, 4}),
+            split_kv_supported=True,
             pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
@@ -591,7 +598,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             cgas=frozenset({2}),
             # The split path also needs a half-precision O (mismatch's
             # facts x knobs gate) and rides the d128 flavor (split_d_shapes).
-            split_kvs=frozenset({1, 2, 4}),
+            split_kv_supported=True,
             # PackGQA is currently not supported for the MXFP8 SDPA engine:
             # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
             # head, so a packed tile's interleaved (token, head) rows cannot
@@ -623,7 +630,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
-    - split_kvs / split_d_shapes: only the SM100 d128 kernel wires
+    - split_kv_supported / split_d_shapes: only the SM100 d128 kernel wires
       SplitHelpers; the SM107 sibling has no split path yet, and the
       d192x128 file forks its own scheduler and has none either.
     - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
@@ -692,7 +699,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # Split partials reduce in half precision, so mismatch()'s
             # facts x knobs gate additionally requires a bf16/fp16 O on the
             # quantized rows; split_d_shapes pins it to the d128 flavor.
-            split_kvs=frozenset({1}) if rubin_row else frozenset({1, 2, 4}),
+            split_kv_supported=not rubin_row,
             split_d_shapes=frozenset({(128, 128)}),
             pack_gqas=frozenset({False, True}),
         ),
@@ -780,7 +787,7 @@ def _sm120_spec() -> EngineSpec:
             # (the combine is one block per row — arch-agnostic). The config
             # backstop bars a split under the LPT remaps, so the heuristic's
             # split sets ride SCHED_NATURAL.
-            split_kvs=frozenset({1, 2, 4}),
+            split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
