@@ -483,6 +483,79 @@ class Batchnorm_attributes;
 class Batchnorm_backward_attributes;
 class Concatenate_attributes;
 
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+namespace json_detail {
+
+// Every attributes class keys its port maps by its own private input_names/output_names enum.
+// Letting nlohmann serialize those maps directly instantiates its object/array machinery once per
+// enum type (76 instantiations across the graph API), which dominates the compile time of this
+// header. Funnel them all through one common list type instead, so the heavy instantiation happens
+// once. The on-the-wire shape (array of [port_name, tensor] pairs) is unchanged.
+using port_list_t = std::vector<std::pair<std::string, std::shared_ptr<Tensor_attributes>>>;
+
+inline void
+ports_to_json(nlohmann::json& j, port_list_t const& ports) {
+    j = ports;
+}
+
+inline void
+ports_from_json(nlohmann::json const& j, port_list_t& ports) {
+    ports = j.get<port_list_t>();
+}
+
+template <typename T>
+void
+json_set(nlohmann::json& j, T const& value) {
+    j = value;
+}
+
+template <typename T>
+void
+json_get(nlohmann::json const& j, T& value) {
+    j.get_to(value);
+}
+
+template <typename PortEnum>
+void
+json_set(nlohmann::json& j, std::unordered_map<PortEnum, std::shared_ptr<Tensor_attributes>> const& ports) {
+    port_list_t list;
+    list.reserve(ports.size());
+    for (auto const& [port, tensor] : ports) {
+        list.emplace_back(nlohmann::json(port).template get<std::string>(), tensor);
+    }
+    ports_to_json(j, list);
+}
+
+template <typename PortEnum>
+void
+json_get(nlohmann::json const& j, std::unordered_map<PortEnum, std::shared_ptr<Tensor_attributes>>& ports) {
+    port_list_t list;
+    ports_from_json(j, list);
+    ports.clear();
+    for (auto& [port, tensor] : list) {
+        ports[nlohmann::json(port).template get<PortEnum>()] = std::move(tensor);
+    }
+}
+
+}  // namespace json_detail
+
+#define CUDNN_FE_JSON_TO(v1) ::cudnn_frontend::graph::json_detail::json_set(nlohmann_json_j[#v1], nlohmann_json_t.v1);
+#define CUDNN_FE_JSON_FROM(v1) \
+    ::cudnn_frontend::graph::json_detail::json_get(nlohmann_json_j.at(#v1), nlohmann_json_t.v1);
+
+// Mirrors NLOHMANN_DEFINE_TYPE_INTRUSIVE, but routes each member through json_detail::json_set and
+// json_detail::json_get so that port maps take the shared funnel above.
+#define CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Type, ...)                                        \
+    friend void to_json(nlohmann::json& nlohmann_json_j, const Type& nlohmann_json_t) {   \
+        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(CUDNN_FE_JSON_TO, __VA_ARGS__))          \
+    }                                                                                     \
+    friend void from_json(const nlohmann::json& nlohmann_json_j, Type& nlohmann_json_t) { \
+        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(CUDNN_FE_JSON_FROM, __VA_ARGS__))        \
+    }
+#else
+#define CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Type, ...)
+#endif
+
 template <typename DerivedT>
 class Attributes {
     DerivedT&
@@ -729,7 +802,7 @@ class BN_finalize_attributes : public Attributes<BN_finalize_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { EQ_SCALE, EQ_BIAS, MEAN, INV_VARIANCE, NEXT_RUNNING_MEAN, NEXT_RUNNING_VAR };
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BN_finalize_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(BN_finalize_attributes, name, compute_data_type, inputs, outputs)
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
     BN_finalize_attributes&
@@ -754,7 +827,7 @@ class Genstats_attributes : public Attributes<Genstats_attributes> {
 
     enum class output_names { SUM, SQ_SUM };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Genstats_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Genstats_attributes, name, compute_data_type, inputs, outputs)
 };
 
 class Conv_fprop_attributes : public Attributes<Conv_fprop_attributes> {
@@ -774,16 +847,16 @@ class Conv_fprop_attributes : public Attributes<Conv_fprop_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Conv_fprop_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   pre_padding,
-                                   post_padding,
-                                   stride,
-                                   dilation,
-                                   math_mode)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Conv_fprop_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    pre_padding,
+                                    post_padding,
+                                    stride,
+                                    dilation,
+                                    math_mode)
 
     ConvolutionMode_t
     get_convolution_mode() const {
@@ -859,7 +932,7 @@ class Batchnorm_backward_attributes : public Attributes<Batchnorm_backward_attri
     // Only special case where one of the inputs is a vector.
     std::vector<std::shared_ptr<Tensor_attributes>> peer_stats;
     enum class output_names { DX, DSCALE, DBIAS };
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Batchnorm_backward_attributes, name, compute_data_type, inputs, peer_stats, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Batchnorm_backward_attributes, name, compute_data_type, inputs, peer_stats, outputs)
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
     Batchnorm_backward_attributes&
@@ -886,7 +959,7 @@ class DBN_weight_attributes : public Attributes<DBN_weight_attributes> {
     enum class input_names { DY, X, SCALE, MEAN, INV_VARIANCE };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DSCALE, DBIAS, EQ_BIAS, EQ_SCALE_DY, EQ_SCALE_X };
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DBN_weight_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(DBN_weight_attributes, name, compute_data_type, inputs, outputs)
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 };
 
@@ -907,16 +980,16 @@ class Conv_dgrad_attributes : public Attributes<Conv_dgrad_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DX };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Conv_dgrad_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   pre_padding,
-                                   post_padding,
-                                   stride,
-                                   dilation,
-                                   math_mode)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Conv_dgrad_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    pre_padding,
+                                    post_padding,
+                                    stride,
+                                    dilation,
+                                    math_mode)
 
     ConvolutionMode_t
     get_convolution_mode() const {
@@ -994,7 +1067,7 @@ class Matmul_fp8_attributes : public Attributes<Matmul_fp8_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { C, Amax_C };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Matmul_fp8_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Matmul_fp8_attributes, name, compute_data_type, inputs, outputs)
 
     Matmul_fp8_attributes&
     set_m_override(std::shared_ptr<Tensor_attributes> const& value) {
@@ -1038,7 +1111,7 @@ class Matmul_attributes : public Attributes<Matmul_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { C };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Matmul_attributes, name, compute_data_type, inputs, outputs, padding_value)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Matmul_attributes, name, compute_data_type, inputs, outputs, padding_value)
 
     Matmul_attributes&
     clone_fp8_attributes(Matmul_fp8_attributes const& attributes) {
@@ -1108,19 +1181,19 @@ class Pointwise_attributes : public Attributes<Pointwise_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { OUT_0 };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Pointwise_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   mode,
-                                   axis,
-                                   relu_lower_clip,
-                                   relu_upper_clip,
-                                   relu_lower_clip_slope,
-                                   swish_beta,
-                                   elu_alpha,
-                                   softplus_beta)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Pointwise_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    mode,
+                                    axis,
+                                    relu_lower_clip,
+                                    relu_upper_clip,
+                                    relu_lower_clip_slope,
+                                    swish_beta,
+                                    elu_alpha,
+                                    softplus_beta)
 
     Pointwise_attributes&
     set_mode(PointwiseMode_t const value) {
@@ -1196,7 +1269,7 @@ class Instancenorm_backward_attributes : public Attributes<Instancenorm_backward
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DX, DSCALE, DBIAS };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Instancenorm_backward_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Instancenorm_backward_attributes, name, compute_data_type, inputs, outputs)
 
     Instancenorm_backward_attributes&
     set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
@@ -1217,7 +1290,7 @@ class Layernorm_backward_attributes : public Attributes<Layernorm_backward_attri
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DX, DSCALE, DBIAS };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Layernorm_backward_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Layernorm_backward_attributes, name, compute_data_type, inputs, outputs)
 
     Layernorm_backward_attributes&
     set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
@@ -1240,7 +1313,7 @@ class Layernorm_attributes : public Attributes<Layernorm_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, MEAN, INV_VARIANCE };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Layernorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Layernorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
 
     Layernorm_attributes&
     set_forward_phase(NormFwdPhase_t const value) {
@@ -1273,7 +1346,7 @@ class AdaLayernorm_attributes : public Attributes<AdaLayernorm_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, MEAN, INV_VARIANCE };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(AdaLayernorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(AdaLayernorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
 
     AdaLayernorm_attributes&
     set_forward_phase(NormFwdPhase_t const value) {
@@ -1298,7 +1371,7 @@ class AdaLayernorm_backward_attributes : public Attributes<AdaLayernorm_backward
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DX, DSCALE, DBIAS };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(AdaLayernorm_backward_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(AdaLayernorm_backward_attributes, name, compute_data_type, inputs, outputs)
 
     AdaLayernorm_backward_attributes&
     set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
@@ -1321,7 +1394,7 @@ class Instancenorm_attributes : public Attributes<Instancenorm_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, MEAN, INV_VARIANCE };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Instancenorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Instancenorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
 
     Instancenorm_attributes&
     set_forward_phase(NormFwdPhase_t const value) {
@@ -1348,7 +1421,7 @@ class Batchnorm_attributes : public Attributes<Batchnorm_attributes> {
     std::vector<std::shared_ptr<Tensor_attributes>> peer_stats;
     enum class output_names { Y, MEAN, INV_VARIANCE, NEXT_RUNNING_MEAN, NEXT_RUNNING_VAR };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Batchnorm_attributes, name, compute_data_type, inputs, peer_stats, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Batchnorm_attributes, name, compute_data_type, inputs, peer_stats, outputs)
 
     Batchnorm_attributes&
     set_previous_running_stats(std::shared_ptr<Tensor_attributes>& mean,
@@ -1383,7 +1456,7 @@ class Batchnorm_inference_attributes : public Attributes<Batchnorm_inference_att
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Batchnorm_inference_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Batchnorm_inference_attributes, name, compute_data_type, inputs, outputs)
 };
 
 class Reduction_attributes : public Attributes<Reduction_attributes> {
@@ -1399,13 +1472,13 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reduction_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   mode,
-                                   is_deterministic)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Reduction_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    mode,
+                                    is_deterministic)
 
     std::optional<ReductionMode_t>
     get_mode() const {
@@ -1452,15 +1525,15 @@ class Rng_attributes : public Attributes<Rng_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Rng_attributes,
-                                   name,
-                                   inputs,
-                                   outputs,
-                                   distribution,
-                                   dim,
-                                   stride,
-                                   seed,
-                                   bernoulli_probability)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Rng_attributes,
+                                    name,
+                                    inputs,
+                                    outputs,
+                                    distribution,
+                                    dim,
+                                    stride,
+                                    seed,
+                                    bernoulli_probability)
 
     std::vector<int64_t>
     get_dim() const {
@@ -1538,17 +1611,17 @@ class Resample_attributes : public Attributes<Resample_attributes> {
     enum class output_names { Y, Index };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Resample_attributes,
-                                   name,
-                                   inputs,
-                                   outputs,
-                                   generate_index,
-                                   resample_mode,
-                                   padding_mode,
-                                   pre_padding,
-                                   post_padding,
-                                   stride,
-                                   window)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Resample_attributes,
+                                    name,
+                                    inputs,
+                                    outputs,
+                                    generate_index,
+                                    resample_mode,
+                                    padding_mode,
+                                    pre_padding,
+                                    post_padding,
+                                    stride,
+                                    window)
 
     auto
     set_resampling_mode(ResampleMode_t const& value) -> Resample_attributes& {
@@ -1652,14 +1725,14 @@ class Reshape_attributes : public Attributes<Reshape_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Reshape_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   dim,
-                                   stride,
-                                   reshape_mode)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Reshape_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    dim,
+                                    stride,
+                                    reshape_mode)
 
     std::vector<int64_t>
     get_dim() const {
@@ -1718,7 +1791,7 @@ class Transpose_attributes : public Attributes<Transpose_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Transpose_attributes, name, compute_data_type, inputs, outputs, permutation)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Transpose_attributes, name, compute_data_type, inputs, outputs, permutation)
 
     std::vector<int64_t>
     get_permutation() const {
@@ -1744,7 +1817,7 @@ class Rmsnorm_attributes : public Attributes<Rmsnorm_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, INV_VARIANCE };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Rmsnorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Rmsnorm_attributes, name, compute_data_type, inputs, outputs, forward_phase)
 
     Rmsnorm_attributes&
     set_forward_phase(NormFwdPhase_t const value) {
@@ -1798,7 +1871,7 @@ class RoPE_attributes : public Attributes<RoPE_attributes> {
         return *this;
     }
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_attributes, name, compute_data_type, inputs, outputs, output_scale, rope_dim)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(RoPE_attributes, name, compute_data_type, inputs, outputs, output_scale, rope_dim)
 };
 
 class RoPE_backward_attributes : public Attributes<RoPE_backward_attributes> {
@@ -1830,13 +1903,13 @@ class RoPE_backward_attributes : public Attributes<RoPE_backward_attributes> {
         return *this;
     }
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_backward_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   output_scale,
-                                   rope_dim)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(RoPE_backward_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    output_scale,
+                                    rope_dim)
 };
 
 class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attributes> {
@@ -1851,7 +1924,7 @@ class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attribute
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DX, DSCALE, DBIAS };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Rmsnorm_backward_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Rmsnorm_backward_attributes, name, compute_data_type, inputs, outputs)
 
     Rmsnorm_backward_attributes&
     has_dbias(bool value) {
@@ -2083,23 +2156,23 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::shared_ptr<Tensor_attributes> Amax_O;    ///< FP8 absolute maximum for output tensor
     };
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_attributes,
-                                   name,
-                                   inputs,
-                                   outputs,
-                                   generate_stats,
-                                   alibi_mask,
-                                   padding_mask,
-                                   dropout_probability,
-                                   attn_scale_value,
-                                   max_seq_len_kv,
-                                   max_total_seq_len_q,
-                                   max_total_seq_len_kv,
-                                   mma_core_mode,
-                                   left_bound,
-                                   right_bound,
-                                   diagonal_alignment,
-                                   implementation)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(SDPA_attributes,
+                                    name,
+                                    inputs,
+                                    outputs,
+                                    generate_stats,
+                                    alibi_mask,
+                                    padding_mask,
+                                    dropout_probability,
+                                    attn_scale_value,
+                                    max_seq_len_kv,
+                                    max_total_seq_len_q,
+                                    max_total_seq_len_kv,
+                                    mma_core_mode,
+                                    left_bound,
+                                    right_bound,
+                                    diagonal_alignment,
+                                    implementation)
 
     SDPA_attributes&
     set_generate_stats(bool const value) {
@@ -2411,20 +2484,20 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { dQ, dK, dV, dBias, RNG_DUMP, DSINK_TOKEN };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_backward_attributes,
-                                   name,
-                                   inputs,
-                                   outputs,
-                                   alibi_mask,
-                                   padding_mask,
-                                   dropout_probability,
-                                   attn_scale_value,
-                                   left_bound,
-                                   right_bound,
-                                   diagonal_alignment,
-                                   max_total_seq_len_q,
-                                   max_total_seq_len_kv,
-                                   is_deterministic_algorithm)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(SDPA_backward_attributes,
+                                    name,
+                                    inputs,
+                                    outputs,
+                                    alibi_mask,
+                                    padding_mask,
+                                    dropout_probability,
+                                    attn_scale_value,
+                                    left_bound,
+                                    right_bound,
+                                    diagonal_alignment,
+                                    max_total_seq_len_q,
+                                    max_total_seq_len_kv,
+                                    is_deterministic_algorithm)
 
     SDPA_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
@@ -2651,18 +2724,18 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     enum class output_names { dQ, dK, dV, Amax_dQ, Amax_dK, Amax_dV, Amax_dP, DSINK_TOKEN };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_fp8_backward_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   padding_mask,
-                                   dropout_probability,
-                                   left_bound,
-                                   right_bound,
-                                   diagonal_alignment,
-                                   attn_scale_value,
-                                   is_deterministic_algorithm)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(SDPA_fp8_backward_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    padding_mask,
+                                    dropout_probability,
+                                    left_bound,
+                                    right_bound,
+                                    diagonal_alignment,
+                                    attn_scale_value,
+                                    is_deterministic_algorithm)
 
     SDPA_fp8_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {
@@ -2812,7 +2885,7 @@ class Softmax_attributes : public Attributes<Softmax_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { S, Stats, Max, Sum_exp };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Softmax_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Softmax_attributes, name, compute_data_type, inputs, outputs)
 
     Softmax_attributes&
     set_sink(std::shared_ptr<Tensor_attributes> value) {
@@ -2842,12 +2915,12 @@ class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attribute
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(DiagonalBandMask_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   comparison_mode)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(DiagonalBandMask_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    comparison_mode)
 
     PointwiseMode_t
     get_comparison_mode() const {
@@ -2878,16 +2951,16 @@ class Conv_wgrad_attributes : public Attributes<Conv_wgrad_attributes> {
 
     enum class output_names { DW };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Conv_wgrad_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   pre_padding,
-                                   post_padding,
-                                   stride,
-                                   dilation,
-                                   math_mode)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Conv_wgrad_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    pre_padding,
+                                    post_padding,
+                                    stride,
+                                    dilation,
+                                    math_mode)
 
     ConvolutionMode_t
     get_convolution_mode() const {
@@ -2966,7 +3039,7 @@ class Slice_attributes : public Attributes<Slice_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Slice_attributes, name, compute_data_type, inputs, outputs, slices, slice_strides)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Slice_attributes, name, compute_data_type, inputs, outputs, slices, slice_strides)
 
     Slice_attributes&
     set_slices(std::vector<std::pair<int64_t, int64_t>> const value) {
@@ -3008,7 +3081,7 @@ class PagedCacheLoad_attributes : public Attributes<PagedCacheLoad_attributes> {
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { yOut };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(PagedCacheLoad_attributes, name, compute_data_type, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(PagedCacheLoad_attributes, name, compute_data_type, inputs, outputs)
 };
 
 class Block_scale_quantize_attributes : public Attributes<Block_scale_quantize_attributes> {
@@ -3025,13 +3098,13 @@ class Block_scale_quantize_attributes : public Attributes<Block_scale_quantize_a
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y, scale };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Block_scale_quantize_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   block_size,
-                                   axis)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Block_scale_quantize_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    block_size,
+                                    axis)
 
     Block_scale_quantize_attributes&
     set_block_size(int32_t const value) {
@@ -3065,13 +3138,13 @@ class Block_scale_dequantize_attributes : public Attributes<Block_scale_dequanti
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Block_scale_dequantize_attributes,
-                                   name,
-                                   compute_data_type,
-                                   inputs,
-                                   outputs,
-                                   block_size,
-                                   is_negative_scale)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Block_scale_dequantize_attributes,
+                                    name,
+                                    compute_data_type,
+                                    inputs,
+                                    outputs,
+                                    block_size,
+                                    is_negative_scale)
 
     Block_scale_dequantize_attributes&
     set_block_size(int32_t const value, int32_t idx = 0) {
@@ -3138,7 +3211,7 @@ class Concatenate_attributes : public Attributes<Concatenate_attributes> {
     std::vector<std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Concatenate_attributes, name, inputs, outputs, axis, in_place_index)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Concatenate_attributes, name, inputs, outputs, axis, in_place_index)
 
     Concatenate_attributes&
     set_axis(int64_t const value) {
@@ -3167,7 +3240,7 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Output };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Moe_grouped_matmul_attributes, name, inputs, outputs, mode, top_k)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Moe_grouped_matmul_attributes, name, inputs, outputs, mode, top_k)
 
     Moe_grouped_matmul_attributes&
     set_mode(MoeGroupedMatmulMode_t mode) {
@@ -3192,7 +3265,7 @@ class Moe_grouped_matmul_bwd_attributes : public Attributes<Moe_grouped_matmul_b
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { DWeight };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Moe_grouped_matmul_bwd_attributes, name, inputs, outputs)
+    CUDNN_FE_DEFINE_ATTRIBUTES_JSON(Moe_grouped_matmul_bwd_attributes, name, inputs, outputs)
 };
 
 }  // namespace graph
