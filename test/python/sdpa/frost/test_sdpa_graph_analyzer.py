@@ -1294,14 +1294,10 @@ def test_bwd_probe_accepts_sink(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(dsink=True))
 
 
-def test_bwd_probe_rejects_bias(monkeypatch):
+def test_bwd_probe_rejects_deterministic_broadcast_dbias(monkeypatch):
+    # A batch-broadcast bias reduces dBias over B through unordered atomics.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(bias=True))
-
-
-def test_bwd_probe_rejects_dbias(monkeypatch):
-    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
+    assert not _bwd_eligible(_mk_bwd_graph(bias=True, dbias=True, use_deterministic_algorithm=True))
 
 
 def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
