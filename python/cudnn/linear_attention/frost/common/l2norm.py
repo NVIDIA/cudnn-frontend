@@ -28,7 +28,7 @@ FWD_ROWS_PER_GROUP = 2  # fwd rows batched per lane group: 8 independent loads i
 
 
 @cute.kernel
-def l2norm_qk_kernel(
+def frost_l2norm_qk(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mQn: cute.Tensor,
@@ -125,7 +125,7 @@ def l2norm_qk_kernel(
 
 
 @cute.kernel
-def l2norm_qk_bwd_kernel(
+def frost_l2norm_qk_bwd(
     mDq: cute.Tensor,
     mDk: cute.Tensor,
     mQn: cute.Tensor,
@@ -229,7 +229,7 @@ def l2norm_qk_launch(
     n_blocks: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    l2norm_qk_kernel(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
+    frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream
     )
 
@@ -249,7 +249,7 @@ def l2norm_qk_bwd_launch(
     n_blocks: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    l2norm_qk_bwd_kernel(dq, dk, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
+    frost_l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
         grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream
     )
 
@@ -328,3 +328,7 @@ def l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, *, stream):
             options="--enable-tvm-ffi",
         )
     cache["compiled"](dq, dk, q_n, k_n, inv_q, inv_k, *args, cu_stream)
+
+
+frost_l2norm_qk.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_l2norm_qk_bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)

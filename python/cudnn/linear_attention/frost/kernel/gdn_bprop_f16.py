@@ -3130,7 +3130,7 @@ def build_descs_body(
 
 
 @cute.kernel
-def prologue_kernel(
+def frost_gdn_bprop_prologue(
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
@@ -3304,7 +3304,7 @@ def prologue(
     )
     base_desc_checkpoint = tma.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(64, d_k_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz128)
 
-    prologue_kernel(
+    frost_gdn_bprop_prologue(
         run_order,
         order_gen,
         b_t,
@@ -3416,7 +3416,7 @@ def host(
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
 
-    kernel(
+    frost_gdn_bprop(
         cfg,
         gate,
         a_log,
@@ -3452,7 +3452,7 @@ def host(
 
 
 @cute.kernel
-def kernel(
+def frost_gdn_bprop(
     cfg: cutlass.Constexpr,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
@@ -3802,7 +3802,6 @@ def kernel(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    # sub-bank split: V + dstate_entry + dQ + dK + dV allocated last
     sV_raw = cutlass.Array(
         cfg.io_dtype,
         cfg.v_cosize,
@@ -4771,3 +4770,7 @@ def run_bwd(
         tensormap_workspace,
         cu_stream,
     )
+
+
+frost_gdn_bprop_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_gdn_bprop.set_name_prefix("cudnn", remove_cutlass_symbol=True)
