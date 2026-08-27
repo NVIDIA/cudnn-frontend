@@ -83,7 +83,7 @@ def _build_spec_map():
     m = {}
     for t, cfg in _candidates(chain):
         label = cfg.name
-        m[label] = (cfg, t.cta_group)
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 

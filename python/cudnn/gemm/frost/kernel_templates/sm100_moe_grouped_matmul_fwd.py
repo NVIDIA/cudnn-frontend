@@ -277,21 +277,16 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
+    # One block per MMA mode, every count defined in both: the 2-CTA pair
+    # releases per PAIR (so ab_empty counts pairs and acc_empty counts both
+    # CTAs' epilogue warps), the 1-CTA one per CTA.
     if cutlass.const_expr(cta_group == 2):
+        ab_empty_count = cluster_size // cta_group if cutlass.const_expr(ab_empty_full_mask) else (cluster_m // cta_group) + cluster_n - 1
         acc_empty_count = num_epilogue_warps * 2
     else:
-        if cutlass.const_expr(ab_empty_full_mask):
-            ab_empty_count = cluster_size
-        else:
-            ab_empty_count = cluster_m + cluster_n - 1
-        sched_empty_count = 1 + 1 + num_epilogue_warps
-    if cutlass.const_expr(cta_group == 2):
-        if cutlass.const_expr(ab_empty_full_mask):
-            ab_empty_count = cluster_size // cta_group
-        else:
-            ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
-        num_consumer_warps_per_cta = 1 + 1 + num_epilogue_warps
-        sched_empty_count = num_consumer_warps_per_cta
+        ab_empty_count = cluster_size if cutlass.const_expr(ab_empty_full_mask) else cluster_m + cluster_n - 1
+        acc_empty_count = num_epilogue_warps
+    sched_empty_count = 1 + 1 + num_epilogue_warps
     if warp_idx == 0:
         if cutlass.const_expr(cta_group == 2):
             if elect_one:
@@ -305,10 +300,7 @@ def _kernel(
             if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
             if elect_one:
-                if cutlass.const_expr(cta_group == 1):
-                    nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), num_epilogue_warps)
-                else:
-                    nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), acc_empty_count)
+                nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), acc_empty_count)
         for i in range(SCHED_STAGES):
             if elect_one:
                 nvvm.mbarrier_init(sched_full_mbar_ptr.subview(i), 1)

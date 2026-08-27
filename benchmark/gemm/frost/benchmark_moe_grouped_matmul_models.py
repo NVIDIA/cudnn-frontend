@@ -358,7 +358,7 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
         label = cfg.name
-        m[label] = (cfg, t.cta_group)
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 

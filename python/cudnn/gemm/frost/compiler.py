@@ -2770,12 +2770,12 @@ def _check_mma_n_dim(
     bs = chain.block_scale
     b_dt = bs.b_dtype if bs is not None else chain.matmul.b_dtype
     if _dtype_bits(b_dt) == 8 and chain.matmul.b_major == "n":
-        step = 32 if cta_group == 2 else 16
+        step = 32 if config.is_cta_pair_mma else 16
         for label, n in ns:
             if n < step or n % step != 0:
                 raise NotImplementedError(
                     f"8-bit transposed (N-major) B needs N ≥ {step} and a multiple "
-                    f"of {step} under cta_group={cta_group}; config {config.name!r} "
+                    f"of {step} under a {config.ctas_per_mma}-CTA MMA; config {config.name!r} "
                     f"has {label}={n}"
                 )
 

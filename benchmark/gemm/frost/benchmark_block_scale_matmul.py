@@ -169,8 +169,12 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str, verbose: bool
 
     dev = "cuda"
     is_fp4, bs, _, _ = _COMBOS[combo]
-    ru = lambda x, m: ((x + m - 1) // m) * m
-    cd = lambda a, b: (a + b - 1) // b
+
+    def ru(x, m):
+        return ((x + m - 1) // m) * m
+
+    def cd(a, b):
+        return (a + b - 1) // b
 
     if is_fp4:
         a = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)

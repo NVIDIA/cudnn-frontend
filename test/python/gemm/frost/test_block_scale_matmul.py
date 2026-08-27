@@ -1295,11 +1295,13 @@ def test_validate_block_scale_config_arch_fork():
             mma_tile_k_bytes=48,
             mma_size_m=1,
             mma_size_n=1,
+            mma_size_k=128 // 48,
             cga_size_m=1,
             cga_size_n=1,
             cga_size_k=1,
             warps_per_cta=8,
             split_k_slices=1,
+            cta_group=1,
             pipeline="sm103",
         )
 
@@ -1684,8 +1686,11 @@ def test_catalog_carries_both_mma_k_widths():
     for c in sm100:
         by_width[c.mma_tile_k_bytes].append(c)
     assert len(by_width[32]) == len(by_width[64]) > 0
+
     # Same geometry, different width -> same name modulo the MMA-inst K token.
-    strip = lambda c: (c.cta_tile_mn, c.cga_size_mn, c.cta_tile_k_bytes, c.mma_tile_m, c.mma_size_m)
+    def strip(c):
+        return (c.cta_tile_mn, c.cga_size_mn, c.cta_tile_k_bytes, c.mma_tile_m, c.mma_size_m)
+
     assert {strip(c) for c in by_width[32]} == {strip(c) for c in by_width[64]}
     assert all(isinstance(c, ConfigSm100) for c in sm100)
     assert by_name(_SM107_128).geometry_name == "128x128x128_128x128x64_cluster1x1_1ctamma"
@@ -1830,7 +1835,7 @@ def test_sm107_block_scale_mixed_cga(combo, config_name):
     hold resident, which is when the device substitutes the fallback shape."""
     cta_group = 2 if config_name.endswith("_2ctamma") else 1
     cfg = by_name(config_name)
-    assert C._mixed_cga_fallback(cfg, "sm100_block_scale_matmul.py") == (cta_group, 1)
+    assert C._mixed_cga_fallback(cfg, "sm100_block_scale_matmul.py") == (cta_group, 1, 1)
     _run_bs_numeric(combo, config_name, 1920, 1920, 512)
 
 
@@ -1842,7 +1847,7 @@ def test_mixed_cga_fallback_is_the_mma_mode_minimum(cta_group):
     fall back to, so it launches as a plain fixed cluster."""
     tmpl = "sm100_block_scale_matmul.py"
     wide = by_name(f"CONFIG_sm100_128x128x128_128x128x64_cluster4x2_{cta_group}ctamma")
-    assert C._mixed_cga_fallback(wide, tmpl) == (cta_group, 1)
+    assert C._mixed_cga_fallback(wide, tmpl) == (cta_group, 1, 1)
     minimal = by_name(f"CONFIG_sm100_128x128x128_128x128x64_cluster{cta_group}x1_{cta_group}ctamma")
     assert C._mixed_cga_fallback(minimal, tmpl) is None
 
@@ -1856,7 +1861,7 @@ def test_mixed_cga_is_off_where_it_cannot_be_honored(monkeypatch):
     cluster shapes)."""
     wide = by_name("CONFIG_sm100_128x128x128_128x128x64_cluster4x2_2ctamma")
     sm107_tmpl = "sm100_block_scale_matmul.py"
-    assert C._mixed_cga_fallback(wide, sm107_tmpl) == (2, 1)
+    assert C._mixed_cga_fallback(wide, sm107_tmpl) == (2, 1, 1)
 
     # Template that never reads the constant -> no fallback attached. The MoE
     # ones stay that way: their fixed-grid persistent scheduler strides by a

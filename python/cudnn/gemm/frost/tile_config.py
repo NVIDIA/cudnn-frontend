@@ -935,7 +935,8 @@ def as_mma_tile_k(cfg: TileConfig, k_bytes: int) -> TileConfig:
     ok = _issuable_mma_tile_k_bytes(type(cfg))
     if cfg.mma_tile_k_bytes == k_bytes or k_bytes not in ok or cfg.cta_tile_k_bytes % k_bytes:
         return cfg
-    return replace(cfg, mma_tile_k_bytes=k_bytes)
+    # mma_size_k counts instructions per warp tile, so it moves with the width.
+    return replace(cfg, mma_tile_k_bytes=k_bytes, mma_size_k=cfg.warp_tile_k_bytes // k_bytes)
 
 
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:

@@ -26,8 +26,8 @@ from cudnn.gemm.frost.tile_config import by_name
 pytestmark = [pytest.mark.L0, requires_sm100]
 
 _GEOMETRIES = [
-    ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
-    ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+    ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma", 1),
+    ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", 2),
 ]
 
 _E, _S, _N, _K, _G = 4, 512, 256, 256, 4
@@ -152,7 +152,7 @@ def test_single_moe_per_group_bias_empty_group():
     y = g.add(a=c, b=bias, name="b")
     y.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
     (aux_ref,) = compiled.chain.aux_tensors
     assert aux_ref.grouped_by_moe and aux_ref.bcast_mode == "per_col"
 
@@ -189,7 +189,7 @@ def test_dual_moe_swiglu_per_group_alpha():
     y = g.mul(a=prod, b=alpha, name="scale")
     y.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"))
     assert compiled.chain.num_gemms == 2
     (aux_ref,) = compiled.chain.aux_tensors
     assert aux_ref.grouped_by_moe and aux_ref.bcast_mode == "scalar"
@@ -260,7 +260,7 @@ def test_single_moe_grouped_amax_only_no_dense_output():
     amax.set_dim([_G, 1, 1]).set_stride([1, 1, 1])
     amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
     assert not compiled.chain.output_specs
     assert [o.source for o in compiled.chain.outputs] == ["reduction_0"]
 
@@ -290,7 +290,7 @@ def test_single_moe_fp4_quant_grouped_amax(bs, scale_dt):
     scale_torch = torch.float8_e8m0fnu if scale_dt == "e8m0" else torch.float8_e4m3fn
     qs.set_data_type(scale_cudnn).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     token, weight, offs = _data()
     out_q = torch.zeros(1, _S, _N // 2, dtype=torch.uint8, device="cuda")
@@ -332,7 +332,7 @@ def test_single_moe_col_quant_aligned_groups(bs):
     qs.set_dim([1, _S // bs, _N]).set_stride([_S // bs * _N, _N, 1])
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     token, weight, _ = _data()
     offs = torch.tensor(offsets, dtype=torch.int32, device="cuda")
@@ -392,7 +392,7 @@ def test_single_moe_col_quant_grouped_segmented(bs):
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     qs.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
     assert compiled.chain.quants[0].grouped_by_moe
 
     token, weight, _ = _data()
@@ -423,7 +423,7 @@ def test_single_moe_col_quant_group_offset_rejections():
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     with pytest.raises(ValueError, match="supports only the M axis"):
-        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     # group_offset that is not the MoE fto: rejected.
     g, c, fto = _graph()
@@ -433,7 +433,7 @@ def test_single_moe_col_quant_group_offset_rejections():
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     with pytest.raises(ValueError, match="must be the MoE"):
-        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     # Grouped col quant without F8_128x4 reordering: rejected.
     g, c, fto = _graph()
@@ -443,7 +443,7 @@ def test_single_moe_col_quant_group_offset_rejections():
     qs.set_dim([1, _S // 32, _N]).set_stride([_S // 32 * _N, _N, 1])
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     with pytest.raises(ValueError, match="requires F8_128x4"):
-        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+        jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
 
 def test_single_moe_swish_quant_grouped_amax():
@@ -456,7 +456,7 @@ def test_single_moe_swish_quant_grouped_amax():
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
     qs.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     token, weight, offs = _data()
     out_q = torch.empty(1, _S, _N, device="cuda", dtype=torch.float8_e4m3fn)
@@ -530,7 +530,7 @@ def test_single_moe_srelu_full_cutedsl_mirror():
     qsc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
     qsc.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
     assert [op.op for op in compiled.chain.ops] == ["mul", "add", "relu", "mul", "mul"]
     assert len(compiled.chain.quants) == 2 and len(compiled.chain.reductions) == 1
 
@@ -677,7 +677,7 @@ def test_single_moe_dswiglu_backward():
     db2.set_dim([_G, 1, _N]).set_stride([_N, _N, 1])
     db2.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
     assert sum(1 for op in compiled.chain.ops if op.op == "aux_load") == 1
     assert len(compiled.chain.reductions) == 3
 
@@ -767,7 +767,7 @@ def test_single_moe_dgeglu_backward():
     dy1 = g.mul(a=g.mul(a=g.mul(a=g.mul(a=gg, b=dsu, name="d1a"), b=w, name="d1b"), b=ag, name="d1c"), b=m1, name="dy1")
     dy1.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     token, weight, offs = _data()
     y1_t = torch.randn(1, _S, _N, device="cuda", dtype=torch.float32) * 3.0
@@ -814,7 +814,7 @@ def test_single_moe_grouped_avg_reduction():
     red.set_dim([_G, 1, _N]).set_stride([_N, _N, 1])
     red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1"))
+    compiled = jit_from_cudnn_graph(g, by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
 
     token, weight, offs = _data()
     out = torch.empty(1, _S, _N, device="cuda", dtype=torch.bfloat16)

@@ -237,7 +237,7 @@ def _build_spec_map():
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.mma_tile_m != 128:
             continue
         label = cfg.name
-        m[label] = (cfg, t.cta_group)
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 

@@ -38,6 +38,7 @@ import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost import compiler, epilogue_codegen
 from cudnn.gemm.frost.epilogue_codegen import generate
+from cudnn.gemm.frost.kernel_registry import select_template
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
@@ -2483,9 +2484,11 @@ def test_both_renderers_emit_the_tma_output_COUNT_not_a_flag() -> None:
     want = len(_tma_slots_for(chain, cfg))
     assert want == 2, "this graph is meant to put BOTH outputs on the surface"
 
+    # Both renderers take the TEMPLATE and derive the store mode from it.
+    tmpl = select_template(chain, cfg)
     for render in (
-        _render_block_scale_tile_constants(cfg, chain, use_tma_store_epi=True),
-        _render_tile_constants(cfg, chain),
+        _render_block_scale_tile_constants(cfg, chain, tmpl),
+        _render_tile_constants(cfg, chain, tmpl),
     ):
         m = re.search(r"^n_tma_outputs = (\d+)$", render, re.M)
         assert m, "every renderer must emit n_tma_outputs"
@@ -2568,7 +2571,7 @@ def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_grou
     tmpl = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
     formulas = set()
     for f in sorted(tmpl.glob("sm*.py")):
-        got = [l.strip() for l in f.read_text().split("\n") if l.strip().startswith("epi_subtile_elems = ")]
+        got = [line.strip() for line in f.read_text().split("\n") if line.strip().startswith("epi_subtile_elems = ")]
         # Only the TMA-store families stage an epilogue ring; sm120 stores STG
         # straight from registers and has no slot to size.
         if f.name.split("_")[0] not in _TMA_STORE_EPI_PIPELINES:
@@ -2590,7 +2593,7 @@ def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_grou
     cfg = by_name(cfg_name)
 
     ns = {"cutlass": cutlass, "cute": cute, "nvvm": nvvm, "_tma": _tma, "num_epilogue_warps": 4}
-    exec(_render_tile_constants(cfg, chain), ns)
+    exec(_render_tile_constants(cfg, chain, select_template(chain, cfg)), ns)
     exec(formulas.pop(), ns)
     slot_bytes = ns["epi_subtile_elems"] * (ns["cd_dtype"].width // 8)
 
@@ -2785,7 +2788,7 @@ def test_m_major_scatter_covers_the_whole_chunk() -> None:
 
     for vsize in (8, 16, 32, 64):
         lines = _emit_mmajor_scatter(0, 0, "vec_out", "bf16", 1, vsize)
-        assert sum(".store(" in l for l in lines) == vsize, vsize
+        assert sum(".store(" in line for line in lines) == vsize, vsize
 
 
 def test_tma_staged_values_reach_the_store_as_vectors() -> None:

@@ -403,18 +403,13 @@ def _kernel(
 
     sA_bytes = sA_elems * (ab_dtype.width // 8)
     sB_bytes = sB_elems * (ab_dtype.width // 8)
+    # The pair leader issues ONE expect_tx for both CTAs, so it counts twice.
+    ab_only_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * cta_group
+    sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * cta_group
     if cutlass.const_expr(cta_group == 2):
-        ab_only_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
-        sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * 2
-
-    if cutlass.const_expr(cta_group == 1):
-        ab_only_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
-        sf_only_copy_bytes = num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes
-
-    else:
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
-        # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
-        # the per-CTA mma_inst_m — half the instruction's hardware M.
+    # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
+    # the per-CTA mma_tile_m — half the instruction's hardware M.
     epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32
     if cutlass.const_expr(cta_group == 2):
