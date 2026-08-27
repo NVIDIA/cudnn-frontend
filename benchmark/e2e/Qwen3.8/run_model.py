@@ -51,7 +51,8 @@ def _wire_sdpa_attention():
     only the SDPA core changes across this axis.
     """
     import cudnn
-    import cudnn.experimental.ops.sdpa as cudnn_sdpa_module
+
+    _ = cudnn.sdpa_torch  # registers cudnn::sdpa_fwd / cudnn::sdpa_bwd
     import fla.layers.attn as fla_attn
     import torch.nn.functional as F
 
@@ -71,7 +72,6 @@ def _wire_sdpa_attention():
     backend_version = cudnn.backend_version()
     if backend_version < backend_floor:
         raise RuntimeError(f"d256 SDPA requires cuDNN backend >= {backend_floor}; got {backend_version}")
-    cudnn_sdpa = cudnn_sdpa_module.scaled_dot_product_attention
 
     def _prepare(q, k, v, window_size):
         qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))  # [B,L,H,D] -> [B,H,L,D]
@@ -116,16 +116,18 @@ def _wire_sdpa_attention():
         **kw,
     ):
         qt, kt, vt = _prepare(q, k, v, window_size)
-        o = cudnn_sdpa(
+        if dropout_p:
+            raise NotImplementedError("cudnn::sdpa_fwd does not serve dropout")
+        if window_size[1] not in (-1, 0):
+            raise NotImplementedError(f"cudnn::sdpa_fwd has no right window bound; got {window_size[1]}")
+        o, _ = torch.ops.cudnn.sdpa_fwd(
             qt,
             kt,
             vt,
+            softmax_scale,
             is_causal=causal,
-            scale=softmax_scale,
-            dropout_p=dropout_p,
-            enable_gqa=qt.shape[1] != kt.shape[1],
-            left_bound=window_size[0],
-            right_bound=window_size[1],
+            window_left=window_size[0],
+            return_lse=False,
         )
         # flash-attn's adapter contract is packed [B,L,H,D].  The direct cuDNN
         # wrapper returns packed BHSD, so normalize once before FLA flattens H*D.

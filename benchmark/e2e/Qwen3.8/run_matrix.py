@@ -385,7 +385,7 @@ def _pick_device(mode):
 def _run_experiment(args, qwen, device, properties, orders, started_utc):
     import cudnn
     from cudnn import _env as cudnn_env
-    import cudnn.experimental.ops.sdpa as sdpamod
+    import cudnn.sdpa.fwd.torch_op as sdpamod
     import cudnn.fla as cfla
     import fla
     import fla.layers.attn as fla_attn
@@ -396,8 +396,6 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     backend_floor = 92300
     if cudnn.backend_version() < backend_floor:
         raise RuntimeError("d256 FE arm requires cuDNN backend " f">= {backend_floor}; got {cudnn.backend_version()}")
-    if any(hasattr(sdpamod, name) for name in ("sdpa_fwd_d256", "sdpa_bwd_d256")):
-        raise RuntimeError("loaded FE SDPA module predates #682 and still exposes the legacy standalone d256 stacks")
 
     from cudnn.gemm.ops import swiglu_mlp as public_swiglu_mlp
 
