@@ -1945,10 +1945,6 @@ def _correction_warp_group(
             total_sum = sStats_raw.subview(stats_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
 
             bars.mb_stat_empty[qs].arrive()
-            # Preserve the persistent-tile phase protocol used by the MMA
-            # prologue; stats now live in SMEM rather than the S accumulator.
-            if cutlass.const_expr(not _E5_SINK):
-                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             beta = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
@@ -2037,7 +2033,7 @@ def _correction_warp_group(
                         num=O_CHUNK,
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    if cutlass.const_expr(_E5_SINK and chunk_idx == N_CHUNKS_O - 1):
+                    if cutlass.const_expr(chunk_idx == N_CHUNKS_O - 1):
                         bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                     o_scaled = o_chunk * inv_sum
                     _zero_f = cutlass.Float32(0.0)
@@ -2125,8 +2121,7 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
 
-                if cutlass.const_expr(_E5_SINK):
-                    bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 o_scaled3 = o_chunk3 * inv_sum
                 o_scaled3 = cutlass.Vector.from_elements(

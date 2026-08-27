@@ -530,7 +530,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             o_gpu_float[t_idx:] = 0
             o_ref_float[t_idx:] = 0
 
-        atol, rtol = 0.08, 0.2
+        # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
+        atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
         torch.testing.assert_close(o_gpu_float, o_ref_float, atol=atol, rtol=rtol)
 
     # Backward pass
