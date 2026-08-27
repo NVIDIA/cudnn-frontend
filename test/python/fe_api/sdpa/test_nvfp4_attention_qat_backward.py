@@ -137,20 +137,20 @@ def test_nvfp4_attention_qat_backward_class_callable_compiles_and_uses_caller_bu
     """Compile through APIBase.__call__, use caller buffers, and validate workspace."""
     from cudnn import Nvfp4AttentionQatBackward
 
-    inputs, _ = _reference_case(32, 48, is_causal=False)
+    inputs, expected = _reference_case(32, 48, is_causal=False)
     q, k, v, high_precision_o, do, lse, scale = inputs
     op = Nvfp4AttentionQatBackward(q, k, v, high_precision_o, do, lse, softmax_scale=scale)
     assert op.check_support()
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dq = torch.full_like(q, float("nan"))
+    dk = torch.full_like(k, float("nan"))
+    dv = torch.full_like(v, float("nan"))
     workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
     op(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
     assert op._compiled_kernel is not None
-    assert torch.isfinite(dq).all()
-    assert torch.isfinite(dk).all()
-    assert torch.isfinite(dv).all()
+
+    for actual, reference in zip((dq, dk, dv), expected):
+        torch.testing.assert_close(actual.float(), reference, rtol=4.0e-2, atol=4.0e-2)
 
     with pytest.raises(ValueError, match="workspace must contain at least"):
         op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace[:-1])
