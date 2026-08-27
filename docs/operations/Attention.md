@@ -72,6 +72,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
 &nbsp;&nbsp; **Ragged Offset Multiplier (cuDNN 9.24+, UNIFIED forward only):**
 - `tensor.set_ragged_offset_multiplier(value)` lets the ragged offsets be stored in coarser units; the engine multiplies each offset by `value` to recover element offsets.
+- `max_total_seq_len_q` / `max_total_seq_len_kv` declare the **packed token totals** of the ragged Q and K/V. A ragged tensor's dims stay `(B, H, S_max, D)` and the per-sequence starts live in a device-side offset tensor, so the packed total is not otherwise expressible in the graph. Supplying it lets the implementation bound the token axis exactly rather than inferring an upper bound from the bound buffers' extents — which matters when a buffer is allocated larger than the tokens it holds, since rows past the real total are masked but still take part in `P @ V` and so must be finite. The values only ever tighten the inferred bound, never widen it, and are accepted only on a ragged layout. `sdpa_backward` has taken the same two arguments since cuDNN 9.6.
 - Example: with a multiplier of $H \times D$, a token-unit cumulative-sequence-length tensor (e.g. `cu_seq_len_q`) can be bound directly as the ragged offset, avoiding a conversion pass.
 
 &nbsp;&nbsp; **Memory Layout visualization:**
@@ -136,40 +137,40 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 
 ## Benchmarks
 
-To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/README.md) folder. Current results:
+To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/README.md) folder. Current results:
 
 ### GB200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb200/llama3.1_top_left.png) 
+![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_top_left.png) 
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb200/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_no_mask.png)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/dsv3/gb200/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb200/dsv3_top_left.png)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB300 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb300/llama3.1_top_left.png)
+![Llama 3.1 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb300/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_no_mask.png)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/dsv3/gb300/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
@@ -305,6 +306,8 @@ graph.sdpa(
     paged_attention_k_table=None,         # Page table for K container
     paged_attention_v_table=None,         # Page table for V container
     paged_attention_max_seq_len_kv=None,  # Max KV sequence length for paged attention
+    max_total_seq_len_q=None,             # Packed token total for Q (ragged tensors)
+    max_total_seq_len_kv=None,            # Packed token total for KV (ragged tensors)
     generate_stats=None,                  # Output softmax stats for training (True/False)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation
@@ -705,19 +708,6 @@ The experimental [Block Sparse Attention API](../fe-oss-apis/bsa.md) provides
 CuTe DSL forward and explicit backward kernels driven by per-query-block lists
 of selected key/value blocks. It is a standalone Python FE OSS API and is
 separate from the cuDNN Graph API described above.
-
-(sdpa-forward-fe-oss-sm100-d256)=
-### SDPA Forward FE OSS API (SM100, D=256)
-
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA forward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes the attention output `O` plus `LSE` statistics. Available through a standalone API (see [sdpa_fwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256) for details) and used by the experimental [SDPA Pytorch custom operator](#scaled-dot-product-attention-pytorch-op) for supported plain-BHSD `D=256` cases.
-
-Note: SDPA Forward D256 is also supported by the cudnn graph/backend API.
-
-(sdpa-backward-fe-oss-sm100-d256)=
-### SDPA Backward FE OSS API (SM100, D=256)
-
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA backward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes `dQ`, `dK`, and `dV` from the forward tensors plus `dO` and `LSE`. Available through a standalone API (see [sdpa_bwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256) for details) or as part of the experimental [SDPA Pytorch custom operator](#scaled-dot-product-attention-pytorch-op).
-
 
 
 (scaled-dot-product-attention-pytorch-op)=

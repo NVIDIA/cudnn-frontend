@@ -218,3 +218,62 @@ def test_grouped_gemm_glu_jax_errors():
             n=n_full,
             b_dtype="uint8",
         )
+
+
+@pytest.mark.L0
+def test_grouped_gemm_glu_jax_addressed_rows_survive_a_dirty_allocator():
+    """Rows before ``padded_offsets[-1]`` are correct whatever the output buffer held.
+
+    The outputs are no longer zero-initialized, so the rows the kernel does not
+    address carry whatever XLA last left in the buffer. A test that runs on a clean
+    allocator passes either way -- fresh device memory reads as zeros -- so this one
+    dirties the allocator first and checks only the contract that still holds.
+    """
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_glu_jax_sm100, grouped_gemm_glu_wrapper_sm100
+
+    m, n_full, k, experts = 1024, 256, 128, 2
+    a_np, b_storage_np, _, alpha_np, prob_np = make_problem(m, n_full, k, experts)
+    # 256-aligned, and the last offset stops short of m, so the tail is never addressed
+    offsets_np = np.array([256, 512], dtype=np.int32)
+
+    to_torch = lambda x: torch.from_numpy(x.view(np.uint8)).view(torch.bfloat16).cuda()
+    a_t = to_torch(a_np).reshape(m, k, 1)
+    b_t = to_torch(b_storage_np).reshape(experts, n_full, k)
+    b_ptrs_t = torch.tensor([b_t[i].data_ptr() for i in range(experts)], dtype=torch.int64, device="cuda")
+    expected = grouped_gemm_glu_wrapper_sm100(
+        a_tensor=a_t,
+        sfa_tensor=None,
+        padded_offsets=torch.from_numpy(offsets_np).cuda(),
+        alpha_tensor=torch.from_numpy(alpha_np).cuda(),
+        prob_tensor=torch.from_numpy(prob_np).cuda(),
+        b_ptrs=b_ptrs_t,
+        n=n_full,
+        b_dtype=torch.bfloat16,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+    )["d_tensor"]
+    device_sync()
+
+    a_j = jnp.asarray(a_np)
+    weights = [jnp.asarray(b_storage_np[i]) for i in range(experts)]
+    offsets_j, alpha_j, prob_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, prob_np))
+    jax.block_until_ready((a_j, offsets_j, alpha_j, prob_j, *weights))
+    b_ptrs_j = _packed_jax_ptrs(weights)
+    jitted = jax.jit(lambda a, off, alpha, ptrs, prob: grouped_gemm_glu_jax_sm100(a, off, alpha, ptrs, n_full, prob)[0])
+
+    # Poison the allocator so a reused output buffer cannot read back as zeros.
+    for _ in range(8):
+        junk = jax.block_until_ready(jnp.full((m, n_full // 2, 1), -7.5, dtype=jnp.bfloat16))
+        del junk
+
+    actual = jax.block_until_ready(jitted(a_j, offsets_j, alpha_j, b_ptrs_j, prob_j))
+    valid = int(offsets_np[-1])
+    np.testing.assert_array_equal(
+        np.asarray(actual)[:valid],
+        expected[:valid].float().cpu().numpy().astype(np.asarray(actual).dtype),
+    )

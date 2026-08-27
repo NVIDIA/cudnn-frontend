@@ -99,10 +99,9 @@ Reading that sequence line by line:
   still forwarded to the lowered C++ graph.
 - **`get_workspace_size()` is honest.** For a python plan it returns
   `CompiledPlan.get_workspace_size()`, the executor's real requirement (for
-  the graph above on an SM100 engine: the dummy-LSE scratch `b*h*s*4 = 16384`
-  bytes, because an inference graph has no Stats output and the SM100 kernels
-  always write an LSE; `lse_optional` adapters like SM120 compile the LSE
-  store out instead and report 0). `execute()` forwards the caller's
+  the dense graph above: 0 — every SM100/SM120 adapter is `lse_optional`, so
+  a stats-less inference graph compiles the LSE store out and binds no dummy
+  buffer at any level). `execute()` forwards the caller's
   buffer through `ExecutionContext.workspace` and the executor carves its
   scratch out of it in 128-byte-aligned chunks, never touching bytes at or
   beyond the reported size -- no hidden per-execute allocation, stable
@@ -507,8 +506,9 @@ expressible, with one discipline separating them:
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
-  (e.g. `bottom_right_with_swa: bool`). The matcher encodes the SHAPE of the
-  interaction once; each engine's row supplies the VERDICT. When a future
+  (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
+  per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
+  each engine's row supplies the VERDICT. When a future
   kernel supports the conjunction, flip its flag -- never edit the matcher.
   This is what keeps interaction checks from regressing into a per-engine
   if-ladder: shared code may know about kinds of interactions, never about
@@ -528,13 +528,13 @@ levels, with no shared vocabulary at all:
 
 - **Vocabulary per operation.** Each op defines a typed, frozen dataclass:
   `cudnn.sdpa.fwd.engines.SdpaFwdKnobs(sched_policy=None, tile_m=None,
-  tile_n=None, cga=None)`, where `None` means "no preference". SDPA's knobs
-  cannot collide with GEMM's; fields have real types instead of
-  enum-plus-int64.
+  tile_n=None, cga=None, pack_gqa=None)`, where `None` means "no
+  preference". SDPA's knobs cannot collide with GEMM's; fields have real
+  types instead of enum-plus-int64.
 - **Domains per engine.** Each `Capabilities` row advertises the values its
   lowering honors: `sched_policies = {NATURAL}`, `tile_ms = {128}`,
-  `tile_ns = {128}`, `cgas = {2}`. Two engines of the same op may honor
-  different subsets.
+  `tile_ns = {128}`, `cgas = {2}`, `pack_gqas = {False}`. Two engines of the
+  same op may honor different subsets.
 - **Per plan, not per graph.** A knob set rides on `PlanConfig.knobs`, so a
   tuning choice is part of the plan's identity: a family that wants several
   tunings ranked emits several `PlanConfig`s from `recommend()`, each with its
@@ -687,17 +687,18 @@ sdpa_bwd_sm100_d128                 (future)
   one row serves several compute capabilities. The row's `Capabilities.arches`
   set is the source of truth for exactly which; the name never enumerates
   minors.
-- Head dimensions are omitted when one engine accepts a domain of dimensions,
-  as the SM120 prefill engine does. `Capabilities.d_qk` and `d_v` are the
-  source of truth for that domain.
-- Geometry-specific engines use `d<dqk>` and append `x<dv>` only when the two
-  head dimensions differ.
+- Head dimensions never appear in engine names: one engine per
+  arch x dtype family accepts a DOMAIN of dimensions and its lowering picks
+  the kernel flavor (the smallest native shape covering the graph).
+  `Capabilities.d_shapes` (native flavor shapes) plus `d_pad_multiple`
+  (envelope alignment; 0 = exact shapes only) are the source of truth for
+  that domain.
 - No version counters. If a genuinely distinct second engine ever serves the
   same cell, give it a descriptive variant suffix (e.g. `_cga4`), not a number.
 - Names are for humans; `engine_id` is for machines. Pin by index
   (`select_plan`) or replay by id -- never by parsing a name.
-- `cudnn.sdpa.fwd.engines.engine_name(d)` computes geometry-specific names;
-  omit `d` for dimension-agnostic engines.
+- `cudnn.sdpa.fwd.engines.engine_name(arch=..., fp8=..., mxfp8=...)` computes
+  the family names (test/user convenience).
 
 
 ## Kernel templates and TemplateParams
@@ -809,6 +810,6 @@ Asserts:
     frontend-integration test that it appears in `graph.plans` and runs when
     pinned. Mark test modules `pytest.mark.L0` -- the default pytest addopts
     is `-m L0` and unmarked tests silently never run. Run
-    `ci/run_style_check_diff.sh --apply` (black, 160 cols) before pushing.
+    `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.

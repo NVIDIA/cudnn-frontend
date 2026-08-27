@@ -4,8 +4,9 @@
 #
 # The ParamsBase, make_fake_tensor, and sub_packed_f32x2 implementations in
 # this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for
-# cudnn-frontend's CUTLASS DSL 4.5 integration.
+# cudnn-frontend's CUTLASS DSL integration.
 
+import inspect
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
@@ -27,23 +28,39 @@ _STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(Non
 def _install_constexpr_tvm_ffi_converter() -> None:
     """Teach CUTLASS DSL's TVM-FFI converter about Constexpr annotations.
 
-    CUTLASS DSL 4.5 otherwise treats fields annotated as ``Constexpr[T]`` as
-    runtime arguments. Emitting ``ConstNone`` keeps those fields in the JIT
-    specialization and lets callers pass ``None`` at runtime. The NamedTuple
-    case preserves its concrete field annotations when a broader tuple type is
-    used at the call site.
+    Emitting ``ConstNone`` keeps static ``ParamsBase`` fields in the JIT
+    specialization, including tuple and enum values that CUTLASS DSL 4.6's
+    native Constexpr converter does not support. The NamedTuple case preserves
+    its concrete field annotations when a broader tuple type is used at the
+    call site.
     """
     import cutlass.cute._tvm_ffi_args_spec_converter as converter
 
     original = converter._convert_single_arg
     if getattr(original, "_cudnn_bsa_constexpr_compat", False):
         return
+    supports_is_constexpr = "is_constexpr" in inspect.signature(original).parameters
 
-    def convert_single_arg(arg, arg_name, arg_type, ctx):
+    def convert_single_arg(
+        arg,
+        arg_name,
+        arg_type,
+        ctx,
+        *,
+        is_constexpr=False,
+    ):
         if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
             return spec.ConstNone(arg_name)
         if isinstance(arg, tuple) and hasattr(type(arg), "_fields") and (arg_type is None or not hasattr(arg_type, "_fields")):
-            return original(arg, arg_name, type(arg), ctx)
+            arg_type = type(arg)
+        if supports_is_constexpr:
+            return original(
+                arg,
+                arg_name,
+                arg_type,
+                ctx,
+                is_constexpr=is_constexpr,
+            )
         return original(arg, arg_name, arg_type, ctx)
 
     convert_single_arg._cudnn_bsa_constexpr_compat = True

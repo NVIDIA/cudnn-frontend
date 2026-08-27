@@ -10,6 +10,7 @@ import torch
 
 from gemm_test_utils import (
     requires_sm100,
+    requires_sm107,
     Plan as _plan,
     kw as _kw,
     E2M1 as _E2M1,
@@ -120,7 +121,7 @@ def test_shared_dequant_dedup():
     assert chain.num_b_operands == 2
     assert chain.gemm_operands == [(0, 0), (0, 1)]
     assert chain.has_block_scale
-    assert chain.block_scale.combo == "nvfp4"
+    assert (chain.block_scale.sf_dtype, chain.block_scale.block_size) == ("fp8_e4m3", 16)
 
 
 def test_shared_dequant_reduction_detected():
@@ -212,7 +213,8 @@ def _run(combo, config_name, M, N, K):
     g = _build_dual_bs_graph(M, N, K, combo=combo)
     compiled = _plan(g, **_kw(config_name))
     assert compiled.chain.is_multi_gemm and compiled.block_scale
-    assert compiled.chain.block_scale.combo == combo
+    _bs = compiled.chain.block_scale
+    assert (_bs.sf_dtype, _bs.block_size) == (("fp8_e4m3", 16) if combo == "nvfp4" else ("fp8_e8m0", 32))
 
     c = torch.zeros(1, M, N, dtype=torch.float32, device=dev)
     compiled(_vp_bs_mg(compiled, pairs, c))
@@ -289,21 +291,6 @@ def _run_reduction(
             128,
             512,
         ),
-        # 1ctamma static (no CLC, 1 tile/CTA).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
         # 2ctamma CLC (2-CTA MMA pair, cluster2x1; cta_n=128 → 2×128+SF fits 512).
         (
             "nvfp4",
@@ -324,21 +311,6 @@ def _run_reduction(
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        # 2ctamma static (no CLC, 1 tile/pair).
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),
@@ -425,13 +397,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
         ),
         (
             "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
             256,
             128,
@@ -441,13 +406,6 @@ def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
             "nvfp4",
             "CONFIG_sm100_128x128x128_128x128x32_cluster4x1_2ctamma",
             512,
-            128,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
             128,
             512,
         ),
@@ -500,3 +458,30 @@ def test_dual_block_scale_matmul_reduction_rejects_int32():
     )
     with pytest.raises(NotImplementedError, match="fp32 compute/output"):
         jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+
+
+# ---------------------------------------------------------------------------
+# sm107 (64-byte-K MMA): the same dual block-scale SwiGLU chain
+# ---------------------------------------------------------------------------
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm107_128x128x128_128x128x64_cluster1x1_1ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma",
+    ],
+)
+def test_sm107_dual_block_scale_matmul_numerics(combo, config_name):
+    """Two parallel block-scale GEMMs sharing A + one epilogue. Both GEMMs land
+    in TMEM alongside the per-operand SF words — the tighter budget the 576
+    columns buy back."""
+    _run(combo, config_name, 256, 128, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_sm107_dual_block_scale_matmul_swiglu_quant_epilogue(combo):
+    test_dual_block_scale_matmul_swiglu_quant_epilogue(combo, "CONFIG_sm107_128x128x128_128x128x64_cluster1x1_1ctamma")

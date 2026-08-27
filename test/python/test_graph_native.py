@@ -541,6 +541,13 @@ class TestReviewSemantics:
         g.create_execution_plans()
         with pytest.raises(RuntimeError, match="frozen"):
             A.set_uid(500)
+        # A name is a variant-pack key, so it is identity too: renaming a
+        # planned graph would leave the lowered graph and any compiled binding
+        # holding the old label while the IR reports the new one.
+        with pytest.raises(RuntimeError, match="frozen"):
+            A.set_name("renamed")
+        assert A.get_name() == "A"
+        A.set_name("A")  # a no-op rename stays legal, as a no-op re-uid does
 
     def test_mxfp8_dsink_is_output(self):
         """Follow-up item 4: mxfp8_backward dSink_token is an output port."""

@@ -459,9 +459,7 @@ def test_mixed_ranking_dispatch(monkeypatch):
 def test_pinned_plan_that_declines_raises(monkeypatch):
     """A select_plan() pin is STRICT: the walk starts there and a decline raises
     instead of quietly running a different plan. Without a pin the same decline
-    only advances the walk (the GPU counterpart is
-    test_build_walk_falls_through_a_declining_plan in
-    test/python/gemm/frost/test_frontend_integration.py)."""
+    only advances the walk."""
 
     class Declines(BaseEngine):
         name = "declines_at_build"
@@ -479,6 +477,39 @@ def test_pinned_plan_that_declines_raises(monkeypatch):
     _pin(g, "declines_at_build")
     with pytest.raises(NotImplementedError, match="cannot compile this graph"):
         g.build_plans()
+
+
+def test_unpinned_plan_that_declines_advances_the_walk(monkeypatch, caplog):
+    """The other half of the pin rule: WITHOUT a pin the same decline is logged
+    and the walk moves to the next entry, so the graph still builds and no
+    exception reaches the user."""
+    import logging
+
+    from cudnn.engines import PlanConfig
+
+    class Declines(BaseEngine):
+        name = "declines_at_build"
+        engine_id = _FAKE + 81
+
+        def build_plan(self, graph, plan, ctx=None):
+            raise NotImplementedError("cannot compile this graph")
+
+        def execute(self, graph, tensor_data, ctx=None):
+            raise AssertionError("should never run")
+
+    declines, works = Declines(), _mk_engine(82)
+    _offer(monkeypatch, declines, works)
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(declines.engine_id), PlanConfig(works.engine_id)])
+
+    g = pygraph()
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    assert _plan_names(g) == ["declines_at_build", works.name]
+    with caplog.at_level(logging.INFO, logger="cudnn.pygraph"):
+        g.build_plans()
+    assert any("declined at build time" in r.getMessage() for r in caplog.records)
+    assert g.selected_engine is works
+    assert _plan_names(g)[g._plan_index] == works.name
 
 
 def test_empty_ranking_output_rejected(monkeypatch):
@@ -553,7 +584,7 @@ def test_failed_stream_query_on_supplied_handle_raises(monkeypatch):
 
     monkeypatch.setattr(_cudnn, "get_stream", boom)
     with pytest.raises(RuntimeError, match="stream query failed"):
-        g.execute({C: torch.empty(2, 2)}, handle=42)
+        g.execute({C: torch.empty(2, 2)}, handle=_cudnn.Handle(backend_handle=42))
 
 
 # ---------------------------------------------------------------------------
@@ -1129,8 +1160,9 @@ def test_execute_time_handle_reaches_a_lazily_built_python_plan(monkeypatch):
     g._lowered_graph = _FakeBackend(build=cudnn.cudnnGraphNotSupportedError("backend build declined"))
     g._cpp_plans_created = g._cpp_bog_done = True
 
-    g.execute({C: torch.empty(2, 2)}, None, 42)
-    assert seen == [42], f"build_plan saw {seen}, execute was given handle=42"
+    h = cudnn.Handle(backend_handle=42)
+    g.execute({C: torch.empty(2, 2)}, None, h)
+    assert seen == [h], f"build_plan saw {seen}, execute was given a cudnn.Handle"
 
 
 def test_backend_runtime_error_is_not_a_decline(monkeypatch):

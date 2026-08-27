@@ -12,7 +12,7 @@ For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point
 
 **Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a
 plain BF16 or legacy block-scaled grouped GEMM fused with a GLU epilogue
-(SwiGLU or GeGLU) on NVIDIA Blackwell GPUs (SM100+). The operation is
+(SwiGLU, GeGLU, or block-scaled SiTU-GLU) on NVIDIA Blackwell GPUs (SM100+). The operation is
 implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
@@ -22,6 +22,7 @@ This is a **unified API** that supports both weight layout modes:
 And both activation functions:
 - **SwiGLU**: `act_func="swiglu"` (default)
 - **GeGLU**: `act_func="geglu"`
+- **SiTU-GLU**: `act_func="situglu"` (block-scaled SM100/SM103 only)
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
@@ -34,6 +35,7 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
+SiTU-GLU is not available on the BF16 or Rubin backends.
 
 ## BF16 contract
 
@@ -91,12 +93,25 @@ always `None`; `c_tensor` is `None` unless `generate_c=True`.
 
 The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
-2. **GLU activation**: Fused SwiGLU or GeGLU activation applied to the GEMM output
+2. **GLU activation**: Fused SwiGLU, GeGLU, or SiTU-GLU activation applied to the GEMM output
 3. **Optional quantized output**: Produces row and column scale factors for downstream quantization
 
 ### Shapes
 
 ### Equations
+
+For SiTU-GLU, with gate branch `G` and up branch `U`, the fused epilogue computes
+
+$$
+D = \mathrm{prob}\,
+    \left[\beta_1\tanh(G/\beta_1)\sigma(G)\right]
+    \left[\beta_2\tanh(U/\beta_2)\right].
+$$
+
+where `beta_1 = situ_beta1` and `beta_2 = situ_beta2`, with defaults
+`beta_1 = 4.0` and `beta_2 = 25.0`. `situ_beta1` specializes the compiled kernel
+and is part of its cache key; `situ_beta2` is a runtime FP32 scalar and does not
+create a new compiled-kernel cache entry.
 
 - **Inputs**
   - `A`: contiguous activation tensor across all groups, shape `(valid_m, K, 1)`
@@ -470,7 +485,9 @@ Providing both or neither raises `ValueError`.
 - `vector_f32`: Enable packed f32 operations. Default: `False`
 - `m_aligned`: Must be `256` (FIX_PAD_SIZE). Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
-- `act_func`: Activation function. `"swiglu"` (default) or `"geglu"`
+- `act_func`: Activation function. `"swiglu"` (default), `"geglu"`, or block-scaled `"situglu"`
+- `situ_beta1`: Positive finite gate tanh scale for SiTU-GLU. Default: `4.0`
+- `situ_beta2`: Positive finite up-branch tanh scale for SiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
 
 ### Wrapper-specific Parameters

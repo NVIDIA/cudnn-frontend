@@ -25,8 +25,11 @@ import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import cudnn
 from cudnn import _pybind_module
 
+from ._device import ensure_current_context
+from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -433,12 +436,16 @@ class pygraph:
         becomes ambiguous and leaves the unique-name index."""
         if name == t.name:
             return
-        # NOT freeze-guarded: names are labels (classic allows renaming after
-        # build — the lowered graph already carries the old label, and labels
-        # have no execution semantics).
+        # Freeze-guarded like every other setter. A name is a label, but it is
+        # also a variant-pack key: a compiled plan may be holding the name it
+        # was built with, and the lowered graph keeps the old one, so a rename
+        # after planning leaves two answers to "which tensor is 'q'" -- and
+        # swapping two names would silently rebind buffers. Nothing needs to
+        # rename a planned graph; build another one.
+        self._check_mutable("rename a tensor")
         if self._tensors.get(t.name) is t:
             del self._tensors[t.name]
-        object.__setattr__(t, "name", name)  # label write is exempt from the freeze
+        object.__setattr__(t, "name", name)
         if name in self._tensors or name in self._ambiguous_names:
             self._tensors.pop(name, None)
             self._ambiguous_names.add(name)
@@ -1260,8 +1267,6 @@ class pygraph:
         fall back to the default stream)."""
         if handle is None:
             return None
-        import cudnn
-
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
@@ -1531,29 +1536,30 @@ class pygraph:
         self.check_support()
         self.build_plans(ctx=ctx)
 
-    def get_workspace_size(self, *args, **kwargs) -> int:
-        """Workspace bytes for the selected plan. Classic overloads (handle /
-        dynamic-shape overrides) pass through on the backend path."""
+    def get_workspace_size(self, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
+        """Workspace bytes for the selected plan. The classic overload args -- a
+        handle and the dynamic-shape overrides -- pass through on the backend path."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
-            # Classic overloads (handle, override_uids/shapes/strides) describe
-            # the problem, and CompiledPlan.get_workspace_size() takes none of
-            # them: a compiled python plan's workspace is a property of the plan.
-            # A shape-dependent one would have to say so through that API.
+            # The overload args (handle, override_uids/shapes/strides) describe the
+            # problem, and CompiledPlan.get_workspace_size() takes none of them: a
+            # compiled python plan's workspace is a property of the plan. A
+            # shape-dependent one would have to say so through that API.
             return self._compiled_plans[self._plan_index].get_workspace_size()
 
-        # Same reason execute() addresses by index; classic overloads pass through.
+        # Same reason execute() addresses by index; the overload args pass through.
         cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
-        if not args and not kwargs and cfg is not None and cfg.cpp_index is not None:
+        no_overload = handle is None and override_uids is None and override_shapes is None and override_strides is None
+        if no_overload and cfg is not None and cfg.cpp_index is not None:
             return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index)
-        return self._lowered_graph.get_workspace_size(*args, **kwargs)
+        return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
-    def get_workspace_size_plan_at_index(self, index: int, *args, **kwargs) -> int:
+    def get_workspace_size_plan_at_index(self, index: int, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
         """Workspace bytes for the plan at ``index`` in the ranked list."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
-            return self._lowered_graph.get_workspace_size_plan_at_index(index, *args, **kwargs)
+            return self._lowered_graph.get_workspace_size_plan_at_index(index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
@@ -1563,8 +1569,8 @@ class pygraph:
             return self._compiled_plans[index].get_workspace_size()
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:  # delegating entry
-            return self._lowered_graph.get_workspace_size(*args, **kwargs)
-        return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index, *args, **kwargs)
+            return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def _reject_if_barred(self, index: int) -> None:
         """The ranked list is never filtered (indices stay stable), so every
@@ -1636,16 +1642,16 @@ class pygraph:
         self._lower_backend_plan()
         return self._lowered_graph.get_behavior_notes(*args, **kwargs)
 
-    def populate_cuda_graph(self, *args, **kwargs):
+    def populate_cuda_graph(self, handle, variant_pack, workspace, cuda_graph):
         """Classic CUDA-graph capture — the backend's, so a python plan declines.
 
         Capture itself is not the obstacle (the python engines run on the
         execute-time handle's stream); this API records the BACKEND's plan."""
-        return self._cuda_graph_call("populate_cuda_graph", *args, **kwargs)
+        return self._cuda_graph_call("populate_cuda_graph", to_backend_handle(handle), variant_pack, workspace, cuda_graph)
 
-    def update_cuda_graph(self, *args, **kwargs):
+    def update_cuda_graph(self, handle, variant_pack, workspace, cuda_graph):
         """Classic CUDA-graph update — backend plans only, as above."""
-        return self._cuda_graph_call("update_cuda_graph", *args, **kwargs)
+        return self._cuda_graph_call("update_cuda_graph", to_backend_handle(handle), variant_pack, workspace, cuda_graph)
 
     def _cuda_graph_call(self, name: str, *args, **kwargs):
         eng = self.selected_engine
@@ -1705,7 +1711,7 @@ class pygraph:
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             uid_to_data = self._uid_to_data(tensor_dict)
             var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, handle, *args, **kwargs)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
@@ -1723,15 +1729,15 @@ class pygraph:
         uid_to_data = self._uid_to_data(tensor_dict)
         var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
         if cfg.cpp_index is None:  # delegating entry
-            self._lowered_graph._execute(var_pack, ws_ptr, handle, *args, **kwargs)
+            self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), *args, **kwargs)
             return
-        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, handle, *args, **kwargs)
+        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, to_backend_handle(handle), *args, **kwargs)
 
     def execute(
         self,
         tensor_dict: Dict[Union[str, int, Tensor], Any],
         workspace: Any = None,
-        handle: int = None,
+        handle: Optional[Handle] = None,
         override_uids: Any = None,
         override_shapes: Any = None,
         override_strides: Any = None,
@@ -1751,9 +1757,12 @@ class pygraph:
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: dynamic-shape overrides (backend path)
         """
-        # A JIT engine must compile for the device/stream it will run on.
-        caller_ctx = self._build_context(handle) if handle is not None else None
         if not self._is_built:
+            # A JIT engine must compile for the device/stream it will run on, so
+            # build the caller context here. Only here: a steady-state execute()
+            # otherwise discarded this (a cudnnGetStream round-trip + an
+            # ExecutionContext alloc, ~2.9us) on every already-built call.
+            caller_ctx = self._build_context(handle) if handle is not None else None
             if not self._planning_done:
                 self.create_execution_plans()
             self.build(ctx=caller_ctx)
@@ -1768,6 +1777,10 @@ class pygraph:
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
             ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
+            # A JIT engine launches through the driver, which reads the calling
+            # thread's context stack; an autograd worker has none. The handle's
+            # device decides when the stream names no context.
+            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
@@ -1801,16 +1814,16 @@ class pygraph:
                 variant_pack.address,
                 len(variant_pack),
                 variant_pack.workspace,
-                handle or 0,
+                to_backend_handle(handle) or 0,
                 -1 if cpp_index is None else cpp_index,
             )
             return
 
         var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, handle, override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2078,8 +2091,16 @@ class pygraph:
         return self._lowered_graph.serialize()
 
     def deserialize(self, *args, **kwargs) -> None:
-        """Deserialize a graph (classic passthrough: (data) or (handle, data,
-        enforce_precompiled=...)). Replaces this graph's lowered C++ graph."""
+        """Deserialize a graph. This is the one genuinely ambiguous classic
+        overload -- ``(data)`` or ``(handle, data, enforce_precompiled=...)`` --
+        so it stays a passthrough. The handle can arrive as the first positional
+        or as the ``handle_`` keyword (the pybind overload's name); unwrap a
+        Handle to its backend int and leave the ``data`` blob (the other overload)
+        untouched."""
+        if args and isinstance(args[0], Handle):
+            args = (args[0].backend_handle,) + args[1:]
+        if isinstance(kwargs.get("handle_"), Handle):
+            kwargs["handle_"] = kwargs["handle_"].backend_handle
         if self._lowered_graph is None:
             import cudnn
 
@@ -2096,7 +2117,7 @@ class pygraph:
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
                 if self._handle is not None:
-                    deser_kwargs["handle"] = self._handle
+                    deser_kwargs["handle"] = to_backend_handle(self._handle)
                 self._lowered_graph = cudnn._pybind_module.backend_graph(**deser_kwargs)
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
@@ -2121,7 +2142,7 @@ class pygraph:
         pg_kwargs["intermediate_data_type"] = _library_type(self._context.intermediate_data_type or cudnn.data_type.FLOAT)
         pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
         if self._handle is not None:
-            pg_kwargs["handle"] = self._handle
+            pg_kwargs["handle"] = to_backend_handle(self._handle)
         graph = cudnn._pybind_module.backend_graph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
@@ -2434,22 +2455,21 @@ def _moe_bwd_dweight_dims(node):
 
 
 def _linear_attention_final_state_dims(node):
-    # [N, HO, K, V]: N sequences (cu_seqlens carries N+1 boundaries), HO =
-    # max(q, v) heads — the recurrent state lives at the gate heads
+    # [N, HO, V, K]
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, max(q[1], v[1]), q[2], v[2]]
+    return [cu.dim[0] - 1, max(q[1], v[1]), v[2], q[2]]
 
 
-def _linear_attention_h_dims(node):
-    # [total_h, HO, K, V] at capacity: sum_b (sl_b - 1) // N <= total_T // N
+def _linear_attention_state_checkpoints_dims(node):
     n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    if not n or not q or not v:
+    cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
+    if not n or not q or not v or not cu:
         return None
-    return [max(v[0] // n, 1), max(q[1], v[1]), q[2], v[2]]
+    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), v[2], q[2]]
 
 
 def _linear_attention_o_dims(node):
@@ -2616,64 +2636,113 @@ _STRUCTURED_OPS = {
     # ---- linear attention ----------------------------------------------------
     "gdn": dict(
         node_type=NodeType.GDN,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens"),
-        outputs=("O", "final_state", "H"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
-        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
-        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
-        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "d_initial_state": _like("initial_state"),
+            "d_a_log": _like("a_log"),
+            "d_dt_bias": _like("dt_bias"),
+        },
         python_only=True,
     ),
     "kda": dict(
         node_type=NodeType.KDA,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound"),
-        outputs=("O", "final_state", "H"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
-        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
-        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
-        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "d_initial_state": _like("initial_state"),
+            "d_a_log": _like("a_log"),
+            "d_dt_bias": _like("dt_bias"),
+        },
         python_only=True,
     ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_w_sigmoid"),
-        outputs=("O", "final_state", "H"),
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "beta_guard",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale",),
-        outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state"),
-        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "beta_guard", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+        },
         infer={
             "dQ": _like("q"),
             "dK": _like("k"),
@@ -2682,6 +2751,8 @@ _STRUCTURED_OPS = {
             "dBeta": _like("beta"),
             "dW": _like("w"),
             "d_initial_state": _like("initial_state"),
+            "d_a_log": _like("a_log"),
+            "d_dt_bias": _like("dt_bias"),
         },
         python_only=True,
     ),

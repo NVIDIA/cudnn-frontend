@@ -355,11 +355,7 @@ class RandomizationContext:
             # ~10% chance of 0-length sequence for each batch
             randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
             # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
-            randoms_.seq_len_kv = [
-                # 0 if rng.random() < 0.1 else rng.randint(randoms_.seq_len_q[i], randoms_.s_kv) for i in range(randoms_.batches)
-                rng.randint(1, randoms_.s_kv)
-                for i in range(randoms_.batches)
-            ]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_kv) for i in range(randoms_.batches)]
 
         # Decide the left and right bounds for the sliding window mask (None = no bound)
         randoms_.left_bound = None
@@ -386,8 +382,13 @@ class RandomizationContext:
         randoms_.shape_stats = (randoms_.batches, randoms_.h_q, randoms_.s_q, 1)
 
         if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
-            randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
-            randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
+            # Q/O strides stay None: fill_derived_fields (called before
+            # return) draws the seeded per-tensor token gaps there, with the
+            # auto-packed fallbacks for the cu / offset-multiplier forms
+            # (#538) and 1-byte data types (#537). Assigning packed strides
+            # here would bypass that knob for the whole randomized fleet —
+            # exactly how the numel()//token_stride capacity bug (issue #613)
+            # stayed invisible to these sweeps.
             if randoms_.ragged_stats_layout == "head_major":
                 # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
                 # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
@@ -403,17 +404,19 @@ class RandomizationContext:
             indices.append(3)
             gaps_q = [0, 0, 0, 0]
             gaps_o = [0, 0, 0, 0]
+            gaps_stats = [0, 0, 0, 0]
 
             if rng.randint(0, 1) == 0:  # 50% chance of gaps
                 gaps_q = [rng.randint(0, 8) for _ in range(3)]
                 gaps_o = [rng.randint(0, 8) for _ in range(3)]
+                gaps_stats = [rng.randint(0, 8) for _ in range(3)]
                 gaps_q.append(elem_align * rng.randint(0, 2))
                 gaps_o.append(elem_align * rng.randint(0, 2))
+                gaps_stats.append(elem_align * rng.randint(0, 2))
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
-            # TODO: Randomize stride_stats once all layouts are supported correctly.
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bhsd")
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
 
         # Decide K, V
         randoms_.shape_k = (
@@ -425,8 +428,7 @@ class RandomizationContext:
         randoms_.shape_v = (randoms_.batches, randoms_.h_v, randoms_.s_kv, randoms_.d_v)
 
         if randoms_.is_ragged:  # Ideally K ragged and V ragged
-            randoms_.stride_k = get_strides_from_layout(randoms_.shape_k, "bshd")
-            randoms_.stride_v = get_strides_from_layout(randoms_.shape_v, "bshd")
+            pass  # K/V strides stay None -> seeded token gaps in fill_derived_fields
 
         else:
             indices = [0, 1, 2]
@@ -444,6 +446,10 @@ class RandomizationContext:
             randoms_.stride_k = get_strides_from_indices(randoms_.shape_k, indices, gaps_k, rng)
             randoms_.stride_v = get_strides_from_indices(randoms_.shape_v, indices, gaps_v, rng)
 
+        # Fill whatever was left None (ragged Q/K/V/O strides) through the
+        # same derivation every ExecConfig takes — one source of truth for
+        # the ragged token-gap draw and its fallbacks.
+        randoms_.fill_derived_fields()
         return randoms_
 
 

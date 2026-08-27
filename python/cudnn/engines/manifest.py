@@ -143,6 +143,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "GdnEngines",
         slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         KDA_ID_BASE,
@@ -150,6 +151,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "KdaEngines",
         slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         GDN2_ID_BASE,
@@ -157,6 +159,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "Gdn2Engines",
         slots={"gdn2_frost": EngineSlot(0)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         FROST_GEMM_ID_BASE,
@@ -171,16 +174,19 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.sdpa.fwd.engine",
         "FrostSdpaFwdEngines",
         # Slots are FIXED FOREVER; append the next free one, never reorder.
+        # RETIRED (one engine per arch x dtype family absorbed the per-head-dim
+        # rows; kernel-flavor choice moved into the lowering — never reuse):
+        #   0 sm100_d128, 1 sm100_d256, 2 sm100_d512, 3 sm100_d128_mxfp8,
+        #   4 sm100_d128_fp8, 6 sm100_d192_d128, 9 sm100_d192_d128_fp8,
+        #   10 sm100_d192_d128_mxfp8
         slots={
-            "sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d256": EngineSlot(1, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d512": EngineSlot(2, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d128_mxfp8": EngineSlot(3, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d128_fp8": EngineSlot(4, opt_in=True),
             "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
-            "sdpa_fwd_prefill_sm100_d192_d128": EngineSlot(6, opt_in=True),
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
             "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
+            "sdpa_fwd_prefill_sm100": EngineSlot(11, opt_in=True),
+            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
+            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
@@ -248,7 +254,12 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 
 
 def resolve_heuristics(family: EngineFamily):
-    """The family's plan-ranking callable, or None when it declares none."""
+    """The family's proposal callable, or None when it declares none.
+
+    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]`` — pure
+    and backend-blind; placement against the backend's entries happens once
+    for every family in ``engines/heuristics._assemble``.
+    """
     return _resolve(family, family.heuristics, "heuristics")
 
 

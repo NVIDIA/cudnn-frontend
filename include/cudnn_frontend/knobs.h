@@ -41,6 +41,7 @@ enum class KnobType_t {
     SWAP_AB,
     INPUT_TMA_ENABLE,
     OUTPUT_TMA_ENABLE,
+    TILE_CGA,
 };
 
 class Knob {
@@ -164,6 +165,11 @@ convert_to_backend_knob_type(KnobType_t const knob_type, cudnnBackendKnobType_t&
             cudnn_knob_type = CUDNN_KNOB_TYPE_OUTPUT_TMA_ENABLE;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #endif
+        case KnobType_t::TILE_CGA:
+            // Deprecated in the backend enum but still reported by some engines'
+            // knob queries; the numeric value avoids the deprecation warning.
+            cudnn_knob_type = (cudnnBackendKnobType_t)26;  // CUDNN_KNOB_TYPE_TILE_CGA
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
@@ -251,6 +257,8 @@ convert_from_backend_knob_type(cudnnBackendKnobType_t cudnn_knob_type) {
         case CUDNN_KNOB_TYPE_OUTPUT_TMA_ENABLE:
             return KnobType_t::OUTPUT_TMA_ENABLE;
 #endif
+        case 26:  // CUDNN_KNOB_TYPE_TILE_CGA (deprecated)
+            return KnobType_t::TILE_CGA;
         default:
             return KnobType_t::NOT_SET;
     }

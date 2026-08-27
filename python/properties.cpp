@@ -143,6 +143,7 @@ init_properties(py::module_& m) {
         .value("FP8_E5M2", cudnn_frontend::DataType_t::FP8_E5M2)
         .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
         .value("FP8_E8M0", cudnn_frontend::DataType_t::FP8_E8M0)
+        .value("FP8_E5M3", cudnn_frontend::DataType_t::FP8_E5M3)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("INT4", cudnn_frontend::DataType_t::INT4)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);
@@ -243,7 +244,8 @@ init_properties(py::module_& m) {
         .value("WARP_SPEC_CFG", cudnn_frontend::KnobType_t::WARP_SPEC_CFG)
         .value("SWAP_AB", cudnn_frontend::KnobType_t::SWAP_AB)
         .value("INPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::INPUT_TMA_ENABLE)
-        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE);
+        .value("OUTPUT_TMA_ENABLE", cudnn_frontend::KnobType_t::OUTPUT_TMA_ENABLE)
+        .value("TILE_CGA", cudnn_frontend::KnobType_t::TILE_CGA);
 
     py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),
@@ -284,9 +286,12 @@ init_properties(py::module_& m) {
               &create_device_properties_helper));
 
     m.def("create_handle", &HandleManagement::create_handle);
-    m.def("destroy_handle", &HandleManagement::destroy_handle);
+    // destroy_handle / set_stream are exposed under a raw name and wrapped in Python
+    // (cudnn/__init__.py) to skip a redundant cudnnSetStream when the stream is unchanged,
+    // matching how the graph execute binding (_execute) is wrapped as the public execute().
+    m.def("_raw_destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
-    m.def("set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
+    m.def("_raw_set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
 
     py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)

@@ -15,7 +15,7 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -84,7 +84,17 @@ class BlockScaledMoEGroupedGemmGluKernel:
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
+        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN/FloatNV8E5M3FNU + sf_vec_size: 16
+
+    :note: FloatNV8E5M3FNU scale factors are Rubin-only and reachable solely through
+        the FP4xFP4 atom (SM107MmaMXF4NVF4Op); the FP8 atom accepts Float8E8M0FNU only.
+        torch has no e5m3 dtype, so the frontend passes such scale factors as
+        torch.float8_e4m3fn storage and overrides the CuTe element type at compile
+        time -- see ``sf_fp8_dtype_override`` in ``_blockscaled_api.py``.
+        ``can_implement`` below does not model this: it reports E5M3 as unsupported
+        because its shared validator is arch-agnostic and other callers are SM100,
+        where E5M3 scales really are invalid. The block-scaled API validates the
+        combination itself and never calls ``can_implement``.
 
     :note: Supported accumulator data types:
         - Float32
@@ -212,6 +222,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = True,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -243,6 +255,13 @@ class BlockScaledMoEGroupedGemmGluKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param expert_cnt: Number of experts (compile-time constant).
         :type expert_cnt: int
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
+        :type sf_fp8_dtype_override: Optional[Literal["e5m3"]]
 
         :raises ValueError: If FIX_PAD_SIZE is not divisible by mma_tiler_mn[0].
         """
@@ -265,11 +284,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
+        if use_single_group_runtime_offsets and expert_cnt != 1:
+            raise ValueError("use_single_group_runtime_offsets requires exactly one expert")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -731,7 +754,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
@@ -1632,6 +1658,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 cpasync.prefetch_descriptor(tma_atom_d_col)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        if cutlass.const_expr(self.use_single_group_runtime_offsets):
+            runtime_padded_offsets = cute.make_rmem_tensor((1,), cutlass.Int32)
+            runtime_padded_offsets[0] = cutlass.Int32(cute.size(mA_mkl.shape[0]))
+            padded_offsets = runtime_padded_offsets
         total_token = padded_offsets[self.expert_cnt - 1]
 
         #
@@ -2368,6 +2398,19 @@ class BlockScaledMoEGroupedGemmGluKernel:
                     expert_idx = tile_info[0]
 
                     gBias_tile = gBias_nl[(None, mma_n_coord, expert_idx)]
+
+                    # For dynamic MNKL, cuteDSL drops the 128bit alignment requirement
+                    # but we know that during runtime the alignment is always 16 bytes.
+                    gBias_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            gBias_tile.element_type,
+                            gBias_tile.iterator.toint(),
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        gBias_tile.layout,
+                    )
+
                     tBs_gBias = thr_bias_g2s.partition_S(gBias_tile)
 
                     # Predicate: check if this thread's chunk is within N

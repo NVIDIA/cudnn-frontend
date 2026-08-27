@@ -86,12 +86,19 @@ class Capabilities:
     sm_hi: int
     d: frozenset[int]  # supported head dims (d_qk == d_v unless dqk_ge_dv)
     # When True, ``d`` is an ENVELOPE upper bound: the lowering also serves any
-    # graph with head dims <= max(d) (the SM80 adapter zero-pads to the
-    # smallest covering kernel flavor). False = exact-set membership.
+    # graph with head dims <= max(d), computing on the smallest covering
+    # kernel size (sm120 in place via TMA zero-fill; sm80 via host-side
+    # zero-padding). False = exact-set membership.
     d_envelope: bool = False
+    # Alignment rule for envelope rows: head dims must be multiples of this
+    # (sm120's TMA 16-byte global-stride rule at 2 B/elem -> 8; sm80's
+    # host-side padding has no such constraint -> 1).
+    d_pad_multiple: int = 1
     # When True the lowering serves rectangular head dims with D_QK >= D_V
     # (e.g. 192/128); False requires D_QK == D_V.
     dqk_ge_dv: bool = False
+    # True when stats is not contiguous (B, H_q, S_q, 1) in memory.
+    strided_stats: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
     # optional features a backward graph may request
@@ -128,9 +135,7 @@ class Capabilities:
     #                  strides included, as long as the head dim is
     #                  innermost-contiguous (stride 1) and the strides are
     #                  non-broadcast / non-overlapping (facts.dense_layout;
-    #                  see graph_analyzer.dense_layout_ok). The lowering
-    #                  normalizes such tensors to the kernel's canonical
-    #                  BSHD-compact buffers (zero-copy when already BSHD).
+    #                  see graph_analyzer.dense_layout_ok).
     layouts: frozenset[str] = frozenset({"bshd"})
 
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
@@ -177,8 +182,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     if capabilities.d_envelope:
         if max(facts.d_qk, facts.d_v) > max(capabilities.d):
             return f"head dims (D_QK={facts.d_qk}, D_V={facts.d_v}) exceed the {max(capabilities.d)} envelope"
+        m = capabilities.d_pad_multiple
+        if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
+            return f"the envelope serves head-dim multiples of {m} (TMA 16-byte global-stride rule); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
+    elif facts.d_v not in capabilities.d:
+        return f"serves D_V in {sorted(capabilities.d)}; graph has D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
     if not facts.uniform_dtype:
@@ -221,26 +231,48 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_dsink and not facts.has_sink:
+        return "dSink_token output requires a sink_token input"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the prefill kernels"
-    if facts.bottom_right and not facts.causal:
-        return "bottom-right alignment requires a causal upper bound"
-    if facts.causal and facts.bottom_right and not capabilities.bottom_right:
+    if facts.bottom_right and not (facts.causal or facts.right_band_widening):
+        return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
+    if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
 
-    # The kernel consumes the forward stats as a contiguous natural-log LSE
-    # (fp32 (B, H_q, S_q, 1)); a strided stats view has no zero-copy reshape.
     if facts.stats_t is not None:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
             return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
         s_dim = tuple(facts.stats_t.get_dim())
         s_stride = tuple(facts.stats_t.get_stride())
         expect_dim = (facts.b, facts.h_q, facts.s_q, 1)
-        expect_stride = (facts.h_q * facts.s_q, facts.s_q, 1, 1)
         if s_dim != expect_dim:
             return f"stats must be (B, H_q, S_q, 1) = {expect_dim}; got {s_dim}"
-        if s_stride != expect_stride:
-            return f"stats must be contiguous {expect_stride}; got stride {s_stride}"
+        if capabilities.strided_stats:
+            if any(st == 0 and d > 1 for d, st in zip(s_dim, s_stride)):
+                return f"stats must not broadcast (stride 0 on a size > 1 dim); got stride {s_stride}"
+        else:
+            expect_stride = (facts.h_q * facts.s_q, facts.s_q, 1, 1)
+            if s_stride != expect_stride:
+                return f"stats must be contiguous {expect_stride}; got stride {s_stride}"
+
+    if facts.has_dbias and not facts.has_bias:
+        return "dBias output requires a bias input"
+    for bias_like_t, label in ((facts.bias_t if facts.has_bias else None, "bias"), (facts.dbias_t if facts.has_dbias else None, "dBias")):
+        if bias_like_t is None:
+            continue
+        dim = tuple(bias_like_t.get_dim())
+        if dim not in ((1, facts.h_q, facts.s_q, facts.s_kv), (facts.b, facts.h_q, facts.s_q, facts.s_kv)):
+            return f"{label} must be (1|B, H_q, S_q, S_kv) = (1|{facts.b}, {facts.h_q}, {facts.s_q}, {facts.s_kv}); got {dim}"
+        expect_bias_stride = (facts.h_q * facts.s_q * facts.s_kv, facts.s_q * facts.s_kv, facts.s_kv, 1)
+        if tuple(bias_like_t.get_stride()) != expect_bias_stride:
+            return f"{label} must be contiguous {expect_bias_stride}; got stride {tuple(bias_like_t.get_stride())}"
+        if bias_like_t.get_data_type() not in (facts.dtype, cudnn.data_type.FLOAT):
+            return f"{label} must be fp32 or match the io dtype {facts.dtype}; got {bias_like_t.get_data_type()}"
+    if facts.has_dbias and tuple(facts.dbias_t.get_dim()) != tuple(facts.bias_t.get_dim()):
+        return f"dBias dims must match the bias dims {tuple(facts.bias_t.get_dim())}; got {tuple(facts.dbias_t.get_dim())}"
+    if facts.has_dbias and facts.deterministic and facts.b > 1 and tuple(facts.bias_t.get_dim())[0] == 1:
+        return "deterministic dBias requires a per-batch bias when B > 1 (a broadcast bias reduces over B through unordered atomics)"
     return None
 
 
@@ -258,12 +290,23 @@ def _sm120_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             # Any head size multipled of 8
-            d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
+            d=frozenset(_SM120_HEAD_DIMS),
+            d_envelope=True,  # any multiple of 8 computes on the next native size (TMA zero-fill)
+            d_pad_multiple=8,
+            dqk_ge_dv=True,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
+            padded=True,
+            sink=True,
+            dsink=True,
+            bias=True,
+            dbias=True,
             layouts=frozenset({"bshd", "dense_flex"}),
+            strided_stats=True,
             deterministic=True,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
@@ -312,7 +355,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
     q_geom, k_geom, v_geom, o_geom = ports["q"], ports["k"], ports["v"], ports["o"]
     do_geom, dq_geom, dk_geom, dv_geom = ports["dO"], ports["dQ"], ports["dK"], ports["dV"]
-    stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
+    stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
 
     import torch
 
@@ -332,6 +375,14 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             name=name,
         )
 
+    seq_kv_t = facts.seq_kv_t if facts.padded else None
+    seq_q_t = facts.seq_q_t if facts.padded else None
+    # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
+    sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
+    dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
+    bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
+    dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
+
     api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(k_geom, facts.dtype, "k"),
@@ -342,13 +393,20 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         sample_dq=_desc(dq_geom, facts.dtype, "dQ"),
         sample_dk=_desc(dk_geom, facts.dtype, "dK"),
         sample_dv=_desc(dv_geom, facts.dtype, "dV"),
-        is_causal=facts.causal,
+        sample_sink=_desc(sink_geom, facts.sink_t.get_data_type(), "sink") if sink_geom is not None else None,
+        sample_dsink=_desc(dsink_geom, facts.dsink_t.get_data_type(), "dSink") if dsink_geom is not None else None,
+        sample_bias=_desc(bias_geom, facts.bias_t.get_data_type(), "bias") if bias_geom is not None else None,
+        sample_dbias=_desc(dbias_geom, facts.dbias_t.get_data_type(), "dBias") if dbias_geom is not None else None,
+        is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
         deterministic=facts.deterministic,
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
+        seq_kv_lens_present=seq_kv_t is not None,
+        seq_q_lens_present=seq_q_t is not None,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -369,6 +427,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dq=facts.dq_t,
         dk=facts.dk_t,
         dv=facts.dv_t,
+        seq_len_kv=seq_kv_t,
+        seq_len_q=seq_q_t,
+        sink_token=facts.sink_t if facts.has_sink else None,
+        dsink=facts.dsink_t if facts.has_dsink else None,
+        bias=facts.bias_t if facts.has_bias else None,
+        dbias=facts.dbias_t if facts.has_dbias else None,
     )
 
     def _canonical_view(buf, geom):
@@ -387,6 +451,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
     def _execute(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
+        seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
+        seq_q_buf = resolved.get(id(binding.seq_len_q)) if binding.seq_len_q is not None else None
+        sink_buf = _canonical_view(resolved[id(binding.sink_token)], sink_geom) if binding.sink_token is not None else None
+        dsink_buf = _canonical_view(resolved[id(binding.dsink)], dsink_geom) if binding.dsink is not None else None
+        bias_buf = _canonical_view(resolved[id(binding.bias)], bias_geom) if binding.bias is not None else None
+        dbias_buf = _canonical_view(resolved[id(binding.dbias)], dbias_geom) if binding.dbias is not None else None
         api.execute(
             q_tensor=_canonical_view(resolved[id(binding.q)], q_geom),
             k_tensor=_canonical_view(resolved[id(binding.k)], k_geom),
@@ -397,6 +467,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             dq_tensor=_canonical_view(resolved[id(binding.dq)], dq_geom),
             dk_tensor=_canonical_view(resolved[id(binding.dk)], dk_geom),
             dv_tensor=_canonical_view(resolved[id(binding.dv)], dv_geom),
+            seq_q_lens=seq_q_buf,
+            seq_kv_lens=seq_kv_buf,
+            sink_tensor=sink_buf,
+            dsink_tensor=dsink_buf,
+            bias_tensor=bias_buf,
+            dbias_tensor=dbias_buf,
             scale_softmax=facts.scale,
             # Scratch comes from the CALLER's workspace (never allocated
             # here): the dispatch sized/validated it against workspace_bytes;
@@ -446,8 +522,6 @@ def _sm80_spec() -> EngineSpec:
             dbias=True,
             dsink=True,
             bias=True,
-            alibi=True,
-            block_mask=True,
             right_band_widening=True,
             seq_q_trim=False,
             swa=True,
@@ -474,7 +548,6 @@ def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any 
         sink_token=facts.sink_t,
         seq_len_kv=facts.seq_kv_t,
         seq_len_q=facts.seq_q_t,
-        block_mask=facts.block_mask_t,
         do=facts.do_t,
         dq=facts.dq_t,
         dk=facts.dk_t,

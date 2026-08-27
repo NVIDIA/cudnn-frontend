@@ -446,6 +446,13 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
             auto stats     = attributes.outputs.at(output_names::Stats);
             auto stats_dim = stats->get_dim();
 
+            // Stats is always computed and stored in FP32, regardless of the io data type.
+            // Default an unset data type here instead of fill_from_context, which would
+            // wrongly assign the io data type.
+            if (stats->get_data_type() == DataType_t::NOT_SET) {
+                stats->set_data_type(DataType_t::FLOAT);
+            }
+
             if (stats_dim.empty()) {
                 // Fill properties of virtual tensors
                 auto const& p_dim = attributes.inputs[input_names::Q]->get_dim();
@@ -497,6 +504,49 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     }
 
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
+
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
+
+        // Stats is always computed and stored in FP32. A narrower declared type makes the kernel
+        // write FP32 values past the end of the user's buffer (silent corruption / IMA), so
+        // reject it loudly here. An unset data type is allowed: shape inference defaults it to
+        // FP32 (see infer_properties_node) rather than letting fill_from_context assign the io
+        // data type.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_stats && stats_out->second->get_data_type() != DataType_t::FLOAT &&
+                                           stats_out->second->get_data_type() != DataType_t::NOT_SET,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "The Stats output of sdpa must be an FP32 tensor.");
+
+        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
+
+        // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
+        {
+            bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                                   attributes.outputs.at(output_names::O)->get_ragged_offset();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) &&
+                    !is_ragged,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
+        }
 
 #undef CUDNN_FE_VALIDATE_STRIDE
 
@@ -1406,15 +1456,32 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
 
-        if(detail::get_backend_version() >= 91801) {
+        if (detail::get_backend_version() >= 91801) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-	    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
-	}
+        }
+
+        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
+        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
+        // once the backward path grows a SDPA_backward_attributes support surface there —
+        // today that file serves only the forward attributes.
+        if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
+            auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
+            auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
+            bool const stats_is_packed_bhsd = stats_stride[3] == 1 &&
+                                              stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!stats_is_packed_bhsd,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "For cuDNN version below 9.26.0, a non-ragged Stats input of sdpa_backward must be "
+                                        "a packed BHSD tensor.");
+        }
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,

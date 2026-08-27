@@ -159,6 +159,10 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "Intermediate tensor data type needs to be set as internal tensors require it.");
 
+    // The Stats layout check (packed BHSD required prior to 9.26.0) lives in
+    // SDPANode::post_validate_node(), as it must run after shape inference has
+    // filled in the dim/stride of an unset Stats output.
+
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
 

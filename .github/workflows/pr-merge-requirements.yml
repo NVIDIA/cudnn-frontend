@@ -1,0 +1,96 @@
+name: PR merge requirements
+
+# Blocks merging until the PR has a Milestone and is on at least one Project
+# board. Runs as `pull_request_target` so that PRs from forks get the repo
+# secrets; this is safe because the job never checks out or executes PR code —
+# it only queries PR metadata.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - edited
+      - labeled
+      - unlabeled
+      - milestoned
+      - demilestoned
+
+permissions:
+  pull-requests: read
+
+jobs:
+  merge-requirements:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check milestone and project assignment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Fine-grained PAT with organization "Projects: read" access; the
+          # built-in GITHUB_TOKEN cannot read Projects v2.
+          PROJECT_READ_TOKEN: ${{ secrets.PROJECT_READ_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+        run: |
+          set -u
+
+          # Bot PRs (dependabot, github-actions, ...) are exempt.
+          if [ "${AUTHOR_TYPE}" = "Bot" ]; then
+            echo "PR author is a bot — merge requirements do not apply."
+            exit 0
+          fi
+
+          # Query live PR state rather than the (possibly stale) event
+          # payload, so that re-running this check after fixing the fields
+          # passes without needing a new PR event.
+          pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+
+          if echo "${pr_json}" | jq -e 'any(.labels[]; .name == "cat-routine-update")' > /dev/null; then
+            echo "PR is labeled cat-routine-update — merge requirements do not apply."
+            exit 0
+          fi
+
+          failed=0
+
+          milestone=$(echo "${pr_json}" | jq -r '.milestone.title // empty')
+          if [ -n "${milestone}" ]; then
+            echo "Milestone: ${milestone}"
+          else
+            echo "::error::This PR has no Milestone."
+            failed=1
+          fi
+
+          if [ -z "${PROJECT_READ_TOKEN:-}" ]; then
+            echo "::error::The PROJECT_READ_TOKEN repository secret is not configured, so the Projects field cannot be verified. Ask a repository admin to set it (a PAT with read access to organization projects)."
+            failed=1
+          else
+            project_count=$(GH_TOKEN="${PROJECT_READ_TOKEN}" gh api graphql \
+              -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number="${PR_NUMBER}" \
+              -f query='query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    projectItems(first: 1) { totalCount }
+                  }
+                }
+              }' --jq '.data.repository.pullRequest.projectItems.totalCount' \
+              2> gh_stderr.txt) || project_count=""
+            if [ -n "${project_count}" ] && [ "${project_count}" -gt 0 ] 2> /dev/null; then
+              echo "PR is on ${project_count} project board(s)."
+            elif [ -z "${project_count}" ]; then
+              echo "::error::Could not query the Projects field. Is the PROJECT_READ_TOKEN secret a valid PAT with read access to organization projects? API said: $(tr '\n' ' ' < gh_stderr.txt)"
+              failed=1
+            else
+              echo "::error::This PR is not on any Project board."
+              failed=1
+            fi
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            echo ""
+            echo "Set the Milestone and Projects fields in the PR sidebar, then re-run this check from the Checks tab."
+            echo "(Adding a PR to a Project does not automatically re-trigger this check; changing the milestone does.)"
+            exit 1
+          fi
+          echo "All merge requirements satisfied."

@@ -9,6 +9,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
+- [FLA Integration Shims](fla.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
@@ -17,6 +18,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM (BF16)](gemm_fusions/grouped_gemm.md)
 - [Grouped GEMM + GLU (Unified)](gemm_fusions/grouped_gemm_glu.md)
 - [Grouped GEMM + GLU + Hadamard](gemm_fusions/grouped_gemm_glu_hadamard.md)
+- [Grouped GEMM + GLU + Hadamard + Quant](gemm_fusions/grouped_gemm_glu_hadamard_quant.md)
 - [Grouped GEMM + dGLU (Unified)](gemm_fusions/grouped_gemm_dglu.md)
 - [Grouped GEMM + SwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_swiglu.md)
 - [Grouped GEMM + dSwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_dswiglu.md)
@@ -32,8 +34,6 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
-- [SDPA Forward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256)
-- [SDPA Backward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 
@@ -124,6 +124,15 @@ Methods:
 - CUDA stream (`current_stream` in class API, `stream` in wrapper)
   - The cuda stream to use for operation kernel execution.
   - Default: None (uses default stream)
+
+- Determinism
+  - Several kernels reduce with cross-CTA atomics, so those outputs are not bit-exact run to
+    run. Kernels react to `torch.use_deterministic_algorithms(True)`: they switch to a
+    deterministic path where one exists, and otherwise raise (or warn, under
+    `warn_only`) rather than silently return a non-reproducible result.
+  - Where a deterministic path exists it can also be selected per call with
+    `deterministic=True`, independent of the torch setting. See
+    [Grouped GEMM + dsReLU](gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob).
 
 
 ## File structure and examples
