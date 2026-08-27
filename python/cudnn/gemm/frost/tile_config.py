@@ -44,7 +44,7 @@ def _sm_smem_budget_bytes(device=None) -> int:
 # every smem barrier, the TMEM base address and — on the MoE templates — the per-CTA TMA
 # tensormap scratch. The ab pipeline itself only counts the operand tensors, so these
 # fragments are budgeted once here instead of being modelled stage by stage.
-_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048}
+_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048, "sm120": 2048}
 _SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096, "sm107": 4096}
 
 
@@ -78,11 +78,11 @@ def l2_swizzle_budget_bytes(device=None) -> int:
 _CTA_TILE_M_MAX = 128
 _CTA_TILE_N_MAX = 256
 _MAX_CLUSTER_SIZE = _FROST_MAX_CLUSTER_SIZE
-_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm107": 128}
+_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm107": 128, "sm120": 128}
 
 # MMA-inst K in bytes
 _MMA_INST_K_BYTES = 32
-_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": 32, "sm103": 48, "sm107": 64}
+_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": 32, "sm103": 48, "sm107": 64, "sm120": 32}
 
 
 def _pipeline_fact(table: dict, pipeline: str, what: str):
@@ -371,10 +371,36 @@ class ConfigSm107(TileConfig):
     ``pipeline="sm107"``."""
 
 
+class ConfigSm120(TileConfig):
+    """sm120 geometry — warp-scoped MMA on consumer Blackwell (CC 12.x). The
+    cluster (none on CC 12.x, so 1x1) and the block size (a fixed 12-warp
+    kernel: 8 compute + TMA + CLC scheduler + 2 donors) are family-FIXED, so
+    ``__post_init__`` pins them rather than validating — a config crossing in
+    from a clustered family (``as_pipeline``) needs no sm120 knowledge. The
+    free axes keep ``cta_tile_n % 16 == 0`` (the 4x2 compute-warp grid owns
+    8-column n-fragments per warp column) and one MMA-M block. Callers pass
+    ``pipeline="sm120"``."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cgrp_size_m", 1)
+        object.__setattr__(self, "cgrp_size_n", 1)
+        object.__setattr__(self, "threads_per_cta", 384)
+        super().__post_init__()
+        if self.cta_tile_n % 16 != 0:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: sm120 needs cta_tile_n % 16 == 0 " f"(each of the 2 compute-warp columns owns 8-column n-fragments)"
+            )
+        if self.num_mma_m != 1:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: sm120 warp MMA has no MMA-M split; " f"mma_inst_m must equal cta_tile_m (got num_mma_m={self.num_mma_m})"
+            )
+
+
 _CONFIG_CLASS_BY_PIPELINE: dict[str, type[TileConfig]] = {
     "sm100": ConfigSm100,
     "sm103": ConfigSm103,
     "sm107": ConfigSm107,
+    "sm120": ConfigSm120,
 }
 
 
@@ -472,6 +498,21 @@ def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigS
     )
 
 
+def _geom_sm120(cta_m: int, cta_n: int, k_bytes: int) -> ConfigSm120:
+    """Build one sm120 config (cluster fixed at 1x1, 12-warp kernel)."""
+    return ConfigSm120(
+        cta_tile_m=cta_m,
+        cta_tile_n=cta_n,
+        cta_tile_k_bytes=k_bytes,
+        cgrp_size_m=1,
+        cgrp_size_n=1,
+        epi_tile_mn=(cta_m, 32),
+        threads_per_cta=384,
+        pipeline="sm120",
+        acc_stages=2,
+    )
+
+
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
     for mma_m, num_mma_m in _M_AXES:
@@ -492,6 +533,12 @@ def _build_catalog() -> tuple[TileConfig, ...]:
         for cta_n in (256, 128):
             for cgrp_m, cgrp_n in _CLUSTERS:
                 cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
+    # sm120 warp-MMA geometries: no cluster axis (fixed 1x1); M ∈ {128, 64}
+    # (the MMA-inst M bounds, and the 4x2 warp grid needs cta_m % 64 == 0).
+    for cta_m in (128, 64):
+        for cta_n in range(256, 0, -32):
+            for k_bytes in (128, 64):
+                cfgs.append(_geom_sm120(cta_m, cta_n, k_bytes))
     return tuple(cfgs)
 
 
@@ -711,9 +758,11 @@ def select_config(
 
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
     """The same geometry as a ``pipeline``-family config — only the family-fixed
-    MMA-inst K width moves. A family whose K axes this geometry cannot satisfy
-    (sm103 fixes a 384-byte K-tile) raises from the config's ``__post_init__``,
-    so the invariant stays in one place."""
+    MMA-inst K width moves (a family that fixes MORE axes pins them in its own
+    ``__post_init__``, e.g. ConfigSm120's cluster and block size). A family
+    whose K axes this geometry cannot satisfy (sm103 fixes a 384-byte K-tile)
+    raises from the config's ``__post_init__``, so the invariant stays in one
+    place."""
     if cfg.pipeline == pipeline:
         return cfg
     cls = config_class_for_pipeline(pipeline)

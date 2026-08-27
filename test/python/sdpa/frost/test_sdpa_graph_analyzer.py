@@ -1088,11 +1088,15 @@ def test_sm120_knob_domains(monkeypatch):
     # remap); a value outside the vocabulary still declines.
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
-    # split_kv: the SM120 row serves {1, 2, 4} (inline chunking + the shared
-    # combine); a value outside the domain still declines.
+    # split_kv: the SM120 row WIRES the split path (inline chunking + the
+    # shared combine), which is a boolean gate — the kernel has no upper bound
+    # on the split count, so 8 is admissible too. WHICH splits get proposed is
+    # split_kv_candidates' device-derived ladder, not a per-row domain. A
+    # non-count still declines.
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=1))
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=4))
-    assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
+    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
+    assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=0))
 
 
 # ---------------------------------------------------------------------------
@@ -1294,14 +1298,10 @@ def test_bwd_probe_accepts_sink(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(dsink=True))
 
 
-def test_bwd_probe_rejects_bias(monkeypatch):
+def test_bwd_probe_rejects_deterministic_broadcast_dbias(monkeypatch):
+    # A batch-broadcast bias reduces dBias over B through unordered atomics.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(bias=True))
-
-
-def test_bwd_probe_rejects_dbias(monkeypatch):
-    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
+    assert not _bwd_eligible(_mk_bwd_graph(bias=True, dbias=True, use_deterministic_algorithm=True))
 
 
 def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):

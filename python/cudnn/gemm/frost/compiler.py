@@ -620,11 +620,24 @@ def _epi_tile_cols(config: TileConfig, cta_group: int) -> int:
     return cols
 
 
+# Widest epilogue chunk in ELEMENTS per pipeline family. The tcgen05 drains
+# take the global cap; sm120's transposed-STG epilogue stores at most the
+# 8-column fragment row run each compute warp owns (template: 8 % _STG_V == 0).
+_EPI_CHUNK_ELEMS_BY_PIPELINE = {
+    "sm100": MAX_EPI_CHUNK_ELEMS,
+    "sm103": MAX_EPI_CHUNK_ELEMS,
+    "sm107": MAX_EPI_CHUNK_ELEMS,
+    "sm120": 8,
+}
+
+
 def _epi_vec_bytes(chain: FusionChain, config: TileConfig, cta_group: int) -> int:
     """The epilogue chunk width the kernel is rendered with: the chain-derived
     width additionally clamped so it divides every power-of-2 subtile span of
-    this config's N-tile (see ``_compute_output_vec_bytes``)."""
-    return _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config, cta_group))
+    this config's N-tile (see ``_compute_output_vec_bytes``), capped at the
+    pipeline's widest store run (:data:`_EPI_CHUNK_ELEMS_BY_PIPELINE`)."""
+    vec = _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config, cta_group))
+    return min(vec, _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline] * DTYPE_BYTES[chain.output_dtype])
 
 
 def _epi_chunk_elems(chain: FusionChain, config: TileConfig, cta_group: int, use_tma_store: bool) -> int:
@@ -2916,6 +2929,10 @@ _EPI_ROW_BYTES_MAX = 128  # widest TMA store swizzle
 _EPI_N_BASE = 32  # drain width when the epilogue is already hidden behind the MMA
 _EPI_N_MAX = 64  # per-lane fp32 registers the drain can hold
 
+# Families whose templates the compiler renders with the TMA-store epilogue;
+# the sm120 warp kernel always takes its transposed-STG path.
+_TMA_STORE_EPI_PIPELINES = ("sm100", "sm103", "sm107")
+
 
 def _epi_n(cfg, cta_group: int, out_dt: str) -> int:
     cols = _epi_tile_cols(cfg, cta_group)
@@ -2982,6 +2999,10 @@ def _smem_d_bytes(cfg, chain, cta_group: int) -> int:
 def _output_store_mode(out, chain, cfg, cta_group: int) -> str:
     """Store mode for ONE output, from the output itself plus the geometry it is
     stored with -- never from what the others need."""
+    # Families whose templates render the TMA-store arm at all; the sm120 warp
+    # kernel always takes its transposed-STG path.
+    if cfg.pipeline not in _TMA_STORE_EPI_PIPELINES:
+        return "stg"
     # TMA addresses its contiguous dim in 16-byte units, and truncates. The next
     # two rejections are that granule at a different extent.
     epi_n = _epi_n(cfg, cta_group, chain.output_dtype)
@@ -3171,8 +3192,8 @@ def _check_executable(chain: FusionChain) -> None:
 
 
 def plan_config(chain: FusionChain) -> "tuple[TileConfig, int]":
-    from .kernel_registry import preferred_pipeline
-    from .tile_config import as_pipeline, select_config
+    from .kernel_registry import preferred_strategy
+    from .tile_config import select_config
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
@@ -3186,14 +3207,16 @@ def plan_config(chain: FusionChain) -> "tuple[TileConfig, int]":
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
     )
-    return as_pipeline(config, preferred_pipeline(chain)), cta_group
+    # Re-target at the preferred family AND clamp cta_group to a group that
+    # family has a template for (sm120 is warp-scoped MMA, 1-CTA only).
+    return preferred_strategy(chain, config, cta_group)
 
 
 def _precheck_plain(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
     from .kernel_registry import select_template
 
     _check_supported(chain, config)
-    _arch_reason = select_template(chain, config, cta_group).active_reject(config)
+    _arch_reason = select_template(chain, config, cta_group).active_reject(config, chain)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3497,6 +3520,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
 
 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
+_MOE_SCHED_COUNTER_SLOTS = 1
 _MOE_DESC_SLOT_BYTES = 128
 
 
@@ -3525,6 +3549,19 @@ def _register_legacy_device_view_adapter() -> None:
         # 128-byte tensormap slot the MoE workspace fake declares.
         ptr = view.data_ptr()
         return from_dlpack(view, assumed_align=min(ptr & -ptr, _MOE_DESC_SLOT_BYTES))
+
+
+def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
+    """Zero the dynamic tile scheduler's global counter, stream-ordered.
+
+    It lives in the slot past the per-CTA descriptor scratch, so it rides the
+    same buffer and the same stable pointer that makes the plan graph-safe.
+    A 4-byte D32 memset, not a kernel."""
+    buffers.memset_zero_async(
+        workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
+        4,
+        _as_custream(stream),
+    )
 
 
 def _moe_carve_workspace(caller, n_slots: int, plan: str):
@@ -3586,7 +3623,7 @@ class CompiledMoeGemm:
         """Per-CTA tensormap scratch: one 128-byte slot per CTA per patched
         descriptor. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
+        return (self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS) * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
@@ -3666,7 +3703,8 @@ class CompiledMoeGemm:
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3787,7 +3825,8 @@ class CompiledMoeGemm:
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3946,7 +3985,7 @@ class CompiledMoeBlockScaleGemm:
         """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
         distinct A operand. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
+        return (self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS) * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
@@ -4034,7 +4073,8 @@ class CompiledMoeBlockScaleGemm:
         ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4169,7 +4209,8 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,

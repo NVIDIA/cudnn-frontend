@@ -176,6 +176,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         rht_rowwise: bool = False,
+        rht_per_expert: bool = False,
         glu_alpha: Optional[float] = None,
         glu_limit: Optional[float] = None,
     ):
@@ -199,6 +200,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         # RHT dump orientation: False = columnwise (16-token blocks per feature),
         # True = rowwise (16-feature blocks per token). Same dump tensor/path either way.
         self.rht_rowwise = rht_rowwise
+        self.rht_per_expert = rht_per_expert
+        if rht_per_expert and rht_rowwise:
+            raise ValueError("rht_per_expert is a colwise RHT layout")
 
         # Always use pingpong epilogue for Hadamard
         self.epilogue_pingpong = True
@@ -610,6 +614,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        self.rht_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
@@ -653,8 +658,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         sf_storage_dtype = cutlass.Float8E4M3FN if self.sf_dtype == cutlass.FloatNV8E5M3FNU else self.sf_dtype
         if cutlass.const_expr(self.generate_sfd and sfd.element_type != sf_storage_dtype):
             raise ValueError("sfd element type must match scale-factor storage dtype")
-        if cutlass.const_expr(self.generate_sfrht and sfrht.element_type != sf_storage_dtype):
-            raise ValueError("sfrht element type must match scale-factor storage dtype")
+        if cutlass.const_expr(self.generate_sfrht and sfrht.element_type != cutlass.Float8E4M3FN):
+            raise ValueError("sfrht element type must be Float8E4M3FN")
         if cutlass.const_expr((self.d_quant or self.rht_quant) and self.act_func == "srelu"):
             raise ValueError("NVFP4 quantization assumes the GLU subtile pair-step (act_func != srelu)")
 
@@ -686,12 +691,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         sfa = cute.make_tensor(sfa.iterator, sfa_layout)
 
         # Dump staging dtype follows the dump tensor's element type (fp4: 2KB/stage vs
-        # 8KB bf16); the layout is CONSTRUCTED f-major like every other epilogue
-        # output (never derived from the rht gmem tensor) — all FWHT store paths
-        # pack along features.
+        # 8KB bf16). Colwise quantized staging is m-minor because packed bytes pair
+        # adjacent tokens; per-expert mode writes the same packed vectors directly
+        # to the flat output and does not TMA-copy this stage.
         self.rht_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.rht_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.COL_MAJOR if cutlass.const_expr(self.rht_quant and not self.rht_rowwise) else utils.LayoutEnum.ROW_MAJOR,
             self.epi_tile,
             self.num_d_stage,
         )
@@ -811,9 +816,11 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.epi_tile,
         )
 
-        # TMA store RHT — identical tile to D; smem layout follows the RHT output
-        # element type (== d_smem_layout for bf16, packed fp4 layout in quant mode).
-        if cutlass.const_expr(self.generate_rht):
+        # TMA store RHT — identical tile to D unless colwise quantized RHT uses
+        # the flat per-expert direct-store layout.
+        if cutlass.const_expr(self.generate_rht and self.rht_per_expert):
+            tma_atom_rht, tma_tensor_rht = None, rht
+        elif cutlass.const_expr(self.generate_rht):
             rht_smem_layout = cute.slice_(self.rht_smem_layout_staged, (None, None, 0))
             tma_atom_rht, tma_tensor_rht = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
@@ -918,7 +925,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 # Same (128, 8) buffer either way.
                 sSfRht: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.sf_dtype,
+                        self.rht_sf_dtype,
                         self.threads_per_warp * len(self.epilog_rht_store_warp_id) * (self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE),
                     ],
                     16,
@@ -1018,9 +1025,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             )
 
     @cute.jit
-    def store_swizzled_sf_row(self, sf_tensor: cute.Tensor, logical_row, sf_col_base, sSf: cute.Tensor, tidx):
+    def store_swizzled_sf_row(self, sf_tensor: cute.Tensor, logical_row, sf_col_base, sSf: cute.Tensor, tidx, sf_dtype=None):
         """Store one logical scale row into M32x4xrm_K4xrk_L SF layout."""
-        sf_tensor = cute.recast_tensor(sf_tensor, self.sf_dtype)
+        if cutlass.const_expr(sf_dtype is None):
+            sf_tensor = cute.recast_tensor(sf_tensor, self.sf_dtype)
+        else:
+            sf_tensor = cute.recast_tensor(sf_tensor, sf_dtype)
         row_m0 = logical_row % 32
         row_m1 = (logical_row // 32) % 4
         row_m2 = logical_row // 128
@@ -2490,7 +2500,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 #
                 # RHT output: per-expert RHT gmem tensor + TMA partition (mirrors ACT's D setup).
                 #
-                if cutlass.const_expr(self.generate_rht):
+                if cutlass.const_expr(self.generate_rht and not self.rht_per_expert):
                     thr_mma_epi_rht = tiled_mma.get_slice(mma_tile_coord_v)
                     real_rht, _ = epi_ext.get_gmem_tensor("d", mRht_mnl, padded_offsets, epi_work_tile_info)
                     gRht_mnl_loop = cute.local_tile(real_rht, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
@@ -2499,9 +2509,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     bSG_gRht = bSG_gRht_partitioned[(None, None, None, *mma_tile_coord_mnl)]
                     bSG_gRht = cute.group_modes(bSG_gRht, 1, cute.rank(bSG_gRht))
                 if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
-                    # Expert token offset for the colwise (f, m) scale grid's
-                    # tile index (offsets are 256-aligned, divisions exact).
-                    rht_t_off, _rht_t_cnt = compute_expert_token_range(padded_offsets, epi_work_tile_info.expert_idx)
+                    # Expert token offset/count for the colwise (f, m) data and
+                    # scale grids. Offsets are 256-aligned, so divisions by 16 are exact.
+                    rht_t_off, rht_t_cnt = compute_expert_token_range(padded_offsets, epi_work_tile_info.expert_idx)
 
                 #
                 # NVFP4 D: per-expert fp4 D gmem tensor + TMA partition (mirrors ACT's D setup).
@@ -2567,10 +2577,28 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         # from the sRht dtype inside the FWHT device functions.
                         if cutlass.const_expr(self.generate_rht):
                             if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
-                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, rht_norm_const, sSfRht, real_subtile_idx, self.sf_dtype)
+                                hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, rht_norm_const, sSfRht, real_subtile_idx, self.rht_sf_dtype)
+                            elif cutlass.const_expr(self.rht_quant and self.rht_per_expert):
+                                hadamard_rmem_colwise_fwht_quant(
+                                    rht_ld,
+                                    d_buffer,
+                                    epi_tidx,
+                                    rht_norm_const,
+                                    None,
+                                    sSfRht,
+                                    real_subtile_idx * 2 * HADAMARD_SIZE,
+                                    self.rht_sf_dtype,
+                                    gRht=mRht_mnl,
+                                    seg16=(mD_mnl.shape[1] // HADAMARD_SIZE) * rht_t_off,
+                                    pitch16=rht_t_cnt // HADAMARD_SIZE,
+                                    feat0=mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1],
+                                    tok16=(sf_row - epi_tidx) // HADAMARD_SIZE,
+                                    row_blocks=cute.ceil_div(mD_mnl.shape[1], 128),
+                                    gSf=mSfRht_mnl,
+                                )
                             elif cutlass.const_expr(self.rht_quant):
                                 hadamard_rmem_colwise_fwht_quant(
-                                    rht_ld, d_buffer, epi_tidx, rht_norm_const, sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.sf_dtype
+                                    rht_ld, d_buffer, epi_tidx, rht_norm_const, sRht, sSfRht, real_subtile_idx * 2 * HADAMARD_SIZE, self.rht_sf_dtype
                                 )
                             elif cutlass.const_expr(self.rht_rowwise):
                                 hadamard_rmem_rowwise_fwht(rht_ld, d_buffer, epi_tidx, sRht, 1.0, None, 0, self.sf_dtype)
@@ -2586,7 +2614,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier_group1.arrive_and_wait()
                         if warp_idx == self.epilog_rht_store_warp_id[0]:
-                            if cutlass.const_expr(self.generate_rht):
+                            if cutlass.const_expr(self.generate_rht and not self.rht_per_expert):
                                 cute.copy(
                                     tma_atom_rht,
                                     bSG_sRht[(None, d_buffer)],
@@ -2630,8 +2658,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         mma_tile_coord_mnl[1] * _num_sf,
                         sSfRht,
                         epi_tidx,
+                        self.rht_sf_dtype,
                     )
-                if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
+                if cutlass.const_expr(self.rht_quant and not self.rht_rowwise and not self.rht_per_expert):
                     # (f, m) scale domain: thread <-> feature-in-tile; columns are
                     # 16-token scale blocks, stored in the same swizzled SF atom layout.
                     sf_feat_row = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1] + epi_tidx
@@ -2641,6 +2670,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         (rht_t_off + sf_row - epi_tidx) // HADAMARD_SIZE,
                         sSfRht,
                         epi_tidx,
+                        self.rht_sf_dtype,
                     )
                 if cutlass.const_expr(self.d_quant):
                     self.store_swizzled_sf_row(

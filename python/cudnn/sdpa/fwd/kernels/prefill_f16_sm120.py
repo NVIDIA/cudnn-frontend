@@ -59,7 +59,12 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
+from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+    build_thd_meta_kernel as _build_thd_meta_kernel,
+    thd_claim_next,
+    thd_decode_unit,
+    THD_SETUP_THREADS,
+)
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
@@ -139,6 +144,15 @@ def pack_to_i32(
 
 # L2 working-set budget used by the LPT_L2 group sizing.
 _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+# THD only: pull units from a device-side counter over a machine-sized grid
+# instead of launching the plan-time envelope as a padded rectangle. The
+# envelope scales with the DECLARED S_q, so on ragged batches most of that
+# rectangle is tiles no sequence owns.
+#
+# This is what made the K/V consumer barriers have to balance per unit (see the
+# drain in _run_unit): a CTA here runs the tile range of several units in turn.
+THD_PERSISTENT = True
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -794,8 +808,11 @@ class SM120FusedMultiHeadAttentionForward:
         """
 
         # The K/V loop walks tile indices in reverse order. The mbarrier parity
-        # still follows the load iteration count: 0, 1, 0, 1, ...
-        tma_phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
+        # still follows the load iteration count: 0, 1, 0, 1, ... Under a
+        # persistent grid the mbarriers are armed once for the CTA and reused by
+        # every unit it claims, so the count continues across units — phase_base
+        # is how many tiles this CTA already loaded (0 on the one-unit paths).
+        tma_phase = (basic_params.phase_base + num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
         while not prims.mbarrier_try_wait_parity(basic_params.k_tma_mbar, tma_phase):
             pass
 
@@ -818,95 +835,57 @@ class SM120FusedMultiHeadAttentionForward:
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
-    @cute.kernel
-    def kernel(
+    @cute.jit
+    def _run_unit(
         self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        v: cute.Tensor,
-        o: cute.Tensor,
-        lse: Optional[cute.Tensor],
-        sinks: Optional[cute.Tensor],
-        seq_q_lens: cute.Tensor,
-        seq_kv_lens: cute.Tensor,
-        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
-        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
-        softmax_scale_log2: cutlass.Float32,
-        n_q_tiles: cutlass.Int32,
-    ) -> None:
-        """SM120 FMHA prefill kernel.
+        q,
+        k,
+        v,
+        o,
+        lse,
+        sinks,
+        seq_q_lens,
+        seq_kv_lens,
+        tma_k_desc,
+        tma_v_desc,
+        softmax_scale_log2,
+        sKV,
+        sK,
+        sV,
+        k_tma_mbar,
+        v_tma_mbar,
+        lane,
+        warp,
+        phase_base,
+        split_idx,
+        o_batch_idx,
+        q_tile_idx,
+        batch_idx,
+        head_idx,
+    ) -> cutlass.Int32:
+        """One unit of work: the (Q tile, sequence, head) triple named by the
+        last three arguments.
 
-        :param q: Query tensor.
-        :param k: Key tensor.
-        :param v: Value tensor.
-        :param o: Output tensor.
-        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense; packed
-            token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
-            ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
-            compile the LSE store out (the DSL specializes on ``None``).
-        :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
-            kernel is configured without ``has_sink``.
-        :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
-        :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
-        :param tma_k_desc: Tensor map descriptor for K.
-        :param tma_v_desc: Tensor map descriptor for V.
-        :param softmax_scale_log2: ``softmax_scale * log2(e)``, pre-folded host-side.
+        Split out of ``kernel`` so the persistent THD path can call it once per
+        claimed unit. SMEM and the per-warp register budget belong to the CTA,
+        not to the unit, so they stay in the caller and arrive here as
+        arguments — the same convention ``load_one_kv_tile`` already uses.
         """
-        tidx, _, _ = cute.arch.thread_idx()
-        q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
-        # KV split rides the BATCH axis: grid.y = batch + split*B.  Q/K/V and the
-        # per-batch seqlens must use the REAL batch; only the O/LSE partial slot
-        # uses the composite.  Folds away entirely at split_kv == 1.  NATURAL-only
-        # (config_sm120 enforces it): LPT / LPT_L2 flatten the grid to 1-D and
-        # derive the batch from the linear tile id, leaving no axis to ride.
-        split_idx = cutlass.Int32(0)
-        o_batch_idx = batch_idx
-        if cutlass.const_expr(self.split_kv > 1):
-            n_batch_real = cutlass.Int32(q.shape[0])
-            split_idx = batch_idx // n_batch_real
-            batch_idx = batch_idx % n_batch_real
-            o_batch_idx = split_idx * n_batch_real + batch_idx
-        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
-            _n_qh = cutlass.Int32((q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]))
-            _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
-            # Host-computed (see __call__): the grid is sized from the same
-            # value, so the decode cannot disagree with the launch geometry.
-            _q_tiles = n_q_tiles
-            if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
-                q_tile_idx, head_idx, batch_idx = lpt_l2_tile_coords(
-                    q_tile_idx,
-                    _n_qh,
-                    _n_batch,
-                    _q_tiles,
-                    _n_qh // cutlass.Int32(k.shape[2]),
-                    cutlass.Int32(k.shape[1]),
-                    (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
-                    _SCHED_L2_BUDGET_BYTES,
-                )
-            else:
-                q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
-            o_batch_idx = batch_idx
-        elif cutlass.const_expr(self.is_causal):
-            # Diagonal-bounded work grows with the Q tile. Launch long tiles
-            # first to avoid leaving a few expensive CTAs in the final
-            # scheduler waves (right-band graphs share the causal shape).
-            grid_q, _, _ = cute.arch.grid_dim()
-            q_tile_idx = grid_q - q_tile_idx - 1
         q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
-
-        lane = tidx % cute.arch.WARP_SIZE
-        warp = cute.arch.warp_idx()
 
         seqlen_q = cutlass.Int32(q.shape[1])
         seqlen_k = cutlass.Int32(k.shape[1])
         q_row_base = cutlass.Int32(0)
         kv_row_base = cutlass.Int32(0)
         if cutlass.const_expr(self.thd_varlen):
-            # THD: seq_kv_lens is the metadata tensor [seq_kv(B) | cu_q(B+1) | cu_k(B+1)].
+            # THD: seq_kv_lens is the metadata tensor
+            # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr].
             # Per-sequence lengths come from the prefix sums; the bases offset
             # every packed (1, T, H, D) access below.
-            n_batch = (seq_kv_lens.shape[0] - 2) // 3
+            n_batch = (seq_kv_lens.shape[0] - 4) // 4
             meta = cutlass.make_array_view(seq_kv_lens)
+            # batch_idx is a real batch index here: whichever dispatch produced
+            # it has already resolved the longest-first batch_remap.
             q_row_base = cutlass.Int32(meta[n_batch + batch_idx])
             seqlen_q = cutlass.Int32(meta[n_batch + batch_idx + 1]) - q_row_base
             kv_row_base = cutlass.Int32(meta[2 * n_batch + 1 + batch_idx])
@@ -986,35 +965,10 @@ class SM120FusedMultiHeadAttentionForward:
             min_kv_tile = _lo
             num_kv_tiles = _lo + _per + _extra
         has_kv_work = num_kv_tiles > 0 and (num_kv_tiles - 1) >= min_kv_tile
-
-        # Shared-memory layout:
-        #   sK: one kv_tile x head_tile_qk K tile
-        #   sV: one kv_tile x head_tile_v V tile
-        # The epilogue later aliases this storage as the q_tile x head_tile_v
-        # sO staging tile after compute warps finish consuming the final K/V
-        # tile.
-        sKV = cutlass.Array(
-            k.dtype,
-            max(self.k_tile_elems + self.v_tile_elems, self.o_tile_elems),
-            space=cutlass.AddressSpace.smem,
-            alignment=128,
-        )
-        sK = sKV
-        sV = sKV.subview(self.k_tile_elems)
-        tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        k_tma_mbar = tma_mbar
-        v_tma_mbar = tma_mbar.subview(1)
-
-        # Initialize the TMA completion barriers before any load or compute warp
-        # can touch the K/V pipeline.
-        if warp == self.load_warp_id:
-            if prims.elect_sync():
-                prims.prefetch_tensormap(tma_k_desc.get_ptr())
-                prims.prefetch_tensormap(tma_v_desc.get_ptr())
-                prims.mbarrier_init(k_tma_mbar, 1)
-                prims.mbarrier_init(v_tma_mbar, 1)
-        prims.fence_mbarrier_init()
-        prims.barrier_cta_sync(0)
+        # Tiles the load warp will push through the K/V mbarriers for this unit.
+        # Branchless on purpose: when has_kv_work is false the difference is
+        # already <= 0, so this is exactly zero.
+        tiles_loaded = cute.math.max(cutlass.Int32(0), num_kv_tiles - min_kv_tile)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  LOAD K/V
@@ -1087,6 +1041,18 @@ class SM120FusedMultiHeadAttentionForward:
                         envelope=v_envelope,
                     )
                     kv_seq_idx -= self.kv_tile
+                # Consume the LAST tile's consumer arrivals. compute_one_kv_tile
+                # arrives at both barriers for every tile it processes (N), but
+                # the loop above only syncs between tiles (N-1), so without this
+                # each pass leaves one unmatched arrival pending on each barrier.
+                # That is invisible while a CTA runs a single tile range -- the
+                # leftover dies with the CTA -- but a CTA that starts a SECOND
+                # range finds the barrier already part-signalled, satisfies its
+                # first sync immediately, and issues the next
+                # mbarrier.arrive.expect_tx while the previous transaction is
+                # still outstanding.
+                prims.barrier_cta_sync(self.bar_k_consumed, thread_count=self.threads_kv_pipeline)
+                prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
         # /////////////////////////////////////////////////////////////////////////////
         #  COMPUTE
         # /////////////////////////////////////////////////////////////////////////////
@@ -1118,6 +1084,7 @@ class SM120FusedMultiHeadAttentionForward:
                 o_regs[i] = 0.0
 
             basic_params = SimpleNamespace(
+                phase_base=phase_base,
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
                 head_dim_qk=head_dim_qk,
@@ -1375,6 +1342,200 @@ class SM120FusedMultiHeadAttentionForward:
         else:
             prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
 
+        return tiles_loaded
+
+    @cute.kernel
+    def kernel(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        o: cute.Tensor,
+        lse: Optional[cute.Tensor],
+        sinks: Optional[cute.Tensor],
+        seq_q_lens: cute.Tensor,
+        seq_kv_lens: cute.Tensor,
+        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
+        softmax_scale_log2: cutlass.Float32,
+        n_q_tiles: cutlass.Int32,
+    ) -> None:
+        """SM120 FMHA prefill kernel.
+
+        :param q: Query tensor.
+        :param k: Key tensor.
+        :param v: Value tensor.
+        :param o: Output tensor.
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense; packed
+            token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
+            ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
+            compile the LSE store out (the DSL specializes on ``None``).
+        :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
+            kernel is configured without ``has_sink``.
+        :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
+        :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
+        :param tma_k_desc: Tensor map descriptor for K.
+        :param tma_v_desc: Tensor map descriptor for V.
+        :param softmax_scale_log2: ``softmax_scale * log2(e)``, pre-folded host-side.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp = cute.arch.warp_idx()
+
+        # Shared-memory layout:
+        #   sK: one kv_tile x head_tile_qk K tile
+        #   sV: one kv_tile x head_tile_v V tile
+        # The epilogue later aliases this storage as the q_tile x head_tile_v
+        # sO staging tile after compute warps finish consuming the final K/V
+        # tile.
+        sKV = cutlass.Array(
+            k.dtype,
+            max(self.k_tile_elems + self.v_tile_elems, self.o_tile_elems),
+            space=cutlass.AddressSpace.smem,
+            alignment=128,
+        )
+        sK = sKV
+        sV = sKV.subview(self.k_tile_elems)
+        tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
+        k_tma_mbar = tma_mbar
+        v_tma_mbar = tma_mbar.subview(1)
+
+        # Initialize the TMA completion barriers before any load or compute warp
+        # can touch the K/V pipeline.
+        if warp == self.load_warp_id:
+            if prims.elect_sync():
+                prims.prefetch_tensormap(tma_k_desc.get_ptr())
+                prims.prefetch_tensormap(tma_v_desc.get_ptr())
+                prims.mbarrier_init(k_tma_mbar, 1)
+                prims.mbarrier_init(v_tma_mbar, 1)
+        prims.fence_mbarrier_init()
+        prims.barrier_cta_sync(0)
+
+        if cutlass.const_expr(self.thd_varlen and THD_PERSISTENT):
+            # Persistent grid: the launch is sized to the MACHINE, not to the
+            # plan-time envelope, and each CTA pulls units from a device-side
+            # counter until the live total runs out. That total depends on the
+            # real sequence lengths, which never reach the host (issue #552), so
+            # the setup launch computes it into the metadata buffer. Launching
+            # more CTAs than there is work is harmless — the extra ones fail the
+            # loop test and retire.
+            _meta = cutlass.make_array_view(seq_kv_lens)
+            _nb = (seq_kv_lens.shape[0] - 4) // 4
+            _live = cutlass.Int32(_meta[4 * _nb + 2])
+            _slot = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=16)
+            _bidx, _, _ = cute.arch.block_idx()
+            _uid = cutlass.Int32(_bidx)
+            # K/V mbarrier parity is a CTA-lifetime count under a persistent
+            # grid: the barriers are armed once above, so each unit picks the
+            # phase up where the previous one left it.
+            _phase = cutlass.Int32(0)
+            while _uid < _live:
+                _qt, _b, _h = thd_decode_unit(
+                    _meta,
+                    cutlass.Int32(_nb),
+                    _uid,
+                    cutlass.Int32(q.shape[2]),
+                    cutlass.Int32(self.q_tile),
+                    self.is_causal,
+                )
+                _phase = _phase + self._run_unit(
+                    q,
+                    k,
+                    v,
+                    o,
+                    lse,
+                    sinks,
+                    seq_q_lens,
+                    seq_kv_lens,
+                    tma_k_desc,
+                    tma_v_desc,
+                    softmax_scale_log2,
+                    sKV,
+                    sK,
+                    sV,
+                    k_tma_mbar,
+                    v_tma_mbar,
+                    lane,
+                    warp,
+                    _phase,
+                    cutlass.Int32(0),
+                    _b,
+                    _qt,
+                    _b,
+                    _h,
+                )
+                _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
+        else:
+            q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
+            # KV split rides the BATCH axis: grid.y = batch + split*B.  Q/K/V and
+            # the per-batch seqlens must use the REAL batch; only the O/LSE
+            # partial slot uses the composite.  Folds away at split_kv == 1.
+            split_idx = cutlass.Int32(0)
+            o_batch_idx = batch_idx
+            if cutlass.const_expr(self.split_kv > 1):
+                n_batch_real = cutlass.Int32(q.shape[0])
+                split_idx = batch_idx // n_batch_real
+                batch_idx = batch_idx % n_batch_real
+                o_batch_idx = split_idx * n_batch_real + batch_idx
+            if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+                _n_qh = cutlass.Int32((q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]))
+                _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
+                if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
+                    q_tile_idx, head_idx, batch_idx = lpt_l2_tile_coords(
+                        q_tile_idx,
+                        _n_qh,
+                        _n_batch,
+                        n_q_tiles,
+                        _n_qh // cutlass.Int32(k.shape[2]),
+                        cutlass.Int32(k.shape[1]),
+                        (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
+                        _SCHED_L2_BUDGET_BYTES,
+                    )
+                else:
+                    q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, n_q_tiles)
+                o_batch_idx = batch_idx
+            elif cutlass.const_expr(self.is_causal):
+                # Diagonal-bounded work grows with the Q tile. Launch long tiles
+                # first to avoid leaving a few expensive CTAs in the final
+                # scheduler waves (right-band graphs share the causal shape).
+                grid_q, _, _ = cute.arch.grid_dim()
+                q_tile_idx = grid_q - q_tile_idx - 1
+            if cutlass.const_expr(self.thd_varlen):
+                # blockIdx.y is a RANK, not a batch: the remap puts the longest
+                # sequences on the low CTA ids so they dispatch first, leaving
+                # the ragged tail of the launch to short sequences whose
+                # over-length tiles retire without work.
+                _m = cutlass.make_array_view(seq_kv_lens)
+                _n = (seq_kv_lens.shape[0] - 4) // 4
+                batch_idx = cutlass.Int32(_m[3 * _n + 2 + batch_idx])
+                o_batch_idx = batch_idx
+            self._run_unit(
+                q,
+                k,
+                v,
+                o,
+                lse,
+                sinks,
+                seq_q_lens,
+                seq_kv_lens,
+                tma_k_desc,
+                tma_v_desc,
+                softmax_scale_log2,
+                sKV,
+                sK,
+                sV,
+                k_tma_mbar,
+                v_tma_mbar,
+                lane,
+                warp,
+                cutlass.Int32(0),
+                split_idx,
+                o_batch_idx,
+                q_tile_idx,
+                batch_idx,
+                head_idx,
+            )
+
     @cute.jit
     def __call__(
         self,
@@ -1391,6 +1552,7 @@ class SM120FusedMultiHeadAttentionForward:
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
         thd_lens_form: Optional[cutlass.Int32],
+        thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
@@ -1486,8 +1648,8 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.thd_varlen):
             if cutlass.const_expr(q.shape[0] != 1):
                 raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-            if cutlass.const_expr(seq_kv_lens.shape != (3 * self.thd_batch + 2,)):
-                raise ValueError("THD seq_kv_lens must be the (3*B+2,) metadata tensor")
+            if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
+                raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
@@ -1532,16 +1694,19 @@ class SM120FusedMultiHeadAttentionForward:
         tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
         tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
         if cutlass.const_expr(self.thd_varlen):
-            # Build the [kv|cu_q|cu_k] metadata buffer DEVICE-side from the
-            # caller's length tensors (no host cumsum, no H2D — issue #552);
-            # the main kernel launched after it on this stream reads it.
+            # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
+            # from the caller's length tensors (no host cumsum, no H2D — issue
+            # #552); the main kernel launched after it on this stream reads it.
             _build_thd_meta_kernel(
                 seq_kv_lens,
                 thd_q_lens,
                 thd_kv_lens,
                 thd_lens_form,
                 cutlass.Int32(self.thd_batch),
-            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+                cutlass.Int32(q.shape[2]),
+                cutlass.Int32(self.q_tile),
+                thd_n_ctas,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
         # sequence's length drain without work. NOTE thd_max_sq is a __call__
@@ -1564,6 +1729,11 @@ class SM120FusedMultiHeadAttentionForward:
             # KV split rides the batch axis: y = batch + split*B (config_sm120
             # allows split_kv > 1 only under NATURAL, whose 3-D grid has one).
             grid = (n_q_tiles, n_batch * self.split_kv, n_head)
+        # Persistent THD: a flat, machine-sized grid -- the unit a CTA works on
+        # comes from the claim counter, not from its block index.
+        _persistent = self.thd_varlen and THD_PERSISTENT
+        if cutlass.const_expr(_persistent):
+            grid = (thd_n_ctas, cutlass.Int32(1), cutlass.Int32(1))
         self.kernel(
             q,
             k,
@@ -1717,7 +1887,7 @@ def compile(  # noqa: A001
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (3 * b + 2,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) ]
+        (4 * b + 4,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr ]
         stride_order=(0,),
         assumed_align=4,
     )
@@ -1748,6 +1918,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
