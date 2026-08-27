@@ -512,9 +512,10 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     fill_sparse_small_int(q_f32, rng_data, sparsity=0.8, abs_max=2)
     k_f32 = torch.empty(b, h_k, s_kv, d_qk, dtype=torch.float32, device="cuda")
     fill_sparse_small_int(k_f32, rng_data, sparsity=0.8, abs_max=2)
-    # keep at least a few q rows in the deeply-negative-score regime (see
-    # inject_negative_score_rows); must run before mxfp8 quantization
-    inject_negative_score_rows(q_f32, k_f32, rng_data, attn_scale=attn_scale)
+    if not perf:
+        # keep at least a few q rows in the deeply-negative-score regime (see
+        # inject_negative_score_rows); must run before mxfp8 quantization
+        inject_negative_score_rows(q_f32, k_f32, rng_data, attn_scale=attn_scale)
     v_f32 = torch.empty(b, h_v, s_kv, d_vo, dtype=torch.float32, device="cuda")
     fill_sparse_small_int(v_f32, rng_data, sparsity=0.8, abs_max=2)
 

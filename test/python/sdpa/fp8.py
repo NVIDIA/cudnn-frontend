@@ -398,9 +398,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     q_gen = create_sparse_int_tensor((b, s_qo, h_q, d_qk), torch.float, rng_data)
     k_gen = create_sparse_int_tensor((b, s_kv, h_k, d_qk), torch.float, rng_data)
     v_gen = create_sparse_int_tensor((b, s_kv, h_v, d_vo), torch.float, rng_data)
-    # keep at least a few q rows in the deeply-negative-score regime (see
-    # inject_negative_score_rows); must run before the amax/descale computation
-    inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale, head_axis=2)  # bshd
+    if not perf:
+        # keep at least a few q rows in the deeply-negative-score regime (see
+        # inject_negative_score_rows); must run before the amax/descale computation.
+        # for ragged, sample only rows the packing step keeps (s >= seq_len is dropped)
+        valid_q_rows = (torch.arange(s_qo, device="cuda")[None, :, None] < seq_len_q_gpu[:, None, None]).expand(b, s_qo, h_q) if is_ragged else None
+        inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale, head_axis=2, valid_rows=valid_q_rows)  # bshd
 
     q_amax = q_gen.abs().max().item()
     k_amax = k_gen.abs().max().item()

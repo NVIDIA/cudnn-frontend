@@ -60,7 +60,7 @@ def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
 
     return tensor
 
-def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16, head_axis=1):
+def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.0, row_fraction=1 / 16, head_axis=1, valid_rows=None):
     """
     Overwrite a random subset of q rows (at least one) so their attention
     scores against every k row are deeply negative — below the fp32 exp
@@ -96,6 +96,8 @@ def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.
         target: desired post-scale score for the selected rows.
         row_fraction: fraction of eligible q rows to overwrite (min 1 row).
         head_axis: which dim of q/k is the head (1 for bhsd/thd, 2 for bshd).
+        valid_rows: optional bool tensor of shape q.shape[:-1]; restricts
+            sampling to True rows (e.g. rows a padded layout actually uses).
     """
     d = q.shape[-1]
     assert k.shape[-1] == d
@@ -105,6 +107,8 @@ def inject_negative_score_rows(q, k, rng, *, attn_scale, k_shift=2, target=-200.
     lead = q.shape[:-1]
     n_rows = math.prod(lead)
     rows = torch.arange(n_rows, device=q.device)
+    if valid_rows is not None:
+        rows = rows[valid_rows.reshape(-1)]
     heads_per_group = q.shape[head_axis] // max(1, k.shape[head_axis])
     if heads_per_group > 1:
         rows = rows[torch.unravel_index(rows, lead)[head_axis] % heads_per_group == 0]

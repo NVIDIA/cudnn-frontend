@@ -153,8 +153,10 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         if not perf:
             # keep at least a few q rows in the deeply-negative-score regime
-            # (see inject_negative_score_rows); 0.125 matches this file's attn_scale
-            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=0.125)
+            # (see inject_negative_score_rows); 0.125 matches this file's attn_scale.
+            # slice to the valid packed prefixes: max_t_* is rounded-up capacity,
+            # so sampling the full buffer could land only on ignored padding rows
+            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], allocs[TensorUid.k][0][: sum(cfg.seq_len_kv)], rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
