@@ -23,8 +23,10 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    add_fto_alignment_arg,
     add_sweep_args,
     find_cublas_time,
+    fto_alignment,
     group_offsets,
     kernel_match_token,
     nsys_run_and_parse,
@@ -64,7 +66,7 @@ _COMBOS = {
 # Graph + data setup.
 
 
-def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
+def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str, alignment: int = 1):
     is_fp4, block_size, a_dt, sf_dt = _COMBOS[combo]
     sf_k = K // block_size
     g = cudnn.pygraph(
@@ -93,6 +95,7 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
@@ -201,6 +204,7 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) 
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(args.fto_alignment, offsets)
     print(f"[worker] shape G={G} M={M} N={N} K={K} (S={S}) combo={combo}, " f"configs={len(configs)}, warmup={warmup}, iters={iters}, rotate={nbuf}")
 
     # 1. BF16 batched-GEMM reference.
@@ -224,7 +228,7 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) 
         if cfg is None:
             continue
         try:
-            g, h = _graph_moe_bs(S, N, K, E, combo)
+            g, h = _graph_moe_bs(S, N, K, E, combo, alignment)
             plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
                 plan(_vp_moe_bs(h, wset[0], wset[1], wset[2], wset[3], offsets, wset[4]))
@@ -254,6 +258,7 @@ def main() -> int:
         help="skip the cuBLAS BF16 reference; its BF16 tensor set is never " "allocated, which is the larger footprint on big shapes",
     )
     add_sweep_args(parser)
+    add_fto_alignment_arg(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -329,6 +334,7 @@ def main() -> int:
         else:
             print("  [timing: torch.cuda.Event wall-clock (incl ~50us/call host overhead)]\n")
         offsets = group_offsets(S, E)
+        alignment = fto_alignment(args.fto_alignment, offsets)
         cublas_tflops, cublas_ms = 0.0, float("nan")
         if not args.no_baseline:
             wbf = _mkdata_bf16(S, N, K, E)
@@ -371,7 +377,7 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g, h = _graph_moe_bs(S, N, K, E, combo)
+                    g, h = _graph_moe_bs(S, N, K, E, combo, alignment)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
                         rotating(

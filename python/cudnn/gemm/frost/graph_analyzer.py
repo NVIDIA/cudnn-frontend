@@ -141,6 +141,7 @@ class _TensorMeta:
     is_input: bool = False
     # SF reorder layout name (e.g. "F8_128x4") or None for the default (NONE).
     reordering: str | None = None
+    alignment_value: int = 1
     # Strong ref to the cuDNN tensor object, used to bind each role for the
     # variant-pack dict (uid / name / object) instead of positional args.
     tensor: Any = None
@@ -468,6 +469,7 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
             dtype=_map_dtype(t.get_data_type()),
             is_input=id(t) not in produced,
             reordering=reordering,
+            alignment_value=max(1, int(getattr(t, "alignment_value", 1) or 1)),
             tensor=t,
         )
         if getattr(t, "data_type", None) is not None:
@@ -785,6 +787,7 @@ def _build_multi_moe_chain(
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
     num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
+    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
 
     # Resolve each moe operand through any dequant, then dedup by PACKED data
     # tensor id (shared dequant → one distinct operand; SF travels with its data).
@@ -1243,7 +1246,13 @@ def _build_multi_moe_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
-        moe=MoeSpec(num_experts=int(E), mode=moe_ops[0].moe_mode, offset_dtype=offset_dtype, num_groups=num_groups),
+        moe=MoeSpec(
+            num_experts=int(E),
+            mode=moe_ops[0].moe_mode,
+            offset_dtype=offset_dtype,
+            num_groups=num_groups,
+            offset_multiple=offset_multiple,
+        ),
         block_scale=block_scale_spec,
         reductions=reductions,
         quants=quants,

@@ -579,6 +579,7 @@ class MoeSpec:
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
+    offset_multiple: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -589,6 +590,8 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+        if self.offset_multiple < 1:
+            raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
