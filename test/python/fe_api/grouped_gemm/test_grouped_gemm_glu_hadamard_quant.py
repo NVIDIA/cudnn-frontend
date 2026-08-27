@@ -222,8 +222,7 @@ def _check_nvfp4_output(
         max_abs_err = err[bad].max().item()
         max_rel_err = torch.nanquantile(err[bad] / ref_bf16[bad].abs(), 1.0).item()
         raise RuntimeError(
-            f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound "
-            f"(max abs err {max_abs_err:.4f}, max rel err {max_rel_err:.4f})"
+            f"{name}: {int(bad.sum())} dequantized elements exceed the quantization error bound (max abs err {max_abs_err:.4f}, max rel err {max_rel_err:.4f})"
         )
 
 
