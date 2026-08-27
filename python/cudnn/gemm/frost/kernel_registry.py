@@ -5,7 +5,7 @@
 
 Whether a kernel runs depends on: gpu arch · kernel template · tile config
 (geometry) · graph type · mma type · other graph info. Tile configs are PURE
-GEOMETRY; the template supplies execution strategy (cta_group,
+GEOMETRY (including cta_group and the MMA mode); the template supplies
 pipeline, graph type, mainloop), so one geometry runs on several templates.
 
 :meth:`KernelTemplate.accepts` funnels cheapest-first:
@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
-from .tile_config import CATALOG, TileConfig, as_pipeline, config_class_for_pipeline
+from .tile_config import CATALOG, TileConfig, as_mma_tile_k, as_pipeline, config_class_for_pipeline
 
 
 def _pipeline_from_file(template_file: str) -> str:
@@ -45,9 +45,14 @@ def _pipeline_from_file(template_file: str) -> str:
 PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
     "sm100": ((100, 120),),
     "sm103": ((103, 110),),
-    "sm107": ((107, 110),),
     "sm120": ((100, 130),),
 }
+
+# SM ranges whose block-scale MMA issues a 64-byte K per instruction (half the
+# instruction count of sm100's 32). SILICON, not a pipeline -- an sm100-pipeline
+# kernel on a 10.7 part gets it, exactly like the B collector and the 576-column
+# TMEM. Read by preferred_mma_tile_k_bytes and validate_block_scale_config.
+MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
 _SUPPORTED_MAINLOOP_OPS: frozenset[str] = frozenset(UNARY_OPS) | frozenset(BINARY_OPS)
@@ -196,13 +201,6 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
             }
         ),
     },
-    "sm107": {
-        GraphType.BLOCK_SCALE_MATMUL: _BLOCK_SCALE_CASES,
-    },
-    # sm120 carries ONLY the graph types it has templates for. No block-scale
-    # row until an sm120 block-scale template lands: a row here without its
-    # MMA_GPU_ARCH_SPECIAL_CASES narrowing would accept descriptor-less combos
-    # (see test_gpu_gated_cases_are_narrowed_everywhere).
     "sm120": {
         GraphType.MATMUL: _MATMUL_CASES,
     },
@@ -221,9 +219,6 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
     ("sm103", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
-    ("sm107", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
 }
 
 
@@ -256,24 +251,31 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     return None
 
 
-# Kernel template — owns the execution-strategy axes (cta_group / pipeline)
+# Kernel template — owns the pipeline family, graph type and mainloop axes
 
 
 @dataclass(frozen=True)
 class KernelTemplate:
     """One kernel template. Carries the execution-strategy axes the pure-geometry
-    config does NOT (pipeline, cta_group, graph_type, mainloop).
-    ``accepts`` runs the funnel using ``self.cta_group`` for cta_group gates."""
+    config does NOT (pipeline, graph_type, mainloop). The MMA mode is NOT here:
+    it is a TileConfig axis, and which modes a pipeline issues is a fact of the
+    config family (``_CTA_GROUPS_BY_PIPELINE``), not of the template."""
 
     file: str  # template filename under kernel_templates/
     pipeline: str  # pipeline family from the filename; pairs with config_<pipeline>
-    cta_group: int  # 1 or 2 (1-CTA vs 2-CTA MMA)
     graph_type: GraphType  # the single graph type this template supports
-    mainloop: bool  # mainloop-fusion variant (transform A/B before MMA)
-    # Multi-GEMM support (templates without it reject multi-GEMM chains).
+    # ``None`` = take the config's. The warp count is a config axis; a template
+    # overrides it only where its own specialization differs from what the
+    # geometry asks for -- the mainloop variant adds 4 warps to the SAME
+    # geometry, and which of the two runs is decided by the CHAIN.
+    warps_per_cta: int | None = None
+    # Per-CTA SMEM this template holds back off the top of the ab pipeline: the
+    # scheduler ring, every smem barrier, the TMEM base address and -- on the
+    # MoE templates -- the per-CTA TMA tensormap scratch. A template fact, not a
+    # geometry one, so it lives here rather than on the config.
+    smem_fixed_reserve: int = 2048
+    supports_mainloop_fusion: bool = False
     supports_multi_gemm: bool = True
-    # A CTA tile spanning several MMA instructions along M (num_mma_m > 1).
-    supports_multi_mma_m: bool = True
 
     @property
     def block_scale(self) -> bool:
@@ -307,26 +309,23 @@ class KernelTemplate:
             return f"config {config.name} is not a {cfg_cls.__name__} " f"(template {self.file} pairs with config_{self.pipeline})"
         if graph_type is not self.graph_type:
             return f"graph_type {graph_type.value} != " f"template graph_type {self.graph_type.value}"
-        if chain.has_mainloop_fusion != self.mainloop:
-            return f"graph mainloop_fusion={chain.has_mainloop_fusion} != " f"template mainloop={self.mainloop}"
+        if chain.has_mainloop_fusion != self.supports_mainloop_fusion:
+            return f"graph mainloop_fusion={chain.has_mainloop_fusion} != " f"template supports_mainloop_fusion={self.supports_mainloop_fusion}"
         if chain.is_multi_gemm and not self.supports_multi_gemm:
             return f"template {self.file} does not support multi-GEMM " f"({chain.num_gemms} parallel GEMMs); only the 1ctamma CLC " "template does this pass"
         return None
 
-    # stage 3: tile-config gates (this template's cta_group on the geometry)
+    # stage 3: tile-config gates (the geometry, including its cta_group)
 
     def _config_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from . import compiler as C
 
-        # cta_group constraints (the template's, not the config's).
+        # cta_group constraints (geometry, so they read the config).
         try:
-            C._check_cta_group_geometry(config, self.cta_group)
-            C._check_mma_n_dim(chain, config, self.cta_group)
+            C._check_cta_group_geometry(config)
+            C._check_mma_n_dim(chain, config)
         except NotImplementedError as e:
             return str(e)
-        reason = self.multi_mma_m_reject(config)
-        if reason is not None:
-            return reason
         try:
             if self.block_scale:
                 from .tile_config import validate_block_scale_config
@@ -337,7 +336,7 @@ class KernelTemplate:
                 cta_k_elems = config.cta_tile_k_bytes * 8 // data_elem_bits
                 validate_block_scale_config(config, bs.block_size, cta_k_elems)
             else:
-                C._check_dtype_config_compat(chain, config, self.cta_group)
+                C._check_dtype_config_compat(chain, config)
         except (ValueError, NotImplementedError) as e:
             return str(e)
         return None
@@ -383,23 +382,12 @@ class KernelTemplate:
             or self._other_reject(chain, config)
         )
 
-    def multi_mma_m_reject(self, config: TileConfig) -> str | None:
-        """``None`` unless the config splits the CTA tile across several MMA
-        instructions along M and this template has not been adapted to it."""
-        if config.num_mma_m > 1 and not self.supports_multi_mma_m:
-            return (
-                f"{self.file} does not support a CTA tile spanning several MMA "
-                f"instructions along M (num_mma_m={config.num_mma_m}); use a "
-                f"cta_tile_m of {config.mma_inst_m}"
-            )
-        return None
-
     def active_reject(self, config: TileConfig, chain: FusionChain | None = None) -> str | None:
         """The gates a JIT path applies once it has picked this template: the
         active GPU's SM range, then capabilities a pure-geometry config can ask
         for that this template does not implement, and — when the caller passes
         the ``chain`` — the template-specific scope (:meth:`_extra_reject`)."""
-        reason = self.arch_active_reject() or self.multi_mma_m_reject(config)
+        reason = self.arch_active_reject()
         if reason is None and chain is not None:
             reason = self._extra_reject(chain, config)
         return reason
@@ -442,7 +430,7 @@ class Sm120KernelTemplate(KernelTemplate):
         from .dtypes import DTYPE_BYTES
 
         try:
-            vec = C._epi_vec_bytes(chain, config, self.cta_group)
+            vec = C._epi_vec_bytes(chain, config)
         except ValueError as e:
             return str(e)
         if vec < 2 * DTYPE_BYTES[chain.output_dtype]:
@@ -451,17 +439,17 @@ class Sm120KernelTemplate(KernelTemplate):
 
 
 # Registry — one entry per template file (20 today). A geometry config expands
-# across these via `candidates`. cta_group / mainloop live HERE.
+# across these via `candidates`. mainloop lives HERE; cta_group is geometry.
 
 
 def _mm(
     file: str,
     *,
-    cta_group: int,
-    mainloop: bool = False,
     graph_type: GraphType = GraphType.MATMUL,
+    warps_per_cta: int | None = None,
+    smem_fixed_reserve: int = 2048,
+    supports_mainloop_fusion: bool = False,
     supports_multi_gemm: bool = True,
-    supports_multi_mma_m: bool = True,
     template_cls: "type[KernelTemplate] | None" = None,
 ) -> KernelTemplate:
     pipeline = _pipeline_from_file(file)
@@ -469,108 +457,44 @@ def _mm(
         raise KeyError(
             f"template {file!r}: pipeline family {pipeline!r} has no SM-range entry in " f"PIPELINE_ARCH_RANGES — add one when introducing a new family"
         )
-    cls = template_cls or (MainloopKernelTemplate if mainloop else KernelTemplate)
+    cls = template_cls or (MainloopKernelTemplate if supports_mainloop_fusion else KernelTemplate)
     return cls(
         file=file,
         pipeline=pipeline,
-        cta_group=cta_group,
         graph_type=graph_type,
-        mainloop=mainloop,
+        warps_per_cta=warps_per_cta,
+        smem_fixed_reserve=smem_fixed_reserve,
+        supports_mainloop_fusion=supports_mainloop_fusion,
         supports_multi_gemm=supports_multi_gemm,
-        supports_multi_mma_m=supports_multi_mma_m,
     )
 
 
 TEMPLATES: tuple[KernelTemplate, ...] = (
-    # plain matmul
-    _mm("sm100_matmul_1ctamma.py", cta_group=1),
-    _mm("sm100_matmul_2ctamma.py", cta_group=2),
-    # block-scaled matmul
+    _mm("sm100_matmul.py"),
+    _mm("sm100_matmul_mainloop.py", warps_per_cta=12, supports_mainloop_fusion=True, supports_multi_gemm=False),
     _mm(
-        "sm100_block_scale_matmul_1ctamma.py",
-        cta_group=1,
+        "sm100_block_scale_matmul.py",
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
     ),
     _mm(
-        "sm100_block_scale_matmul_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    # sm103 block-scaled matmul: fp4-only (nvfp4/mxfp4), K=48B UTCOMMA
-    # (K-tile 384 B, 8 MMAs over 3× 128-B chunks via circular SMEM descs).
-    # num_mma_m > 1 is NOT adapted here: the chunk pipeline miscomputes (A reads
-    # unwritten SMEM in K, period 192 B) and the ab_stages budget under-counts,
-    # so cta_tile_m=256 also overruns the SMEM cap. Both are silent-wrong /
-    # launch-fail, hence the gate. See CLAUDE.md for what was ruled out.
-    # Multi-GEMM has never been validated on this pipeline either — same gate.
-    _mm(
-        "sm103_block_scale_matmul_1ctamma.py",
-        cta_group=1,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=False,
-        supports_multi_mma_m=False,
-    ),
-    _mm(
-        "sm103_block_scale_matmul_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=False,
-        supports_multi_mma_m=False,
-    ),
-    _mm(
-        "sm107_block_scale_matmul_1ctamma.py",
-        cta_group=1,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    _mm(
-        "sm107_block_scale_matmul_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.BLOCK_SCALE_MATMUL,
-    ),
-    # mainloop-fusion matmul (no block-scale variant yet)
-    # The mainloop templates have no per-GEMM operand indexing (no gemm_a_idx /
-    # gemm_b_idx in the MMA warp), so a second GEMM's accumulator would never be
-    # written. The analyzer also only detects mainloop at len(matmuls) == 1.
-    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, mainloop=True, supports_multi_gemm=False),
-    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, mainloop=True, supports_multi_gemm=False),
-    # MoE grouped matmul fwd (own grouped persistent scheduler).
-    _mm(
-        "sm100_moe_grouped_matmul_fwd_1ctamma.py",
-        cta_group=1,
+        "sm100_moe_grouped_matmul_fwd.py",
+        # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
+        smem_fixed_reserve=4096,
         graph_type=GraphType.MOE,
     ),
     _mm(
-        "sm100_moe_grouped_matmul_fwd_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.MOE,
-    ),
-    # MoE grouped matmul with block-scaled (FP4/FP8 + SF) inputs.
-    _mm(
-        "sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
-        cta_group=1,
+        "sm100_moe_grouped_block_scale_matmul_fwd.py",
+        # + the per-CTA TMA tensormap scratch the per-group descriptor patch needs.
+        smem_fixed_reserve=4096,
         graph_type=GraphType.MOE_BLOCK_SCALE,
     ),
     _mm(
-        "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.MOE_BLOCK_SCALE,
+        "sm103_block_scale_matmul.py",
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
     ),
-    _mm(
-        "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
-        cta_group=1,
-        graph_type=GraphType.MOE_BLOCK_SCALE,
-    ),
-    _mm(
-        "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
-        cta_group=2,
-        graph_type=GraphType.MOE_BLOCK_SCALE,
-    ),
-    # sm120 (consumer Blackwell) warp-MMA matmul: no clusters, CLC persistent
-    # scheduler, single-GEMM only (no per-GEMM operand indexing in the compute
-    # warps). The v1 scope gates (TN, N-major output) live on Sm120KernelTemplate.
     _mm(
         "sm120_matmul.py",
-        cta_group=1,
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),
@@ -582,7 +506,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
 # select_config's geometry ladder, so it stays an explicit-config pipeline.
 # sm120 is last: it serves the GPUs (SM 12.x) the tcgen05 families cannot, and
 # never outranks them where both run.
-_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm107", "sm100", "sm120")
+_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm100", "sm120")
 
 
 def preferred_pipeline(chain: FusionChain) -> str:
@@ -597,42 +521,51 @@ def preferred_pipeline(chain: FusionChain) -> str:
     return _AUTO_PIPELINE_ORDER[-1]
 
 
-def preferred_strategy(chain: FusionChain, config: TileConfig, cta_group: int) -> tuple[TileConfig, int]:
-    """Re-target an auto pick at the family :func:`preferred_pipeline` chooses:
-    the geometry crosses via ``as_pipeline``, and ``cta_group`` survives only
-    if the family has a template for it (else the smallest it does have —
-    sm120 is warp-scoped MMA, 1-CTA only)."""
+def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
+    """MMA-inst K width the auto path should build ``chain`` with. The 64-byte
+    block-scale MMA halves the instruction count at a wide tile, so take it
+    whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
+    asks the arch and not the config family. Everything else stays at 32."""
+    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE):
+        return 32
+    from . import compiler as C
+
+    arch = C._current_arch()
+    return 64 if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) else 32
+
+
+def preferred_strategy(chain: FusionChain, config: TileConfig) -> TileConfig:
+    """Re-target an auto pick at the family :func:`preferred_pipeline` chooses and
+    the MMA-inst K width :func:`preferred_mma_tile_k_bytes` wants. ``cta_group``
+    rides the geometry, and a family that fixes it re-pins it in its own
+    ``__post_init__`` (sm120's warp MMA is 1-CTA), so nothing is clamped here."""
     pipeline = preferred_pipeline(chain)
-    if pipeline == config.pipeline:
-        return config, cta_group
-    groups = {t.cta_group for t in TEMPLATES if t.pipeline == pipeline}
-    return as_pipeline(config, pipeline), cta_group if cta_group in groups else min(groups)
+    config = as_mma_tile_k(config, preferred_mma_tile_k_bytes(chain))
+    if pipeline != config.pipeline:
+        config = as_pipeline(config, pipeline)
+    return config
 
 
 def select_template(
     chain: FusionChain,
     config: TileConfig,
-    cta_group: int = 2,
 ) -> KernelTemplate:
-    """The single template that renders (chain, config) under the requested
-    execution strategy (``cta_group``; mainloop + graph_type derived from the
-    chain). Capability gates are NOT applied — this renders even unsupported
+    """The single template that renders (chain, config). Everything that selects
+    it -- pipeline, MMA mode, graph type, mainloop -- is on the config or the
+    chain. Capability gates are NOT applied: this renders even unsupported
     configs for deliberate single-point probing."""
     gt = classify_graph_type(chain)
     matches = [
         t
         for t in TEMPLATES
-        if isinstance(config, config_class_for_pipeline(t.pipeline))
-        and t.graph_type is gt
-        and t.mainloop == chain.has_mainloop_fusion
-        and t.cta_group == cta_group
+        if isinstance(config, config_class_for_pipeline(t.pipeline)) and t.graph_type is gt and t.supports_mainloop_fusion == chain.has_mainloop_fusion
     ]
     if len(matches) == 1:
         return matches[0]
     if not matches:
         raise ValueError(
             f"no kernel template for graph_type={gt.value}, "
-            f"mainloop={chain.has_mainloop_fusion}, cta_group={cta_group}, "
+            f"mainloop={chain.has_mainloop_fusion}, config={config.name!r}, "
             f"pipeline={config.pipeline}. "
             "E.g. mainloop fusion has no block-scale template variant yet."
         )

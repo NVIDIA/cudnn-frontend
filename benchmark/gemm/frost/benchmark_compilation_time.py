@@ -147,7 +147,6 @@ def _compile(case: str, batch: int, m: int, n: int, k: int) -> tuple[int, float]
     jit_from_cudnn_graph(
         graph,
         config=by_name(_CONFIG),
-        cta_group=2,
     )
     return start, (time.perf_counter_ns() - start) / 1e6
 

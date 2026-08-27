@@ -41,7 +41,7 @@ def _B(g, K, N, name="B"):
     return g.tensor(name=name, dim=[1, K, N], stride=[K * N, 1, K])
 
 
-_N128_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
+_N128_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
 
 
 # --- Analyzer + codegen (no GPU) ---
@@ -169,9 +169,7 @@ def test_heterogeneous_gemms_rejected() -> None:
         analyze(g)
 
 
-_N256_C2_CFG = next(
-    c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 2 and c.cgrp_size_n == 1
-)
+_N256_C2_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 2 and c.cga_size_n == 1)
 
 
 @requires_sm100
@@ -202,7 +200,7 @@ def test_multi_gemm_mainloop_template_rejected() -> None:
     Y = g.add(a=C0, b=C1, name="a")
     Y.set_output(True)
     chain = analyze(g)
-    mainloop_tmpl = next(t for t in TEMPLATES if t.mainloop)
+    mainloop_tmpl = next(t for t in TEMPLATES if t.supports_mainloop_fusion)
     assert not mainloop_tmpl.supports_multi_gemm
     assert mainloop_tmpl.accepts(chain, _N256_C2_CFG) is not None
 
@@ -301,7 +299,7 @@ def _assert_red_close(actual, expected, mode, *, exact=False):
 
 
 # A split CTA tile competes with multi-GEMM for the SAME 512 TMEM columns: one
-# acc stage holds num_gemms x num_mma_m x cols_per_mma_m.
+# acc stage holds num_gemms x mma_size_m x cols_per_mma_m.
 _SPLIT_CFG = by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1")
 
 

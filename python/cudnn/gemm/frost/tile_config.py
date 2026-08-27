@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import ClassVar
 
-from cudnn.frost.occupancy import MAX_CLUSTER_SIZE as _FROST_MAX_CLUSTER_SIZE
+from cudnn.frost.occupancy import MAX_CLUSTER_SIZE
 
 
 @functools.lru_cache(maxsize=None)
@@ -40,32 +41,26 @@ def _sm_smem_budget_bytes(device=None) -> int:
     return _sm_smem_budget_bytes_of(resolve_device(device))
 
 
-# Per-CTA SMEM held back off the top when sizing the ab pipeline: the scheduler ring,
-# every smem barrier, the TMEM base address and — on the MoE templates — the per-CTA TMA
-# tensormap scratch. The ab pipeline itself only counts the operand tensors, so these
-# fragments are budgeted once here instead of being modelled stage by stage.
-_SMEM_FIXED_RESERVE_BY_PIPELINE = {"sm100": 2048, "sm103": 2048, "sm107": 2048, "sm120": 2048}
-_SMEM_FIXED_RESERVE_MOE_BY_PIPELINE = {"sm100": 4096, "sm103": 4096, "sm107": 4096}
-
-
-def _sm_smem_ab_budget_bytes(pipeline: str, device=None, *, moe: bool = False) -> int:
-    table = _SMEM_FIXED_RESERVE_MOE_BY_PIPELINE if moe else _SMEM_FIXED_RESERVE_BY_PIPELINE
-    return _sm_smem_budget_bytes(device) - _pipeline_fact(table, pipeline, "SMEM fixed reserve")
-
-
-_L2_RETENTION_DIVISOR = 3
+def smem_ab_budget_bytes(smem_fixed_reserve: int, device=None) -> int:
+    """SMEM left for the ab pipeline once the template's fixed reserve is off
+    the top. That reserve -- the scheduler ring, every smem barrier, the TMEM
+    base address and, on MoE, the per-CTA TMA tensormap scratch -- is the
+    TEMPLATE's, so it is passed in rather than looked up from the geometry."""
+    return _sm_smem_budget_bytes(device) - smem_fixed_reserve
 
 
 @functools.lru_cache(maxsize=None)
 def _l2_swizzle_budget_bytes_of(device: int) -> int:
     from cudnn.frost.device import device_name, is_available, l2_cache_bytes
 
+    # A third of L2: the streaming operand and the C output take the rest.
+    retention_divisor = 3
     if not is_available():
         raise RuntimeError("cannot size the L2 tile-rasterization budget: no CUDA device is visible to query L2CacheSize")
     l2 = l2_cache_bytes(device)
     if not l2:
         raise RuntimeError(f"the driver did not report L2CacheSize for device {device_name(device)!r}; cannot size the L2 tile-rasterization budget")
-    return int(l2) // _L2_RETENTION_DIVISOR
+    return int(l2) // retention_divisor
 
 
 def l2_swizzle_budget_bytes(device=None) -> int:
@@ -75,171 +70,198 @@ def l2_swizzle_budget_bytes(device=None) -> int:
     return _l2_swizzle_budget_bytes_of(resolve_device(device))
 
 
-_CTA_TILE_M_MAX = 128
-_CTA_TILE_N_MAX = 256
-_MAX_CLUSTER_SIZE = _FROST_MAX_CLUSTER_SIZE
-_CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384, "sm107": 128, "sm120": 128}
-
-# MMA-inst K in bytes
-_MMA_INST_K_BYTES = 32
-_MMA_INST_K_BYTES_BY_PIPELINE = {"sm100": 32, "sm103": 48, "sm107": 64, "sm120": 32}
-
-
-def _pipeline_fact(table: dict, pipeline: str, what: str):
-    """A per-pipeline hardware fact, by EXPLICIT membership. Every table keyed by
-    pipeline goes through here so a family added without an entry raises instead
-    of silently inheriting another family's value."""
-    if pipeline not in table:
-        raise NotImplementedError(f"{what} not known for pipeline {pipeline!r}; known: {sorted(table)}")
-    return table[pipeline]
+def _issuable_mma_tile_k_bytes(cls: "type[TileConfig]") -> tuple[int, ...]:
+    """The K widths ``cls``'s MMA can issue. A hardware fact, so each family
+    DECLARES it -- the base has no such attribute, and a family that forgot is
+    an error rather than a silent inheritance of somebody else's width."""
+    ok = getattr(cls, "MMA_TILE_K_BYTES", None)
+    if not ok:
+        raise NotImplementedError(f"MMA-inst K width not known for pipeline {cls.__name__} -- declare MMA_TILE_K_BYTES on its config class")
+    return ok
 
 
-# MMA instructions the CTA tile spans along M. N is deliberately NOT an axis:
-# it measured within noise of a single instruction (0.96x vs 0.97x cuBLAS at
-# 4096^3), cuBLAS does not split N either, and neither the 2-CTA nor the
-# block-scale pipeline can express it (the pair already splits B's N; the SF
-# words are indexed per 128-column block).
-_NUM_MMA_MAX = 2
+def smem_ab_stages(per_stage_bytes: int, *, smem_fixed_reserve: int, extra_smem_bytes: int = 0, device=None) -> int:
+    """How many ab-pipeline stages of ``per_stage_bytes`` fit, capped.
 
-_AB_STAGES_CAP = 16  # cap even if SMEM permits more
-
-
-def smem_max_ab_stages(
-    cta_tile_m: int,
-    cta_tile_n: int,
-    cta_tile_k_bytes: int,
-    *,
-    cta_group: int = 1,
-    extra_smem_bytes: int = 0,
-    extra_per_stage_bytes: int = 0,
-    pipeline: str,
-    moe: bool = False,
-    device=None,
-) -> int:
-    smem_b_n = cta_tile_n // cta_group
-    per_stage = (cta_tile_m + smem_b_n) * cta_tile_k_bytes + extra_per_stage_bytes
-    avail = _sm_smem_ab_budget_bytes(pipeline, device, moe=moe) - extra_smem_bytes
-    if avail < per_stage:
-        raise ValueError(
-            f"tile ({cta_tile_m},{cta_tile_n},K={cta_tile_k_bytes}B) "
-            f"cta_group={cta_group} per-stage SMEM {per_stage} bytes exceeds "
-            f"the budget (extra_smem_bytes={extra_smem_bytes}) — can't fit "
-            f"even 1 stage"
-        )
-    return min(avail // per_stage, _AB_STAGES_CAP)
+    The caller owns the stage LAYOUT -- a plain K-tile, a packed tile plus its
+    scale factors, or one 128-byte K chunk -- so it passes the size in; this
+    owns the budget and the ceiling. 0 when not even one stage fits, so each
+    caller can complain in its own terms.
+    """
+    cap = 16  # nothing in the templates assumes it: mbar arrays, ab_iter % ab_stages and the tail drain are all parameterized
+    avail = smem_ab_budget_bytes(smem_fixed_reserve, device) - extra_smem_bytes
+    return min(avail // per_stage_bytes, cap) if avail >= per_stage_bytes else 0
 
 
 @dataclass(frozen=True)
 class TileConfig:
     """One pure-geometry tile config. Dtype- AND execution-independent.
 
-    NOT here (template strategy, not geometry): cta_group,
-    ab_stages — those, plus K-in-elements, the SMEM tile, and the hardware MMA
-    shape, are derived per (dtype, cta_group) at render time.
+    Four nested tiles, outermost first -- CGA (a cluster of CTAs), CTA, warp,
+    MMA instruction -- plus the K-split axis. Each level must divide the one
+    above it. K is stored in BYTES throughout, so one config serves every dtype.
 
-    The CTA tile may span SEVERAL MMA instructions along M:
-    ``num_mma_m = cta_tile_m / mma_inst_m``. The whole CTA tile is still
-    TMA-loaded in one go; the MMA warp issues one instruction per M sub-block
-    into its own TMEM accumulator region. N is never split
-    (``mma_inst_n == cta_tile_n``).
+    NOT here, because they are not choices: `ab_stages` (the device SMEM budget
+    decides), the epilogue subtile N (the output dtype and drain width decide),
+    the acc-stage count (the TMEM budget decides) and the L2 rasterization width
+    (the kernel picks it per launch from the runtime shape). Anything the
+    compiler can derive is derived at render time, not stored here.
+
+    Family facts live on the family CLASS, not in a table keyed by pipeline
+    name. ``cta_group`` is the clearest case: it does NOT exist here -- the
+    families whose MMA spans a CTA pair declare it, and a family without the
+    pair has no such attribute at all, so reading it is an AttributeError rather
+    than a silent 1.
     """
+
+    pipeline: str  # family; pairs with the template whose filename leads with it
 
     cta_tile_m: int
     cta_tile_n: int
-    cta_tile_k_bytes: int  # K in BYTES (dtype-independent)
-    cgrp_size_m: int
-    cgrp_size_n: int
-    epi_tile_mn: tuple[int, int]  # epilogue subtile (M, 32)
-    threads_per_cta: int  # block size (256 = 8-warp warp-spec)
-    pipeline: str  # pipeline family (sm100 / sm103); matched against the template's pipeline
-    acc_stages: int = 2  # TMEM accumulator stages (double-buffer)
-    # N-direction super-block width (L2 reuse). 0 = adaptive: the kernel picks it per
-    # launch from the runtime M/N/K, since the best width flips with the tile-grid
-    # aspect ratio and one compiled kernel serves many shapes. >0 pins the width.
-    tile_swizzle_n: int = 0
-    # Per-CTA MMA-inst tile (None → CTA tile M/N + _MMA_INST_K_BYTES K, filled in
-    # __post_init__). Forward-looking for MMA-tile-smaller-than-CTA-tile configs.
-    mma_inst_m: int | None = None
-    mma_inst_n: int | None = None
-    mma_inst_k_bytes: int = _MMA_INST_K_BYTES
+    cta_tile_k_bytes: int
+
+    warp_tile_m: int
+    warp_tile_n: int
+    warp_tile_k_bytes: int
+
+    mma_tile_m: int
+    mma_tile_n: int
+    mma_tile_k_bytes: int
+
+    mma_size_m: int
+    mma_size_n: int
+    mma_size_k: int
+
+    cga_size_m: int
+    cga_size_n: int
+    cga_size_k: int
+
+    warps_per_cta: int
+
+    split_k_slices: int
 
     def __post_init__(self) -> None:
-        m, n, kb = self.cta_tile_m, self.cta_tile_n, self.cta_tile_k_bytes
-        cm, cn = self.cgrp_size_m, self.cgrp_size_n
+        name = self.name
 
-        kb_max = _pipeline_fact(_CTA_TILE_K_BYTES_MAX_BY_PIPELINE, self.pipeline, "max cta_tile_k_bytes")
-        if kb <= 0 or kb > kb_max:
-            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"positive, ≤ {kb_max} for pipeline {self.pipeline}")
-        # sm103's K-tile is not free geometry either (K-tile = lcm(128, 48)).
-        if self.pipeline == "sm103" and kb != 384:
-            raise NotImplementedError(f"TileConfig {self.name!r}: sm103 fixes cta_tile_k_bytes=384 " f"(K-tile = lcm(128, 48)); got {kb}")
-        # A pipeline whose MMA instruction fixes its K width owns that axis — it
-        # is not free geometry (sm103 K=48B UTCOMMA, sm107 K=64B), and the K-tile
-        # walks that instruction, so it is a multiple of the SAME width.
-        mkb_want = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, self.pipeline, "MMA-inst K width")
-        if self.mma_inst_k_bytes != mkb_want:
-            raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} fixes " f"mma_inst_k_bytes={mkb_want}; got {self.mma_inst_k_bytes}")
-        if kb % mkb_want != 0:
+        for label, v in (
+            ("cta_tile_m", self.cta_tile_m),
+            ("cta_tile_n", self.cta_tile_n),
+            ("cta_tile_k_bytes", self.cta_tile_k_bytes),
+            ("warp_tile_m", self.warp_tile_m),
+            ("warp_tile_n", self.warp_tile_n),
+            ("warp_tile_k_bytes", self.warp_tile_k_bytes),
+            ("mma_tile_m", self.mma_tile_m),
+            ("mma_tile_n", self.mma_tile_n),
+            ("mma_tile_k_bytes", self.mma_tile_k_bytes),
+            ("cga_size_m", self.cga_size_m),
+            ("cga_size_n", self.cga_size_n),
+            ("cga_size_k", self.cga_size_k),
+            ("warps_per_cta", self.warps_per_cta),
+            ("split_k_slices", self.split_k_slices),
+        ):
+            if v <= 0:
+                raise NotImplementedError(f"TileConfig {name!r}: {label}={v} must be positive")
+
+        # Each tile level divides the one above it.
+        for label, outer, inner in (
+            ("m", self.cta_tile_m, self.warp_tile_m),
+            ("n", self.cta_tile_n, self.warp_tile_n),
+            ("k_bytes", self.cta_tile_k_bytes, self.warp_tile_k_bytes),
+        ):
+            if outer % inner:
+                raise NotImplementedError(f"TileConfig {name!r}: warp_tile_{label}={inner} must divide cta_tile_{label}={outer}")
+        for label, outer, inner in (
+            ("m", self.warp_tile_m, self.mma_tile_m),
+            ("n", self.warp_tile_n, self.mma_tile_n),
+            ("k_bytes", self.warp_tile_k_bytes, self.mma_tile_k_bytes),
+        ):
+            if outer % inner:
+                raise NotImplementedError(f"TileConfig {name!r}: mma_tile_{label}={inner} must divide warp_tile_{label}={outer}")
+
+        for axis, warp, mma in (
+            ("m", self.warp_tile_m, self.mma_tile_m),
+            ("n", self.warp_tile_n, self.mma_tile_n),
+            ("k", self.warp_tile_k_bytes, self.mma_tile_k_bytes),
+        ):
+            want = warp // mma
+            got = getattr(self, f"mma_size_{axis}")
+            if got != want:
+                raise NotImplementedError(f"TileConfig {name!r}: mma_size_{axis}={got} but the tiles say {want}")
+
+        # K is never split across CTAs of a cluster, and the workspace-reduced
+        # split is not implemented -- both are axes reserved for later.
+        if self.cga_size_k != 1:
+            raise NotImplementedError(f"TileConfig {name!r}: cga_size_k={self.cga_size_k} — cross-CTA K reduction is not implemented")
+        if self.split_k_slices != 1:
+            raise NotImplementedError(f"TileConfig {name!r}: split_k_slices={self.split_k_slices} — split-K is not implemented")
+
+        cga = self.cga_size_m * self.cga_size_n * self.cga_size_k
+        if cga > MAX_CLUSTER_SIZE:
             raise NotImplementedError(
-                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"a multiple of {self.pipeline}'s mma_inst_k_bytes={mkb_want}"
+                f"TileConfig {name!r}: cluster {self.cga_size_m}x{self.cga_size_n} is {cga} CTAs — the architecture CGA limit is {MAX_CLUSTER_SIZE}"
             )
 
-        # CGRP size sanity. (cta_group-specific constraints — e.g. cgrp_size_m
-        # even for 2-CTA MMA — live on the 2ctamma template in the registry.)
-        if cm <= 0 or cn <= 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: cgrp_size_mn=({cm},{cn})")
-        if cm * cn > _MAX_CLUSTER_SIZE:
-            raise NotImplementedError(f"TileConfig {self.name!r}: cluster {cm}x{cn} is {cm * cn} CTAs — " f"the architecture CGA limit is {_MAX_CLUSTER_SIZE}")
+    # -- derived -------------------------------------------------------------
 
-        # MMA-inst tile defaults to the CTA tile M/N + s128b K. Frozen → setattr.
-        if self.mma_inst_m is None:
-            object.__setattr__(self, "mma_inst_m", m)
-        if self.mma_inst_n is None:
-            object.__setattr__(self, "mma_inst_n", n)
-        mm, mn, mkb = self.mma_inst_m, self.mma_inst_n, self.mma_inst_k_bytes
-        if mm <= 0 or m % mm != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_m={mm} must be positive " f"and divide cta_tile_m={m}")
-        if mn <= 0 or n % mn != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} must be positive " f"and divide cta_tile_n={n}")
-        if mkb <= 0 or kb % mkb != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_k_bytes={mkb} must be " f"positive and divide cta_tile_k_bytes={kb}")
-        # The M/N hardware bounds. These have always been the MMA INSTRUCTION's;
-        # they read as the CTA tile's only while one instruction covered it.
-        # M = the two TMEM row layouts (128 full lanes / 64 packed half-lanes);
-        # N = the idesc n_dim, encoded with its 3 LSBs dropped.
-        if mm not in (64, _CTA_TILE_M_MAX):
-            raise NotImplementedError(
-                f"TileConfig {self.name!r}: mma_inst_m={mm} (= cta_tile_m {m} / " f"num_mma_m {self.num_mma_m}) — supported values are 64 and {_CTA_TILE_M_MAX}"
-            )
-        if mn < 8 or mn > _CTA_TILE_N_MAX or mn % 8 != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} — supported range is " f"8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8")
-        # The one NEW axis: how many instructions the CTA tile spans along M. K is
-        # not an instruction-count axis (the mainloop already walks
-        # cta_tile_k / mma_inst_k), and N is not one at all.
-        if self.num_mma_m > _NUM_MMA_MAX:
-            raise NotImplementedError(
-                f"TileConfig {self.name!r}: num_mma_m={self.num_mma_m} — at most " f"{_NUM_MMA_MAX} MMA instructions per CTA tile along M"
-            )
-        if mn != n:
-            raise NotImplementedError(f"TileConfig {self.name!r}: N is not split across MMA instructions — " f"mma_inst_n must equal cta_tile_n={n}; got {mn}")
-        # The epilogue drains one MMA-M block at a time, so its subtile height
-        # is the instruction's M, not the CTA tile's.
-        if self.epi_tile_mn[0] != mm:
-            raise NotImplementedError(f"TileConfig {self.name!r}: epi_tile_mn[0]={self.epi_tile_mn[0]} " f"must equal mma_inst_m={mm}")
+    @property
+    def threads_per_cta(self) -> int:
+        # Imported here, not at module scope: the whole gemm.frost package is
+        # importable without the [cutedsl] extra, and this is the only thing in
+        # the geometry that would have pulled cutlass in.
+        from cutlass.cute.arch import WARP_SIZE
+
+        return self.warps_per_cta * WARP_SIZE
+
+    @property
+    def ctas_per_mma(self) -> int:
+        """CTAs ONE MMA instruction spans. Everything a multi-CTA MMA changes
+        follows from this number, so a family without one answers 1 truthfully
+        rather than being asked for an axis it does not have."""
+        return 1
+
+    @property
+    def is_cta_pair_mma(self) -> bool:
+        return self.ctas_per_mma == 2
+
+    @property
+    def cta_smem_tile_n(self) -> int:
+        """B's SMEM N per CTA -- an MMA spanning several CTAs splits it."""
+        return self.cta_tile_n // self.ctas_per_mma
+
+    @property
+    def mma_tile_m_hw(self) -> int:
+        """M the MMA INSTRUCTION covers, across however many CTAs it spans."""
+        return self.mma_tile_m * self.ctas_per_mma
+
+    @property
+    def epi_tile_m(self) -> int:
+        """Rows the epilogue drains per pass -- one MMA-M block."""
+        return self.mma_tile_m
+
+    @property
+    def fallback_cga_size_mnk(self) -> tuple[int, int, int]:
+        """The cluster a mixed-CGA launch falls back to on the SMs a wider one
+        cannot fill: the smallest this geometry is legal in. An MMA that spans
+        several CTAs must keep them inside one cluster, so it can never fall
+        back below its own span."""
+        return (self.ctas_per_mma, 1, 1)
 
     @property
     def geometry_name(self) -> str:
         """Geometry token (no ``CONFIG_``/pipeline prefix) used in the kernel symbol."""
         return (
             f"{self.cta_tile_m}x{self.cta_tile_n}x{self.cta_tile_k_bytes}"
-            f"_{self.mma_inst_m}x{self.mma_inst_n}x{self.mma_inst_k_bytes}"
-            f"_cluster{self.cgrp_size_m}x{self.cgrp_size_n}"
+            f"_{self.mma_tile_m}x{self.mma_tile_n}x{self.mma_tile_k_bytes}"
+            f"_cluster{self.cga_size_m}x{self.cga_size_n}"
+            # Named only where it is an AXIS -- a pipeline without the CTA pair
+            # declares no such field, so there is nothing to spell.
+            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
         )
 
     @property
     def name(self) -> str:
-        """Canonical identifier ``CONFIG_<pipeline>_<geometry_name>`` — pure geometry
-        (cta_group/ab_stages are the template's, not in the name)."""
+        """Canonical identifier ``CONFIG_<pipeline>_<geometry_name>`` — pure
+        geometry (``ab_stages`` is derived from the device budget, not named)."""
         return f"CONFIG_{self.pipeline}_{self.geometry_name}"
 
     @property
@@ -248,29 +270,24 @@ class TileConfig:
         return (self.cta_tile_m, self.cta_tile_n)
 
     @property
-    def num_mma_m(self) -> int:
-        """MMA instructions the CTA tile spans along M."""
-        return self.cta_tile_m // self.mma_inst_m
+    def cga_size_mn(self) -> tuple[int, int]:
+        """CTAs per cluster along (M, N)."""
+        return (self.cga_size_m, self.cga_size_n)
 
     @property
-    def cgrp_size_mn(self) -> tuple[int, int]:
-        """CTAs per cluster along (M, N). K is never split (cgrp_size_k == 1)."""
-        return (self.cgrp_size_m, self.cgrp_size_n)
+    def cga_size_mnk(self) -> tuple[int, int, int]:
+        """cga_size as a cluster_shape-style triple."""
+        return (self.cga_size_m, self.cga_size_n, 1)
 
     @property
-    def cgrp_size_mnk(self) -> tuple[int, int, int]:
-        """cgrp_size as a cluster_shape-style triple (cgrp_size_k always 1)."""
-        return (self.cgrp_size_m, self.cgrp_size_n, 1)
-
-    @property
-    def cgrp_tile_mn(self) -> tuple[int, int]:
+    def cga_tile_mn(self) -> tuple[int, int]:
         """Cluster aggregate output tile (M, N) in elements."""
-        return (self.cta_tile_m * self.cgrp_size_m, self.cta_tile_n * self.cgrp_size_n)
+        return (self.cta_tile_m * self.cga_size_m, self.cta_tile_n * self.cga_size_n)
 
     @property
     def cluster_shape(self) -> tuple[int, int, int]:
-        """Alias for cgrp_size_mnk (cluster-launch terminology)."""
-        return self.cgrp_size_mnk
+        """Alias for cga_size_mnk (cluster-launch terminology)."""
+        return self.cga_size_mnk
 
     # -- dtype-dependent shape views (require elem_bytes) -------------------
 
@@ -284,66 +301,51 @@ class TileConfig:
         """Per-CTA logical tile in elements (M, N, K)."""
         return (self.cta_tile_m, self.cta_tile_n, self.cta_tile_k(elem_bytes))
 
-    def cgrp_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
+    def cga_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
         """Cluster aggregate tile in elements (M, N, K)."""
-        m, n = self.cgrp_tile_mn
+        m, n = self.cga_tile_mn
         return (m, n, self.cta_tile_k(elem_bytes))
 
-    def cta_smem_tile_mnk(self, elem_bytes: int, cta_group: int) -> tuple[int, int, int]:
-        """Per-CTA SMEM tile in elements. B's N is halved under 2-CTA MMA (needs
-        the template's ``cta_group``)."""
-        return (
-            self.cta_tile_m,
-            self.cta_tile_n // cta_group,
-            self.cta_tile_k(elem_bytes),
-        )
+    def cta_smem_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
+        """Per-CTA SMEM tile in elements."""
+        return (self.cta_tile_m, self.cta_smem_tile_n, self.cta_tile_k(elem_bytes))
 
-    def mma_inst_mnk(self, elem_bytes: int, cta_group: int) -> tuple[int, int, int]:
-        """Hardware MMA-inst shape in elements. M spans the CTA pair
-        (``mma_inst_m × cta_group``); K is ``mma_inst_k_bytes`` in elements."""
-        k_inst = self.mma_inst_k_bytes // elem_bytes
-        return (self.mma_inst_m * cta_group, self.mma_inst_n, k_inst)
+    def mma_tile_mnk(self, elem_bytes: int) -> tuple[int, int, int]:
+        """Hardware MMA-instruction shape in elements; K is ``mma_tile_k_bytes``."""
+        return (self.mma_tile_m_hw, self.mma_tile_n, self.mma_tile_k_bytes // elem_bytes)
 
-    def max_ab_stages(
-        self,
-        cta_group: int,
-        *,
-        extra_smem_bytes: int = 0,
-        extra_per_stage_bytes: int = 0,
-        moe: bool = False,
-    ) -> int:
-        """Largest SMEM pipeline depth under ``cta_group`` (2-CTA MMA halves B's
-        SMEM N, so it fits more stages)."""
-        return smem_max_ab_stages(
-            self.cta_tile_m,
-            self.cta_tile_n,
-            self.cta_tile_k_bytes,
-            cta_group=cta_group,
-            extra_smem_bytes=extra_smem_bytes,
-            extra_per_stage_bytes=extra_per_stage_bytes,
-            pipeline=self.pipeline,
-            moe=moe,
-        )
+    def max_ab_stages(self, *, smem_fixed_reserve: int, extra_smem_bytes: int = 0, extra_per_stage_bytes: int = 0) -> int:
+        """Largest ab-pipeline depth this geometry fits, once the TEMPLATE's
+        fixed reserve is off the top (which is why the caller supplies it)."""
+        per_stage = (self.cta_tile_m + self.cta_smem_tile_n) * self.cta_tile_k_bytes + extra_per_stage_bytes
+        stages = smem_ab_stages(per_stage, smem_fixed_reserve=smem_fixed_reserve, extra_smem_bytes=extra_smem_bytes)
+        if stages == 0:
+            raise ValueError(
+                f"TileConfig {self.name!r}: per-stage SMEM {per_stage} bytes exceeds the budget "
+                f"(reserve={smem_fixed_reserve}, extra_smem_bytes={extra_smem_bytes}) — cannot fit even 1 stage"
+            )
+        return stages
 
     # -- multicast model -----------------------------------------------------
 
     @property
     def multicast_a_factor(self) -> int:
         """# CTAs sharing the same M slice of A. Independent of cta_group."""
-        return self.cgrp_size_n
+        return self.cga_size_n
 
-    def multicast_b_factor(self, cta_group: int) -> int:
-        """# CTAs sharing the same N slice of B. Under 2-CTA MMA the leading
-        factor of 2 in cgrp_size_m is consumed by the MMA pair, so B-multicast
-        only kicks in when cgrp_size_m ≥ 4."""
-        return self.cgrp_size_m // cta_group
+    @property
+    def multicast_b_factor(self) -> int:
+        """# CTAs sharing the same N slice of B. The CTAs an MMA spans are
+        consumed by the instruction, not by B-multicast."""
+        return self.cga_size_m // self.ctas_per_mma
 
     @property
     def multicast_a(self) -> bool:
         return self.multicast_a_factor > 1
 
-    def multicast_b(self, cta_group: int) -> bool:
-        return self.multicast_b_factor(cta_group) > 1
+    @property
+    def multicast_b(self) -> bool:
+        return self.multicast_b_factor > 1
 
 
 # ---------------------------------------------------------------------------
@@ -353,53 +355,178 @@ class TileConfig:
 # ---------------------------------------------------------------------------
 
 
-class ConfigSm100(TileConfig):
-    """sm100 geometry — every axis is free (the original pure-geometry config).
-    Type marker for template pairing; callers pass ``pipeline="sm100"``."""
+@dataclass(frozen=True)
+class CtaPairTileConfig(TileConfig):
+    """Base for the tcgen05 families, whose MMA may span a PAIR of CTAs.
 
+    Their tensor core is CTA-scoped, so a warp tile IS the CTA tile -- the axis
+    exists in the base for families that really have one (sm120), and here it is
+    pinned rather than validated. ``cta_group`` is a real geometry axis, and
+    everything the pair changes is an override so the base never needs it: the
+    pair splits B's N across the two CTAs, one instruction covers twice the M,
+    the leading factor of 2 in ``cga_size_m`` is consumed by the pair rather
+    than by B-multicast, and the pair must stay inside one cluster."""
 
-class ConfigSm103(TileConfig):
-    """sm103 geometry — ``cta_tile_k_bytes`` (384) and ``mma_inst_k_bytes``
-    (48) are fixed by the fp4 K=48B UTCOMMA (K-tile = lcm(128, 48)); the other
-    axes match :class:`ConfigSm100`. Type marker; callers pass ``pipeline="sm103"``."""
+    # The tcgen05 instruction's own M/N bounds: M is the two TMEM row layouts
+    # (128 full lanes / 64 packed half-lanes), N is the idesc n_dim encoded with
+    # its 3 LSBs dropped. These were never the CTA tile's -- they read that way
+    # only while one instruction covered the whole tile.
+    _MMA_TILE_M_VALUES: ClassVar[tuple[int, ...]] = (64, 128)
+    _MMA_TILE_N_MAX: ClassVar[int] = 256
+    # MMA instructions one warp tile may span along M. K is not an axis (the
+    # mainloop already walks cta_tile_k / mma_tile_k) and N is deliberately not
+    # one at all: splitting it measured within noise of a single instruction,
+    # cuBLAS does not do it either, and neither the CTA pair nor the block-scale
+    # pipeline can express it.
+    MMA_SIZE_M_MAX: ClassVar[int] = 2
 
-
-class ConfigSm107(TileConfig):
-    """sm107 geometry — identical to :class:`ConfigSm100` except
-    ``mma_inst_k_bytes`` is 64 (the SM 10.7 block-scale MMA reads a 64-byte K
-    per instruction, twice sm100's 32). Type marker; callers pass
-    ``pipeline="sm107"``."""
-
-
-class ConfigSm120(TileConfig):
-    """sm120 geometry — warp-scoped MMA on consumer Blackwell (CC 12.x). The
-    cluster (none on CC 12.x, so 1x1) and the block size (a fixed 12-warp
-    kernel: 8 compute + TMA + CLC scheduler + 2 donors) are family-FIXED, so
-    ``__post_init__`` pins them rather than validating — a config crossing in
-    from a clustered family (``as_pipeline``) needs no sm120 knowledge. The
-    free axes keep ``cta_tile_n % 16 == 0`` (the 4x2 compute-warp grid owns
-    8-column n-fragments per warp column) and one MMA-M block. Callers pass
-    ``pipeline="sm120"``."""
+    cta_group: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "cgrp_size_m", 1)
-        object.__setattr__(self, "cgrp_size_n", 1)
-        object.__setattr__(self, "threads_per_cta", 384)
+        # Their tensor core is CTA-scoped, so a warp tile IS the CTA tile: pin
+        # it rather than ask the caller to spell an axis they do not have.
+        object.__setattr__(self, "warp_tile_m", self.cta_tile_m)
+        object.__setattr__(self, "warp_tile_n", self.cta_tile_n)
+        object.__setattr__(self, "warp_tile_k_bytes", self.cta_tile_k_bytes)
+        if self.cta_group not in (1, 2):
+            raise NotImplementedError(f"TileConfig {self.name!r}: cta_group must be 1 or 2, got {self.cta_group}")
+        # The M/N hardware bounds of the tcgen05 instruction: M is the two TMEM
+        # row layouts (128 full lanes / 64 packed half-lanes); N is the idesc
+        # n_dim, encoded with its 3 LSBs dropped. Checked BEFORE the generic
+        # instruction-count rule so an illegal M is named as such, not as a count.
+        if self.mma_tile_m not in self._MMA_TILE_M_VALUES:
+            raise NotImplementedError(f"TileConfig {self.name!r}: mma_tile_m={self.mma_tile_m} — supported values are {list(self._MMA_TILE_M_VALUES)}")
+        if self.mma_tile_n < 8 or self.mma_tile_n > self._MMA_TILE_N_MAX or self.mma_tile_n % 8:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: mma_tile_n={self.mma_tile_n} — supported range is 8 ≤ N ≤ {self._MMA_TILE_N_MAX}, multiple of 8"
+            )
+        # One tcgen05 instruction covers the tile's whole N; only M is an
+        # instruction-count axis here.
+        if self.mma_tile_n != self.warp_tile_n:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: N is not split across MMA instructions — mma_tile_n must equal warp_tile_n={self.warp_tile_n}; got {self.mma_tile_n}"
+            )
+        issuable = _issuable_mma_tile_k_bytes(type(self))
+        if self.mma_tile_k_bytes not in issuable:
+            raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} issues mma_tile_k_bytes {sorted(issuable)}; got {self.mma_tile_k_bytes}")
+        if self.mma_size_m > self.MMA_SIZE_M_MAX:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: {self.pipeline} spans at most {self.MMA_SIZE_M_MAX} MMA instruction(s) along M per warp tile; got mma_size_m={self.mma_size_m}"
+            )
         super().__post_init__()
-        if self.cta_tile_n % 16 != 0:
+
+    @property
+    def ctas_per_mma(self) -> int:
+        return self.cta_group
+
+
+@dataclass(frozen=True)
+class ConfigSm100(CtaPairTileConfig):
+    """sm100 geometry — every axis is free, including ``mma_tile_k_bytes``
+    ∈ {32, 64} and the 2-CTA MMA pair. The 64-byte block-scale MMA is SM 10.7+
+    SILICON, so which of the two a given GPU may issue is decided by
+    :func:`validate_block_scale_config`, not by the config family."""
+
+    MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32, 64)
+    # The widest SMEM row swizzle.
+    CTA_TILE_K_BYTES_MAX: ClassVar[int] = 128
+
+    def __post_init__(self) -> None:
+        if self.cta_tile_k_bytes > self.CTA_TILE_K_BYTES_MAX:
             raise NotImplementedError(
-                f"TileConfig {self.name!r}: sm120 needs cta_tile_n % 16 == 0 " f"(each of the 2 compute-warp columns owns 8-column n-fragments)"
+                f"TileConfig {self.name!r}: cta_tile_k_bytes={self.cta_tile_k_bytes} — at most {self.CTA_TILE_K_BYTES_MAX} for pipeline {self.pipeline}"
             )
-        if self.num_mma_m != 1:
+        super().__post_init__()
+
+
+# 4 epilogue + MMA + TMA + CLC scheduler + a donor. The mainloop variant of the
+# same geometry needs 4 more; that is the TEMPLATE's override, not a config.
+_TCGEN05_WARPS_PER_CTA = 8
+
+# The fp4 K=48B UTCOMMA fixes both: the K-tile is lcm(128, 48).
+_SM103_CTA_TILE_K_BYTES = 384
+_SM103_MMA_TILE_K_BYTES = 48
+
+
+@dataclass(frozen=True)
+class ConfigSm103(CtaPairTileConfig):
+    """sm103 geometry — ``cta_tile_k_bytes`` (384) and ``mma_tile_k_bytes``
+    (48) are fixed by the fp4 K=48B UTCOMMA (K-tile = lcm(128, 48)); the other
+    axes match :class:`ConfigSm100`."""
+
+    MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (_SM103_MMA_TILE_K_BYTES,)
+    # The chunk pipeline miscomputes at a split M tile (A reads unwritten SMEM
+    # in K) and its ab_stages budget under-counts; both are silent-wrong.
+    MMA_SIZE_M_MAX: ClassVar[int] = 1
+    CTA_TILE_K_BYTES_FIXED: ClassVar[int] = _SM103_CTA_TILE_K_BYTES
+
+    def __post_init__(self) -> None:
+        if self.cta_tile_k_bytes != self.CTA_TILE_K_BYTES_FIXED:
             raise NotImplementedError(
-                f"TileConfig {self.name!r}: sm120 warp MMA has no MMA-M split; " f"mma_inst_m must equal cta_tile_m (got num_mma_m={self.num_mma_m})"
+                f"TileConfig {self.name!r}: {self.pipeline} fixes cta_tile_k_bytes={self.CTA_TILE_K_BYTES_FIXED}; got {self.cta_tile_k_bytes}"
             )
+        super().__post_init__()
+
+
+# sm120's tensor core is WARP-scoped, so the warp tile is a real level: the CTA
+# tile is split over a fixed grid of compute warps. Both are pinned to the one
+# geometry the template is validated at; widening them is the next step.
+_SM120_WARP_GRID_MN = (4, 2)
+_SM120_WARPS_PER_CTA = 12  # 8 compute + TMA + CLC scheduler + 2 donors
+_SM120_CTA_TILE_MNK_BYTES = (128, 128, 128)
+_SM120_MMA_TILE_MNK_BYTES = (16, 16, 32)
+
+
+@dataclass(frozen=True)
+class ConfigSm120(TileConfig):
+    """sm120 geometry — warp-scoped MMA on consumer Blackwell (CC 12.x).
+
+    ``mma.sync`` is m16n8; the template issues two of them back to back along N
+    and treats the pair as ONE 16x16 instruction, which is what ``mma_tile_n``
+    counts. There is no CTA pair and no cluster (CC 12.x has no CGA), and the
+    12-warp block is 8 compute + TMA + CLC scheduler + 2 donors."""
+
+    MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32,)
+
+    def __post_init__(self) -> None:
+        # PINNED, not validated: every axis below is fixed for now, so a config
+        # crossing in from another family (`as_pipeline`) needs no sm120
+        # knowledge -- it is rewritten to the one geometry the template is
+        # validated at. Widening them is the next step.
+        cta_m, cta_n, cta_kb = _SM120_CTA_TILE_MNK_BYTES
+        warps_m, warps_n = _SM120_WARP_GRID_MN
+        mma_m, mma_n, mma_kb = _SM120_MMA_TILE_MNK_BYTES
+        for field, value in (
+            ("cta_tile_m", cta_m),
+            ("cta_tile_n", cta_n),
+            ("cta_tile_k_bytes", cta_kb),
+            ("warp_tile_m", cta_m // warps_m),
+            ("warp_tile_n", cta_n // warps_n),
+            ("warp_tile_k_bytes", cta_kb),
+            ("mma_tile_m", mma_m),
+            ("mma_tile_n", mma_n),
+            ("mma_tile_k_bytes", mma_kb),
+            ("mma_size_m", cta_m // warps_m // mma_m),
+            ("mma_size_n", cta_n // warps_n // mma_n),
+            ("mma_size_k", cta_kb // mma_kb),
+            # CC 12.x has no CGA.
+            ("cga_size_m", 1),
+            ("cga_size_n", 1),
+            ("warps_per_cta", _SM120_WARPS_PER_CTA),
+        ):
+            object.__setattr__(self, field, value)
+        super().__post_init__()
+
+    @property
+    def epi_tile_m(self) -> int:
+        """The accumulators are already in registers -- the epilogue drains the
+        whole CTA tile in one pass, not an MMA-M block at a time."""
+        return self.cta_tile_m
 
 
 _CONFIG_CLASS_BY_PIPELINE: dict[str, type[TileConfig]] = {
     "sm100": ConfigSm100,
     "sm103": ConfigSm103,
-    "sm107": ConfigSm107,
     "sm120": ConfigSm120,
 }
 
@@ -419,11 +546,11 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 # spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
 # K_bytes ∈ {128,64}, cluster ∈ _CLUSTERS. N < 8 / N % 8 rejected by
 # __post_init__ (tcgen05 idesc n_dim is a multiple of 8). 2-CTA templates accept
-# only cgrp_size_m % 2 == 0 (registry predicate).
+# only cga_size_m % 2 == 0 (registry predicate).
 # ---------------------------------------------------------------------------
 
-# (mma_inst_m, num_mma_m) — the UTCMMA instruction M and how many of them one CTA
-# tile spans; cta_tile_m is their product. num_mma_m == 1 first, so a lookup like
+# (mma_tile_m, mma_size_m) — the UTCMMA instruction M and how many of them one CTA
+# tile spans; cta_tile_m is their product. mma_size_m == 1 first, so a lookup like
 # `next(c for c in CATALOG if c.cta_tile_m == 128)` still lands on the unsplit tile.
 _M_AXES: tuple[tuple[int, int], ...] = ((128, 1), (64, 1), (128, 2), (64, 2))
 
@@ -446,99 +573,122 @@ _CLUSTERS: tuple[tuple[int, int], ...] = (
 )
 
 
-def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
-    """Build one sm100 pure-geometry config from the MMA-instruction M and the
-    number of them the CTA tile spans."""
+def _geom_sm100(
+    cta_tile_m: int,
+    cta_tile_n: int,
+    cta_tile_k_bytes: int,
+    mma_tile_m: int,
+    mma_tile_n: int,
+    mma_tile_k_bytes: int,
+    cga_size_m: int,
+    cga_size_n: int,
+    cta_group: int,
+) -> ConfigSm100:
+    """One sm100 geometry. The warp tile is the CTA tile (a CTA-scoped MMA), so
+    the family pins it and it is not spelled here."""
     return ConfigSm100(
-        cta_tile_m=mma_m * num_mma_m,
-        cta_tile_n=cta_n,
-        cta_tile_k_bytes=k_bytes,
-        cgrp_size_m=cgrp_m,
-        cgrp_size_n=cgrp_n,
-        mma_inst_m=mma_m,
-        epi_tile_mn=(mma_m, 32),
-        threads_per_cta=256,
         pipeline="sm100",
-        acc_stages=2,
+        cta_tile_m=cta_tile_m,
+        cta_tile_n=cta_tile_n,
+        cta_tile_k_bytes=cta_tile_k_bytes,
+        warp_tile_m=cta_tile_m,
+        warp_tile_n=cta_tile_n,
+        warp_tile_k_bytes=cta_tile_k_bytes,
+        mma_tile_m=mma_tile_m,
+        mma_tile_n=mma_tile_n,
+        mma_tile_k_bytes=mma_tile_k_bytes,
+        mma_size_m=cta_tile_m // mma_tile_m,
+        mma_size_n=cta_tile_n // mma_tile_n,
+        mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
+        cga_size_m=cga_size_m,
+        cga_size_n=cga_size_n,
+        cga_size_k=1,
+        warps_per_cta=_TCGEN05_WARPS_PER_CTA,
+        split_k_slices=1,
+        cta_group=cta_group,
     )
 
 
-def _geom_sm103(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm103:
-    """Build one sm103 config (the fixed K axes are the family's, not ours)."""
+def _geom_sm103(cta_tile_m: int, cta_tile_n: int, cga_size_m: int, cga_size_n: int, cta_group: int) -> ConfigSm103:
+    """One sm103 geometry. The K axes are the FAMILY's (the fp4 K=48B UTCOMMA
+    fixes both), and one instruction covers the whole tile."""
     return ConfigSm103(
-        cta_tile_m=cta_m,
-        cta_tile_n=cta_n,
-        cta_tile_k_bytes=384,
-        cgrp_size_m=cgrp_m,
-        cgrp_size_n=cgrp_n,
-        epi_tile_mn=(cta_m, 32),
-        threads_per_cta=256,
         pipeline="sm103",
-        acc_stages=2,
-        mma_inst_k_bytes=48,
+        cta_tile_m=cta_tile_m,
+        cta_tile_n=cta_tile_n,
+        cta_tile_k_bytes=_SM103_CTA_TILE_K_BYTES,
+        warp_tile_m=cta_tile_m,
+        warp_tile_n=cta_tile_n,
+        warp_tile_k_bytes=_SM103_CTA_TILE_K_BYTES,
+        mma_tile_m=cta_tile_m,
+        mma_tile_n=cta_tile_n,
+        mma_tile_k_bytes=_SM103_MMA_TILE_K_BYTES,
+        mma_size_m=1,
+        mma_size_n=1,
+        mma_size_k=_SM103_CTA_TILE_K_BYTES // _SM103_MMA_TILE_K_BYTES,
+        cga_size_m=cga_size_m,
+        cga_size_n=cga_size_n,
+        cga_size_k=1,
+        warps_per_cta=_TCGEN05_WARPS_PER_CTA,
+        split_k_slices=1,
+        cta_group=cta_group,
     )
 
 
-def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
-    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours).
-    mma_inst_m is pinned to 128 — the block-scale F8_128x4 SF swizzle needs
-    mma_inst_m % 128 == 0, so 64 is not an axis here."""
-    return ConfigSm107(
-        cta_tile_m=_CTA_TILE_M_MAX * num_mma_m,
-        cta_tile_n=cta_n,
-        cta_tile_k_bytes=128,
-        cgrp_size_m=cgrp_m,
-        cgrp_size_n=cgrp_n,
-        mma_inst_m=_CTA_TILE_M_MAX,
-        epi_tile_mn=(_CTA_TILE_M_MAX, 32),
-        threads_per_cta=256,
-        pipeline="sm107",
-        acc_stages=2,
-        mma_inst_k_bytes=64,
-    )
-
-
-def _geom_sm120(cta_m: int, cta_n: int, k_bytes: int) -> ConfigSm120:
-    """Build one sm120 config (cluster fixed at 1x1, 12-warp kernel)."""
+def _geom_sm120(
+    cta_tile_m: int,
+    cta_tile_n: int,
+    cta_tile_k_bytes: int,
+    warps_size_m: int,
+    warps_size_n: int,
+    cga_size_m: int,
+    cga_size_n: int,
+) -> ConfigSm120:
+    """One sm120 geometry. The CTA tile is split over a ``warps_size_m`` x
+    ``warps_size_n`` grid of compute warps; the MMA tile is the family's."""
+    mma_tile_m, mma_tile_n, mma_tile_k_bytes = _SM120_MMA_TILE_MNK_BYTES
     return ConfigSm120(
-        cta_tile_m=cta_m,
-        cta_tile_n=cta_n,
-        cta_tile_k_bytes=k_bytes,
-        cgrp_size_m=1,
-        cgrp_size_n=1,
-        epi_tile_mn=(cta_m, 32),
-        threads_per_cta=384,
         pipeline="sm120",
-        acc_stages=2,
+        cta_tile_m=cta_tile_m,
+        cta_tile_n=cta_tile_n,
+        cta_tile_k_bytes=cta_tile_k_bytes,
+        warp_tile_m=cta_tile_m // warps_size_m,
+        warp_tile_n=cta_tile_n // warps_size_n,
+        warp_tile_k_bytes=cta_tile_k_bytes,
+        mma_tile_m=mma_tile_m,
+        mma_tile_n=mma_tile_n,
+        mma_tile_k_bytes=mma_tile_k_bytes,
+        mma_size_m=cta_tile_m // warps_size_m // mma_tile_m,
+        mma_size_n=cta_tile_n // warps_size_n // mma_tile_n,
+        mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
+        cga_size_m=cga_size_m,
+        cga_size_n=cga_size_n,
+        cga_size_k=1,
+        warps_per_cta=_SM120_WARPS_PER_CTA,
+        split_k_slices=1,
     )
 
 
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
-    for mma_m, num_mma_m in _M_AXES:
+    for mma_m, mma_size_m in _M_AXES:
         for cta_n in range(256, 0, -8):
             for k_bytes in (128, 64):
-                for cgrp_m, cgrp_n in _CLUSTERS:
-                    cfgs.append(_geom_sm100(mma_m, num_mma_m, cta_n, k_bytes, cgrp_m, cgrp_n))
+                for mma_k_bytes in (32, 64):
+                    if k_bytes % mma_k_bytes:
+                        continue
+                    for cga_m, cga_n in _CLUSTERS:
+                        for cta_group in (1, 2):
+                            cfgs.append(_geom_sm100(mma_m * mma_size_m, cta_n, k_bytes, mma_m, cta_n, mma_k_bytes, cga_m, cga_n, cta_group))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
     # rank-decomposition multicast masks for data + SF).
     for cta_n in (256, 128):
-        for cgrp_m, cgrp_n in _CLUSTERS:
-            cfgs.append(_geom_sm103(128, cta_n, cgrp_m, cgrp_n))
-    # sm107 block-scale geometries: the sm100 axes narrowed to what the F8_128x4
-    # SF swizzle admits (M/N multiples of 128, K-tile 128 B) — the rest of the
-    # sm100 enumeration would only be rejected by validate_block_scale_config.
-    for num_mma_m in (1, 2):
-        for cta_n in (256, 128):
-            for cgrp_m, cgrp_n in _CLUSTERS:
-                cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
-    # sm120 warp-MMA geometries: no cluster axis (fixed 1x1); M ∈ {128, 64}
-    # (the MMA-inst M bounds, and the 4x2 warp grid needs cta_m % 64 == 0).
-    for cta_m in (128, 64):
-        for cta_n in range(256, 0, -32):
-            for k_bytes in (128, 64):
-                cfgs.append(_geom_sm120(cta_m, cta_n, k_bytes))
+        for cga_m, cga_n in _CLUSTERS:
+            for cta_group in (1, 2):
+                cfgs.append(_geom_sm103(128, cta_n, cga_m, cga_n, cta_group))
+    # sm120 is pinned to the one geometry its template is validated at.
+    cfgs.append(_geom_sm120(*_SM120_CTA_TILE_MNK_BYTES, *_SM120_WARP_GRID_MN, 1, 1))
     return tuple(cfgs)
 
 
@@ -558,7 +708,7 @@ _CONFIG_NAME_RE = re.compile(
     r"^CONFIG_(?P<pipeline>sm\d+)_"
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
-    r"cluster(?P<cgrp_m>\d+)x(?P<cgrp_n>\d+)$"
+    r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?$"
 )
 
 
@@ -574,33 +724,47 @@ def _synthesize_config(name: str) -> TileConfig:
     cta_m = int(m.group("cta_m"))
     mma_m = int(m.group("mma_m"))
     cfg = cls(
+        pipeline=pipeline,
         cta_tile_m=cta_m,
         cta_tile_n=int(m.group("cta_n")),
         cta_tile_k_bytes=int(m.group("k_bytes")),
-        cgrp_size_m=int(m.group("cgrp_m")),
-        cgrp_size_n=int(m.group("cgrp_n")),
-        # The epilogue drains one MMA-M block per pass.
-        epi_tile_mn=(mma_m, 32),
-        threads_per_cta=256,
-        pipeline=pipeline,
-        acc_stages=2,
-        mma_inst_m=mma_m,
-        mma_inst_n=int(m.group("mma_n")),
-        mma_inst_k_bytes=int(m.group("mma_k_bytes")),
+        # The warp tile is family-derived, not named: a CTA-scoped MMA pins it
+        # to the CTA tile, a warp-scoped one to its own warp grid. Passing the
+        # CTA tile lets each family's __post_init__ overwrite or reject it.
+        warp_tile_m=cta_m,
+        warp_tile_n=int(m.group("cta_n")),
+        warp_tile_k_bytes=int(m.group("k_bytes")),
+        mma_tile_m=mma_m,
+        mma_tile_n=int(m.group("mma_n")),
+        mma_tile_k_bytes=int(m.group("mma_k_bytes")),
+        mma_size_m=cta_m // mma_m,
+        mma_size_n=int(m.group("cta_n")) // int(m.group("mma_n")),
+        mma_size_k=int(m.group("k_bytes")) // int(m.group("mma_k_bytes")),
+        cga_size_m=int(m.group("cga_m")),
+        cga_size_n=int(m.group("cga_n")),
+        cga_size_k=1,
+        # Not spelled by the name; a family that fixes its own block pins it.
+        warps_per_cta=_TCGEN05_WARPS_PER_CTA,
+        split_k_slices=1,
+        # Only where the family HAS the axis; a name for one that does not
+        # carries no such token either.
+        **({"cta_group": int(m.group("cta_group") or 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
-    if cfg.name != name:  # e.g. leading zeros; keep the canonical spelling unique
+    # Leading zeros etc. must still round-trip; a name that merely omitted the
+    # cta_group suffix is accepted as the 1-CTA spelling.
+    if cfg.name != name and cfg.name != f"{name}_{getattr(cfg, 'cta_group', 1)}ctamma":
         raise KeyError(f"tile config name {name!r} is not canonical (round-trips to {cfg.name!r})")
     return cfg
 
 
 def by_name(name: str) -> TileConfig:
-    cfg = _CATALOG_BY_NAME.get(name)
+    cfg = _CATALOG_BY_NAME.get(name) or _CATALOG_BY_NAME.get(f"{name}_1ctamma")
     if cfg is not None:
         return cfg
     return _synthesize_config(name)
 
 
-DEFAULT_CONFIG: TileConfig = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
+DEFAULT_CONFIG: TileConfig = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
 
 
 def _floor_pow2(v: int) -> int:
@@ -685,8 +849,8 @@ def select_config(
     b_n_major: bool = False,
     b_elem_bytes: int = 2,
     sm_count: int | None = None,
-) -> tuple[TileConfig, int]:
-    """Pick (TileConfig, cta_group) from problem geometry.
+) -> TileConfig:
+    """Pick a TileConfig from problem geometry.
 
     One selection path for every graph type frost supports. The tile and the cluster
     are each chosen by an analytic score over (M, N, K, tile geometry,
@@ -749,11 +913,30 @@ def select_config(
     # --- cluster ------------------------------------------------------------
     pool = [g for g in _CLUSTERS_1D + _CLUSTERS_2D if not _hang_prone(cta_m, cta_n, g[0], g[1])]
     if cta_group == 2:
-        pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cgrp_size_m % 2 == 0
+        pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cga_size_m % 2 == 0
     cgrp_m, cgrp_n = max(pool, key=lambda g: _cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm))
 
-    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x{_MMA_INST_K_BYTES}_cluster{cgrp_m}x{cgrp_n}"
-    return by_name(name), cta_group
+    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
+    return by_name(name)
+
+
+def as_mma_tile_k_bytes(k_bytes: int, pipeline: str) -> int:
+    """The MMA-inst K width ``pipeline`` issues closest to ``k_bytes``: itself
+    when the family can issue it, else the family's narrowest. A family that
+    fixes the axis (sm103's 48-byte UTCOMMA) therefore always wins."""
+    ok = _issuable_mma_tile_k_bytes(config_class_for_pipeline(pipeline))
+    return k_bytes if k_bytes in ok else min(ok)
+
+
+def as_mma_tile_k(cfg: TileConfig, k_bytes: int) -> TileConfig:
+    """The same geometry at a different MMA-inst K width. A no-op when the width
+    already matches or the config's family cannot issue the requested one, so
+    callers need no arch or family knowledge."""
+    ok = _issuable_mma_tile_k_bytes(type(cfg))
+    if cfg.mma_tile_k_bytes == k_bytes or k_bytes not in ok or cfg.cta_tile_k_bytes % k_bytes:
+        return cfg
+    # mma_size_k counts instructions per warp tile, so it moves with the width.
+    return replace(cfg, mma_tile_k_bytes=k_bytes, mma_size_k=cfg.warp_tile_k_bytes // k_bytes)
 
 
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
@@ -767,19 +950,25 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
         return cfg
     cls = config_class_for_pipeline(pipeline)
     return cls(
+        pipeline=pipeline,
         cta_tile_m=cfg.cta_tile_m,
         cta_tile_n=cfg.cta_tile_n,
         cta_tile_k_bytes=cfg.cta_tile_k_bytes,
-        cgrp_size_m=cfg.cgrp_size_m,
-        cgrp_size_n=cfg.cgrp_size_n,
-        epi_tile_mn=cfg.epi_tile_mn,
-        threads_per_cta=cfg.threads_per_cta,
-        pipeline=pipeline,
-        acc_stages=cfg.acc_stages,
-        tile_swizzle_n=cfg.tile_swizzle_n,
-        mma_inst_m=cfg.mma_inst_m,
-        mma_inst_n=cfg.mma_inst_n,
-        mma_inst_k_bytes=_pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, pipeline, "MMA-inst K width"),
+        warp_tile_m=cfg.cta_tile_m,
+        warp_tile_n=cfg.cta_tile_n,
+        warp_tile_k_bytes=cfg.cta_tile_k_bytes,
+        mma_tile_m=cfg.mma_tile_m,
+        mma_tile_n=cfg.mma_tile_n,
+        mma_tile_k_bytes=as_mma_tile_k_bytes(cfg.mma_tile_k_bytes, pipeline),
+        mma_size_m=cfg.cta_tile_m // cfg.mma_tile_m,
+        mma_size_n=cfg.cta_tile_n // cfg.mma_tile_n,
+        mma_size_k=cfg.cta_tile_k_bytes // as_mma_tile_k_bytes(cfg.mma_tile_k_bytes, pipeline),
+        cga_size_m=cfg.cga_size_m,
+        cga_size_n=cfg.cga_size_n,
+        cga_size_k=cfg.cga_size_k,
+        warps_per_cta=cfg.warps_per_cta,
+        split_k_slices=cfg.split_k_slices,
+        **({"cta_group": getattr(cfg, "cta_group", 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
 
 
@@ -798,18 +987,29 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
     # block, and the rule is that EACH MMA INSTRUCTION must land on whole blocks —
     # so it applies to the instruction tile, not the CTA tile. They coincide at
     # num_mma == 1, which is why this used to read cta_tile_m/n.
-    if cfg.mma_inst_m % 128 != 0:
+    if cfg.mma_tile_m % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires mma_inst_m % 128 == 0 (SF 128x4 swizzle: "
+            f"block-scaled matmul requires mma_tile_m % 128 == 0 (SF 128x4 swizzle: "
             f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
-            f"has cta_tile_m={cfg.cta_tile_m} / num_mma_m={cfg.num_mma_m} = {cfg.mma_inst_m}"
+            f"has cta_tile_m={cfg.cta_tile_m} / mma_size_m={cfg.mma_size_m} = {cfg.mma_tile_m}"
         )
-    if cfg.mma_inst_n % 128 != 0:
+    if cfg.mma_tile_n % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires mma_inst_n % 128 == 0 (SF 128x4 swizzle: "
+            f"block-scaled matmul requires mma_tile_n % 128 == 0 (SF 128x4 swizzle: "
             f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
-            f"has mma_inst_n={cfg.mma_inst_n}"
+            f"has mma_tile_n={cfg.mma_tile_n}"
         )
+    # The 64-byte MMA-inst K is SM 10.7+ SILICON, not a pipeline property, so it
+    # is gated on the ACTIVE GPU here rather than by a config family. No GPU
+    # visible (render-only / CI) leaves it open, like every other arch gate.
+    if cfg.mma_tile_k_bytes == 64:
+        from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+        from . import compiler as _C
+
+        arch = _C._current_arch()
+        if arch is not None and not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
+            spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+            raise NotImplementedError(f"block-scaled matmul at mma_tile_k_bytes=64 needs {spans}, but the " f"active GPU is sm_{arch}; config {cfg.name!r}")
     # K-tile bytes: sm100 = one 128-B swizzled SMEM row; sm103 = 384 B
     kb_want = 384 if cfg.pipeline == "sm103" else 128
     if cfg.cta_tile_k_bytes != kb_want:

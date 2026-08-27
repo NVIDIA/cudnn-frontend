@@ -94,12 +94,10 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
-# @@STG_ONLY:BEGIN@@
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
 _AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
 ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
 assert ab_stages >= 1, "transposed STG epilogue: staging stream cannot be funded from the AB pipeline"
-# @@STG_ONLY:END@@
 
 # ---- v1 scope guards (fail at render/import, not at runtime) ---------------
 assert cluster_shape_mnk == (1, 1, 1), "sm120 has no thread-block clusters (CC 12.0): cluster_shape must be (1,1,1)"
@@ -113,13 +111,7 @@ assert cta_tile_mnk[1] % WARPS_N == 0 and _WARP_TILE_N % 8 == 0, f"cta_tile_n={c
 _TMA_SWIZZLE_BY_BYTES = {32: _tma.TensorMapSwizzle.s32b, 64: _tma.TensorMapSwizzle.s64b, 128: _tma.TensorMapSwizzle.s128b}
 assert ab_tma_swizzle == _TMA_SWIZZLE_BY_BYTES.get(_AB_SMEM_SWIZZLE_BYTES), "SMEM K-row width must equal the swizzle span"
 assert _NUM_K_BLOCKS * _K_BLK_ELEMS == _CTA_K_ELEMS, "cta_tile_k must be a multiple of 32 bytes"
-# @@TMA_STORE_ONLY:BEGIN@@
-assert vec_bytes_epi * 8 == 2 * cd_dtype.width, "sm120 TMA-store epilogue drains one (n, n+1) accumulator pair per thread"
-assert cta_tile_mnk[1] % _EPI_N == 0, "TMA-store epilogue needs cta_tile_n to be a whole number of epi subtiles"
-# @@TMA_STORE_ONLY:END@@
-# @@STG_ONLY:BEGIN@@
 assert _STG_V >= 2 and _STG_V % 2 == 0 and 8 % _STG_V == 0, "transposed STG epilogue: the store vector must be whole pairs tiling the 8-column row run"
-# @@STG_ONLY:END@@
 
 # ---------------------------------------------------------------------------
 # The warp MMA instruction, resolved from the injected MMA dtypes.
@@ -207,15 +199,8 @@ def _kernel(
     # @@INJECT_KERNEL_TAP_PARAMS@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_KERNEL_TMA_C_PARAMS@@
-    # @@TMA_STORE_ONLY:END@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_TMA_C_LISTS@@
-    tma_c_desc = tma_c_descs[0]
-    # @@TMA_STORE_ONLY:END@@
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -233,10 +218,6 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
         for _j in cutlass.range_constexpr(num_b_operands):
             nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
-
-        # @@TMA_STORE_ONLY:BEGIN@@
-        nvvm.prefetch_tensormap(tma_c_desc.get_ptr())
-        # @@TMA_STORE_ONLY:END@@
 
     # First tile from the launch grid (grid == tile grid); later tiles come
     # from canceled-CTA ids delivered through the CLC response ring.
@@ -282,17 +263,6 @@ def _kernel(
         for _ in range(num_b_operands)
     ]
 
-    # @@TMA_STORE_ONLY:BEGIN@@
-    epi_subtile_elems = cta_tile_mnk[0] * epi_tile_mn[1]
-    smem_d_ptr = cutlass.Array(
-        cd_dtype,
-        epi_subtile_elems * EPI_SMEM_STAGES,
-        space=cutlass.AddressSpace.smem,
-        alignment=1024,
-    )
-    # @@TMA_STORE_ONLY:END@@
-
-    # @@STG_ONLY:BEGIN@@
     # Per-compute-warp staging stream for the transposed STG epilogue (raw
     # accumulator dtype; 4 batches x (128 elems + 16B pad) = 528 elems, one
     # 32-column group of one m-frag at a time). Slices are warp-private, so
@@ -303,7 +273,6 @@ def _kernel(
         space=cutlass.AddressSpace.smem,
         alignment=1024,
     )
-    # @@STG_ONLY:END@@
 
     # ab full: one producer-elected arrive_expect_tx per stage.
     # ab empty: one elected arrive per compute warp per stage (fort inits this
@@ -331,7 +300,7 @@ def _kernel(
     # @@INJECT_TAP_PTRS@@
 
     VEC_BYTES = vec_bytes_epi
-    vsize = (VEC_BYTES * 8) // cd_dtype.width
+    vsize = epi_chunk_elems
 
     M = m
     N = n
@@ -514,9 +483,6 @@ def _kernel(
 
         ab_full_phase_bit = cutlass.Int32(0)
         ab_iter = cutlass.Int32(0)
-        # @@TMA_STORE_ONLY:BEGIN@@
-        epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
-        # @@TMA_STORE_ONLY:END@@
         tile_m = init_tile_m
         tile_n = init_tile_n
         tile_l = init_tile_l
@@ -603,68 +569,6 @@ def _kernel(
 
             # @@INJECT_AUX_VIEWS@@
 
-            # @@TMA_STORE_ONLY:BEGIN@@
-            for subtile_idx in cutlass.range_constexpr(cta_tile_mnk[1] // _EPI_N):
-                subtile_col_offset = subtile_idx * _EPI_N
-                epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                smem_subtile_ptr = smem_d_ptr.subview(epi_stage_idx * epi_subtile_elems)
-                col = coord_n + subtile_col_offset
-
-                for mf in cutlass.range_constexpr(_M_FRAGS):
-                    for half in cutlass.range_constexpr(2):
-                        row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
-                        row = coord_m + row_in_cta
-                        for nf in cutlass.range_constexpr(_N_FRAGS):
-                            # Only fragments inside this subtile's N span write —
-                            # warp-uniform predicate (warp_col is warp-uniform).
-                            frag_rel_col = warp_col * _WARP_TILE_N + nf * 8 - subtile_col_offset
-                            if frag_rel_col >= 0:
-                                if frag_rel_col < _EPI_N:
-                                    _o = (mf * _N_FRAGS + nf) * 4 + half * 2
-                                    _pair = acc[_o:2]
-                                    if cutlass.const_expr(acc_widen_to_fp32):
-                                        # INT8 int32 accumulate -> widen to fp32; `+ 0.0`
-                                        # forces a fresh fp32 register so int32->fp32 isn't
-                                        # folded into an invalid int32->fp8 cast.
-                                        _pf = _pair.to(cutlass.Float32)
-                                        vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
-                                    else:
-                                        vec_f32 = _pair
-                                    col_j = col + frag_rel_col + lane_mod4 * 2
-                                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
-
-                                    # @@INJECT_EPILOGUE@@
-
-                                    _e_off = row_in_cta * _EPI_N + frag_rel_col + lane_mod4 * 2
-                                    (smem_subtile_ptr.data_ptr() + _e_off).store_swizzled(
-                                        vec_out,
-                                        alignment=vec_bytes_epi,
-                                        swizzle=_EPI_SWIZZLE,
-                                    )
-
-                cute.arch.fence_view_async_shared()
-                nvvm.barrier_cta_sync(
-                    barrier_id=EPI_SYNC_BAR_ID,
-                    thread_count=NUM_COMPUTE_WARPS * 32,
-                )
-
-                if warp_idx == 0:
-                    if elect_one:
-                        nvvm.cp_async_bulk_tensor_global_shared_cta(
-                            tma_c_desc.get_ptr(),
-                            smem_subtile_ptr,
-                            (col, coord_m, tile_l),
-                        )
-                        nvvm.cp_async_bulk_commit_group()
-                    nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
-
-                nvvm.barrier_cta_sync(
-                    barrier_id=EPI_SYNC_BAR_ID,
-                    thread_count=NUM_COMPUTE_WARPS * 32,
-                )
-            # @@TMA_STORE_ONLY:END@@
-
-            # @@STG_ONLY:BEGIN@@
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
             for mf in cutlass.range_constexpr(_M_FRAGS):
                 for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
@@ -708,7 +612,6 @@ def _kernel(
 
                                         # @@INJECT_EPILOGUE@@
                     nvvm.bar_warp_sync(0xFFFFFFFF)
-            # @@STG_ONLY:END@@
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
@@ -737,11 +640,6 @@ def _kernel(
                 if elect_one:
                     nvvm.griddepcontrol("launch_dependents")
 
-        # @@TMA_STORE_ONLY:BEGIN@@
-        if warp_idx == 0:
-            nvvm.cp_async_bulk_wait_group(0, read=True)
-        # @@TMA_STORE_ONLY:END@@
-
     # -- Unused donor warps ---------------------------------------------------
     if warp_idx > SCHEDULER_WARP_ID:
         nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
@@ -753,9 +651,6 @@ def _host(
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
     # @@INJECT_HOST_AUX_PARAMS@@
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_HOST_TMA_C_PARAMS@@
-    # @@TMA_STORE_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
     # @@INJECT_HOST_AB_LISTS@@
@@ -829,24 +724,6 @@ def _host(
             )
         )
 
-    # @@TMA_STORE_ONLY:BEGIN@@
-    # @@INJECT_HOST_TMA_C_LISTS@@
-    c = _tma_c_outputs[0]
-    # N-major output only (enforced by Sm120KernelTemplate._extra_reject).
-    tma_c_desc = _tma.create_tensor_map_tiled(
-        global_address=c.iterator.toint(),
-        dtype=cd_dtype,
-        global_dims=[n, m, batch],
-        global_strides=[
-            out_stride_m_0 * cd_dtype.width // 128,
-            out_stride_l_0 * cd_dtype.width // 128,
-        ],
-        box_dims=[epi_tile_mn[1], cta_tile_mnk[0], 1],
-        swizzle=_tma.TensorMapSwizzle.s64b,
-    )
-    tma_c_desc_list = [tma_c_desc]
-    # @@TMA_STORE_ONLY:END@@
-
     # CLC persistent grid: launch the full tile grid (fort launches the same);
     # CTAs that finish early cancel not-yet-launched blocks and steal their
     # (m, n, l) coordinates through the response ring. No cluster launch on
@@ -864,9 +741,6 @@ def _host(
         # @@INJECT_HOST_TAP_PASS@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
-        # @@TMA_STORE_ONLY:BEGIN@@
-        # @@INJECT_HOST_TMA_C_PASS@@
-        # @@TMA_STORE_ONLY:END@@
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),
@@ -911,17 +785,6 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # @@TMA_STORE_ONLY:BEGIN@@
-    def _make_fake_c(_dt, _div, _mm):
-        return make_fake_compact_tensor(
-            _dt,
-            (sym_m, sym_n // _div, sym_l),
-            stride_order=(0, 1, 2) if _mm else (1, 0, 2),
-            assumed_align=16,
-        )
-
-    # @@INJECT_COMPILE_TMA_C_FAKES@@
-    # @@TMA_STORE_ONLY:END@@
     def _sym_operand_strides(is_mn_major: bool) -> tuple:
         # Operand is permuted to (M|N, K, L): the unit stride is mode 0 when MN-major, mode 1 when K-major, and never reaches TMA.
         unit = 0 if is_mn_major else 1
@@ -953,9 +816,6 @@ def compile() -> Callable:
         # @@INJECT_COMPILE_AB_PASS@@
         # @@INJECT_COMPILE_TAP_PASS@@
         # @@INJECT_COMPILE_AUX_PASS@@
-        # @@TMA_STORE_ONLY:BEGIN@@
-        # @@INJECT_COMPILE_TMA_C_PASS@@
-        # @@TMA_STORE_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
     )

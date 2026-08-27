@@ -12,6 +12,7 @@ CATALOG. Also runnable as a script (forwards argv to pytest).
 
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
 import sys
@@ -22,7 +23,7 @@ import torch
 
 from gemm_test_utils import (
     requires_int8_mma,
-    requires_sm100,
+    requires_matmul_gpu,
     Plan as _plan,
     vp as _vp,
     resolve as _resolve,
@@ -31,14 +32,16 @@ from gemm_test_utils import (
     requires_sm107,
 )
 
-# Module-wide GPU gate — every test here is end-to-end and needs a B200.
-pytestmark = [pytest.mark.L0, requires_sm100]
+# Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
+pytestmark = [pytest.mark.L0, requires_matmul_gpu]
 
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
-from cudnn.gemm.frost.compiler import _current_arch, _epi_chunk_elems, _epi_vec_bytes
-from cudnn.gemm.frost.tile_config import CATALOG, by_name
+from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, _current_arch, _epi_chunk_elems, _epi_vec_bytes
+from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.tile_config import CATALOG, ConfigSm120, by_name
 
 _TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -112,12 +115,12 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x40x128_128x40x32_cluster1x1_1ctamma",  # 32+8 tail span
     "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
     "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
-    # CTA tiles split across num_mma_m MMA instructions along M. Split is just
+    # CTA tiles split across mma_size_m MMA instructions along M. Split is just
     # another geometry axis, so it rides the same dtype x layout x shape matrix;
     # the invariants it has to hold are pinned by the unit tests at the end.
-    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
-    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # num_mma_m=2, acc_stages drops to 1
-    "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # num_mma_m=2 at mma_inst_m=64 (packed drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # mma_size_m=2
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # mma_size_m=2, acc_stages drops to 1
+    "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # mma_size_m=2 at mma_inst_m=64 (packed drain)
     "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # on the pair (cuBLAS geometry)
     "CONFIG_sm100_256x128x128_128x128x32_cluster2x2_1ctamma",  # split + both multicasts
     "CONFIG_sm100_256x256x64_128x256x32_cluster2x1_1ctamma",  # split + K_BYTES=64
@@ -125,12 +128,17 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     # half is not a power of two exercises the tile-clamped epilogue chunk.
     "CONFIG_sm100_128x48x128_64x48x32_cluster2x1_2ctamma",  # 2x2 DP, 24-col per-M-block drain
     "CONFIG_sm100_128x16x128_64x16x32_cluster2x1_2ctamma",  # 2x2 DP, 8-col per-M-block drain
+    # sm120 (warp-scoped MMA, no cluster / no cta_group). Its arch range starts
+    # at SM 10.0, so it runs on the Blackwell datacenter parts too. The family
+    # is pinned to one geometry for now, so there is one entry to sweep.
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
 )
 
 _BATCHED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # rank-3 baseline
     "CONFIG_sm100_64x64x128_64x64x32_cluster2x2_1ctamma",  # rank-3 + TMA multicast
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # rank-3 + CTA_2 MMA
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",  # rank-3 on the warp-MMA family
 )
 
 _BATCHED_SHAPES: tuple[tuple[int, int, int, int], ...] = (
@@ -173,6 +181,7 @@ _NONCANONICAL_LAYOUTS: tuple[tuple[str, str], ...] = tuple(p for p in _INPUT_LAY
 _NONPACKED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
 )
 _NONPACKED_LAYOUTS: tuple[tuple[str, str], ...] = (
     ("k", "k"),
@@ -187,11 +196,11 @@ _NONPACKED_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
 def _sweep_config_names() -> list[str]:
     """Quick subset by default; full catalog under CUDNN_GEMM_TEST_FULL=1.
 
-    The full sweep expands every catalog geometry (all arches) across both
-    cta_groups; combos the engine rejects — sm103 configs (block-scale-only
-    family), odd-cga_m 2ctamma — SKIP via the engine's own clean rejection."""
+    The full sweep expands every catalog geometry of every family; combos the
+    engine rejects — sm103 configs (block-scale-only family), an sm120 config on
+    a non-K-major graph — SKIP via the engine's own clean rejection."""
     if os.environ.get("CUDNN_GEMM_TEST_FULL", "0") == "1":
-        return [f"{c.name}_{g}ctamma" for c in CATALOG for g in (1, 2)]
+        return [c.name for c in CATALOG]
     return list(_QUICK_CONFIGS)
 
 
@@ -241,7 +250,6 @@ def _compatible(
     out_dtype: str,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
     out_major: str = "n",
 ) -> tuple[bool, str]:
     """Reject only shapes the kernel can't service. Returns (ok, reason)."""
@@ -263,16 +271,24 @@ def _compatible(
             f"{b_contig_extent * in_eb} not 16B-aligned. "
             f"{in_dtype!r} needs that extent % {16 // in_eb} == 0."
         )
-    cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb, cta_group)
+    cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
     # Each MMA instruction reads its own M sub-block of the SMEM tile, so the
-    # swizzle-group rule applies per MMA (== the whole extent at num_mma_m == 1).
-    mma_smem_m = cta_smem_m // cfg.num_mma_m
+    # swizzle-group rule applies per MMA (== the whole extent at mma_size_m == 1).
+    mma_smem_m = cta_smem_m // cfg.mma_size_m
     mma_smem_n = cta_smem_n
     if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
         return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     if b_major == "n" and (mma_smem_n < mn_group_elems or mma_smem_n % mn_group_elems != 0):
         return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
+        return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
+    if cfg.pipeline == "sm120":
+        # v1 scope of the warp-scoped MMA template: K-major operands, N-major output.
+        if a_major != "k" or b_major != "k":
+            return False, f"sm120 reads K-major operands only, got A {a_major}-major / B {b_major}-major"
+        if out_major != "n":
+            return False, "sm120 stores N-major only"
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
@@ -602,12 +618,12 @@ def _cached_outcome(entry):
     return entry
 
 
-def _plan_or_skip(cache, key, build_graph, cfg, cta_group):
+def _plan_or_skip(cache, key, build_graph, cfg):
     """JIT the anchor graph; the engine's clean "unsupported" rejections —
     NotImplementedError from the compiler gates, or the registry's "no kernel
     template" — SKIP, any other compile error FAILS."""
     try:
-        compiled = _plan(build_graph(), config=cfg, cta_group=cta_group)
+        compiled = _plan(build_graph(), config=cfg)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         if isinstance(e, NotImplementedError) or (isinstance(e, ValueError) and "no kernel template" in str(e)):
@@ -627,7 +643,6 @@ def _pick_anchor(
     out_dt: str,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
     out_major: str = "n",
 ) -> tuple[int, int, int] | None:
     """First menu shape compatible with (cfg, in_dt, out_dt), as the JIT anchor.
@@ -639,7 +654,7 @@ def _pick_anchor(
     runtime shapes to be drop-in.
     """
     for shape in _WEIRD_SHAPES:
-        ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, cta_group, out_major)
+        ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, out_major)
         if ok:
             return shape
     return None
@@ -652,15 +667,14 @@ def _get_compiled(
     out_dt: str,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
     out_major: str = "n",
 ):
     """Return the cached compiled kernel, building it on first miss."""
-    key = (cfg.name, in_dt, out_dt, a_major, b_major, cta_group, out_major)
+    key = (cfg.name, in_dt, out_dt, a_major, b_major, out_major)
     if key in cache:
         return _cached_outcome(cache[key])
 
-    anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, cta_group, out_major)
+    anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, out_major)
     if anchor is None:
         # No compatible anchor to build against (rare; e.g. K_BYTES vs elem_bytes mismatch).
         msg = f"no menu shape is compatible with ({cfg.name}, {in_dt}->{out_dt})"
@@ -672,7 +686,6 @@ def _get_compiled(
         key,
         lambda: _build_graph(*anchor, in_dt, out_dt, a_major, b_major, out_major),
         cfg,
-        cta_group,
     )
 
 
@@ -683,14 +696,13 @@ def _pick_batched_anchor(
     batch: int,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
     out_major: str = "n",
 ) -> tuple[int, int, int] | None:
     """Pick a compatible M/N/K anchor for a fixed batch size."""
     for b, M, N, K in _BATCHED_SHAPES:
         if b != batch:
             continue
-        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group, out_major)
+        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, out_major)
         if ok:
             return M, N, K
     return None
@@ -704,7 +716,6 @@ def _get_batched_compiled(
     batch: int,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
     out_major: str = "n",
 ):
     """Return the cached rank-3 compiled kernel for this graph batch."""
@@ -716,13 +727,12 @@ def _get_batched_compiled(
         batch,
         a_major,
         b_major,
-        cta_group,
         out_major,
     )
     if key in cache:
         return _cached_outcome(cache[key])
 
-    anchor = _pick_batched_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, cta_group, out_major)
+    anchor = _pick_batched_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, out_major)
     if anchor is None:
         msg = f"no batched menu shape is compatible with " f"({cfg.name}, {in_dt}->{out_dt}, batch={batch})"
         cache[key] = ("skip", msg)
@@ -733,7 +743,6 @@ def _get_batched_compiled(
         key,
         lambda: _build_batched_graph(batch, *anchor, in_dt, out_dt, a_major, b_major, out_major),
         cfg,
-        cta_group,
     )
 
 
@@ -744,13 +753,12 @@ def _pick_batch_broadcast_anchor(
     batch: int,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
 ) -> tuple[int, int, int] | None:
     """Pick a compatible M/N/K anchor for a fixed broadcast output batch."""
     for b, M, N, K in _BATCH_BROADCAST_SHAPES:
         if b != batch:
             continue
-        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
         if ok:
             return M, N, K
     return None
@@ -765,7 +773,6 @@ def _get_batch_broadcast_compiled(
     broadcast_side: str,
     a_major: str = "k",
     b_major: str = "k",
-    cta_group: int = 2,
 ):
     """Return the cached rank-3 compiled kernel for a batch-broadcast graph."""
     key = (
@@ -777,12 +784,11 @@ def _get_batch_broadcast_compiled(
         batch,
         a_major,
         b_major,
-        cta_group,
     )
     if key in cache:
         return _cached_outcome(cache[key])
 
-    anchor = _pick_batch_broadcast_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, cta_group)
+    anchor = _pick_batch_broadcast_anchor(cfg, in_dt, out_dt, batch, a_major, b_major)
     if anchor is None:
         msg = f"no batch-broadcast menu shape is compatible with " f"({cfg.name}, {in_dt}->{out_dt}, batch={batch})"
         cache[key] = ("skip", msg)
@@ -793,7 +799,6 @@ def _get_batch_broadcast_compiled(
         key,
         lambda: _build_batch_broadcast_graph(batch, *anchor, in_dt, out_dt, broadcast_side, a_major, b_major),
         cfg,
-        cta_group,
     )
 
 
@@ -816,12 +821,12 @@ def test_matmul(
     shape: tuple[int, int, int],
 ) -> None:
     """One (config, dtype-pair, shape); incompatible combos SKIP, else bit-tight."""
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, *shape, in_dt, out_dt, cta_group=cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, *shape, in_dt, out_dt)
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt, cta_group=cta_group)
+    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt)
 
     M, N, K = shape
     a, b, c = _mkdata(M, N, K, in_dt, out_dt)
@@ -946,20 +951,20 @@ def test_partial_n_chunk_store_matches_stg(config_name: str, shape: tuple[int, i
     """The two store paths are bit-identical when the last chunk of the N tile is
     partial. Guards the gate-relaxation work: a store rule that only holds for a
     whole chunk passes every other shape in the suite."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M, N, K = shape
-    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", cta_group=cta_group)
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
     if not ok:
         pytest.skip(reason)
 
-    tma = _plan(_straddle_graph(kind, M, N, K), config=cfg, cta_group=cta_group)
+    tma = _plan(_straddle_graph(kind, M, N, K), config=cfg)
     if not tma._compiled.use_tma_store:
         pytest.skip(f"{kind} does not take the TMA-store path on {config_name}")
 
-    chunk = _epi_chunk_elems(tma.chain, cfg, cta_group, True)
+    chunk = _epi_chunk_elems(tma.chain, cfg, True)
     assert N % chunk != 0, f"shape {shape} no longer straddles the {chunk}-element chunk — the test is vacuous"
 
-    stg = _plan(_straddle_graph(kind, M, N, K), config=cfg, cta_group=cta_group, force_stg_epi=True)
+    stg = _plan(_straddle_graph(kind, M, N, K), config=cfg, force_stg_epi=True)
     assert not stg._compiled.use_tma_store
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -985,14 +990,13 @@ def test_partial_n_chunk_store_matches_stg(config_name: str, shape: tuple[int, i
 def test_dense_block_scale_quant_epilogue() -> None:
     """Plain dense GEMM can use terminal block_scale_quantize epilogue."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M = N = K = 128
     block_size = 32
     g = _build_block_quant_graph(M, N, K, block_size)
     compiled = _plan(
         g,
         config=cfg,
-        cta_group=cta_group,
     )
     assert not compiled.block_scale
     assert compiled.chain.quants
@@ -1071,7 +1075,7 @@ def _f8_row_scale_addr(M: int, N: int, block_size: int) -> torch.Tensor:
 )
 def test_dense_col_block_scale_quant(config_name) -> None:
     """M-axis (col) quant: warp-redux amax, compact (B, M/32, N) scale."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M, N, K = 256, 128, 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1088,7 +1092,7 @@ def test_dense_col_block_scale_quant(config_name) -> None:
     QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert compiled.chain.quants[0].axis == 1
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1110,7 +1114,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
     """COL block quantize with an E5M3 scale. This path keeps the scale in a
     per-lane register (`_scale_mine_*`) before storing, so it exercises the
     zero-init + assignment + store of the byte carrier that row quant does not."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
@@ -1122,7 +1126,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
     QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E5M3)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert compiled.chain.quants[0].axis == 1 and compiled.chain.quants[0].scale_dtype == "fp8_e5m3"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1141,7 +1145,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
 def test_dense_row_col_dual_quant_f8_reorder() -> None:
     """The cutedsl dual-output pattern: one producer -> row quant + col quant,
     both with F8_128x4 scale reordering."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     bs = 32
     g = cudnn.pygraph(
@@ -1166,7 +1170,7 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
     QSc.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
 
@@ -1259,10 +1263,10 @@ def _fp4_dual_graph(M, N, K, fp4_axis, fp4_bs, fp4_scale_dt):
 @pytest.mark.parametrize("fp4_axis", [-1, 1], ids=["row", "col"])
 def test_dense_mxfp4_quant_output(fp4_axis) -> None:
     """mxfp4 (fp4 data + e8m0 SF, block32) quant tap beside an fp8 row quant."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = _fp4_dual_graph(M, N, K, fp4_axis, 32, cudnn.data_type.FP8_E8M0)
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert chain.output_specs[0].dtype == "fp4_e2m1" and chain.output_specs[1].dtype == "fp8_e4m3"
 
@@ -1289,7 +1293,7 @@ def test_dense_nvfp4_quant_output() -> None:
     """nvfp4 (fp4 data + e4m3 SF, block16) quant tap; slot0 = bf16 pre-quant tap
     (vsize 16). Dequantized-value tolerance (rcp_approx of a non-pow2 e4m3
     scale is inexact vs the torch reference)."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     bs = 16
     g = cudnn.pygraph(
@@ -1307,7 +1311,7 @@ def test_dense_nvfp4_quant_output() -> None:
     QS4.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
@@ -1329,7 +1333,7 @@ def test_dense_nvfp4_quant_output() -> None:
 @pytest.mark.parametrize("fp4_axis,bs,scale_dt", [(-1, 16, "e4m3"), (-1, 32, "e8m0"), (1, 32, "e8m0")], ids=["nvfp4-row", "mxfp4-row", "mxfp4-col"])
 def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
     """fp4 quant data as the ONLY output (slot 0): Phase C codegen-emitted store."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1350,7 +1354,7 @@ def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
         QS4.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
     QS4.set_output(True).set_data_type(scale_cudnn)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert compiled.chain.output_specs[0].dtype == "fp4_e2m1"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1386,7 +1390,7 @@ def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
 def test_dense_col_block16_quant(config_name) -> None:
     """block16 col quant: half-warp redux; the cta_tile_m=64 1-CTA packed
     layout (16 active rows per warp = exactly one block) is supported."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1402,7 +1406,7 @@ def test_dense_col_block16_quant(config_name) -> None:
     QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
     qs = torch.zeros(1, M // bs, N, dtype=torch.float8_e8m0fnu, device="cuda")
@@ -1418,7 +1422,7 @@ def test_dense_col_block16_quant(config_name) -> None:
 
 def test_dense_block16_fp8_quant() -> None:
     """block_size=16 row quant with fp8 data (vsize pinned to the block)."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1434,7 +1438,7 @@ def test_dense_block16_fp8_quant() -> None:
     QS.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
     qs = torch.empty(1, M, N // bs, dtype=torch.float8_e8m0fnu, device="cuda")
@@ -1452,7 +1456,7 @@ def test_dense_mixed_block_quants() -> None:
     """Two quants with DIFFERENT block sizes in one graph: nvfp4 row block16 +
     fp8 row block32 (vsize = max block; the small block quantizes per
     sub-chunk), plus a col16 alongside a row32 variant."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1476,7 +1480,7 @@ def test_dense_mixed_block_quants() -> None:
     QSc.set_dim([1, M // 16, N]).set_stride([M // 16 * N, N, 1])
     QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert sorted(q.block_size for q in compiled.chain.quants) == [16, 16, 32]
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
@@ -1525,16 +1529,16 @@ def test_dense_col_quant_rejections() -> None:
         QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
         return g
 
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     with pytest.raises(ValueError, match="divisible by block_size"):
-        _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg, cta_group=cta_group)
+        _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg)
     with pytest.raises(NotImplementedError, match="block_size 32"):
-        _plan(_col_graph(256, 128, 128, 8), config=cfg, cta_group=cta_group)
+        _plan(_col_graph(256, 128, 128, 8), config=cfg)
 
 
 def test_dense_block_scale_quant_with_dense_tap() -> None:
     """Quant data rides slot 0 while the pre-quant producer is also tapped."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1551,7 +1555,7 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     specs = compiled.chain.output_specs
     assert len(specs) == 2 and specs[0].quant_idx is None and specs[1].quant_idx == 0
     assert [o.source for o in compiled.chain.outputs] == ["op_0", "quant_0", "quant_scale_0"]
@@ -1577,7 +1581,7 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
 def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
     """The chunk stays pinned to the quant block even when the widest dense
     output is 4 bytes: 32 elements x 4 B = 128 B, split into four 32 B stores."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1593,8 +1597,8 @@ def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
     Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
-    assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == block_size * 4
+    compiled = _plan(g, config=cfg)
+    assert _epi_vec_bytes(compiled.chain, cfg) == block_size * 4
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     tap = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
@@ -1615,7 +1619,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
     32-lane block group: a narrower one has the upper lanes store a scale they
     never computed, to columns past the chunk (and past the scale tensor on the
     last chunk of a row block)."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M, N, K, bs = 256, 128, 128, 32
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1632,8 +1636,8 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
     QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
     QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
-    assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == bs * 2
+    compiled = _plan(g, config=cfg)
+    assert _epi_vec_bytes(compiled.chain, cfg) == bs * 2
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
@@ -1656,7 +1660,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
 
 def test_dense_dual_block_scale_quant() -> None:
     """Two quant nodes fan out from one producer (e4m3 + e5m2 data)."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1675,7 +1679,7 @@ def test_dense_dual_block_scale_quant() -> None:
     Q2.set_output(True).set_data_type(cudnn.data_type.FP8_E5M2)
     QS2.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2
     assert [o.source for o in chain.outputs] == ["quant_0", "quant_1", "quant_scale_0", "quant_scale_1"]
@@ -1700,7 +1704,7 @@ def test_dense_dual_block_scale_quant() -> None:
 
 def test_dense_amax_only_no_dense_output() -> None:
     """Reduction-only graph: pointwise chain + AMAX, no dense output at all."""
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
     M = N = K = 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1715,7 +1719,7 @@ def test_dense_amax_only_no_dense_output() -> None:
     amax.set_dim([1, 1, 1]).set_stride([1, 1, 1])
     amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert not compiled.chain.output_specs
     assert [o.source for o in compiled.chain.outputs] == ["reduction_0"]
 
@@ -1755,8 +1759,8 @@ def test_input_layout_matmul(
 ) -> None:
     """A M-major / B N-major inputs over the full (config, dtype, shape) matrix."""
     M, N, K = shape
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
     if not ok:
         pytest.skip(reason)
 
@@ -1767,7 +1771,6 @@ def test_input_layout_matmul(
         out_dt,
         a_major,
         b_major,
-        cta_group=cta_group,
     )
     a, b, c = _mkdata(M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
@@ -1812,8 +1815,8 @@ def test_nonpacked_batched_matmul(
 ) -> None:
     """Padded A/B/C views exercise dynamic strides in TMA descriptors and stores."""
     batch, M, N, K = 2, 256, 256, 256
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
     if not ok:
         pytest.skip(reason)
 
@@ -1825,7 +1828,6 @@ def test_nonpacked_batched_matmul(
         batch,
         a_major,
         b_major,
-        cta_group=cta_group,
     )
     a, b, c = _mkbatched_nonpacked_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     assert not a.is_contiguous() and not b.is_contiguous() and not c.is_contiguous()
@@ -1857,8 +1859,8 @@ def test_zero_stride_broadcast_input_matmul(
 ) -> None:
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, "k", "k", cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, "k", "k")
     if not ok:
         pytest.skip(reason)
 
@@ -1870,7 +1872,6 @@ def test_zero_stride_broadcast_input_matmul(
         batch,
         "k",
         "k",
-        cta_group=cta_group,
     )
     a, b, c = _mkbatched_zero_stride_input_data(batch, M, N, K, in_dt, out_dt)
     assert a.stride() == (0, 0, 1)
@@ -1908,8 +1909,8 @@ def test_batched_matmul(
 ) -> None:
     """Rank-3 matmul keeps batch as the native L mode and maps it to grid.z."""
     batch, M, N, K = shape
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt)
     if not ok:
         pytest.skip(reason)
 
@@ -1919,7 +1920,6 @@ def test_batched_matmul(
         in_dt,
         out_dt,
         batch,
-        cta_group=cta_group,
     )
 
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt)
@@ -1955,10 +1955,10 @@ def test_input_layout_batched_matmul(
 ) -> None:
     """Rank-3 layout coverage keeps batch native while varying A/B major mode."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     batch, M, N, K = 2, 256, 256, 256
     in_dt = out_dt = "bf16"
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
     if not ok:
         pytest.skip(reason)
 
@@ -1970,7 +1970,6 @@ def test_input_layout_batched_matmul(
         batch,
         a_major,
         b_major,
-        cta_group=cta_group,
     )
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
@@ -2006,8 +2005,8 @@ def test_batch_broadcast_matmul(
 ) -> None:
     """Rank-3 matmul with one input broadcast across the output batch."""
     batch, M, N, K = shape
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group)
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt)
     if not ok:
         pytest.skip(reason)
 
@@ -2018,7 +2017,6 @@ def test_batch_broadcast_matmul(
         out_dt,
         batch,
         broadcast_side,
-        cta_group=cta_group,
     )
 
     a, b, c = _mkbatch_broadcast_data(batch, M, N, K, in_dt, out_dt, broadcast_side)
@@ -2057,10 +2055,10 @@ def test_input_layout_batch_broadcast_matmul(
 ) -> None:
     """Input-layout coverage when one operand is broadcast across batch."""
     config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     batch, M, N, K = 3, 256, 256, 256
     in_dt = out_dt = "bf16"
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
     if not ok:
         pytest.skip(reason)
 
@@ -2073,7 +2071,6 @@ def test_input_layout_batch_broadcast_matmul(
         broadcast_side,
         a_major,
         b_major,
-        cta_group=cta_group,
     )
     a, b, c = _mkbatch_broadcast_data(
         batch,
@@ -2113,7 +2110,7 @@ _FP8_MIXED_CONFIGS = [
 @pytest.mark.parametrize("config_name", _FP8_MIXED_CONFIGS, ids=[_config_id(n) for n in _FP8_MIXED_CONFIGS])
 def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     """A and B each an arbitrary FP8 variant -> FP16 out, bit-exact vs fp32."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M = N = K = 256
 
     g = cudnn.pygraph(
@@ -2137,7 +2134,7 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn.data_type.HALF)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert compiled.chain.matmul.a_dtype == a_dt
     assert compiled.chain.matmul.b_dtype == b_dt
 
@@ -2180,7 +2177,7 @@ _INT8_OUT_DTYPES = {
 def test_int8_matmul(config_name: str, out_dt: str) -> None:
     """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
     rounded integer reference (values small enough that the rounding is exact)."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M = N = K = 256
     cudnn_dt, torch_dt, vmax = _INT8_OUT_DTYPES[out_dt]
 
@@ -2195,7 +2192,7 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn_dt)
 
-    compiled = _plan(g, config=cfg, cta_group=cta_group)
+    compiled = _plan(g, config=cfg)
     assert compiled.chain.matmul.accum_dtype == "int32"
     assert compiled.chain.output_dtype == out_dt
 
@@ -2241,8 +2238,8 @@ def test_m_major_output_batched(
     the TMA-store and STG m-major store paths."""
     batch = 3
     M, N, K = shape
-    cfg, cta_group = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group, out_major="m")
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, out_major="m")
     if not ok:
         pytest.skip(reason)
     compiled = _get_batched_compiled(
@@ -2251,7 +2248,6 @@ def test_m_major_output_batched(
         in_dt,
         out_dt,
         batch,
-        cta_group=cta_group,
         out_major="m",
     )
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, out_major="m")
@@ -2283,8 +2279,8 @@ def _mm_plan(b_major: str):
     B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, b_major))
     C = g.matmul(A=A, B=B, name="mm")
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    cfg, cta_group = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
-    return _plan(g, config=cfg, cta_group=cta_group), M, N, K
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    return _plan(g, config=cfg), M, N, K
 
 
 def test_operand_k_mismatch_rejected():
@@ -2407,15 +2403,15 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
     assert any(name.endswith("generated_kernel.py") for name in renamed)
 
 
-# --- num_mma_m geometry invariants ------------------------------------------
+# --- mma_size_m geometry invariants ------------------------------------------
 #
-# The CTA tile may span several `tcgen05.mma` along M (`num_mma_m = cta_tile_m /
+# The CTA tile may span several `tcgen05.mma` along M (`mma_size_m = cta_tile_m /
 # mma_inst_m`). The e2e behaviour rides `_QUICK_CONFIGS` above; what needs its own
 # assertion is the geometry contract those configs rely on.
 
 
 @pytest.mark.parametrize(
-    "name,num_mma_m",
+    "name,mma_size_m",
     [
         ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
         ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
@@ -2423,14 +2419,14 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
         ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
     ],
 )
-def test_num_mma_m_is_derived_from_the_two_tiles(name: str, num_mma_m: int) -> None:
+def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> None:
     cfg = by_name(name)
-    assert cfg.num_mma_m == num_mma_m
-    assert cfg.cta_tile_m == cfg.num_mma_m * cfg.mma_inst_m
-    assert cfg.mma_inst_n == cfg.cta_tile_n  # N is never split
+    assert cfg.mma_size_m == mma_size_m
+    assert cfg.cta_tile_m == cfg.mma_size_m * cfg.mma_tile_m
+    assert cfg.mma_tile_n == cfg.cta_tile_n  # N is never split
     # The epilogue drains one MMA-M block per pass, so its subtile height is the
     # instruction's M, not the CTA tile's.
-    assert cfg.epi_tile_mn[0] == cfg.mma_inst_m
+    assert cfg.epi_tile_m == cfg.mma_tile_m
 
 
 @pytest.mark.parametrize(
@@ -2438,12 +2434,12 @@ def test_num_mma_m_is_derived_from_the_two_tiles(name: str, num_mma_m: int) -> N
     [
         # The pre-existing M/N bounds read off the MMA INSTRUCTION tile now that
         # the CTA tile can be several instructions wide.
-        ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_inst_m=32"),
-        ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_inst_n=512"),
-        ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_inst_n=12"),
+        ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_tile_m=32"),
+        ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_tile_n=512"),
+        ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_tile_n=12"),
         # At most 2 instructions along M this pass...
-        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "num_mma_m=4"),
-        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "num_mma_m=4"),
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "mma_size_m=4"),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "mma_size_m=4"),
         # ... and N is not an instruction-count axis at all.
         ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
     ],
@@ -2455,39 +2451,43 @@ def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
 
 
 def test_catalog_enumerates_the_mma_m_axis() -> None:
-    """M is enumerated as (mma_inst_m, num_mma_m); `cta_tile_m` is their PRODUCT,
+    """M is enumerated as (mma_inst_m, mma_size_m); `cta_tile_m` is their PRODUCT,
     not an axis. So a split tile is an ordinary catalog geometry and reaches the
     funnel, the CUDNN_GEMM_TEST_FULL sweep and the benchmarks' default config set.
-    `num_mma_m == 1` is enumerated first, so an unqualified `cta_tile_m` lookup
+    `mma_size_m == 1` is enumerated first, so an unqualified `cta_tile_m` lookup
     still lands on the unsplit tile — several suites rely on that."""
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.kernel_registry import candidates
     from cudnn.gemm.frost.tile_config import _M_AXES
 
     sm100 = [c for c in CATALOG if c.pipeline == "sm100"]
-    assert {(c.mma_inst_m, c.num_mma_m) for c in sm100} == set(_M_AXES)
-    assert all(c.cta_tile_m == c.mma_inst_m * c.num_mma_m for c in CATALOG)
-    # sm103 / sm107 pin the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
-    # mma_inst_m % 128 == 0); sm107 still splits, sm103 does not (supports_multi_mma_m=False).
-    assert {c.mma_inst_m for c in CATALOG if c.pipeline != "sm100"} == {128}
-    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm107"} == {1, 2}
-    assert {c.num_mma_m for c in CATALOG if c.pipeline == "sm103"} == {1}
+    assert {(c.mma_tile_m, c.mma_size_m) for c in sm100} == set(_M_AXES)
+    # mma_size_m counts instructions per WARP tile; on the tcgen05 families a
+    # warp tile IS the CTA tile, on sm120 the CTA tile is warps_m of them.
+    assert all(c.warp_tile_m == c.mma_tile_m * c.mma_size_m for c in CATALOG)
+    # sm103 pins the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
+    # mma_tile_m % 128 == 0) and does not split (MMA_SIZE_M_MAX = 1).
+    assert {c.mma_tile_m for c in CATALOG if c.pipeline == "sm103"} == {128}
+    # sm120's warp-scoped MMA has no M-split axis: its two M values are whole tiles.
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"} == {2}
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2}
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm103"} == {1}
     # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
-    assert next(c for c in sm100 if c.cta_tile_m == 128).num_mma_m == 1
+    assert next(c for c in sm100 if c.cta_tile_m == 128).mma_size_m == 1
 
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
     B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
     g.matmul(A=A, B=B, name="mm").set_output(True)
-    assert {cfg.num_mma_m for _t, cfg in candidates(analyze(g))} == {1, 2}
+    assert {cfg.mma_size_m for _t, cfg in candidates(analyze(g))} == {1, 2}
 
 
 @pytest.mark.parametrize(
     "name,cta_group,want",
     [
         ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2, 128),  # mma_inst_m=128 -> full N
-        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=1
-        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=2
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, mma_size_m=1
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, mma_size_m=2
         ("CONFIG_sm100_128x256x128_64x256x32_cluster2x1", 2, 128),
         ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1, 128),  # 1-CTA never halves
     ],
@@ -2495,13 +2495,13 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
 def test_drain_width_keys_on_the_mma_block_height(name: str, cta_group: int, want: int) -> None:
     """The 2-CTA 2x2-DP drain splits N across the two 64-lane halves. That is a
     property of the per-CTA MMA block height (cluster-MMA m=128), NOT of the CTA
-    tile — they agree only at num_mma_m == 1. Keying it on cta_tile_m made the
+    tile — they agree only at mma_size_m == 1. Keying it on cta_tile_m made the
     compiler over-report the drain width, which both over-reserved TMEM (losing an
     acc stage) and let the baked STG chunk exceed the real subtile: the 2-CTA
     cta_tile_n=48 split entry of _QUICK_CONFIGS faulted with `misaligned address`."""
     from cudnn.gemm.frost.compiler import _epi_tile_cols
 
-    assert _epi_tile_cols(by_name(name), cta_group) == want
+    assert _epi_tile_cols(by_name(f"{name}_{cta_group}ctamma")) == want
 
 
 _MMAJOR_COORD_KINDS = ("gen_index_axis1", "gen_index_axis2", "per_row", "per_col", "per_elem")
@@ -2540,14 +2540,14 @@ def test_m_major_tma_store_serves_coordinate_reading_pointwise(config_name: str,
     (gen_index, per_row / per_col / per_elem aux) goes through
     `_mmajor_elem_coord`; before it did not, and gen_index measured wrong on
     BOTH axes here while being exact through STG."""
-    cfg, cta_group = _resolve(config_name)
+    cfg = _resolve(config_name)
     M, N, K = shape
-    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", cta_group=cta_group, out_major="m")
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", out_major="m")
     if not ok:
         pytest.skip(reason)
 
     g, aux_name = _mmajor_coord_graph(kind, M, N, K)
-    plan = _plan(g, config=cfg, cta_group=cta_group)
+    plan = _plan(g, config=cfg)
     if not plan._compiled.use_tma_store:
         pytest.skip(f"{kind} does not take the M-major TMA-store path on {config_name}")
 
@@ -2583,8 +2583,8 @@ def test_tma_arm_never_writes_past_the_output_rows() -> None:
     there are no overhang rows to write. 384 with cluster2x1 x cta_tile_m=128
     (cgrp_tile_m=256) leaves 128."""
     M, N, K = 384, 256, 256
-    cfg, cta_group = _resolve("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
-    assert M % (cfg.cta_tile_m * cfg.cgrp_size_m) != 0
+    cfg = _resolve("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    assert M % (cfg.cta_tile_m * cfg.cga_size_m) != 0
 
     g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
@@ -2595,7 +2595,7 @@ def test_tma_arm_never_writes_past_the_output_rows() -> None:
     q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
     sc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
 
-    plan = _plan(g, config=cfg, cta_group=cta_group)
+    plan = _plan(g, config=cfg)
     if not plan._compiled.use_tma_store:
         pytest.skip("this graph does not take the TMA-store arm")
 
@@ -2623,7 +2623,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     """`cta_group == 2 and cta_tile_n < 64` used to fall back to STG on the
     theory that a subtile would split across the MMA pair. It does not: each
     CTA drains its own half and the subtile span walk already halves to fit.
-    Measured bit-identical to STG on 16 (config, cta_group) pairs."""
+    Measured bit-identical to STG on 16 (config) pairs."""
     from cudnn.gemm.frost.compiler import _use_tma_store_epi
     from cudnn.gemm.frost.graph_analyzer import analyze
 
@@ -2633,7 +2633,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
     g.matmul(A=A, B=B, name="mm").set_output(True)
     cfg = by_name(name)
     assert cfg.cta_tile_n < 64
-    assert _use_tma_store_epi(analyze(g), cfg, 2) is True
+    assert _use_tma_store_epi(analyze(g), cfg) is True
 
 
 @pytest.mark.parametrize(
@@ -2667,7 +2667,7 @@ def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: t
         return g, A, B, C
 
     g, _, _, _ = build()
-    assert _store_modes(analyze(g), cfg, cta_group) == ("tma",)
+    assert _store_modes(analyze(g), cfg) == ("tma",)
 
     torch.manual_seed(0)
     a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
@@ -2680,7 +2680,8 @@ def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: t
         c.zero_()
         tail = raw[2 * M * N :].clone()
         gg, aa, bb, cc = build()
-        jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group, force_stg_epi=force_stg)({aa: a, bb: b, cc: c})
+        with _force_stg_epi(force_stg):
+            jit_from_cudnn_graph(gg, config=cfg)({aa: a, bb: b, cc: c})
         torch.cuda.synchronize()
         assert torch.equal(raw[2 * M * N :], tail), "the store ran past the output"
         return c.clone()
@@ -2711,7 +2712,7 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
     from cudnn.gemm.frost.graph_analyzer import analyze
 
     cfg = by_name(name)
-    epi_n = _epi_n(cfg, cta_group, out_dt)
+    epi_n = _epi_n(cfg, out_dt)
     assert epi_n * DTYPE_BYTES[out_dt] == want
 
     # The width is no longer a shared constant -- it is per output, so it is a
@@ -2721,7 +2722,7 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     g.matmul(A=A, B=B, name="mm").set_output(True).set_data_type(_CUDNN_DTYPE.get(out_dt, cudnn.data_type.FLOAT))
-    seq = _tma_store_sequence(analyze(g), cfg, cta_group, frozenset({0}), epi_n)
+    seq = _tma_store_sequence(analyze(g), cfg, frozenset({0}), epi_n)
     assert f"alignment={want}" in seq, seq
 
 
@@ -2737,14 +2738,19 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.tile_config import by_name
 
+    from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
+
     tmpl_dir = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
     files = sorted(p for p in tmpl_dir.glob("sm*.py"))
-    assert len(files) == 16, [p.name for p in files]
+    assert len(files) == 7, [p.name for p in files]
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
-        assert "@@INJECT_TMA_STORE_SEQUENCE@@" in src, path.name
         assert "alignment=epi_smem_row_bytes" not in src, path.name
+        # sm120 has no TMA-store arm at all (its pipeline always stores STG), so
+        # there is no store sequence for the renderer to unroll.
+        if path.name.split("_")[0] in _TMA_STORE_EPI_PIPELINES:
+            assert "@@INJECT_TMA_STORE_SEQUENCE@@" in src, path.name
 
     # The renderer emits the row width the output's OWN dtype implies.
     M = N = K = 256
@@ -2754,8 +2760,8 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
     g.matmul(A=A, B=B, name="mm").set_output(True)
     chain = analyze(g)
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    epi_n = _epi_n(cfg, 1, chain.output_dtype)
-    seq = _tma_store_sequence(chain, cfg, 1, frozenset({0}), epi_n)
+    epi_n = _epi_n(cfg, chain.output_dtype)
+    seq = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
     assert f"alignment={epi_n * 2}" in seq, seq  # bf16
 
 
@@ -2784,8 +2790,8 @@ def test_epilogue_chunk_is_the_width_the_arm_hands_the_snippet(name: str, cta_gr
     g.matmul(A=A, B=B, name="mm").set_output(True)
     chain = analyze(g)
     cfg = by_name(name)
-    assert _epi_chunk_elems(chain, cfg, cta_group, True) == _epi_n(cfg, cta_group, chain.output_dtype)
-    assert _epi_chunk_elems(chain, cfg, cta_group, False) == _epi_vec_bytes(chain, cfg, cta_group) // DTYPE_BYTES[chain.output_dtype]
+    assert _epi_chunk_elems(chain, cfg, True) == _epi_n(cfg, chain.output_dtype)
+    assert _epi_chunk_elems(chain, cfg, False) == _epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype]
 
 
 @pytest.mark.parametrize(
@@ -2824,7 +2830,7 @@ def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> N
     g, _, _, _ = build()
     chain = analyze(g)
     assert chain.out_major == "m"
-    assert _store_modes(chain, cfg, cta_group) == ("tma",)
+    assert _store_modes(chain, cfg) == ("tma",)
 
     torch.manual_seed(0)
     a = torch.randn(1, m, k, device="cuda", dtype=torch.bfloat16)
@@ -2836,7 +2842,8 @@ def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> N
         c = raw.view(torch.bfloat16)[: n * m].view(1, n, m).transpose(1, 2)
         tail = raw[2 * n * m :].clone()
         gg, aa, bb, cc = build()
-        jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group, force_stg_epi=force_stg)({aa: a, bb: b, cc: c})
+        with _force_stg_epi(force_stg):
+            jit_from_cudnn_graph(gg, config=cfg)({aa: a, bb: b, cc: c})
         torch.cuda.synchronize()
         assert torch.equal(raw[2 * n * m :], tail), "store ran past the output"
         return c.contiguous()
@@ -2869,7 +2876,7 @@ def test_m_major_chunk_follows_n(N: int, want_chunk: int) -> None:
     assert chain.out_major == "m"
     # the STG chunk specifically -- `_epi_chunk_elems(..., use_tma=False)` -- which
     # is what an M-major scatter walks, whichever arm this config ends up on.
-    assert _epi_chunk_elems(chain, cfg, 1, False) == want_chunk
+    assert _epi_chunk_elems(chain, cfg, False) == want_chunk
 
 
 def test_epi_n_divides_the_drain_width() -> None:
@@ -2885,12 +2892,12 @@ def test_epi_n_divides_the_drain_width() -> None:
     seen_non_pow2_tile = False
     for cfg in CATALOG:
         for cta_group in (1, 2):
-            if cta_group == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_n % 16 or cfg.mma_inst_n % 16):
+            if cta_group == 2 and (cfg.cga_size_m % 2 or cfg.cta_tile_n % 16 or cfg.mma_tile_n % 16):
                 continue
-            cols = _epi_tile_cols(cfg, cta_group)
+            cols = _epi_tile_cols(cfg)
             seen_non_pow2_tile |= cols & (cols - 1) != 0
             for dt in ("bf16", "fp32", "fp8_e4m3", "fp4_e2m1"):
-                n = _epi_n(cfg, cta_group, dt)
+                n = _epi_n(cfg, dt)
                 assert n > 0 and n & (n - 1) == 0, (cfg.name, cta_group, dt, n)
                 assert cols % n == 0, f"{cfg.name} cta_group={cta_group} {dt}: epi_n {n} does not divide {cols}"
     assert seen_non_pow2_tile, "the catalog no longer carries a non-power-of-2 drain width — the test is vacuous"
@@ -2908,7 +2915,7 @@ def test_the_auto_path_never_picks_a_non_power_of_two_tile() -> None:
             for num_gemms in (1, 2, 3):
                 for block_scale in (False, True):
                     try:
-                        widths.add(select_config(M, N, num_gemms=num_gemms, block_scale=block_scale)[0].cta_tile_n)
+                        widths.add(select_config(M, N, num_gemms=num_gemms, block_scale=block_scale).cta_tile_n)
                     except NotImplementedError:
                         pass
     assert widths, "select_config produced nothing — the sweep is vacuous"
@@ -2991,3 +2998,177 @@ def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
         assert len(named) == 1, f"{fn_name}: exactly one branch may name {kwarg!r}, got {len(named)}"
         # ...and the other branch must be reachable without the newer DSL.
         assert len(calls) - len(named) == 1, f"{fn_name}: no branch left that omits {kwarg!r}"
+
+
+# =============================================================================
+# sm120 (consumer Blackwell, warp-scoped MMA) — the family's own wiring. The
+# e2e behaviour rides the config lists above like any other geometry; what is
+# sm120-SPECIFIC is the registry/config plumbing and the v1 scope contract.
+# =============================================================================
+
+
+def test_sm120_registry_wiring() -> None:
+    """The sm120 template is registered with its own family, class and gates."""
+    from cudnn.gemm.frost.kernel_registry import (
+        MMA_TYPE_SUPPORT,
+        TEMPLATES,
+        GraphType,
+        Sm120KernelTemplate,
+    )
+
+    # SM 12.x is in the family's active range (whatever else the range covers).
+    assert any(lo <= 120 < hi for lo, hi in PIPELINE_ARCH_RANGES["sm120"])
+
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120"]
+    assert tmpl.file == "sm120_matmul.py"
+    assert isinstance(tmpl, Sm120KernelTemplate)
+    # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
+    assert not tmpl.supports_multi_gemm
+    assert tmpl.graph_type is GraphType.MATMUL and not tmpl.supports_mainloop_fusion
+
+    # dtype support mirrors the sm100 matmul pipeline (incl. int8 and fp8 mixes)
+    assert ("bf16", "bf16", "fp32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
+    assert ("int8", "int8", "int32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
+
+    # the template file itself ships with the package
+    from pathlib import Path
+
+    import cudnn.gemm.frost.compiler as C
+
+    assert (Path(C.__file__).parent / "kernel_templates" / "sm120_matmul.py").is_file()
+
+
+def test_sm120_tile_config_family() -> None:
+    """ConfigSm120: the family is PINNED to one geometry for now, and it pins
+    rather than validates -- a config crossing in from another family
+    (``as_pipeline``, which the auto path uses on an SM 12.x part) is rewritten
+    to it instead of being rejected, so no caller needs sm120 knowledge."""
+    from cudnn.gemm.frost.tile_config import as_pipeline
+
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    assert len(sm120) == 1
+    (cfg,) = sm120
+    assert isinstance(cfg, ConfigSm120)
+    assert cfg.name == "CONFIG_sm120_128x128x128_16x16x32_cluster1x1"
+
+    # The warp tile is a REAL level here: the CTA tile is split over a 4x2
+    # compute-warp grid, which is what makes sm120 different from the tcgen05
+    # families (where a warp tile is the CTA tile).
+    assert (cfg.cta_tile_m, cfg.cta_tile_n, cfg.cta_tile_k_bytes) == (128, 128, 128)
+    assert (cfg.warp_tile_m, cfg.warp_tile_n, cfg.warp_tile_k_bytes) == (32, 64, 128)
+    # mma.sync is m16n8; the template issues two along N and treats the pair as
+    # one 16x16 instruction.
+    assert (cfg.mma_tile_m, cfg.mma_tile_n, cfg.mma_tile_k_bytes) == (16, 16, 32)
+    assert cfg.mma_size_m == 2  # == the template's _M_FRAGS
+    assert cfg.cga_size_mn == (1, 1) and cfg.warps_per_cta == 12 and cfg.threads_per_cta == 384
+    # The CTA pair is not an axis here at all -- reading it is an error, not a 1.
+    assert not hasattr(cfg, "cta_group")
+
+    # Every axis is pinned, so a name that spells a different one round-trips
+    # to the pinned config and is rejected as non-canonical.
+    with pytest.raises(KeyError, match="round-trips"):
+        by_name("CONFIG_sm120_128x256x128_16x16x32_cluster1x1")
+    with pytest.raises(KeyError, match="round-trips"):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster2x1")
+
+    # as_pipeline: an sm100 auto pick crosses over and lands on the pinned one.
+    conv = as_pipeline(by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"), "sm120")
+    assert isinstance(conv, ConfigSm120) and conv.name == cfg.name
+
+    assert _resolve(cfg.name) is cfg
+
+
+def test_sm120_template_routing() -> None:
+    """select_template routes on the CONFIG alone now that cta_group is geometry,
+    and sm120 has no such axis at all -- ConfigSm120 pins it, like its cluster."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import replace
+
+    chain = analyze(_build_graph(256, 256, 128, "bf16", "bf16"))
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    assert select_template(chain, cfg).file == "sm120_matmul.py"
+    # A 2-CTA sm120 config is not constructible: ConfigSm120 declares no
+    # cta_group field at all, so the mode is not an axis here rather than an
+    # axis the template declines. It still READS as 1 off the base class.
+    assert not hasattr(cfg, "cta_group")
+    with pytest.raises(TypeError, match="cta_group"):
+        replace(cfg, cta_group=2)
+    # sm100 configs keep routing to the sm100 family
+    cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    assert select_template(chain, cfg100).file == "sm100_matmul.py"
+
+
+def test_sm120_scope_gates() -> None:
+    """The v1 scope contract rejects through the registry (never a template
+    AssertionError mid-render): K-major-only inputs, N-major output, and a
+    pair-storable epilogue chunk."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    tmpl = select_template(analyze(_build_graph(256, 256, 128, "bf16", "bf16")), cfg)
+
+    def scope_reject(**graph_kw):
+        return tmpl._extra_reject(analyze(_build_graph(256, 256, 128, "bf16", "bf16", **graph_kw)), cfg)
+
+    assert scope_reject() is None
+    assert "K-major" in scope_reject(a_major="m")
+    assert "K-major" in scope_reject(b_major="n")
+    assert "N-major" in scope_reject(out_major="m")
+
+    # the funnel never offers sm120 points for an out-of-scope chain
+    from cudnn.gemm.frost.kernel_registry import candidates
+
+    nmaj = analyze(_build_graph(256, 256, 128, "bf16", "bf16", b_major="n"))
+    assert not [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"]
+
+
+def test_sm120_epi_vec_clamp_and_stg_only() -> None:
+    """sm120 always renders the transposed-STG epilogue, with the chunk capped
+    at the 8-element fragment row run; the sm100 derivation is untouched."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+
+    chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
+    for name in (
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+    ):
+        c = by_name(name)
+        v = _epi_vec_bytes(chain, c)
+        assert v == 16, name  # 8-element bf16 run (template: 8 % _STG_V == 0)
+        assert _use_tma_store_epi(chain, c) is False, name
+
+    # the sm100 chunk derivation and its TMA-store gate are untouched
+    cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    v100 = _epi_vec_bytes(chain, cfg100)
+    assert v100 >= 16 and _use_tma_store_epi(chain, cfg100) is True
+
+    # 8B-aligned output rows (N=100 bf16) narrow the chunk to 4 elements
+    narrow = analyze(_build_graph(256, 100, 256, "bf16", "bf16"))
+    assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")) == 8
+
+
+def test_sm120_render_smoke() -> None:
+    """Render the sm120 template end-to-end (real tile constants + epilogue
+    snippets) on whatever GPU is active — no cute.compile, so this covers the
+    sm100 CI too. The source must be marker-free, parseable, and carry the
+    STG-only sm120 contract constants."""
+    from cudnn.gemm.frost.compiler import _render_template
+    from cudnn.gemm.frost.epilogue_codegen import generate
+
+    chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
+    for name in (
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",  # odd n-frag tail
+    ):
+        cfg = by_name(name)
+        vec = _epi_vec_bytes(chain, cfg)
+        snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2)  # empty tma_slots == STG everywhere
+        src = _render_template(chain, snippets, cfg)
+        assert "@@" not in src, "leftover injection markers"
+        ast.parse(src)
+        assert "cudnn_frost_sm120_matmul_" in src
+        assert "threads_per_cta = 384" in src
+        assert f"vec_bytes_epi = {vec}" in src
+        assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"
+        assert "tma_c_desc" not in src, "TMA-store arm must be stripped"

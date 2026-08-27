@@ -564,8 +564,8 @@ def build_gemm_plan(graph: cudnn.pygraph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import jit_from_cudnn_graph, plan_config
 
-    config, cta_group = plan_config(analyze(graph))
-    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
+    config = plan_config(analyze(graph))
+    return jit_from_cudnn_graph(graph, config=config)
 
 
 # Analyzer

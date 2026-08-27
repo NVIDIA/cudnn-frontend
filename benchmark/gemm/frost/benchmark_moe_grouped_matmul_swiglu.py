@@ -28,7 +28,7 @@ from benchmark_utils import add_sweep_args, group_offsets, report_pool, resolve_
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the graph with a forced tile config → callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -173,10 +173,10 @@ def _build_spec_map():
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
