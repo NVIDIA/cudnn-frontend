@@ -200,9 +200,10 @@ CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTT
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
 # kernels/dsl/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
-# seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
+# seq_kv_lens overloaded as the THD metadata buffer (int32 len 4B+4):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
+#   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -2270,10 +2271,12 @@ def _host(
             thd_q_lens_tensor,
             thd_kv_lens_tensor,
             thd_lens_form,
-            cutlass.Int32(QH),
+            cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+            n_thd_units,  # CLC path: envelope units; the counter goes unused
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # Grid Python-folds on Cfg constant (avoids DSL if staging).
@@ -2444,8 +2447,8 @@ def compile(  # noqa: A001
     )
     # seq_kv_lens always part of the ABI; read only when CFG.SEQ_KV_LENS_PRESENT == 1
     # (compile-time fold).  THD overloads it as the [seq_kv_lens(B)|cu_q(B+1)|
-    # cu_k(B+1)] metadata buffer (length 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # cu_k(B+1)|batch_remap(B)|live|ctr] metadata buffer (length 4B+4).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

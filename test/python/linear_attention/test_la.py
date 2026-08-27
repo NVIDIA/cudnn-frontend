@@ -679,6 +679,22 @@ def test_bwd_no_decay_gate_grad_floor(backend):
     assert_bwd_parity(backend, make_case("gdn", torch.bfloat16, T=192, alpha=False), gate_grad_tol=0.3)
 
 
+MODEL_GATE_LO = math.exp(-5.0)  # alpha at gate_lower_bound = -5, the model gate range
+
+
+@pytest.mark.parametrize("variant", ("kda", "gdn2"))
+def test_bwd_model_gate_range_bf16(backend, variant):
+    """The per-channel gate at its real range: alpha down to exp(-5)."""
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128, lo=MODEL_GATE_LO))
+
+
+@pytest.mark.xfail(reason="phi(K)/Gamma overflows fp16 once a channel's 16-token cumulative log-decay passes ~-13.5", strict=False)
+@pytest.mark.parametrize("variant", ("kda", "gdn2"))
+def test_bwd_model_gate_range_fp16(backend, variant):
+    """Same in fp16, where the decayed key operands leave the dtype's range."""
+    assert_bwd_parity(backend, make_case(variant, torch.float16, T=128, lo=MODEL_GATE_LO))
+
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_with_checkpoints(backend, variant):
     """The checkpoint dump is non-differentiable and must not block backward."""

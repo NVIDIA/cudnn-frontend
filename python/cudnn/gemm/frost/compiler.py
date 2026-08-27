@@ -3520,6 +3520,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
 
 
 # One 128-byte TMA tensormap slot per CTA per distinct A operand.
+_MOE_SCHED_COUNTER_SLOTS = 1
 _MOE_DESC_SLOT_BYTES = 128
 
 
@@ -3548,6 +3549,19 @@ def _register_legacy_device_view_adapter() -> None:
         # 128-byte tensormap slot the MoE workspace fake declares.
         ptr = view.data_ptr()
         return from_dlpack(view, assumed_align=min(ptr & -ptr, _MOE_DESC_SLOT_BYTES))
+
+
+def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
+    """Zero the dynamic tile scheduler's global counter, stream-ordered.
+
+    It lives in the slot past the per-CTA descriptor scratch, so it rides the
+    same buffer and the same stable pointer that makes the plan graph-safe.
+    A 4-byte D32 memset, not a kernel."""
+    buffers.memset_zero_async(
+        workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
+        4,
+        _as_custream(stream),
+    )
 
 
 def _moe_carve_workspace(caller, n_slots: int, plan: str):
@@ -3609,7 +3623,7 @@ class CompiledMoeGemm:
         """Per-CTA tensormap scratch: one 128-byte slot per CTA per patched
         descriptor. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
+        return (self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS) * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
@@ -3689,7 +3703,8 @@ class CompiledMoeGemm:
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3810,7 +3825,8 @@ class CompiledMoeGemm:
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -3969,7 +3985,7 @@ class CompiledMoeBlockScaleGemm:
         """Per-CTA A-descriptor scratch: one 128-byte tensormap slot per CTA per
         distinct A operand. The persistent grid is shape-independent, so this is
         constant for the plan — which is why override-shape needs no re-query."""
-        return self._grid_ctas * self._desc_slots_per_cta * _MOE_DESC_SLOT_BYTES
+        return (self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS) * _MOE_DESC_SLOT_BYTES
 
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA A-descriptor GMEM workspace (16 int64/slot, 128-byte
@@ -4057,7 +4073,8 @@ class CompiledMoeBlockScaleGemm:
         ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4192,7 +4209,8 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the first_token_offset length); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta, workspace)
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
+        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,

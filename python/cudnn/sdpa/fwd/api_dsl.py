@@ -114,6 +114,10 @@ _SM120_DTYPE_QKV_CODE = {
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
 _WS_ALIGN = 128
 
+# Private torch symbol, resolved once. It only shortcuts the stream context, so
+# a build without it must fall through to the public API rather than fail.
+_CUDA_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
 
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
@@ -130,6 +134,15 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         # ordered against the default stream here, so run in place.
         yield
         return
+    # Fast path: the launch stream is almost always the one torch is already on,
+    # and entering a context for the current stream is a no-op. Building the two
+    # Stream objects below costs ~3.4 us each and this runs several times per
+    # execute; the raw handle getter is ~0.07 us.
+    if _CUDA_RAW_STREAM is not None:
+        _idx = device.index if device.index is not None else torch.cuda.current_device()
+        if handle == _CUDA_RAW_STREAM(_idx):
+            yield
+            return
     torch_current = torch.cuda.current_stream(device)
     torch_default = torch.cuda.default_stream(device)
     if handle == torch_current.cuda_stream:
@@ -147,6 +160,32 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
 # block-cyclic grouping can actually keep that K/V resident; otherwise plain
 # reverse-row LPT.
 _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+# SM count per device for the persistent THD grid. A device property cannot
+# change under a live process, and the query costs ~7 us on the execute hot
+# path, so resolve it once per device.
+_THD_CTAS_CACHE: dict = {}
+# Raw multi_processor_count, cached separately: _THD_CTAS_CACHE holds an
+# already-scaled CTA count, so the two cannot share a key.
+_THD_SMS_CACHE: dict = {}
+
+
+def _thd_cache_key(device):
+    """Cache key for a device. ``torch.device("cuda")`` carries index None and
+    means the CURRENT device, so resolve it — keying on None would hand every
+    device on a multi-GPU host whichever entry landed first."""
+    key = getattr(device, "index", None)
+    return torch.cuda.current_device() if key is None else key
+
+
+def _device_sm_count(device) -> int:
+    """``multi_processor_count``, resolved once per device (see above)."""
+    key = _thd_cache_key(device)
+    n = _THD_SMS_CACHE.get(key)
+    if n is None:
+        n = torch.cuda.get_device_properties(device).multi_processor_count
+        _THD_SMS_CACHE[key] = n
+    return n
 
 
 def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int:
@@ -740,7 +779,18 @@ class SdpaFwdDsl(APIBase):
     def _combine_dtype_tag(self) -> str:
         # The combine reduces INTO the O dtype: the graph's dtype_o on the
         # quantized rows (half-gated by check_support), Q's dtype elsewhere.
-        o_dtype = self.dtype_o if (self._fp8 and self.dtype_o is not None) else self.dtype
+        # self.dtype is the fp8 INPUT type on those rows, so falling back to it
+        # would compile an f16 combine for a bf16 output; not every arch's
+        # check_support populates dtype_o, so read the O descriptor when it does
+        # not (SM100 sets it and is unaffected).
+        # Read the O DESCRIPTOR, not self.dtype_o: the latter is a cudnn.data_type
+        # enum on some rows (SM120 fp8) and a torch dtype on others, so comparing
+        # it against torch.bfloat16 silently yields "f16" and compiles a
+        # half-precision combine for a bf16 output. self.dtype is the fp8 INPUT
+        # type on the quantized rows, so it cannot stand in either.
+        o_dtype = getattr(self.o_desc, "dtype", None) if self._fp8 else self.dtype
+        if o_dtype is None:
+            o_dtype = self.dtype_o if self.dtype_o is not None else self.dtype
         return "bf16" if o_dtype == torch.bfloat16 else "f16"
 
     def _split_partials(self, workspace, o_like, device, current_stream=None):
@@ -1133,7 +1183,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sched_policy = self.sched_policy
         if sched_policy is None:
             sched_policy = SCHED_NATURAL
-            if self.window_right is not None:
+            # THD is excluded: the LPT decodes assume a dense rectangular
+            # tile space, while a ragged batch carries its own scheduler,
+            # which walks the live units through batch_remap.
+            if self.window_right is not None and not self.thd:
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape
@@ -1287,7 +1340,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # FP8/MXFP8 flavors carry two more slots for the packed-total-
             # clamped K/V runtime descriptors (see the kernels' THD closures).
             o_desc_slots = b + (3 if self._fp8 else 1)
-            return ws_align((3 * b + 2) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
+            return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
         if self.split_kv > 1:
@@ -1604,7 +1657,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
         with _torch_stream_context(current_stream, dev):
-            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -1627,7 +1680,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             o_desc_slots = b + (3 if self._fp8 else 1)
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
-        units = self._thd_unit_envelope()
+        # PERSISTENT THD grid: cap the launch at what the device can hold
+        # resident (one cluster per CTA_MMA SMs) instead of the plan-time
+        # envelope. The kernel pulls units from a device-bounded counter, so
+        # the grid no longer has to cover the work list -- which is what made
+        # 38-84% of clusters dead.
+        _env = self._thd_unit_envelope()
+        if getattr(self._k_mod, "THD_PERSISTENT", False):
+            # Resolved here, not above: the CLC path below never reads it, and
+            # this runs per execute.
+            _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
+            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cta_mma)))
+            _dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
+            if _dbg > 0:
+                units = min(_env, _dbg)
+        else:
+            units = _env  # CLC path: the grid must BE the work list
 
         Q = self._thd_view(q_buf, self.q_desc, t_q)
         O = self._thd_view(o_buf, self.o_desc, t_q)
@@ -2620,7 +2688,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # backstop additionally bars a split under the LPT remaps —
             # validated at compile via make_cfg, and the heuristic's split
             # sets ride SCHED_NATURAL.
-            self._not_implemented_error_if(self._fp8, "SM120 split_kv > 1 is f16/bf16-only (the fp8 kernel has no split path)")
+            self._value_error_if(
+                self._fp8 and self.o_desc.dtype not in (torch.float16, torch.bfloat16),
+                "split_kv > 1 on a quantized graph requires a bf16/fp16 O (the combine reduces half-precision partials)",
+            )
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             self._value_error_if(
@@ -2658,7 +2729,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sched_policy = self.sched_policy
         if sched_policy is None:
             sched_policy = SCHED_NATURAL
-            if self.window_right is not None:
+            # THD is excluded: the LPT decodes assume a dense rectangular
+            # tile space, while a ragged batch carries its own scheduler,
+            # which walks the live units through batch_remap.
+            if self.window_right is not None and not self.thd:
                 # Causal: balance the triangular load; pick the LPT variant by working set.
                 _, _, s_kv_sched, _ = self.k_desc.shape
                 _, _, _, d_qk_sched = self.q_desc.shape
@@ -2726,7 +2800,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 splits=self.split_kv,
                 dtype_o=self._combine_dtype_tag(),
                 has_lse=self.lse_desc is not None,
-                has_amax=False,
+                # The quantized rows stand their in-kernel amax down under a split,
+                # so the combine owns the amax of the RECOMBINED O.
+                has_amax=self._fp8,
                 lse_stride=self._lse_stride,
             )
         self._logger.debug("compile completed")
@@ -2868,6 +2944,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             None,  # thd_q_lens / thd_kv_lens / thd_lens_form: THD-only, folded out
             None,
             None,
+            cutlass.Int32(0),  # thd_n_ctas: THD-only persistent grid extent
             current_stream,
         )
         if self.split_kv > 1:
@@ -3008,6 +3085,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         with _torch_stream_context(current_stream, device):
             amax_o_buf.zero_()
 
+        # Split-KV: the kernel writes split-major partials and stands its own
+        # amax down (a max over partials over-reports the recombined O); the
+        # combine below owns both the reduction and the amax.
+        o_dst, lse_dst = o, lse
+        if self.split_kv > 1:
+            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
+
         fn = self._compiled_kernel
         if pack is not None:
             # PLAN-TIME-ONLY compile key (issue #552): this lru-cached call
@@ -3018,8 +3102,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.Q if pack is not None else q,
             pack.K if pack is not None else k,
             pack.V if pack is not None else v,
-            pack.O if pack is not None else o,
-            lse,
+            pack.O if pack is not None else o_dst,
+            lse_dst,
             sinks_t,
             pack.seq_q_dummy if pack is not None else seq_q_t,
             pack.meta if pack is not None else seq_kv_t,
@@ -3034,10 +3118,28 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.q_lens_dev if pack is not None else None,
             pack.kv_lens_dev if pack is not None else None,
             cutlass.Int32(pack.lens_form) if pack is not None else None,
+            cutlass.Int32(0),  # thd_n_ctas: unused on this path (no persistent grid)
             current_stream,
         )
         # Both of these consume what the kernel just wrote, so they belong on
         # the launch stream for the same reason the resets above do.
+        if self.split_kv > 1:
+            self._combine_kernel(
+                o_dst,
+                lse_dst,
+                o,
+                lse,
+                # float32 here, unlike the main kernel's int32 bitcast: the combine
+                # writes the amax normally, it does not atomicMax into it.
+                # Unconditional: compile() set has_amax from _fp8, not from
+                # whether the caller passed one, so the compiled kernel always
+                # expects a tensor -- _amax_slot hands back a cached dummy when
+                # the caller supplied nothing. Same as the SM100 arms.
+                amax_o_buf,
+                (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
+                cutlass.Int32(self.split_kv),
+                stream=current_stream,
+            )
         with _torch_stream_context(current_stream, device):
             if o_needs_copy_back:
                 o_view.copy_(o_scratch)
@@ -3115,7 +3217,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # validation — AGENTS.md Rule 3; cu prefixes are normalized by the
         # setup kernel).
         with _torch_stream_context(current_stream, dev):
-            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            meta = carver.take(4 * b + 4, torch.int32) if carver is not None else torch.empty(4 * b + 4, dtype=torch.int32, device=dev)
         q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
@@ -3268,8 +3370,31 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.q_lens_dev,
             pack.kv_lens_dev,
             cutlass.Int32(pack.lens_form),
+            cutlass.Int32(self._thd_persistent_ctas(pack.Q.device)),
             current_stream,
         )
+
+    def _thd_persistent_ctas(self, device) -> int:
+        """CTA count for the persistent THD grid.
+
+        Sized to the MACHINE, not to the work: the live unit total is a
+        device-side quantity (issue #552), a CTA with nothing left to claim just
+        retires, and one with more work loops. So over-launching is harmless and
+        under-launching only costs parallelism. One CTA per SM matches the
+        kernel's ``min_blocks_per_mp``.
+        """
+        key = _thd_cache_key(device)
+        n = _THD_CTAS_CACHE.get(key)
+        if n is None:
+            forced = int(os.environ.get("FROST_THD_CTAS", "0"))
+            if forced > 0:
+                n = forced
+            else:
+                sms = torch.cuda.get_device_properties(device).multi_processor_count
+                per_sm = int(os.environ.get("FROST_THD_CTAS_PER_SM", "1"))
+                n = max(1, sms * max(1, per_sm))
+            _THD_CTAS_CACHE[key] = n
+        return n
 
     def scratch_workspace_bytes(self) -> int:
         if self.thd:
@@ -3283,7 +3408,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
             b = self.batch_size
-            return ws_align((3 * b + 2) * 4)
+            return ws_align((4 * b + 4) * 4)
         if self.split_kv > 1:
             # Split-major partial slabs (see the SM100 sibling): O_s in the O
             # dtype (half) + lse_s fp32, carved from the caller's workspace.

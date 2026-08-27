@@ -246,8 +246,11 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # is (0, 0, batch_idx) and _thd_sf_tile_bases (0, 0) dense — TMA coords
 # byte-identical).  Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs /
 # O stores per tile).  seq_kv_lens overloaded as the THD metadata buffer
-# (int32 len 3B+2): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1)
-# — built DEVICE-side by the setup kernel (issue #552).
+# (int32 len 4B+4): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1)
+# [3B+2..4B+1]=batch_remap(B) [4B+2]=live units [4B+3]=claim counter
+# — built DEVICE-side by the setup kernel (issue #552).  The decode walks
+# batch_remap on EVERY THD flavor, so the setup kernel must fill it; the
+# trailing two words are read only by the persistent schedulers.
 # MXFP8-only: _thd_sf_tile_bases returns the per-sequence SF-tile prefix bases
 # (cu_sf_q_base / cu_sf_k_base) for the packed scale-factor layout.
 from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
@@ -2759,8 +2762,9 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     # seq_kv_lens always part of the ABI; unread when CFG.SEQ_KV_LENS_PRESENT
-    # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)] (len 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|
+    # batch_remap(B)|live|ctr] (len 4B+4).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

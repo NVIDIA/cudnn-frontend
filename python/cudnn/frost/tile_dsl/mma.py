@@ -93,6 +93,16 @@ def mma_m16n8k32_f32(
 
 
 @cute.jit
+def desc_opaque(value):
+    """Identity mov.b64 so LLVM cannot reassociate a descriptor base into per-k-step 64-bit literals."""
+    return inline_ptx(
+        "mov.b64 $0, $1;",
+        write_only_types=[type(value)],
+        read_only_args=[value],
+    )
+
+
+@cute.jit
 def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=None, accumulate: bool = False, k_start: int = 0, k_count=None):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1

@@ -922,6 +922,30 @@ def test_dsl_sm120_thd():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=27)
+def test_dsl_sm120_thd_multi_unit_per_cta():
+    """THD with more live units than the machine has CTAs.
+
+    The other THD cases are small enough that every CTA is handed at most one
+    unit, so they never exercise re-entering the K/V pipeline for a second one
+    -- the regime where an unmatched consumer arrival on bar_k/v_consumed used
+    to desynchronise the next unit's producer handshake. These lengths give
+    O(100) units against a grid sized to the SM count, so CTAs claim repeatedly,
+    and each unit spans several K/V tiles.
+    """
+
+    _run_thd_case(
+        seq_q_lens=[1024, 768, 512, 256],
+        seq_kv_lens=[1024, 768, 512, 256],
+        h_q=8,
+        h_kv=2,
+        head_dim=128,
+        is_causal=True,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=23)
 def test_dsl_sm120_thd_cross():
     """THD cross-attention: unequal packed Q and KV token totals."""

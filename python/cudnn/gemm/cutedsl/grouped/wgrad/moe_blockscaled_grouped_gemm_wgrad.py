@@ -22,6 +22,7 @@ Scheduler: moe_persistent_scheduler.py (CLC mode, scenario="2Dx2D")
 Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
+import re
 from importlib.metadata import PackageNotFoundError, version
 from typing import Literal, Type, Tuple, Optional
 
@@ -66,7 +67,19 @@ def _using_internal_cutlass_dsl() -> bool:
     return True
 
 
-_USING_INTERNAL_CUTLASS_DSL = _using_internal_cutlass_dsl()
+def _cutlass_dsl_needs_fp4_layout_workaround() -> bool:
+    # Public cutlass-dsl wheels before 4.8 interpret packed sub-byte
+    # from_dlpack layouts in byte units, so the FP4 A/B layouts must be
+    # recast to element units.
+    if _using_internal_cutlass_dsl():
+        return False
+    match = re.match(r"(\d+)\.(\d+)", getattr(cutlass, "__version__", "") or "")
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) < (4, 8)
+
+
+_NEEDS_FP4_LAYOUT_WORKAROUND = _cutlass_dsl_needs_fp4_layout_workaround()
 
 
 class BlockScaledMoEGroupedGemmWgradKernel:
@@ -329,10 +342,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         out_single_expert: Optional[cute.Tensor] = None,
     ) -> None:
 
-        # Public CUTLASS DSL 4.5 needs the packed-FP4 from_dlpack layout
-        # workaround. Rubin and the internal DSL wheel consume the native
-        # 4-bit layout directly.
-        needs_fp4_layout_workaround = self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
+        # Public CUTLASS DSL < 4.8 needs the packed-FP4 from_dlpack layout
+        # workaround. Rubin, the internal DSL wheel, and public wheels >= 4.8
+        # consume the native 4-bit layout directly.
+        needs_fp4_layout_workaround = self.architecture != "sm_107" and _NEEDS_FP4_LAYOUT_WORKAROUND
         if cutlass.const_expr(needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
