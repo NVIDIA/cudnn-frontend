@@ -64,51 +64,18 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
     def __init__(
         self,
-        head_dim: int,
-        head_dim_v: int | None = None,
-        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
-        mask_payload_valid_words_dq: int = 4,
-        mask_payload_padded_words_dq: int = 4,
-        mask_payload_valid_words_dkdv: int = 1,
-        mask_payload_padded_words_dkdv: int = 1,
-        subtile_factor: cutlass.Constexpr[int] = 1,
-        tile_m_dq: int = 128,
-        tile_n_dq: int = 128,
-        tile_m_dkdv: int = 128,
-        tile_n_dkdv: int = 64,
+        qhead_per_kvhead: cutlass.Constexpr[int],
     ):
         """Initialization."""
-        head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        assert head_dim == 256 and head_dim_v == 256, "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
-        assert tile_m_dq == 128 and tile_n_dq == 128, "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
-        assert tile_m_dkdv == 128 and tile_n_dkdv == 64, "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
         assert qhead_per_kvhead >= 1
-        assert subtile_factor == 2, "SM100 backward with head_dim=256 arbitrary requires Q256 K2Q entries"
-        assert mask_payload_valid_words_dq == 4 and mask_payload_padded_words_dq == 4, "SM100 hd256 arbitrary dQ payload requires four valid/padded words"
-        assert mask_payload_valid_words_dkdv == 1 and mask_payload_padded_words_dkdv == 1, "SM100 hd256 arbitrary dKdV payload requires one valid/padded word"
-        self.subtile_factor = subtile_factor
 
-        self.acc_dtype = cutlass.Float32
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.tile_m_dq = tile_m_dq
-        self.tile_n_dq = tile_n_dq
-        self.tile_m_dkdv = tile_m_dkdv
-        self.tile_n_dkdv = tile_n_dkdv
 
         self.dq_kernel = BlackwellFusedMultiHeadAttentionBackwardDQKernel(
-            self.acc_dtype,
-            (self.tile_m_dq, self.tile_n_dq, 256),
-            qhead_per_kvhead=self.qhead_per_kvhead,
-            mask_payload_valid_words=mask_payload_valid_words_dq,
-            mask_payload_padded_words=mask_payload_padded_words_dq,
+            self.qhead_per_kvhead,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
-            self.acc_dtype,
-            (self.tile_m_dkdv, self.tile_n_dkdv, 256),
-            qhead_per_kvhead=self.qhead_per_kvhead,
-            mask_payload_valid_words=mask_payload_valid_words_dkdv,
-            mask_payload_padded_words=mask_payload_padded_words_dkdv,
-            subtile_factor=self.subtile_factor,
+            self.qhead_per_kvhead,
         )
 
     @cute.jit
@@ -133,38 +100,28 @@ class BlackwellFusedMultiHeadAttentionBackward:
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
-        varlen = cumulative_s_q is not None or cumulative_s_k is not None
-        if cutlass.const_expr(block_sparse_tensors_dq is not None):
-            assert block_sparse_tensors_dq.mask_block_offset is not None, "SM100 backward with head_dim=256 dQ only supports linear CSR block sparse tensors"
-        if cutlass.const_expr(block_sparse_tensors is not None):
-            assert block_sparse_tensors.mask_block_offset is not None, "SM100 backward with head_dim=256 only supports linear CSR block sparse tensors"
-        assert (cumulative_s_q is None) == (cumulative_s_k is None), "SM100 hd256 arbitrary varlen backward requires both cu_seqlens tensors"
         assert block_sparse_tensors_dq is not None and block_sparse_tensors is not None, (
             "SM100 backward with head_dim=256 arbitrary requires independent " "dQ Q2K and dKdV K2Q plans"
         )
+        assert block_sparse_tensors_dq.mask_block_offset is not None, "SM100 backward with head_dim=256 dQ only supports linear CSR block sparse tensors"
+        assert block_sparse_tensors.mask_block_offset is not None, "SM100 backward with head_dim=256 only supports linear CSR block sparse tensors"
+        assert (cumulative_s_q is None) == (cumulative_s_k is None), "SM100 hd256 arbitrary varlen backward requires both cu_seqlens tensors"
+        varlen = cumulative_s_q is not None
         assert block_sparse_tensors_dq.mask_block_masks is not None, "SM100 backward with head_dim=256 arbitrary dQ requires mask_block_masks"
         assert block_sparse_tensors.mask_block_masks is not None, "SM100 backward with head_dim=256 arbitrary dKdV requires mask_block_masks"
         assert dQ_accum is not None, "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         dQ = dQ_accum
-        q_rank = cute.rank(Q.layout)
-        k_rank = cute.rank(K.layout)
-        if cutlass.const_expr(q_rank == 5):
-            h_q = Q.shape[2] * Q.shape[3]
-        elif cutlass.const_expr(q_rank == 4):
-            h_q = Q.shape[2]
-        else:
+        if cutlass.const_expr(varlen):
+            assert cute.rank(Q.layout) == 3 and cute.rank(K.layout) == 3
             h_q = Q.shape[1]
-        if cutlass.const_expr(k_rank == 5):
-            h_k = K.shape[2]
-        elif cutlass.const_expr(k_rank == 4):
-            h_k = K.shape[2]
-        else:
             h_k = K.shape[1]
+        else:
+            assert cute.rank(Q.layout) == 4 and cute.rank(K.layout) == 4
+            h_q = Q.shape[2]
+            h_k = K.shape[2]
         h_r = h_q // h_k
         if cutlass.const_expr(cumulative_s_q is not None):
             b = cumulative_s_q.shape[0] - 1
-        elif cutlass.const_expr(cumulative_s_k is not None):
-            b = cumulative_s_k.shape[0] - 1
         else:
             b = Q.shape[0]
 

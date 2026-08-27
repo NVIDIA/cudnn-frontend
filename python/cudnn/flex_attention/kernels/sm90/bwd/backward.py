@@ -19,6 +19,7 @@ from cudnn.flex_attention._compat import sm90_utils
 from cudnn.flex_attention._compat.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from cudnn.flex_attention.runtime.dsl_utils import assume_tensor_aligned
+from cudnn.flex_attention.kernels.common.copy_utils import cpasync_bulk_get_copy_fn
 from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 from cudnn.flex_attention.kernels.common import pipeline
@@ -31,7 +32,11 @@ from cudnn.flex_attention.kernels.common.tile_scheduler import (
 from cudnn.flex_attention.kernels.common import barrier
 from cudnn.flex_attention.kernels.sm90.bwd.named_barrier import NamedBarrierBwd
 from cudnn.flex_attention.plan.kernels import BlockSparseTensors
-from cudnn.flex_attention.kernels.sm90.bwd.backward_config import make_sm90_bwd_tiled_mma_sdp
+from cudnn.flex_attention.kernels.sm90.bwd.backward_config import (
+    _SM90_BWD_NUM_MMA_WG,
+    _SM90_BWD_NUM_THREADS,
+    make_sm90_bwd_tiled_mma_sdp,
+)
 from cudnn.flex_attention.plan.kernels.packed_mask import (
     produce_block_sparse_q_loads_bwd_sm90,
     consume_block_sparse_mma_bwd_sm90,
@@ -46,7 +51,7 @@ class FlexAttentionBackwardSm90:
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
-        head_dim_v: Optional[int] = None,
+        head_dim_v: int,
         qhead_per_kvhead: int = 1,
         deterministic: bool = False,
         spt: Optional[bool] = None,
@@ -57,31 +62,22 @@ class FlexAttentionBackwardSm90:
         PdS_stage: int = 2,
         SdP_swapAB: bool = False,
         dKV_swapAB: bool = False,
-        dQ_swapAB: bool = False,
-        AtomLayoutMSdP: int = 1,
         AtomLayoutNdKV: int = 2,
         AtomLayoutMdQ: int = 1,
-        num_threads: int = 384,
-        V_in_regs: bool = False,
-        subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
         self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
-        # Can save registers (and hence be faster) if we don't have to check hdim predication
-        self.check_hdim_oob = head_dim != self.tile_hdim
-        self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
         self.qhead_per_kvhead = qhead_per_kvhead
         self.deterministic = deterministic
         self.spt_override = spt
         self.tile_m = tile_m
         self.tile_n = tile_n
-        self.num_threads = num_threads
+        self.num_threads = _SM90_BWD_NUM_THREADS
         self.Q_stage = Q_stage
         self.dO_stage = dO_stage
         self.PdS_stage = PdS_stage
@@ -89,17 +85,13 @@ class FlexAttentionBackwardSm90:
         assert self.PdS_stage in [1, self.Q_stage]
         self.SdP_swapAB = SdP_swapAB
         self.dKV_swapAB = dKV_swapAB
-        self.dQ_swapAB = dQ_swapAB
-        self.AtomLayoutMSdP = AtomLayoutMSdP
         self.AtomLayoutNdKV = AtomLayoutNdKV
         self.AtomLayoutMdQ = AtomLayoutMdQ
-        self.num_wg_mma = (self.num_threads // 128) - 1
-        self.mma_dkv_is_rs = AtomLayoutMSdP == 1 and AtomLayoutNdKV == self.num_wg_mma and SdP_swapAB and not dKV_swapAB
-        self.V_in_regs = V_in_regs
+        self.num_wg_mma = _SM90_BWD_NUM_MMA_WG
+        self.mma_dkv_is_rs = AtomLayoutNdKV == self.num_wg_mma and SdP_swapAB and not dKV_swapAB
         # May be overridden in __call__ for varlen inputs.
         if qhead_per_kvhead > 1:
             assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
-            assert self.num_wg_mma == 2, "GQA backward assumes 2 warp groups"
         # These are tuned for speed
         # Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share
         # them and then shuffle to get the value whenever we need? This can reduce register
@@ -110,42 +102,9 @@ class FlexAttentionBackwardSm90:
 
         self.buffer_align_bytes = 1024
 
-        self.subtile_factor = subtile_factor
-        self.qk_acc_dtype = Float32
-        # dQ_single_wg: WG0 computes the full dQ GEMM, WG1 skips it.
-        # Only valid for 2 MMA warp groups.
-        # Credit: Ben Spector
-        if dQ_single_wg:
-            assert self.num_wg_mma == 2, "dQ_single_wg only supports 2 warp groups"
+        self.subtile_factor = 1
+        # With dQ_single_wg, WG0 computes the full dQ GEMM and WG1 skips it.
         self.num_wg_dQ = 1 if dQ_single_wg else self.num_wg_mma
-        # Preserve the native chunked dQ accumulator layout. The row-major
-        # R2S path generates heavily bank-conflicted shared stores on SM90.
-        self.dQ_accum_row_major = False
-
-    @staticmethod
-    def can_implement(
-        dtype,
-        head_dim,
-        head_dim_v,
-        tile_m,
-        tile_n,
-        Q_stage,
-        num_threads,
-        V_in_regs=False,
-    ) -> bool:
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if head_dim_v % 8 != 0:
-            return False
-        if tile_n % 16 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if (tile_m * 2) % num_threads != 0:
-            return False
-        return True
 
     def _check_type(
         self,
@@ -207,7 +166,7 @@ class FlexAttentionBackwardSm90:
         # There's only V, no V.T, so layout is normal
         self.sV_layout = sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv), None)
         # Accomodate both S and S.T
-        wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
+        wg_n_SdP = self.num_wg_mma
         wg_n_dKV = self.AtomLayoutNdKV
         self.sPdS_layout = sm90_utils.make_smem_layout(
             self.dtype,
@@ -235,8 +194,6 @@ class FlexAttentionBackwardSm90:
             self.dtype,
             self.tile_m,
             self.tile_n,
-            self.num_wg_mma,
-            self.AtomLayoutMSdP,
             self.SdP_swapAB,
         )
         # dV = P.T @ dO, dK = dS.T @ Q
@@ -263,11 +220,11 @@ class FlexAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
-            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.MN,
             Float32,
-            atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
-            tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),
+            atom_layout_mnk=atom_layout_dQ,
+            tiler_mn=(64, tiler_mn_dQ[1]),
         )
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -316,7 +273,7 @@ class FlexAttentionBackwardSm90:
             sQ_block_metadata: cute.struct.Align[
                 cute.struct.MemRange[
                     Int32,
-                    self.Q_stage if self.use_arbitrary else 0,
+                    self.Q_stage,
                 ],
                 16,
             ]
@@ -394,27 +351,14 @@ class FlexAttentionBackwardSm90:
         assert self.num_mma_threads + 128 == self.num_threads
 
         self.num_threads_per_warp_group = 128
-        self.num_producer_threads = 32
-        self.use_arbitrary = True
-
-        REG_LIMIT = 504 if self.num_wg_mma == 2 else 512
-        if const_expr(self.num_wg_mma == 2):
-            if const_expr(self.num_wg_dQ == 1):
-                self.num_mma_regs_wg0 = 256
-                self.num_mma_regs_wg1 = 224
-                self.num_producer_regs = 24
-            else:
-                self.num_mma_regs_wg0 = 240
-                self.num_mma_regs_wg1 = 240
-                self.num_producer_regs = 24
-            self.num_mma_regs = self.num_mma_regs_wg0  # for backward compat
-            assert self.num_mma_regs_wg0 + self.num_mma_regs_wg1 + self.num_producer_regs <= REG_LIMIT
-        else:  # 3 warp groups
-            self.num_mma_regs_wg0 = 160
-            self.num_mma_regs_wg1 = 160
-            self.num_mma_regs = 160
-            self.num_producer_regs = 32
-            assert self.num_mma_regs_wg0 * self.num_wg_mma + self.num_producer_regs <= REG_LIMIT
+        if const_expr(self.num_wg_dQ == 1):
+            self.num_mma_regs_wg0 = 256
+            self.num_mma_regs_wg1 = 224
+        else:
+            self.num_mma_regs_wg0 = 240
+            self.num_mma_regs_wg1 = 240
+        self.num_producer_regs = 24
+        assert self.num_mma_regs_wg0 + self.num_mma_regs_wg1 + self.num_producer_regs <= 504
 
         self._setup_attributes()
         SharedStorage, SharedStorageMainloop = self._get_shared_storage_cls()
@@ -459,8 +403,8 @@ class FlexAttentionBackwardSm90:
             (self.tile_m, self.tile_hdimv),
         )
         if const_expr(self.qhead_per_kvhead == 1):
-            mdK_tma = copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True) if self.varlen_k else mdK
-            mdV_tma = copy_utils.create_ragged_tensor_for_tma(mdV, ragged_dim=0, ptr_shift=True) if self.varlen_k else mdV
+            mdK_tma = copy_utils.create_ragged_tensor_for_tma(mdK) if self.varlen_k else mdK
+            mdV_tma = copy_utils.create_ragged_tensor_for_tma(mdV) if self.varlen_k else mdV
             tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 mdK_tma,
@@ -500,7 +444,6 @@ class FlexAttentionBackwardSm90:
             mCuSeqlensQ=mCuSeqlensK,
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
-            is_persistent=False,
             lpt=self.spt,
             head_swizzle=self.deterministic,
         )
@@ -662,9 +605,7 @@ class FlexAttentionBackwardSm90:
             )
         )
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
-        sQ_block_metadata = None
-        if const_expr(self.use_arbitrary):
-            sQ_block_metadata = storage.sQ_block_metadata.get_tensor(cute.make_layout((1, self.Q_stage), stride=(1, 1)))
+        sQ_block_metadata = storage.sQ_block_metadata.get_tensor(cute.make_layout((1, self.Q_stage), stride=(1, 1)))
 
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -726,7 +667,6 @@ class FlexAttentionBackwardSm90:
                 mdV,
                 mdK_semaphore,
                 mdV_semaphore,
-                mdQaccum,
                 sQ,
                 sK,
                 sV,
@@ -823,9 +763,11 @@ class FlexAttentionBackwardSm90:
                 load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
                 load_dO, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
-                load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
+                # The compatibility helper always adds an outer elect_one(), which
+                # deadlocks when the installed CuTe DSL bulk-copy lowering elects internally.
+                load_LSE = cpasync_bulk_get_copy_fn(gLSE, sLSE)
                 load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_Q)
-                load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
+                load_dPsum = cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
                 load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
 
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
@@ -872,7 +814,6 @@ class FlexAttentionBackwardSm90:
         mdV: cute.Tensor,
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
-        mdQaccum: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -939,19 +880,18 @@ class FlexAttentionBackwardSm90:
         shape_mnk_dQ = (self.tile_m, self.tile_hdim, self.tile_n)
         mma_dsk_fn = None
         if const_expr(is_dQ_wg):
-            _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB)
+            _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(wg_mma_dQ, shape_mnk_dQ, sdS, sKt)
             mma_dsk_fn = partial(
                 gemm_zero_init,
                 tiled_mma_dQ,
                 shape_mnk_dQ[:2],
                 tdQrdS,
                 tdQrKt,
-                swap_AB=self.dQ_swapAB,
             )
 
         # Smem copy atom tiling for P/dS R2S
         copy_P_r2s = None
-        mms_PdS = self.tile_n // (self.num_wg_mma // self.AtomLayoutMSdP)
+        mms_PdS = self.tile_n // self.num_wg_mma
         if const_expr(sP is not None):
             sP_cpy = sP if const_expr(not self.SdP_swapAB) else sPt
             copy_P_r2s, _, _ = copy_utils.get_smem_store_C(
@@ -959,7 +899,6 @@ class FlexAttentionBackwardSm90:
                 sP_cpy,
                 tidx,
                 transpose=self.SdP_swapAB,
-                position_independent=True,
                 major_mode_size=mms_PdS,
             )
         sdS_cpy = sdS if const_expr(not self.SdP_swapAB) else sdSt
@@ -968,7 +907,6 @@ class FlexAttentionBackwardSm90:
             sdS_cpy,
             tidx,
             transpose=self.SdP_swapAB,
-            position_independent=True,
             major_mode_size=mms_PdS,
         )
 
@@ -986,27 +924,9 @@ class FlexAttentionBackwardSm90:
             tLSEsdPsum = cute.group_modes(tLSEsdPsum, 0, 2)
 
         tdQsdQaccum = None
-        copy_dQaccum_r2s = None
         if const_expr(is_dQ_wg):
-            if const_expr(self.dQ_accum_row_major):
-                sdQaccum_matrix = cute.make_tensor(
-                    sdQaccum.iterator,
-                    cute.make_layout(
-                        (self.tile_m, self.tile_hdim),
-                        stride=(self.tile_hdim, 1),
-                    ),
-                )
-                sdQaccum_cpy = sdQaccum_matrix if const_expr(not self.dQ_swapAB) else layout_utils.transpose_view(sdQaccum_matrix)
-                copy_dQaccum_r2s, _, _ = copy_utils.get_smem_store_C(
-                    tiled_mma_dQ,
-                    sdQaccum_cpy,
-                    tidx,
-                    transpose=self.dQ_swapAB,
-                    position_independent=True,
-                )
-            else:
-                smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
-                tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
+            smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
+            tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
         PdS_barrier = cutlass.pipeline.NamedBarrier(barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads)
         mma_one_m_block_all = partial(
@@ -1024,11 +944,8 @@ class FlexAttentionBackwardSm90:
             tLSEsLSE=tLSEsLSE,
             tLSEsdPsum=tLSEsdPsum,
             tdQsdQaccum=tdQsdQaccum,
-            copy_dQaccum_r2s=copy_dQaccum_r2s,
             softmax_scale_log2=softmax_scale_log2,
             PdS_barrier=PdS_barrier,
-            # acc_dV=acc_dV,
-            # acc_dK=acc_dK,
             is_dQ_wg=is_dQ_wg,
         )
 
@@ -1149,7 +1066,6 @@ class FlexAttentionBackwardSm90:
         tLSEsLSE: cute.Tensor,
         tLSEsdPsum: cute.Tensor,
         tdQsdQaccum: Optional[cute.Tensor],
-        copy_dQaccum_r2s: Optional[Callable],
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
@@ -1266,13 +1182,9 @@ class FlexAttentionBackwardSm90:
                 barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
                 number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
             )
-            if const_expr(self.dQ_accum_row_major):
-                assert copy_dQaccum_r2s is not None
-                copy_dQaccum_r2s(acc_dQ)
-            else:
-                assert tdQsdQaccum is not None
-                tdQrdQaccum_flat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
-                cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+            assert tdQsdQaccum is not None
+            tdQrdQaccum_flat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
+            cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
             cute.arch.fence_view_async_shared()
             cute.arch.barrier_arrive(
                 barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
@@ -1336,14 +1248,12 @@ class FlexAttentionBackwardSm90:
                 sdV,
                 tidx,
                 transpose=self.dKV_swapAB,
-                position_independent=True,
             )
             copy_dK_r2s, _, _ = copy_utils.get_smem_store_C(
                 tiled_mma_dK,
                 sdK,
                 tidx,
                 transpose=self.dKV_swapAB,
-                position_independent=True,
             )
             cute.arch.cp_async_bulk_wait_group(1, read=True)
             epi_barrier.arrive_and_wait()
@@ -1406,13 +1316,11 @@ class FlexAttentionBackwardSm90:
                     tiled_mma_dK,
                     sdKaccum,
                     tidx,
-                    position_independent=True,
                 )
                 copy_dVaccum_r2s, _, _ = copy_utils.get_smem_store_C(
                     tiled_mma_dV,
                     sdVaccum,
                     tidx,
-                    position_independent=True,
                 )
             else:
                 tiled_copy_dKVaccum_r2s = cute.make_tiled_copy_tv(
@@ -1452,7 +1360,7 @@ class FlexAttentionBackwardSm90:
 
             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             if const_expr(deterministic_KV):
-                barrier.arrive_inc(mdK_semaphore_cur.iterator, tidx, 0, 1)
+                barrier.arrive_inc(mdK_semaphore_cur.iterator, tidx, 0)
                 barrier.wait_eq(mdV_semaphore_cur.iterator, tidx, 0, lock_value)
             epi_barrier.arrive_and_wait()
             if const_expr(self.AtomLayoutNdKV == 1):
@@ -1473,7 +1381,7 @@ class FlexAttentionBackwardSm90:
                 cute.arch.cp_async_bulk_commit_group()
             if const_expr(deterministic_KV):
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                barrier.arrive_inc(mdV_semaphore_cur.iterator, tidx, 0, 1)
+                barrier.arrive_inc(mdV_semaphore_cur.iterator, tidx, 0)
 
     @cute.jit
     def dQaccum_store(
@@ -1488,7 +1396,6 @@ class FlexAttentionBackwardSm90:
         tidx, _, _ = cute.arch.thread_idx()
         # warp-local thread index (dQaccum_store runs on warp 1, global tidx 32-63)
         warp_local_tidx = tidx % cute.arch.WARP_SIZE
-        read_flag = const_expr(not self.deterministic)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1526,7 +1433,6 @@ class FlexAttentionBackwardSm90:
                 num_threads_per_warp_group=self.num_threads_per_warp_group,
                 tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
                 deterministic=self.deterministic,
-                accum_row_major=self.dQ_accum_row_major,
                 mdQ_semaphore_cur=mdQ_semaphore_cur,
                 warp_local_tidx=warp_local_tidx,
             )

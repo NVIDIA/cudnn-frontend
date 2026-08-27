@@ -9,7 +9,6 @@ partition instead of a hand-written lane formula.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import cutlass
@@ -33,6 +32,7 @@ _SM100_QSTAGE1_2CTA_Q_STAGE = 1
 _SM100_QSTAGE1_2CTA_CTA_GROUP_SIZE = 2
 _SM100_SOFTMAX_THREADS_PER_SUBTILE = 128
 _SM100_TMEM_LOAD_ATOM_ID = "tcgen05.ld32x32b.r32"
+_SM100_FWD_PAYLOAD_VALUES_PER_THREAD = 128
 SM100_FWD_MASK_PAYLOAD_WORDS = 4
 
 
@@ -75,7 +75,6 @@ class _ResolvedSm100FwdConsumerConfig:
     cluster_axis: str
     physical_subtiles: int
     softmax_threads_per_subtile: int
-    attention_num_threads: int
     num_mask_payload_groups: int
     payload_values_per_thread: int
     payload_valid_words: int
@@ -188,17 +187,10 @@ def resolve_sm100_fwd_consumer_config(
     cluster_axis = "m"
     physical_subtiles = q_stage
 
-    payload_values_per_thread, remainder = divmod(tile_m * tile_n, _SM100_SOFTMAX_THREADS_PER_SUBTILE)
-    if remainder:
-        raise AssertionError("SM100 score values must partition evenly across softmax threads")
-    payload_valid_words = math.ceil(payload_values_per_thread / 32)
-    # The first consumer implementation deliberately targets the native x4
-    # 128-bit load width.  NCU spill validation remains a PR 1 gate.
-    payload_padded_words = SM100_FWD_MASK_PAYLOAD_WORDS
-    if payload_valid_words > payload_padded_words:
-        raise AssertionError("SM100 payload exceeds the initial four-word contract")
     tmem_load_atom_id = _SM100_TMEM_LOAD_ATOM_ID
-    payload_layout_id = "sm100_tcgen05_qk" f"_ld32x32b_r32_t{_SM100_SOFTMAX_THREADS_PER_SUBTILE}" f"_v{payload_values_per_thread}_w{payload_padded_words}_v1"
+    payload_layout_id = (
+        "sm100_tcgen05_qk" f"_ld32x32b_r32_t{_SM100_SOFTMAX_THREADS_PER_SUBTILE}" f"_v{_SM100_FWD_PAYLOAD_VALUES_PER_THREAD}_w{SM100_FWD_MASK_PAYLOAD_WORDS}_v1"
+    )
 
     return _ResolvedSm100FwdConsumerConfig(
         arch=arch,
@@ -217,11 +209,10 @@ def resolve_sm100_fwd_consumer_config(
         cluster_axis=cluster_axis,
         physical_subtiles=physical_subtiles,
         softmax_threads_per_subtile=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        attention_num_threads=512,
         num_mask_payload_groups=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        payload_values_per_thread=payload_values_per_thread,
-        payload_valid_words=payload_valid_words,
-        payload_padded_words=payload_padded_words,
+        payload_values_per_thread=_SM100_FWD_PAYLOAD_VALUES_PER_THREAD,
+        payload_valid_words=SM100_FWD_MASK_PAYLOAD_WORDS,
+        payload_padded_words=SM100_FWD_MASK_PAYLOAD_WORDS,
         tmem_load_atom_id=tmem_load_atom_id,
         payload_layout_id=payload_layout_id,
     )
@@ -260,21 +251,10 @@ def resolve_sm100_fwd_qstage1_2cta_consumer_config(
     )
     q_stage = _SM100_QSTAGE1_2CTA_Q_STAGE
     cta_group_size = _SM100_QSTAGE1_2CTA_CTA_GROUP_SIZE
-    payload_values_per_thread, remainder = divmod(
-        tile_m * tile_n,
-        _SM100_SOFTMAX_THREADS_PER_SUBTILE,
-    )
-    if remainder:
-        raise AssertionError("SM100 score values must partition evenly across softmax threads")
-    payload_valid_words = math.ceil(payload_values_per_thread / 32)
-    payload_padded_words = SM100_FWD_MASK_PAYLOAD_WORDS
-    if payload_valid_words > payload_padded_words:
-        raise AssertionError("SM100 payload exceeds the four-word vector contract")
-
     payload_layout_id = (
         "sm100_tcgen05_qk"
         f"_ld32x32b_r32_t{_SM100_SOFTMAX_THREADS_PER_SUBTILE}"
-        f"_v{payload_values_per_thread}_w{payload_padded_words}"
+        f"_v{_SM100_FWD_PAYLOAD_VALUES_PER_THREAD}_w{SM100_FWD_MASK_PAYLOAD_WORDS}"
         f"_m{tile_m * cta_group_size}n{tile_n}"
         f"_ctarank{cta_group_size}_axis_m_qstage1_v1"
     )
@@ -295,11 +275,10 @@ def resolve_sm100_fwd_qstage1_2cta_consumer_config(
         cluster_axis="m",
         physical_subtiles=q_stage * cta_group_size,
         softmax_threads_per_subtile=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        attention_num_threads=512,
         num_mask_payload_groups=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        payload_values_per_thread=payload_values_per_thread,
-        payload_valid_words=payload_valid_words,
-        payload_padded_words=payload_padded_words,
+        payload_values_per_thread=_SM100_FWD_PAYLOAD_VALUES_PER_THREAD,
+        payload_valid_words=SM100_FWD_MASK_PAYLOAD_WORDS,
+        payload_padded_words=SM100_FWD_MASK_PAYLOAD_WORDS,
         tmem_load_atom_id="tcgen05.ld32x32b.r32.cta_group2",
         payload_layout_id=payload_layout_id,
     )
@@ -338,21 +317,10 @@ def resolve_sm100_fwd_qstage1_1cta_consumer_config(
     )
     q_stage = _SM100_QSTAGE1_1CTA_Q_STAGE
     cta_group_size = _SM100_QSTAGE1_1CTA_CTA_GROUP_SIZE
-    payload_values_per_thread, remainder = divmod(
-        tile_m * tile_n,
-        _SM100_SOFTMAX_THREADS_PER_SUBTILE,
-    )
-    if remainder:
-        raise AssertionError("SM100 score values must partition evenly across softmax threads")
-    payload_valid_words = math.ceil(payload_values_per_thread / 32)
-    payload_padded_words = SM100_FWD_MASK_PAYLOAD_WORDS
-    if payload_valid_words > payload_padded_words:
-        raise AssertionError("SM100 payload exceeds the four-word vector contract")
-
     payload_layout_id = (
         "sm100_tcgen05_qk"
         f"_ld32x32b_r32_t{_SM100_SOFTMAX_THREADS_PER_SUBTILE}"
-        f"_v{payload_values_per_thread}_w{payload_padded_words}"
+        f"_v{_SM100_FWD_PAYLOAD_VALUES_PER_THREAD}_w{SM100_FWD_MASK_PAYLOAD_WORDS}"
         f"_m{tile_m}n{tile_n}_cta1_axis_m_qstage1_v1"
     )
     return _ResolvedSm100FwdConsumerConfig(
@@ -372,11 +340,10 @@ def resolve_sm100_fwd_qstage1_1cta_consumer_config(
         cluster_axis="m",
         physical_subtiles=1,
         softmax_threads_per_subtile=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        attention_num_threads=512,
         num_mask_payload_groups=_SM100_SOFTMAX_THREADS_PER_SUBTILE,
-        payload_values_per_thread=payload_values_per_thread,
-        payload_valid_words=payload_valid_words,
-        payload_padded_words=payload_padded_words,
+        payload_values_per_thread=_SM100_FWD_PAYLOAD_VALUES_PER_THREAD,
+        payload_valid_words=SM100_FWD_MASK_PAYLOAD_WORDS,
+        payload_padded_words=SM100_FWD_MASK_PAYLOAD_WORDS,
         tmem_load_atom_id=_SM100_TMEM_LOAD_ATOM_ID,
         payload_layout_id=payload_layout_id,
     )

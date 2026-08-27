@@ -9,7 +9,6 @@ without duplicating a lane formula.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import cutlass
@@ -29,6 +28,7 @@ _SM100_GENERIC_BWD_TILE_N = 128
 _SM100_BWD_COMPUTE_WARPS = 8
 _SM100_BWD_CONSUMER_THREADS = _SM100_BWD_COMPUTE_WARPS * 32
 _SM100_BWD_TMEM_LOAD_ATOM_ID = "tcgen05.ld32x32b.r32.wg2"
+_SM100_BWD_PAYLOAD_VALUES_PER_THREAD = 64
 SM100_BWD_MASK_PAYLOAD_WORDS = 2
 
 
@@ -50,9 +50,7 @@ class _ResolvedSm100BwdConsumerConfig:
     physical_subtiles: int
     cta_group_size: int
     cluster_axis: str
-    num_wg: int
     num_mma_threads: int
-    attention_num_threads: int
     payload_values_per_thread: int
     payload_valid_words: int
     payload_padded_words: int
@@ -137,7 +135,6 @@ def resolve_sm100_bwd_consumer_config(
     num_q_heads: int,
     num_kv_heads: int,
     is_varlen: bool,
-    subtile_factor: int | None = None,
 ) -> _ResolvedSm100BwdConsumerConfig:
     """Resolve a generic SM100 backward topology.
 
@@ -158,11 +155,6 @@ def resolve_sm100_bwd_consumer_config(
         raise ValueError(f"head_dim and head_dim_v must be divisible by {alignment} for {dtype}")
     if num_kv_heads <= 0 or num_q_heads <= 0 or num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
-    if subtile_factor is None:
-        subtile_factor = 1
-    if subtile_factor != 1:
-        raise NotImplementedError("SM100/SM103 arbitrary backward currently requires subtile_factor=1")
-
     is_d128 = head_dim == 128 and head_dim_v == 128
     requires_cooperative_ctas = is_d192_v128 or is_d128
     tile_m = _SM100_GENERIC_BWD_TILE_M
@@ -170,20 +162,10 @@ def resolve_sm100_bwd_consumer_config(
     cta_group_size = 2 if requires_cooperative_ctas else 1
     cluster_axis = "n"
     sparse_tile_n = tile_n * cta_group_size
-    payload_values_per_thread, remainder = divmod(
-        tile_m * sparse_tile_n,
-        _SM100_BWD_CONSUMER_THREADS * cta_group_size,
-    )
-    if remainder:
-        raise AssertionError("SM100 backward score values must partition evenly across compute threads")
-    payload_valid_words = math.ceil(payload_values_per_thread / 32)
-    payload_padded_words = SM100_BWD_MASK_PAYLOAD_WORDS
-    if payload_valid_words > payload_padded_words:
-        raise AssertionError("SM100 backward payload exceeds the packed vector")
     payload_layout_id = (
         "sm100_tcgen05_bwd_sdp"
         f"_ld32x32b_r32_wg2_t{_SM100_BWD_CONSUMER_THREADS}"
-        f"_v{payload_values_per_thread}_w{payload_padded_words}"
+        f"_v{_SM100_BWD_PAYLOAD_VALUES_PER_THREAD}_w{SM100_BWD_MASK_PAYLOAD_WORDS}"
         + (f"_k{sparse_tile_n}_ctarank{cta_group_size}_axis{cluster_axis}_v2" if requires_cooperative_ctas else "_v1")
     )
 
@@ -200,16 +182,14 @@ def resolve_sm100_bwd_consumer_config(
         tile_n=tile_n,
         sparse_tile_m=tile_m,
         sparse_tile_n=sparse_tile_n,
-        subtile_factor=subtile_factor,
-        physical_subtiles=subtile_factor * cta_group_size,
+        subtile_factor=1,
+        physical_subtiles=cta_group_size,
         cta_group_size=cta_group_size,
         cluster_axis=cluster_axis,
-        num_wg=2,
         num_mma_threads=_SM100_BWD_CONSUMER_THREADS,
-        attention_num_threads=512,
-        payload_values_per_thread=payload_values_per_thread,
-        payload_valid_words=payload_valid_words,
-        payload_padded_words=payload_padded_words,
+        payload_values_per_thread=_SM100_BWD_PAYLOAD_VALUES_PER_THREAD,
+        payload_valid_words=SM100_BWD_MASK_PAYLOAD_WORDS,
+        payload_padded_words=SM100_BWD_MASK_PAYLOAD_WORDS,
         tmem_load_atom_id=_SM100_BWD_TMEM_LOAD_ATOM_ID,
         payload_layout_id=payload_layout_id,
         # Deterministic mode uses the native descending-K scheduler.
@@ -239,7 +219,6 @@ def make_sm100_bwd_tiled_mma_sdp(
 @cute.jit
 def make_sm100_bwd_tmem_load(
     consumer_tidx: cutlass.Int32,
-    num_wg: cutlass.Constexpr[int] = 2,
 ):
     """Build the exact score TMEM-to-register copy used by compute_loop."""
 
@@ -247,7 +226,7 @@ def make_sm100_bwd_tmem_load(
         tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
         Float32,
     )
-    return copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(consumer_tidx)
+    return copy_utils.make_tmem_copy(tmem_load_atom, 2).get_slice(consumer_tidx)
 
 
 __all__ = [

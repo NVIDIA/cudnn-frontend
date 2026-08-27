@@ -2,24 +2,16 @@
 # Copyright (c) 2025, Tri Dao.
 
 import contextlib
-from functools import lru_cache
 import re
 from typing import Tuple
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
-try:
-    from triton.tools.disasm import extract
-except ImportError:
-    extract = None
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import NumericMeta, dsl_user_op
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
-
-StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
 
 def _cute_dsl_version() -> tuple[int, int, int]:
@@ -37,9 +29,12 @@ def _cute_dsl_version() -> tuple[int, int, int]:
 _CUTE_DSL_VERSION = _cute_dsl_version()
 
 
-def _cute_dsl_bulk_copy_self_elects() -> bool:
+def _cute_dsl_bulk_copy_self_elects(
+    version: tuple[int, int, int] | None = None,
+) -> bool:
     """Return whether cute.copy elects a lane for bulk-async copies."""
-    return (4, 6, 0) <= _CUTE_DSL_VERSION < (4, 6, 2)
+    version = _CUTE_DSL_VERSION if version is None else version
+    return (4, 6, 0) <= version < (4, 6, 2)
 
 
 _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
@@ -73,27 +68,6 @@ def struct_scalar_ptr(field):
     ``.ptr``. Older releases return the pointer directly.
     """
     return field.ptr if hasattr(field, "ptr") else field
-
-
-load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
-cute_compile_og = cute.compile
-
-
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
-
-
-@lru_cache
-def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
-
-
-@lru_cache
-def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
-    return torch.cuda.get_device_capability(device)
 
 
 def _has_aligned_pointer(tensor: torch.Tensor, align_bytes: int) -> bool:
@@ -147,48 +121,32 @@ def as_bshkrd_tensor(
     varlen: bool,
 ) -> cute.Tensor:
     """Normalize (B,S,H,D)/(S,H,D) to a (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        if cutlass.const_expr(varlen):
-            return cute.make_tensor(
-                tensor.iterator,
-                cute.make_layout(
-                    tensor.shape,
-                    stride=(
-                        0,
-                        tensor.stride[1],
-                        tensor.stride[2],
-                        tensor.stride[3],
-                        tensor.stride[4],
-                    ),
-                ),
-            )
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
+    if cutlass.const_expr(varlen):
+        assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
         return cute.make_tensor(
             tensor.iterator,
             cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
+                (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
                 stride=(
+                    0,
                     tensor.stride[0],
+                    tensor.stride[1] * h_r,
                     tensor.stride[1],
-                    tensor.stride[2] * h_r,
                     tensor.stride[2],
-                    tensor.stride[3],
                 ),
             ),
         )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 4), "Expected rank-4 fixed-length tensor"
     return cute.make_tensor(
         tensor.iterator,
         cute.make_layout(
-            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
+            (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
             stride=(
-                0,
                 tensor.stride[0],
-                tensor.stride[1] * h_r,
                 tensor.stride[1],
+                tensor.stride[2] * h_r,
                 tensor.stride[2],
+                tensor.stride[3],
             ),
         ),
     )
@@ -198,13 +156,9 @@ def to_cute_tensor(
     t,
     assumed_align=16,
     leading_dim=-1,
-    fully_dynamic=False,
-    enable_tvm_ffi=True,
 ):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
-    if fully_dynamic:
-        return tensor.mark_layout_dynamic()
+    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True)
     if leading_dim == -1:
         leading_dim = t.ndim - 1
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)

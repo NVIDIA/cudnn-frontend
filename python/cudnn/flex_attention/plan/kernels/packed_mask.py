@@ -385,12 +385,10 @@ def prefetch_arbitrary_forward_mask(
 @cute.jit
 def apply_arbitrary_forward_mask(
     acc_S: cute.Tensor,
-    n_block: Int32,
     mask_payloads: cute.Tensor,
     payload_idx: Int32,
     payload_group_idx: Int32,
     payload_words: cutlass.Constexpr[int],
-    mask_seqlen: cutlass.Constexpr[bool] = True,
     r_bitmask: Optional[cute.Tensor] = None,
 ):
     """Apply one partial-block payload."""
@@ -402,13 +400,12 @@ def apply_arbitrary_forward_mask(
             payload_group_idx,
             payload_words=payload_words,
         )
-    apply_loaded_arbitrary_mask(acc_S, n_block, r_bitmask, payload_words)
+    apply_loaded_arbitrary_mask(acc_S, r_bitmask, payload_words)
 
 
 @cute.jit
 def apply_loaded_arbitrary_mask(
     acc_S: cute.Tensor,
-    n_block: Int32,
     r_bitmask: cute.Tensor,
     payload_valid_words: cutlass.Constexpr[int],
 ):
@@ -432,93 +429,19 @@ def apply_loaded_arbitrary_mask(
 @cute.jit
 def apply_loaded_arbitrary_forward_mask(
     acc_S: cute.Tensor,
-    n_block: Int32,
     r_bitmask: cute.Tensor,
 ):
     """Apply every word of a forward consumer-native payload."""
 
     apply_loaded_arbitrary_mask(
         acc_S,
-        n_block,
         r_bitmask,
         cute.size(r_bitmask.shape[0]),
     )
 
 
 @cute.jit
-def produce_arbitrary_forward_nonoverlap(
-    partial_block_cnt,
-    partial_block_idx: cute.Tensor,
-    full_block_cnt,
-    full_block_idx: cute.Tensor,
-    partial_payload_base: Int32,
-    mask_payloads: cute.Tensor,
-    payload_words: cutlass.Constexpr[int],
-    kv_producer_state,
-    load_K: Callable,
-    load_V: Callable,
-    pipeline_k,
-    pipeline_v,
-    o_empty_mbar_ptr: Optional[cute.Pointer] = None,
-    o_empty_phase: Optional[Int32] = None,
-    pipeline_mask=None,
-    mask_producer_state=None,
-    sMask: Optional[cute.Tensor] = None,
-    payload_groups: cutlass.Constexpr[int] = 0,
-):
-    """Produce anchored partial/full CSR loops without K/V overlap."""
-    if const_expr(o_empty_mbar_ptr is not None):
-        assert o_empty_phase is not None
-        cute.arch.mbarrier_wait(o_empty_mbar_ptr, phase=o_empty_phase)
-
-    for iteration in cutlass.range(partial_block_cnt, unroll=1):
-        partial_list_idx = partial_block_cnt - Int32(1) - iteration
-        n_block = partial_block_idx[partial_list_idx]
-        payload_idx = partial_payload_base + partial_list_idx
-        if const_expr(pipeline_mask is not None):
-            assert mask_producer_state is not None
-            assert sMask is not None
-            mask_producer_state = load_mask_payload_to_smem(
-                mask_payloads,
-                payload_idx,
-                Int32(0),
-                sMask[None, None, mask_producer_state.index],
-                pipeline_mask,
-                mask_producer_state,
-                payload_groups,
-                payload_words,
-            )
-        else:
-            prefetch_arbitrary_forward_mask(mask_payloads, payload_idx, True, payload_words)
-        prefetch_arbitrary_forward_block_index(
-            partial_block_idx,
-            partial_list_idx - Int32(1),
-            iteration + Int32(1) < partial_block_cnt,
-        )
-        pipeline_k.producer_acquire(kv_producer_state)
-        load_K(src_idx=n_block, producer_state=kv_producer_state)
-        pipeline_v.producer_acquire(kv_producer_state)
-        load_V(src_idx=n_block, producer_state=kv_producer_state)
-        kv_producer_state.advance()
-
-    for iteration in cutlass.range(full_block_cnt, unroll=1):
-        full_list_idx = full_block_cnt - Int32(1) - iteration
-        n_block = full_block_idx[full_list_idx]
-        prefetch_arbitrary_forward_block_index(
-            full_block_idx,
-            full_list_idx - Int32(1),
-            iteration + Int32(1) < full_block_cnt,
-        )
-        pipeline_k.producer_acquire(kv_producer_state)
-        load_K(src_idx=n_block, producer_state=kv_producer_state)
-        pipeline_v.producer_acquire(kv_producer_state)
-        load_V(src_idx=n_block, producer_state=kv_producer_state)
-        kv_producer_state.advance()
-    return kv_producer_state, mask_producer_state
-
-
-@cute.jit
-def produce_arbitrary_forward_overlap(
+def produce_arbitrary_forward(
     partial_block_cnt,
     partial_block_idx: cute.Tensor,
     full_block_cnt,
@@ -661,129 +584,11 @@ def produce_arbitrary_forward_overlap(
 
 
 @cute.jit
-def consume_arbitrary_forward_nonoverlap(
+def consume_arbitrary_forward(
     partial_block_cnt,
-    partial_block_idx: Optional[cute.Tensor],
     full_block_cnt,
-    full_block_idx: Optional[cute.Tensor],
     partial_payload_base: Int32,
     mask_payloads: cute.Tensor,
-    kv_consumer_state,
-    mma_pv_fn: Callable,
-    mma_one_n_block: Callable,
-    payload_group_idx: Int32,
-    payload_words: cutlass.Constexpr[int],
-    warp_scheduler_barrier_sync: Callable,
-    warp_scheduler_barrier_arrive: Callable,
-    pipeline_mask=None,
-    mask_consumer_state=None,
-    sMask: Optional[cute.Tensor] = None,
-):
-    """Consume partial/full CSR loops without K/V overlap."""
-    total_block_cnt = partial_block_cnt + full_block_cnt
-    processed_any = total_block_cnt > Int32(0)
-    full_start = Int32(0)
-    if processed_any:
-        warp_scheduler_barrier_sync()
-        if partial_block_cnt > Int32(0):
-            partial_list_idx = partial_block_cnt - Int32(1)
-            payload_idx = partial_payload_base + partial_list_idx
-            n_block = Int32(0)
-            if const_expr(partial_block_idx is not None):
-                n_block = partial_block_idx[partial_list_idx]
-            r_bitmask = None
-            if const_expr(pipeline_mask is not None):
-                assert mask_consumer_state is not None
-                assert sMask is not None
-                r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
-                    sMask[None, None, mask_consumer_state.index],
-                    payload_group_idx,
-                    pipeline_mask,
-                    mask_consumer_state,
-                )
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=True),
-                mask_fn=partial(
-                    apply_arbitrary_forward_mask,
-                    mask_payloads=mask_payloads,
-                    payload_idx=payload_idx,
-                    payload_group_idx=payload_group_idx,
-                    payload_words=payload_words,
-                    r_bitmask=r_bitmask,
-                ),
-                is_first_n_block=True,
-            )
-            for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
-                partial_list_idx = partial_block_cnt - Int32(1) - iteration
-                payload_idx = partial_payload_base + partial_list_idx
-                n_block = Int32(0)
-                if const_expr(partial_block_idx is not None):
-                    n_block = partial_block_idx[partial_list_idx]
-                r_bitmask = None
-                if const_expr(pipeline_mask is not None):
-                    assert mask_consumer_state is not None
-                    assert sMask is not None
-                    r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
-                        sMask[None, None, mask_consumer_state.index],
-                        payload_group_idx,
-                        pipeline_mask,
-                        mask_consumer_state,
-                    )
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=False),
-                    mask_fn=partial(
-                        apply_arbitrary_forward_mask,
-                        mask_payloads=mask_payloads,
-                        payload_idx=payload_idx,
-                        payload_group_idx=payload_group_idx,
-                        payload_words=payload_words,
-                        r_bitmask=r_bitmask,
-                    ),
-                    is_first_n_block=False,
-                )
-            full_start = Int32(0)
-        else:
-            full_list_idx = full_block_cnt - Int32(1)
-            n_block = Int32(0)
-            if const_expr(full_block_idx is not None):
-                n_block = full_block_idx[full_list_idx]
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=True),
-                mask_fn=None,
-                is_first_n_block=True,
-            )
-            full_start = Int32(1)
-        for iteration in cutlass.range(full_start, full_block_cnt, unroll=1):
-            full_list_idx = full_block_cnt - Int32(1) - iteration
-            n_block = Int32(0)
-            if const_expr(full_block_idx is not None):
-                n_block = full_block_idx[full_list_idx]
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=False),
-                mask_fn=None,
-                is_first_n_block=False,
-            )
-        warp_scheduler_barrier_arrive()
-    return kv_consumer_state, processed_any, mask_consumer_state
-
-
-@cute.jit
-def consume_arbitrary_forward_overlap(
-    partial_block_cnt,
-    partial_block_idx: Optional[cute.Tensor],
-    full_block_cnt,
-    full_block_idx: Optional[cute.Tensor],
-    partial_payload_base: Int32,
-    mask_payloads: cute.Tensor,
-    seqlen_info,
     kv_consumer_state,
     mma_pv_fn: Callable,
     mma_one_n_block: Callable,
@@ -803,9 +608,6 @@ def consume_arbitrary_forward_overlap(
         if partial_block_cnt > Int32(0):
             partial_list_idx = partial_block_cnt - Int32(1)
             payload_idx = partial_payload_base + partial_list_idx
-            n_block = Int32(0)
-            if const_expr(partial_block_idx is not None):
-                n_block = partial_block_idx[partial_list_idx]
             if const_expr(pipeline_mask is not None):
                 assert mask_consumer_state is not None
                 assert sMask is not None
@@ -816,8 +618,6 @@ def consume_arbitrary_forward_overlap(
                     mask_consumer_state,
                 )
                 kv_consumer_state = process_first_half_block(
-                    n_block=n_block,
-                    seqlen=seqlen_info,
                     kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(
                         apply_arbitrary_forward_mask,
@@ -832,8 +632,6 @@ def consume_arbitrary_forward_overlap(
                 )
             else:
                 kv_consumer_state = process_first_half_block(
-                    n_block=n_block,
-                    seqlen=seqlen_info,
                     kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(
                         apply_arbitrary_forward_mask,
@@ -854,9 +652,6 @@ def consume_arbitrary_forward_overlap(
             for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
                 partial_list_idx = partial_block_cnt - Int32(1) - iteration
                 payload_idx = partial_payload_base + partial_list_idx
-                n_block = Int32(0)
-                if const_expr(partial_block_idx is not None):
-                    n_block = partial_block_idx[partial_list_idx]
                 if const_expr(pipeline_mask is not None):
                     assert mask_consumer_state is not None
                     assert sMask is not None
@@ -868,8 +663,6 @@ def consume_arbitrary_forward_overlap(
                     )
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
-                        n_block=n_block,
-                        seqlen=seqlen_info,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=partial(
                             apply_arbitrary_forward_mask,
@@ -884,8 +677,6 @@ def consume_arbitrary_forward_overlap(
                 else:
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
-                        n_block=n_block,
-                        seqlen=seqlen_info,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=partial(
                             apply_arbitrary_forward_mask,
@@ -905,13 +696,7 @@ def consume_arbitrary_forward_overlap(
                 O_should_accumulate = True
             full_start = Int32(0)
         else:
-            full_list_idx = full_block_cnt - Int32(1)
-            n_block = Int32(0)
-            if const_expr(full_block_idx is not None):
-                n_block = full_block_idx[full_list_idx]
             kv_consumer_state = process_first_half_block(
-                n_block=n_block,
-                seqlen=seqlen_info,
                 kv_consumer_state=kv_consumer_state,
                 mask_fn=None,
                 mask_prefetch_fn=None,
@@ -919,15 +704,9 @@ def consume_arbitrary_forward_overlap(
             )
             full_start = Int32(1)
 
-        for iteration in cutlass.range(full_start, full_block_cnt, unroll=1):
-            full_list_idx = full_block_cnt - Int32(1) - iteration
-            n_block = Int32(0)
-            if const_expr(full_block_idx is not None):
-                n_block = full_block_idx[full_list_idx]
+        for _ in cutlass.range(full_start, full_block_cnt, unroll=1):
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
-                n_block=n_block,
-                seqlen=seqlen_info,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                 mask_fn=None,
                 mask_prefetch_fn=None,
@@ -954,7 +733,6 @@ def produce_block_sparse_loads(
     load_V,
     pipeline_k,
     pipeline_v,
-    intra_wg_overlap: cutlass.Constexpr,
     tile_m: cutlass.Constexpr[int],
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     o_empty_mbar_ptr: Optional[cute.Pointer] = None,
@@ -983,48 +761,26 @@ def produce_block_sparse_loads(
         tile_m,
         qhead_per_kvhead,
     )
-    if const_expr(not intra_wg_overlap):
-        kv_producer_state, mask_producer_state = produce_arbitrary_forward_nonoverlap(
-            curr_mask_block_cnt,
-            curr_mask_block_idx,
-            curr_full_block_cnt,
-            curr_full_block_idx,
-            mask_payload_base,
-            mask_payloads,
-            payload_words,
-            kv_producer_state,
-            load_K,
-            load_V,
-            pipeline_k,
-            pipeline_v,
-            o_empty_mbar_ptr,
-            o_empty_phase,
-            pipeline_mask,
-            mask_producer_state,
-            sMask,
-            payload_groups,
-        )
-    else:
-        kv_producer_state, mask_producer_state = produce_arbitrary_forward_overlap(
-            curr_mask_block_cnt,
-            curr_mask_block_idx,
-            curr_full_block_cnt,
-            curr_full_block_idx,
-            mask_payload_base,
-            mask_payloads,
-            payload_words,
-            kv_producer_state,
-            load_K,
-            load_V,
-            pipeline_k,
-            pipeline_v,
-            o_empty_mbar_ptr,
-            o_empty_phase,
-            pipeline_mask,
-            mask_producer_state,
-            sMask,
-            payload_groups,
-        )
+    kv_producer_state, mask_producer_state = produce_arbitrary_forward(
+        curr_mask_block_cnt,
+        curr_mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_idx,
+        mask_payload_base,
+        mask_payloads,
+        payload_words,
+        kv_producer_state,
+        load_K,
+        load_V,
+        pipeline_k,
+        pipeline_v,
+        o_empty_mbar_ptr,
+        o_empty_phase,
+        pipeline_mask,
+        mask_producer_state,
+        sMask,
+        payload_groups,
+    )
     if const_expr(pipeline_mask is not None):
         return kv_producer_state, mask_producer_state
     return kv_producer_state
@@ -1042,9 +798,6 @@ def consume_block_sparse_loads(
     mma_one_n_block,
     process_first_half_block,
     process_last_half_block,
-    intra_wg_overlap: cutlass.Constexpr,
-    warp_scheduler_barrier_sync: Callable,
-    warp_scheduler_barrier_arrive: Callable,
     tile_m: cutlass.Constexpr[int],
     consumer_tidx: Int32,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
@@ -1073,36 +826,11 @@ def consume_block_sparse_loads(
         consumer_tidx,
         qhead_per_kvhead,
     )
-    if const_expr(not intra_wg_overlap):
-        kv_consumer_state, processed_any, mask_consumer_state = consume_arbitrary_forward_nonoverlap(
-            curr_mask_block_cnt,
-            None,
-            curr_full_block_cnt,
-            None,
-            mask_payload_base,
-            mask_payloads,
-            kv_consumer_state,
-            mma_pv_fn,
-            mma_one_n_block,
-            payload_group_idx,
-            payload_words,
-            warp_scheduler_barrier_sync,
-            warp_scheduler_barrier_arrive,
-            pipeline_mask,
-            mask_consumer_state,
-            sMask,
-        )
-        if const_expr(pipeline_mask is not None):
-            return kv_consumer_state, processed_any, processed_any, mask_consumer_state
-        return kv_consumer_state, processed_any, processed_any
-    kv_consumer_state, O_should_accumulate, processed_any, mask_consumer_state = consume_arbitrary_forward_overlap(
+    kv_consumer_state, O_should_accumulate, processed_any, mask_consumer_state = consume_arbitrary_forward(
         curr_mask_block_cnt,
-        None,
         curr_full_block_cnt,
-        None,
         mask_payload_base,
         mask_payloads,
-        seqlen_info,
         kv_consumer_state,
         mma_pv_fn,
         mma_one_n_block,
@@ -1581,7 +1309,6 @@ def softmax_arbitrary_forward_sm100(
     softmax_step: Callable,
     mma_si_consumer_phase: Int32,
     si_corr_producer_phase: Int32,
-    s0_s1_sequence_phase: Int32,
     sm_stats_barrier: cutlass.pipeline.NamedBarrier,
     stage_idx: Int32,
     payload_subtile_idx: Int32,
@@ -1595,9 +1322,9 @@ def softmax_arbitrary_forward_sm100(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     (
         partial_count,
-        partial_indices,
+        _,
         full_count,
-        full_indices,
+        _,
         payload_base,
     ) = get_curr_arbitrary_blocksparse_tensors(
         batch_idx,
@@ -1617,7 +1344,6 @@ def softmax_arbitrary_forward_sm100(
     else:
         if partial_count > 0:
             partial_ordinal = partial_count - Int32(1)
-            n_block = partial_indices[partial_ordinal]
             payload_idx = payload_base + partial_ordinal
             # This global-to-register load intentionally precedes the score
             # pipeline wait inside softmax_step. The four words remain live
@@ -1632,12 +1358,9 @@ def softmax_arbitrary_forward_sm100(
             (
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
-                s0_s1_sequence_phase,
             ) = softmax_step(
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
-                s0_s1_sequence_phase,
-                n_block,
                 is_first=True,
                 mask_fn=partial(
                     apply_loaded_arbitrary_forward_mask,
@@ -1646,7 +1369,6 @@ def softmax_arbitrary_forward_sm100(
             )
             for offset in cutlass.range(1, partial_count, unroll=1):
                 partial_ordinal = partial_count - Int32(1) - offset
-                n_block = partial_indices[partial_ordinal]
                 payload_idx = payload_base + partial_ordinal
                 r_bitmask = load_mask_payload(
                     mask_payloads,
@@ -1658,12 +1380,9 @@ def softmax_arbitrary_forward_sm100(
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
                 ) = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    n_block,
                     mask_fn=partial(
                         apply_loaded_arbitrary_forward_mask,
                         r_bitmask=r_bitmask,
@@ -1671,18 +1390,13 @@ def softmax_arbitrary_forward_sm100(
                 )
 
         if full_count > 0:
-            full_ordinal = full_count - Int32(1)
-            n_block = full_indices[full_ordinal]
             if partial_count == 0:
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
                 ) = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    n_block,
                     is_first=True,
                     mask_fn=None,
                 )
@@ -1690,33 +1404,24 @@ def softmax_arbitrary_forward_sm100(
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
                 ) = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    n_block,
                     mask_fn=None,
                 )
-            for offset in cutlass.range(1, full_count, unroll=1):
-                full_ordinal = full_count - Int32(1) - offset
-                n_block = full_indices[full_ordinal]
+            for _ in cutlass.range(1, full_count, unroll=1):
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
                 ) = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    n_block,
                     mask_fn=None,
                 )
 
     return (
         mma_si_consumer_phase,
         si_corr_producer_phase,
-        s0_s1_sequence_phase,
         total_count == 0,
     )
 
@@ -1747,9 +1452,9 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     (
         partial_count,
-        partial_indices,
+        _,
         full_count,
-        full_indices,
+        _,
         payload_base,
     ) = get_curr_arbitrary_blocksparse_tensors(
         batch_idx,
@@ -1769,7 +1474,6 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
         first_traversal_ordinal = Int32(stage_idx)
         if first_traversal_ordinal < partial_count:
             partial_ordinal = partial_count - Int32(1) - first_traversal_ordinal
-            n_block = partial_indices[partial_ordinal]
             if const_expr(pipeline_mask is not None):
                 assert sMask is not None
                 r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
@@ -1786,11 +1490,9 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
                     subtile_idx=payload_subtile_idx,
                     payload_words=payload_words,
                 )
-            mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
+            mma_si_consumer_phase, si_corr_producer_phase = softmax_step(
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
-                Int32(0),
-                n_block,
                 is_first=True,
                 mask_fn=partial(
                     apply_loaded_arbitrary_forward_mask,
@@ -1802,7 +1504,6 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
             for stream_ordinal in cutlass.range(Int32(1), partial_stream_count, unroll=1):
                 traversal_ordinal = Int32(stage_idx) + stream_ordinal * Int32(2)
                 partial_ordinal = partial_count - Int32(1) - traversal_ordinal
-                n_block = partial_indices[partial_ordinal]
                 if const_expr(pipeline_mask is not None):
                     r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
                         sMask,
@@ -1818,11 +1519,9 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
                         subtile_idx=payload_subtile_idx,
                         payload_words=payload_words,
                     )
-                mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
+                mma_si_consumer_phase, si_corr_producer_phase = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    Int32(0),
-                    n_block,
                     mask_fn=partial(
                         apply_loaded_arbitrary_forward_mask,
                         r_bitmask=r_bitmask,
@@ -1832,13 +1531,9 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
         full_start = (Int32(stage_idx) - partial_count) & Int32(1)
         full_is_first = first_traversal_ordinal >= partial_count
         if full_is_first:
-            full_ordinal = full_count - Int32(1) - full_start
-            n_block = full_indices[full_ordinal]
-            mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
+            mma_si_consumer_phase, si_corr_producer_phase = softmax_step(
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
-                Int32(0),
-                n_block,
                 is_first=True,
                 mask_fn=None,
             )
@@ -1846,15 +1541,10 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
 
         if full_start < full_count:
             full_stream_count = (full_count - full_start + Int32(1)) // Int32(2)
-            for stream_ordinal in cutlass.range(full_stream_count, unroll=1):
-                full_traversal_ordinal = full_start + stream_ordinal * Int32(2)
-                full_ordinal = full_count - Int32(1) - full_traversal_ordinal
-                n_block = full_indices[full_ordinal]
-                mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
+            for _ in cutlass.range(full_stream_count, unroll=1):
+                mma_si_consumer_phase, si_corr_producer_phase = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
-                    Int32(0),
-                    n_block,
                     mask_fn=None,
                 )
     else:
@@ -1891,7 +1581,6 @@ def get_total_q_block_count_bwd(
     head_idx,
     n_block,
     subtile_factor: cutlass.Constexpr = 1,
-    m_block_max: int = 0,
     n_blocks_per_sample: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
@@ -1901,7 +1590,6 @@ def get_total_q_block_count_bwd(
         head_idx,
         n_block,
         subtile_factor=subtile_factor,
-        m_block_max=m_block_max,
         n_blocks_per_sample=n_blocks_per_sample,
     )
     return total
@@ -1955,48 +1643,31 @@ def produce_block_sparse_q_loads_bwd_sm100(
         curr_full_idx,
         _,
         _,
-        loop_count,
+        _,
     ) = get_block_sparse_iteration_info_bwd(
         blocksparse_tensors,
         batch_idx,
         head_idx,
         n_block,
         subtile_factor,
-        m_block_max,
         n_blocks_per_sample,
     )
 
-    split_sparse_blocks = const_expr(curr_full_idx is not None)
-    block_group_count: cutlass.Constexpr[int] = 2 if const_expr(split_sparse_blocks) else 1
-    for block_group in cutlass.range_constexpr(block_group_count):
-        group_loop_count = loop_count
+    for block_group in cutlass.range_constexpr(2):
+        group_loop_count = curr_q_cnt * subtile_factor
         iter_offset = Int32(0)
-        if const_expr(split_sparse_blocks):
-            group_loop_count = curr_q_cnt * subtile_factor
-            if const_expr(block_group == 1):
-                group_loop_count = curr_full_cnt * subtile_factor
-                iter_offset = curr_q_cnt * subtile_factor
+        if const_expr(block_group == 1):
+            group_loop_count = curr_full_cnt * subtile_factor
+            iter_offset = curr_q_cnt * subtile_factor
 
         for group_iter_idx in cutlass.range(group_loop_count, unroll=1):
             iter_idx = group_iter_idx + iter_offset
-            if const_expr(split_sparse_blocks):
-                sparse_iter_idx = group_iter_idx // subtile_factor
-                subtile_offset = group_iter_idx % subtile_factor
-                if const_expr(block_group == 0):
-                    m_block = curr_q_idx[sparse_iter_idx] * subtile_factor + subtile_offset
-                else:
-                    assert curr_full_idx is not None
-                    m_block = curr_full_idx[sparse_iter_idx] * subtile_factor + subtile_offset
+            sparse_iter_idx = group_iter_idx // subtile_factor
+            subtile_offset = group_iter_idx % subtile_factor
+            if const_expr(block_group == 0):
+                m_block = curr_q_idx[sparse_iter_idx] * subtile_factor + subtile_offset
             else:
-                m_block, _ = get_m_block_from_iter_bwd(
-                    iter_idx,
-                    curr_q_cnt,
-                    curr_q_idx,
-                    curr_full_cnt,
-                    curr_full_idx,
-                    subtile_factor,
-                    m_block_max,
-                )
+                m_block = curr_full_idx[sparse_iter_idx] * subtile_factor + subtile_offset
             m_block_safe = m_block
             if m_block_max > 0:
                 m_block_safe = cutlass.min(m_block, m_block_max - 1)
@@ -2062,7 +1733,6 @@ def get_block_sparse_iteration_info_bwd(
     head_idx,
     n_block,
     subtile_factor: cutlass.Constexpr = 1,
-    m_block_max: int = 0,
     n_blocks_per_sample: int = 0,
 ):
     """Extract block-sparse iteration info for backward pass.
@@ -2087,10 +1757,7 @@ def get_block_sparse_iteration_info_bwd(
         n_blocks_per_sample,
     )
 
-    sparse_block_count = curr_q_cnt
-    if const_expr(curr_full_idx is not None):
-        sparse_block_count = sparse_block_count + curr_full_cnt
-    total_count = sparse_block_count * subtile_factor
+    total_count = (curr_q_cnt + curr_full_cnt) * subtile_factor
 
     return (
         curr_q_cnt,
@@ -2111,12 +1778,13 @@ def get_curr_dq_write_order_bwd(
     n_block,
     n_blocks_per_sample: int = 0,
 ):
-    if const_expr(blocksparse_tensors.dq_write_order is None):
-        return None, None
     assert blocksparse_tensors.dq_write_order is not None
+    assert blocksparse_tensors.dq_write_order_full is not None
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
     mask_block_offset = blocksparse_tensors.mask_block_offset
+    full_block_offset = blocksparse_tensors.full_block_offset
     assert mask_block_offset is not None
+    assert full_block_offset is not None
     plan_head = Int32(0) if mask_block_cnt.shape[0] == 1 else head_idx
     outer_row = batch_idx * n_blocks_per_sample + n_block
     cu_total_k_blocks = blocksparse_tensors.cu_total_m_blocks
@@ -2124,12 +1792,7 @@ def get_curr_dq_write_order_bwd(
         outer_row = cu_total_k_blocks[batch_idx] + n_block
     offset_idx = plan_head * mask_block_cnt.shape[1] + outer_row
     curr_dq_write_order = cute.domain_offset(mask_block_offset[offset_idx], blocksparse_tensors.dq_write_order)
-    curr_dq_write_order_full = None
-    if const_expr(blocksparse_tensors.dq_write_order_full is not None):
-        assert blocksparse_tensors.dq_write_order_full is not None
-        full_block_offset = blocksparse_tensors.full_block_offset
-        assert full_block_offset is not None
-        curr_dq_write_order_full = cute.domain_offset(full_block_offset[offset_idx], blocksparse_tensors.dq_write_order_full)
+    curr_dq_write_order_full = cute.domain_offset(full_block_offset[offset_idx], blocksparse_tensors.dq_write_order_full)
     return curr_dq_write_order, curr_dq_write_order_full
 
 
@@ -2139,9 +1802,8 @@ def get_m_block_from_iter_bwd(
     curr_q_cnt,
     curr_q_idx: cute.Tensor,
     curr_full_cnt,
-    curr_full_idx: Optional[cute.Tensor],
+    curr_full_idx: cute.Tensor,
     subtile_factor: cutlass.Constexpr = 1,
-    m_block_max: int = 0,
     full_first: cutlass.Constexpr[bool] = False,
 ):
     """Derive m_block index and is_full_block flag from iteration index.
@@ -2155,21 +1817,18 @@ def get_m_block_from_iter_bwd(
 
     sparse_m_block = Int32(0)
     is_full_block = False
-    if const_expr(curr_full_idx is not None):
-        if const_expr(full_first):
-            if sparse_iter_idx < curr_full_cnt:
-                sparse_m_block = curr_full_idx[sparse_iter_idx]
-                is_full_block = True
-            else:
-                sparse_m_block = curr_q_idx[sparse_iter_idx - curr_full_cnt]
+    if const_expr(full_first):
+        if sparse_iter_idx < curr_full_cnt:
+            sparse_m_block = curr_full_idx[sparse_iter_idx]
+            is_full_block = True
         else:
-            if sparse_iter_idx < curr_q_cnt:
-                sparse_m_block = curr_q_idx[sparse_iter_idx]
-            else:
-                sparse_m_block = curr_full_idx[sparse_iter_idx - curr_q_cnt]
-                is_full_block = True
+            sparse_m_block = curr_q_idx[sparse_iter_idx - curr_full_cnt]
     else:
-        sparse_m_block = curr_q_idx[sparse_iter_idx]
+        if sparse_iter_idx < curr_q_cnt:
+            sparse_m_block = curr_q_idx[sparse_iter_idx]
+        else:
+            sparse_m_block = curr_full_idx[sparse_iter_idx - curr_q_cnt]
+            is_full_block = True
 
     return sparse_m_block * subtile_factor + subtile_offset, is_full_block
 
@@ -2312,33 +1971,32 @@ def produce_block_sparse_q_loads_bwd_sm90(
                 )
                 kv_loaded = True
 
-    if const_expr(curr_full_idx is not None):
-        for sparse_idx in cutlass.range(curr_full_cnt, unroll=1):
-            sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
-            for subtile_offset in cutlass.range(subtile_factor, unroll=1):
-                m_block = sparse_m_block + subtile_offset
+    for sparse_idx in cutlass.range(curr_full_cnt, unroll=1):
+        sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
+        for subtile_offset in cutlass.range(subtile_factor, unroll=1):
+            m_block = sparse_m_block + subtile_offset
 
-                if m_block < m_block_max:
-                    producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
-                        m_block,
-                        producer_state_Q,
-                        producer_state_dO,
-                        pipeline_Q,
-                        pipeline_dO,
-                        load_K,
-                        load_V,
-                        load_Q,
-                        load_dO,
-                        load_LSE,
-                        load_dPsum,
-                        sQ_block_metadata,
-                        producer_tidx,
-                        tma_copy_bytes_K,
-                        tma_copy_bytes_V,
-                        Q_stage_eq_dO_stage,
-                        load_kv=not kv_loaded,
-                    )
-                    kv_loaded = True
+            if m_block < m_block_max:
+                producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
+                    m_block,
+                    producer_state_Q,
+                    producer_state_dO,
+                    pipeline_Q,
+                    pipeline_dO,
+                    load_K,
+                    load_V,
+                    load_Q,
+                    load_dO,
+                    load_LSE,
+                    load_dPsum,
+                    sQ_block_metadata,
+                    producer_tidx,
+                    tma_copy_bytes_K,
+                    tma_copy_bytes_V,
+                    Q_stage_eq_dO_stage,
+                    load_kv=not kv_loaded,
+                )
+                kv_loaded = True
 
     return producer_state_Q, producer_state_dO
 
@@ -2480,20 +2138,14 @@ def _store_one_dQaccum_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
-    accum_row_major: cutlass.Constexpr[bool] = False,
     deterministic: cutlass.Constexpr[bool] = False,
     mdQ_semaphore_cur: Optional[cute.Tensor] = None,
     warp_local_tidx: Int32 = Int32(0),
     lock_value: Int32 = Int32(0),
 ):
     """Store dQaccum for a single m_block."""
-    if const_expr(accum_row_major and not deterministic):
-        # A row-major copy chunk contains columns produced by every warp
-        # group. Do not release any writer for the next iteration until all
-        # previous chunks have finished reading shared memory.
-        cute.arch.cp_async_bulk_wait_group(0, read=True)
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-        if const_expr(not deterministic and not accum_row_major):
+        if const_expr(not deterministic):
             cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
@@ -2509,36 +2161,18 @@ def _store_one_dQaccum_sm90(
             lock_value,
         )
 
-    if const_expr(accum_row_major):
-        # A contiguous store chunk spans rows and therefore contains columns
-        # produced by every dQ warp group. Wait for all writers before reading
-        # any chunk from the row-major shared-memory matrix.
-        for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
-                number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+        with cute.arch.elect_one():
+            copy_utils.cpasync_reduce_bulk_add_f32(
+                sdQaccum[None, warp_group_idx].iterator,
+                gdQaccum[(None, warp_group_idx), m_block].iterator,
+                tma_copy_bytes_dQ,
             )
-        for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-            with cute.arch.elect_one():
-                copy_utils.cpasync_reduce_bulk_add_f32(
-                    sdQaccum[None, warp_group_idx].iterator,
-                    gdQaccum[(None, warp_group_idx), m_block].iterator,
-                    tma_copy_bytes_dQ,
-                )
-            cute.arch.cp_async_bulk_commit_group()
-    else:
-        for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
-                number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
-            )
-            with cute.arch.elect_one():
-                copy_utils.cpasync_reduce_bulk_add_f32(
-                    sdQaccum[None, warp_group_idx].iterator,
-                    gdQaccum[(None, warp_group_idx), m_block].iterator,
-                    tma_copy_bytes_dQ,
-                )
-            cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_commit_group()
 
     if const_expr(deterministic):
         assert mdQ_semaphore_cur is not None
@@ -2549,7 +2183,6 @@ def _store_one_dQaccum_sm90(
             mdQ_semaphore_cur[(m_block, None)].iterator,
             warp_local_tidx,
             0,  # flag_offset
-            1,
         )
 
 
@@ -2568,7 +2201,6 @@ def dQaccum_store_block_sparse_bwd_sm90(
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
     deterministic: cutlass.Constexpr[bool] = False,
-    accum_row_major: cutlass.Constexpr[bool] = False,
     mdQ_semaphore_cur: Optional[cute.Tensor] = None,
     warp_local_tidx: Int32 = Int32(0),
 ):
@@ -2617,36 +2249,32 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     num_dQ_warp_groups,
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
-                    accum_row_major=accum_row_major,
                     deterministic=deterministic,
                     mdQ_semaphore_cur=mdQ_semaphore_cur,
                     warp_local_tidx=warp_local_tidx,
                     lock_value=lock_value,
                 )
 
-    if const_expr(curr_full_idx is not None):
+    if const_expr(deterministic):
+        assert curr_dq_write_order_full is not None
+    for sparse_idx in cutlass.range(curr_full_cnt, unroll=1):
+        sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
+        lock_value = Int32(0)
         if const_expr(deterministic):
-            assert curr_dq_write_order_full is not None
-        for sparse_idx in cutlass.range(curr_full_cnt, unroll=1):
-            sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
-            lock_value = Int32(0)
-            if const_expr(deterministic):
-                assert curr_dq_write_order_full is not None
-                lock_value = curr_dq_write_order_full[sparse_idx]
-            for subtile_offset in cutlass.range(subtile_factor, unroll=1):
-                m_block = sparse_m_block + subtile_offset
+            lock_value = curr_dq_write_order_full[sparse_idx]
+        for subtile_offset in cutlass.range(subtile_factor, unroll=1):
+            m_block = sparse_m_block + subtile_offset
 
-                if m_block < m_block_max:
-                    _store_one_dQaccum_sm90(
-                        m_block,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        accum_row_major=accum_row_major,
-                        deterministic=deterministic,
-                        mdQ_semaphore_cur=mdQ_semaphore_cur,
-                        warp_local_tidx=warp_local_tidx,
-                        lock_value=lock_value,
-                    )
+            if m_block < m_block_max:
+                _store_one_dQaccum_sm90(
+                    m_block,
+                    sdQaccum,
+                    gdQaccum,
+                    num_dQ_warp_groups,
+                    num_threads_per_warp_group,
+                    tma_copy_bytes_dQ,
+                    deterministic=deterministic,
+                    mdQ_semaphore_cur=mdQ_semaphore_cur,
+                    warp_local_tidx=warp_local_tidx,
+                    lock_value=lock_value,
+                )

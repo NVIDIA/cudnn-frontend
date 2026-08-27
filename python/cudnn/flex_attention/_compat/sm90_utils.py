@@ -40,10 +40,6 @@ def make_smem_layout(
     return smem_layout_staged
 
 
-# For compatibility with blackwell_helpers.py
-make_smem_layout_epi = make_smem_layout
-
-
 @cute.jit
 def gemm(
     tiled_mma: cute.TiledMma,
@@ -52,7 +48,6 @@ def gemm(
     tCrB: cute.Tensor,
     zero_init: cutlass.Constexpr[bool] = False,
     wg_wait: cutlass.Constexpr[int] = 0,
-    # A_in_regs: cutlass.Constexpr[bool] = False,
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
     if const_expr(swap_AB):

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
-from typing import Type, Tuple, Optional
+from typing import Tuple, Optional
 
 import math
 import cutlass
@@ -13,18 +13,12 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 
-from cutlass.utils import ClcDynamicPersistentTileScheduler
-
 import cuda.bindings.driver as cuda
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
-    ClcState,
     compute_sm100_fmha_grid as compute_grid,
-    compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaStaticTileScheduler as FmhaStaticTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
-    Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
-    Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
 )
 from cudnn.flex_attention.kernels.common.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 import cudnn.flex_attention.kernels.common.copy_utils as fa_copy_utils
@@ -84,60 +78,34 @@ def _hd256_dq_bs_nblock(i: Int32, bs_info):
     total, mask_cnt, mask_off, mask_idx, full_off, full_idx = bs_info
     n_block = Int32(0)
     if total > 0:
-        if cutlass.const_expr(full_idx is not None):
-            if i < mask_cnt:
-                n_block = mask_idx[mask_off + i]
-            else:
-                n_block = full_idx[full_off + i - mask_cnt]
-        else:
+        if i < mask_cnt:
             n_block = mask_idx[mask_off + i]
+        else:
+            n_block = full_idx[full_off + i - mask_cnt]
     return n_block
-
-
-@cute.jit
-def _hd256_dq_bs_is_full_block(i: Int32, bs_info):
-    total, mask_cnt, _, _, _, full_idx = bs_info
-    is_full_block = False
-    if total > 0:
-        if cutlass.const_expr(full_idx is not None):
-            if i >= mask_cnt:
-                is_full_block = True
-    return is_full_block
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     def __init__(
         self,
-        acc_dtype: Type[cutlass.Numeric],
-        mma_tiler: Tuple[int, int, int],
-        qhead_per_kvhead: int = 1,
-        mask_payload_valid_words: int = 4,
-        mask_payload_padded_words: int = 4,
+        qhead_per_kvhead: int,
     ):
-        self.acc_dtype = acc_dtype
-        self.mma_tiler = mma_tiler
+        self.acc_dtype = cutlass.Float32
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.mask_payload_valid_words = mask_payload_valid_words
-        self.mask_payload_padded_words = mask_payload_padded_words
+        self.mask_payload_valid_words = 4
+        self.mask_payload_padded_words = 4
         assert self.qhead_per_kvhead >= 1
-        assert self.mask_payload_valid_words == 4 and self.mask_payload_padded_words == 4, "SM100 hd256 arbitrary dQ payload requires four valid/padded words"
-        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
-        assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
-        self.cta_tiler = (
-            mma_tiler[0],
-            mma_tiler[1],
-            mma_tiler[2],
-        )
+        self.cta_tiler = (128, 128, 256)
         self.qk_mma_tiler = (
-            2 * mma_tiler[0],
-            mma_tiler[1],
+            2 * self.cta_tiler[0],
+            self.cta_tiler[1],
             self.cta_tiler[2],
         )
         self.dov_mma_tiler = self.qk_mma_tiler
         self.dsk_mma_tiler = (
-            2 * mma_tiler[0],
+            2 * self.cta_tiler[0],
             self.cta_tiler[2],
-            mma_tiler[1],
+            self.cta_tiler[1],
         )
 
         self.dsk_block_tiler = (
@@ -150,21 +118,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.iterations_dsk = self.cta_tiler[2] // self.dsk_mma_tiler[1]
         self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        self.is_persistent = False
-        self.use_clc_scheduler = False
 
         self.compute_warp_ids = (0, 1, 2, 3)
         self.epilogue_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.load_warp_id = 9
         self.empty_warp_id = (10, 11)
-        self.sched_warp_id = None
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
         self.num_compute_warps = len(self.compute_warp_ids)
-
-        self.cta_sync_bar_id = 0
-        self.tmem_alloc_sync_bar_id = 1
-        self.compute_sync_bar_id = 2
 
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
@@ -190,8 +151,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.num_regs_epilogue = 160
         self.num_regs_other = 32
 
-        self.buffer_align_bytes = 1024
-
     def _setup_attributes(self):
         self.q_stage = self.iterations_qk
         self.k_stage = self.iterations_qk
@@ -204,9 +163,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.epi_stage = 1
         self.load_compute_LSE_stage = 1
         self.load_compute_sum_OdO_stage = 1
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self.num_clc_stage = 1
-            self.num_clc_response_bytes = 16
 
     @cute.jit
     def __call__(
@@ -225,7 +181,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         max_seqlen_q_runtime: Int32,
         stream: cuda.CUstream,
     ):
-        varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
         assert block_sparse_tensors.mask_block_offset is not None
         assert (cum_seqlen_q is None) == (cum_seqlen_k is None), "SM100 hd256 arbitrary dQ varlen requires both cu_seqlens tensors"
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -242,8 +197,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         h_r = q_tensor.shape[3]
         if cutlass.const_expr(cum_seqlen_q is not None):
             b = cum_seqlen_q.shape[0] - 1
-        elif cutlass.const_expr(cum_seqlen_k is not None):
-            b = cum_seqlen_k.shape[0] - 1
         else:
             b = q_tensor.shape[0]
         # `lse_tensor` / `sum_odo_tensor` are preallocated FP32 buffers (lse_log2 / dpsum)
@@ -357,23 +310,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.v_dtype = v.element_type
         self.do_dtype = do.element_type
         self.dq_dtype = dq.element_type
-        self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
         grid_seqlen_q = s_q
         if cutlass.const_expr(cum_seqlen_q is not None):
             grid_seqlen_q = max_seqlen_q_runtime
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self.tile_sched_params, grid = compute_grid_clc(
-                (grid_seqlen_q, dq.shape[1], dq.shape[2]),
-                self.cta_tiler,
-                (*self.cluster_shape_mn, 1),
-            )
-        else:
-            self.tile_sched_params, grid = compute_grid(
-                (grid_seqlen_q, dq.shape[1], dq.shape[2]),
-                self.cta_tiler,
-                self.is_persistent,
-            )
+        self.tile_sched_params, grid = compute_grid(
+            (grid_seqlen_q, dq.shape[1], dq.shape[2]),
+            self.cta_tiler,
+        )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.do_major_mode = utils.LayoutEnum.from_tensor(do).mma_major_mode()
@@ -580,8 +524,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # CLC pipeline barriers and response buffer
-            clc_mbar_ptr: cute.struct.MemRange[Int64, 2]
-            clc_response: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
 
         self.shared_storage = SharedStorage
 
@@ -664,19 +606,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         sdQ_epi_layout: cute.ComposedLayout,
         lse_smem_layout: cute.Layout,
         sum_odo_smem_layout: cute.Layout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: FmhaStaticTileSchedulerParams,
         block_sparse_tensors: Optional[BlockSparseTensors],
     ):
-        # llvm.inline_asm(
-        #     None,
-        #     [],
-        #     '.pragma "global knob CommonIntoMultiBlockLoop=1";',
-        #     "",
-        #     has_side_effects=True,
-        #     is_align_stack=False,
-        #     asm_dialect=llvm.AsmDialect.AD_ATT,
-        # )
-
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         #
         # Prefetch tma desc
@@ -689,9 +621,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_kt)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_dQ)
 
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
+        varlen = cum_seqlen_q is not None
         mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
@@ -811,38 +743,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-        # Initialize CLC state if using dynamic scheduler
-        if cutlass.const_expr(self.use_clc_scheduler):
-            clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            cluster_size = cute.size(self.cluster_shape_mnk)
-            num_clc_consumer_threads = self.threads_per_warp * (
-                1 + cluster_size * (len(self.compute_warp_ids) + len(self.epilogue_warp_ids) + 1 + 1)  # sched_warp (CTA 0 only)  # mma_warp  # load_warp
-            )
-            clc_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_clc_consumer_threads)
-            clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
-                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
-                    self.tile_sched_params.clc_hw_params(),
-                    cute.arch.block_idx(),
-                    cute.arch.grid_dim(),
-                    clc_response_ptr,
-                ),
-                pipeline=pipeline.PipelineClcFetchAsync.create(
-                    barrier_storage=storage.clc_mbar_ptr.data_ptr(),
-                    num_stages=self.num_clc_stage,
-                    producer_group=clc_pipeline_producer_group,
-                    consumer_group=clc_pipeline_consumer_group,
-                    tx_count=self.num_clc_response_bytes,
-                    cta_layout_vmnk=cluster_layout_vmnk,
-                    defer_sync=True,
-                ),
-                consumer_state=pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_clc_stage),
-                producer_state=pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_clc_stage),
-            )
-        else:
-            clc = None
-            clc_response_ptr = None
-
         # Cluster arrive after barrier init
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
@@ -927,17 +827,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             if warp_idx == self.empty_warp_id[_i]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-        if cutlass.const_expr(self.use_clc_scheduler):
-            tile_sched = FmhaClcDynamicTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response_ptr,
-                clc,
-            )
-        else:
-            blk_idx = cute.arch.block_idx()
-            tile_sched = FmhaStaticTileScheduler(tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim())
+        blk_idx = cute.arch.block_idx()
+        tile_sched = FmhaStaticTileScheduler(tile_sched_params, blk_idx)
         work_tile = tile_sched.initial_work_tile_info()
 
         # Cluster wait
@@ -958,7 +849,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
                 is_valid_q = True
@@ -972,7 +862,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 assert block_sparse_tensors is not None
                 bs_info = _hd256_dq_bs_block_info(
                     block_sparse_tensors,
@@ -982,7 +871,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cute.ceil_div(seqlen_q, self.qk_mma_tiler[0]),
                     is_valid_q,
                 )
-                seqlen_kv_loop_start = Int32(0)
                 seqlen_kv_loop_steps = bs_info[0]
                 is_valid_k = seqlen_kv_loop_steps > 0
                 has_work = is_valid_q and is_valid_k
@@ -1154,7 +1042,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             tma_bar_ptr=do_handle.barrier,
                         )
 
-                    kv_coord = seqlen_kv_loop_start
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         kv_block = _hd256_dq_bs_nblock(i, bs_info)
                         # Ki
@@ -1184,7 +1071,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tKTsKT[None, kt_handle.index],
                                 tma_bar_ptr=kt_handle.barrier,
                             )
-                        kv_coord += 1
 
                 work_tile = tile_sched.advance_to_next_work()
                 # End of persistent scheduler loop
@@ -1213,7 +1099,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[2],
                 )
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 batch_coord = curr_block_coord[2][1]
                 is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
@@ -1226,9 +1111,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 assert block_sparse_tensors is not None
-                seqlen_kv_loop_start = Int32(0)
                 seqlen_kv_loop_steps = _hd256_dq_bs_block_info(
                     block_sparse_tensors,
                     batch_coord,
@@ -1241,7 +1124,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 has_work = is_valid_q and is_valid_k
 
                 if has_work:
-                    # dq_handle = mma_dq_producer.acquire_and_advance()
                     load_q_releaser = load_q_consumer.clone()
                     load_do_releaser = load_do_consumer.clone()
                     dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1804,7 +1686,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
@@ -1817,7 +1698,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 assert block_sparse_tensors is not None
                 bs_info = _hd256_dq_bs_block_info(
                     block_sparse_tensors,
@@ -1836,11 +1716,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     end_count = start_count + trip_count
                     cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                     cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
-                    tScS = qk_thr_mma.partition_C(cS)
 
                     cdP_base = cute.make_identity_tensor((self.dov_mma_tiler[0], self.dov_mma_tiler[1]))
                     cdP = cute.domain_offset((mma_block_coord[0] * self.dov_mma_tiler[0], 0), cdP_base)
-                    tdPcdP = dov_thr_mma.partition_C(cdP)
 
                     lse_handle = load_lse_consumer.wait_and_advance()
                     sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
@@ -1863,13 +1741,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 apply_arbitrary_mask,
                                 mask_payloads,
                                 payload_idx,
-                                col_block,
                             ),
                             (
                                 seqlen_q,
-                                seqlen_k,
                                 scale_softmax,
-                                batch_coord,
                                 curr_block_coord[0],
                                 varlen,
                             ),
@@ -1881,7 +1756,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 lse_handle,
                                 sum_odo_handle,
                             ),
-                            step,
                         )
                     lse_handle.release()
                     sum_odo_handle.release()
@@ -1904,7 +1778,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
@@ -1917,9 +1790,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 assert block_sparse_tensors is not None
-                seqlen_kv_loop_start = Int32(0)
                 seqlen_kv_loop_steps = _hd256_dq_bs_block_info(
                     block_sparse_tensors,
                     batch_coord,
@@ -1969,29 +1840,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Scheduler Warp (only for CLC dynamic scheduler)
-        # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_scheduler):
-            is_first_cta_in_cluster = cta_rank_in_cluster == 0
-
-            if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-                while work_tile.is_valid_tile:
-                    tile_sched.prefetch_next_work()
-                    work_tile = tile_sched.advance_to_next_work()
-                tile_sched.producer_tail()
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Empty warps reg dealloc
-        # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_scheduler):
-            if warp_idx > self.load_warp_id:
-                if not (warp_idx == self.sched_warp_id and is_first_cta_in_cluster):
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-        else:
-            if warp_idx > self.load_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        if warp_idx > self.load_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cooperative TMEM Deallocation (2CTA)
@@ -2012,15 +1862,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         value_args: Tuple,
         tensor_args: Tuple,
         pipeline_args: Tuple,
-        step: Int32,
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         (
             apply_arbitrary_mask,
             mask_payloads,
             payload_idx,
-            n_block,
         ) = mask_args
-        seqlen_q, seqlen_k, scale_softmax, batch_coord, block_m_idx, varlen = value_args
+        seqlen_q, scale_softmax, block_m_idx, varlen = value_args
         tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO = tensor_args
         mma_s_consumer, mma_dp_consumer, ds_mma_producer, lse_handle, sum_odo_handle = pipeline_args
 
@@ -2053,14 +1901,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             )
             apply_loaded_arbitrary_mask(
                 tTMEM_LOADrS,
-                n_block,
                 r_bitmask,
                 self.mask_payload_valid_words,
             )
 
         log2_e = cutlass.Float32(math.log2(math.e))
         softmax_scale_log2_e = scale_softmax * log2_e
-        tTMEM_STORErP = cute.make_rmem_tensor(tTMEM_LOADrS.shape, self.q_dtype)
         for k in cutlass.range(0, cute.size(tTMEM_LOADrS), 2, unroll_full=True):
             lse = (
                 -sLSE[
@@ -2150,8 +1996,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen = tma_args
         dq_handle = mma_dq_consumer.wait_and_advance()
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, bidz = cute.arch.block_idx()
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cute.arch.fence_view_async_shared()
 
         epi_cols_dQ = math.gcd(128 // (self.dq_dtype.width // 8), epi_tile[1])

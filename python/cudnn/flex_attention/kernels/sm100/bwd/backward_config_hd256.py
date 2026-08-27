@@ -173,10 +173,6 @@ class _ResolvedSm100Hd256DqConsumerConfig:
         return self.num_mask_payload_groups
 
     @property
-    def attention_num_threads(self) -> int:
-        return 12 * 32
-
-    @property
     def payload_values_per_thread(self) -> int:
         return _HD256_DQ_PAYLOAD_VALUES
 
@@ -187,14 +183,6 @@ class _ResolvedSm100Hd256DqConsumerConfig:
     @property
     def payload_padded_words(self) -> int:
         return _HD256_DQ_PAYLOAD_PADDED_WORDS
-
-    @property
-    def payload_shape_tail(self) -> tuple[int, int, int]:
-        return (
-            self.physical_subtiles,
-            self.num_mask_payload_groups,
-            self.payload_padded_words,
-        )
 
     @property
     def tmem_load_atom_id(self) -> str:
@@ -352,10 +340,6 @@ class _ResolvedSm100Hd256DkdvConsumerConfig:
         return self.num_mask_payload_groups
 
     @property
-    def attention_num_threads(self) -> int:
-        return 12 * 32
-
-    @property
     def payload_values_per_thread(self) -> int:
         return _HD256_DKDV_PAYLOAD_VALUES
 
@@ -366,14 +350,6 @@ class _ResolvedSm100Hd256DkdvConsumerConfig:
     @property
     def payload_padded_words(self) -> int:
         return _HD256_DKDV_PAYLOAD_PADDED_WORDS
-
-    @property
-    def payload_shape_tail(self) -> tuple[int, int, int]:
-        return (
-            self.physical_subtiles,
-            self.num_mask_payload_groups,
-            self.payload_padded_words,
-        )
 
     @property
     def tmem_load_atom_id(self) -> str:
@@ -528,54 +504,6 @@ def resolve_sm100_hd256_dkdv_consumer_config(
 
 
 @cute.jit
-def make_sm100_hd256_dq_tiled_mma_qk(dtype: type[cutlass.Numeric]):
-    """Build the exact 2CTA Q256 x K128 score MMA used by the dQ kernel."""
-
-    return sm100_utils.make_trivial_tiled_mma(
-        dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
-        _HD256_ACC_DTYPE,
-        tcgen05.CtaGroup.TWO,
-        (_HD256_DQ_TILE_M * _HD256_CTA_GROUP_SIZE, _HD256_DQ_TILE_N),
-    )
-
-
-@cute.jit
-def make_sm100_hd256_dq_tmem_load(tSAcc: cute.Tensor, consumer_tidx: cutlass.Int32):
-    """Build the dQ kernel's native Rep16 score TMEM load slice."""
-
-    tmem_load_atom = cute.make_copy_atom(
-        tcgen05.Ld32x32bOp(tcgen05.Repetition(16)),
-        _HD256_ACC_DTYPE,
-    )
-    return tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(consumer_tidx)
-
-
-@cute.jit
-def make_sm100_hd256_dq_score_ownership(
-    tiled_mma_qk: cute.TiledMma,
-    cta_rank: cutlass.Int32,
-    consumer_tidx: cutlass.Int32,
-):
-    """Return score coordinates owned by one dQ payload group and CTA rank."""
-
-    thr_mma_qk = tiled_mma_qk.get_slice(cta_rank)
-    score_shape = (
-        _HD256_DQ_TILE_M * _HD256_CTA_GROUP_SIZE,
-        _HD256_DQ_TILE_N,
-    )
-    qk_acc_shape = thr_mma_qk.partition_shape_C(score_shape)
-    # Match qk_acc_stage=1 and the score slice used by compute_loop exactly.
-    tStS = thr_mma_qk.make_fragment_C(cute.append(qk_acc_shape, 1))
-    tSAcc = tStS[(None, None), 0, 0, 0]
-    thr_tmem_load = make_sm100_hd256_dq_tmem_load(tSAcc, consumer_tidx)
-    cS = cute.make_identity_tensor(score_shape)
-    tScS = thr_mma_qk.partition_C(cS)
-    return thr_tmem_load.partition_D(tScS[(None, None), 0, 0])
-
-
-@cute.jit
 def make_sm100_hd256_dkdv_tiled_mma_kq(dtype: type[cutlass.Numeric]):
     """Build the exact 2CTA K128 x Q128 score MMA used by the dKdV kernel."""
 
@@ -637,9 +565,6 @@ __all__ = [
     "make_sm100_hd256_dkdv_score_ownership",
     "make_sm100_hd256_dkdv_tiled_mma_kq",
     "make_sm100_hd256_dkdv_tmem_load",
-    "make_sm100_hd256_dq_score_ownership",
-    "make_sm100_hd256_dq_tiled_mma_qk",
-    "make_sm100_hd256_dq_tmem_load",
     "resolve_sm100_hd256_dkdv_consumer_config",
     "resolve_sm100_hd256_dq_consumer_config",
 ]

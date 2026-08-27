@@ -37,7 +37,6 @@ from cudnn.flex_attention.kernels.sm90.bwd.backward import FlexAttentionBackward
 from cudnn.flex_attention.kernels.sm90.bwd.backward_config import resolve_sm90_bwd_consumer_config
 from cudnn.flex_attention.kernels.sm90.fwd.forward import FlexAttentionForwardSm90
 from cudnn.flex_attention.kernels.sm90.fwd.forward_config import (
-    FwdConfig,
     _ResolvedSm90FwdConsumerConfig,
     resolve_sm90_fwd_consumer_config,
 )
@@ -52,10 +51,8 @@ from cudnn.flex_attention.kernels.sm100.bwd.backward_config_hd256 import (
 from cudnn.flex_attention.kernels.sm100.bwd.backward_hd256 import (
     BlackwellFusedMultiHeadAttentionBackward,
 )
-from cudnn.flex_attention.kernels.sm100.fwd import (
-    FlexAttentionForwardQStage1Sm100,
-    FlexAttentionForwardSm100,
-)
+from cudnn.flex_attention.kernels.sm100.fwd.forward_qstage1 import FlexAttentionForwardQStage1Sm100
+from cudnn.flex_attention.kernels.sm100.fwd.forward_qstage2 import FlexAttentionForwardSm100
 from cudnn.flex_attention.kernels.sm100.fwd.forward_config import (
     _ResolvedSm100FwdConsumerConfig,
     resolve_sm100_fwd_consumer_config,
@@ -87,7 +84,6 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH") is not None:
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
 }
 
 
@@ -154,7 +150,6 @@ def _block_sparse_runtime_tuple(tensors):
         tensors.full_block_cnt,
         tensors.full_block_idx,
         tensors.cu_total_m_blocks,
-        tensors.cu_block_idx_offsets,
         tensors.dq_write_order,
         tensors.dq_write_order_full,
         tensors.mask_block_offset,
@@ -259,7 +254,6 @@ def _validate_plan_binding(
     context: str,
 ):
     signature = validate_arbitrary_attention_plan(
-        arbitrary=True,
         block_sparse_tensors=plan,
     )
     expected_arch_family = "sm90" if arch == 90 else canonical_blackwell_arch_family(arch)
@@ -334,7 +328,6 @@ def _resolve_forward_config(
     if head_dim == 256 and head_dim_v == 256:
         supported_hd256_families = (
             "sm100_hd256_fwd",
-            "sm100_hd256_qstage1_1cta_fwd",
             "sm100_hd256_qstage1_2cta_fwd",
         )
         if kernel_family not in supported_hd256_families:
@@ -526,13 +519,6 @@ def _flex_attn_fwd(
 
         if arch == 90:
             assert isinstance(config, _ResolvedSm90FwdConsumerConfig)
-            fwd_config = FwdConfig(
-                config.tile_m,
-                config.tile_n,
-                config.mma_pv_is_rs,
-                config.intra_wg_overlap,
-                config.num_stages,
-            )
             kernel = FlexAttentionForwardSm90(
                 torch2cute_dtype_map[q.dtype],
                 head_dim,
@@ -541,14 +527,9 @@ def _flex_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=fwd_config.num_stages,
-                num_threads=config.attention_num_threads,
-                Q_in_regs=False,
-                intra_wg_overlap=config.intra_wg_overlap,
                 mma_pv_is_rs=config.mma_pv_is_rs,
                 use_smem_mask_pipeline=use_smem_mask_pipeline,
                 num_mask_payload_groups=config.num_mask_payload_groups,
-                q_subtile_factor=1,
             )
             scheduler_counter_tensor = (
                 to_cute_tensor(
@@ -578,12 +559,6 @@ def _flex_attn_fwd(
         elif use_hd256:
             assert isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
             kernel = BlackwellFusedMultiHeadAttentionForward(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                pack_gqa=False,
-                mask_payload_valid_words=config.payload_valid_words,
-                mask_payload_padded_words=config.payload_padded_words,
                 use_2cta_instrs=config.cta_group_size == 2,
             )
             compile_args = [
@@ -603,21 +578,20 @@ def _flex_attn_fwd(
         else:
             assert isinstance(config, _ResolvedSm100FwdConsumerConfig)
             kernel_cls = FlexAttentionForwardQStage1Sm100 if use_qstage1_1cta or use_qstage1_2cta else FlexAttentionForwardSm100
-            kernel_kwargs = {"overlap_pv_with_k_wait": qstage1_overlap_pv_with_k_wait} if use_qstage1_1cta else {}
+            kernel_kwargs = (
+                {
+                    "use_2cta_instrs": use_qstage1_2cta,
+                    "overlap_pv_with_k_wait": qstage1_overlap_pv_with_k_wait,
+                }
+                if use_qstage1_1cta or use_qstage1_2cta
+                else {}
+            )
             kernel = kernel_cls(
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead=qhead_per_kvhead,
                 pack_gqa=pack_gqa,
-                q_subtile_factor=1,
-                m_block_size=tile_m,
-                n_block_size=tile_n,
-                q_stage=q_stage,
-                is_persistent=True,
-                persistent_block_major=False,
                 is_varlen_q=is_varlen,
-                use_2cta_instrs=use_qstage1_2cta,
-                use_clc_scheduler=True,
                 **kernel_kwargs,
             )
             compile_args = [
@@ -691,47 +665,38 @@ def _symbolic_fake_strides(rank: int, divisibility: int):
     return tuple(cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)) + (1,)
 
 
-def _make_fake_bwd_tensors(dtype, has_gqa: bool, is_varlen: bool):
+def _make_fake_bwd_aux_tensors(dtype, is_varlen: bool):
     sym = cute.sym_int
     divisibility = 128 // dtype.width
-    batch, seqlen_q, seqlen_k = sym(), sym(), sym()
+    batch, seqlen_q = sym(), sym()
     num_q_heads, head_dim, head_dim_v = sym(), sym(), sym()
-    num_kv_heads = sym() if has_gqa else num_q_heads
-    total_q, total_k = sym(), sym()
+    total_q = sym()
     q_rounded = sym()
-    q_d_rounded, k_d_rounded, k_dv_rounded = sym(), sym(), sym()
-    q_shape = (total_q,) if is_varlen else (batch, seqlen_q)
-    k_shape = (total_k,) if is_varlen else (batch, seqlen_k)
+    q_d_rounded = sym()
+    q_prefix = (total_q,) if is_varlen else (batch, seqlen_q)
+    out_shape = (*q_prefix, num_q_heads, head_dim_v)
+    dq_shape = (*q_prefix, num_q_heads, head_dim)
 
-    q_shape = (*q_shape, num_q_heads, head_dim)
-    k_shape = (*k_shape, num_kv_heads, head_dim)
-    v_shape = (*k_shape[:-2], num_kv_heads, head_dim_v)
-    out_shape = (*q_shape[:-2], num_q_heads, head_dim_v)
-
-    q, k, v, out, dout, dq, dk, dv = (
+    out, dout, dq = (
         cute.runtime.make_fake_tensor(
             dtype,
             shape,
             stride=_symbolic_fake_strides(len(shape), divisibility),
             assumed_align=divisibility * dtype.width // 8,
         )
-        for shape in (q_shape, k_shape, v_shape, out_shape, out_shape, q_shape, k_shape, v_shape)
+        for shape in (out_shape, out_shape, dq_shape)
     )
     if is_varlen:
         lse_shape = (num_q_heads, total_q)
         lse_log2_shape = (num_q_heads, q_rounded)
         dpsum_shape = (num_q_heads, q_rounded)
         dq_accum_shape = (num_q_heads, q_d_rounded)
-        dk_accum_shape = (num_kv_heads, k_d_rounded)
-        dv_accum_shape = (num_kv_heads, k_dv_rounded)
     else:
         lse_shape = (batch, num_q_heads, seqlen_q)
         lse_log2_shape = (batch, num_q_heads, q_rounded)
         dpsum_shape = (batch, num_q_heads, q_rounded)
         dq_accum_shape = (batch, num_q_heads, q_d_rounded)
-        dk_accum_shape = (batch, num_kv_heads, k_d_rounded)
-        dv_accum_shape = (batch, num_kv_heads, k_dv_rounded)
-    lse, lse_log2, dpsum, dq_accum, dk_accum, dv_accum = (
+    lse, lse_log2, dpsum, dq_accum = (
         cute.runtime.make_fake_tensor(
             Float32,
             shape,
@@ -743,26 +708,9 @@ def _make_fake_bwd_tensors(dtype, has_gqa: bool, is_varlen: bool):
             (lse_log2_shape, 4),
             (dpsum_shape, 4),
             (dq_accum_shape, 4),
-            (dk_accum_shape, 4),
-            (dv_accum_shape, 4),
         )
     )
-    return (
-        q,
-        k,
-        v,
-        out,
-        dout,
-        dq,
-        dk,
-        dv,
-        lse,
-        lse_log2,
-        dpsum,
-        dq_accum,
-        dk_accum,
-        dv_accum,
-    )
+    return out, dout, dq, lse, lse_log2, dpsum, dq_accum
 
 
 def _compile_bwd_preprocess(
@@ -774,10 +722,8 @@ def _compile_bwd_preprocess(
     has_dlse,
     has_dq_accum,
     use_padded_offsets,
-    accum_hdim_multiple,
 ):
-    tensors = _make_fake_bwd_tensors(dtype, has_gqa=True, is_varlen=is_varlen)
-    _, _, _, out, dout, _, _, _, lse, lse_log2, dpsum, dq_accum, _, _ = tensors
+    out, dout, _, lse, lse_log2, dpsum, dq_accum = _make_fake_bwd_aux_tensors(dtype, is_varlen)
     cu_q = cute.runtime.make_fake_tensor(Int32, (cute.sym_int(),), stride=(1,), assumed_align=4) if is_varlen else None
     dlse = cute.runtime.make_fake_tensor(Float32, lse.shape, stride=_symbolic_fake_strides(len(lse.shape), 1), assumed_align=4) if has_dlse else None
     kernel = FlexAttentionBackwardPreprocess(
@@ -786,7 +732,6 @@ def _compile_bwd_preprocess(
         head_dim_v,
         tile_m,
         use_padded_offsets=use_padded_offsets,
-        accum_hdim_multiple=accum_hdim_multiple,
     )
     return _compile_with_timing(
         kernel,
@@ -797,7 +742,6 @@ def _compile_bwd_preprocess(
         lse_log2,
         dq_accum if has_dq_accum else None,
         cu_q,
-        None,
         dlse,
         Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -820,7 +764,6 @@ def _bwd_preprocess(
     tile_m,
     max_seqlen_q,
     use_padded_offsets,
-    accum_hdim_multiple,
 ):
     compile_key = (
         dtype,
@@ -831,7 +774,6 @@ def _bwd_preprocess(
         dlse is not None,
         dq_accum is not None,
         use_padded_offsets,
-        accum_hdim_multiple,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -844,7 +786,6 @@ def _bwd_preprocess(
             lse_log2,
             dq_accum,
             cu_seqlens_q,
-            None,
             dlse,
             max_seqlen_q,
         )
@@ -866,8 +807,7 @@ def _compile_bwd_postprocess(
     cluster_size,
     arch,
 ):
-    tensors = _make_fake_bwd_tensors(dtype, has_gqa=True, is_varlen=is_varlen)
-    _, _, _, _, _, output, _, _, _, _, _, accum, _, _ = tensors
+    _, _, output, _, _, _, accum = _make_fake_bwd_aux_tensors(dtype, is_varlen)
     cu_q = cute.runtime.make_fake_tensor(Int32, (cute.sym_int(),), stride=(1,), assumed_align=4) if is_varlen else None
     kernel = FlexAttentionBackwardPostprocess(
         dtype,
@@ -887,7 +827,6 @@ def _compile_bwd_postprocess(
         output,
         Float32(0.0),
         cu_q,
-        None,
         Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -933,7 +872,6 @@ def _bwd_postprocess_convert(
             output,
             scale,
             cu_seqlens,
-            None,
             max_seqlen,
         )
 
@@ -1184,11 +1122,8 @@ def _flex_attn_bwd(
         num_stages_pds = bwd_config.num_stages_pds
         sdp_swap_ab = bwd_config.sdp_swap_ab
         dkv_swap_ab = bwd_config.dkv_swap_ab
-        dq_swap_ab = bwd_config.dq_swap_ab
-        atom_layout_m_sdp = bwd_config.atom_layout_m_sdp
         atom_layout_n_dkv = bwd_config.atom_layout_n_dkv
         atom_layout_m_dq = bwd_config.atom_layout_m_dq
-        attention_num_threads = bwd_config.attention_num_threads
         dq_single_wg = bwd_config.dq_single_wg
     else:
         tile_m = 128
@@ -1196,11 +1131,8 @@ def _flex_attn_bwd(
         num_stages_q = num_stages_do = num_stages_pds = 2
         sdp_swap_ab = False
         dkv_swap_ab = False
-        dq_swap_ab = False
-        atom_layout_m_sdp = 2
         atom_layout_n_dkv = 1
         atom_layout_m_dq = 1
-        attention_num_threads = 384
         dq_single_wg = False
 
     dq = torch.empty_like(q)
@@ -1219,9 +1151,8 @@ def _flex_attn_bwd(
 
     # Generic SM90/SM100 kernels pad MMA head dimensions to 16 elements.
     # Keep the flattened accumulator workspace on the same row stride.
-    accum_multiple = 16 if arch in (90, 100, 103) else 32
-    head_dim_rounded = math.ceil(head_dim / accum_multiple) * accum_multiple
-    head_dim_v_rounded = math.ceil(head_dim_v / accum_multiple) * accum_multiple
+    head_dim_rounded = math.ceil(head_dim / 16) * 16
+    head_dim_v_rounded = math.ceil(head_dim_v / 16) * 16
     if is_varlen:
         total_q_padded = (total_q + cu_seqlens_q.shape[0] * tile_m - 1) // tile_m * tile_m
         dq_accum = (
@@ -1315,7 +1246,6 @@ def _flex_attn_bwd(
         tile_m,
         resolved_max_q,
         use_hd256,
-        accum_multiple,
     )
 
     normalized_bwd = normalize_arbitrary_block_sparse_config_bwd(
@@ -1349,15 +1279,7 @@ def _flex_attn_bwd(
             payload_padded_words=dq_config.payload_padded_words,
             expected_fixed_total_m_blocks=(None if is_varlen else batch_size * math.ceil(seqlen_q / dq_config.block_size[0])),
         )
-    elif deterministic:
-        if normalized_bwd.dq_write_order is None:
-            raise ValueError("deterministic backward requires partial-block dQ write order")
-        if normalized_bwd.full_block_cnt is not None and normalized_bwd.dq_write_order_full is None:
-            raise ValueError("deterministic backward requires full-block dQ write order")
-        if normalized_bwd.spt is None:
-            raise ValueError("deterministic backward requires an SPT direction contract")
-
-    spt = normalized_bwd.spt and deterministic if normalized_bwd.spt is not None else False
+    spt = deterministic and not use_hd256
     dQ_semaphore = (
         torch.zeros(
             batch_size,
@@ -1401,8 +1323,6 @@ def _flex_attn_bwd(
         num_stages_do,
         sdp_swap_ab,
         dkv_swap_ab,
-        dq_swap_ab,
-        atom_layout_m_sdp,
         atom_layout_n_dkv,
         atom_layout_m_dq,
         dq_single_wg,
@@ -1450,14 +1370,7 @@ def _flex_attn_bwd(
                         dtype=semaphore.dtype,
                         device=semaphore.device,
                     )
-                sem_tensors.append(
-                    utils.convert_from_dlpack_leading_static(
-                        compile_semaphore.detach(),
-                        leading_dim=3,
-                        alignment=4,
-                        stride_order=compile_semaphore.dim_order(),
-                    )
-                )
+                sem_tensors.append(utils.convert_semaphore_from_dlpack(compile_semaphore.detach()))
         dq_sem_tensor, dk_sem_tensor, dv_sem_tensor = sem_tensors
         sparse_tensor = to_cute_block_sparse_tensors(normalized_bwd)
         sparse_dq_tensor = to_cute_block_sparse_tensors(normalized_dq) if normalized_dq is not None else None
@@ -1477,13 +1390,8 @@ def _flex_attn_bwd(
                 PdS_stage=num_stages_pds,
                 SdP_swapAB=sdp_swap_ab,
                 dKV_swapAB=dkv_swap_ab,
-                dQ_swapAB=dq_swap_ab,
-                AtomLayoutMSdP=atom_layout_m_sdp,
                 AtomLayoutNdKV=atom_layout_n_dkv,
                 AtomLayoutMdQ=atom_layout_m_dq,
-                num_threads=attention_num_threads,
-                V_in_regs=False,
-                subtile_factor=bwd_config.subtile_factor,
                 dQ_single_wg=dq_single_wg,
             )
             compile_args = [
@@ -1511,18 +1419,7 @@ def _flex_attn_bwd(
         elif use_hd256:
             assert isinstance(bwd_config, _ResolvedSm100Hd256DkdvConsumerConfig)
             kernel = BlackwellFusedMultiHeadAttentionBackward(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                mask_payload_valid_words_dq=dq_config.payload_valid_words,
-                mask_payload_padded_words_dq=dq_config.payload_padded_words,
-                mask_payload_valid_words_dkdv=bwd_config.payload_valid_words,
-                mask_payload_padded_words_dkdv=bwd_config.payload_padded_words,
-                subtile_factor=bwd_config.subtile_factor,
-                tile_m_dq=128,
-                tile_n_dq=128,
-                tile_m_dkdv=128,
-                tile_n_dkdv=64,
+                qhead_per_kvhead,
             )
             compile_args = [
                 kernel,
@@ -1549,15 +1446,9 @@ def _flex_attn_bwd(
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead=qhead_per_kvhead,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                cluster_size=cluster_size,
                 use_2cta_instrs=use_2cta,
                 deterministic=deterministic,
                 spt=spt,
-                subtile_factor=bwd_config.subtile_factor,
-                mask_payload_valid_words=bwd_config.payload_valid_words,
-                mask_payload_padded_words=bwd_config.payload_padded_words,
             )
             compile_args = [
                 kernel,
@@ -1654,8 +1545,8 @@ def _flex_attn_bwd(
         _flex_attn_bwd.compile_cache[compile_key](*call_args)
 
     if not use_hd256:
-        num_threads_post_q = 128 if arch == 90 and dq_single_wg else bwd_config.num_wg * 128 if arch == 90 else 128
-        num_threads_post_kv = bwd_config.num_wg * 128 if arch == 90 else 128
+        num_threads_post_q = 128 if arch == 90 and dq_single_wg else 256 if arch == 90 else 128
+        num_threads_post_kv = 256 if arch == 90 else 128
         _bwd_postprocess_convert(
             dq_accum,
             dq,
@@ -1668,7 +1559,7 @@ def _flex_attn_bwd(
             tile_m,
             num_threads_post_q,
             atom_layout_m_dq,
-            dq_swap_ab,
+            False,
             use_2cta_instrs=use_2cta,
             cluster_size=1,
         )

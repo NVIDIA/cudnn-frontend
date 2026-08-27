@@ -15,14 +15,14 @@ from cutlass.cute.nvgpu import warpgroup
 
 from cudnn.flex_attention.plan.mask_plan import ArbitraryPlanSignature
 
+_SM90_FWD_NUM_STAGES = 2
+
 
 @dataclass(frozen=True)
 class FwdConfig:
     m_block_size: int
     n_block_size: int
     mma_pv_is_rs: bool
-    intra_wg_overlap: bool
-    num_stages: int = 2
 
 
 @dataclass(frozen=True)
@@ -39,13 +39,10 @@ class _ResolvedSm90FwdConsumerConfig:
     tile_m: int
     tile_n: int
     mma_pv_is_rs: bool
-    intra_wg_overlap: bool
     swap_ab: bool
     physical_subtiles: int
     num_mma_threads: int
     num_mask_payload_groups: int
-    attention_num_threads: int
-    num_stages: int
     payload_values_per_thread: int
     payload_valid_words: int
     payload_padded_words: int
@@ -101,24 +98,19 @@ class _ResolvedSm90FwdConsumerConfig:
 def _tile_size_fwd_sm90(
     head_dim: int,
     head_dim_v: int,
-    sparse_block_size_q: int | None = None,
 ) -> FwdConfig:
     """Return the native SM90 forward tile configuration."""
 
     if head_dim <= 64:
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, True, True)
-        return FwdConfig(192, 128, True, True)
+        return FwdConfig(192, 128, True)
     if head_dim <= 96:
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, False, True)
-        return FwdConfig(192, 128, False, True)
+        return FwdConfig(192, 128, False)
     if head_dim <= 128:
-        return FwdConfig(128, 128, True, True)
+        return FwdConfig(128, 128, True)
     if head_dim <= 192:
         tile_n = 128 if head_dim_v <= 128 else 112
-        return FwdConfig(128, tile_n, True, True)
-    return FwdConfig(128, 64, True, True)
+        return FwdConfig(128, tile_n, True)
+    return FwdConfig(128, 64, True)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -141,26 +133,26 @@ def _native_sm90_fwd_smem_bytes(
 
     # Preserve the conservative native-QKV estimate while accounting for the
     # actual SharedStorageQKV lifetime layout used by the mask pipeline.
-    native_offset = (2 + 2 * config.num_stages + 2 * config.num_stages) * 8
+    native_offset = (2 + 2 * _SM90_FWD_NUM_STAGES + 2 * _SM90_FWD_NUM_STAGES) * 8
     native_fields = (
-        config.n_block_size * tile_hdim_v * config.num_stages * 2,
+        config.n_block_size * tile_hdim_v * _SM90_FWD_NUM_STAGES * 2,
         config.m_block_size * max(tile_hdim, tile_hdim_v) * 2,
-        config.n_block_size * tile_hdim * config.num_stages * 2,
+        config.n_block_size * tile_hdim * _SM90_FWD_NUM_STAGES * 2,
         0 if config.mma_pv_is_rs else config.m_block_size * config.n_block_size * 2,
     )
     for size in native_fields:
         native_offset = _align_up(native_offset, 1024) + size
 
-    pipeline_offset = (2 + 2 * config.num_stages + 2 * config.num_stages + 2 * 2) * 8
+    pipeline_offset = (2 + 2 * _SM90_FWD_NUM_STAGES + 2 * _SM90_FWD_NUM_STAGES + 2 * 2) * 8
     pipeline_offset = _align_up(pipeline_offset, 16) + mask_pipeline_bytes
     pipeline_fields = (
         max(
-            config.n_block_size * tile_hdim_v * config.num_stages,
+            config.n_block_size * tile_hdim_v * _SM90_FWD_NUM_STAGES,
             config.m_block_size * tile_hdim_v,
         )
         * 2,
         config.m_block_size * tile_hdim * 2,
-        config.n_block_size * tile_hdim * config.num_stages * 2,
+        config.n_block_size * tile_hdim * _SM90_FWD_NUM_STAGES * 2,
         0 if config.mma_pv_is_rs else config.m_block_size * config.n_block_size * 2,
     )
     for size in pipeline_fields:
@@ -297,7 +289,7 @@ def resolve_sm90_fwd_consumer_config(
 ) -> _ResolvedSm90FwdConsumerConfig:
     """Resolve the exact SM90 forward consumer signature used by a packed plan."""
 
-    if arch // 10 != 9:
+    if arch != 90:
         raise NotImplementedError("Arbitrary attention currently supports SM90 only")
     if dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError("SM90 arbitrary attention supports FP16 and BF16 only")
@@ -351,13 +343,10 @@ def resolve_sm90_fwd_consumer_config(
         tile_m=fwd.m_block_size,
         tile_n=fwd.n_block_size,
         mma_pv_is_rs=fwd.mma_pv_is_rs,
-        intra_wg_overlap=fwd.intra_wg_overlap,
         swap_ab=False,
         physical_subtiles=1,
         num_mma_threads=num_mma_threads,
         num_mask_payload_groups=num_mask_payload_groups,
-        attention_num_threads=128 + num_mma_threads,
-        num_stages=fwd.num_stages,
         payload_values_per_thread=payload_values_per_thread,
         payload_valid_words=payload_valid_words,
         payload_padded_words=payload_padded_words,

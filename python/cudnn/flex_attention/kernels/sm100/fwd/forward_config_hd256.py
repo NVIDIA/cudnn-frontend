@@ -6,21 +6,14 @@ subtiles.  Each CTA uses 128 softmax threads for its TMEM slice. ``q_stage``
 remains one; ``cta_group_size`` selects a logical M128 or M256 consumer tile.
 The two D256/K128 MMA K phases are internal and do not add payload planes.
 
-Only hashable host metadata lives in the resolved dataclass.  The CuTe layout
-constructors below are shared by the payload materializer and the attention
-consumer so mask bits follow the exact TMEM-to-register ownership.
+Only hashable host metadata lives in the resolved dataclass.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-import cutlass
-import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import torch
-from cutlass import Float32, cute
-from cutlass.cute.nvgpu import tcgen05
 
 from cudnn.flex_attention.plan.mask_plan import (
     ArbitraryPlanSignature,
@@ -32,7 +25,7 @@ _SM100_HD256_FWD_TILE_M = 128
 _SM100_HD256_FWD_TILE_N = 128
 _SM100_HD256_FWD_Q_STAGE = 1
 _SM100_HD256_SOFTMAX_THREADS_PER_SUBTILE = 128
-_SM100_HD256_ATTENTION_THREADS_PER_CTA = 384
+_SM100_HD256_PAYLOAD_VALUES_PER_THREAD = 128
 SM100_HD256_FWD_MASK_PAYLOAD_WORDS = 4
 
 
@@ -56,7 +49,6 @@ class _ResolvedSm100Hd256FwdConsumerConfig:
     cluster_axis: str
     physical_subtiles: int
     softmax_threads_per_subtile: int
-    attention_num_threads: int
     num_mask_payload_groups: int
     payload_values_per_thread: int
     payload_valid_words: int
@@ -174,21 +166,11 @@ def resolve_sm100_hd256_fwd_consumer_config(
     tile_n = _SM100_HD256_FWD_TILE_N
     q_stage = _SM100_HD256_FWD_Q_STAGE
     physical_subtiles = q_stage * cta_group_size
-    payload_values_per_thread, remainder = divmod(
-        tile_m * tile_n,
-        _SM100_HD256_SOFTMAX_THREADS_PER_SUBTILE,
-    )
-    if remainder:
-        raise AssertionError("hd256 score subtile must partition evenly across softmax threads")
-    payload_valid_words = math.ceil(payload_values_per_thread / 32)
-    payload_padded_words = SM100_HD256_FWD_MASK_PAYLOAD_WORDS
-    if payload_valid_words > payload_padded_words:
-        raise AssertionError("hd256 payload exceeds the four-word vector contract")
 
     payload_layout_id = (
         "sm100_hd256_tcgen05_qk"
         f"_ld32x32b_r32_rep32_t{_SM100_HD256_SOFTMAX_THREADS_PER_SUBTILE}"
-        f"_v{payload_values_per_thread}_w{payload_padded_words}"
+        f"_v{_SM100_HD256_PAYLOAD_VALUES_PER_THREAD}_w{SM100_HD256_FWD_MASK_PAYLOAD_WORDS}"
         f"_m{tile_m}n{tile_n}"
         f"_ctarank{cta_group_size}_axis_m_v2"
     )
@@ -210,56 +192,17 @@ def resolve_sm100_hd256_fwd_consumer_config(
         cluster_axis="m",
         physical_subtiles=physical_subtiles,
         softmax_threads_per_subtile=_SM100_HD256_SOFTMAX_THREADS_PER_SUBTILE,
-        attention_num_threads=_SM100_HD256_ATTENTION_THREADS_PER_CTA,
         num_mask_payload_groups=_SM100_HD256_SOFTMAX_THREADS_PER_SUBTILE,
-        payload_values_per_thread=payload_values_per_thread,
-        payload_valid_words=payload_valid_words,
-        payload_padded_words=payload_padded_words,
+        payload_values_per_thread=_SM100_HD256_PAYLOAD_VALUES_PER_THREAD,
+        payload_valid_words=SM100_HD256_FWD_MASK_PAYLOAD_WORDS,
+        payload_padded_words=SM100_HD256_FWD_MASK_PAYLOAD_WORDS,
         tmem_load_atom_id=(f"tcgen05.ld32x32b.r32.rep32.cta_group{cta_group_size}"),
         payload_layout_id=payload_layout_id,
     )
 
 
-@cute.jit
-def make_sm100_hd256_fwd_tiled_mma_qk(
-    dtype: type[cutlass.Numeric],
-    tile_m: cutlass.Constexpr[int] = _SM100_HD256_FWD_TILE_M,
-    tile_n: cutlass.Constexpr[int] = _SM100_HD256_FWD_TILE_N,
-    cta_group_size: cutlass.Constexpr[int] = 1,
-):
-    """Build the exact one- or two-CTA QK MMA used by the hd256 forward kernel."""
-
-    if cutlass.const_expr(cta_group_size not in (1, 2)):
-        raise ValueError("cta_group_size must be 1 or 2")
-
-    return sm100_utils_basic.make_trivial_tiled_mma(
-        dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
-        Float32,
-        tcgen05.CtaGroup.TWO if cta_group_size == 2 else tcgen05.CtaGroup.ONE,
-        (tile_m * cta_group_size, tile_n),
-    )
-
-
-@cute.jit
-def make_sm100_hd256_fwd_tmem_load(
-    tSAcc: cute.Tensor,
-    tidx: cutlass.Int32,
-):
-    """Build the exact Rep32 score TMEM-to-register copy used by softmax."""
-
-    tmem_load_atom = cute.make_copy_atom(
-        tcgen05.Ld32x32bOp(tcgen05.Repetition(32)),
-        Float32,
-    )
-    return tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
-
-
 __all__ = [
     "SM100_HD256_FWD_MASK_PAYLOAD_WORDS",
     "_ResolvedSm100Hd256FwdConsumerConfig",
-    "make_sm100_hd256_fwd_tiled_mma_qk",
-    "make_sm100_hd256_fwd_tmem_load",
     "resolve_sm100_hd256_fwd_consumer_config",
 ]

@@ -219,8 +219,6 @@ class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):
         self.consumer_tile_n = config.tile_n
         self.subtile_factor = config.subtile_factor
         self.sdp_swap_ab = config.sdp_swap_ab if isinstance(config, _ResolvedSm90BwdConsumerConfig) else True
-        self.atom_layout_m_sdp = config.atom_layout_m_sdp if isinstance(config, _ResolvedSm90BwdConsumerConfig) else 1
-        self.num_wg_mma = config.num_wg
         self.cta_group_size = (
             config.cta_group_size
             if isinstance(

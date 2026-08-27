@@ -1176,7 +1176,7 @@ def _build_packed_mask_plan(
     device = q.device
     arch = _get_plan_builder_arch(device)
     dq_config = None
-    if arch // 10 == 9:
+    if arch == 90:
         fwd_config = resolve_sm90_fwd_consumer_config(
             arch=arch,
             dtype=q.dtype,
@@ -1202,9 +1202,7 @@ def _build_packed_mask_plan(
             else None
         )
         fwd_topology_config = fwd_config
-    elif arch // 10 == 10 and arch != 101:
-        if build_backward and arch not in (100, 103):
-            raise NotImplementedError("arbitrary backward currently supports SM100/SM103 only")
+    elif arch in (100, 103):
         use_hd256_consumer = q.shape[-1] == 256 and v.shape[-1] == 256
         if use_hd256_consumer and _fwd_variant == "qstage2_1cta":
             raise NotImplementedError("dedicated SM100 D256 forward does not support qstage2")
@@ -2227,7 +2225,6 @@ def _build_packed_mask_plan(
             full_block_cnt=dq_full_counts,
             full_block_idx=dq_full_indices,
             cu_total_m_blocks=(cu_total_bwd_m_blocks if metadata["is_varlen"] else None),
-            cu_block_idx_offsets=None,
             block_size=dq_config.block_size,
             dq_write_order=None,
             dq_write_order_full=None,
@@ -2252,7 +2249,6 @@ def _build_packed_mask_plan(
             full_block_cnt=bwd_full_counts,
             full_block_idx=bwd_full_indices,
             cu_total_m_blocks=(cu_total_bwd_n_blocks if metadata["is_varlen"] else None),
-            cu_block_idx_offsets=None,
             block_size=bwd_config.block_size,
             dq_write_order=exposed_partial_dq_order,
             dq_write_order_full=exposed_full_dq_order,
@@ -2285,7 +2281,6 @@ def _build_packed_mask_plan(
         full_block_cnt=full_counts,
         full_block_idx=full_indices,
         cu_total_m_blocks=cu_total_m_blocks,
-        cu_block_idx_offsets=None,
         block_size=fwd_config.block_size,
         dq_write_order=None,
         dq_write_order_full=None,

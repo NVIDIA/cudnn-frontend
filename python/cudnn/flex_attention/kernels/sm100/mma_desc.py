@@ -19,38 +19,9 @@ class Major(IntEnum):  # matrix “layout” in the ISA docs
     MN = 1
 
 
-class ScaleIn(IntEnum):  # negate flags
-    One = 0
-    Neg = 1
-
-
-class Saturate(IntEnum):
-    False_ = 0
-    True_ = 1
-
-
-class CFormat(IntEnum):  # 2-bit field (bits 4-5)
-    F16 = 0
-    F32 = 1
-    S32 = 2
-
-
-class F16F32Format(IntEnum):  # 3-bit field (A/B element type)
+class InputFormat(IntEnum):  # 3-bit field (A/B element type)
     F16 = 0
     BF16 = 1
-    TF32 = 2
-
-
-class S8Format(IntEnum):
-    UINT8 = 0
-    INT8 = 1
-
-
-class MaxShift(IntEnum):
-    NoShift = 0
-    MaxShift8 = 1
-    MaxShift16 = 2
-    MaxShift32 = 3
 
 
 # ---------------------------------------------------------------------------
@@ -58,37 +29,13 @@ class MaxShift(IntEnum):
 # ---------------------------------------------------------------------------
 
 
-def to_UMMA_format(cutlass_type) -> int:
-    """
-    Map a CUTLASS scalar class to the 3-bit encoding for Matrix A/B.
-    """
-    if cutlass_type is cutlass.Int8:
-        return S8Format.INT8
-    # Unsigned 8-bit (if available in your CUTLASS build)
-    if cutlass_type is cutlass.Uint8:
-        return S8Format.UINT8
-    # FP-16 / BF-16
+def to_input_format(cutlass_type) -> int:
+    """Map an FP16/BF16 CUTLASS scalar class to its UMMA encoding."""
     if cutlass_type is cutlass.Float16:
-        return F16F32Format.F16
+        return InputFormat.F16
     if cutlass_type is cutlass.BFloat16:
-        return F16F32Format.BF16
-    # TensorFloat-32 (8-bit exponent, 10-bit mantissa packed in 19 bits)
-    if cutlass_type is cutlass.TFloat32:
-        return F16F32Format.TF32
+        return InputFormat.BF16
     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
-
-
-def to_C_format(cutlass_type) -> int:
-    """
-    Map a CUTLASS scalar class to the 2-bit accumulator encoding.
-    """
-    if cutlass_type is cutlass.Float16:
-        return CFormat.F16
-    if cutlass_type is cutlass.Float32:
-        return CFormat.F32
-    if cutlass_type is cutlass.Int32:
-        return CFormat.S32
-    raise TypeError(f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -97,28 +44,16 @@ def to_C_format(cutlass_type) -> int:
 
 
 def make_instr_desc(
-    a_type,  # CUTLASS scalar class, e.g. cutlass.Int8
+    a_type,
     b_type,
-    c_type,
     M: int,  # 64, 128 or 256
     N: int,  # 8 … 256 (multiple of 8)
     a_major: Major,
     b_major: Major,
-    a_neg: ScaleIn = ScaleIn.One,
-    b_neg: ScaleIn = ScaleIn.One,
-    c_sat: Saturate = Saturate.False_,
-    is_sparse: bool = False,
-    max_shift: MaxShift = MaxShift.NoShift,
 ) -> int:
-    """
-    Build the 32-bit instruction descriptor for Blackwell MMA.
-    All matrix/accumulator **types must be CUTLASS scalar classes** –
-    passing integers is forbidden.
-    """
-    # --- encode element formats -------------------------------------------------
-    a_fmt = int(to_UMMA_format(a_type))
-    b_fmt = int(to_UMMA_format(b_type))
-    c_fmt = int(to_C_format(c_type))
+    """Build the dense FP16/BF16-to-FP32 Blackwell MMA descriptor."""
+    a_fmt = int(to_input_format(a_type))
+    b_fmt = int(to_input_format(b_type))
 
     # --- range checks on M/N -----------------------------------------------------
     if M not in (64, 128, 256):
@@ -132,29 +67,24 @@ def make_instr_desc(
     # fmt: off
     # --- pack the bit-fields -----------------------------------------------------
     desc = 0
-    desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
-    desc |= (int(is_sparse)    & 0x1) << 2        # sparse_flag
-    desc |= (int(c_sat)        & 0x1) << 3        # saturate
-    desc |= (c_fmt             & 0x3) << 4        # c_format
+    desc |= 1 << 4  # c_format = FP32
     desc |= (a_fmt             & 0x7) << 7        # a_format
     desc |= (b_fmt             & 0x7) << 10       # b_format
-    desc |= (int(a_neg)        & 0x1) << 13       # a_negate
-    desc |= (int(b_neg)        & 0x1) << 14       # b_negate
     desc |= (int(a_major)      & 0x1) << 15       # a_major
     desc |= (int(b_major)      & 0x1) << 16       # b_major
     desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
     desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
-    desc |= (int(max_shift)    & 0x3) << 30       # max_shift (2 bits)
     # fmt: on
 
     return desc & 0xFFFF_FFFF  # ensure 32-bit result
 
 
 def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
+    if op.acc_dtype is not cutlass.Float32:
+        raise TypeError(f"FlexAttention UMMA requires a Float32 accumulator; got {op.acc_dtype!r}")
     return make_instr_desc(
         op.a_dtype,
         op.b_dtype,
-        op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
         Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,

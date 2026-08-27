@@ -12,7 +12,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 
-from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.kernels.sm100 import blackwell_helpers as sm100_utils
 from cudnn.flex_attention.kernels.sm100 import mma_desc as sm100_desc
 from cudnn.flex_attention.kernels.sm100.fwd.forward_config import (
@@ -65,26 +64,15 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
     def __init__(
         self,
         head_dim: int,
-        head_dim_v: Optional[int] = None,
+        head_dim_v: int,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
-        m_block_size: int = 128,
-        n_block_size: int = 128,
-        q_stage: cutlass.Constexpr[int] = 1,
-        is_persistent: bool = True,
-        persistent_block_major: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
-        use_clc_scheduler: bool = True,
         overlap_pv_with_k_wait: bool = False,
     ):
         if type(overlap_pv_with_k_wait) is not bool:
             raise TypeError("overlap_pv_with_k_wait must be a bool")
-        if m_block_size != 128 or n_block_size != 128:
-            raise NotImplementedError("generic qstage1 forward requires M128xN128 per CTA")
-        if q_stage != 1:
-            raise ValueError("generic qstage1 forward requires q_stage=1")
         if use_2cta_instrs and overlap_pv_with_k_wait:
             raise ValueError("overlap_pv_with_k_wait is only supported by qstage1 1CTA")
         self.overlap_pv_with_k_wait = overlap_pv_with_k_wait
@@ -93,16 +81,9 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
             head_dim_v=head_dim_v,
             qhead_per_kvhead=qhead_per_kvhead,
             pack_gqa=pack_gqa,
-            q_subtile_factor=q_subtile_factor,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
             q_stage=1,
-            is_persistent=is_persistent,
-            persistent_block_major=persistent_block_major,
             is_varlen_q=is_varlen_q,
             use_2cta_instrs=use_2cta_instrs,
-            use_clc_scheduler=use_clc_scheduler,
-            _enable_qstage1_n_direction=True,
         )
         # All generic 2CTA kernels share the same packed-mask pipeline.
         self.use_smem_mask_pipeline = self.use_2cta_instrs
@@ -114,8 +95,6 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                 self.num_regs_softmax = self._tune["num_regs_softmax"]
                 self.num_regs_correction = self._tune["num_regs_correction"]
                 self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
-        if not self.use_tma_Q:
-            raise NotImplementedError("generic qstage1 forward requires a PackGQA ratio divisible into M128")
         if self.head_dim_padded == 128 and self.head_dim_v_padded == 128:
             if self.use_2cta_instrs and self.is_sm103:
                 self.num_regs_softmax = 192
@@ -176,7 +155,6 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         self,
         thr_mma_qk: cute.ThrMma,
         thr_mma_pv: cute.ThrMma,
-        tStS: cute.Tensor,
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
         mO: cute.Tensor,
@@ -373,23 +351,9 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                     else -Float32.inf
                 )
                 seqlen_q = seqlen.seqlen_q if const_expr(not self.pack_gqa) else seqlen.seqlen_q * self.qhead_per_kvhead
-                if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
-                    gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                        gLSE[tidx] = lse
-                else:
-                    idx = m_tile_idx * self.m_block_size + tidx
-                    if idx < seqlen_q:
-                        m_idx = idx // self.qhead_per_kvhead
-                        h_idx = idx - m_idx * self.qhead_per_kvhead
-                        lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
-                        lse_gmem_ptr = cute.make_ptr(
-                            mLSE_cur.element_type,
-                            lse_ptr_i64,
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
-                        )
-                        cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                    gLSE[tidx] = lse
 
             if const_expr(pipeline_load_epi is not None and self.use_correction_warps_for_epi):
                 pipeline_load_epi.producer_acquire(load_epi_producer_state)
@@ -496,8 +460,6 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
-        tStS: cute.Tensor,
-        tOtO: cute.Tensor,
         tOrP: cute.Tensor,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
@@ -514,7 +476,6 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         tOrV = tiled_mma_pv.make_fragment_B(sV)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        qk_mma_kind = sm100_utils._tcgen05_mma_kind(qk_mma_op)
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         q_smem_start = sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, 0].iterator)
@@ -535,9 +496,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                 tCrB_layout=tSrK[None, None, None, 0].layout,
                 smem_var_name_prefix="flex_fwd_qstage1_q_smem_desc",
                 idesc_var_name="flex_fwd_qstage1_qk_mma_idesc",
-                kind=qk_mma_kind,
                 smem_offset=0,
-                zero_init=True,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.score_stage)
@@ -549,7 +508,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                 self.tmem_o_offset[stage],
                 tOrP[None, None, None, stage],
                 sA=None,
-                split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                split_arrive=self.split_P_arrive,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.score_stage)
@@ -639,7 +598,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                             tCrB=tOrVi,
                             sB=sV_cur,
                             zero_init=not o_acc_cur,
-                            mbar_ptr=(pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None),
+                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage),
                             mbar_phase=phase_cur,
                         )
                         if const_expr(self.overlap_pv_with_k_wait):
@@ -686,7 +645,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                         tCrB=tOrVi,
                         sB=sV_cur,
                         zero_init=not o_acc_s0,
-                        mbar_ptr=(pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None),
+                        mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0),
                         mbar_phase=phase_s0,
                     )
                     if const_expr(self.overlap_pv_with_k_wait):
@@ -722,7 +681,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                             tCrB=tOrVi,
                             sB=sV_cur,
                             zero_init=not o_acc_s0,
-                            mbar_ptr=(pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None),
+                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0),
                             mbar_phase=phase_s0,
                         )
                         pipeline_o_acc.producer_commit_w_index(0)
@@ -734,7 +693,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                             tCrB=tOrVi,
                             sB=sV_cur,
                             zero_init=not o_acc_s1,
-                            mbar_ptr=(pipeline_p_lastsplit.sync_object_full.get_barrier(1) if self.split_P_arrive > 0 else None),
+                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(1),
                             mbar_phase=phase_s1,
                         )
                         pipeline_o_acc.producer_commit_w_index(1)

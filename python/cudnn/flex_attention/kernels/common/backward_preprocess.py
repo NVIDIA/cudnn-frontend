@@ -21,7 +21,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
-from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from cudnn.flex_attention._compat import copy_utils, layout_utils
 
@@ -42,9 +41,7 @@ class FlexAttentionBackwardPreprocess:
         head_dim: int,
         head_dim_v: int,
         tile_m: int = 128,
-        num_threads: int = 256,
         use_padded_offsets: bool = True,
-        accum_hdim_multiple: int = 32,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -54,45 +51,16 @@ class FlexAttentionBackwardPreprocess:
         :type head_dim: int
         :param tile_m: m block size
         :type tile_m: int
-        :param num_threads: number of threads
-        :type num_threads: int
         """
-        self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
         # Accumulator storage must use the same head-dimension padding as the
         # main backward kernel and postprocess kernel.
-        self.head_dim_padded = int(math.ceil(head_dim / accum_hdim_multiple) * accum_hdim_multiple)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / accum_hdim_multiple) * accum_hdim_multiple)
+        self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
+        self.head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
-        self.num_threads = num_threads
+        self.num_threads = 256
         self.use_padded_offsets = use_padded_offsets
-
-    @staticmethod
-    def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
-        """Check if the kernel can be implemented with the given parameters.
-
-        :param dtype: data type
-        :type dtype: cutlass.Numeric
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param tile_m: m block size
-        :type tile_m: int
-        :param num_threads: number of threads
-        :type num_threads: int
-
-        :return: True if the kernel can be implemented, False otherwise
-        :rtype: bool
-        """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if num_threads < tile_m:  # For multiplying lse with log2
-            return False
-        return True
 
     def _setup_attributes(self):
         # ///////////////////////////////////////////////////////////////////////////////
@@ -123,7 +91,6 @@ class FlexAttentionBackwardPreprocess:
         # (batch, nheads, seqlen_padded * head_dim_v) or (nheads, total_q_padded * head_dim_v)
         mdQaccum: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
-        mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
         mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
         max_seqlen_q: cutlass.Int32 = 0,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -162,10 +129,10 @@ class FlexAttentionBackwardPreprocess:
         if const_expr(mdQaccum is not None):
             mdQaccum = layout_utils.select(mdQaccum, transpose)
 
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+        if const_expr(mCuSeqlensQ is not None):
             TileScheduler = SingleTileMaxVarlenScheduler
-            num_head = mO.shape[1] if const_expr(mCuSeqlensQ is not None) else mO.shape[2]
-            num_batch = mCuSeqlensQ.shape[0] - 1 if const_expr(mCuSeqlensQ is not None) else mO.shape[0]
+            num_head = mO.shape[1]
+            num_batch = mCuSeqlensQ.shape[0] - 1
             num_block = cute.ceil_div(max_seqlen_q, self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
@@ -183,7 +150,6 @@ class FlexAttentionBackwardPreprocess:
             total_q=mO.shape[0],
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
-            mSeqUsedQ=mSeqUsedQ,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -197,7 +163,6 @@ class FlexAttentionBackwardPreprocess:
             mLSElog2,
             mdQaccum,
             mCuSeqlensQ,
-            mSeqUsedQ,
             mdLSE,
             self.gmem_tiled_copy_O,
             self.gmem_tiled_copy_dQaccum,
@@ -207,7 +172,7 @@ class FlexAttentionBackwardPreprocess:
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             stream=stream,
-            use_pdl=self.use_pdl,
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -220,7 +185,6 @@ class FlexAttentionBackwardPreprocess:
         mLSElog2: Optional[cute.Tensor],
         mdQaccum: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         mdLSE: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_dQaccum: cute.TiledCopy,
@@ -239,14 +203,13 @@ class FlexAttentionBackwardPreprocess:
         # before touching any upstream GMEM outputs (mO, mdO, mLSE); otherwise we risk
         # reading a partially-written dout, which silently corrupts dpsum = sum(O * dO) and
         # propagates to dQ/dK via dS = P * (dP - dpsum).
-        if const_expr(self.use_pdl):
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()
 
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m)
+            seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, tile=self.tile_m)
             mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
             mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
             # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
@@ -351,6 +314,5 @@ class FlexAttentionBackwardPreprocess:
 
             # Publish the dependency only after every thread has written dPsum,
             # lse_log2, and the zeroed dQ accumulator consumed by backward.
-            if const_expr(self.use_pdl):
-                cute.arch.barrier()
-                cute.arch.griddepcontrol_launch_dependents()
+            cute.arch.barrier()
+            cute.arch.griddepcontrol_launch_dependents()

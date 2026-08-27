@@ -41,27 +41,13 @@ def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
 
 
 @dsl_user_op
-def red_relaxed(lock_ptr: cute.Pointer, val: cutlass.Constexpr[Int32], *, loc=None, ip=None) -> None:
+def red_release(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
-        [lock_ptr_i64, Int32(val).ir_value(loc=loc, ip=ip)],
-        "red.relaxed.gpu.global.add.s32 [$0], $1;",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def red_release(lock_ptr: cute.Pointer, val: cutlass.Constexpr[Int32], *, loc=None, ip=None) -> None:
-    lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [lock_ptr_i64, Int32(val).ir_value(loc=loc, ip=ip)],
-        "red.release.gpu.global.add.s32 [$0], $1;",
-        "l,r",
+        [lock_ptr_i64],
+        "red.release.gpu.global.add.s32 [$0], 1;",
+        "l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -78,8 +64,7 @@ def wait_eq(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, v
 
 
 @cute.jit
-def arrive_inc(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: cutlass.Constexpr[Int32]) -> None:
+def arrive_inc(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int) -> None:
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:
-        red_release(flag_ptr, val)
-        # red_relaxed(flag_ptr, val)
+        red_release(flag_ptr)

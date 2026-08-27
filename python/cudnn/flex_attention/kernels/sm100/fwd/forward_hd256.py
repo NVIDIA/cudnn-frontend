@@ -16,7 +16,6 @@ from cudnn.flex_attention._compat import copy_utils
 
 import cuda.bindings.driver as cuda
 
-from cudnn.flex_attention.kernels.common.device_utils import ex2_emulation_2
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
     SM100_TMEM_CAPACITY_COLUMNS,
     ClcState,
@@ -41,7 +40,6 @@ def _hd256_bs_block_info(
     batch_idx: Int32,
     head_idx: Int32,
     m_block: Int32,
-    seqlen_q: Int32,
 ):
     """Return one hd256 Q2K plan row and its partial/full payload bases."""
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
@@ -96,55 +94,26 @@ def _hd256_bs_nblock(i: Int32, bs_info):
     total, mask_cnt, mask_off, mask_idx, _, full_off, full_idx = bs_info
     n_block = Int32(0)
     if total > 0:
-        if cutlass.const_expr(full_idx is not None):
-            if i < mask_cnt:
-                n_block = mask_idx[mask_off + i]
-            else:
-                n_block = full_idx[full_off + i - mask_cnt]
-        else:
+        if i < mask_cnt:
             n_block = mask_idx[mask_off + i]
+        else:
+            n_block = full_idx[full_off + i - mask_cnt]
     return n_block
-
-
-@cute.jit
-def _hd256_bs_is_full_block(i: Int32, bs_info):
-    """Return whether the i-th processed CSR entry comes from the full-block list."""
-    total, mask_cnt, _, _, _, _, full_idx = bs_info
-    is_full_block = False
-    if total > 0:
-        if cutlass.const_expr(full_idx is not None):
-            if i >= mask_cnt:
-                is_full_block = True
-    return is_full_block
 
 
 class BlackwellFusedMultiHeadAttentionForward:
     def __init__(
         self,
-        head_dim: int,
-        head_dim_v: Optional[int] = None,
-        qhead_per_kvhead: int = 1,
-        pack_gqa: bool = False,
-        mask_payload_valid_words: int = 4,
-        mask_payload_padded_words: int = 4,
-        use_2cta_instrs: bool = False,
+        use_2cta_instrs: bool,
     ):
-        head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        assert head_dim == 256 and head_dim_v == 256, "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"
-        assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
-        assert mask_payload_valid_words == 4 and mask_payload_padded_words == 4, "SM100 hd256 arbitrary forward requires four valid/padded words"
         if type(use_2cta_instrs) is not bool:
             raise TypeError("use_2cta_instrs must be a bool")
 
         qk_acc_dtype = cutlass.Float32
         pv_acc_dtype = cutlass.Float32
-        mma_tiler = (128, 128, head_dim)
+        mma_tiler = (128, 128, 256)
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
-        self.qhead_per_kvhead = qhead_per_kvhead
-        self.mma_tiler = mma_tiler
-        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
-        assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
         self.cta_tiler = (
             mma_tiler[0],
             mma_tiler[1],
@@ -167,8 +136,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
         self.cluster_shape_mn = (self.cta_group_size, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        self.mask_payload_valid_words = mask_payload_valid_words
-        self.mask_payload_padded_words = mask_payload_padded_words
+        self.mask_payload_valid_words = 4
+        self.mask_payload_padded_words = 4
         self.tile_scheduler_cls = PlanClcPersistentTileSchedulerSm100
 
         self.softmax_warp_ids = (0, 1, 2, 3)
@@ -203,16 +172,10 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.tmem_s_offset = 0
         self.tmem_o_offset = 256
-        self.tmem_p_offset = self.tmem_s_offset
 
         self.num_regs_softmax = 240
         self.num_regs_correction = 128
         self.num_regs_other = 72
-        self.ex2_emu_freq = 0
-        self.ex2_emu_res = 0
-        self.ex2_emu_start_frg = 0
-
-        self.buffer_align_bytes = 1024
         # Each CTA stages its physical M128 x Dv128 PV accumulator slice.
         self.o_tma_tile = self.pv_block_tiler[:2]
         self.o_store_stages = 1
@@ -241,76 +204,45 @@ class BlackwellFusedMultiHeadAttentionForward:
         stream: cuda.CUstream = None,
     ):
         assert blocksparse_tensors is not None, "SM100 hd256 arbitrary forward requires a compact Q2K plan"
-        if cutlass.const_expr(blocksparse_tensors is not None):
-            assert (mCuSeqlensQ is None) == (mCuSeqlensK is None), "SM100 hd256 arbitrary varlen forward requires both cu_seqlens tensors"
-            if cutlass.const_expr(mCuSeqlensQ is not None):
-                assert blocksparse_tensors.sequence_desc is not None, "SM100 hd256 arbitrary varlen forward requires sequence descriptors"
-            assert len(blocksparse_tensors.mask_block_cnt.shape) == 2, "SM100 hd256 arbitrary forward requires rank-2 compact counts"
-            assert len(blocksparse_tensors.mask_block_idx.shape) == 1
-            assert blocksparse_tensors.full_block_cnt is not None
-            assert len(blocksparse_tensors.full_block_cnt.shape) == 2
-            assert blocksparse_tensors.mask_block_offset is not None
-            assert len(blocksparse_tensors.mask_block_offset.shape) == 1
-            assert blocksparse_tensors.full_block_offset is not None
-            assert len(blocksparse_tensors.full_block_offset.shape) == 1
-            assert blocksparse_tensors.full_block_idx is not None
-            assert len(blocksparse_tensors.full_block_idx.shape) == 1
-            assert blocksparse_tensors.mask_block_masks is not None, "SM100 hd256 arbitrary forward requires mask_block_masks"
-            assert len(blocksparse_tensors.mask_block_masks.shape) == 4, "SM100 hd256 arbitrary forward payload must be rank 4"
+        assert (mCuSeqlensQ is None) == (mCuSeqlensK is None), "SM100 hd256 arbitrary varlen forward requires both cu_seqlens tensors"
+        if cutlass.const_expr(mCuSeqlensQ is not None):
+            assert blocksparse_tensors.sequence_desc is not None, "SM100 hd256 arbitrary varlen forward requires sequence descriptors"
+        assert len(blocksparse_tensors.mask_block_cnt.shape) == 2, "SM100 hd256 arbitrary forward requires rank-2 compact counts"
+        assert len(blocksparse_tensors.mask_block_idx.shape) == 1
+        assert blocksparse_tensors.full_block_cnt is not None
+        assert len(blocksparse_tensors.full_block_cnt.shape) == 2
+        assert blocksparse_tensors.mask_block_offset is not None
+        assert len(blocksparse_tensors.mask_block_offset.shape) == 1
+        assert blocksparse_tensors.full_block_offset is not None
+        assert len(blocksparse_tensors.full_block_offset.shape) == 1
+        assert blocksparse_tensors.full_block_idx is not None
+        assert len(blocksparse_tensors.full_block_idx.shape) == 1
+        assert blocksparse_tensors.mask_block_masks is not None, "SM100 hd256 arbitrary forward requires mask_block_masks"
+        assert len(blocksparse_tensors.mask_block_masks.shape) == 4, "SM100 hd256 arbitrary forward payload must be rank 4"
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
 
-        q_rank = len(mQ.shape)
-        k_rank = len(mK.shape)
         if cutlass.const_expr(cum_seqlen_q is not None):
-            # Varlen path accepts either legacy 5D tensors or standard 3D tensors.
-            if cutlass.const_expr(q_rank == 5):
-                s_q = mQ.shape[1]
-                h_q = mQ.shape[2] * mQ.shape[3]
-                d = mQ.shape[4]
-            elif cutlass.const_expr(q_rank == 3):
-                s_q = mQ.shape[0]
-                h_q = mQ.shape[1]
-                d = mQ.shape[2]
-            else:
-                raise RuntimeError(f"hd256 forward varlen expects q rank 3 or 5, got rank {q_rank}")
+            assert len(mQ.shape) == 3
+            s_q = mQ.shape[0]
+            h_q = mQ.shape[1]
+            d = mQ.shape[2]
         else:
-            # Non-varlen path accepts either legacy 5D tensors or standard 4D tensors.
-            if cutlass.const_expr(q_rank == 5):
-                s_q = mQ.shape[1]
-                h_q = mQ.shape[2] * mQ.shape[3]
-                d = mQ.shape[4]
-            elif cutlass.const_expr(q_rank == 4):
-                s_q = mQ.shape[1]
-                h_q = mQ.shape[2]
-                d = mQ.shape[3]
-            else:
-                raise RuntimeError(f"hd256 forward non-varlen expects q rank 4 or 5, got rank {q_rank}")
+            assert len(mQ.shape) == 4
+            s_q = mQ.shape[1]
+            h_q = mQ.shape[2]
+            d = mQ.shape[3]
 
         if cutlass.const_expr(cum_seqlen_k is not None):
-            if cutlass.const_expr(k_rank == 5):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            elif cutlass.const_expr(k_rank == 3):
-                s_k = mK.shape[0]
-                h_k = mK.shape[1]
-            else:
-                raise RuntimeError(f"hd256 forward varlen expects k rank 3 or 5, got rank {k_rank}")
+            assert len(mK.shape) == 3
+            h_k = mK.shape[1]
         else:
-            if cutlass.const_expr(k_rank == 5):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            elif cutlass.const_expr(k_rank == 4):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            else:
-                raise RuntimeError(f"hd256 forward non-varlen expects k rank 4 or 5, got rank {k_rank}")
+            assert len(mK.shape) == 4
+            h_k = mK.shape[2]
         if cutlass.const_expr(cum_seqlen_q is not None):
             b = mCuSeqlensQ.shape[0] - 1
-        elif cutlass.const_expr(cum_seqlen_k is not None):
-            b = mCuSeqlensK.shape[0] - 1
         else:
             b = mQ.shape[0]
         scale_softmax = softmax_scale
@@ -851,7 +783,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 continue_cond = False
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
                 block_offset = (
@@ -865,7 +796,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     seqlen_q = mSequenceDescQ[batch_coord, Int32(2)]
                     if cutlass.const_expr(mSequenceDescK is not None):
                         cuseqlen_k = mSequenceDescK[batch_coord, Int32(1)]
-                        seqlen_k = mSequenceDescK[batch_coord, Int32(3)]
                     block_offset = (
                         cuseqlen_q,
                         cuseqlen_k,
@@ -907,7 +837,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
-                        seqlen_q,
                     )
                     bs_total = bs_info[0]
                     seqlen_kv_loop_steps = bs_total
@@ -936,7 +865,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_bar_ptr=k_handle.barrier,
                         )
                     kv_coord += 1
-                    for i in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
+                    for _ in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
                         k_blk = _hd256_bs_nblock(kv_coord, bs_info)
                         for iter in cutlass.range(self.iterations_qk, unroll=1):
                             k_handle = load_k_producer.acquire_and_advance()
@@ -999,7 +928,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         v_batch_coord,
                         v_block_coord[2][0],
                         v_mma_block_coord[0],
-                        v_seqlen_q,
                     )
                     v_loop_steps = v_bs_info[0]
                     if v_loop_steps == 0:
@@ -1037,7 +965,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 batch_coord = curr_block_coord[2][1]
                 if cutlass.const_expr(mSequenceDescQ is not None):
                     cuseqlen_q = mSequenceDescQ[batch_coord, Int32(0)]
@@ -1047,14 +974,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if not continue_cond:
                     if cutlass.const_expr(mSequenceDescK is not None):
                         cuseqlen_k = mSequenceDescK[batch_coord, Int32(1)]
-                        seqlen_k = mSequenceDescK[batch_coord, Int32(3)]
 
                     bs_total = _hd256_bs_block_info(
                         blocksparse_tensors,
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
-                        seqlen_q,
                     )[0]
                     seqlen_kv_loop_steps = bs_total
                     if bs_total == 0:
@@ -1205,7 +1130,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(mSequenceDescQ is not None):
                     cuseqlen_q = mSequenceDescQ[batch_coord, Int32(0)]
@@ -1214,7 +1138,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if not continue_cond:
                     if cutlass.const_expr(mSequenceDescK is not None):
                         cuseqlen_k = mSequenceDescK[batch_coord, Int32(1)]
-                        seqlen_k = mSequenceDescK[batch_coord, Int32(3)]
 
                     row_max = -Float32.inf
                     row_max_prev = -Float32.inf
@@ -1225,7 +1148,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
-                        seqlen_q,
                     )
                     bs_total = bs_info[0]
                     # Keep one zero-masked iteration for the pipeline protocol.
@@ -1235,7 +1157,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         end_count = Int32(1)
                     cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                     cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
-                    tScS = qk_thr_mma.partition_C(cS)
 
                     if bs_total == 0:
                         step = Int32(0)
@@ -1253,15 +1174,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 True,
                                 None,
                                 Int32(0),
-                                col_block,
                                 True,
                                 mma_tile_coord_v,
                             ),
                             (
                                 row_max_prev,
                                 row_sum,
-                                seqlen_q,
-                                seqlen_k,
                                 scale_softmax_log2,
                             ),
                             (tStS, tScS_iter),
@@ -1286,15 +1204,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     True,
                                     mask_payloads,
                                     bs_info[2] + step,
-                                    col_block,
                                     False,
                                     mma_tile_coord_v,
                                 ),
                                 (
                                     row_max_prev,
                                     row_sum,
-                                    seqlen_q,
-                                    seqlen_k,
                                     scale_softmax_log2,
                                 ),
                                 (tStS, tScS_iter),
@@ -1312,12 +1227,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 p_mma_producer,
                                 s_corr_producer,
                             ) = self.softmax_step(
-                                (False, None, Int32(0), Int32(0), False, Int32(0)),
+                                (False, None, Int32(0), False, Int32(0)),
                                 (
                                     row_max_prev,
                                     row_sum,
-                                    seqlen_q,
-                                    seqlen_k,
                                     scale_softmax_log2,
                                 ),
                                 (tStS, tScS_iter),
@@ -1360,7 +1273,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(mSequenceDescQ is not None):
@@ -1371,7 +1283,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if not continue_cond:
                     if cutlass.const_expr(mSequenceDescK is not None):
                         cuseqlen_k = mSequenceDescK[batch_coord, Int32(1)]
-                        seqlen_k = mSequenceDescK[batch_coord, Int32(3)]
 
                     mO_qdl_eff = mO_qdl
                     if cutlass.const_expr(mSequenceDescQ is not None):
@@ -1403,7 +1314,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
-                        seqlen_q,
                     )[0]
                     seqlen_kv_loop_steps = bs_total
                     if bs_total == 0:
@@ -1482,11 +1392,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             apply_arbitrary_mask,
             mask_payloads,
             payload_idx,
-            n_block,
             empty_dummy,
             subtile_idx,
         ) = mask_args
-        row_max, row_sum, seqlen_q, seqlen_k, scale_softmax_log2 = value_args
+        row_max, row_sum, scale_softmax_log2 = value_args
         tStS, tScS = tensor_args
         mma_s_consumer, p_mma_producer, s_corr_producer = pipeline_args
         tidx, _, _ = cute.arch.thread_idx()
@@ -1518,7 +1427,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 r_bitmask.fill(Uint32(0))
                 apply_loaded_arbitrary_mask(
                     tTMEM_LOADrS,
-                    n_block,
                     r_bitmask,
                     self.mask_payload_valid_words,
                 )
@@ -1534,7 +1442,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 apply_loaded_arbitrary_mask(
                     tTMEM_LOADrS,
-                    n_block,
                     r_bitmask,
                     self.mask_payload_valid_words,
                 )
@@ -1582,15 +1489,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     (scale, scale),
                     (minus_row_max_scale, minus_row_max_scale),
                 )
-                if cutlass.const_expr(self.ex2_emu_freq == 0):
-                    tTMEM_LOADrS_ex2[k, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k, j], fastmath=True)
-                    tTMEM_LOADrS_ex2[k + 1, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k + 1, j], fastmath=True)
-                else:
-                    if cutlass.const_expr(k % self.ex2_emu_freq < self.ex2_emu_freq - self.ex2_emu_res or j >= ex2_frg_cnt - 1 or j < self.ex2_emu_start_frg):
-                        tTMEM_LOADrS_ex2[k, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k, j], fastmath=True)
-                        tTMEM_LOADrS_ex2[k + 1, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k + 1, j], fastmath=True)
-                    else:
-                        tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j] = ex2_emulation_2(tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j])
+                tTMEM_LOADrS_ex2[k, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k, j], fastmath=True)
+                tTMEM_LOADrS_ex2[k + 1, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k + 1, j], fastmath=True)
             tTMEM_STORErP_ex2[None, j].store(tTMEM_LOADrS_ex2[None, j].load().to(self.q_dtype))
         tmem_store_atom = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition(32)), self.qk_acc_dtype)
         tilePlikeFP32 = tStS_slice.shape[1] // Float32.width * self.q_dtype.width

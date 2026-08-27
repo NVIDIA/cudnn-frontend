@@ -310,7 +310,6 @@ class ArbitraryTopologyTensors:
     runtime_binding: ArbitraryPlanRuntimeBinding = field(compare=False)
     dq_write_order: torch.Tensor | None = field(default=None, compare=False)
     dq_write_order_full: torch.Tensor | None = field(default=None, compare=False)
-    indices_are_sample_local: bool = True
 
     def __post_init__(self) -> None:
         if self.direction not in ("q2k", "k2q"):
@@ -320,8 +319,6 @@ class ArbitraryTopologyTensors:
         full_present = tuple(tensor is not None for tensor in (self.full_count, self.full_offset, self.full_index))
         if any(full_present) and not all(full_present):
             raise ValueError("full count/offset/index must be provided together")
-        if type(self.indices_are_sample_local) is not bool:
-            raise TypeError("indices_are_sample_local must be a bool")
         if not isinstance(self.runtime_binding, ArbitraryPlanRuntimeBinding):
             raise TypeError("topology runtime_binding must be an ArbitraryPlanRuntimeBinding")
 
@@ -465,8 +462,6 @@ def validate_arbitrary_topology_binding(
     )
     if expected_direction is None or topology.direction != expected_direction:
         raise ValueError("arbitrary topology direction does not match plan signature")
-    if not topology.indices_are_sample_local:
-        raise ValueError("arbitrary topology indices must be sample-local")
     q_prefix = topology.cu_total_q_plan_rows
     k_prefix = topology.cu_total_k_plan_rows
     if runtime_binding.is_varlen:
@@ -494,10 +489,9 @@ def validate_arbitrary_topology_binding(
 
 def validate_arbitrary_attention_plan(
     *,
-    arbitrary: bool,
     block_sparse_tensors: object | None,
-) -> ArbitraryPlanSignature | None:
-    """Validate that every arbitrary request carries a complete versioned plan.
+) -> ArbitraryPlanSignature:
+    """Validate that an attention request carries a complete versioned plan.
 
     A payload without a versioned signature is deliberately rejected.  Shape
     checks alone cannot distinguish an SM90 WGMMA payload from an SM100
@@ -516,17 +510,9 @@ def validate_arbitrary_attention_plan(
         "mask_block_masks": has_payload,
         "topology_tensors": has_topology,
     }
-    if not arbitrary:
-        if any(plan_parts.values()):
-            if not all(plan_parts.values()):
-                missing = ", ".join(name for name, present in plan_parts.items() if not present)
-                raise ValueError(f"arbitrary plan requires {missing}")
-            raise ValueError("an arbitrary plan requires arbitrary=True")
-        return None
-
     if not all(plan_parts.values()):
         missing = ", ".join(name for name, present in plan_parts.items() if not present)
-        raise ValueError("arbitrary=True requires a plan returned by " f"create_arbitrary_block_sparse_tensors; missing {missing}")
+        raise ValueError("arbitrary attention requires a plan returned by " f"create_mask_plan; missing {missing}")
     if not isinstance(signature, ArbitraryPlanSignature):
         raise TypeError("arbitrary plan_signature must be an ArbitraryPlanSignature")
     if not isinstance(topology_tensors, ArbitraryTopologyTensors):
@@ -581,7 +567,6 @@ class MaskPlan:
         device: torch.device,
     ) -> None:
         signature = validate_arbitrary_attention_plan(
-            arbitrary=True,
             block_sparse_tensors=packed_plan,
         )
         self._packed_plan = packed_plan

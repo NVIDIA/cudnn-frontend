@@ -42,40 +42,13 @@ def mask_f32_by_u32_bit(
 
 
 # Obtained from sollya:
-# fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
-POLY_EX2 = {
-    0: (1.0),
-    1: (
-        1.0,
-        0.922497093677520751953125,
-    ),
-    2: (
-        1.0,
-        0.6657850742340087890625,
-        0.330107033252716064453125,
-    ),
-    3: (
-        1.0,
-        0.695146143436431884765625,
-        0.227564394474029541015625,
-        0.077119089663028717041015625,
-    ),
-    4: (
-        1.0,
-        0.693042695522308349609375,
-        0.2412912547588348388671875,
-        5.2225358784198760986328125e-2,
-        1.3434938155114650726318359375e-2,
-    ),
-    5: (
-        1.0,
-        0.693151414394378662109375,
-        0.24016360938549041748046875,
-        5.5802188813686370849609375e-2,
-        9.01452265679836273193359375e-3,
-        1.86810153536498546600341796875e-3,
-    ),
-}
+# fpminimax(exp(x * log(2.0)), 3, [|1,24...|],[0;1],relative);
+POLY_EX2 = (
+    1.0,
+    0.695146143436431884765625,
+    0.227564394474029541015625,
+    0.077119089663028717041015625,
+)
 
 
 def sub_packed_f32x2(a, b):
@@ -102,31 +75,24 @@ LOG2_E = math.log2(math.e)
 
 def compute_softmax_scale_log2(softmax_scale):
     """Fold the natural-to-base-2 conversion into the attention scale."""
-    return softmax_scale * LOG2_E, None
+    return softmax_scale * LOG2_E
 
 
-def convert_from_dlpack_leading_static(x, leading_dim, alignment=16, static_modes=None, stride_order=None) -> cute.Tensor:
-    if stride_order is None:
-        stride_order = x.dim_order()
-    x_ = from_dlpack(x, assumed_align=alignment)
-    for i in range(x.ndim):
-        if i != leading_dim and (static_modes is None or i not in static_modes):
-            x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=stride_order)
-    return x_
+def convert_semaphore_from_dlpack(x) -> cute.Tensor:
+    """Keep the rank-4 semaphore stage mode static while making outer modes dynamic."""
+    assert x.ndim == 4
+    tensor = from_dlpack(x, assumed_align=4)
+    for mode in range(3):
+        tensor = tensor.mark_compact_shape_dynamic(mode=mode, stride_order=x.dim_order())
+    return tensor
 
 
-def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
-        return cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            element_type,
-            num_bits_per_copy=2 * element_type.width,
-        )
-    else:
-        return cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
-            element_type,
-        )
+def get_smem_store_atom(element_type: Type[cute.Numeric], transpose: bool = False) -> cute.CopyAtom:
+    assert element_type.width == 16
+    return cute.make_copy_atom(
+        cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+        element_type,
+    )
 
 
 @cute.jit
@@ -171,7 +137,7 @@ def fmax(
 
 
 @cute.jit
-def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80) -> Float32:
+def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None, arch: cutlass.Constexpr[int]) -> Float32:
     if const_expr(arch == 90):
         # Keep four independent chains to expose enough ILP for Hopper's
         # floating-point max pipeline across all native SM90 tile widths.
@@ -187,18 +153,9 @@ def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
         local_max[2] = fmax(local_max[2], local_max[3], ftz=True)
         local_max[0] = fmax(local_max[0], local_max[2], ftz=True)
         return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val, ftz=True)
-    elif const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
-        # if const_expr(init_val is None):
-        #     init_val = -cutlass.Float32.if
-        # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
+    elif const_expr(cute.size(x.shape) % 8 != 0):
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
-        # local_max = [res[0], res[1]]
-        # for i in cutlass.range_constexpr(2, cute.size(x.shape), 2):
-        #     local_max[0] = fmax(local_max[0], res[i + 0])
-        #     local_max[1] = fmax(local_max[1], res[i + 1])
-        # local_max[0] = fmax(local_max[0], local_max[1])
-        # return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
         local_max = [res[0], res[1], res[2], res[3]]
         for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
             local_max[0] = fmax(local_max[0], res[i + 0])
@@ -231,32 +188,15 @@ def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
 
 
 @cute.jit
-def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80) -> Float32:
-    if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None, arch: cutlass.Constexpr[int]) -> Float32:
+    if const_expr(arch == 90 or cute.size(x.shape) % 8 != 0):
         if const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-        # res = cute.make_rmem_tensor(x.shape, Float32)
-        # res.store(x)
-        # local_sum = [res[0], res[1], res[2], res[3]]
-        # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
-        #     local_sum[0] += res[i + 0]
-        #     local_sum[1] += res[i + 1]
-        #     local_sum[2] += res[i + 2]
-        #     local_sum[3] += res[i + 3]
-        # local_sum[0] += local_sum[1]
-        # local_sum[2] += local_sum[3]
-        # local_sum[0] += local_sum[2]
-        # return local_sum[0] if const_expr(init_val is None) else local_sum[0] + init_val
     else:
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
-        local_sum_0 = (
-            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
-            # cute.arch.add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
-            if const_expr(init_val is not None)
-            else (res[0], res[1])
-        )
+        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1])) if const_expr(init_val is not None) else (res[0], res[1])
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
             local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
@@ -290,33 +230,6 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     return tApA
 
 
-def canonical_warp_group_idx(sync: bool = True) -> cutlass.Int32:
-    warp_group_idx = cute.arch.thread_idx()[0] // 128
-    if const_expr(sync):
-        warp_group_idx = cute.arch.make_warp_uniform(warp_group_idx)
-    return warp_group_idx
-
-
-# @dsl_user_op
-# def warp_vote_any_lt(a: float | Float32, b: float | Float32, *, loc=None, ip=None) -> cutlass.Boolean:
-#     mask = cutlass.Int32(-1)
-#     return cutlass.Boolean(
-#         llvm.inline_asm(
-#             T.i32(),
-#             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip), mask.ir_value(loc=loc, ip=ip)],
-#             ".pred p1, p2;\n"
-#             "setp.lt.f32 p1, $1, $2;\n"
-#             "vote.sync.any.pred p2, p1, $3;\n"
-#             "selp.u32 $0, 1, 0, p2;",
-#             # "selp.u32 $0, 1, 0, p1;",
-#             "=r,f,f,r",
-#             has_side_effects=False,
-#             is_align_stack=False,
-#             asm_dialect=llvm.AsmDialect.AD_ATT,
-#         )
-#     )
-
-
 @cute.jit
 def shuffle_sync(
     value: cute.Numeric,
@@ -335,64 +248,6 @@ def shuffle_sync(
     for i in cutlass.range_constexpr(cute.size(val_i32)):
         val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
     return val[0]
-
-
-@dsl_user_op
-def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
-    """
-    Left-shift val by shift bits using PTX shl.b32 (sign-agnostic).
-
-    Named ``shl_u32`` (not ``shl_b32``) because python type annotations
-    distinguish signed/unsigned.
-
-    PTX semantics (§9.7.8.8): "Shift amounts greater than the register width N
-    are clamped to N."  So ``shl.b32 d, a, 32`` is well-defined and yields 0.
-
-    This differs from C/C++ and LLVM IR, where shifting by >= the type width is
-    undefined behavior.  CuTeDSL compiles through MLIR -> LLVM IR, so a plain
-    Python-level ``Uint32(x) << Uint32(n)`` inherits LLVM's UB: the optimizer
-    may treat the result as poison and eliminate dependent code.  Inline PTX
-    bypasses the LLVM IR shift entirely — the instruction is emitted verbatim
-    into PTX where clamping makes it safe for all shift amounts.
-    """
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
-                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
-            ],
-            "shl.b32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
-    """
-    Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
-
-    See ``shl_u32`` docstring for why inline PTX is used instead of plain
-    CuTeDSL shift operators (LLVM shift-by-type-width UB).
-    """
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
-                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
-            ],
-            "shr.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @cute.jit
@@ -499,7 +354,7 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
 
 # TODO: check that the ex2_emulation_2 produces the same SASS as the ptx version
 @dsl_user_op
-def ex2_emulation_2(x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
@@ -509,20 +364,7 @@ def ex2_emulation_2(x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, i
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
     xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
-    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
+    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2, loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
     return x_out, y_out
-
-
-@cute.jit
-def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
-    """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
-    vec = cute.make_rmem_tensor(1, dtype)
-    vec[0] = a
-    return vec.load()
-
-
-def ssa_to_scalar(val):
-    """Could inline but nice for reflecting the above api"""
-    return val[0]

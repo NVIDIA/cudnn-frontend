@@ -9,7 +9,6 @@ import cutlass.cute as cute
 import cutlass.pipeline
 from cutlass import Boolean, Int32, const_expr
 from cutlass._mlir.dialects import llvm
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -44,33 +43,17 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 
 @dsl_user_op
-def load_t2r(thr_copy: cute.ThrCopy, shape: cute.Shape, src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
-    cDst = cute.make_identity_tensor(shape)
-    dst = cute.make_rmem_tensor(thr_copy.partition_D(cDst).shape, src.element_type, loc=loc, ip=ip)
-    cute.copy(thr_copy, src, dst, loc=loc, ip=ip)
-    return dst
-
-
-@dsl_user_op
-def get_copy_atom(dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None) -> cute.CopyAtom:
-    num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
-    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
-    return cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
-
-
-@dsl_user_op
 def copy(
     src: cute.Tensor,
     dst: cute.Tensor,
     *,
     pred: Optional[cute.Tensor] = None,
-    is_async: bool = False,
     loc=None,
     ip=None,
     **kwargs,
 ) -> None:
-    num_copy_elems = src.shape[0][0]
-    copy_atom = get_copy_atom(src.element_type, num_copy_elems, is_async)
+    num_copy_bits = const_expr(min(128, src.shape[0][0] * src.element_type.width))
+    copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), src.element_type, num_bits_per_copy=num_copy_bits)
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
@@ -120,34 +103,21 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
 
 BIG_INT = 2**30
 MAX_INT = 2**31 - 1
-BIG_INT_INV = 2**64 // BIG_INT
 
 
 @dsl_user_op
 def create_ragged_tensor_for_tma(
     T: cute.Tensor,
-    ragged_dim: int = 0,
-    ptr_shift: bool = False,
     *,
     loc=None,
     ip=None,
 ) -> cute.Tensor:
     rank = cute.rank(T)
-    if ragged_dim < 0:
-        ragged_dim += rank
-    if ptr_shift:
-        assert rank <= 4, "ptr_shift ragged tensor only supports up to 4 dimensions"
-        new_shape = T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT,)
-        new_stride = T.stride + (T.stride[ragged_dim],)
-        ptr_offset = (None,) * ragged_dim + (-BIG_INT,) + (None,) * (rank - ragged_dim - 1)
-        new_ptr = cute.domain_offset(ptr_offset, T).iterator
-        return cute.make_tensor(new_ptr, cute.make_layout(new_shape, stride=new_stride))
-    else:
-        assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
-        stride_r = T.stride[ragged_dim]
-        new_shape = T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
-        new_stride = T.stride[:ragged_dim] + (stride_r,) + T.stride[ragged_dim + 1 :] + (BIG_INT_INV - stride_r, stride_r)
-        return cute.make_tensor(T.iterator, cute.make_layout(new_shape, stride=new_stride))
+    assert rank <= 4, "ragged TMA tensor only supports up to 4 dimensions"
+    new_shape = (BIG_INT,) + T.shape[1:] + (MAX_INT,)
+    new_stride = T.stride + (T.stride[0],)
+    new_ptr = cute.domain_offset((-BIG_INT,) + (None,) * (rank - 1), T).iterator
+    return cute.make_tensor(new_ptr, cute.make_layout(new_shape, stride=new_stride))
 
 
 @dsl_user_op
@@ -156,26 +126,17 @@ def offset_ragged_tensor(
     offset: Int32,
     length: Int32,
     ragged_dim: int = 0,
-    ptr_shift: bool = False,
     *,
     loc=None,
     ip=None,
 ) -> cute.Tensor:
     rank = cute.rank(T)
-    if ragged_dim < 0:
-        ragged_dim += rank
+    assert 0 <= ragged_dim < rank - 1
     big_int = cute.size(T, mode=[ragged_dim])
     offset_val = big_int - length
-    if ptr_shift:
-        # 1-extra-dim: rank = original_rank + 1
-        assert rank >= ragged_dim + 2
-        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 2)
-        index_tuple = (None,) * (rank - 1) + (offset + length,)
-    else:
-        # 2-extra-dim: rank = original_rank + 2, last 2 modes are the wraparound dims
-        assert rank >= ragged_dim + 3
-        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 3)
-        index_tuple = (None,) * (rank - 2) + (big_int, offset + length)
+    assert rank >= ragged_dim + 2
+    offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 2)
+    index_tuple = (None,) * (rank - 1) + (offset + length,)
     return cute.domain_offset(offset_tuple, T[index_tuple])
 
 
@@ -215,8 +176,7 @@ def get_smem_store_atom(
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
-    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
+    if const_expr(element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
@@ -235,17 +195,13 @@ def get_smem_store_C(
     sC: cute.Tensor,
     tidx: Int32,
     transpose: bool = False,
-    position_independent=False,
     major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
     copy_atom = get_smem_store_atom(dtype, transpose, major_mode_size=major_mode_size)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
-    if const_expr(not position_independent):
-        tRS_sC = thr_copy.partition_D(sC)
-    else:
-        tRS_sC = partition_D_position_independent(thr_copy, sC)
+    tRS_sC = partition_D_position_independent(thr_copy, sC)
 
     def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, **new_kwargs):
         dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[None, None, None, dst_idx]
@@ -264,15 +220,11 @@ def cpasync_reduce_bulk_add_f32(
     ip=None,
 ):
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
     llvm.inline_asm(
         None,
         [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
         "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
         "l,r,r",
-        # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
-        # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
-        # "l,r,r,l",
         has_side_effects=True,
         is_align_stack=False,
     )
@@ -281,11 +233,10 @@ def cpasync_reduce_bulk_add_f32(
 def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
-    single_stage: bool = False,
     **kwargs,
 ) -> Callable:
-    group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
-    group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
+    group_rank_src = const_expr(cute.rank(src_tensor) - 1)
+    group_rank_dst = const_expr(cute.rank(dst_tensor) - 1)
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     src = cute.group_modes(src_tensor, 0, group_rank_src)
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
@@ -302,12 +253,7 @@ def cpasync_bulk_get_copy_fn(
                 **kwargs,
             )
 
-    def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
-        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
-            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
-
-    return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
+    return copy_bulk
 
 
 @dsl_user_op

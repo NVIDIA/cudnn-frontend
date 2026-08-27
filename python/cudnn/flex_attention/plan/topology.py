@@ -37,11 +37,9 @@ def _consumer_plan_signature(config) -> ArbitraryPlanSignature:
             cta_group_size=1,
             pack_gqa=False,
             qhead_per_kvhead=config.qhead_per_kvhead,
-            mma_atom_layout_id=(f"sm90_wgmma_f32_ss_sdp_m{config.tile_m}n{config.tile_n}" f"_atom_m{config.atom_layout_m_sdp}_wg{config.num_wg}_major_kk"),
+            mma_atom_layout_id=f"sm90_wgmma_f32_ss_sdp_m{config.tile_m}n{config.tile_n}_atom_m1_wg2_major_kk",
             swap_ab=config.sdp_swap_ab,
-            payload_layout_id=(
-                f"sm90_wgmma_sdp_t{config.num_mma_threads}" f"_s{config.subtile_factor}_swap{int(config.sdp_swap_ab)}" f"_w{config.payload_padded_words}_v1"
-            ),
+            payload_layout_id=(f"sm90_wgmma_sdp_t256_s{config.subtile_factor}_swap{int(config.sdp_swap_ab)}_w{config.payload_padded_words}_v1"),
             dq_order_format="rank_only",
             cluster_axis="m",
         )

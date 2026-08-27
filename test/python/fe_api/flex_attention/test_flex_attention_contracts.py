@@ -18,8 +18,24 @@ from cudnn.flex_attention.autograd import FlexAttnFunc
 from cudnn.flex_attention.plan.mask_plan import MaskPlan
 from cudnn.flex_attention.plan.validation import is_supported_head_dims, validate_call_options
 from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
+from cudnn.flex_attention.runtime.dsl_utils import _cute_dsl_bulk_copy_self_elects
 
 pytestmark = pytest.mark.L0
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    (
+        ((4, 5, 2), False),
+        ((4, 6, 0), True),
+        ((4, 6, 1), True),
+        ((4, 6, 2), False),
+        ((4, 6, 3), False),
+        ((4, 7, 0), False),
+    ),
+)
+def test_bulk_copy_internal_election_version_window(version, expected):
+    assert _cute_dsl_bulk_copy_self_elects(version) is expected
 
 
 def test_public_exports_are_lazy_top_level_aliases():

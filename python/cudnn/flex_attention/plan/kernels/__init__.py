@@ -24,7 +24,6 @@ class BlockSparseTensors(NamedTuple):
     full_block_cnt: cute.Tensor | None = None
     full_block_idx: cute.Tensor | None = None
     cu_total_m_blocks: cute.Tensor | None = None
-    cu_block_idx_offsets: cute.Tensor | None = None
     dq_write_order: cute.Tensor | None = None
     dq_write_order_full: cute.Tensor | None = None
     mask_block_offset: cute.Tensor | None = None
@@ -53,7 +52,6 @@ class BlockSparseTensorsTorch(NamedTuple):
     full_block_cnt: torch.Tensor | None = None
     full_block_idx: torch.Tensor | None = None
     cu_total_m_blocks: torch.Tensor | None = None
-    cu_block_idx_offsets: torch.Tensor | None = None
     block_size: tuple[int, int] | None = None
     dq_write_order: torch.Tensor | None = None
     dq_write_order_full: torch.Tensor | None = None
@@ -256,7 +254,6 @@ def normalize_arbitrary_block_sparse_config(
     elif tensors.sequence_desc is not None or tensors.fwd_work_desc is not None:
         raise ValueError("forward schedule descriptors require a supported FWD plan")
     for name in (
-        "cu_block_idx_offsets",
         "dq_write_order",
         "dq_write_order_full",
         "spt",
@@ -284,7 +281,7 @@ def normalize_arbitrary_block_sparse_config_bwd(
 ) -> BlockSparseTensorsTorch:
     """Validate a compact K-to-Q arbitrary-mask backward plan."""
 
-    hmask, total_n_blocks = _validate_common_compact_plan(
+    _, total_n_blocks = _validate_common_compact_plan(
         tensors,
         device=device,
         num_q_heads=num_q_heads,
@@ -292,7 +289,6 @@ def normalize_arbitrary_block_sparse_config_bwd(
         expected_hmask=expected_hmask,
         context="arbitrary backward plan",
     )
-    del hmask
     if tensors.pack_gqa is not None:
         raise ValueError("arbitrary backward plan requires pack_gqa=None")
     if tensors.bwd_tensors is not None:
@@ -336,8 +332,6 @@ def normalize_arbitrary_block_sparse_config_bwd(
         is_varlen=is_varlen,
         context="arbitrary backward plan",
     )
-    if tensors.cu_block_idx_offsets is not None:
-        raise ValueError("arbitrary backward plan requires cu_block_idx_offsets=None")
     if require_dq_write_order:
         if tensors.spt is None or tensors.spt != expected_spt:
             raise ValueError(f"arbitrary backward plan spt={tensors.spt} does not match " f"consumer spt={expected_spt}")
@@ -348,7 +342,6 @@ def normalize_arbitrary_block_sparse_config_bwd(
 
 def to_cute_block_sparse_tensors(
     tensors: BlockSparseTensorsTorch,
-    enable_tvm_ffi: bool = True,
 ) -> BlockSparseTensors:
     """Convert one validated arbitrary-mask plan from Torch to CuTe tensors."""
 
@@ -358,7 +351,6 @@ def to_cute_block_sparse_tensors(
                 tensor,
                 assumed_align=align,
                 leading_dim=leading_dim,
-                enable_tvm_ffi=enable_tvm_ffi,
             )
             if tensor is not None
             else None
@@ -370,7 +362,6 @@ def to_cute_block_sparse_tensors(
         convert(tensors.full_block_cnt),
         convert(tensors.full_block_idx),
         convert(tensors.cu_total_m_blocks, leading_dim=0),
-        convert(tensors.cu_block_idx_offsets, leading_dim=0),
         convert(tensors.dq_write_order),
         convert(tensors.dq_write_order_full),
         convert(tensors.mask_block_offset, leading_dim=0),

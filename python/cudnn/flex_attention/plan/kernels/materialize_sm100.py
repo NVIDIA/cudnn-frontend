@@ -51,7 +51,6 @@ class _ArbitraryPlanMaterializeSm100(_ArbitraryPlanMaterializeSm90):
     ):
         self.is_hd256_fwd = isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
         self.is_hd256_dq = isinstance(config, _ResolvedSm100Hd256DqConsumerConfig)
-        self.is_hd256 = self.is_hd256_fwd or self.is_hd256_dq
         if self.is_hd256_fwd:
             topology_config = _ResolvedSm100Hd256FwdTopologyConfig(config)
         elif self.is_hd256_dq:
@@ -485,10 +484,7 @@ class _ArbitraryPlanK2QMaterializeSm100(_ArbitraryPlanK2QMaterializeSm90):
                         gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
                         cute.autovec_copy(rMask, gMask)
             if const_expr(not self.is_hd256_dkdv):
-                thr_tmem_load = make_sm100_bwd_tmem_load(
-                    consumer_tidx,
-                    self.num_wg_mma,
-                )
+                thr_tmem_load = make_sm100_bwd_tmem_load(consumer_tidx)
                 for subtile_idx in cutlass.range_constexpr(self.subtile_factor):
                     for cta_rank in cutlass.range_constexpr(self.cta_group_size):
                         thr_mma_sdp = tiled_mma_sdp.get_slice(cta_rank)

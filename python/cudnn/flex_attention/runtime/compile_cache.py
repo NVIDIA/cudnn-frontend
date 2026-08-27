@@ -217,13 +217,13 @@ class JITPersistentCache(JITCache):
             label=sha256_hex,
         ):
             if obj_path.exists():
-                flex_log(1, f"Loading compiled function from disk: {obj_path}")
+                flex_log(f"Loading compiled function from disk: {obj_path}")
                 m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
                 fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
                 JITCache.__setitem__(self, key, fn)
                 return True
             else:
-                flex_log(1, f"Cache miss on disk for key hash {sha256_hex}")
+                flex_log(f"Cache miss on disk for key hash {sha256_hex}")
         return False
 
     def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
@@ -238,14 +238,14 @@ class JITPersistentCache(JITCache):
             obj_path = self.cache_path / f"{sha256_hex}.o"
             if obj_path.exists():
                 # Another process already exported.
-                flex_log(1, f"Skipping export, already on disk: {obj_path}")
+                flex_log(f"Skipping export, already on disk: {obj_path}")
                 return
-            flex_log(1, f"Exporting compiled function to disk: {obj_path}")
+            flex_log(f"Exporting compiled function to disk: {obj_path}")
             fn.export_to_c(
                 object_file_path=str(obj_path),
                 function_name=self.EXPORT_FUNCTION_PREFIX,
             )
-            flex_log(1, f"Successfully exported compiled function to disk: {obj_path}")
+            flex_log(f"Successfully exported compiled function to disk: {obj_path}")
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
         return hashlib.sha256(pickle.dumps(key)).hexdigest()
@@ -257,7 +257,7 @@ class JITPersistentCache(JITCache):
         """
         Not only clear the in-memory cache. Also purge persistent compilation cache.
         """
-        flex_log(1, f"Clearing persistent cache at {self.cache_path}")
+        flex_log(f"Clearing persistent cache at {self.cache_path}")
         super().clear()
         for child in self.cache_path.iterdir():
             child.unlink()
@@ -276,8 +276,8 @@ def get_jit_cache(name: str | None = None) -> JITCache:
         path = get_cache_path() / _compute_source_fingerprint()
         if name:
             path = path / name
-        flex_log(1, f"Creating persistent JIT cache at {path}")
+        flex_log(f"Creating persistent JIT cache at {path}")
         return JITPersistentCache(path)
     else:
-        flex_log(1, "Persistent cache disabled, using in-memory JIT cache")
+        flex_log("Persistent cache disabled, using in-memory JIT cache")
         return JITCache()

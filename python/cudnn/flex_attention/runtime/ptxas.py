@@ -139,7 +139,6 @@ def patch():
 
     # Track if user originally wanted PTX kept
     _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
-    # os.environ['CUTE_DSL_KEEP_PTX'] = '1'
     assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
 
     cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction

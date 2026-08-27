@@ -286,8 +286,6 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
             self.dtype,
             self.consumer_tile_m,
             self.tile_n,
-            self.num_wg_mma,
-            self.atom_layout_m_sdp,
             self.sdp_swap_ab,
         )
         self.compact_kernel(

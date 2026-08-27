@@ -27,7 +27,6 @@ class SeqlenInfo:
         batch_idx: Int32,
         seqlen_static: Int32,
         cu_seqlens: Optional[cute.Tensor] = None,
-        seqused: Optional[cute.Tensor] = None,
         tile: cutlass.Constexpr[int] = 128,
     ):
         offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
@@ -37,9 +36,7 @@ class SeqlenInfo:
             # Add divby so that the compiler knows the alignment when moving by offset_padded
             else cute.assume((offset + batch_idx * tile) // tile * tile, divby=tile)
         )
-        if const_expr(seqused is not None):
-            seqlen = seqused[batch_idx]
-        elif const_expr(cu_seqlens is not None):
+        if const_expr(cu_seqlens is not None):
             seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
         else:
             seqlen = seqlen_static
@@ -73,12 +70,8 @@ class SeqlenInfoQK:
     seqlen_q: Int32
     seqlen_k: Int32
     m_block_offset: Int32
-    block_idx_offset: Int32
-    num_n_blocks: Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
     has_cu_seqlens_k: cutlass.Constexpr[bool]
-    has_seqused_q: cutlass.Constexpr[bool]
-    has_seqused_k: cutlass.Constexpr[bool]
 
     @staticmethod
     def create(
@@ -87,10 +80,7 @@ class SeqlenInfoQK:
         seqlen_k_static: Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
@@ -98,17 +88,9 @@ class SeqlenInfoQK:
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
         padded_offset_q = 0 if const_expr(mCuSeqlensQ is None) else cute.assume((offset_q + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
         padded_offset_k = 0 if const_expr(mCuSeqlensK is None) else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
-        if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
-        else:
-            seqlen_q = seqlen_q_static if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx + 1] - offset_q
-        if const_expr(mSeqUsedK is not None):
-            seqlen_k = mSeqUsedK[batch_idx]
-        else:
-            seqlen_k = seqlen_k_static if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx + 1] - offset_k
+        seqlen_q = seqlen_q_static if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx + 1] - offset_q
+        seqlen_k = seqlen_k_static if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx + 1] - offset_k
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
-        num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
-        block_idx_offset = mCuBlockIdxOffsets[batch_idx] if const_expr(mCuBlockIdxOffsets is not None) else m_block_offset * num_n_blocks
         return SeqlenInfoQK(
             offset_q,
             offset_k,
@@ -117,12 +99,8 @@ class SeqlenInfoQK:
             seqlen_q,
             seqlen_k,
             m_block_offset,
-            block_idx_offset,
-            num_n_blocks,
             has_cu_seqlens_q=mCuSeqlensQ is not None,
             has_cu_seqlens_k=mCuSeqlensK is not None,
-            has_seqused_q=mSeqUsedQ is not None,
-            has_seqused_k=mSeqUsedK is not None,
         )
 
     @staticmethod
@@ -131,7 +109,6 @@ class SeqlenInfoQK:
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
         mSequenceDesc: Optional[cute.Tensor] = None,
-        mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
@@ -143,16 +120,12 @@ class SeqlenInfoQK:
             seqlen_q = seqlen_q_static
             seqlen_k = seqlen_k_static
             m_block_offset = Int32(0)
-            num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
-            block_idx_offset = Int32(0)
         else:
             offset_q = mSequenceDesc[batch_idx, Int32(0)]
             offset_k = mSequenceDesc[batch_idx, Int32(1)]
             seqlen_q = mSequenceDesc[batch_idx, Int32(2)]
             seqlen_k = mSequenceDesc[batch_idx, Int32(3)]
             m_block_offset = mSequenceDesc[batch_idx, Int32(4)]
-            num_n_blocks = mSequenceDesc[batch_idx, Int32(6)]
-            block_idx_offset = mCuBlockIdxOffsets[batch_idx] if const_expr(mCuBlockIdxOffsets is not None) else m_block_offset * num_n_blocks
 
         padded_offset_q = (
             Int32(0)
@@ -178,12 +151,8 @@ class SeqlenInfoQK:
             seqlen_q,
             seqlen_k,
             m_block_offset,
-            block_idx_offset,
-            num_n_blocks,
             has_cu_seqlens_q=mSequenceDesc is not None,
             has_cu_seqlens_k=mSequenceDesc is not None,
-            has_seqused_q=False,
-            has_seqused_k=False,
         )
 
     def offset_batch_Q(
@@ -212,13 +181,13 @@ class SeqlenInfoQK:
             else:
                 offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
             if const_expr(cute.rank(mQ.shape[0]) == 1):
-                return copy_utils.offset_ragged_tensor(mQ, offset_q, self.seqlen_q, ragged_dim=0, ptr_shift=True)
+                return copy_utils.offset_ragged_tensor(mQ, offset_q, self.seqlen_q, ragged_dim=0)
             else:  # PackGQA
                 assert cute.rank(mQ.shape[0]) == 2
                 # Unpack before calling offset_ragged_tensor, then pack
                 idx = ((None, None),) + (None,) * (cute.rank(mQ) - 1)
                 mQ = mQ[idx]
-                mQ = copy_utils.offset_ragged_tensor(mQ, offset_q, self.seqlen_q, ragged_dim=1, ptr_shift=True)
+                mQ = copy_utils.offset_ragged_tensor(mQ, offset_q, self.seqlen_q, ragged_dim=1)
                 return cute.group_modes(mQ, 0, 2)
 
     def offset_batch_K(
@@ -248,87 +217,4 @@ class SeqlenInfoQK:
             else:
                 offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
                 offset_k *= multiple
-            return copy_utils.offset_ragged_tensor(mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=True)
-
-
-@dataclass(frozen=True)
-class SeqlenInfoQKNewK:
-    """Sequence length info for append-KV with left-padding and new K support.
-
-    Extends SeqlenInfoQK with:
-    - leftpad_k: left padding for K (tokens to skip at the start of the KV cache)
-    - offset_k_new: offset into the new K tensor
-    - seqlen_k_og: original K length (before appending new K), excluding leftpad
-    - seqlen_k_new: length of new K to append
-    - seqlen_k: total K length (seqlen_k_og + seqlen_k_new)
-    - seqlen_rotary: position for rotary embedding computation
-    """
-
-    leftpad_k: Int32
-    offset_q: Int32
-    offset_k: Int32
-    offset_k_new: Int32
-    seqlen_q: Int32
-    seqlen_k_og: Int32
-    seqlen_k_new: Int32
-    seqlen_k: Int32
-    seqlen_rotary: Int32
-
-    @staticmethod
-    def create(
-        batch_idx: Int32,
-        seqlen_q_static: Int32,
-        seqlen_k_static: Int32,
-        shape_K_new_0: Int32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mCuSeqlensKNew: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mLeftpadK: Optional[cute.Tensor] = None,
-        mSeqlensRotary: Optional[cute.Tensor] = None,
-    ):
-        leftpad_k = 0 if const_expr(mLeftpadK is None) else mLeftpadK[batch_idx]
-        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        if const_expr(mCuSeqlensK is not None):
-            offset_k = mCuSeqlensK[batch_idx] + leftpad_k
-        else:
-            offset_k = leftpad_k if const_expr(mCuSeqlensQ is not None) else 0
-        offset_k_new = 0 if const_expr(mCuSeqlensKNew is None) else mCuSeqlensKNew[batch_idx]
-        # seqlen_q
-        if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
-        elif const_expr(mCuSeqlensQ is not None):
-            seqlen_q = mCuSeqlensQ[batch_idx + 1] - mCuSeqlensQ[batch_idx]
-        else:
-            seqlen_q = seqlen_q_static
-        # seqlen_k_og: original K length (excluding leftpad)
-        if const_expr(mSeqUsedK is not None):
-            seqlen_k_og = mSeqUsedK[batch_idx] - leftpad_k
-        elif const_expr(mCuSeqlensK is not None):
-            seqlen_k_og = mCuSeqlensK[batch_idx + 1] - mCuSeqlensK[batch_idx] - leftpad_k
-        else:
-            seqlen_k_og = seqlen_k_static - leftpad_k if const_expr(mCuSeqlensQ is not None) else seqlen_k_static
-        # seqlen_k_new
-        if const_expr(mCuSeqlensKNew is None):
-            seqlen_k_new = 0 if const_expr(mCuSeqlensQ is None) else shape_K_new_0
-        else:
-            seqlen_k_new = mCuSeqlensKNew[batch_idx + 1] - mCuSeqlensKNew[batch_idx]
-        seqlen_k = seqlen_k_og if const_expr(mCuSeqlensQ is None) else seqlen_k_og + seqlen_k_new
-
-        # seqlen_rotary: defaults to seqlen_k_og + leftpad_k unless explicitly provided
-        if const_expr(mSeqlensRotary is not None):
-            seqlen_rotary = mSeqlensRotary[batch_idx]
-        else:
-            seqlen_rotary = seqlen_k_og + leftpad_k
-        return SeqlenInfoQKNewK(
-            leftpad_k,
-            offset_q,
-            offset_k,
-            offset_k_new,
-            seqlen_q,
-            seqlen_k_og,
-            seqlen_k_new,
-            seqlen_k,
-            seqlen_rotary,
-        )
+            return copy_utils.offset_ragged_tensor(mK, offset_k, self.seqlen_k, ragged_dim=0)

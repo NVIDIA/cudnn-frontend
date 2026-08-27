@@ -10,7 +10,6 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass import Boolean, Float32, Int32, const_expr
 
-from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.kernels.sm100 import blackwell_helpers as sm100_utils
 from cudnn.flex_attention.kernels.sm100 import mma_desc as sm100_desc
 from cudnn.flex_attention.plan.kernels import BlockSparseTensors
@@ -34,36 +33,19 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
     def __init__(
         self,
         head_dim: int,
-        head_dim_v: Optional[int] = None,
+        head_dim_v: int,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
-        m_block_size: int = 128,
-        n_block_size: int = 128,
-        q_stage: cutlass.Constexpr[int] = 2,
-        is_persistent: bool = True,
-        persistent_block_major: bool = False,
         is_varlen_q: bool = False,
-        use_2cta_instrs: bool = False,
-        use_clc_scheduler: bool = True,
     ):
-        if q_stage != 2 or use_2cta_instrs:
-            raise ValueError("generic qstage2 forward requires q_stage=2 and CtaGroup.ONE")
         super().__init__(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             qhead_per_kvhead=qhead_per_kvhead,
             pack_gqa=pack_gqa,
-            q_subtile_factor=q_subtile_factor,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
             q_stage=2,
-            is_persistent=is_persistent,
-            persistent_block_major=persistent_block_major,
             is_varlen_q=is_varlen_q,
             use_2cta_instrs=False,
-            use_clc_scheduler=use_clc_scheduler,
-            _enable_qstage1_n_direction=False,
         )
 
     @cute.jit
@@ -108,8 +90,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
-        tStS: cute.Tensor,
-        tOtO: cute.Tensor,
         tOrP: cute.Tensor,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
@@ -126,7 +106,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         tOrV = tiled_mma_pv.make_fragment_B(sV)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        qk_mma_kind = sm100_utils._tcgen05_mma_kind(qk_mma_op)
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
@@ -136,8 +115,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
 
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
-        if const_expr(self.q_stage == 1):
-            sQ_stage_stride = 0
         gemm_Si = [
             partial(
                 sm100_utils.gemm_ptx_precomputed_varname,
@@ -146,9 +123,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 tCrB_layout=tSrK[None, None, None, 0].layout,
                 smem_var_name_prefix="fa_fwd_q_smem_desc",
                 idesc_var_name="fa_fwd_qk_mma_idesc",
-                kind=qk_mma_kind,
                 smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                zero_init=True,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.q_stage)
@@ -160,7 +135,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 self.tmem_o_offset[stage],
                 tOrP[None, None, None, stage],
                 sA=None,
-                split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                split_arrive=self.split_P_arrive,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.q_stage)
@@ -216,7 +191,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
-                for i in cutlass.range(block_loop_count, unroll=1):
+                for _ in cutlass.range(block_loop_count, unroll=1):
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -230,16 +205,14 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                         # the last iteration of the previous work tile.
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                         # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
-                            # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                             zero_init=not O_should_accumulate,
-                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
+                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage),
                             mbar_phase=P_full_O_rescaled_phase,
                         )
                         # Don't need to signal O_full to the correction warps since the
@@ -262,7 +235,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                         # Don't need to wait for the softmax warp to have finished reading the previous
                         # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                         # has been read and Pi has been written.
-                        # sm100_utils.gemm(tiled_mma_qk, tStS[None, None, None, stage], tSrQ[None, None, None, stage], tSrK[None, None, None, Ki_index], zero_init=True)
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -290,16 +262,14 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                     # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                     # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
-                        # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                         zero_init=not O_should_accumulate,
-                        mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
+                        mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage),
                         mbar_phase=P_full_O_rescaled_phase,
                     )
                     # 4. release accumulated O0_partial
@@ -326,7 +296,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         self,
         thr_mma_qk: cute.ThrMma,
         thr_mma_pv: cute.ThrMma,
-        tStS: cute.Tensor,
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
         mO: cute.Tensor,
@@ -348,8 +317,6 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mma_tile_coord_v = thr_mma_qk.thr_idx
 
-        tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScales = tuple(cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout) for stage in range(self.q_stage))
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
         for stage in cutlass.range(self.q_stage):
@@ -365,7 +332,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            max_offset = Float32(0.0)
             seqlen = SeqlenInfoCls(batch_idx)
 
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
@@ -392,11 +359,10 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 # Ignore first signal from softmax as no correction is required
                 sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
                 pipeline_sm_stats.consumer_release_w_index(0)
-                if const_expr(self.q_stage == 2):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                for i in cutlass.range(total_block_count - 1, unroll=1):
+                for _ in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
@@ -410,8 +376,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                     sm_stats_consumer_phase ^= 1
-                if const_expr(self.q_stage == 2):
-                    pipeline_sm_stats.consumer_release_w_index(1)
+                pipeline_sm_stats.consumer_release_w_index(1)
                 # End of seqlen_corr_loop_steps
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
@@ -503,19 +468,9 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                         else -Float32.inf
                     )
                     seqlen_q = seqlen.seqlen_q if const_expr(not self.pack_gqa) else seqlen.seqlen_q * self.qhead_per_kvhead
-                    if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
-                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                        if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                            # This actually just works with PackGQA too
-                            gLSE[tidx] = lse
-                    else:
-                        idx = m_tile_idx * self.m_block_size + tidx
-                        if idx < seqlen_q:
-                            m_idx = idx // self.qhead_per_kvhead
-                            h_idx = idx - m_idx * self.qhead_per_kvhead
-                            lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
-                            lse_gmem_ptr = cute.make_ptr(mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4)
-                            cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+                    gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                        gLSE[tidx] = lse
 
             if const_expr(pipeline_load_epi is not None and self.use_correction_warps_for_epi):
                 pipeline_load_epi.producer_acquire(load_epi_producer_state)

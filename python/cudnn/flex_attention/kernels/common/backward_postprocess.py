@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
@@ -21,7 +21,6 @@ from cudnn.flex_attention._compat import sm90_utils
 
 from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.runtime.dsl_utils import assume_tensor_aligned
-import cudnn.flex_attention.kernels.common as mma_helpers
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
@@ -54,55 +53,18 @@ class FlexAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
-        assert arch // 10 in [8, 9, 10, 11, 12], "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
+        assert arch in (90, 100, 103), "Only SM90, SM100, and SM103 are supported"
         self.arch = arch
-        # SM90 and datacenter Blackwell mainloops use 16-element head padding.
-        hdim_multiple_of = 16 if arch // 10 in (9, 10, 11) else 32
-        self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.check_hdim_oob = head_dim != self.tile_hdim
+        self.tile_hdim = int(math.ceil(head_dim / 16) * 16)
         self.num_threads = num_threads
         self.AtomLayoutMdQ = AtomLayoutMdQ
         self.dQ_swapAB = dQ_swapAB
         self.accum_row_major = accum_row_major
-        self.use_2cta_instrs = use_2cta_instrs and arch // 10 == 10 and head_dim != 64
+        self.use_2cta_instrs = use_2cta_instrs and arch in (100, 103) and head_dim != 64
         self.cluster_size = cluster_size
 
-    @staticmethod
-    def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
-        """Check if the kernel can be implemented with the given parameters.
-
-        :param dtype: data type
-        :type dtype: cutlass.Numeric
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param tile_m: m block size
-        :type tile_m: int
-
-        :return: True if the kernel can be implemented, False otherwise
-        :rtype: bool
-        """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        return True
-
     def _get_tiled_mma(self):
-        if const_expr(self.arch // 10 in [8, 12]):
-            num_mma_warps = self.num_threads // 32
-            atom_layout_dQ = (
-                (self.AtomLayoutMdQ, num_mma_warps // self.AtomLayoutMdQ, 1)
-                if const_expr(not self.dQ_swapAB)
-                else (num_mma_warps // self.AtomLayoutMdQ, self.AtomLayoutMdQ, 1)
-            )
-            tiled_mma = cute.make_tiled_mma(
-                warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16)),
-                atom_layout_dQ,
-                permutation_mnk=(atom_layout_dQ[0] * 16, atom_layout_dQ[1] * 16, 16),
-            )
-        elif const_expr(self.arch // 10 == 9):
+        if const_expr(self.arch == 90):
             num_wg_mma = self.num_threads // 128
             atom_layout_dQ = (self.AtomLayoutMdQ, num_wg_mma // self.AtomLayoutMdQ)
             tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
@@ -115,6 +77,7 @@ class FlexAttentionBackwardPostprocess:
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1]) + (1,),
                 tiler_mn=(tiler_mn_dQ if not self.dQ_swapAB else (64, tiler_mn_dQ[0])),
             )
+            assert self.num_threads == tiled_mma.size
         else:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
@@ -125,8 +88,6 @@ class FlexAttentionBackwardPostprocess:
                 cta_group,
                 (self.tile_m, self.tile_hdim),
             )
-        if const_expr(self.arch // 10 in [8, 9, 12]):
-            assert self.num_threads == tiled_mma.size
         return tiled_mma
 
     def _setup_attributes(self):
@@ -153,11 +114,8 @@ class FlexAttentionBackwardPostprocess:
             cute.make_layout(self.num_g2s_threads),
             cute.make_layout(async_copy_elems_accum),
         )
-        num_s2r_copy_elems = 1 if const_expr(self.arch // 10 in [8, 12]) else 4
-        if const_expr(self.arch // 10 in [8, 12]):
-            self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(Float32, self.num_threads, num_s2r_copy_elems)
-            self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
-        elif const_expr(self.arch // 10 == 9):
+        num_s2r_copy_elems = 4
+        if const_expr(self.arch == 90):
             num_threads_per_warp_group = 128
             num_wg_mma = self.num_threads // 128
             self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
@@ -182,11 +140,7 @@ class FlexAttentionBackwardPostprocess:
         # We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
-        mma_shape_n = self.tiled_mma.get_tile_size(1)
-        if const_expr(self.arch // 10 in [8, 12]):
-            sdQ_layout_atom = mma_helpers.get_smem_layout_atom(self.dtype, mma_shape_n)
-            self.sdQ_layout = cute.tile_to_shape(sdQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1))
-        elif const_expr(self.arch // 10 == 9):
+        if const_expr(self.arch == 90):
             wg_d_dQ = num_wg_mma // self.AtomLayoutMdQ
             self.sdQ_layout = sm90_utils.make_smem_layout(
                 self.dtype,
@@ -205,7 +159,6 @@ class FlexAttentionBackwardPostprocess:
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         max_seqlen_q: cutlass.Int32 = 0,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -227,10 +180,10 @@ class FlexAttentionBackwardPostprocess:
             cute.size_in_bytes(self.dtype, self.sdQ_layout),
         )
 
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+        if const_expr(mCuSeqlensQ is not None):
             TileScheduler = SingleTileMaxVarlenScheduler
-            num_head = mdQ.shape[1] if const_expr(mCuSeqlensQ is not None) else mdQ.shape[2]
-            num_batch = mCuSeqlensQ.shape[0] - 1 if const_expr(mCuSeqlensQ is not None) else mdQ.shape[0]
+            num_head = mdQ.shape[1]
+            num_batch = mCuSeqlensQ.shape[0] - 1
             num_block = cute.ceil_div(max_seqlen_q, self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
@@ -248,7 +201,6 @@ class FlexAttentionBackwardPostprocess:
             total_q=mdQ.shape[0],
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
-            mSeqUsedQ=mSeqUsedQ,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -260,7 +212,6 @@ class FlexAttentionBackwardPostprocess:
                 mdQaccum,
                 mdQ,
                 mCuSeqlensQ,
-                mSeqUsedQ,
                 scale,
                 tile_sched_params,
                 TileScheduler,
@@ -274,7 +225,6 @@ class FlexAttentionBackwardPostprocess:
                 mdQaccum,
                 mdQ,
                 mCuSeqlensQ,
-                mSeqUsedQ,
                 scale,
                 self.tiled_mma,
                 self.dQ_swapAB,
@@ -298,7 +248,6 @@ class FlexAttentionBackwardPostprocess:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         scale: cutlass.Float32,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
@@ -315,8 +264,6 @@ class FlexAttentionBackwardPostprocess:
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
-                mSeqUsedQ=mSeqUsedQ,
-                mSeqUsedK=None,
                 tile_m=self.tile_m * self.cluster_size,
             )
             if const_expr(not seqlen.has_cu_seqlens_q):
@@ -356,7 +303,6 @@ class FlexAttentionBackwardPostprocess:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
@@ -374,7 +320,7 @@ class FlexAttentionBackwardPostprocess:
         smem = cutlass.utils.SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
-        if const_expr(self.arch // 10 in [8, 9, 12]):
+        if const_expr(self.arch == 90):
             sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
         else:
             # extra stage dimension
@@ -403,8 +349,6 @@ class FlexAttentionBackwardPostprocess:
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
-                mSeqUsedQ=mSeqUsedQ,
-                mSeqUsedK=None,
                 tile_m=self.tile_m * self.cluster_size,
             )
             if const_expr(not seqlen.has_cu_seqlens_q):
@@ -433,9 +377,8 @@ class FlexAttentionBackwardPostprocess:
             gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
             seqlen_q = seqlen.seqlen_q
-            seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
 
-            if const_expr(self.arch // 10 == 10 and self.use_2cta_instrs):
+            if const_expr(self.use_2cta_instrs):
                 # 2-CTA: remap dQaccum layout into TMEM view before writing sdQ
                 num_reduce_threads = self.num_threads
                 thr_mma_dsk = tiled_mma.get_slice(tidx)
@@ -554,13 +497,12 @@ class FlexAttentionBackwardPostprocess:
                 tile_shape = (self.tile_m, self.tile_hdim)
                 acc = None
                 tiled_copy_t2r = None
-                if const_expr(self.arch // 10 in [8, 9, 12]):
+                if const_expr(self.arch == 90):
                     mma_for_acc = tiled_mma
-                    if const_expr(self.arch // 10 == 9):
-                        num_wg_mma = self.num_threads // 128
-                        warp_group_idx = cute.arch.make_warp_uniform(tidx // 128)
-                        warp_group_layout = cute.make_layout(num_wg_mma, stride=128)
-                        mma_for_acc = tiled_mma.get_slice(warp_group_layout(warp_group_idx))
+                    num_wg_mma = self.num_threads // 128
+                    warp_group_idx = cute.arch.make_warp_uniform(tidx // 128)
+                    warp_group_layout = cute.make_layout(num_wg_mma, stride=128)
+                    mma_for_acc = tiled_mma.get_slice(warp_group_layout(warp_group_idx))
                     acc_shape = mma_for_acc.partition_shape_C(tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1])
                     acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
                     assert cute.size(acc) == cute.size(tdQsdQaccum)
@@ -585,14 +527,10 @@ class FlexAttentionBackwardPostprocess:
 
                 # Step 3: Copy dQ from register to smem
                 cute.arch.barrier()  # make sure all threads have finished loading dQaccum
-                if const_expr(self.arch // 10 in [8, 9, 12]):
-                    copy_atom_r2s_dQ = utils.get_smem_store_atom(self.arch, self.dtype, transpose=self.dQ_swapAB)
+                if const_expr(self.arch == 90):
+                    copy_atom_r2s_dQ = utils.get_smem_store_atom(self.dtype, transpose=self.dQ_swapAB)
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
                 else:
-                    # copy_atom_r2s_dQ = sm100_utils_basic.get_smem_store_op(
-                    #     LayoutEnum.ROW_MAJOR, self.dtype, Float32, tiled_copy_t2r,
-                    # )
-                    # tiled_copy_r2s_dQ = cute.make_tiled_copy_D(copy_atom_r2s_dQ, tiled_copy_t2r)
                     thr_layout_r2s_dQ = cute.make_layout((self.num_threads, 1))  # 128 threads
                     val_layout_r2s_dQ = cute.make_layout((1, 128 // self.dtype.width))
                     copy_atom_r2s_dQ = cute.make_copy_atom(
@@ -603,7 +541,7 @@ class FlexAttentionBackwardPostprocess:
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(copy_atom_r2s_dQ, thr_layout_r2s_dQ, val_layout_r2s_dQ)
                 thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
                 cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
-                if const_expr(self.arch // 10 in [8, 9, 12]):
+                if const_expr(self.arch == 90):
                     taccdQrdQ = thr_copy_r2s_dQ.retile(rdQ)
                 else:
                     taccdQcdQ_shape = thr_copy_r2s_dQ.partition_S(cdQ).shape

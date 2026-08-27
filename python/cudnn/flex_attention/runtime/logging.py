@@ -12,9 +12,7 @@ configure their own logging can remove or replace it via the standard API.
 FLEX_ATTN_LOG_LEVEL mapping::
 
     0  off       nothing logged
-    1  host      host-side summaries only (no kernel printf)
-    2  verbose   additional host-side diagnostics
-    3  max       all host-side diagnostics
+    1+ host      host-side summaries only (no kernel printf)
 
 Set via environment variable::
 
@@ -65,19 +63,6 @@ def _configure_default_handler() -> None:
 _configure_default_handler()
 
 
-def get_flex_log_level() -> int:
-    return _flex_log_level
-
-
-def set_flex_log_level(level: int | str) -> None:
-    """Set the host logging level programmatically."""
-    global _flex_log_level
-    if isinstance(level, str):
-        level = _parse_log_level(level)
-    _flex_log_level = max(0, min(int(level), 3))
-    _configure_default_handler()
-
-
-def flex_log(level: int, msg: str):
-    if _flex_log_level >= level:
+def flex_log(msg: str):
+    if _flex_log_level >= 1:
         _logger.info(msg)

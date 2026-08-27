@@ -18,22 +18,19 @@ from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
 @dataclass
 class Softmax(ParamsBase):
     scale_log2: Float32
-    num_rows: cutlass.Constexpr[int]
     row_max: cute.Tensor
     row_sum: cute.Tensor
-    arch: cutlass.Constexpr[int] = 80
-    softmax_scale: Float32 | None = None
+    arch: cutlass.Constexpr[int]
 
     @staticmethod
     def create(
         scale_log2: Float32,
         num_rows: cutlass.Constexpr[int],
-        arch: cutlass.Constexpr[int] = 80,
-        softmax_scale: Float32 | None = None,
+        arch: cutlass.Constexpr[int],
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+        return Softmax(scale_log2, row_max, row_sum, arch)
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -149,7 +146,6 @@ class SoftmaxSm100(Softmax):
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
-        softmax_scale: Float32 | None = None,
         max_offset: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
@@ -158,23 +154,12 @@ class SoftmaxSm100(Softmax):
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return SoftmaxSm100(
             scale_log2,
-            num_rows,
             row_max,
             row_sum,
             arch,
-            softmax_scale,
             rescale_threshold=rescale_threshold,
             max_offset=max_offset,
         )
-
-    @cute.jit
-    def compute_row_max_local(self, acc_S_row: cute.TensorSSA, is_first: Boolean) -> Float32:
-        if cutlass.const_expr(is_first):
-            row_max_new = self._compute_row_max(acc_S_row)
-        else:
-            row_max_old = self.row_max[0]
-            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
-        return row_max_new
 
     @cute.jit
     def update_row_max_from_local(
@@ -276,32 +261,4 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                     else:
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
-            acc_S_row_converted_frg[None, j].store(acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type))
-
-    @cute.jit
-    def scale_apply_exp2_convert(
-        self,
-        acc_S_row: cute.Tensor,
-        row_max: Float32,
-        acc_S_row_converted: cute.Tensor,
-    ):
-        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        minus_row_max_scaled = -row_max * self.scale_log2
-        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (minus_row_max_scaled, minus_row_max_scaled),
-            )
-
-        frg_tile = 32
-        assert frg_tile % 2 == 0
-        frg_cnt = cute.size(acc_S_row) // frg_tile
-        assert cute.size(acc_S_row) % frg_tile == 0
-        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(acc_S_row_converted, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
             acc_S_row_converted_frg[None, j].store(acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type))
