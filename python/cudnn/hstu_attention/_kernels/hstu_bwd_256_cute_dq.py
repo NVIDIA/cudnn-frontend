@@ -42,8 +42,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         is_causal: bool,
         window_size_left: int | None,
         window_size_right: int | None,
-        is_target: bool = False,
-        target_group_size: int = 1,
         skip_residual_mask: bool = False,
         is_arbitrary: bool = False,
         func_num: int = 0,
@@ -51,24 +49,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     ):
         self.acc_dtype = acc_dtype
         self.is_causal = is_causal
-        self.window_size_left = window_size_left
         # Normalize negative window sizes to the unbounded-window sentinel.
         window_size_left = None if (window_size_left is None or window_size_left < 0) else cutlass.Int32(window_size_left)
         window_size_right = None if (window_size_right is None or window_size_right < 0) else cutlass.Int32(window_size_right)
         self.window_size_left = None if self.is_causal else window_size_left
         self.window_size_right = cutlass.Int32(0) if self.is_causal else window_size_right
         self.is_local = (not self.is_causal) and (self.window_size_left is not None or self.window_size_right is not None)
-        self.is_target = is_target
-        self.target_group_size = target_group_size
         self.skip_residual_mask = skip_residual_mask
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
         self.use_auto_block_metadata = use_auto_block_metadata
-        assert not self.is_arbitrary or not (self.is_causal or self.is_local or self.is_target)
+        assert not self.is_arbitrary or not (self.is_causal or self.is_local)
         assert not self.is_arbitrary or (self.func_num > 0 and self.func_num % 2 == 1)
         assert not self.use_auto_block_metadata or self.is_arbitrary
-        assert not self.is_target or self.is_causal
-        assert not self.is_target or self.target_group_size > 0
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
         assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
         self.cta_tiler = (
@@ -157,45 +150,34 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         v_tensor: cute.Tensor,
         dq_tensor: cute.Tensor,
         do_tensor: cute.Tensor,
-        cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
         func: Optional[cute.Tensor],
         max_seqlen_q: Int32,
-        max_seqlen_k: Int32,
         scale_softmax: cutlass.Float32,
         scale_gradient: cutlass.Float32,
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
-        varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D),
         # similar to the dedicated hd256 forward path.
         # Packed tensors expose total tokens in shape[1].  Grid geometry must
         # use the maximum per-sequence length or it over-launches by roughly B.
-        s_q = max_seqlen_q if varlen else q_tensor.shape[1]
-        s_k = max_seqlen_k if varlen else k_tensor.shape[1]
+        s_q = max_seqlen_q
         d = q_tensor.shape[4]
         h_k = q_tensor.shape[2]
         h_r = q_tensor.shape[3]
-        if cutlass.const_expr(cum_seqlen_q is not None):
-            b = cum_seqlen_q.shape[0] - 1
-        elif cutlass.const_expr(cum_seqlen_k is not None):
-            b = cum_seqlen_k.shape[0] - 1
-        else:
-            b = q_tensor.shape[0]
-        s_q64 = Int64(s_q)
-        s_k64 = Int64(s_k)
+        b = cum_seqlen_q.shape[0] - 1
         d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         # Packed-varlen representation uses batch-dim = 1 and sequence-dim = total_{q,k}.
         # Keep the *physical* sequence extent in the tensor layouts so that applying
         # `cuseqlen_*` offsets stays within the tensor domain.
-        s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None else s_q64
-        s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None else s_k64
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
+        s_q_total = q_tensor.shape[1]
+        s_k_total = k_tensor.shape[1]
+        stride_b_qo = 0
+        stride_b_kv = 0
 
         # (s, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
@@ -239,13 +221,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
         self.do_dtype = do.element_type
-        self.dq_dtype = dq.element_type
         if cutlass.const_expr(self.use_auto_block_metadata):
             assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
             assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16)
 
         self.tile_sched_params, grid = compute_grid(
-            (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+            (s_q, dq.shape[1], dq.shape[2]),
             self.cta_tiler,
         )
 
@@ -452,7 +433,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             dq,
             cum_seqlen_q,
             cum_seqlen_k,
-            num_targets,
             func,
             block_sparse_tensors,
             scale_softmax,
@@ -493,9 +473,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tma_atom_kt: cute.CopyAtom,
         mK_dkl: cute.Tensor,
         mdQ_qdl: cute.Tensor,
-        cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
         func: Optional[cute.Tensor],
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         scale_softmax: Float32,
@@ -1552,23 +1531,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 mask_block_idx = None
                 full_block_cnt = None
                 full_block_idx = None
-                num_targets_cur_batch = Int32(0)
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
+                cuseqlen_q = cum_seqlen_q[batch_coord]
+                seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                    self.qk_mma_tiler[0],
+                    mma_block_coord[0],
+                    seqlen_q,
+                )
                 if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-
-                    if cutlass.const_expr(self.is_target):
-                        assert isinstance(num_targets, cute.Tensor)
-                        num_targets_cur_batch = num_targets[batch_coord]
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
                 if cutlass.const_expr(self.use_auto_block_metadata):
                     assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
@@ -1596,7 +1568,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                 has_work = not continue_cond and trip_count > 0
                 if has_work:
-                    end_count = start_count + trip_count
                     if cutlass.const_expr(self.use_semantic_trip_range):
                         n_block_min_causal_local_mask, n_block_min_before_local_mask = FusedMask.get_trip_mask_bounds_via_block_info(
                             mma_block_coord,
@@ -1638,7 +1609,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             cuseqlen_q,
                             scale_softmax,
                             scale_gradient,
-                            num_targets_cur_batch,
                         )
                         tensor_args = (tStS, tScS_iter, tdPtdP, tdPcdP_iter, func)
                         pipeline_args = (
@@ -1968,7 +1938,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cuseqlen_q,
             scale_softmax,
             scale_gradient,
-            num_targets_cur_batch,
         ) = value_args
         tStS, tScS, tdPtdP, tdPcdP, func = tensor_args
         mma_s_consumer, mma_dp_consumer, ds_mma_producer = pipeline_args
@@ -2003,9 +1972,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     self.is_local,
                     window_size_left,
                     window_size_right,
-                    self.is_target,
-                    self.target_group_size,
-                    num_targets_cur_batch,
                     self.is_arbitrary,
                     self.func_num,
                     func,

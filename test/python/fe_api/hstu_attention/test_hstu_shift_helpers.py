@@ -10,7 +10,6 @@ import pytest
 import torch
 
 try:
-    import cutlass
     import cutlass.cute as cute
     from cutlass import Int32, Uint32
     from cutlass.cute.runtime import from_dlpack

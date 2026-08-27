@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 # SPDX-License-Identifier: MIT
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -74,11 +74,6 @@ class FastDivmod:
     @cute.jit
     def div(self, dividend: Int32) -> Int32:
         return Int32(umulhi(dividend, self.multiplier) >> self.shift_right) if self.divisor != 1 else dividend
-
-    def divmod(self, dividend: Int32) -> Tuple[Int32, Int32]:
-        quotient = self.div(dividend)
-        remainder = dividend - quotient * self.divisor
-        return quotient, remainder
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []

@@ -33,27 +33,9 @@ def _as_bshkrd_tensor(
     tensor: cute.Tensor,
     h_k: Int32,
     h_r: Int32,
-    varlen: bool,
 ) -> cute.Tensor:
-    """Normalize (B,S,H,D)/(S,H,D) to a (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
-                stride=(
-                    tensor.stride[0],
-                    tensor.stride[1],
-                    tensor.stride[2] * h_r,
-                    tensor.stride[2],
-                    tensor.stride[3],
-                ),
-            ),
-        )
+    """View a packed (T,H,D) tensor as (1,T,H_k,H_r,D)."""
     assert cutlass.const_expr(cute.rank(tensor.layout) == 3)
-    assert cutlass.const_expr(varlen)
     return cute.make_tensor(
         tensor.iterator,
         cute.make_layout(
@@ -76,28 +58,19 @@ class HSTUAttentionBackwardSm100D256:
         self,
         *,
         is_causal: bool,
-        is_local: bool,
-        is_target: bool,
         is_arbitrary: bool,
         func_num: int,
-        target_group_size: int,
         window_size_left: Optional[int],
         window_size_right: Optional[int],
         skip_residual_mask: bool,
         use_auto_block_metadata: bool = False,
     ):
-        self.is_causal = is_causal
-        self.is_local = is_local
-        self.is_target = is_target
-        self.target_group_size = target_group_size
         self.dq_kernel = BlackwellFusedMultiHeadAttentionBackwardDQKernel(
             cutlass.Float32,
             (128, 128, 256),
             is_causal,
             window_size_left,
             window_size_right,
-            is_target=is_target,
-            target_group_size=target_group_size,
             skip_residual_mask=skip_residual_mask,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
@@ -109,8 +82,6 @@ class HSTUAttentionBackwardSm100D256:
             is_causal,
             window_size_left,
             window_size_right,
-            is_target=is_target,
-            target_group_size=target_group_size,
             skip_residual_mask=skip_residual_mask,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
@@ -129,7 +100,6 @@ class HSTUAttentionBackwardSm100D256:
         dv: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
-        num_targets: cute.Tensor | None,
         func: cute.Tensor | None,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -139,29 +109,18 @@ class HSTUAttentionBackwardSm100D256:
         k2q_block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
-        varlen = True
-        q_rank = cute.rank(q.layout)
-        k_rank = cute.rank(k.layout)
-        if cutlass.const_expr(q_rank == 5):
-            h_q = q.shape[2] * q.shape[3]
-        elif cutlass.const_expr(q_rank == 4):
-            h_q = q.shape[2]
-        else:
-            h_q = q.shape[1]
-        if cutlass.const_expr(k_rank == 5):
-            h_k = k.shape[2]
-        elif cutlass.const_expr(k_rank == 4):
-            h_k = k.shape[2]
-        else:
-            h_k = k.shape[1]
+        assert cutlass.const_expr(cute.rank(q.layout) == 3)
+        assert cutlass.const_expr(cute.rank(k.layout) == 3)
+        h_q = q.shape[1]
+        h_k = k.shape[1]
         h_r = h_q // h_k
-        q = _as_bshkrd_tensor(q, h_k, h_r, varlen)
-        k = _as_bshkrd_tensor(k, h_k, 1, varlen)
-        v = _as_bshkrd_tensor(v, h_k, 1, varlen)
-        do = _as_bshkrd_tensor(do, h_k, h_r, varlen)
-        dq = _as_bshkrd_tensor(dq, h_k, h_r, varlen)
-        dk = _as_bshkrd_tensor(dk, h_k, 1, varlen)
-        dv = _as_bshkrd_tensor(dv, h_k, 1, varlen)
+        q = _as_bshkrd_tensor(q, h_k, h_r)
+        k = _as_bshkrd_tensor(k, h_k, 1)
+        v = _as_bshkrd_tensor(v, h_k, 1)
+        do = _as_bshkrd_tensor(do, h_k, h_r)
+        dq = _as_bshkrd_tensor(dq, h_k, h_r)
+        dk = _as_bshkrd_tensor(dk, h_k, 1)
+        dv = _as_bshkrd_tensor(dv, h_k, 1)
         self.dq_kernel(
             q,
             k,
@@ -170,10 +129,8 @@ class HSTUAttentionBackwardSm100D256:
             do,
             cu_seqlens_q,
             cu_seqlens_k,
-            num_targets,
             func,
             max_seqlen_q,
-            max_seqlen_k,
             alpha,
             alpha * normalization_scale,
             q2k_block_sparse_tensors,
@@ -188,7 +145,6 @@ class HSTUAttentionBackwardSm100D256:
             do,
             cu_seqlens_q,
             cu_seqlens_k,
-            num_targets,
             func,
             max_seqlen_q,
             max_seqlen_k,
@@ -384,11 +340,8 @@ def hstu_varlen_bwd_256_cute(
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = HSTUAttentionBackwardSm100D256(
             is_causal=is_causal,
-            is_local=is_local,
-            is_target=False,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
-            target_group_size=1,
             window_size_left=window_size_left if is_local else None,
             window_size_right=window_size_right if is_local else None,
             skip_residual_mask=skip_residual_mask,
@@ -405,7 +358,6 @@ def hstu_varlen_bwd_256_cute(
             dv_tensor,
             cu_q_tensor,
             cu_k_tensor,
-            None,
             func_tensor,
             Int32(max_seqlen_q),
             Int32(max_seqlen_k),
@@ -431,7 +383,6 @@ def hstu_varlen_bwd_256_cute(
         dv_work,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
         func,
         Int32(max_seqlen_q),
         Int32(max_seqlen_k),

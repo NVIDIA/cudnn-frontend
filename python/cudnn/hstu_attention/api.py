@@ -262,7 +262,6 @@ class _HSTUBase(APIBase):
         self.num_heads = None
         self.is_causal = None
         self.is_local = None
-        self._func_num = 0
 
     def _check_common(self, supported_head_dims: Tuple[int, ...]) -> None:
         q = self._sample_q
@@ -346,7 +345,6 @@ class _HSTUBase(APIBase):
                 raise ValueError(f"func_tensor's last dimension must be at least total_q + " f"256 ({total_q + 256}), got {func.shape[2]}")
             if self.is_causal or self.is_local:
                 raise ValueError("arbitrary func masking cannot be combined with causal or local " "masking")
-            self._func_num = int(func.shape[1])
 
         major, minor = torch.cuda.get_device_capability(q.device)
         if major != 10:

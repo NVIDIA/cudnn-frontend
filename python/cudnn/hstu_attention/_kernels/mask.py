@@ -325,7 +325,6 @@ class AttentionMask:
         wg_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
-        thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
     ) -> None:
         """Apply a transposed arbitrary mask with 8-way endpoint-load MLP.
@@ -422,7 +421,6 @@ class AttentionMask:
         wg_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
-        thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
     ) -> None:
         """Apply only packed Q/K bounds to the backward split-WG fragment."""

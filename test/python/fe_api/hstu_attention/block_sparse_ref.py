@@ -121,7 +121,7 @@ def make_arbitrary_func(
             )
             func[0, 2, rows] = torch.where(
                 kind_2 | kind_3,
-                torch.full_like(local_q, k_length, dtype=torch.int32),
+                torch.full_like(local_q, interval_1_end, dtype=torch.int32),
                 func[0, 0, rows],
             )
         q_offset += q_length

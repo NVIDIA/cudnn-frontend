@@ -216,9 +216,9 @@ class HSTUAttentionBackwardSm100:
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
-        q_seq_max, k_seq_max, d, hb = problem_shape
+        _, _, _, hb = problem_shape
         h, b = hb
-        h_r, h_k = h
+        _, h_k = h
 
         def assume_strides_aligned(tensor: cute.Tensor) -> cute.Tensor:
             """Restore the 128-bit stride contract for gradient stores.
@@ -1406,7 +1406,7 @@ class HSTUAttentionBackwardSm100:
         cu_seqlens_q: Union[cute.Tensor, None],
         dQ_scale: Float32,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
+        tidx, tidy, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
 
         offset = cu_seqlens_q[bidy]
@@ -1742,7 +1742,6 @@ class HSTUAttentionBackwardSm100:
                     tma_atom_dO,
                     tma_atom_dOt,
                     blk_offset,
-                    problem_shape_cur_batch,
                     pipeline_args,
                     block_info,
                     block_sparse_tensors,
@@ -1789,7 +1788,6 @@ class HSTUAttentionBackwardSm100:
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dOt: Optional[cute.CopyAtom],
         blk_offset: cute.Shape,
-        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
         # (load_mma_Q_pipeline, load_mma_dO_pipeline)
         pipeline_args: tuple,
         block_info: BWDBlockInfo,
@@ -1801,7 +1799,6 @@ class HSTUAttentionBackwardSm100:
         load_mma_Kt_producer_state: cutlass.pipeline.PipelineState,
         load_mma_dO_producer_state: cutlass.pipeline.PipelineState,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
         _, blk_coord_k, _, blk_coord_batch = blk_coord
         _, blk_coord_h_k = blk_coord_batch[0]
         blk_coord_b = blk_coord_batch[1]
@@ -1809,8 +1806,6 @@ class HSTUAttentionBackwardSm100:
 
         blk_coord_h_r = Int32(0)
         blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
-        seq_Q, seq_K, D, HB = problem_shape
-        H, B = HB
         (
             load_mma_Q_pipeline,
             load_mma_Qt_pipeline,
@@ -2243,7 +2238,6 @@ class HSTUAttentionBackwardSm100:
         load_mma_Q_producer_state: cutlass.pipeline.PipelineState,
         load_mma_Qt_producer_state: cutlass.pipeline.PipelineState,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
         (
             load_mma_dO_pipeline,
             load_mma_Q_pipeline,
@@ -2878,9 +2872,8 @@ class HSTUAttentionBackwardSm100:
         dS_cluster_leader_mbar_ptr: cute.Pointer,
         dS_cluster_phase: Int32,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
-        blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_batch = blk_coord
-        blk_coord_h, blk_coord_b = blk_coord_batch
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
+        _, blk_coord_b = blk_coord_batch
         seqlen_obj = SeqlenInfoCls(blk_coord_b)
         n_block = blk_coord_k
 
@@ -3478,12 +3471,9 @@ class HSTUAttentionBackwardSm100:
         compute_mma_dS_producer_state: cutlass.pipeline.PipelineState,
         mma_compute_dKdV_consumer_state: cutlass.pipeline.PipelineState,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
-        bidx, bidy, bidz = cute.arch.block_idx()
-
-        Q, K, D, HB = problem_shape
-        blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_batch = blk_coord
-        blk_coord_h, blk_coord_b = blk_coord_batch
+        tidx, _, _ = cute.arch.thread_idx()
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
+        _, blk_coord_b = blk_coord_batch
         seqlen_obj = SeqlenInfoCls(blk_coord_b)
 
         n_block = blk_coord_k
@@ -3702,14 +3692,12 @@ class HSTUAttentionBackwardSm100:
                 mask.apply_mask_swapAB_arbitrary_prefetch,
                 n_block=blk_coord_k,
                 wg_idx=wg_idx,
-                thr_mma=thr_mma_S,
                 thr_tmem_load=thr_t2r,
             )
         seqlen_mask_fn = partial(
             mask.apply_mask_swapAB_seqlen,
             n_block=blk_coord_k,
             wg_idx=wg_idx,
-            thr_mma=thr_mma_S,
             thr_tmem_load=thr_t2r,
         )
 
@@ -4386,7 +4374,6 @@ class HSTUAttentionBackwardSm100:
                     dQ_acc,
                     sdQ,
                     blk_coord,
-                    problem_shape_cur_batch,
                     scaling_seqlen,
                     pipeline_args,
                     block_info,
@@ -4409,7 +4396,6 @@ class HSTUAttentionBackwardSm100:
         dQ_acc: cute.Tensor,
         sdQ: cute.Tensor,
         blk_coord: cute.Coord,
-        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
         scaling_seqlen: Float32,
         pipeline_args: tuple,
         block_info: BWDBlockInfo,
@@ -4418,10 +4404,9 @@ class HSTUAttentionBackwardSm100:
         mma_reduce_dQ_consumer_state: cutlass.pipeline.PipelineState,
         reduce_tma_store_producer_state: cutlass.pipeline.PipelineState,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
+        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        Q, K, D, HB = problem_shape
-        blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_batch = blk_coord
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
 
         blk_coord_h, blk_coord_b = blk_coord_batch
         blk_coord_h_r, blk_coord_h_k = blk_coord_h
@@ -4710,7 +4695,6 @@ class HSTUAttentionBackwardSm100:
         input: cute.Tensor,
         frg_cnt: Int32,
     ) -> cute.Tensor:
-        tidx, tidy, tidz = cute.arch.thread_idx()
         output = cute.make_fragment_like(cute.make_layout(input.shape), self.element_dtype)
         frg_tile = cute.size(input) // frg_cnt
         t_frg = cute.logical_divide(input, cute.make_layout(frg_cnt))
@@ -4867,10 +4851,10 @@ class HSTUAttentionBackwardSm100:
         # (mma_compute_dKdV_pipeline, mma_compute_dKdV_consumer_state)
         pipeline_args: tuple,
     ):
-        tidx, tidy, tidz = cute.arch.thread_idx()
+        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        Q, K, D, HB = problem_shape
-        blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_batch = blk_coord
+        _, K, D, HB = problem_shape
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
         mma_compute_dKdV_pipeline, mma_compute_dKdV_consumer_state = pipeline_args
 
         load_op = cute.make_copy_atom(

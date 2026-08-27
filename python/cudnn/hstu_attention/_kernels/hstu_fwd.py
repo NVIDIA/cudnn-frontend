@@ -25,7 +25,7 @@ from .seqlen_info import SeqlenInfo
 from .block_info import BlockInfo
 from . import blackwell_helpers as sm100_utils
 from . import mma_sm100_desc as sm100_desc
-from .fast_math import FastDivmod, FastSilU
+from .fast_math import FastSilU
 from .tile_scheduler import (
     ClcDescriptorState,
     ClcState,
@@ -261,7 +261,6 @@ class HSTUAttentionForwardSm100:
         page_ids: Optional[cute.Tensor],
         page_indptrs: Optional[cute.Tensor],
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
-        buffers=None,  # Not typing for now since conversion behaves a lil funny
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -591,14 +590,6 @@ class HSTUAttentionForwardSm100:
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
 
-        fastdiv_mods = None
-        if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
-            seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmod.create(seqlen_q)
-            seqlen_k_divmod = FastDivmod.create(seqlen_k)
-            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
-
         # Launch the kernel synchronously
         self.kernel(
             tma_tensor_Q,
@@ -628,8 +619,6 @@ class HSTUAttentionForwardSm100:
             tiled_mma_qk,
             tiled_mma_pv,
             tile_sched_params,
-            buffers,
-            fastdiv_mods,
             tma_atom_Kp,
             tma_atom_Vp,
             tma_tensor_Kp,
@@ -677,8 +666,6 @@ class HSTUAttentionForwardSm100:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
-        buffers=None,
-        fastdiv_mods=(None, None),
         tma_atom_Kp: Optional[cute.CopyAtom] = None,
         tma_atom_Vp: Optional[cute.CopyAtom] = None,
         mPagedK: Optional[cute.Tensor] = None,
@@ -1059,7 +1046,6 @@ class HSTUAttentionForwardSm100:
                     tma_atom_Q,
                     tma_atom_K,
                     tma_atom_V,
-                    pipeline_kv,
                     mbar_ptr,
                     block_info,
                     block_sparse_tensors,
@@ -1075,10 +1061,8 @@ class HSTUAttentionForwardSm100:
                     sK,
                     sV,
                     tma_atom_Q,
-                    pipeline_kv,
                     mbar_ptr,
                     block_info,
-                    block_sparse_tensors,
                     SeqlenInfoCls,
                     TileSchedulerCls,
                     tma_atom_Kp,
@@ -1134,8 +1118,6 @@ class HSTUAttentionForwardSm100:
                         sQ_layout.inner,
                         sK_layout.inner,
                         sV_layout.inner,
-                        tStSs,
-                        tOtOs,
                         tOrPs,
                         pipeline_kv,
                         mbar_ptr,
@@ -1154,8 +1136,6 @@ class HSTUAttentionForwardSm100:
                         sQ_layout.inner,
                         sK_layout.inner,
                         sV_layout.inner,
-                        tStSs,
-                        tOtOs,
                         tOrPs,
                         pipeline_kv,
                         mbar_ptr,
@@ -1207,12 +1187,9 @@ class HSTUAttentionForwardSm100:
                 TileSchedulerCls=TileSchedulerCls,
                 store_O=store_O,
                 func=func,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
                 mma_tile_coord_v=mma_tile_coord_v,
                 pipeline_s_p=pipeline_s_p,
                 pipeline_p_full=pipeline_p_full,
-                pipeline_o=pipeline_o,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
                 tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
@@ -1473,7 +1450,6 @@ class HSTUAttentionForwardSm100:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
@@ -1708,10 +1684,8 @@ class HSTUAttentionForwardSm100:
         sK: cute.Tensor,
         sV: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
-        pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
-        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         tma_atom_Kp: cute.CopyAtom,
@@ -2179,8 +2153,6 @@ class HSTUAttentionForwardSm100:
         sQ_swizzle: cute.Swizzle,
         sK_swizzle: cute.Swizzle,
         sV_swizzle: cute.Swizzle,
-        tStSs: Tuple[cute.Tensor, cute.Tensor],
-        tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
         pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
@@ -2439,8 +2411,6 @@ class HSTUAttentionForwardSm100:
         sQ_swizzle: cute.Swizzle,
         sK_swizzle: cute.Swizzle,
         sV_swizzle: cute.Swizzle,
-        tStSs: Tuple[cute.Tensor, cute.Tensor],
-        tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
         pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
@@ -2683,12 +2653,9 @@ class HSTUAttentionForwardSm100:
         TileSchedulerCls: Callable,
         store_O: Callable,
         func: Optional[cute.Tensor],
-        buffers=None,
-        fastdiv_mods=(None, None),
         mma_tile_coord_v: Int32 = Int32(0),
         pipeline_s_p: Optional[cutlass.pipeline.PipelineUmmaAsync] = None,
         pipeline_p_full: Optional[cutlass.pipeline.PipelineAsyncUmma] = None,
-        pipeline_o: Optional[cutlass.pipeline.PipelineUmmaAsync] = None,
     ):
         """Compute silu on attention scores from QK matrix multiplication."""
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * (len(self.silu0_warp_ids)))
@@ -2791,12 +2758,6 @@ class HSTUAttentionForwardSm100:
                 tStS_t2r=tStS_t2r,
                 tStP_r2t=tStP_r2t,
                 stage=stage,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                m_block=m_block,
-                seqlen=seqlen,
-                buffers=buffers,
-                fastdiv_mods=fastdiv_mods,
                 pipeline_s_p=pipeline_s_p,
                 pipeline_p_full=pipeline_p_full,
             )
@@ -2948,12 +2909,6 @@ class HSTUAttentionForwardSm100:
         tStS_t2r: cute.Tensor,
         tStP_r2t: cute.Tensor,
         stage: int | Int32,
-        batch_idx: Int32,
-        head_idx: Int32,
-        m_block: Int32,
-        seqlen,
-        buffers=None,
-        fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         r2p_mask_fn: Optional[Callable] = None,
         pipeline_s_p: Optional[cutlass.pipeline.PipelineUmmaAsync] = None,

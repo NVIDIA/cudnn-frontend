@@ -52,7 +52,6 @@ class Sm100FmhaStaticTileScheduler:
         self._blk_coord = blk_coord
         self._grid_shape = grid_shape
         self._current_work_linear_idx = current_work_linear_idx
-        self._problem_shape_mbh = cute.make_layout(params.problem_shape_mbh)
         self._is_first_block = True
         self._loc = loc
 
@@ -84,7 +83,7 @@ class Sm100FmhaStaticTileScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None):
         self._is_first_block = False
         return self.get_current_work(loc=loc, ip=ip)
 
@@ -205,9 +204,6 @@ class HSTUFusedMask:
         is_local: cutlass.Constexpr[bool] = False,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
-        is_target: cutlass.Constexpr[bool] = False,
-        target_group_size: cutlass.Constexpr[int] = 1,
-        num_targets: Int32 = Int32(0),
         is_arbitrary: cutlass.Constexpr[bool] = False,
         func_num: cutlass.Constexpr[int] = 0,
         func: Optional[cute.Tensor] = None,
@@ -232,10 +228,4 @@ class HSTUFusedMask:
                 valid = valid and index_k <= score_row + right
                 if cutlass.const_expr(is_local and window_size_left is not None):
                     valid = valid and index_k >= score_row - window_size_left
-            if cutlass.const_expr(is_target):
-                seqlen_h = seqlen_k - num_targets
-                target_index = (score_row - seqlen_h) // target_group_size
-                target_left = seqlen_h + target_index * target_group_size
-                hides_previous_target_groups = score_row >= seqlen_h and index_k >= seqlen_h and index_k < target_left
-                valid = valid and not hides_previous_target_groups
             predicates[i] = valid
