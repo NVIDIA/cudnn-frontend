@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Float16, BFloat16
@@ -17,6 +18,26 @@ from ._kernels.block_sparse_builder import (
     build_hstu_q2k_block_sparse,
 )
 from ._kernels.block_sparsity import HSTUBlockSparseTensors
+
+
+def _cutlass_dsl_version() -> tuple[int, int, int]:
+    """Return the installed CUTLASS DSL version without another dependency."""
+    version = getattr(cutlass, "__version__", None)
+    try:
+        parts = str(version).split(".")
+        parsed = []
+        for index in range(3):
+            digits = ""
+            for character in parts[index]:
+                if not character.isdigit():
+                    break
+                digits += character
+            if not digits:
+                raise ValueError
+            parsed.append(int(digits))
+        return tuple(parsed)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}") from exc
 
 
 def _normalize_scaling_seqlen(
@@ -187,6 +208,10 @@ def hstu_varlen_fwd_100(
         and not is_paged
         and q.shape[1] == k.shape[1] == v.shape[1]
     )
+    # The 4.5.x PipelineAsync descriptor path is nondeterministic when CUDA
+    # contexts contend for an SM. Keep CLC scheduling, but use its direct
+    # work-coordinate path until the corrected 4.6 pipeline implementation.
+    use_clc_descriptor = _cutlass_dsl_version() >= (4, 6, 0)
     if is_paged:
         assert is_causal, "Paged KV is True, but causal mask is False, this is not supported."
         assert not is_local, "Paged KV is True, but local mask is True, this is not supported."
@@ -218,6 +243,7 @@ def hstu_varlen_fwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
+        use_clc_descriptor,
     )
 
     block_sparse_tensors = None
@@ -277,6 +303,7 @@ def hstu_varlen_fwd_100(
             kBlockN=kBlockN,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
+            use_clc_descriptor=use_clc_descriptor,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(

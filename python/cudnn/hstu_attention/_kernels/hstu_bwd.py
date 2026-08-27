@@ -2039,11 +2039,13 @@ class HSTUAttentionBackwardSm100:
                 )
             else:
                 m_block = m_block_iter
-            load_mma_Q_pipeline.producer_acquire(
-                load_mma_Q_producer_state,
-                expected_tx=Int32(self.tma_copy_Q_bytes + self.tma_copy_K_bytes),
-            )
+            load_mma_Q_pipeline.producer_acquire(load_mma_Q_producer_state)
             tma_barrier = load_mma_Q_pipeline.producer_get_barrier(load_mma_Q_producer_state)
+            # CuTeDSL 4.5.x has no per-acquire expected_tx override. The
+            # pipeline already accounts for Q; extend its barrier for K.
+            if load_mma_Q_pipeline.is_leader_cta:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_expect_tx(tma_barrier, self.tma_copy_K_bytes)
 
             # Load K
             cute.copy(
@@ -2070,11 +2072,11 @@ class HSTUAttentionBackwardSm100:
 
             load_mma_Q_producer_state.advance()
 
-            load_mma_dO_pipeline.producer_acquire(
-                load_mma_dO_producer_state,
-                expected_tx=Int32(self.tma_copy_dO_bytes + self.tma_copy_dOt_bytes + self.tma_copy_V_bytes),
-            )
+            load_mma_dO_pipeline.producer_acquire(load_mma_dO_producer_state)
             tma_barrier = load_mma_dO_pipeline.producer_get_barrier(load_mma_dO_producer_state)
+            if load_mma_dO_pipeline.is_leader_cta:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_expect_tx(tma_barrier, self.tma_copy_dOt_bytes + self.tma_copy_V_bytes)
 
             # Load V
             cute.copy(
@@ -2142,7 +2144,7 @@ class HSTUAttentionBackwardSm100:
                 load_mma_Qt_pipeline,
             )
             m_block_qt = m_block
-            for m_block_iter in cutlass.range(
+            for next_m_block_iter in cutlass.range(
                 m_block_iter,
                 m_block_max,
                 unroll=1,
@@ -2153,10 +2155,10 @@ class HSTUAttentionBackwardSm100:
                         mask_block_idx,
                         full_block_cnt,
                         full_block_idx,
-                        m_block_iter,
+                        next_m_block_iter,
                     )
                 else:
-                    m_block_valid = m_block_iter
+                    m_block_valid = next_m_block_iter
                 (
                     load_mma_dO_producer_state,
                     load_mma_Q_producer_state,
@@ -2280,11 +2282,12 @@ class HSTUAttentionBackwardSm100:
 
         load_mma_Q_producer_state.advance()
 
-        load_mma_dO_pipeline.producer_acquire(
-            load_mma_dO_producer_state,
-            expected_tx=Int32(self.tma_copy_dO_bytes + self.tma_copy_dOt_bytes),
-        )
+        load_mma_dO_pipeline.producer_acquire(load_mma_dO_producer_state)
         tma_barrier = load_mma_dO_pipeline.producer_get_barrier(load_mma_dO_producer_state)
+        if cutlass.const_expr(self.use_2cta_instrs):
+            if load_mma_dO_pipeline.is_leader_cta:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_expect_tx(tma_barrier, self.tma_copy_dOt_bytes)
 
         # Load dO
         cute.copy(

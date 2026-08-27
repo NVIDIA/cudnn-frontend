@@ -1814,9 +1814,9 @@ def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 def test_current_stream_and_compile_cache():
-    q, k, v, _, cu = _inputs()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
+        q, k, v, _, cu = _inputs()
         first = hstu_attention_forward(
             q,
             k,
