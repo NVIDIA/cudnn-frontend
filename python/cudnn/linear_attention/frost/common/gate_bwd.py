@@ -48,7 +48,7 @@ def scalar_gate_blocks(n_tokens: int) -> int:
 
 
 @cute.kernel
-def scalar_gate_bwd_partial_kernel(
+def frost_scalar_gate_bwd_partial(
     mDg: cute.Tensor,
     mG: cute.Tensor,
     mALog: cute.Tensor,
@@ -92,7 +92,7 @@ def scalar_gate_bwd_partial_kernel(
 
 
 @cute.kernel
-def scalar_gate_bwd_finish_kernel(
+def frost_scalar_gate_bwd_finish(
     mPartA: cute.Tensor,
     mPartDt: cute.Tensor,
     mDA: cute.Tensor,
@@ -139,7 +139,7 @@ def scalar_gate_bwd_finish_kernel(
 
 
 @cute.kernel
-def channel_gate_bwd_partial_kernel(
+def frost_channel_gate_bwd_partial(
     mDg: cute.Tensor,
     mG: cute.Tensor,
     mALog: cute.Tensor,
@@ -239,7 +239,7 @@ def channel_gate_bwd_partial_kernel(
 
 
 @cute.kernel
-def channel_gate_bwd_finish_kernel(
+def frost_channel_gate_bwd_finish(
     mPartA: cute.Tensor,
     mPartDt: cute.Tensor,
     mDA: cute.Tensor,
@@ -299,10 +299,10 @@ def scalar_gate_bwd_launch(
     head_tiles: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    scalar_gate_bwd_partial_kernel(d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len).launch(
+    frost_scalar_gate_bwd_partial(d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len).launch(
         grid=(n_blocks, head_tiles, 1), block=(SCALAR_HEAD_TILE, 1, 1), stream=stream
     )
-    scalar_gate_bwd_finish_kernel(part_a, part_dt, d_a_log, d_dt_bias, h_o, n_blocks).launch(grid=(h_o, 1, 1), block=(32, 1, 1), stream=stream)
+    frost_scalar_gate_bwd_finish(part_a, part_dt, d_a_log, d_dt_bias, h_o, n_blocks).launch(grid=(h_o, 1, 1), block=(32, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -321,10 +321,10 @@ def channel_gate_bwd_launch(
     lower_bound: cutlass.Float32,
     stream: cuda.CUstream,
 ):
-    channel_gate_bwd_partial_kernel(d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len, lower_bound).launch(
+    frost_channel_gate_bwd_partial(d_gate, g_raw, a_log, dt_bias, part_a, part_dt, n_tokens, h_o, slice_len, lower_bound).launch(
         grid=(GATE_BWD_BLOCKS, h_o, 1), block=(128, 1, 1), stream=stream
     )
-    channel_gate_bwd_finish_kernel(part_a, part_dt, d_a_log, d_dt_bias, h_o).launch(grid=(h_o, 1, 1), block=(128, 1, 1), stream=stream)
+    frost_channel_gate_bwd_finish(part_a, part_dt, d_a_log, d_dt_bias, h_o).launch(grid=(h_o, 1, 1), block=(128, 1, 1), stream=stream)
 
 
 @functools.cache
@@ -398,3 +398,9 @@ def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, 
             options="--enable-tvm-ffi",
         )
     cache["compiled"](*tensors, *args, float(gate_lower_bound), cu_stream)
+
+
+frost_scalar_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_scalar_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_channel_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_channel_gate_bwd_finish.set_name_prefix("cudnn", remove_cutlass_symbol=True)

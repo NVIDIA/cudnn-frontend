@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """FROST GDN-2 engine: GDN2 nodes on the chunked prefill kernel
-(``kernel/gdn2_prefill_f16.py``, Blackwell SM100/SM103, bf16/fp16, BT=16).
+(``kernel/gdn2_prefill_f16.py``, SM100/SM103/SM107, bf16/fp16, BT=16).
 Forward + backward (GDN2_BWD on ``kernel/gdn2_bprop_f16.py`` with a
 checkpoint recompute on ``kernel/gdn2_recompute_f16.py``); the only GDN-2 engine — no cuTile
 fallback."""
@@ -41,7 +41,7 @@ def build_gdn2(graph):
 class Gdn2FrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node GDN-2 graphs (THD layout).
 
-    The only GDN-2 engine (SM100/SM103); GDN2_BWD runs on the FROST backward
+    The only GDN-2 engine (SM100/SM103/SM107); GDN2_BWD runs on the FROST backward
     kernel with a forward checkpoint recompute when the graph has no ``state_checkpoints`` input."""
 
     name = "gdn2_frost"

@@ -683,89 +683,17 @@ def gate_beta_warp(
         write_end_token = batch_start + write_end * cfg.b_t
         write_end_token = write_end_token if write_end_token < batch_end else batch_end
 
-        # ---- prefetch: the FIRST backward chunk's Gate/Beta --------------------------
-        if num_item_chunks > 0:
-            chunk_offset = batch_start + (compute_end - 1) * cfg.b_t
-            gGate = cute.domain_offset((chunk_offset,), mGate[None, head_idx])
-            gBeta = cute.domain_offset((chunk_offset,), mBeta[None, head_idx])
-            gate_idx = gate_index.idx
-            gate_index = advance(gate_index, cfg.smem_gate_stages)
-            pos_valid = [(chunk_offset + lane_idx + col * cfg.threads_per_warp) < batch_end for col in range(n_cols)]
-
-            # ---- Gate load: GMEM -> SMEM (OOB neutral: 1.0 -> log2 = 0.0) ------------
-            oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
-            gate_vals = [gGate[lane_idx + col * cfg.threads_per_warp] if pos_valid[col] else oob_neutral for col in range(n_cols)]
-
-            if cutlass.const_expr(cfg.safe_gate):
-                for col in cutlass.range_constexpr(0, n_cols, 2):
-                    biased_lo, biased_hi = fadd2(gate_vals[col], gate_vals[col + 1], bias, bias)
-                    sp_lo, sp_hi = softplus2(biased_lo, biased_hi)
-                    contrib_lo, contrib_hi = fmul2(sp_lo, sp_hi, a, a)
-                    gate_vals[col] = contrib_lo if pos_valid[col] else cutlass.Float32(0.0)
-                    gate_vals[col + 1] = contrib_hi if pos_valid[col + 1] else cutlass.Float32(0.0)
-            elif cutlass.const_expr(cfg.log_gate):
-                rcp_ln2 = opaque_f32_zero() + cutlass.Float32(RCP_LN2)
-                for col in cutlass.range_constexpr(0, n_cols, 2):
-                    gate_vals[col], gate_vals[col + 1] = fmul2(gate_vals[col], gate_vals[col + 1], rcp_ln2, rcp_ln2)
-            else:
-                floor = cutlass.Float32(1e-10)
-                for col in cutlass.range_constexpr(0, n_cols, 2):
-                    shifted_lo, shifted_hi = fadd2(gate_vals[col], gate_vals[col + 1], floor, floor)
-                    gate_vals[col] = cute.math.log2(shifted_lo, fastmath=True)
-                    gate_vals[col + 1] = cute.math.log2(shifted_hi, fastmath=True)
-            for offset in [1, 2, 4, 8, 16]:
-                for col in cutlass.range_constexpr(n_cols):
-                    n = nvvm.shfl_sync(0xFFFFFFFF, gate_vals[col], offset, 0, kind=nvvm.Shfl.UP)
-                    if lane_idx >= offset:
-                        gate_vals[col] = gate_vals[col] + n
-            for col in cutlass.range_constexpr(1, n_cols):
-                last_v = nvvm.shfl_sync(
-                    0xFFFFFFFF,
-                    gate_vals[col - 1],
-                    cfg.threads_per_warp - 1,
-                    cfg.threads_per_warp - 1,
-                    kind=nvvm.Shfl.IDX,
-                )
-                gate_vals[col] += last_v
-
-            for col in cutlass.range_constexpr(n_cols):
-                pos = lane_idx + col * cfg.threads_per_warp
-                sCumsumlog[pos, 0, gate_idx] = gate_vals[col]
-                sCumprod[pos, 0, gate_idx] = cute.math.exp2(gate_vals[col], fastmath=True)
-
-            bars.mb_gate_ready[gate_idx].arrive()
-
-            # ---- Beta load: GMEM -> SMEM (per-element cp.async) ----------------------
-            beta_idx = beta_index.idx
-            beta_index = advance(beta_index, cfg.smem_beta_stages)
-            if cutlass.const_expr(cfg.beta_sigmoid):
-                for col in cutlass.range_constexpr(n_cols):
-                    pos = lane_idx + col * cfg.threads_per_warp
-                    beta_value = cutlass.Float32(0.0)
-                    if pos_valid[col]:
-                        beta_value = gBeta[pos].to(cutlass.Float32)
-                        beta_value = sigmoid(beta_value).to(mBeta.element_type).to(cutlass.Float32)
-                    sBeta[pos, 0, beta_idx] = beta_value
-                bars.mb_beta_ready[beta_idx].arrive()
-            else:
-                for col in cutlass.range_constexpr(n_cols):
-                    pos = lane_idx + col * cfg.threads_per_warp
-                    src = gBeta.iterator + gBeta.layout((pos,))
-                    dst = sBeta.iterator + sBeta.layout((pos, 0, beta_idx))
-                    cp_size = cutlass.Int32(4) * cutlass.Int32(pos_valid[col])
-                    nvvm.cp_async_shared_global(dst, src, 4, nvvm.LoadCacheModifier.CA, cp_size=cp_size)
-                nvvm.cp_async_mbarrier_arrive(bars.mb_beta_ready[beta_idx].smem_ptr, noinc=True)
-
-        for rev_idx in cutlass.range(num_item_chunks):
+        for rev_idx in cutlass.range(num_item_chunks + 1):
             # ---- prefetch the NEXT chunk's Gate/Beta ---------------------------------
-            if rev_idx + 1 < num_item_chunks:
-                chunk_offset = batch_start + (compute_end - 2 - rev_idx) * cfg.b_t
+            if rev_idx < num_item_chunks:
+                chunk_offset = batch_start + (compute_end - 1 - rev_idx) * cfg.b_t
                 gGate = cute.domain_offset((chunk_offset,), mGate[None, head_idx])
                 gBeta = cute.domain_offset((chunk_offset,), mBeta[None, head_idx])
                 gate_idx = gate_index.idx
                 gate_index = advance(gate_index, cfg.smem_gate_stages)
                 pos_valid = [(chunk_offset + lane_idx + col * cfg.threads_per_warp) < batch_end for col in range(n_cols)]
 
+                # ---- Gate load: GMEM -> SMEM (OOB neutral: 1.0 -> log2 = 0.0) --------
                 oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
                 gate_vals = [gGate[lane_idx + col * cfg.threads_per_warp] if pos_valid[col] else oob_neutral for col in range(n_cols)]
 
@@ -808,6 +736,7 @@ def gate_beta_warp(
 
                 bars.mb_gate_ready[gate_idx].arrive()
 
+                # ---- Beta load: GMEM -> SMEM (per-element cp.async) ------------------
                 beta_idx = beta_index.idx
                 beta_index = advance(beta_index, cfg.smem_beta_stages)
                 if cutlass.const_expr(cfg.beta_sigmoid):
@@ -829,40 +758,41 @@ def gate_beta_warp(
                     nvvm.cp_async_mbarrier_arrive(bars.mb_beta_ready[beta_idx].smem_ptr, noinc=True)
 
             # ---- dGate/dBeta store: SMEM -> GMEM (in place) --------------------------
-            st_offset = batch_start + (compute_end - 1 - rev_idx) * cfg.b_t
-            gDgate = cute.domain_offset((st_offset,), mDgate[None, head_idx])
-            gDbeta = cute.domain_offset((st_offset,), mDbeta[None, head_idx])
+            if rev_idx > 0:
+                st_offset = batch_start + (compute_end - rev_idx) * cfg.b_t
+                gDgate = cute.domain_offset((st_offset,), mDgate[None, head_idx])
+                gDbeta = cute.domain_offset((st_offset,), mDbeta[None, head_idx])
 
-            # ---- dGate store ---------------------------------------------------------
-            gate_store_idx = gate_store_index.idx
-            bars.mb_gate_done[gate_store_idx].wait(gate_store_index.phase)
-            gate_store_index = advance(gate_store_index, cfg.smem_gate_stages)
-            dgate_vals = [sCumsumlog[lane_idx + col * cfg.threads_per_warp, 0, gate_store_idx] for col in range(n_cols)]
-            for offset in [1, 2, 4, 8, 16]:
+                # ---- dGate store -----------------------------------------------------
+                gate_store_idx = gate_store_index.idx
+                bars.mb_gate_done[gate_store_idx].wait(gate_store_index.phase)
+                gate_store_index = advance(gate_store_index, cfg.smem_gate_stages)
+                dgate_vals = [sCumsumlog[lane_idx + col * cfg.threads_per_warp, 0, gate_store_idx] for col in range(n_cols)]
+                for offset in [1, 2, 4, 8, 16]:
+                    for col in cutlass.range_constexpr(n_cols):
+                        n = nvvm.shfl_sync(0xFFFFFFFF, dgate_vals[col], offset, 31, kind=nvvm.Shfl.DOWN)
+                        if lane_idx < cfg.threads_per_warp - offset:
+                            dgate_vals[col] = dgate_vals[col] + n
+                for col in cutlass.range_constexpr(n_cols - 1):
+                    rev_col = cutlass.const_expr(n_cols - 2 - col)
+                    later_total = nvvm.shfl_sync(0xFFFFFFFF, dgate_vals[rev_col + 1], 0, 0, kind=nvvm.Shfl.IDX)
+                    dgate_vals[rev_col] = dgate_vals[rev_col] + later_total
                 for col in cutlass.range_constexpr(n_cols):
-                    n = nvvm.shfl_sync(0xFFFFFFFF, dgate_vals[col], offset, 31, kind=nvvm.Shfl.DOWN)
-                    if lane_idx < cfg.threads_per_warp - offset:
-                        dgate_vals[col] = dgate_vals[col] + n
-            for col in cutlass.range_constexpr(n_cols - 1):
-                rev_col = cutlass.const_expr(n_cols - 2 - col)
-                later_total = nvvm.shfl_sync(0xFFFFFFFF, dgate_vals[rev_col + 1], 0, 0, kind=nvvm.Shfl.IDX)
-                dgate_vals[rev_col] = dgate_vals[rev_col] + later_total
-            for col in cutlass.range_constexpr(n_cols):
-                pos = lane_idx + col * cfg.threads_per_warp
-                if st_offset + pos < write_end_token:
-                    gDgate[pos] = dgate_vals[col]
+                    pos = lane_idx + col * cfg.threads_per_warp
+                    if st_offset + pos < write_end_token:
+                        gDgate[pos] = dgate_vals[col]
 
-            # ---- dBeta store ---------------------------------------------------------
-            beta_store_idx = beta_store_index.idx
-            bars.mb_beta_done[beta_store_idx].wait(beta_store_index.phase)
-            beta_store_index = advance(beta_store_index, cfg.smem_beta_stages)
-            for col in cutlass.range_constexpr(n_cols):
-                pos = lane_idx + col * cfg.threads_per_warp
-                if st_offset + pos < write_end_token:
-                    if cutlass.const_expr(cfg.beta_sigmoid):
-                        gDbeta[pos] = sBeta[pos, 0, beta_store_idx].to(mDbeta.element_type)
-                    else:
-                        gDbeta[pos] = sBeta[pos, 0, beta_store_idx]
+                # ---- dBeta store -----------------------------------------------------
+                beta_store_idx = beta_store_index.idx
+                bars.mb_beta_done[beta_store_idx].wait(beta_store_index.phase)
+                beta_store_index = advance(beta_store_index, cfg.smem_beta_stages)
+                for col in cutlass.range_constexpr(n_cols):
+                    pos = lane_idx + col * cfg.threads_per_warp
+                    if st_offset + pos < write_end_token:
+                        if cutlass.const_expr(cfg.beta_sigmoid):
+                            gDbeta[pos] = sBeta[pos, 0, beta_store_idx].to(mDbeta.element_type)
+                        else:
+                            gDbeta[pos] = sBeta[pos, 0, beta_store_idx]
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, tile_idx, num_ctas, elect_one)
 
 
@@ -1243,7 +1173,7 @@ def tcgen05_mma_warp(
     dq_acc_ptr = nvvm.make_tmem_ptr(tmem_dstate_input_col, cutlass.Float32)
     dvdk_acc_ptr = nvvm.make_tmem_ptr(tmem_dvdk_acc_col, cutlass.Float32)
 
-    # ---- warp-top descriptors (1-stage tiles are loop-constant; K advances) ----------
+    # ---- warp-top descriptors --------------------------------------------------------
     d_q0 = sQ[0].desc()
     d_k0 = sK[0].desc()
     d_k_trans0 = sK_trans[0].desc()
@@ -2493,7 +2423,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_do_prime_input_ready[0].arrive()
 
-            # ---- dU stage: dV acc -> TMEM f16 A operand ------------------------------
+            # ---- dU stage: dV acc -> TMEM f16 ----------------------------------------
             bars.mb_du_total_acc_ready[0].wait(cg1_du_total_ready.phase)
             cg1_du_total_ready = advance(cg1_du_total_ready, 1)
             for half in cutlass.range_constexpr(2):
@@ -2579,7 +2509,7 @@ def compute1_warp_group(
             nvvm.tcgen05_wait("store")
             bars.mb_dyp_input_ready[0].arrive()
 
-            # ---- dV stage: dV = dY -> sdV --------------------------------------------
+            # ---- dV stage: dV = dY ---------------------------------------------------
             dv_stg_idx = dv_index.idx
             bars.mb_dv_tmastg_done[dv_stg_idx].wait(dv_index.phase)
             dv_index = advance(dv_index, cfg.smem_dv_stages)
@@ -3079,7 +3009,7 @@ def compute2_warp_group(
             bars.mb_dk_tmastg_ready[dk_stg_idx].arrive()
             bars.mb_gate_done[gate_idx].arrive()
 
-        # ---- dstate store: with an initial state this is its gradient ----------------
+        # ---- dstate store ------------------------------------------------------------
         if num_item_chunks > 0:
             dstate_idx = dstate_acc_index.idx
             bars.mb_dstate_acc_ready[dstate_idx].wait(dstate_acc_index.phase)
@@ -3200,7 +3130,7 @@ def build_descs_body(
 
 
 @cute.kernel
-def prologue_kernel(
+def frost_gdn_bprop_prologue(
     run_order: cutlass.Constexpr[bool],
     order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
@@ -3374,7 +3304,7 @@ def prologue(
     )
     base_desc_checkpoint = tma.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(64, d_k_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz128)
 
-    prologue_kernel(
+    frost_gdn_bprop_prologue(
         run_order,
         order_gen,
         b_t,
@@ -3486,7 +3416,7 @@ def host(
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
 
-    kernel(
+    frost_gdn_bprop(
         cfg,
         gate,
         a_log,
@@ -3522,7 +3452,7 @@ def host(
 
 
 @cute.kernel
-def kernel(
+def frost_gdn_bprop(
     cfg: cutlass.Constexpr,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
@@ -3872,7 +3802,6 @@ def kernel(
         stride_byte_offset=STRIDE,
         layout=SWZ,
     )
-    # sub-bank split: V + dstate_entry + dQ + dK + dV allocated last
     sV_raw = cutlass.Array(
         cfg.io_dtype,
         cfg.v_cosize,
@@ -4841,3 +4770,7 @@ def run_bwd(
         tensormap_workspace,
         cu_stream,
     )
+
+
+frost_gdn_bprop_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_gdn_bprop.set_name_prefix("cudnn", remove_cutlass_symbol=True)
