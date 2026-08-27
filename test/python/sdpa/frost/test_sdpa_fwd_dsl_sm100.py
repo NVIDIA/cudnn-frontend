@@ -12,7 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_cudnn_9_24, requires_cudnn_9_26, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -257,7 +257,6 @@ def _check_dsl_sm100_strided_stats(d_qk, d_v):
 
 
 @pytest.mark.L0
-@requires_cudnn_9_26
 @torch_fork_set_rng(seed=59)
 def test_dsl_sm100_strided_stats():
     """The SM100 half L0 flavor writes permuted, gapped LSE directly."""
@@ -1414,7 +1413,6 @@ def test_dsl_sm100_thd_all_q_zero_stats(stats_layout):
 
 
 @pytest.mark.L0
-@requires_cudnn_9_24
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=35)
 def test_dsl_sm100_thd_cu_seq_len_stats(stats_layout):
@@ -1427,7 +1425,6 @@ def test_dsl_sm100_thd_cu_seq_len_stats(stats_layout):
 
 
 @pytest.mark.L1
-@requires_cudnn_9_24
 @torch_fork_set_rng(seed=36)
 def test_dsl_sm100_thd_cu_seq_len_zero_lens():
     """cu_seq_len form with degenerate lengths: a zero-length sequence
@@ -1522,13 +1519,11 @@ def test_dsl_sm100_thd_lens_never_reach_host():
     a host read of the lengths is structurally impossible — while full
     numerics run in both length forms."""
     _require_dsl()
-    import cudnn
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     assert not hasattr(SdpaFwdDsl, "_thd_host_lens") and not hasattr(SdpaFwdDslSm100, "_thd_host_lens")
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="token_major")
-    if cudnn.backend_version() >= 92400:
-        _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
 
 
 @pytest.mark.L0

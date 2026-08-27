@@ -27,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_cudnn_9_24, requires_cudnn_9_26, requires_dsl
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -308,7 +308,6 @@ def _check_fp8_strided_stats(d_qk, d_v, in_key):
 
 
 @pytest.mark.L0
-@requires_cudnn_9_26
 @torch_fork_set_rng(seed=59)
 def test_fp8_strided_stats():
     """The per-tensor FP8 L0 flavor preserves dense Stats strides."""
@@ -980,7 +979,6 @@ def test_fp8_thd_zero_len_kv():
 
 
 @pytest.mark.L0
-@requires_cudnn_9_24
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_cu_seq_len():
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""

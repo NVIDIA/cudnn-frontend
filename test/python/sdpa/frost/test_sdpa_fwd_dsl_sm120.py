@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_cudnn_9_24, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, _dsl_installed
 
 
 def _is_sm120() -> bool:
@@ -1030,7 +1030,6 @@ def test_dsl_sm120_thd_all_q_zero_stats(stats_layout: str):
 
 
 @pytest.mark.L0
-@requires_cudnn_9_24
 @pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=35)
 def test_dsl_sm120_thd_cu_seq_len_stats(stats_layout: str):
@@ -1043,7 +1042,6 @@ def test_dsl_sm120_thd_cu_seq_len_stats(stats_layout: str):
 
 
 @pytest.mark.L1
-@requires_cudnn_9_24
 @torch_fork_set_rng(seed=36)
 def test_dsl_sm120_thd_cu_seq_len_zero_lens():
     """cu_seq_len form with degenerate lengths: a zero-length sequence
@@ -1118,13 +1116,11 @@ def test_dsl_sm120_thd_lens_never_reach_host():
     The old host round-trip helper (_thd_host_lens) is GONE from the
     adapter entirely, while full numerics run in both length forms."""
     _require_dsl()
-    import cudnn
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm120
 
     assert not hasattr(SdpaFwdDsl, "_thd_host_lens") and not hasattr(SdpaFwdDslSm120, "_thd_host_lens")
     _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, check_stats=True, stats_layout="token_major")
-    if cudnn.backend_version() >= 92400:
-        _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, check_stats=True, stats_layout="head_major", cu_lens=True)
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, check_stats=True, stats_layout="head_major", cu_lens=True)
 
 
 @pytest.mark.L0

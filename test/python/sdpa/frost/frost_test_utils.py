@@ -12,11 +12,6 @@ while the engines they test serve the whole line.
 
 import pytest
 
-try:
-    import cudnn
-except ImportError:
-    cudnn = None
-
 
 def _active_sm():
     import torch
@@ -44,17 +39,6 @@ requires_pre_rubin_blackwell = pytest.mark.skipif(
 requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
-)
-
-
-requires_cudnn_9_24 = pytest.mark.skipif(
-    cudnn is None or cudnn.backend_version() < 92400,
-    reason="cu_seq_len_q/kv graphs require cuDNN backend >= 9.24",
-)
-
-requires_cudnn_9_26 = pytest.mark.skipif(
-    cudnn is None or cudnn.backend_version() < 92600,
-    reason="a non-packed dense Stats output requires cuDNN backend >= 9.26",
 )
 
 
