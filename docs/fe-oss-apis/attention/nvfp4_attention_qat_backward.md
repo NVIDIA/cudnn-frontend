@@ -40,7 +40,7 @@ torch dependency group:
 
 ```bash
 python -m pip install --upgrade "pip>=25.1"
-pip install -e ".[cutedsl,triton]" --group torch
+python -m pip install -e ".[cutedsl,triton]" --group torch
 ```
 
 For a published wheel, install a CUDA-enabled torch build separately:

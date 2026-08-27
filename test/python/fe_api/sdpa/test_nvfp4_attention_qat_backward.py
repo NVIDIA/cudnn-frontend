@@ -133,21 +133,21 @@ def test_nvfp4_attention_qat_backward_tails_and_causal(seqlen_q, seqlen_kv, is_c
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=53)
-def test_nvfp4_attention_qat_backward_class_uses_caller_buffers():
-    """Write into caller buffers and reject an undersized workspace."""
+def test_nvfp4_attention_qat_backward_class_callable_compiles_and_uses_caller_buffers():
+    """Compile through APIBase.__call__, use caller buffers, and validate workspace."""
     from cudnn import Nvfp4AttentionQatBackward
 
     inputs, _ = _reference_case(32, 48, is_causal=False)
     q, k, v, high_precision_o, do, lse, scale = inputs
     op = Nvfp4AttentionQatBackward(q, k, v, high_precision_o, do, lse, softmax_scale=scale)
     assert op.check_support()
-    op.compile()
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
-    op.execute(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
+    op(q, k, v, high_precision_o, do, lse, dq, dk, dv, workspace)
+    assert op._compiled_kernel is not None
     assert torch.isfinite(dq).all()
     assert torch.isfinite(dk).all()
     assert torch.isfinite(dv).all()
