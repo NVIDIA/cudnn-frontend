@@ -529,14 +529,30 @@ def _sm80_spec() -> EngineSpec:
             sink=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
+            # Served by gathering the strided stats into carved contiguous
+            # staging (issue #514 workspace machinery) — the kernels read a
+            # packed LSE; sm120 reads declared strides natively instead.
+            strided_stats=True,
         ),
         lower=lower_sm80_bwd,
     )
 
 
 def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
-    """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter."""
-    from .api import sdpa_bwd_wrapper_sm80
+    """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter.
+
+    Built at plan time (issue #514): the adapter is constructed here from the
+    NORMALIZED buffer descriptors (compact BSHD-physical), its scratch
+    requirement plus this executor's own dense_flex gather staging is recorded
+    as ``workspace_bytes``, and execute carves everything from the caller's
+    workspace — no per-execute allocation on this path.
+    """
+    import dataclasses
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
+
+    from .api import SdpabwdSm80
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -556,49 +572,136 @@ def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any 
         dsink=facts.dsink_t,
     )
     mask_args = ga.adapter_mask_args(facts)
+    elem = 2  # fp16/bf16 — mismatch() admits no other input dtype
+    b, h_q = facts.b, facts.h_q
 
-    def _execute(variant_pack, stream=None):
+    def _compact_desc(t, name):
+        desc = ga.tensor_desc_from_ir(t, name=name)
+        bb, hh, ss, dd = desc.shape
+        return dataclasses.replace(desc, stride=(ss * hh * dd, dd, hh * dd, 1), stride_order=(3, 1, 2, 0))
+
+    def _is_compact_bshd(t) -> bool:
+        _, h, s, d = tuple(t.get_dim())
+        return tuple(t.get_stride()) == (s * h * d, d, h * d, 1)
+
+    # dense_flex gather staging, sized from the PORT layouts (static): a port
+    # already stored as a compact BSHD-physical allocation is handed through
+    # zero-copy. The adapter's own scratch then covers head-dim pads and the
+    # kernel-internal buffers.
+    ports = ((facts.q_t, "q"), (facts.k_t, "k"), (facts.v_t, "v"), (facts.o_t, "o"), (facts.do_t, "dO"))
+
+    def _port_numel(t) -> int:
+        n = 1
+        for extent in t.get_dim():
+            n *= int(extent)
+        return n
+
+    stage_bytes = {name: (0 if _is_compact_bshd(t) else ws_align(_port_numel(t) * elem)) for t, name in ports}
+    # Strided stats (Capabilities.strided_stats): the kernels read a PACKED
+    # (B, H_q, S_q) fp32 LSE, so a stats input with any other declared strides
+    # is gathered into a carved contiguous chunk at execute.
+    _stats_contig = facts.stats_t is not None and tuple(facts.stats_t.get_stride()) == (h_q * facts.s_q, facts.s_q, 1, 1)
+    stats_stage = 0 if (facts.stats_t is None or _stats_contig) else ws_align(b * h_q * facts.s_q * 4)
+
+    q_desc = _compact_desc(facts.q_t, "q")
+    sample_lse = TensorDesc(
+        dtype=ga.to_torch_dtype(cudnn.data_type.FLOAT),
+        shape=(b, h_q, facts.s_q),
+        stride=(h_q * facts.s_q, facts.s_q, 1),
+        stride_order=(2, 1, 0),
+        device=q_desc.device,
+        name="lse",
+    )
+    api = SdpabwdSm80(
+        sample_q=q_desc,
+        sample_k=_compact_desc(facts.k_t, "k"),
+        sample_v=_compact_desc(facts.v_t, "v"),
+        sample_o=_compact_desc(facts.o_t, "o"),
+        sample_do=_compact_desc(facts.do_t, "dO"),
+        sample_lse=sample_lse,
+        scale_softmax=facts.scale,
+        has_seq_kv_lens=facts.seq_kv_t is not None,
+        has_bias=facts.has_bias,
+        **mask_args,
+    )
+    if not api.check_support():
+        raise ValueError("SdpabwdSm80 declined the normalized graph geometry")
+    api.compile()
+    bias_batch = int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1
+    api_scratch = api.scratch_workspace_bytes(
+        has_bias=facts.has_bias,
+        bias_batch=bias_batch,
+        has_sink=facts.has_sink,
+        deterministic=facts.deterministic,
+    )
+    total_workspace_bytes = sum(stage_bytes.values()) + stats_stage + api_scratch
+
+    def _normalize(carver, buf, staged: int):
+        if not staged:
+            return buf
+        bb, hh, ss, dd = buf.shape
+        dst = carver.take(bb * ss * hh * dd, buf.dtype).view(bb, ss, hh, dd)
+        dst.copy_(buf.permute(0, 2, 1, 3))
+        return dst.permute(0, 2, 1, 3)
+
+    def _ir_view(buf, ir_t):
+        """Reinterpret a variant-pack buffer through the IR tensor's dim/stride.
+
+        cuDNN's execute contract treats variant-pack entries as raw storage
+        laid out per the IR tensor descriptor — the caller's torch tensor may
+        be flat or otherwise logically reshaped. The staging/squeeze/copy_
+        paths below consume torch views, so rebuild the IR-shaped view instead
+        of trusting the caller's metadata (mirrors the forward lowering's
+        ``_ir_view``). INPUT ports only: output-port IR strides are
+        PROVISIONAL row-major unless the user assigned them (the layout
+        invariant in docs/python_graph_and_execution_backends.md), so the
+        gradient outputs below keep the caller tensor's own view — re-striding
+        them to the provisional layout would scatter the copy-back.
+        """
+        dim, stride = tuple(ir_t.get_dim()), tuple(ir_t.get_stride())
+        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
+            return buf
+        return buf.as_strided(dim, stride)
+
+    def _execute(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
-        # mismatch() admits only the contiguous (B, H_q, S_q, 1) stats layout,
-        # so this is a pure view (a copying reshape would violate the
-        # execute() contract and hide the -inf padded-row trim semantics).
-        lse = resolved[id(facts.stats_t)].view(facts.b, facts.h_q, facts.s_q)
+        carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
+        # squeeze(-1) is a valid view for ANY (B, H_q, S_q, 1) strides; the
+        # kernels read a packed LSE, so a strided stats input (strided_stats)
+        # is gathered into carved contiguous staging first.
+        lse = _ir_view(resolved[id(facts.stats_t)], facts.stats_t).squeeze(-1)
+        if stats_stage:
+            lse_stage = carver.take(b * h_q * facts.s_q, lse.dtype).view(b, h_q, facts.s_q)
+            lse_stage.copy_(lse)
+            lse = lse_stage
+        dbias_buf = resolved.get(id(facts.dbias_t)) if facts.has_dbias and facts.dbias_t is not None else None
+        dsink_buf = resolved.get(id(facts.dsink_t)) if facts.has_dsink and facts.dsink_t is not None else None
 
-        out = sdpa_bwd_wrapper_sm80(
-            # dense_flex delivery: normalize to the BSHD-physical order the
-            # adapter requires (zero-copy when already BSHD).
-            ga.to_bshd_physical(resolved[id(facts.q_t)]),
-            ga.to_bshd_physical(resolved[id(facts.k_t)]),
-            ga.to_bshd_physical(resolved[id(facts.v_t)]),
-            ga.to_bshd_physical(resolved[id(facts.o_t)]),
-            ga.to_bshd_physical(resolved[id(facts.do_t)]),
-            lse,
+        api.execute(
+            q_tensor=_normalize(carver, _ir_view(resolved[id(facts.q_t)], facts.q_t), stage_bytes["q"]),
+            k_tensor=_normalize(carver, _ir_view(resolved[id(facts.k_t)], facts.k_t), stage_bytes["k"]),
+            v_tensor=_normalize(carver, _ir_view(resolved[id(facts.v_t)], facts.v_t), stage_bytes["v"]),
+            o_tensor=_normalize(carver, _ir_view(resolved[id(facts.o_t)], facts.o_t), stage_bytes["o"]),
+            do_tensor=_normalize(carver, _ir_view(resolved[id(facts.do_t)], facts.do_t), stage_bytes["dO"]),
+            lse_tensor=lse,
+            dq_tensor=resolved[id(facts.dq_t)],
+            dk_tensor=resolved[id(facts.dk_t)],
+            dv_tensor=resolved[id(facts.dv_t)],
+            dbias_tensor=dbias_buf,
+            dsink_tensor=dsink_buf.view(-1) if dsink_buf is not None else None,
             scale_softmax=facts.scale,
             deterministic=facts.deterministic,
             # Stream from the caller's handle (ExecutionContext.stream);
             # None keeps the current stream.
             current_stream=stream,
-            **mask_args,
+            workspace=carver.remaining() if (carver is not None and api_scratch) else None,
             **ga.adapter_feature_buffers(facts, resolved),
         )
-
-        # copy_ casts in place; no .to() (which would allocate a staging
-        # tensor per execute).
-        for t_ref, key in ((facts.dq_t, "dq_tensor"), (facts.dk_t, "dk_tensor"), (facts.dv_t, "dv_tensor")):
-            resolved[id(t_ref)].copy_(out[key])
-        if facts.has_dbias and "dbias_tensor" in out:
-            buf = resolved.get(id(facts.dbias_t))
-            if buf is not None:
-                buf.copy_(out["dbias_tensor"].view(buf.shape))
-        if facts.has_dsink and "dsink_tensor" in out:
-            buf = resolved.get(id(facts.dsink_t))
-            if buf is not None:
-                buf.view(-1).copy_(out["dsink_tensor"])
         return None
 
-    # Executor contract (engine._FrostSdpaBwdPlan): torch-native host code,
-    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
-    _execute.workspace_bytes = 0
+    # Executor contract (engine._FrostSdpaBwdPlan): a non-zero workspace_bytes
+    # means _execute(variant_pack, workspace, stream) with the caller's buffer.
+    _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
     return _execute
 

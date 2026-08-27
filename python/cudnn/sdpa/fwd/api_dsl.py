@@ -3964,8 +3964,45 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
         self._logger.debug("compile completed")
 
+    def _bshd_gather_bytes(self, desc) -> int:
+        """Bytes to gather ``desc`` into a compact BSHD buffer, or 0 when its
+        BSHD transpose is already contiguous (the common, engine-normalized
+        case)."""
+        b, h, s, d = desc.shape
+        if tuple(desc.stride) == (s * h * d, d, h * d, 1):
+            return 0
+        return ws_align(b * h * s * d * 2)  # fp16/bf16 only on this row
+
     def scratch_workspace_bytes(self) -> int:
-        return 0
+        """Per-execute scratch (issue #514): dense_flex gathers, the GQA head
+        expansion, the V head-dim pad, the kernel-layout O staging those need,
+        strided-LSE staging, and the sinks log2 rescale — everything execute()
+        would otherwise allocate. Sized in execute()'s carve order."""
+        self._ensure_support_checked()
+        if self.thd:
+            return 0  # engine rows never lower THD; the wrapper path allocates
+        elem = 2  # fp16/bf16 — check_support admits no other input dtype
+        b, hq, sq, skv = self.batch_size, self.h_q, self.s_q_max, self.s_k_max
+        gqa = self.h_kv != self.h_q
+        pad_v = self.head_dim_v < self.flavor_d_v
+        total = self._bshd_gather_bytes(self.q_desc)
+        # K/V: layout gather, GQA expansion, and the V pad share ONE carved
+        # buffer each (expanded heads at the padded flavor width).
+        if gqa or self._bshd_gather_bytes(self.k_desc):
+            total += ws_align(b * skv * hq * self.head_dim_qk * elem)
+        if pad_v:
+            total += ws_align(b * skv * hq * self.flavor_d_v * elem)
+        elif gqa or self._bshd_gather_bytes(self.v_desc):
+            total += ws_align(b * skv * hq * self.head_dim_v * elem)
+        # O: the compiled ABI is (B, SQ, H, flavor_d_v) — staged for the padded
+        # envelope or a non-BSHD (dense_flex) caller buffer.
+        if pad_v:
+            total += ws_align(b * sq * hq * self.flavor_d_v * elem)
+        elif self._bshd_gather_bytes(self.o_desc):
+            total += ws_align(b * sq * hq * self.head_dim_v * elem)
+        if self.has_sink:
+            total += ws_align(hq * 4)  # sinks * log2(e) product
+        return total
 
     # ------------------------------------------------------------------
     def execute(
@@ -4007,39 +4044,79 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = q_tensor.device
         launch_stream = self._get_default_stream(current_stream)
 
-        with _torch_stream_context(current_stream, device):
-            # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
-            # normalizes with one copy — the same grandfathered normalization
-            # the SM100 dense path applies (open cleanup, Hard Rule 2).
-            Q = self._to_bshd(q_tensor)
-            K = self._to_bshd(k_tensor)
-            V = self._to_bshd(v_tensor)
-            if self.h_kv != self.h_q:
-                # Dense GQA: expand K/V heads until the kernels' native dense
-                # GQA path is qualified (see class docstring). BSHD head dim is 2.
-                reps = self.h_q // self.h_kv
-                K = K.repeat_interleave(reps, dim=2)
-                V = V.repeat_interleave(reps, dim=2)
+        # Per-execute scratch: carved from the caller's workspace when one is
+        # provided (the engine lowering passes one sized by
+        # scratch_workspace_bytes(); issue #514), otherwise allocated (the
+        # standalone wrapper path). Carve order mirrors the sizing order.
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm80") if workspace is not None else None
 
+        with _torch_stream_context(current_stream, device):
             pad_v = self.head_dim_v < self.flavor_d_v
-            if pad_v:
-                V = _sm80_pad_last_dim(V, self.flavor_d_v)
+            gqa = self.h_kv != self.h_q
+            reps = self.h_q // self.h_kv
+
+            def _gather_bshd(t: torch.Tensor) -> torch.Tensor:
+                """Compact BSHD view/gather of logical BHSD ``t`` (dense_flex)."""
+                view = t.transpose(1, 2)
+                if view.is_contiguous():
+                    return view
+                if carver is None:
+                    return view.contiguous()
+                dst = carver.take(t.numel(), t.dtype).view(view.shape)
+                dst.copy_(view)
+                return dst
+
+            def _kv_operand(t: torch.Tensor, fd: Optional[int]) -> torch.Tensor:
+                """K/V kernel operand: layout gather, GQA head expansion, and
+                the head-dim pad in ONE carved buffer (allocating fallbacks on
+                the wrapper path)."""
+                view = t.transpose(1, 2)  # (b, s, h_kv, d)
+                bb, ss, hh, dd = view.shape
+                fd = dd if fd is None else fd
+                if not gqa and fd == dd:
+                    return _gather_bshd(t)
+                if carver is not None:
+                    dst = carver.take(bb * ss * self.h_q * fd, t.dtype).view(bb, ss, hh, reps, fd)
+                    if fd != dd:
+                        dst[..., dd:].zero_()
+                    dst[..., :dd].copy_(view.unsqueeze(3))
+                    return dst.view(bb, ss, self.h_q, fd)
+                out = view.repeat_interleave(reps, dim=2) if gqa else view
+                if fd != dd:
+                    out = _sm80_pad_last_dim(out, fd)
+                elif not out.is_contiguous():
+                    out = out.contiguous()
+                return out
+
+            Q = _gather_bshd(q_tensor)
+            K = _kv_operand(k_tensor, None)
+            V = _kv_operand(v_tensor, self.flavor_d_v if pad_v else None)
 
             # Output binding: the compiled O ABI is (B, SQ, H, flavor_d_v).
             # Direct-bind the caller's BSHD view when it matches; the padded-V
-            # envelope and dense_flex cases go through a scratch + copy-back
-            # (both pre-existing normalizations).
-            o_view, o_needs_copyback, o_scratch = self._to_bshd_writable(o_tensor)
+            # envelope and dense_flex cases go through carved staging +
+            # copy-back.
+            o_view = o_tensor.transpose(1, 2)
+            o_needs_copyback = pad_v or not o_view.is_contiguous()
             if pad_v:
-                o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
+                if carver is not None:
+                    o_kernel = carver.take(self.batch_size * self.s_q_max * self.h_q * self.flavor_d_v, q_tensor.dtype)
+                    o_kernel = o_kernel.view(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v)
+                    o_kernel.zero_()
+                else:
+                    o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
             elif o_needs_copyback:
-                o_kernel = o_scratch
+                if carver is not None:
+                    o_kernel = carver.take(o_tensor.numel(), o_tensor.dtype).view(o_view.shape)
+                else:
+                    o_kernel = torch.empty_like(o_view, memory_format=torch.contiguous_format)
             else:
                 o_kernel = o_view
+
             # DEFENSIVE zero-fill, not load-bearing: the dense epilogue stores
             # every in-bounds row unconditionally; kept so a bound buffer can
             # never surface uninitialized memory if a future path skips rows.
-            # (The pad_v scratch above is allocated zeroed already.)
+            # (The pad_v staging above is zeroed already.)
             if (seq_q_lens is not None or seq_kv_lens is not None) and not pad_v:
                 o_kernel.zero_()
                 if lse_tensor is not None:
@@ -4059,8 +4136,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             )
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
-                # (pre-existing SM80 contract; the kernels consume log2 units).
-                sinks_b = (self._checked_sinks_1d(sinks) * _LOG2E).contiguous()
+                # (the kernels consume log2 units), into carved scratch.
+                checked_sinks = self._checked_sinks_1d(sinks)
+                if carver is not None:
+                    sinks_b = carver.take(self.h_q, torch.float32)
+                    torch.mul(checked_sinks, _LOG2E, out=sinks_b)
+                else:
+                    sinks_b = (checked_sinks * _LOG2E).contiguous()
             else:
                 sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             if bias_tensor is not None:
@@ -4122,7 +4204,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             if pad_v:
                 o_view.copy_(o_kernel[..., : self.head_dim_v])
             elif o_needs_copyback:
-                o_view.copy_(o_scratch)
+                o_view.copy_(o_kernel)
         self._logger.debug("execute completed")
 
 

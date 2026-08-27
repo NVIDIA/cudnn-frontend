@@ -1619,6 +1619,62 @@ def _compile_dsink(B, H, SQ):
 # ===========================================================================
 # Python entry point.
 # ===========================================================================
+
+# One-time cached 1-element zero dummies for absent optional operands (Rule 1
+# in python/cudnn/AGENTS.md permits a cached ``_dummy`` for a dead ABI slot; a
+# fresh ``torch.zeros(1)`` per call is a per-execute allocation). Never read —
+# the matching has_* Constexpr is False, so the slot is compiled out.
+_DUMMY_CACHE: dict = {}
+
+
+def _dummy1z(dtype, device):
+    key = (dtype, str(device))
+    t = _DUMMY_CACHE.get(key)
+    if t is None:
+        t = _DUMMY_CACHE[key] = torch.zeros(1, dtype=dtype, device=device)
+    return t
+
+
+def scratch_bytes(
+    *,
+    B: int,
+    SQ: int,
+    SKV: int,
+    H: int,
+    Hk: int,
+    d_qk: int,
+    d_v: int,
+    io_bytes: int = 2,
+    deterministic: bool = False,
+    has_bias: bool = False,
+    bias_batch: int = 1,
+    has_sink: bool = False,
+    need_do_dot: bool = True,
+    tile_q: int = _LLAMA_CFG.TILE_Q,
+) -> int:
+    """Per-execute scratch requirement of the DENSE ``backward()`` path (issue
+    #514): the exact bytes ``backward(..., workspace=...)`` will carve. Keep in
+    lockstep with the ``_scratch`` takes there."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    total = ws_align(H * 4) if has_sink else 0  # dSink accumulator (fp32)
+    total += ws_align(B * SQ * H * d_qk * 4)  # dQ_acc (fp32)
+    total += ws_align(B * SQ * H * d_qk * io_bytes)  # dQ (io dtype)
+    if deterministic:
+        sem_units = B * H * ((SQ + tile_q - 1) // tile_q)
+        total += ws_align(max(sem_units, 1) * 4)  # dq semaphore (int32)
+    total += ws_align(B * SKV * H * d_qk * io_bytes)  # dK_ws
+    total += ws_align(B * SKV * H * d_v * io_bytes)  # dV_ws
+    if H != Hk:  # GQA: group-reduced outputs
+        total += ws_align(B * SKV * Hk * d_qk * io_bytes)
+        total += ws_align(B * SKV * Hk * d_v * io_bytes)
+    if has_bias:
+        total += ws_align(bias_batch * H * SQ * SKV * 4)  # dBias accumulator (fp32)
+    if need_do_dot:
+        total += ws_align(B * H * SQ * 4)  # do_dot (fp32)
+    return total
+
+
 def backward(
     Q: torch.Tensor,  # [B, SQ,  H, D] io_dtype (BSHD)
     K: torch.Tensor,  # [B, SKV, H, D]
@@ -1646,6 +1702,9 @@ def backward(
     tile_kv: int = _LLAMA_CFG.TILE_KV,
     tile_q: int = _LLAMA_CFG.TILE_Q,
     warps_per_sg: int = _LLAMA_CFG.WARPS_PER_SG,
+    workspace: Optional[torch.Tensor] = None,  # caller scratch, sized by
+    # scratch_bytes() — every internal buffer is carved from it instead of
+    # allocated (issue #514). Dense-only; None → allocate (wrapper paths).
 ):
     """Full SDPA backward — only ``O`` and ``lse`` (forward outputs) + ``dO`` are
     needed beyond Q/K/V.  ``do_dot`` is computed on-device from O·dO unless
@@ -1680,6 +1739,40 @@ def backward(
     #      n_seq logical sequences drive the grid + cu_* sizing.  Q.shape[1]/
     #      K.shape[1] are the packed totals T_q/T_kv (== the kernel's SQ/SKV). ---
     thd = cu_seqlens_q is not None
+    _carver = None
+    if workspace is not None:
+        assert not thd, "workspace carving is dense-only (the engine path; THD comes via the wrappers)"
+        from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+        _carver = WorkspaceCarver(
+            workspace,
+            scratch_bytes(
+                B=B,
+                SQ=SQ,
+                SKV=SKV,
+                H=H,
+                Hk=Hk,
+                d_qk=d_qk,
+                d_v=d_v,
+                io_bytes=Q.element_size(),
+                deterministic=bool(deterministic),
+                has_bias=bias is not None,
+                bias_batch=(bias.shape[0] if bias is not None else 1),
+                has_sink=sinks is not None,
+                need_do_dot=do_dot is None,
+                tile_q=tile_q,
+            ),
+            "bprop_f16_sm80",
+        )
+
+    def _scratch(numel, dtype, zero):
+        if _carver is None:
+            return (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=Q.device)
+        t = _carver.take(numel, dtype)
+        if zero:
+            t.zero_()
+        return t
+
     if thd:
         assert cu_seqlens_k is not None, "THD needs both cu_seqlens_q and cu_seqlens_k"
         assert B == 1, f"THD: Q/K/V/dO/O must be packed [1,T,H,D]; got batch dim {B}"
@@ -1750,13 +1843,13 @@ def backward(
         rope_cs_t = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
     else:
         rope_max_s = 1
-        rope_cs_t = torch.zeros(1, dtype=torch.float32, device=Q.device)
+        rope_cs_t = _dummy1z(torch.float32, Q.device)
     # Attention sink: dQ/dK/dV need NO kernel change (P recomputed from the
     # sink-aware LSE the caller passes); only dSink is computed (standalone).
     has_sink = sinks is not None
     if has_sink:
         sinks_t = sinks.to(dtype=torch.float32, device=Q.device).reshape(H).contiguous()
-        dsink_t = torch.zeros(H, dtype=torch.float32, device=Q.device)
+        dsink_t = _scratch(H, torch.float32, True)
     # THD is dense-feature-only for now (bias/rope/sink/seq_kv_lens are
     # dense-only); per-sequence padding is handled by the packed bounds, not
     # the PADDED mask.  THD uses SCHED_DEFAULT (LPT+THD is a future tweak).
@@ -1775,7 +1868,7 @@ def backward(
     if has_seq_len_q:
         seqq_t = seq_len_q.to(dtype=torch.int32, device=Q.device).contiguous()
     else:
-        seqq_t = torch.zeros(1, dtype=torch.int32, device=Q.device)
+        seqq_t = _dummy1z(torch.int32, Q.device)
     assert d_qk % 2 == 0
     # dQ splits d-cols across the two sub-groups → each reads a DQ_N = d_qk//2
     # column slice of sK.  load_b_smem_x4 takes the d-col offset as `col_base`
@@ -1802,32 +1895,32 @@ def backward(
     scale_log2 = scale * math.log2(math.e)
     inv_scale = 1.0 / float(scale)
 
-    dQ_acc = torch.zeros(B, SQ, H, d_qk, dtype=torch.float32, device=Q.device)
-    dQ = torch.empty(B, SQ, H, d_qk, dtype=Q.dtype, device=Q.device)
+    dQ_acc = _scratch(B * SQ * H * d_qk, torch.float32, True).view(B, SQ, H, d_qk)
+    dQ = _scratch(B * SQ * H * d_qk, Q.dtype, False).view(B, SQ, H, d_qk)
     # Deterministic-dQ relay counter: one int32 per (seq, head, q_tile), zeroed
     # per launch.  Stride = ceil(max_SQ/tile_q) so the per-seq q_iter (THD) or the
     # dense q_iter both index in-bounds; n_seq sequences (= B dense).  1-elem dummy
     # (never touched) on the fast path so it costs nothing.
     sem_q_stride = (max_sq + tile_q - 1) // tile_q if deterministic else 0
     sem_units = n_seq * H * sem_q_stride if deterministic else 1
-    dq_sem = torch.zeros(max(sem_units, 1), dtype=torch.int32, device=Q.device)
+    dq_sem = _scratch(max(sem_units, 1), torch.int32, True) if deterministic else _dummy1z(torch.int32, Q.device)
     # dK/dV write buffers have H_q heads (one slice per query head — no atomics).
     # MHA (gqa_ratio==1): they ARE the outputs.  GQA: a per-query-head workspace
     # that a reduction kernel sums over the group → [B,SKV,Hk,d] outputs.
-    dK_ws = torch.empty(B, SKV, H, d_qk, dtype=Q.dtype, device=Q.device)
-    dV_ws = torch.empty(B, SKV, H, d_v, dtype=Q.dtype, device=Q.device)
+    dK_ws = _scratch(B * SKV * H * d_qk, Q.dtype, False).view(B, SKV, H, d_qk)
+    dV_ws = _scratch(B * SKV * H * d_v, Q.dtype, False).view(B, SKV, H, d_v)
     if gqa_ratio == 1:
         dK, dV = dK_ws, dV_ws
     else:
-        dK = torch.empty(B, SKV, Hk, d_qk, dtype=Q.dtype, device=Q.device)
-        dV = torch.empty(B, SKV, Hk, d_v, dtype=Q.dtype, device=Q.device)
+        dK = _scratch(B * SKV * Hk * d_qk, Q.dtype, False).view(B, SKV, Hk, d_qk)
+        dV = _scratch(B * SKV * Hk * d_v, Q.dtype, False).view(B, SKV, Hk, d_v)
 
     lse_t = lse.to(dtype=torch.float32, device=Q.device).contiguous()
     # seq_kv_lens [B] int32 (or 1-elem dummy when not padded — never read).
     if has_seq_kv_lens:
         seqk_t = seq_kv_lens.to(dtype=torch.int32, device=Q.device).contiguous()
     else:
-        seqk_t = torch.zeros(1, dtype=torch.int32, device=Q.device)
+        seqk_t = _dummy1z(torch.int32, Q.device)
     # cu_seqlens [n_seq+1] int32 (THD) or 1-elem dummy (dense — never read).  The
     # over-provisioned THD grid covers the longest sequence (ceil(max_skv/tile_kv)
     # kv-tiles) × H × n_seq; short sequences early-out per kv-tile.
@@ -1837,27 +1930,27 @@ def backward(
         grid_kv_tiles = (max_skv + tile_kv - 1) // tile_kv
         grid_batch = n_seq
     else:
-        cu_q_t = torch.zeros(1, dtype=torch.int32, device=Q.device)
-        cu_k_t = torch.zeros(1, dtype=torch.int32, device=Q.device)
+        cu_q_t = _dummy1z(torch.int32, Q.device)
+        cu_k_t = _dummy1z(torch.int32, Q.device)
         grid_kv_tiles = 0
         grid_batch = 0
     # Bias + dBias (fp32 accumulator, same shape as bias; atomicAdd reduces over
     # batch when bias is broadcast [1,H,SQ,SKV]).
     if has_bias:
         bias_t = bias.contiguous()
-        dbias_t = torch.zeros(bias_batch, H, SQ, SKV, dtype=torch.float32, device=Q.device)
+        dbias_t = _scratch(bias_batch * H * SQ * SKV, torch.float32, True).view(bias_batch, H, SQ, SKV)
     else:
         # Dummy must match the fake tensor _compile_main builds at has_bias=False
         # (bias_is_fp32 defaults True → fp32).
-        bias_t = torch.zeros(1, dtype=torch.float32, device=Q.device)
-        dbias_t = torch.zeros(1, dtype=torch.float32, device=Q.device)
+        bias_t = _dummy1z(torch.float32, Q.device)
+        dbias_t = _dummy1z(torch.float32, Q.device)
 
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
     # ---- do_dot: on-device (default) or caller-supplied ------------------
     if do_dot is None:
-        dot_t = torch.empty(B, H, SQ, dtype=torch.float32, device=Q.device)
+        dot_t = _scratch(B * H * SQ, torch.float32, False).view(B, H, SQ)
         dd_fn = _compile_do_dot(B, H, SQ, d_v, io_is_bf16)
         dd_fn(from_dlpack(O), from_dlpack(dO), from_dlpack(dot_t), cutlass.Int32(B * H * SQ), stream)
     else:

@@ -674,6 +674,22 @@ def _compile_unpermute(B, H, SQ, d, io_is_bf16):
     return cute.compile(_unpermute_host, fdq_acc, fdq_out, d, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
 
 
+def scratch_bytes(*, B: int, SQ: int, SKV: int, H: int, io_bytes: int = 2, need_do_dot: bool = True) -> int:
+    """Per-execute scratch requirement of ``backward(..., workspace=...)``
+    (issue #514): the exact bytes it will carve. Keep in lockstep with the
+    ``_scratch`` takes there. d_qk == d_v == 64 by this kernel's contract."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    d = 64
+    total = ws_align(B * H * SQ * d * 4)  # permuted dQ accumulator (fp32)
+    total += ws_align(B * SKV * H * d * io_bytes)  # dK
+    total += ws_align(B * SKV * H * d * io_bytes)  # dV
+    total += ws_align(B * SQ * H * d * io_bytes)  # dQ
+    if need_do_dot:
+        total += ws_align(B * H * SQ * 4)  # do_dot (fp32)
+    return total
+
+
 def backward(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -684,6 +700,9 @@ def backward(
     *,
     scale: Optional[float] = None,
     do_dot: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,  # caller scratch, sized by
+    # scratch_bytes(); every internal buffer is carved from it instead of
+    # allocated (issue #514). None → allocate (wrapper paths).
     **_ignored,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SDPA backward for head-dim 64, fp16/bf16.  BSHD in/out; ``lse`` natural-log
@@ -702,19 +721,37 @@ def backward(
     scale_log2 = scale * math.log2(math.e)
 
     dev = Q.device
+    _carver = None
+    if workspace is not None:
+        from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+
+        _carver = WorkspaceCarver(
+            workspace,
+            scratch_bytes(B=B, SQ=SQ, SKV=SKV, H=H, io_bytes=Q.element_size(), need_do_dot=do_dot is None),
+            "bprop_d64_f16_sm80",
+        )
+
+    def _scratch(numel, dtype, zero):
+        if _carver is None:
+            return (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=dev)
+        t = _carver.take(numel, dtype)
+        if zero:
+            t.zero_()
+        return t
+
     # PERMUTED-flat dQ scratch [B, H, SQ, D] — the main kernel atomicAdds into it
     # thread-major; the _unpermute kernel casts it → row-major dQ.
-    dQ_acc = torch.zeros(B, H, SQ, D, dtype=torch.float32, device=dev)
-    dK = torch.empty(B, SKV, H, D, dtype=Q.dtype, device=dev)
-    dV = torch.empty(B, SKV, H, D, dtype=Q.dtype, device=dev)
-    dQ = torch.empty(B, SQ, H, D, dtype=Q.dtype, device=dev)
+    dQ_acc = _scratch(B * H * SQ * D, torch.float32, True).view(B, H, SQ, D)
+    dK = _scratch(B * SKV * H * D, Q.dtype, False).view(B, SKV, H, D)
+    dV = _scratch(B * SKV * H * D, Q.dtype, False).view(B, SKV, H, D)
+    dQ = _scratch(B * SQ * H * D, Q.dtype, False).view(B, SQ, H, D)
     lse_t = lse.to(dtype=torch.float32, device=dev).contiguous()
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # do_dot (rowsum O∘dO) preprocessing reuses the shared device kernel.
     if do_dot is None:
-        dot_t = torch.empty(B, H, SQ, dtype=torch.float32, device=dev)
+        dot_t = _scratch(B * H * SQ, torch.float32, False).view(B, H, SQ)
         dd_fn = _base._compile_do_dot(B, H, SQ, D, io_is_bf16)
         dd_fn(from_dlpack(O), from_dlpack(dO), from_dlpack(dot_t), cutlass.Int32(B * H * SQ), stream)
     else:
