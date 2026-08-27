@@ -305,8 +305,9 @@ and normalization semantics differ from the indexer path.
 Three-stage sparse top-K pipeline that produces the training gradients for the
 indexer tower:
 
-1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute from
-   `attn_score` (target) and `index_score` (predict).
+1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute
+   that overwrites `attn_score` (target) and reads `index_score` (predict)
+   without modifying it.
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
@@ -388,10 +389,10 @@ the default backend.
   full dQ/dK contribution (`g' * w`, not scaled by `S`) is what differs. The
   default backend's multiply preserves subnormals, so reaching it takes an
   exact `sm_scale * S` below `2^-150` (~7.0e-46).
-- **Scratch / workspace behavior** — `attn_score`/`index_score` are consumed
-  in place exactly like the default backend (`attn_score` is left holding
-  kernel 1's `grad_signal`; `sm_scale` folds inside kernel 2 without touching
-  the buffer). The backend owns one piece of per-plan workspace — the
+- **Scratch / workspace behavior** — `attn_score` is consumed in place and left
+  holding kernel 1's `grad_signal`, while `index_score` is read-only and
+  preserved. `sm_scale` folds inside kernel 2 without touching either buffer.
+  The backend owns one piece of per-plan workspace — the
   dynamic-ticket counter — allocated on first execute and reused by every
   later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
   accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
@@ -403,7 +404,7 @@ the default backend.
 - **Concurrency** — executions sharing one plan must not overlap on the
   device (the ticket counter is per-plan workspace). One plan serves one
   device: the workspace is device-resident, and execution rejects tensors on
-  any other device before touching the score buffers. The wrapper keys its
+  any other device before overwriting `attn_score`. The wrapper keys its
   plan cache on the CUDA device and on the **resolved** stream (`stream` when
   given, otherwise `torch.cuda.current_stream()` at call time), so calls that
   differ in device or stream get a private plan and private workspace; calls

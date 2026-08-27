@@ -169,11 +169,11 @@ class IndexerBackward(APIBase):
 
     1. Runtime signature re-validation of the tensors against the descriptors
        captured at plan-build time (dtype, shape, and stride/layout),
-       *before* any kernel launch — kernel 1 mutates the score buffers in
+       *before* any kernel launch — kernel 1 overwrites ``attn_score`` in
        place, so a mismatched reuse of an exported plan must raise here to
        avoid a fail-dirty.
-    2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score`` and
-       ``index_score``).
+    2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score``
+       with ``grad_signal`` and reads ``index_score`` without modifying it).
     3. (conditional) fp32 ``d_index_k`` zero-init — when the ``d_index_k``
        output buffer is fp32, ``execute`` zeroes it on the selected stream
        before the GEMM, because the dK epilogue atomic-adds into it. This is a
@@ -191,8 +191,9 @@ class IndexerBackward(APIBase):
     of the 24 fp32 significand bits — measured ~675x lower gradient-matrix
     representation error than the default single-bf16 rounding);
     ``d_weights`` is additionally reduced deterministically (bitwise
-    run-to-run, as is ``d_index_q``). Same wrapper contract and in-place
-    score consumption. Output dtype selects output precision: ``d_weights``
+    run-to-run, as is ``d_index_q``). Same wrapper contract: ``attn_score`` is
+    the in-place score scratch and ``index_score`` remains read-only. Output
+    dtype selects output precision: ``d_weights``
     and ``d_index_k`` accept fp32 buffers, which receive the fp32
     accumulators directly — **the headline accuracy gains require fp32
     output buffers**; bf16 output buffers round the result and keep only the
@@ -270,13 +271,13 @@ class IndexerBackward(APIBase):
     def _validate_plan_shapes_and_layout(self) -> None:
         """Semantic shape + layout validation of the plan's tensor descriptors.
 
-        Runs before kernel 1 mutates the score buffers in place.
+        Runs before kernel 1 overwrites ``attn_score`` in place.
         ``check_support`` otherwise only checks dtypes and ``execute``'s
         signature check only compares each runtime tensor against the recorded
         descriptor, so without this a directly-built / first-call plan whose
         ``d_weights`` / ``d_index_q`` / ``d_index_k`` / score / top-k shape is
         already inconsistent with ``index_q`` would pass validation, kernel 1
-        would corrupt the scores, and only the GEMM would fault or corrupt
+        would overwrite ``attn_score``, and only the GEMM would fault or corrupt
         memory. The relationships enforced (per the API contract):
 
           index_q      (B, S_q, H, D)      weights   (B, S_q, H)
@@ -366,7 +367,7 @@ class IndexerBackward(APIBase):
             # full metadata matrix: cross-tensor shapes, output dtypes,
             # devices, contiguity — the backend binds true views and uses
             # 16B-aligned row pointers, so reject bad metadata before
-            # kernel 1 mutates the score buffers.
+            # kernel 1 overwrites ``attn_score``.
             self._check_tensor_shape(self.w_desc, (b, s_q, h), name="weights")
             self._check_tensor_shape(self.ik_desc, (b, s_k, d), name="index_k")
             self._check_tensor_shape(self.diq_desc, (b, s_q, h, d), name="d_index_q")
@@ -409,9 +410,9 @@ class IndexerBackward(APIBase):
         self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
         self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
         # Output-dtype contract, validated here — before compile()/execute(),
-        # i.e. before kernel 1 mutates attn_score/index_score in place (no
-        # fail-dirty on a bad output dtype). ``d_index_q`` is bf16-only (TMA
-        # store of the input dtype). ``d_index_k`` accepts bf16 or fp32 on both
+        # i.e. before kernel 1 overwrites ``attn_score`` (``index_score`` is
+        # read-only; no fail-dirty on a bad output dtype). ``d_index_q`` is
+        # bf16-only (TMA store of the input dtype). ``d_index_k`` accepts bf16 or fp32 on both
         # arches (the GEMM accumulates dK in fp32; a bf16 buffer gets a
         # trailing cast). ``d_weights`` is bf16-only on the default backend:
         # its kernel's dW store rounds the fp32 accumulator to bf16, so an
@@ -435,8 +436,8 @@ class IndexerBackward(APIBase):
                 extra_error_msg="fp32 buffers receive the fp32 accumulator directly",
             )
         # Semantic shape relationships + compact-layout requirement, validated
-        # here (before compile()/execute(), i.e. before kernel 1 mutates the
-        # score buffers). Guards a directly-built / first-call plan whose output
+        # here (before compile()/execute(), i.e. before kernel 1 overwrites
+        # ``attn_score``). Guards a directly-built / first-call plan whose output
         # or score shapes are inconsistent, or whose layout is non-compact.
         self._validate_plan_shapes_and_layout()
         self._is_supported = True
@@ -496,7 +497,7 @@ class IndexerBackward(APIBase):
         Each entry is ``(tensor, descriptor, name)``. Guards against reusing a
         directly-built/exported plan with a tensor whose dtype, shape, or
         stride/layout differs from what it was compiled for — kernel 1
-        mutates the score buffers in place, so a mismatch must raise *before*
+        overwrites ``attn_score`` in place, so a mismatch must raise *before*
         the pipeline starts (no fail-dirty).
         """
         for tensor, desc, name in entries:
@@ -537,10 +538,10 @@ class IndexerBackward(APIBase):
         self._logger.debug("Entering execute")
         # Stage 1: runtime signature re-validation against the descriptors
         # captured at plan-build time, BEFORE any kernel launch. The plan is
-        # specialized to the sample dtypes and shapes. Kernel 1
-        # mutates ``attn_score`` / ``index_score`` in place before the GEMM
-        # runs, so reusing an exported plan with a mismatched signature would
-        # otherwise fail (or corrupt memory) only after the scores were
+        # specialized to the sample dtypes and shapes. Kernel 1 overwrites
+        # ``attn_score`` in place and treats ``index_score`` as read-only before
+        # the GEMM runs, so reusing an exported plan with a mismatched signature
+        # would otherwise fail (or corrupt memory) only after ``attn_score`` was
         # already mutated. Raise a clean ValueError here — no fail-dirty. The
         # signature-keyed wrapper cache never hits this, but a directly-
         # built/exported plan can.
@@ -563,8 +564,8 @@ class IndexerBackward(APIBase):
         )
         # One plan serves one device: the v2 backend's per-plan
         # workspace (the ticket counter) lives on the sample tensors'
-        # device, so reject cross-device execution before kernel 1 mutates
-        # the score buffers. The backend re-checks every
+        # device, so reject cross-device execution before kernel 1 overwrites
+        # ``attn_score``. The backend re-checks every
         # tensor against index_q.device, so validating index_q covers all.
         if self.use_v2 and index_q.device != self.iq_desc.device:
             raise ValueError(
@@ -817,9 +818,9 @@ def indexer_backward_wrapper(
             outside its envelope — SM100, H == 64, D == 128, block_I == 128,
             topk % 128 == 0 with 128 <= topk <= 2048, sm_scale > 0, contiguous
             same-device tensors — and never silently falls back to the default
-            backend. It keeps the wrapper contract (same inputs, outputs, and
-            in-place score consumption: ``attn_score`` is left holding
-            exactly kernel 1's ``grad_signal``; ``sm_scale`` folds in-kernel)
+            backend. It keeps the wrapper contract (same inputs and outputs:
+            ``attn_score`` is left holding exactly kernel 1's ``grad_signal``,
+            ``index_score`` remains read-only, and ``sm_scale`` folds in-kernel)
             and computes the GEMM stage with fp32 weights and a two-term
             bf16 expansion of the gradient matrix, plus deterministic
             (bitwise run-to-run) ``d_weights`` / ``d_index_q``.

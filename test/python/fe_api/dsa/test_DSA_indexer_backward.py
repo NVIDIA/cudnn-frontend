@@ -183,7 +183,7 @@ def test_DSA_indexer_backward_wrapper(
 # ===========================================================================
 # Regression coverage for the output/plan-signature validation on the default
 # indexer backward (SM100/SM90):
-#   * illegal output dtypes raise BEFORE kernel 1 mutates the score buffers;
+#   * illegal output dtypes raise BEFORE kernel 1 overwrites attn_score;
 #   * wrong-rank / wrong-shape / non-contiguous plans are rejected up front;
 #   * a direct plan or a cached wrapper plan reused with a mismatched
 #     shape/stride signature raises (no fail-dirty);
@@ -232,7 +232,7 @@ def _idxbwd_inputs():
 @torch_fork_set_rng(seed=0)
 def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
     """Each illegal output dtype raises ValueError, and the raise happens
-    before kernel 1 mutates attn_score / index_score in place (no fail-dirty)."""
+    before kernel 1 overwrites attn_score (index_score is always read-only)."""
     _require_sm100()
     DSA, _ = _import_dsa()
 
@@ -313,7 +313,7 @@ def _noncontiguous_like(sample):
 def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     """A directly-built plan rejects a runtime tensor whose shape or
     stride/layout differs from the descriptor it was compiled for, raising a
-    clean ValueError BEFORE kernel 1 mutates the score buffers (no fail-dirty)."""
+    clean ValueError BEFORE kernel 1 overwrites attn_score (no fail-dirty)."""
     _require_sm100()
     DSA, _ = _import_dsa()
 
@@ -409,7 +409,7 @@ def test_DSA_indexer_backward_wrapper_cache_hit_stride_mismatch_raises():
 def test_DSA_indexer_backward_wrong_shape_plan_rejected_before_kernel1():
     """A first-call / directly-built plan whose output/score shape is
     inconsistent with ``index_q`` is rejected by the semantic shape validation
-    in ``check_support`` BEFORE kernel 1 mutates the score buffers — not
+    in ``check_support`` BEFORE kernel 1 overwrites attn_score — not
     silently run on a mismatched signature that only faults in the GEMM. Covers
     both the wrapper (cache miss) and a directly-built plan. Fail-hard."""
     _require_sm100()
@@ -488,7 +488,7 @@ def test_DSA_indexer_backward_noncontiguous_index_k_plan_rejected():
         plan.check_support()
 
     # (b) Wrapper first call (cache miss) with a non-contiguous index_k is
-    #     rejected before kernel 1 mutates the score buffers.
+    #     rejected before kernel 1 overwrites attn_score.
     aq = attn.clone()
     isc = idx.clone()
     aq_pre = aq.clone()
@@ -551,12 +551,11 @@ def _v2_call(
     d_index_k=None,
     stream=None,
 ):
-    """Run the wrapper with backend="sm100_v2" on CLONED score buffers.
+    """Run the wrapper with backend="sm100_v2" on cloned score inputs.
 
-    Returns (result, grad_signal, predict) -- the two in-place score buffers
-    after the call: grad_signal is the attn_score scratch (kernel 1's output)
-    and predict is the consumed index_score buffer. Both are shared
-    bit-for-bit with the default backend.
+    Returns (result, grad_signal, predict): grad_signal is the overwritten
+    attn_score scratch (kernel 1's output), while predict is the preserved,
+    read-only index_score input. Both match the default backend bit-for-bit.
     """
     from cudnn import DSA
     from cuda.bindings import driver as cuda
@@ -979,7 +978,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
     request,
 ):
     """check_support must reject out-of-envelope requests with ValueError
-    BEFORE kernel 1 mutates the score buffers: topk bounds (2176 above the
+    BEFORE kernel 1 overwrites attn_score: topk bounds (2176 above the
     smem cap, non-multiple-of-128), non-positive sm_scale, unsupported output
     dtypes, non-contiguous metadata, and an index_k whose dim 0 / dim 2
     disagree with index_q. (topk 128/256 are now inside the envelope and are
@@ -1181,11 +1180,10 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
     folds the scale into the grad signal -- an autograd-reference check
     alone historically could not catch a mis-applied scale here (its noise
     floor has since dropped to rms_rel <= 0.005, but the fp64 recompute stays
-    the authoritative scale check); (b) both in-place score
-    buffers are left bitwise identical to the default backend's, i.e. the
-    scratch holds exactly kernel 1's grad_signal and ``index_score`` is
-    consumed the same way (the scale folds inside kernel 2, no host-side
-    buffer mutation)."""
+    the authoritative scale check); (b) score handling is bitwise identical
+    to the default backend, i.e. the attn_score scratch holds exactly kernel
+    1's grad_signal and ``index_score`` remains unchanged (the scale folds
+    inside kernel 2, with no host-side buffer mutation)."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -1389,7 +1387,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_stream(
 
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     cu_streams = [cuda.CUstream(s.cuda_stream) for s in streams]
-    # pre-clone the in-place score buffers for every iteration up front so
+    # pre-clone the score inputs for every iteration up front so
     # the interleaved phase enqueues only wrapper work
     clones = [[(inp[3].clone(), inp[4].clone()) for _ in range(n_iters)] for inp in inputs]
     results = [[None] * n_iters for _ in range(2)]
@@ -1701,7 +1699,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
     Run the identical input bits on each device, then interleave the devices,
     checking dq/dw bitwise against each device's serial result and dk in the
     fp32-atomic class; finally, executing a plan with tensors on the wrong
-    device must raise ValueError before kernel 1 mutates the score buffers."""
+    device must raise ValueError before kernel 1 overwrites attn_score."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda  # noqa: F401
@@ -1778,7 +1776,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
             assert _rms_rel(r["d_index_k"], refs[dev]["d_index_k"].double()) < _DK_ATOMIC_BAND, f"device {dev} iter {it}: d_index_k diverged"
 
     # direct-object contract: a plan built on device 0 must reject device-1
-    # tensors BEFORE kernel 1 mutates the score buffers
+    # tensors BEFORE kernel 1 overwrites attn_score
     iq0, w0, ik0, attn0, index0, tki0 = inputs[0]
     with torch.cuda.device(0):
         plan = DSA.IndexerBackward(
