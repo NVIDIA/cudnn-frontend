@@ -39,6 +39,7 @@ From a source checkout, install the CuTe DSL base dependencies, Triton, and the
 torch dependency group:
 
 ```bash
+python -m pip install --upgrade "pip>=25.1"
 pip install -e ".[cutedsl,triton]" --group torch
 ```
 

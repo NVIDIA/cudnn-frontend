@@ -12,6 +12,7 @@ from test_utils import torch_fork_set_rng
 
 
 def _environment_supported() -> bool:
+    """Return whether the current process can execute the Blackwell kernels."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(10, 0), (10, 3), (12, 0), (12, 1)}:
         return False
     try:
@@ -53,6 +54,7 @@ def _fake_quantize_nvfp4_reference(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _reference_case(seqlen_q: int, seqlen_kv: int, *, is_causal: bool):
+    """Construct one input case and its PyTorch gradient reference."""
     batch, heads, head_dim = 1, 2, 128
     scale = 1.0 / math.sqrt(head_dim)
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -86,6 +88,7 @@ def _reference_case(seqlen_q: int, seqlen_kv: int, *, is_causal: bool):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=31)
 def test_nvfp4_attention_qat_backward_wrapper_matches_reference():
+    """Match the wrapper outputs against the NVFP4 PyTorch reference."""
     from cudnn import nvfp4_attention_qat_backward
 
     inputs, expected = _reference_case(64, 64, is_causal=False)
@@ -108,6 +111,7 @@ def test_nvfp4_attention_qat_backward_wrapper_matches_reference():
 @pytest.mark.parametrize(("seqlen_q", "seqlen_kv", "is_causal"), [(37, 45, False), (63, 63, True)])
 @torch_fork_set_rng(seed=41)
 def test_nvfp4_attention_qat_backward_tails_and_causal(seqlen_q, seqlen_kv, is_causal):
+    """Cover non-tile-aligned cross attention and causal attention."""
     from cudnn import nvfp4_attention_qat_backward
 
     inputs, expected = _reference_case(seqlen_q, seqlen_kv, is_causal=is_causal)
@@ -130,6 +134,7 @@ def test_nvfp4_attention_qat_backward_tails_and_causal(seqlen_q, seqlen_kv, is_c
 @pytest.mark.L0
 @torch_fork_set_rng(seed=53)
 def test_nvfp4_attention_qat_backward_class_uses_caller_buffers():
+    """Write into caller buffers and reject an undersized workspace."""
     from cudnn import Nvfp4AttentionQatBackward
 
     inputs, _ = _reference_case(32, 48, is_causal=False)
@@ -154,6 +159,7 @@ def test_nvfp4_attention_qat_backward_class_uses_caller_buffers():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=59)
 def test_nvfp4_attention_qat_backward_zero_and_masked_blocks_are_finite():
+    """Keep all-zero and fully masked quantization blocks finite."""
     from cudnn import nvfp4_attention_qat_backward
 
     shape = (1, 1, 32, 128)
@@ -174,6 +180,7 @@ def test_nvfp4_attention_qat_backward_zero_and_masked_blocks_are_finite():
 
 @pytest.mark.L0
 def test_nvfp4_attention_qat_backward_rejects_unsupported_contracts():
+    """Reject unsupported activation dtypes and causal cross attention."""
     from cudnn import Nvfp4AttentionQatBackward
 
     q = torch.empty((1, 1, 16, 128), device="cuda", dtype=torch.float16)

@@ -84,6 +84,15 @@ def test_importing_cudnn_ops_pulls_no_framework():
 
 
 @pytest.mark.L0
+def test_importing_nvfp4_qat_package_pulls_no_framework():
+    """Import the QAT namespace without materializing torch or Triton."""
+    stage = "import cudnn.sdpa.bwd.qat"
+    imported = _imported_by(stage)
+    _assert_absent(imported, stage)
+    assert "triton" not in imported, f"{stage} imported triton; it must not"
+
+
+@pytest.mark.L0
 def test_ops_symbol_reports_install_hint_without_torch():
     probe = """
 import importlib.abc

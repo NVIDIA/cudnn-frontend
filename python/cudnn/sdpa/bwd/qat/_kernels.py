@@ -25,6 +25,7 @@ def attention_backward_preprocess(
     block_m: tl.constexpr,
     head_dim: tl.constexpr,
 ):
+    """Compute the per-query dot product between forward output and dO."""
     row_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
     batch_head = tl.program_id(1)
     col_offsets = tl.arange(0, head_dim)
@@ -61,6 +62,7 @@ def attention_backward_dq(
     head_dim: tl.constexpr,
     causal: tl.constexpr,
 ):
+    """Compute one query tile of the straight-through-estimator dQ."""
     batch_head = tl.program_id(1)
     q_batch_head_offset = q_stride_h * (batch_head % num_heads) + q_stride_b * (batch_head // num_heads)
     kv_batch_head_offset = kv_stride_h * (batch_head % num_heads) + kv_stride_b * (batch_head // num_heads)
@@ -149,6 +151,7 @@ def attention_backward_dkdv(
     head_dim: tl.constexpr,
     causal: tl.constexpr,
 ):
+    """Compute one key/value tile of dK and probability-quantized dV."""
     batch_head = tl.program_id(1)
     q_batch_head_offset = q_stride_h * (batch_head % num_heads) + q_stride_b * (batch_head // num_heads)
     kv_batch_head_offset = kv_stride_h * (batch_head % num_heads) + kv_stride_b * (batch_head // num_heads)

@@ -14,6 +14,7 @@ from cudnn import Nvfp4AttentionQatBackward
 
 
 def _measure_ms(operation, warmup: int, iterations: int) -> float:
+    """Return the median CUDA-event latency after warmup."""
     for _ in range(warmup):
         operation()
     torch.cuda.synchronize()
@@ -31,6 +32,7 @@ def _measure_ms(operation, warmup: int, iterations: int) -> float:
 
 
 def main() -> None:
+    """Parse benchmark options and report executed QAT-backward throughput."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=16)

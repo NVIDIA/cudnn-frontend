@@ -4,36 +4,29 @@
 
 from __future__ import annotations
 
-from functools import reduce
-from operator import mul
+import math
 
 import torch
 import triton
 
 from ._kernels import attention_backward_dkdv, attention_backward_dq, attention_backward_preprocess
 from ._nvfp4 import fake_quantize_kv, fake_quantize_q
-
-
-def _numel(shape: tuple[int, ...]) -> int:
-    return reduce(mul, shape, 1)
-
-
-def _align_up(value: int, alignment: int = 16) -> int:
-    return (value + alignment - 1) // alignment * alignment
+from ._workspace import WorkspaceEntry, nvfp4_workspace_layout
 
 
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Return row-major strides for ``shape``."""
     strides = [1] * len(shape)
     for index in range(len(shape) - 2, -1, -1):
         strides[index] = strides[index + 1] * shape[index + 1]
     return tuple(strides)
 
 
-def _carve_tensor(workspace: torch.Tensor, offset: int, shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, int]:
-    offset = _align_up(offset)
-    nbytes = _numel(shape) * dtype.itemsize
-    tensor = workspace.narrow(0, offset, nbytes).view(dtype).view(shape)
-    return tensor, offset + nbytes
+def _workspace_tensor(workspace: torch.Tensor, entry: WorkspaceEntry) -> torch.Tensor:
+    """Bind a typed tensor view to one precomputed workspace entry."""
+    offset, shape, dtype = entry
+    nbytes = math.prod(shape) * dtype.itemsize
+    return workspace.narrow(0, offset, nbytes).view(dtype).view(shape)
 
 
 def compile_nvfp4_attention_qat_backward(
@@ -178,11 +171,8 @@ def run_nvfp4_attention_qat_backward(
     batch, heads, seqlen_q, head_dim = q.shape
     seqlen_kv = k.shape[2]
 
-    offset = 0
-    fake_q, offset = _carve_tensor(workspace, offset, tuple(q.shape), q.dtype)
-    fake_k, offset = _carve_tensor(workspace, offset, tuple(k.shape), k.dtype)
-    fake_v, offset = _carve_tensor(workspace, offset, tuple(v.shape), v.dtype)
-    delta, _ = _carve_tensor(workspace, offset, tuple(lse.shape), torch.float32)
+    entries, _ = nvfp4_workspace_layout(tuple(q.shape), tuple(k.shape), tuple(v.shape), tuple(lse.shape))
+    fake_q, fake_k, fake_v, delta = (_workspace_tensor(workspace, entry) for entry in entries)
 
     quant_block = 32
     q_grid = (triton.cdiv(seqlen_q, quant_block), batch * heads)

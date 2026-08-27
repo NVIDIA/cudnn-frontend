@@ -16,6 +16,7 @@ E4M3_MIN_SUBNORMAL = tl.constexpr(0.001953125)
 
 @triton.jit
 def _quantize_nvfp4(src_tensor, valid_src_mask):
+    """Pack a tile as E2M1 values with one E4M3 scale per 16 values."""
     block_rows: tl.constexpr = src_tensor.shape[0]
     block_cols: tl.constexpr = src_tensor.shape[1]
     scale_cols: tl.constexpr = block_cols // NVFP4_BLOCK_SIZE
@@ -58,6 +59,7 @@ def _quantize_nvfp4(src_tensor, valid_src_mask):
 
 @triton.jit
 def _dequantize_nvfp4(packed, scale, block_rows: tl.constexpr, block_cols: tl.constexpr, dst_dtype: tl.constexpr):
+    """Unpack E2M1 pairs and apply their E4M3 block scales."""
     tl.static_assert(block_cols % NVFP4_BLOCK_SIZE == 0)
     tl.static_assert(dst_dtype == tl.bfloat16 or dst_dtype == tl.float16 or dst_dtype == tl.float32)
 
@@ -114,6 +116,7 @@ def fake_quantize_q(
     block_m: tl.constexpr,
     head_dim: tl.constexpr,
 ):
+    """Fake-quantize one Q tile into workspace storage."""
     batch_head = tl.program_id(1)
     q_ptr += stride_h * (batch_head % num_heads) + stride_b * (batch_head // num_heads)
     fake_q_ptr += fake_stride_h * (batch_head % num_heads) + fake_stride_b * (batch_head // num_heads)
@@ -149,6 +152,7 @@ def fake_quantize_kv(
     block_n: tl.constexpr,
     head_dim: tl.constexpr,
 ):
+    """Fake-quantize matching K and V tiles into workspace storage."""
     batch_head = tl.program_id(1)
     input_offset = stride_h * (batch_head % num_heads) + stride_b * (batch_head // num_heads)
     output_offset = fake_stride_h * (batch_head % num_heads) + fake_stride_b * (batch_head // num_heads)

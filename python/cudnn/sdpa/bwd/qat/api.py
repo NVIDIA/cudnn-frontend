@@ -5,15 +5,16 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from contextlib import contextmanager
-from functools import reduce
-from operator import mul
 from typing import Iterator, Optional
 
 import cuda.bindings.driver as cuda
 import torch
 
 from cudnn.api_base import APIBase, TupleDict
+
+from ._workspace import nvfp4_workspace_layout
 
 _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0), (12, 1)}
 
@@ -27,21 +28,13 @@ def _stream_context(current_stream: Optional[cuda.CUstream], device: torch.devic
             return
         stream_handle = int(current_stream)
         torch_current = torch.cuda.current_stream(device)
-        if stream_handle in (0, 1, 2) or stream_handle == torch_current.cuda_stream:
+        if stream_handle == torch_current.cuda_stream:
             yield
             return
         torch_default = torch.cuda.default_stream(device)
         launch_stream = torch_default if stream_handle == torch_default.cuda_stream else torch.cuda.ExternalStream(stream_handle, device=device)
         with torch.cuda.stream(launch_stream):
             yield
-
-
-def _numel(shape: tuple[int, ...]) -> int:
-    return reduce(mul, shape, 1)
-
-
-def _align_up(value: int, alignment: int = 16) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 class Nvfp4AttentionQatBackward(APIBase):
@@ -65,6 +58,7 @@ class Nvfp4AttentionQatBackward(APIBase):
         is_causal: bool = False,
         softmax_scale: Optional[float] = None,
     ):
+        """Capture the tensor contract and compile-time attention options."""
         super().__init__()
         self._warn_experimental_api()
         self.q_desc = self._make_tensor_desc(sample_q, name="q")
@@ -79,6 +73,7 @@ class Nvfp4AttentionQatBackward(APIBase):
         self._launch_config: Optional[tuple[int, int, int, int, int]] = None
 
     def check_support(self) -> bool:
+        """Validate the contract and derive workspace and launch metadata."""
         activations = (
             self.q_desc,
             self.k_desc,
@@ -121,14 +116,12 @@ class Nvfp4AttentionQatBackward(APIBase):
             self.softmax_scale = 1.0 / math.sqrt(head_dim)
         self._value_error_if(not math.isfinite(self.softmax_scale) or self.softmax_scale <= 0.0, "softmax_scale must be finite and positive")
 
-        # Three BF16 fake-quantized activations plus one FP32 delta buffer.
-        offset = 0
-        for desc in (self.q_desc, self.k_desc, self.v_desc):
-            offset = _align_up(offset)
-            offset += _numel(desc.shape) * 2
-        offset = _align_up(offset)
-        offset += _numel(self.lse_desc.shape) * 4
-        self._workspace_bytes = _align_up(offset)
+        _, self._workspace_bytes = nvfp4_workspace_layout(
+            self.q_desc.shape,
+            self.k_desc.shape,
+            self.v_desc.shape,
+            self.lse_desc.shape,
+        )
 
         optimized_sm100 = capability == (10, 0) and not self.is_causal and seqlen_kv % 16 == 0
         block_size = 64 if optimized_sm100 else 32
@@ -164,12 +157,14 @@ class Nvfp4AttentionQatBackward(APIBase):
             )
 
     def scratch_workspace_bytes(self) -> int:
+        """Return the caller-owned workspace size required by ``execute``."""
         self._ensure_support_checked()
         assert self._workspace_bytes is not None
         return self._workspace_bytes
 
     @staticmethod
     def _validate_runtime_tensor(tensor: torch.Tensor, desc, name: str) -> None:
+        """Require a runtime tensor to match its plan-time descriptor."""
         if tuple(tensor.shape) != desc.shape:
             raise ValueError(f"{name} must have shape {desc.shape}, got {tuple(tensor.shape)}")
         if tensor.dtype != desc.dtype:
@@ -197,6 +192,7 @@ class Nvfp4AttentionQatBackward(APIBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        """Launch the compiled backward into caller-owned outputs and workspace."""
         if self._compiled_kernel is None:
             raise RuntimeError("Nvfp4AttentionQatBackward is not compiled")
 
@@ -258,7 +254,8 @@ class Nvfp4AttentionQatBackward(APIBase):
             )
 
 
-_OBJECT_CACHE: dict = {}
+_OBJECT_CACHE_LIMIT = 64
+_OBJECT_CACHE: OrderedDict[tuple[object, ...], Nvfp4AttentionQatBackward] = OrderedDict()
 
 
 def nvfp4_attention_qat_backward(
@@ -291,7 +288,9 @@ def nvfp4_attention_qat_backward(
         for tensor in (q_tensor, k_tensor, v_tensor, high_precision_o_tensor, do_tensor, lse_tensor)
     ) + (bool(is_causal),)
     op = _OBJECT_CACHE.get(key)
-    if op is None:
+    if op is not None:
+        _OBJECT_CACHE.move_to_end(key)
+    else:
         op = Nvfp4AttentionQatBackward(
             q_tensor,
             k_tensor,
@@ -305,6 +304,8 @@ def nvfp4_attention_qat_backward(
         op.check_support()
         op.compile()
         _OBJECT_CACHE[key] = op
+        if len(_OBJECT_CACHE) > _OBJECT_CACHE_LIMIT:
+            _OBJECT_CACHE.popitem(last=False)
 
     scale = 1.0 / math.sqrt(q_tensor.shape[-1]) if requested_scale is None else requested_scale
     with _stream_context(current_stream, q_tensor.device):
