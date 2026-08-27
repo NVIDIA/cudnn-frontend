@@ -306,6 +306,10 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+}
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
@@ -313,6 +317,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
+    "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -382,7 +388,8 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+        install_hint = _OPTIONAL_DEPENDENCY_INSTALL_HINTS.get(name, _OPTIONAL_DEPENDENCY_INSTALL_HINT)
+        raise ImportError(f"{name} requires optional dependencies. {install_hint}: {e}") from e
 
     globals()[name] = value
     return value

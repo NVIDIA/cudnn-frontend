@@ -81,6 +81,7 @@ To add a new frontend-only API, follow these steps:
 - `Block Sparse Attention (BSA)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
+- `NVFP4 Attention QAT Backward (Triton, D=128)`
 
 **In progress frontend-only APIs**:
 - GEMM + Dswiglu
