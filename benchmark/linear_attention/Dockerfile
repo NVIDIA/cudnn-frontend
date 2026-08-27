@@ -19,8 +19,11 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbs
 RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
 RUN pip install -v /workspace/cudnn-frontend
 
-# Install the Cutlass DSL runtime (cuDNN FROST engines) and FLA.
-RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi flash-linear-attention
+# Install the Cutlass DSL runtime (cuDNN FROST engines).
+RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi
+
+RUN git clone https://github.com/fla-org/flash-linear-attention.git
+RUN pip install -v /workspace/flash-linear-attention
 
 # Install FlashQLA from source.
 RUN git clone https://github.com/QwenLM/FlashQLA.git
