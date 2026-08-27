@@ -4,10 +4,13 @@
 """
 Indexer Backward — SM100 CuTe-DSL, 3-kernel design.
 
-Three kernels launched sequentially on the same stream:
+Three stream-ordered kernels; the first two use programmatic dependent launch
+to overlap independent prologue work while preserving their data dependencies:
 
   Kernel 1 (CuTe DSL): score_grad — compute sum_grad and grad_signal from
       AttnScore and IdxScore, overwrite AttnScore with grad_signal.
+      The BF16-output path also clears its FP32 dK accumulation scratch in the
+      same launch, avoiding a standalone memset kernel.
       Unsupported inputs trigger an exception before this stage launches.
   Kernel 2 (CuTe DSL): kernel_gemm — warp-specialized GEMM kernel (below).
       dK is accumulated in float32; the optimized path stages padded rows in
@@ -53,8 +56,11 @@ Barriers for kernel 2:
   mbar[17-18]:dS_half_0/1    (TopK=512 first-half dS publication)
 
 Each warp/warpgroup has its own independent loop, communicating via barriers.
-TopK=512 uses a grid-stride persistent CTA path capped at one CTA per SM; it
-retains TMEM across rows and consolidates per-row barrier initialization.
+TopK=128/256/384/512 can use a grid-stride persistent CTA path capped at one
+CTA per SM; it retains TMEM across rows and consolidates per-row barrier
+initialization.  The short-row variants select it only when the grid has more
+rows than SMs.  Stage phases are derived from the number of 128-wide blocks per
+row so the same schedule is valid for one through four blocks.
 TopK=1024/2048 retain the one-query-per-CTA 2-D grid.
 """
 
@@ -181,6 +187,52 @@ def _load_global_i32x4(gmem_ptr, *, loc=None, ip=None):
         Int32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
         Int32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
         Int32(llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _load_global_f32x4(gmem_ptr, *, loc=None, ip=None):
+    """Load four contiguous FP32 values with one aligned 16-byte load."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(
+            [T.f32(), T.f32(), T.f32(), T.f32()],
+        ),
+        [gmem_ptr.toint(loc=loc, ip=ip).ir_value()],
+        "ld.global.v4.f32 {$0,$1,$2,$3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _store_global_f32x4(gmem_ptr, value0, value1, value2, value3, *, loc=None, ip=None):
+    """Store four contiguous FP32 values with one aligned 16-byte store."""
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint(loc=loc, ip=ip).ir_value(),
+            Float32(value0).ir_value(loc=loc, ip=ip),
+            Float32(value1).ir_value(loc=loc, ip=ip),
+            Float32(value2).ir_value(loc=loc, ip=ip),
+            Float32(value3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.f32 [$0], {$1,$2,$3,$4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -334,6 +386,7 @@ class IndexerBackwardSm100:
         total_rows: int = 1,
         persistent_grid_size: int = 1,
         topk_indices_global: bool = True,
+        enable_score_pdl: bool = False,
     ):
         self.head_dim = head_dim
         self.heads = heads
@@ -342,6 +395,11 @@ class IndexerBackwardSm100:
         self.total_seqlen_k = total_seqlen_k
         self.total_rows = total_rows
         self.persistent_grid_size = persistent_grid_size
+        # Only the full wrapper guarantees that the immediate predecessor is
+        # ScoreGrad and that Q/K/top-k are independent of it. Direct
+        # ``gemm_only`` calls compile a non-PDL variant to preserve arbitrary
+        # stream-predecessor semantics.
+        self.enable_score_pdl = enable_score_pdl
         # When True (default, matches the public fwd convention), mTopkIdx
         # carries global KV ids (``b * seqlen_k + local``); the kernel uses
         # them as flat ids into the (B*S_k, D) K/dK view directly. When
@@ -359,12 +417,23 @@ class IndexerBackwardSm100:
         # H64 x I128 fragment map. Larger TopK values retain the full-dS drain
         # order because the additional barrier traffic regresses them.
         self.use_ds_half = topk == 512 and self.heads_padded == 64 and block_I == 128
-        self.use_tma_gather = topk_indices_global
-        self.use_persistent = topk == 512 and self.heads_padded == 64 and self.head_dim_padded == 128 and block_I == 128
-        # The cross-row K role is specialized around SM100 Gather4, whose
-        # coordinate tensor consumes the public global-id contract. Local-id
-        # inputs use the fully drained persistent-row fallback.
-        self.use_cross_row_persistent = self.use_persistent and topk_indices_global
+        self.use_persistent = (
+            topk in (128, 256, 384, 512)
+            and self.heads_padded == 64
+            and self.head_dim_padded == 128
+            and block_I == 128
+            # For the new short-row variants, at most one row per resident CTA
+            # leaves nothing to amortize and is 1-5% slower.  Preserve the
+            # established TopK=512 dispatch policy unchanged.
+            and (topk == 512 or total_rows > persistent_grid_size)
+        )
+        # Gather4 consumes explicit row coordinates, so short-row local IDs can
+        # be normalized to flat global IDs in registers before issue.  Keep the
+        # established TopK=512 local-ID fallback unchanged; the new policy is
+        # deliberately scoped to the 128/256/384 specializations evaluated
+        # here.
+        self.use_tma_gather = topk_indices_global or (self.use_persistent and topk in (128, 256, 384))
+        self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather
 
         # GEMM tilers (M, N, K) — cute.gemm, SMEM operands, TMEM acc
         # GEMM1: S[H,TileN] = Q[H,D] @ K[TileN,D].  A=Q K-major, B=K K-major
@@ -609,6 +678,7 @@ class IndexerBackwardSm100:
             cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_score_pdl,
         )
 
     @cute.kernel
@@ -640,6 +710,12 @@ class IndexerBackwardSm100:
         seqlen: Int32,
         batch_size: Int32,
     ):
+        # ScoreGrad launches this grid programmatically.  Serial rows wait at
+        # entry; the cross-row persistent path delays the wait until its load
+        # warp has issued the independent first-row Q TMA, allowing the Q/K
+        # prologue and barrier initialization to overlap score_grad safely.
+        if const_expr(self.enable_score_pdl and not self.use_cross_row_persistent):
+            cute.arch.griddepcontrol_wait()
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if const_expr(self.use_persistent):
@@ -1063,6 +1139,7 @@ class IndexerBackwardSm100:
                 seqlen_k,
                 tidx,
                 mbar,
+                Int32(0),
             )
 
         else:
@@ -1208,11 +1285,13 @@ class IndexerBackwardSm100:
         tidx,
         warp_idx,
     ):
-        """TopK=512 persistent CTA with dominance-safe role-local row loops.
+        """Persistent CTA with dominance-safe role-local row loops.
 
         Only scalar row/stage/phase values are loop carried.  In particular,
         the mutable tcgen05 MMA wrappers are cloned inside ``_mma_warp`` and
-        never escape warp 1's dynamic branch.
+        never escape warp 1's dynamic branch.  Barrier phases are derived
+        from ``num_topk_blocks`` so one-, two-, three-, and four-block rows can
+        share the same role decomposition without restarting the pipeline.
         """
         s_acc_shape = tmma1.partition_shape_C(self.gemm1_tiler[:2])
         s_acc_layout = tmma1.make_fragment_C(s_acc_shape).layout
@@ -1353,6 +1432,13 @@ class IndexerBackwardSm100:
                         mbar + MBAR_ROW_FREE_0 + parity,
                         Int32((epoch - 1) & 1),
                     )
+                if const_expr(self.enable_score_pdl) and it == 0:
+                    # grad_signal and the FP32 dK zeroing are produced by the
+                    # preceding score grid.  Q/K/top-k setup above is
+                    # independent; wait immediately before the first
+                    # dependent operand load.  GW_READY -> dS -> dK barriers
+                    # transitively keep the reduce role behind this wait.
+                    cute.arch.griddepcontrol_wait()
                 sGrad_row = cute.make_tensor(
                     sGrad_storage_ptr + parity * self.topk,
                     cute.make_layout((self.topk,), stride=(1,)),
@@ -1605,6 +1691,16 @@ class IndexerBackwardSm100:
                     mbar,
                     Int32(it),
                 )
+                # A short-row gather can reach the row-release barrier before
+                # compute/reduce have completed the preceding row that used
+                # the same operand parity.  Observe that older completion
+                # before publishing this row's gather arrival, otherwise the
+                # arrival can be counted in the still-open prior phase.
+                if const_expr(self.num_topk_blocks < 4) and it >= 2:
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_ROW_FREE_0 + parity,
+                        Int32((it // 2 - 1) & 1),
+                    )
                 cute.arch.mbarrier_arrive(
                     mbar + MBAR_ROW_FREE_0 + parity,
                 )
@@ -1643,6 +1739,7 @@ class IndexerBackwardSm100:
                     seqlen_k,
                     tidx,
                     mbar,
+                    Int32(it & 1),
                 )
                 cute.arch.mbarrier_arrive(
                     mbar + MBAR_ROW_FREE_0 + parity,
@@ -1933,6 +2030,7 @@ class IndexerBackwardSm100:
                 seqlen_k,
                 tidx,
                 mbar,
+                Int32(0),
             )
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
@@ -2095,8 +2193,8 @@ class IndexerBackwardSm100:
 
         dk_empty_0_phase = Int32(0)
         dk_empty_1_phase = Int32(0)
-        ds_ready_0_phase = Int32(0)
-        ds_ready_1_phase = Int32(0)
+        ds_ready_0_phase = Int32(persistent_row_phase if const_expr(((self.num_topk_blocks + 1) // 2) & 1) else 0)
+        ds_ready_1_phase = Int32(persistent_row_phase if const_expr((self.num_topk_blocks // 2) & 1) else 0)
         ds_half_0_phase = Int32(0)
         ds_half_1_phase = Int32(0)
         k_loaded_0_phase = Int32(0)
@@ -2104,15 +2202,17 @@ class IndexerBackwardSm100:
         k_loaded_2_phase = Int32(persistent_row_phase)
         is_first_dq = True
 
-        # The serial path reinitialized these barriers every row.  In the
-        # continuous path each TMEM stage completes twice per TopK=512 row:
-        # consume the second completion from row it-1 before its first reuse,
-        # then let the original in-row phase-0 waits cover blocks 2 and 3.
+        # The serial path reinitializes these barriers every row.  The
+        # continuous path derives the reuse wait from the number of prior uses
+        # of each TMEM stage.  This is the key distinction between one through
+        # four 128-wide blocks: odd block counts leave one stage toggled at the
+        # row boundary, while even counts may leave both stages aligned.
         if const_expr(self.use_cross_row_persistent):
             if row_iteration >= 1:
+                stage_0_uses = const_expr((self.num_topk_blocks + 1) // 2)
                 cute.arch.mbarrier_wait(
                     mbar + MBAR_DK_EMPTY_0,
-                    Int32(1),
+                    Int32((row_iteration * stage_0_uses - 1) & 1),
                 )
                 _tcgen05_fence_after_thread_sync()
 
@@ -2120,7 +2220,7 @@ class IndexerBackwardSm100:
         # Prologue: Fill block 0 (sK stage 0, TMEM stage 0)
         # =============================================================
         if const_expr(self.use_cross_row_persistent):
-            k_stage_0 = row_iteration % 3
+            k_stage_0 = (row_iteration * self.num_topk_blocks) % 3
             self._wait_rotating_k_loaded(mbar, row_iteration, 0)
         else:
             k_stage_0 = const_expr(0)
@@ -2152,23 +2252,25 @@ class IndexerBackwardSm100:
         for bi_offset in cutlass.range_constexpr(self.num_topk_blocks - 1):
             bi = bi_offset + 1
             if const_expr(self.use_cross_row_persistent):
-                fill_k_stage = (row_iteration + bi) % 3
-                drain_k_stage = (row_iteration + bi - 1) % 3
+                row_block_base = row_iteration * self.num_topk_blocks
+                fill_k_stage = (row_block_base + bi) % 3
+                drain_k_stage = (row_block_base + bi - 1) % 3
             else:
                 fill_k_stage = const_expr(bi % 3)
                 drain_k_stage = const_expr((bi - 1) % 3)
 
-            if const_expr(self.use_cross_row_persistent and bi == 1):
-                if row_iteration >= 1:
-                    cute.arch.mbarrier_wait(
-                        mbar + MBAR_DK_EMPTY_1,
-                        Int32(1),
-                    )
-                    _tcgen05_fence_after_thread_sync()
-
             # ------ Fill[bi]: GEMM1 for current block ------
             # DK_EMPTY: wait for TMEM slot reuse (2-stage, bi%2)
-            if bi >= 2:
+            if const_expr(self.use_cross_row_persistent):
+                stage_uses_per_row = const_expr((self.num_topk_blocks + 1) // 2 if bi % 2 == 0 else self.num_topk_blocks // 2)
+                prior_uses = row_iteration * stage_uses_per_row + bi // 2
+                if prior_uses > 0:
+                    cute.arch.mbarrier_wait(
+                        mbar + MBAR_DK_EMPTY_0 + bi % 2,
+                        Int32((prior_uses - 1) & 1),
+                    )
+                    _tcgen05_fence_after_thread_sync()
+            elif bi >= 2:
                 if bi % 2 == 0:
                     cute.arch.mbarrier_wait(mbar + MBAR_DK_EMPTY_0, dk_empty_0_phase)
                     dk_empty_0_phase ^= 1
@@ -2348,9 +2450,18 @@ class IndexerBackwardSm100:
         # =============================================================
         LAST_TMEM_STAGE = const_expr((self.num_topk_blocks - 1) % 2)
         if const_expr(self.use_cross_row_persistent):
-            last_sk_stage = (row_iteration + self.num_topk_blocks - 1) % 3
+            last_sk_stage = (row_iteration * self.num_topk_blocks + self.num_topk_blocks - 1) % 3
         else:
             last_sk_stage = const_expr((self.num_topk_blocks - 1) % 3)
+        if const_expr(self.use_cross_row_persistent and self.num_topk_blocks == 1):
+            # With one block there is no main-loop Drain[0], so acquire the dQ
+            # accumulator parity immediately before the epilogue drain.
+            if row_iteration >= 2:
+                cute.arch.mbarrier_wait(
+                    dq_free_barrier,
+                    Int32(dq_free_phase),
+                )
+                _tcgen05_fence_after_thread_sync()
         if LAST_TMEM_STAGE == 0:
             if const_expr(self.use_ds_half):
                 cute.arch.mbarrier_wait(
@@ -2636,8 +2747,12 @@ class IndexerBackwardSm100:
         )
 
         # ---- Per topk-block iteration (2-stage S/dS) ----
-        s_full_0_phase = Int32(0)
-        s_full_1_phase = Int32(0)
+        # Persistent rows do not necessarily leave both stage barriers at
+        # phase zero: a row has ceil(N/2) stage-0 blocks and floor(N/2)
+        # stage-1 blocks.  Fold that per-row completion count into the first
+        # wait, then keep the existing in-row toggle sequence.
+        s_full_0_phase = Int32(persistent_row_phase if const_expr(((self.num_topk_blocks + 1) // 2) & 1) else 0)
+        s_full_1_phase = Int32(persistent_row_phase if const_expr((self.num_topk_blocks // 2) & 1) else 0)
 
         dw_accum = cute.make_rmem_tensor(tSrS_shape, Float32)
         for ei in cutlass.range_constexpr(cute.size(dw_accum)):
@@ -2925,6 +3040,7 @@ class IndexerBackwardSm100:
         seqlen_k,
         tidx,
         mbar,
+        persistent_row_phase,
     ):
         """Reduce dK through padded SMEM and bulk FP32 global additions."""
         wg_tidx = tidx % self.WARPGROUP_SIZE
@@ -2947,8 +3063,11 @@ class IndexerBackwardSm100:
         thr_tmem_load_dk_1 = tiled_tmem_load_dk_1.get_slice(wg_tidx)
         tDkDk_t2r_1 = thr_tmem_load_dk_1.partition_S(tDkDk_1)
 
-        dk_full_0_phase = Int32(0)
-        dk_full_1_phase = Int32(0)
+        # A persistent row contributes ceil(N/2) completions to stage 0 and
+        # floor(N/2) to stage 1.  Start each wait at the parity left by all
+        # preceding rows; the in-row toggles below then remain unchanged.
+        dk_full_0_phase = Int32(persistent_row_phase if const_expr(((self.num_topk_blocks + 1) // 2) & 1) else 0)
+        dk_full_1_phase = Int32(persistent_row_phase if const_expr((self.num_topk_blocks // 2) & 1) else 0)
         for bi in cutlass.range(0, self.num_topk_blocks):
             tDKrDK = cute.make_rmem_tensor(tDKrDK_shape, Float32)
             if bi % 2 == 0:
@@ -3044,11 +3163,13 @@ class IndexerBackwardSm100:
 
         if const_expr(self.use_tma_gather):
             if const_expr(self.use_cross_row_persistent):
-                # Treat the four K blocks of every row as one flattened
-                # producer stream.  Rotating by global block number avoids
-                # the 0,1,2,0 -> 0,1,2,0 row-boundary restart and lets the
-                # gather role remain three blocks ahead across rows.
+                # Treat every row's K blocks as one flattened producer stream.
+                # Rotating by global block number avoids restarting stage 0 at
+                # row boundaries and lets gather remain three blocks ahead.
                 topk_row_ptr = mTopkIdx[seq_idx, None, batch_idx].iterator
+                batch_count = cute.size(mTopkIdx.shape[2])
+                seqlen_k_per_batch = seqlen_k // batch_count
+                batch_offset_l2g = batch_idx * seqlen_k_per_batch
                 K_STAGE_BYTES = const_expr(self.block_I * self.head_dim_padded * self.k_dtype.width // 8)
                 warp_in_wg = wg_tidx // self.WARP_SIZE
                 lane_in_warp = wg_tidx % self.WARP_SIZE
@@ -3073,10 +3194,16 @@ class IndexerBackwardSm100:
                         row0, row1, row2, row3 = _load_global_i32x4(
                             topk_row_ptr + idx_pos,
                         )
-                        row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
-                        row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
-                        row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
-                        row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
+                        if const_expr(self.topk_indices_global):
+                            row0 = row0 if row0 >= 0 and row0 < seqlen_k else Int32(-1)
+                            row1 = row1 if row1 >= 0 and row1 < seqlen_k else Int32(-1)
+                            row2 = row2 if row2 >= 0 and row2 < seqlen_k else Int32(-1)
+                            row3 = row3 if row3 >= 0 and row3 < seqlen_k else Int32(-1)
+                        else:
+                            row0 = row0 + batch_offset_l2g if row0 >= 0 and row0 < seqlen_k_per_batch else Int32(-1)
+                            row1 = row1 + batch_offset_l2g if row1 >= 0 and row1 < seqlen_k_per_batch else Int32(-1)
+                            row2 = row2 + batch_offset_l2g if row2 >= 0 and row2 < seqlen_k_per_batch else Int32(-1)
+                            row3 = row3 + batch_offset_l2g if row3 >= 0 and row3 < seqlen_k_per_batch else Int32(-1)
                         for stripe in cutlass.range_constexpr(2):
                             dst_offset = stage * self.block_I * self.head_dim_padded + stripe * self.block_I * 64 + n * 64
                             _tma_gather4_k_rows(
@@ -3304,14 +3431,35 @@ def indexer_backward_sm100(
 
 
 class ScoreGradSm100:
-    """CuTe DSL kernel for in-place score_grad precompute."""
+    """CuTe DSL kernel for in-place score_grad and optional dK zeroing."""
 
-    THREADS_PER_CTA = 256
     WARP_SIZE = 32
-    NUM_WARPS = THREADS_PER_CTA // WARP_SIZE
 
-    def __init__(self, topk: int):
+    def __init__(self, topk: int, zero_dk_f32: bool = False):
         self.topk = topk
+        self.zero_dk_f32 = zero_dk_f32
+        # For short TopK, each thread owns one aligned float4.  TopK=128 maps
+        # one row to a warp and packs 16 rows per CTA; TopK=256 packs four
+        # two-warp rows; TopK=384/512 pack two three-/four-warp rows.  These
+        # choices keep at least a few CTAs per SM on production grids while
+        # amortizing block scheduling. Larger rows retain the generic loop.
+        if topk == 128:
+            self.rows_per_cta = 16
+            self.threads_per_cta = 512
+        elif topk == 256:
+            self.rows_per_cta = 4
+            self.threads_per_cta = 256
+        elif topk == 384:
+            self.rows_per_cta = 2
+            self.threads_per_cta = 192
+        elif topk == 512:
+            self.rows_per_cta = 2
+            self.threads_per_cta = 256
+        else:
+            self.rows_per_cta = 1
+            self.threads_per_cta = 256
+        self.num_warps = self.threads_per_cta // self.WARP_SIZE
+        self.vectorized_short_row = topk in (128, 256, 384, 512)
 
     @cute.jit
     def __call__(
@@ -3319,6 +3467,7 @@ class ScoreGradSm100:
         mAttnScore: cute.Tensor,
         mIndexScore: cute.Tensor,
         mGradLoss: cute.Tensor,
+        mDkF32: cute.Tensor,
         grad_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
@@ -3328,61 +3477,205 @@ class ScoreGradSm100:
 
         seqlen = cute.size(mAttnScore.shape[0])
         batch_size = cute.size(mAttnScore.shape[2]) if cute.rank(mAttnScore.shape) > 2 else 1
-        self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, grad_scale).launch(
-            grid=(seqlen, batch_size, 1),
-            block=[self.THREADS_PER_CTA, 1, 1],
+        self.kernel_score_grad(
+            mAttnScore,
+            mIndexScore,
+            mGradLoss,
+            mDkF32,
+            grad_scale,
+        ).launch(
+            grid=(cute.ceil_div(seqlen, self.rows_per_cta), batch_size, 1),
+            block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=True,
         )
 
     @cute.kernel
-    def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, grad_scale: Float32 | float):
+    def kernel_score_grad(
+        self,
+        mAttnScore,
+        mIndexScore,
+        mGradLoss,
+        mDkF32,
+        grad_scale: Float32 | float,
+    ):
+        # Hint the next PDL-enabled GEMM launch at CTA entry. The dependent
+        # kernel waits before touching grad_signal/dK.  This score grid can
+        # itself launch over the preceding call's dK cast, so wait before any
+        # global access to keep reuse of score/dK buffers race-free.
+        cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_wait()
         tidx = cute.arch.thread_idx()[0]
-        seq_idx = cute.arch.block_idx()[0]
         batch_idx = cute.arch.block_idx()[1]
         # grad_scale is a compile/runtime scalar (loss_coeff / (b*sq));
         # grad_loss lives in a shape-(1,) f32 GPU tensor (from autograd).
         # Fold them together once per CTA — the compiler will hoist.
         grad_scale_f32 = Float32(grad_scale) * Float32(mGradLoss[0])
 
-        @cute.struct
-        class SharedStorage:
-            # One partial per warp. The former implementation staged all 128
-            # thread partials and reduced them serially in thread 0.
-            warp_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.NUM_WARPS], 128]
+        if const_expr(self.topk == 128):
+            lane_idx = tidx % self.WARP_SIZE
+            row_in_cta = tidx // self.WARP_SIZE
+            seq_idx = cute.arch.block_idx()[0] * self.rows_per_cta + row_in_cta
+            seqlen = cute.size(mAttnScore.shape[0])
+            if seq_idx < seqlen:
+                attn_ptr = mAttnScore[seq_idx, None, batch_idx].iterator + lane_idx * 4
+                index_ptr = mIndexScore[seq_idx, None, batch_idx].iterator + lane_idx * 4
+                target0, target1, target2, target3 = _load_global_f32x4(attn_ptr)
+                predict0, predict1, predict2, predict3 = _load_global_f32x4(index_ptr)
+                target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
+                target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
+                target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
+                target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
+                mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                g0 = -target0 * mask0 * grad_scale_f32
+                g1 = -target1 * mask1 * grad_scale_f32
+                g2 = -target2 * mask2 * grad_scale_f32
+                g3 = -target3 * mask3 * grad_scale_f32
+                sum_grad = cute.arch.warp_reduction_sum(g0 + g1 + g2 + g3)
+                _store_global_f32x4(
+                    attn_ptr,
+                    g0 - predict0 * sum_grad,
+                    g1 - predict1 * sum_grad,
+                    g2 - predict2 * sum_grad,
+                    g3 - predict3 * sum_grad,
+                )
+        elif const_expr(self.vectorized_short_row):
+            row_threads = const_expr(self.topk // 4)
+            warps_per_row = const_expr(row_threads // self.WARP_SIZE)
+            row_in_cta = tidx // row_threads
+            vector_in_row = tidx % row_threads
+            seq_idx = cute.arch.block_idx()[0] * self.rows_per_cta + row_in_cta
+            seqlen = cute.size(mAttnScore.shape[0])
+            row_is_valid = seq_idx < seqlen
 
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        warp_sums = storage.warp_sums.get_tensor(cute.make_layout((self.NUM_WARPS,), stride=(1,)))
+            # Initialize the tail-row values so every thread can participate
+            # in the CTA-wide barrier when TopK=256 has one leftover row.
+            predict0 = Float32(0.0)
+            predict1 = Float32(0.0)
+            predict2 = Float32(0.0)
+            predict3 = Float32(0.0)
+            g0 = Float32(0.0)
+            g1 = Float32(0.0)
+            g2 = Float32(0.0)
+            g3 = Float32(0.0)
+            if row_is_valid:
+                attn_ptr = mAttnScore[seq_idx, None, batch_idx].iterator + vector_in_row * 4
+                index_ptr = mIndexScore[seq_idx, None, batch_idx].iterator + vector_in_row * 4
+                target0, target1, target2, target3 = _load_global_f32x4(attn_ptr)
+                predict0, predict1, predict2, predict3 = _load_global_f32x4(index_ptr)
+                target0 = cute.arch.fmax(target0, Float32(CLIP_PROB_MIN))
+                target1 = cute.arch.fmax(target1, Float32(CLIP_PROB_MIN))
+                target2 = cute.arch.fmax(target2, Float32(CLIP_PROB_MIN))
+                target3 = cute.arch.fmax(target3, Float32(CLIP_PROB_MIN))
+                mask0 = Float32(1.0) if predict0 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask1 = Float32(1.0) if predict1 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask2 = Float32(1.0) if predict2 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                mask3 = Float32(1.0) if predict3 >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                g0 = -target0 * mask0 * grad_scale_f32
+                g1 = -target1 * mask1 * grad_scale_f32
+                g2 = -target2 * mask2 * grad_scale_f32
+                g3 = -target3 * mask3 * grad_scale_f32
 
-        local_sum = Float32(0.0)
-        for pos in cutlass.range(tidx, self.topk, self.THREADS_PER_CTA):
-            target = Float32(mAttnScore[seq_idx, pos, batch_idx])
-            predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-            target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-            log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-            local_sum += -target_eff * log_clip_mask * grad_scale_f32
+            @cute.struct
+            class ShortRowStorage:
+                warp_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.num_warps], 128]
 
-        warp_idx = tidx // self.WARP_SIZE
-        warp_sum = cute.arch.warp_reduction_sum(local_sum)
-        with cute.arch.elect_one():
-            warp_sums[warp_idx] = warp_sum
-        cute.arch.sync_threads()
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(ShortRowStorage)
+            warp_sums = storage.warp_sums.get_tensor(cute.make_layout((self.num_warps,), stride=(1,)))
+            warp_sum = cute.arch.warp_reduction_sum(g0 + g1 + g2 + g3)
+            warp_idx = tidx // self.WARP_SIZE
+            with cute.arch.elect_one():
+                warp_sums[warp_idx] = warp_sum
+            cute.arch.sync_threads()
 
-        sum_grad = Float32(0.0)
-        for warp in cutlass.range_constexpr(self.NUM_WARPS):
-            sum_grad += warp_sums[warp]
-        for pos in cutlass.range(tidx, self.topk, self.THREADS_PER_CTA):
-            target = Float32(mAttnScore[seq_idx, pos, batch_idx])
-            predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-            target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-            log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
-            g_i = -target_eff * log_clip_mask * grad_scale_f32
-            mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
+            if row_is_valid:
+                sum_grad = Float32(0.0)
+                for row_warp in cutlass.range_constexpr(warps_per_row):
+                    sum_grad += warp_sums[row_in_cta * warps_per_row + row_warp]
+                attn_ptr = mAttnScore[seq_idx, None, batch_idx].iterator + vector_in_row * 4
+                _store_global_f32x4(
+                    attn_ptr,
+                    g0 - predict0 * sum_grad,
+                    g1 - predict1 * sum_grad,
+                    g2 - predict2 * sum_grad,
+                    g3 - predict3 * sum_grad,
+                )
+        else:
+            seq_idx = cute.arch.block_idx()[0]
+
+            @cute.struct
+            class SharedStorage:
+                # One partial per warp. The former implementation staged all 128
+                # thread partials and reduced them serially in thread 0.
+                warp_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.num_warps], 128]
+
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            warp_sums = storage.warp_sums.get_tensor(cute.make_layout((self.num_warps,), stride=(1,)))
+
+            local_sum = Float32(0.0)
+            for pos in cutlass.range(tidx, self.topk, self.threads_per_cta):
+                target = Float32(mAttnScore[seq_idx, pos, batch_idx])
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                local_sum += -target_eff * log_clip_mask * grad_scale_f32
+
+            warp_idx = tidx // self.WARP_SIZE
+            warp_sum = cute.arch.warp_reduction_sum(local_sum)
+            with cute.arch.elect_one():
+                warp_sums[warp_idx] = warp_sum
+            cute.arch.sync_threads()
+
+            sum_grad = Float32(0.0)
+            for warp in cutlass.range_constexpr(self.num_warps):
+                sum_grad += warp_sums[warp]
+            for pos in cutlass.range(tidx, self.topk, self.threads_per_cta):
+                target = Float32(mAttnScore[seq_idx, pos, batch_idx])
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                g_i = -target_eff * log_clip_mask * grad_scale_f32
+                mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
+
+        if const_expr(self.zero_dk_f32):
+            # Fold the caller-owned FP32 dK scratch clear into score_grad.  Each
+            # lane writes float4 vectors after its row work; distributing the
+            # clear over the score grid removes a standalone memset launch and
+            # lets memory traffic from short/tail row CTAs overlap naturally.
+            grid_x = cute.arch.grid_dim()[0]
+            grid_y = cute.arch.grid_dim()[1]
+            flat_block = cute.arch.block_idx()[1] * grid_x + cute.arch.block_idx()[0]
+            num_blocks = grid_x * grid_y
+            vector_count = cute.size(mDkF32) // 4
+            for vector_idx in cutlass.range(
+                flat_block * self.threads_per_cta + tidx,
+                vector_count,
+                num_blocks * self.threads_per_cta,
+            ):
+                _store_global_f32x4(
+                    mDkF32.iterator + vector_idx * 4,
+                    Float32(0.0),
+                    Float32(0.0),
+                    Float32(0.0),
+                    Float32(0.0),
+                )
 
 
-def _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=None):
+def _score_grad_inplace_cute(
+    AttnScore,
+    IndexScore,
+    GradLoss,
+    grad_scale,
+    dIndexK_f32=None,
+    current_stream=None,
+):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D. ``to_cute_tensor``
@@ -3393,30 +3686,48 @@ def _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, curren
         GradLoss = GradLoss.reshape(1)
 
     _, _, topk = AttnScore.shape
-    compile_key = (topk,)
+    zero_dk_f32 = dIndexK_f32 is not None
+    compile_key = (topk, zero_dk_f32)
     s = _resolve_stream(current_stream)
     if compile_key not in _score_grad_cute_cache:
-        kernel_obj = ScoreGradSm100(topk=topk)
+        kernel_obj = ScoreGradSm100(
+            topk=topk,
+            zero_dk_f32=zero_dk_f32,
+        )
+        # The unused dummy keeps the two specializations on one kernel
+        # signature; const_expr removes every access in score-only mode.
+        dk_arg = dIndexK_f32 if zero_dk_f32 else GradLoss
         _score_grad_cute_cache[compile_key] = cute.compile(
             kernel_obj,
             to_cute_tensor(AttnScore),
             to_cute_tensor(IndexScore),
             to_cute_tensor(GradLoss),
+            to_cute_tensor(dk_arg),
             cutlass.Float32(float(grad_scale)),
             s,
             options=compile_options("--opt-level 2"),
         )
 
+    dk_arg = dIndexK_f32 if zero_dk_f32 else GradLoss
     _score_grad_cute_cache[compile_key](
         AttnScore,
         IndexScore,
         GradLoss,
+        dk_arg,
         cutlass.Float32(float(grad_scale)),
         s,
     )
 
 
-def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128, current_stream=None):
+def _score_grad_inplace(
+    AttnScore,
+    IndexScore,
+    GradLoss,
+    grad_scale,
+    block_I=128,
+    dIndexK_f32=None,
+    current_stream=None,
+):
     """Kernel 1: Compute clipped-log KL grad_signal from target/predict.
 
     Results overwrite AttnScore in-place with grad_signal. IndexScore remains
@@ -3443,7 +3754,14 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
     )
     if not can_use_cute:
         raise NotImplementedError("score_grad_inplace requires contiguous fp32 CUDA tensors with matching " "3D shapes; the torch fallback was removed")
-    _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=current_stream)
+    _score_grad_inplace_cute(
+        AttnScore,
+        IndexScore,
+        GradLoss,
+        grad_scale,
+        dIndexK_f32=dIndexK_f32,
+        current_stream=current_stream,
+    )
 
 
 def _build_cute_dsl_kernel(
@@ -3462,18 +3780,25 @@ def _build_cute_dsl_kernel(
     if torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("Requires SM100+")
     persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    kernel_obj = IndexerBackwardSm100(
-        head_dim=dim,
-        heads=heads,
-        block_I=block_I,
-        topk=topk,
-        total_seqlen_k=batch * seqlen_k,
-        total_rows=batch * seqlen,
-        persistent_grid_size=persistent_grid_size,
-        topk_indices_global=topk_indices_global,
-    )
 
-    compile_key = (
+    def _make_kernel(enable_score_pdl: bool):
+        return IndexerBackwardSm100(
+            head_dim=dim,
+            heads=heads,
+            block_I=block_I,
+            topk=topk,
+            total_seqlen_k=batch * seqlen_k,
+            total_rows=batch * seqlen,
+            persistent_grid_size=persistent_grid_size,
+            topk_indices_global=topk_indices_global,
+            enable_score_pdl=enable_score_pdl,
+        )
+
+    kernel_objects = {
+        False: _make_kernel(False),
+        True: _make_kernel(True),
+    }
+    compile_key_base = (
         batch,
         seqlen,
         seqlen_k,
@@ -3484,23 +3809,35 @@ def _build_cute_dsl_kernel(
         topk_indices_global,
     )
 
-    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=None):
-        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
+    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
+        """Lazy-compile the GEMM kernel (kernel 2)."""
+        compile_key = (*compile_key_base, enable_score_pdl)
         if compile_key not in _compile_cache:
             s = _resolve_stream(current_stream)
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
             _compile_cache[compile_key] = cute.compile(
-                kernel_obj,
+                kernel_objects[enable_score_pdl],
                 *cute_args,
                 cutlass.Float32(sm_scale),
                 s,
                 options=compile_options("--opt-level 2"),
             )
 
-    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
-        """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
+    def _run_gemm(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        TopkIndices,
+        enable_score_pdl: bool,
+        current_stream=None,
+    ):
         s = _resolve_stream(current_stream)
-        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=current_stream)
+        compile_key = (*compile_key_base, enable_score_pdl)
+        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, enable_score_pdl, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
             _compile_cache[compile_key](
                 IndexQ,
@@ -3515,35 +3852,106 @@ def _build_cute_dsl_kernel(
                 s,
             )
 
+    def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
+        """Run kernel 2 after arbitrary stream work (PDL overlap disabled)."""
+        _run_gemm(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            GradSignal,
+            TopkIndices,
+            False,
+            current_stream=current_stream,
+        )
+
+    def _run_gemm_after_score(
+        IndexQ,
+        Weights,
+        IndexK,
+        dIndexQ,
+        dWeights,
+        dIndexK_f32,
+        GradSignal,
+        TopkIndices,
+        current_stream=None,
+    ):
+        """Run kernel 2 as ScoreGrad's PDL-dependent consumer."""
+        _run_gemm(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK_f32,
+            GradSignal,
+            TopkIndices,
+            True,
+            current_stream=current_stream,
+        )
+
     def _run(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None):
         # ``grad_scale`` is a host scalar (Python float / 0-D fp32 tensor)
         # multiplied into ``score_grad`` as a runtime ``Float32`` arg —
         # changing it across calls does **not** trigger recompilation.
         score_grad = partial(_score_grad_inplace, block_I=block_I)
 
-        # Kernel 1: Compute grad_signal from scores (CuTe DSL only).
-        score_grad(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=current_stream)
-
         if dIndexK.dtype == torch.float32:
-            # fp32 output: the dK epilogue atomic-adds into this buffer, so it
-            # must start zeroed. Zero it internally on the selected stream
-            # (cheap; removes the fragile caller pre-zero contract) rather than
-            # trusting the caller. This zero-init is a promised stage of the
-            # execute pipeline (see the IndexerBackward docstring) and mirrors
-            # the SM90 backend and the DenseIndexerBackward fp32 paths, which
-            # zero their fp32 dK buffer the same way.
-            with _torch_stream_context(current_stream):
-                dIndexK.zero_()
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, TopkIndices, current_stream=current_stream)
+            # The dK epilogue atomic-adds into this caller-owned fp32 buffer,
+            # so clear it internally as promised by the public API. Fold the
+            # clear into ScoreGrad instead of launching a standalone memset,
+            # then let the PDL-dependent GEMM consume both grad_signal and dK.
+            score_grad(
+                AttnScore,
+                IndexScore,
+                GradLoss,
+                grad_scale,
+                dIndexK_f32=dIndexK,
+                current_stream=current_stream,
+            )
+            _run_gemm_after_score(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK,
+                AttnScore,
+                TopkIndices,
+                current_stream=current_stream,
+            )
         else:
-            # Need a separate f32 buffer for atomicAdd, then cast back to output dtype.
+            # Need a separate f32 buffer for atomicAdd.  ScoreGrad clears it in
+            # the same launch, then kernel 2 accumulates and the epilogue casts.
             with _torch_stream_context(current_stream):
-                dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=current_stream)
+                dIndexK_f32 = torch.empty_like(dIndexK, dtype=torch.float32)
+            score_grad(
+                AttnScore,
+                IndexScore,
+                GradLoss,
+                grad_scale,
+                dIndexK_f32=dIndexK_f32,
+                current_stream=current_stream,
+            )
+            _run_gemm_after_score(
+                IndexQ,
+                Weights,
+                IndexK,
+                dIndexQ,
+                dWeights,
+                dIndexK_f32,
+                AttnScore,
+                TopkIndices,
+                current_stream=current_stream,
+            )
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
     _run.score_grad = partial(_score_grad_inplace, block_I=block_I)
+    _run.score_grad_zero = partial(_score_grad_inplace, block_I=block_I)
     _run.gemm_only = _run_gemm_only
+    _run.gemm_after_score = _run_gemm_after_score
 
     return _run

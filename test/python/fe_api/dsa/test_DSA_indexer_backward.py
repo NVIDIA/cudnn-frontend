@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 import inspect
 import threading
@@ -2222,9 +2225,50 @@ def test_DSA_indexer_backward_wrapper_legacy_positional_call(
     assert torch.isfinite(d_index_q.float()).all()
     assert torch.isfinite(d_weights.float()).all()
     assert torch.isfinite(d_index_k.float()).all()
+
+
 @pytest.mark.L1
-def test_DSA_indexer_backward_sm100_local_oob_id_is_padding():
-    """A positive out-of-range local id must not alias the next batch."""
+def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
+    """Use persistence only once a CTA can amortize setup across rows."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    for topk in (128, 256, 384):
+        short = IndexerBackwardSm100(
+            128,
+            heads=64,
+            block_I=128,
+            topk=topk,
+            total_seqlen_k=512,
+            total_rows=sm_count,
+            persistent_grid_size=sm_count,
+            topk_indices_global=True,
+        )
+        long = IndexerBackwardSm100(
+            128,
+            heads=64,
+            block_I=128,
+            topk=topk,
+            total_seqlen_k=512,
+            total_rows=sm_count + 1,
+            persistent_grid_size=sm_count,
+            topk_indices_global=True,
+        )
+        assert not short.use_persistent
+        assert long.use_persistent
+        assert long.use_cross_row_persistent
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [128, 256, 384, 512])
+def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(topk):
+    """Packed tail rows preserve score math and clear the FP32 dK scratch."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("SM100+ required")
 
@@ -2234,16 +2278,27 @@ def test_DSA_indexer_backward_sm100_local_oob_id_is_padding():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    batch, seqlen_q, seqlen_k, heads, head_dim, topk = 2, 2048, 512, 64, 128, 512
-    index_q = torch.ones(batch, seqlen_q, heads, head_dim, device=device, dtype=torch.bfloat16)
-    index_k = torch.ones(batch, seqlen_k, head_dim, device=device, dtype=torch.bfloat16)
-    weights = torch.ones(batch, seqlen_q, heads, device=device, dtype=torch.bfloat16)
-    grad_signal = torch.ones(batch, seqlen_q, topk, device=device, dtype=torch.float32)
-    padding_ids = torch.full((batch, seqlen_q, topk), -1, device=device, dtype=torch.int32)
-    oob_ids = padding_ids.clone()
-    # Without the upper-bound check, this local batch-0 id becomes flat row
-    # ``seqlen_k`` and aliases batch 1's first K row.
-    oob_ids[0, :, 0] = seqlen_k
+    generator = torch.Generator(device=device).manual_seed(20260826 + topk)
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 151, max(512, topk), 64, 128
+    target = torch.softmax(
+        torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator),
+        dim=-1,
+    )
+    predict = torch.softmax(
+        torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator),
+        dim=-1,
+    )
+    target[:, ::23, ::31] = 0.0
+    predict[:, ::29, ::37] = 0.0
+    grad_loss = torch.tensor([0.7], device=device, dtype=torch.float32)
+    grad_scale = 0.13
+    actual = target.clone()
+    d_index_k_f32 = torch.full(
+        (batch, seqlen_k, head_dim),
+        7.0,
+        device=device,
+        dtype=torch.float32,
+    )
 
     kernel = indexer_backward_sm100(
         batch,
@@ -2254,24 +2309,185 @@ def test_DSA_indexer_backward_sm100_local_oob_id_is_padding():
         topk,
         sm_scale=head_dim**-0.5,
         block_I=128,
-        topk_indices_global=False,
+        topk_indices_global=True,
+    )
+    kernel.score_grad_zero(
+        actual,
+        predict,
+        grad_loss,
+        grad_scale,
+        dIndexK_f32=d_index_k_f32,
+    )
+    torch.cuda.synchronize()
+
+    clip_probability_min = math.exp(-100.0)
+    grad = -target.clamp_min(clip_probability_min) * (predict >= clip_probability_min) * (grad_scale * grad_loss.item())
+    expected = grad - predict * grad.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-7)
+    torch.testing.assert_close(d_index_k_f32, torch.zeros_like(d_index_k_f32), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [128, 256, 384])
+def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(topk):
+    """PDL prologue overlap remains ordered across back-to-back calls."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260827 + topk)
+    batch, seqlen_q, seqlen_k, heads, head_dim = 1, 149, 512, 64, 128
+    index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=torch.bfloat16, generator=generator).abs().mul_(0.1)
+    topk_indices = torch.randint(0, seqlen_k, (batch, seqlen_q, topk), device=device, dtype=torch.int32, generator=generator)
+    target = torch.softmax(torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator), dim=-1)
+    predict = torch.softmax(torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator), dim=-1)
+    grad_loss = torch.tensor([0.7], device=device, dtype=torch.float32)
+    grad_scale = 0.13
+    clip_probability_min = math.exp(-100.0)
+    grad = -target.clamp_min(clip_probability_min) * (predict >= clip_probability_min) * (grad_scale * grad_loss.item())
+    grad_signal = (grad - predict * grad.sum(dim=-1, keepdim=True)).contiguous()
+
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=head_dim**-0.5,
+        block_I=128,
+        topk_indices_global=True,
+    )
+    d_index_q_ref = torch.empty_like(index_q)
+    d_weights_ref = torch.empty_like(weights)
+    d_index_k_ref_f32 = torch.zeros_like(index_k, dtype=torch.float32)
+    kernel.gemm_only(
+        index_q,
+        weights,
+        index_k,
+        d_index_q_ref,
+        d_weights_ref,
+        d_index_k_ref_f32,
+        grad_signal,
+        topk_indices,
+    )
+    d_index_k_ref = d_index_k_ref_f32.to(torch.bfloat16)
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k)
+    for _ in range(2):
+        kernel(
+            index_q,
+            weights,
+            index_k,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            target.clone(),
+            predict,
+            topk_indices,
+            grad_loss,
+            grad_scale,
+        )
+    torch.cuda.synchronize()
+
+    for name, actual, expected in (
+        ("dQ", d_index_q, d_index_q_ref),
+        ("dW", d_weights, d_weights_ref),
+        ("dK", d_index_k, d_index_k_ref),
+    ):
+        assert torch.isfinite(actual.float()).all(), f"{name} contains NaN/Inf"
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2, msg=lambda msg, name=name: f"{name}: {msg}")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("topk", [128, 256, 384])
+@pytest.mark.parametrize("topk_indices_global", [True, False], ids=["global", "local"])
+def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(topk, topk_indices_global):
+    """Exercise cross-row barrier phases for one through three TopK blocks."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260825 + topk + int(topk_indices_global))
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 151, 512, 64, 128
+    sm_scale = head_dim**-0.5
+    index_q = torch.randn((batch, seqlen_q, heads, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    index_k = torch.randn((batch, seqlen_k, head_dim), device=device, dtype=torch.bfloat16, generator=generator)
+    weights = torch.randn((batch, seqlen_q, heads), device=device, dtype=torch.bfloat16, generator=generator).abs().mul_(0.1)
+    local_ids = torch.randint(0, seqlen_k, (batch, seqlen_q, topk), device=device, dtype=torch.int32, generator=generator)
+    local_ids[:, ::17, ::19] = -1
+    valid = local_ids >= 0
+    batch_offsets = torch.arange(batch, device=device, dtype=torch.int32)[:, None, None] * seqlen_k
+    global_ids = torch.where(valid, local_ids + batch_offsets, local_ids)
+    if topk_indices_global:
+        kernel_ids = global_ids.clone()
+        kernel_ids[0, 1, 3] = batch * seqlen_k
+    else:
+        kernel_ids = local_ids.clone()
+        kernel_ids[0, 1, 3] = seqlen_k
+    local_ids[0, 1, 3] = -1
+    global_ids[0, 1, 3] = -1
+    valid[0, 1, 3] = False
+    grad_signal = torch.randn((batch, seqlen_q, topk), device=device, dtype=torch.float32, generator=generator)
+
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.zeros_like(index_k, dtype=torch.float32)
+    kernel = indexer_backward_sm100(
+        batch,
+        seqlen_q,
+        seqlen_k,
+        heads,
+        head_dim,
+        topk,
+        sm_scale=sm_scale,
+        block_I=128,
+        topk_indices_global=topk_indices_global,
+    )
+    kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, kernel_ids)
+    torch.cuda.synchronize()
+
+    safe_ids = local_ids.clamp(min=0).long()
+    selected_k = torch.gather(
+        index_k[:, None].expand(-1, seqlen_q, -1, -1),
+        2,
+        safe_ids[..., None].expand(-1, -1, -1, head_dim),
+    ).float()
+    scores = torch.einsum("bqhd,bqtd->bqht", index_q.float(), selected_k) * sm_scale
+    d_scores = grad_signal[:, :, None, :] * weights.float()[:, :, :, None] * ((scores > 0) & valid[:, :, None, :])
+    d_index_q_ref = torch.einsum("bqht,bqtd->bqhd", d_scores, selected_k) * sm_scale
+    d_weights_ref = (grad_signal[:, :, None, :] * torch.relu(scores) * valid[:, :, None, :]).sum(dim=-1)
+    d_index_k_ref = torch.zeros_like(index_k, dtype=torch.float32)
+    d_index_k_contrib = torch.einsum("bqht,bqhd->bqtd", d_scores, index_q.float()) * sm_scale
+    d_index_k_ref.view(-1, head_dim).index_add_(
+        0,
+        global_ids.clamp(min=0).reshape(-1).long(),
+        d_index_k_contrib.reshape(-1, head_dim),
     )
 
-    def run(topk_ids):
-        d_index_q = torch.zeros_like(index_q)
-        d_weights = torch.zeros_like(weights)
-        d_index_k = torch.zeros_like(index_k, dtype=torch.float32)
-        kernel.gemm_only(index_q, weights, index_k, d_index_q, d_weights, d_index_k, grad_signal, topk_ids)
-        torch.cuda.synchronize()
-        return d_index_q, d_index_k, d_weights
-
-    padding_grads = run(padding_ids)
-    oob_grads = run(oob_ids)
-    for name, actual, expected in zip(("dQ", "dK", "dW"), oob_grads, padding_grads):
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=0.0,
-            atol=0.0,
-            msg=lambda msg, name=name: f"positive OOB local id changed {name}: {msg}",
-        )
+    for name, actual, expected in (
+        ("dQ", d_index_q.float(), d_index_q_ref),
+        ("dW", d_weights.float(), d_weights_ref),
+        ("dK", d_index_k, d_index_k_ref),
+    ):
+        actual_flat = actual.flatten()
+        expected_flat = expected.flatten()
+        cosine = F.cosine_similarity(actual_flat, expected_flat, dim=0).item()
+        rms_relative = ((actual_flat - expected_flat).square().mean().sqrt() / expected_flat.square().mean().sqrt().clamp_min(1e-12)).item()
+        assert torch.isfinite(actual_flat).all(), f"{name} contains NaN/Inf"
+        assert cosine >= 0.99, f"{name} cosine={cosine:.6f}"
+        assert rms_relative <= 0.02, f"{name} RMS-relative error={rms_relative:.6f}"
