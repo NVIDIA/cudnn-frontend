@@ -37,7 +37,7 @@ class Cfg:
 
     # --- warp assignments (16 warps total) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse / parts
-    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # dH prep / dV-dK-dQ epilogues / dq dot
+    COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # dstate prep / dV-dK-dQ epilogues / dq dot
     COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dK inter rescale / attn read / dGate K parts / dK fold
     TCGEN05_MMA_WARP_ID: int = 12
     TMA_QKV_WARP_ID: int = 13

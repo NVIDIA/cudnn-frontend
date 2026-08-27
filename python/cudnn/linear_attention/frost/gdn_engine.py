@@ -3,7 +3,7 @@
 
 """FROST GDN engine: GDN nodes on the chunked prefill kernel
 (``kernel/gdn_prefill_f16.py``) and GDN_BWD nodes on the chunked backward
-kernel (``kernel/gdn_bprop_f16.py``), Blackwell SM100/SM103, bf16/fp16.
+kernel (``kernel/gdn_bprop_f16.py``), SM100/SM103/SM107, bf16/fp16.
 The backward regenerates the per-chunk state checkpoints with the recompute kernel
 (``kernel/gdn_recompute_f16.py``) when the graph does not provide one."""
 
@@ -41,7 +41,7 @@ def build_gdn(graph):
 class GdnFrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node GDN graphs (THD layout).
 
-    Default GDN engine on SM100/SM103 (lowest GDN engine_id); declines
+    Default GDN engine on SM100/SM103/SM107 (lowest GDN engine_id); declines
     elsewhere so ranking falls back to ``GdnCuTileEngine``."""
 
     name = "gdn_frost"

@@ -818,7 +818,7 @@ def tcgen05_mma_warp(
         )
         n_local = write_end - compute_start
 
-        # ---- fused KK^T/QK^T pair 0: each member issued ahead of the loop ------------
+        # ---- fused KK^T/QK^T pair 0 --------------------------------------------------
         if n_local > 0:
             cg0_acc_idx = cg0_acc_index.idx
             bars.mb_cg0_acc_done[cg0_acc_idx].wait(cg0_acc_index.phase)
@@ -1913,7 +1913,7 @@ def build_descs_body(
 
 
 @cute.kernel
-def prologue_kernel(
+def frost_gdn_prefill_prologue(
     order_gen: cutlass.Constexpr[bool],
     has_scheduler: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
@@ -2062,7 +2062,7 @@ def prologue(
             checkpoint_view, box_dims=(checkpoint_elements_per_128b, d_k_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz128
         )
 
-    prologue_kernel(
+    frost_gdn_prefill_prologue(
         order_gen,
         has_scheduler,
         b_t,
@@ -2249,7 +2249,7 @@ def host(
     # ---- launch ----------------------------------------------------------------------
     grid_shape = (cfg.max_active_clusters, 1, 1)
 
-    kernel(
+    frost_gdn_prefill(
         cfg,
         gate,
         a_log,
@@ -2281,7 +2281,7 @@ def host(
 
 
 @cute.kernel
-def kernel(
+def frost_gdn_prefill(
     cfg: cutlass.Constexpr,
     mGate: cute.Tensor,
     mA_log: Optional[cute.Tensor],
@@ -3188,3 +3188,7 @@ def run_prefill(
         tensormap_workspace,
         cu_stream,
     )
+
+
+frost_gdn_prefill_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_gdn_prefill.set_name_prefix("cudnn", remove_cutlass_symbol=True)

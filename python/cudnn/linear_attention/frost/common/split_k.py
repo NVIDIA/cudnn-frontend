@@ -251,7 +251,7 @@ def near_boundary(c, span, num_blocks):
 
 
 @cute.kernel
-def scan_kernel(
+def frost_split_k_scan(
     b_t: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
@@ -378,7 +378,7 @@ def scan_kernel(
 
 
 @cute.kernel
-def scan_scalar_kernel(
+def frost_split_k_scan_scalar(
     b_t: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
@@ -466,7 +466,7 @@ def scan_scalar_kernel(
 
 
 @cute.kernel
-def walk_kernel(
+def frost_split_k_walk(
     b_t: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
     n_heads_out: cutlass.Int32,
@@ -741,7 +741,7 @@ def launch(
 ) -> None:
     if cutlass.const_expr(split):
         if cutlass.const_expr(gate_channels > 0):
-            scan_kernel(
+            frost_split_k_scan(
                 b_t,
                 log_gate,
                 safe_gate,
@@ -765,7 +765,7 @@ def launch(
                 stream=stream,
             )
         else:
-            scan_scalar_kernel(
+            frost_split_k_scan_scalar(
                 b_t,
                 log_gate,
                 safe_gate,
@@ -786,7 +786,7 @@ def launch(
                 block=(SCAN_THREADS, 1, 1),
                 stream=stream,
             )
-        walk_kernel(
+        frost_split_k_walk(
             b_t,
             overhead_chunks,
             n_heads_out,
@@ -1019,3 +1019,8 @@ def build_split_table(
         n_scan_ctas,
         n_walk_ctas,
     )
+
+
+frost_split_k_scan.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_split_k_scan_scalar.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_split_k_walk.set_name_prefix("cudnn", remove_cutlass_symbol=True)
