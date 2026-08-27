@@ -12,6 +12,7 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -39,6 +40,7 @@ def flash_attn_bwd_sm100(
     topk_length: Optional[torch.Tensor] = None,
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
     current_stream=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
@@ -58,6 +60,7 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
+        deterministic: use the bounded-wave deterministic H64 kernel
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -68,6 +71,7 @@ def flash_attn_bwd_sm100(
     # head_dim in {512, 576}; any other value indexes shared memory out of
     # bounds and crashes inside the kernel.
     assert head_dim in (512, 576), f"head_dim must be 512 or 576, got {head_dim}"
+    assert not deterministic or num_head == 64, f"deterministic SM100 DSA backward requires H64, got H{num_head}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
@@ -158,7 +162,8 @@ def flash_attn_bwd_sm100(
             device=device,
         )
 
-        ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+        dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+        ws_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
             total_S_kv,
             head_dim,
             batch_size,
@@ -176,7 +181,7 @@ def flash_attn_bwd_sm100(
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length, deterministic)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -207,7 +212,8 @@ def flash_attn_bwd_sm100(
             # Keep this constructor and class byte-for-byte on the tuned H64
             # path; embedding H16 conditionals in the same CuTe DSL class
             # measurably perturbs H64 code generation.
-            kernel_obj = FlashAttentionDSABackwardSm100(
+            kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+            kernel_obj = kernel_cls(
                 element_dtype=dtype,
                 head_dim=head_dim,
                 head_dim_v=head_dim_v,

@@ -77,6 +77,90 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
+            FlashAttentionDSABackwardSm100Deterministic,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    assert issubclass(FlashAttentionDSABackwardSm100Deterministic, FlashAttentionDSABackwardSm100)
+    assert FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards == 128
+    assert FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size == 8
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=419)
+@pytest.mark.parametrize("head_dim", [512, 576])
+def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_dim):
+    """Three waves, including an empty row, must be bitwise reproducible."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 257, 256, 64
+    topk = 64
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
+    topk_length[128] = 0
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+
+    def run():
+        result = DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            deterministic=True,
+        )
+        torch.cuda.synchronize()
+        return result["dq"].clone(), result["dkv"].clone(), result["d_sink"].clone()
+
+    reference = run()
+    for _ in range(3):
+        actual = run()
+        assert all(torch.equal(lhs, rhs) for lhs, rhs in zip(actual, reference))
+
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        *reference,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_attention_backward_params
 def test_DSA_sparse_attention_backward_wrapper(
@@ -949,6 +1033,16 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
         sample_topk_length=topk_length,
     )
     assert SparseAttentionBackward(**good).check_support()
+    assert SparseAttentionBackward(**good, deterministic=True).check_support()
+
+    deterministic_h32 = dict(good)
+    deterministic_h32["sample_q"] = q[:, :32].contiguous()
+    deterministic_h32["sample_out"] = out[:, :32].contiguous()
+    deterministic_h32["sample_dout"] = dout[:, :32].contiguous()
+    deterministic_h32["sample_lse"] = lse[:, :32].contiguous()
+    deterministic_h32["sample_attn_sink"] = attn_sink[:32].contiguous()
+    with pytest.raises(ValueError, match="requires the SM100 H64 path"):
+        SparseAttentionBackward(**deterministic_h32, deterministic=True).check_support()
 
     fp16_good = dict(good)
     for name in ("sample_q", "sample_kv", "sample_out", "sample_dout"):

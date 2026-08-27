@@ -35,6 +35,7 @@ class SparseAttentionBackward(APIBase):
         sample_topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
+        deterministic: bool = False,
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -47,6 +48,7 @@ class SparseAttentionBackward(APIBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
+        self.deterministic = bool(deterministic)
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -107,6 +109,10 @@ class SparseAttentionBackward(APIBase):
         # coordinates derived from Q, so a mismatched shape silently reads or
         # writes out of place at execution time instead of failing.
         total_s_q, num_heads, head_dim = self.q_desc.shape
+        self._value_error_if(
+            self.deterministic and (major != 10 or num_heads != 64),
+            f"deterministic DSA backward requires the SM100 H64 path, found SM{major} H{num_heads}",
+        )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
         # layout that indexes shared memory out of bounds and crashes.
@@ -202,6 +208,7 @@ class SparseAttentionBackward(APIBase):
             topk_length=topk_length,
             dq=dq,
             dkv=dkv,
+            deterministic=self.deterministic,
             current_stream=current_stream,
         )
 
@@ -222,12 +229,14 @@ def sparse_attention_backward_wrapper(
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
     block_tile: int = 64,
+    deterministic: bool = False,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
-    ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+    ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
+    ``deterministic=True`` for bitwise-reproducible H64 gradients on SM100.
     """
     key = (
         q.dtype,
@@ -241,6 +250,7 @@ def sparse_attention_backward_wrapper(
         topk_length is not None,
         int(block_tile),
         softmax_scale,
+        bool(deterministic),
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -255,6 +265,7 @@ def sparse_attention_backward_wrapper(
             sample_topk_length=topk_length,
             softmax_scale=softmax_scale,
             block_tile=block_tile,
+            deterministic=deterministic,
         )
         assert obj.check_support()
         obj.compile()
