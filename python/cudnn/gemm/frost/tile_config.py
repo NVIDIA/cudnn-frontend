@@ -869,22 +869,30 @@ def select_config(
     # Multi-GEMM shares the 256-wide N budget across the parallel GEMMs.
     cta_n_max = max(32, min(256, _floor_pow2(256 // x)))
 
-    cta_m = 128
+    # --- tile ---------------------------------------------------------------
+    rep_m = min(_floor_pow2(max(1, M)), 4096)
+    # M-starved problems (M <= 128: at most one 128-tall tile row) are occupancy-
+    # bound, and the sweep shows 64-tall / narrow tiles winning them outright, so
+    # the 64-tall family joins the scan and the wide-N restriction steps aside
+    # there; taller problems keep the single 128-tall wide family. Restricted to
+    # the single-GEMM row-major-B path the sweep characterised.
+    cta_m_choices = (64, 128) if (M <= 128 and x == 1 and not block_scale and not b_n_major) else (128,)
+    tiles = []
+    for tm in cta_m_choices:
+        choices = [c for c in (32, 64, 128, 256) if c <= cta_n_max]
+        if block_scale or (N >= 512 and M > 128):
+            # Widening beat every narrower tile family across the measured range —
+            # where M supplies more than one 128-tall tile row. M-starved problems
+            # keep the full tile list rather than extrapolating.
+            wide = [c for c in choices if c >= 128]
+            if wide:
+                choices = wide
+        tiles += [(tm, c) for c in choices]
+    cta_m, cta_n = max(tiles, key=lambda t: _tile_score(rep_m, N, K, t[0], t[1], sm))
+
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
     # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
     cta_group = 1 if x > 1 else (2 if M > cta_m else 1)
-
-    # --- tile ---------------------------------------------------------------
-    rep_m = min(_floor_pow2(max(1, M)), 4096)
-    choices = [c for c in (32, 64, 128, 256) if c <= cta_n_max]
-    if block_scale or N >= 512:
-        # Widening beat every narrower tile family across the measured range. Applied
-        # only for N >= 512, the range that was characterised; narrower problems keep
-        # the full tile list rather than extrapolating.
-        wide = [c for c in choices if c >= 128]
-        if wide:
-            choices = wide
-    cta_n = max(choices, key=lambda c: _tile_score(rep_m, N, K, cta_m, c, sm))
 
     if block_scale:
         cta_m = max(cta_m, 128)
@@ -914,7 +922,20 @@ def select_config(
     pool = [g for g in _CLUSTERS_1D + _CLUSTERS_2D if not _hang_prone(cta_m, cta_n, g[0], g[1])]
     if cta_group == 2:
         pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cga_size_m % 2 == 0
-    cgrp_m, cgrp_n = max(pool, key=lambda g: _cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm))
+    # _cluster_score depends only on the wave count, so shapes tie in whole groups
+    # and the winner used to be whichever came first in the pool. Break those ties
+    # with the sweep's measured preference instead: A-multicast x4 for 1-CTA
+    # non-block-scale picks, and 2x4 / 2x2 for block-scale 2-CTA picks once the
+    # grid runs deep (> 4 waves); everything else keeps the old order.
+    ctas = -(-M // (cta_m * cta_group)) * cta_group * -(-N // cta_n)
+    if cta_group == 1 and not block_scale and x == 1:
+        prefer = ((1, 4),)
+    elif cta_group == 2 and block_scale and ctas > 4 * sm:
+        prefer = ((2, 4), (2, 2))
+    else:
+        prefer = ()
+    rank = {g: len(prefer) - i for i, g in enumerate(prefer)}
+    cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), rank.get(g, 0)))
 
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
     return by_name(name)
