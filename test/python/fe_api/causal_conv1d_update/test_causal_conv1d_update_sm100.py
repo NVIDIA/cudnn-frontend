@@ -80,6 +80,60 @@ def test_nonzero_state_across_consecutive_steps():
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("n_channels", [2048, 4096])
+def test_n128_no_index_row_batch_specialization(n_channels):
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(29 + n_channels)
+    n_rows = 128
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    expected_state = state.clone()
+
+    # Use the public cached route for two updates.  The host-only contract test
+    # independently proves that these two descriptors select rows_per_cta=2.
+    for _ in range(2):
+        x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+        expected_output, expected_state = _reference_step(x, weight, expected_state)
+        output = causal_conv1d_update(x, weight, state)
+        torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+        _assert_state_bits_equal(state, expected_state)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("n_channels", [2048, 4096])
+def test_n128_row_batch_state_shift_is_bitwise(n_channels):
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(41 + n_channels)
+    n_rows = 128
+
+    # Exercise arbitrary BF16 payloads through the specialized public/cache
+    # route.  Ignore output: NaN payloads make only the state mutation contract
+    # meaningful, and that contract must remain bitwise over repeated steps.
+    state_bits = torch.randint(
+        -(2**15),
+        2**15,
+        (n_rows, n_channels, 4),
+        device="cuda",
+        dtype=torch.int16,
+    )
+    state = state_bits.view(torch.bfloat16)
+    weight = torch.zeros(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    expected_bits = state_bits.clone()
+
+    for _ in range(2):
+        x_bits = torch.randint(
+            -(2**15),
+            2**15,
+            (n_rows, n_channels),
+            device="cuda",
+            dtype=torch.int16,
+        )
+        causal_conv1d_update(x_bits.view(torch.bfloat16), weight, state)
+        expected_bits = torch.cat((expected_bits[..., 1:], x_bits.unsqueeze(-1)), dim=-1)
+        torch.testing.assert_close(state.view(torch.int16), expected_bits, rtol=0, atol=0)
+
+
+@torch.no_grad()
 def test_paged_state_slots_and_untouched_rows():
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(1)

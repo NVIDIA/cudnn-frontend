@@ -97,6 +97,55 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
+    assert api.rows_per_cta == 1
+
+
+@pytest.mark.parametrize("n_channels", [2048, 4096])
+def test_n128_no_index_selects_two_row_specialization(monkeypatch, n_channels):
+    cls = _api_class()
+    api = cls(
+        *_inputs(
+            n_rows=128,
+            n_channels=n_channels,
+            n_slots=128,
+            indexed=False,
+        )
+    )
+    _mock_cuda_contract(monkeypatch, api)
+
+    assert api.check_support()
+    assert api.rows_per_cta == 2
+
+
+@pytest.mark.parametrize(
+    "n_rows,n_channels,indexed",
+    [
+        (32, 2048, False),
+        (128, 1024, False),
+        (128, 2048, True),
+        (128, 4096, True),
+    ],
+    ids=["different-rows", "different-width", "indexed-d2048", "indexed-d4096"],
+)
+def test_row_batch_specialization_declines_unmeasured_or_indexed_signatures(
+    monkeypatch,
+    n_rows,
+    n_channels,
+    indexed,
+):
+    cls = _api_class()
+    api = cls(
+        *_inputs(
+            n_rows=n_rows,
+            n_channels=n_channels,
+            n_slots=n_rows + int(indexed),
+            indexed=indexed,
+        )
+    )
+    _mock_cuda_contract(monkeypatch, api)
+
+    assert api.check_support()
+    assert api.rows_per_cta == 1
 
 
 @pytest.mark.parametrize(

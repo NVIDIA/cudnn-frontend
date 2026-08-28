@@ -43,6 +43,14 @@ general Mamba causal-convolution interface. The indexed path is provided for
 functional paged-state support; its duplicate-index validation has not been
 performance-characterized as a fast path.
 
+For the two measured Qwen3.5 decode signatures `N=128, D=2048` and
+`N=128, D=4096`, an unindexed call compiles a two-row CTA specialization. It
+loads each channel's four-tap weight once and reuses it across the two rows,
+while issuing both rows' state/input loads before arithmetic. Indexed calls and
+every other shape retain the original one-row kernel, including its device-side
+index validation and channel-tail handling. This route is an internal schedule
+choice; it does not change the public API or cache key.
+
 ## High-level wrapper
 
 The standard FE-OSS wrapper allocates the output and returns a `TupleDict`:
@@ -104,6 +112,23 @@ public `causal_conv1d_update` contract from Dao-AILab/causal-conv1d at revision
 `cd81f0413cad2fc1e6f17e785ac39f59aae690cd` (BSD-3-Clause). No source from
 either project is included. The implementation uses CUTLASS/CuTe DSL, inline
 PTX, and in-tree NVIDIA FROST primitives.
+
+The two-row scheduling idea was selected from audited internal Kernel Factory
+candidate `73d90c7f...`, but that standalone source was not copied into this
+module. The FE specialization is independently implemented on top of the
+existing native inline-PTX path and keeps FE's architecture, alignment, alias,
+index, and cache contracts.
+
+On ComputeLab job `3999943` (B200 SM100, driver `610.57.04`, CUDA `13.0`,
+PyTorch `2.13.0+cu130`, CUTLASS DSL `4.7.0`), an interleaved same-process CUPTI
+run measured the FE specialization against the preceding FE implementation at
+`2.304` versus `2.464` microseconds for `N=128, D=2048`, and `2.848` versus
+`3.328` microseconds for `N=128, D=4096` (201 samples per arm and shape). Paired
+median speedups were `1.134x` and `1.170x`; the `D=2048:D=4096` 2:1 weighted
+geometric mean was `1.146x`. The raw result SHA-256 is
+`fa0d3e7d5fc2d7a0ad2f53362ddf21932dfec109cde119d9dadf4e7fdb9e4cbd`.
+These are direct kernel-active measurements, not single-node CUDA-graph replay
+or end-to-end model latency.
 
 Use `benchmark/causal_conv1d_update_sm100.py` on the target GPU for route-proof,
 correctness, and interleaved comparison against FLA. Performance measurements

@@ -15,7 +15,11 @@ import torch
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
-from .kernel import CausalConv1dUpdateKernel
+from .kernel import (
+    CausalConv1dUpdateKernel,
+    CausalConv1dUpdateRowBatchKernel,
+    select_rows_per_cta,
+)
 
 _API_CACHE = {}
 _API_CACHE_LOCK = threading.Lock()
@@ -118,6 +122,7 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = None
         self.n_channels = None
         self.n_slots = None
+        self.rows_per_cta = None
 
     @staticmethod
     def _require_rank(desc: TensorDesc, rank: int, name: str) -> None:
@@ -231,6 +236,11 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = n_rows
         self.n_channels = n_channels
         self.n_slots = n_slots
+        self.rows_per_cta = select_rows_per_cta(
+            n_rows,
+            n_channels,
+            self.state_indices_desc is not None,
+        )
         self._is_supported = True
         return True
 
@@ -246,7 +256,7 @@ class CausalConv1dUpdateSm100(APIBase):
         fake_state_indices = self._make_fake_cute_tensor_from_desc(self.state_indices_desc, assumed_align=4)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        kernel = CausalConv1dUpdateKernel()
+        kernel = CausalConv1dUpdateRowBatchKernel() if self.rows_per_cta == 2 else CausalConv1dUpdateKernel()
         # CuTe DSL targets the current CUDA device.  Honor the sample tensor's
         # device even when a multi-GPU caller has another device current.
         with torch.cuda.device(self.x_desc.device):
