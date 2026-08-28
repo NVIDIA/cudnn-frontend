@@ -31,7 +31,20 @@ except (ImportError, OSError):
     pass
 
 import cudnn
-import torch
+
+# cudart via cuda-python instead of torch: torch is optional, and startup must
+# not create a CUDA context so per-worker CUDA_VISIBLE_DEVICES routing works.
+import cuda.bindings.driver as cuda_driver
+import cuda.bindings.runtime as cudart
+
+
+def _cudart_call(fn, *args):
+    err, *rest = fn(*args)
+    if int(err) != 0:
+        raise RuntimeError(
+            f"{fn.__name__} failed: {cudart.cudaGetErrorString(err)[1].decode()}"
+        )
+    return rest[0] if len(rest) == 1 else tuple(rest)
 
 # fmt: off
 
@@ -84,13 +97,15 @@ def _dead_cuda_context():
     # A sticky context error is returned by every later CUDA call, so one
     # synchronize is both the cheapest and the most complete probe; it also
     # surfaces async faults the test itself swallowed.
-    if not torch.cuda.is_initialized():
+    # Probe only if this thread already holds a context; cudaDeviceSynchronize
+    # would otherwise create one in a worker that never touched the GPU.
+    err, ctx = cuda_driver.cuCtxGetCurrent()
+    if int(err) != 0 or int(ctx) == 0:
         return None
-    try:
-        torch.cuda.synchronize()
-    except Exception as e:
-        return str(e).strip().splitlines()[0]
-    return None
+    (err,) = cudart.cudaDeviceSynchronize()
+    if int(err) == 0:
+        return None
+    return cudart.cudaGetErrorString(err)[1].decode()
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -142,19 +157,26 @@ def _under_xdist():
     return int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1")) > 1
 
 
+def _torch_empty_cache():
+    # No-op unless torch (and thus its caching allocator) is loaded.
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.cuda.empty_cache()
+
+
 def _wait_for_free_gpu_memory(context):
     # Best effort: proceed after the timeout even if the floor was not reached,
     # so a worker can never deadlock the run; the allocation itself then either
     # succeeds or fails with the usual OOM.
-    free, total = torch.cuda.mem_get_info()
+    free, total = _cudart_call(cudart.cudaMemGetInfo)
     floor = _MEM_GATE_FRACTION * total
     if free >= floor:
         return
-    torch.cuda.empty_cache()
+    _torch_empty_cache()
     deadline = time.monotonic() + _MEM_GATE_TIMEOUT_S
     waited = False
     while time.monotonic() < deadline:
-        free, _ = torch.cuda.mem_get_info()
+        free, _ = _cudart_call(cudart.cudaMemGetInfo)
         if free >= floor:
             break
         waited = True
@@ -171,7 +193,8 @@ def _wait_for_free_gpu_memory(context):
 
 def _is_cuda_oom(exc):
     # torch.OutOfMemoryError only exists on newer torch; the cuda alias is old.
-    return isinstance(exc, torch.cuda.OutOfMemoryError)
+    torch = sys.modules.get("torch")
+    return torch is not None and isinstance(exc, torch.cuda.OutOfMemoryError)
 
 
 @pytest.fixture(autouse=True)
@@ -180,7 +203,7 @@ def _gpu_memory_gate(request):
         _wait_for_free_gpu_memory(request.node.name)
     yield
     if _under_xdist():
-        torch.cuda.empty_cache()
+        _torch_empty_cache()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -191,7 +214,7 @@ def pytest_runtest_call(item):
     # OOM under xdist is usually transient sibling-worker pressure, not a
     # property of this test: release our cache, wait for the device, retry once.
     print(f"[mem-gate] {item.nodeid}: OOM under xdist, retrying once", file=sys.__stderr__, flush=True)
-    torch.cuda.empty_cache()
+    _torch_empty_cache()
     _wait_for_free_gpu_memory(item.nodeid)
     try:
         item.runtest()
@@ -211,11 +234,12 @@ def cudnn_handle():
         return
     
     # Create CUDA stream and graph objects
-    stream = torch.cuda.Stream()
+    stream = _cudart_call(cudart.cudaStreamCreateWithFlags, cudart.cudaStreamNonBlocking)
     cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(handle=cudnn_handle, stream=stream.cuda_stream)
+    cudnn.set_stream(handle=cudnn_handle, stream=int(stream))
     yield cudnn_handle
     cudnn.destroy_handle(cudnn_handle)
+    _cudart_call(cudart.cudaStreamDestroy, stream)
 
 
 # =================== PyTest Hooks =====================
@@ -225,7 +249,7 @@ def pytest_configure(config):
     _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
     _stderr_fd = os.dup(sys.__stderr__.fileno())
 
-    assert torch.cuda.is_available()
+    assert _cudart_call(cudart.cudaGetDeviceCount) > 0
 
     print("===== cudnn-frontend conftest.py ====")
     print(f"cuDNN Frontend Version: {cudnn.__version__}")
@@ -234,12 +258,18 @@ def pytest_configure(config):
         print(f"cuDNN Backend Version: {cudnn.backend_version()}")
     except Exception as e:
         print(f"cuDNN Backend not available: {e}")
-    print(f"PyTorch Version: {torch.__version__}")
-    print(f"PyTorch Path: {torch.__file__}")
-    print(f"PyTorch GPU Name: {torch.cuda.get_device_name()}")
-    print(f"PyTorch SM Arch Version: {torch.cuda.get_device_capability()}")
-    print(f"PyTorch CUDA Version: {torch.version.cuda}")
-    print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    prop = _cudart_call(cudart.cudaGetDeviceProperties, 0)
+    print(f"GPU Name: {prop.name.decode().rstrip(chr(0))}")
+    print(f"SM Arch Version: {(prop.major, prop.minor)}")
+    try:
+        import torch
+    except ImportError:
+        print("PyTorch: not installed")
+    else:
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"PyTorch Path: {torch.__file__}")
+        print(f"PyTorch CUDA Version: {torch.version.cuda}")
+        print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
 
 # fmt: off
 def pytest_addoption(parser):
