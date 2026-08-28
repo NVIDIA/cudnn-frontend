@@ -69,8 +69,7 @@ class Mxfp8Backend:
                 )
             except (ImportError, OSError) as exc:
                 raise BackendUnavailableError(
-                    "MoeEp MXFP8 backend requires the 'moe_ep' optional "
-                    "dependencies and their shared libraries"
+                    "MoeEp MXFP8 backend requires the 'cutedsl' and 'comm' " "optional dependencies and their shared libraries"
                 ) from exc
         return self._prepared_kernel
 
@@ -83,27 +82,16 @@ class Mxfp8Backend:
         # those writes.
         stream.synchronize()
         if resources.runtime.group is None:
-            raise RuntimeError(
-                "distributed MXFP8 launch requires a "
-                "torch.distributed process group"
-            )
-        tuning_signature = self.kernel_config.tuning_signature(
-            self._ensure_prepared_kernel().launch_cluster_count
-        )
+            raise RuntimeError("distributed MXFP8 launch requires a " "torch.distributed process group")
+        tuning_signature = self.kernel_config.tuning_signature(self._ensure_prepared_kernel().launch_cluster_count)
         rank_tuning_signatures = [None] * resources.runtime.world_size
         dist.all_gather_object(
             rank_tuning_signatures,
             tuning_signature,
             group=resources.runtime.group,
         )
-        if any(
-            signature != rank_tuning_signatures[0]
-            for signature in rank_tuning_signatures[1:]
-        ):
-            raise RuntimeError(
-                "MoeEp tuning must match on every expert-parallel rank; "
-                f"effective signatures by rank: {rank_tuning_signatures}"
-            )
+        if any(signature != rank_tuning_signatures[0] for signature in rank_tuning_signatures[1:]):
+            raise RuntimeError("MoeEp tuning must match on every expert-parallel rank; " f"effective signatures by rank: {rank_tuning_signatures}")
         dist.barrier(group=resources.runtime.group)
         self._ep_launch_ready = True
 
@@ -112,32 +100,18 @@ class Mxfp8Backend:
             if self._closed:
                 raise RuntimeError("MoeEp MXFP8 backend is closed")
             if request.device != self.device:
-                raise ValueError(
-                    f"MoeEp MXFP8 backend is bound to {self.device}, "
-                    f"got {request.device}"
-                )
+                raise ValueError(f"MoeEp MXFP8 backend is bound to {self.device}, " f"got {request.device}")
 
             with torch.cuda.device(self.device):
                 capturing = torch.cuda.is_current_stream_capturing()
-                if (
-                    capturing
-                    and not self._adapter.weights_have_version_counters(
-                        request
-                    )
-                ):
+                if capturing and not self._adapter.weights_have_version_counters(request):
                     raise NotImplementedError(
                         "CUDA graph capture does not support inference tensor "
                         "weights without version counters; eager calls remain "
                         "supported and repack those weights on every call"
                     )
-                if capturing and (
-                    not self._warmed_up
-                    or not self._adapter.has_cached_weights(request)
-                ):
-                    raise RuntimeError(
-                        "MoeEp MXFP8 backend and weights must be warmed up "
-                        "before CUDA graph capture"
-                    )
+                if capturing and (not self._warmed_up or not self._adapter.has_cached_weights(request)):
+                    raise RuntimeError("MoeEp MXFP8 backend and weights must be warmed up " "before CUDA graph capture")
 
                 stream = torch.cuda.current_stream(self.device)
                 if self._device_work_may_be_pending:
@@ -167,24 +141,12 @@ class Mxfp8Backend:
                         request,
                         resources,
                         self.kernel_config,
-                        local_workspace_zero_bytes=(
-                            prepared.local_workspace_zero_bytes
-                        ),
-                        shared_workspace_zero_bytes=(
-                            prepared.shared_workspace_zero_bytes
-                        ),
-                        pre_reduced_activation_offset=(
-                            prepared.pre_reduced_activation_offset
-                        ),
-                        pre_reduced_activation_bytes_per_token=(
-                            prepared.pre_reduced_activation_bytes_per_token
-                        ),
-                        pre_reduced_activation_sf_offset=(
-                            prepared.pre_reduced_activation_sf_offset
-                        ),
-                        pre_reduced_activation_sf_bytes_per_token=(
-                            prepared.pre_reduced_activation_sf_bytes_per_token
-                        ),
+                        local_workspace_zero_bytes=(prepared.local_workspace_zero_bytes),
+                        shared_workspace_zero_bytes=(prepared.shared_workspace_zero_bytes),
+                        pre_reduced_activation_offset=(prepared.pre_reduced_activation_offset),
+                        pre_reduced_activation_bytes_per_token=(prepared.pre_reduced_activation_bytes_per_token),
+                        pre_reduced_activation_sf_offset=(prepared.pre_reduced_activation_sf_offset),
+                        pre_reduced_activation_sf_bytes_per_token=(prepared.pre_reduced_activation_sf_bytes_per_token),
                         col_quant_data_rows=prepared.col_quant_data_rows,
                         col_quant_sf_elements=prepared.col_quant_sf_elements,
                         fc1_c=None,
@@ -202,8 +164,7 @@ class Mxfp8Backend:
                     )
                 except (ImportError, OSError) as exc:
                     raise BackendUnavailableError(
-                        "MoeEp MXFP8 backend requires the 'moe_ep' optional "
-                        "dependencies and their shared libraries"
+                        "MoeEp MXFP8 backend requires the 'cutedsl' and 'comm' " "optional dependencies and their shared libraries"
                     ) from exc
                 finally:
                     if device_work_attempted and not capturing:
@@ -240,9 +201,7 @@ class Mxfp8Backend:
                 token_padding_size=128,
                 sf_padding_size=128,
             )
-            training_kernel_config = Mxfp8KernelConfig.from_forward_config(
-                training_config
-            )
+            training_kernel_config = Mxfp8KernelConfig.from_forward_config(training_config)
             # Graph transport must complete its cross-rank protocol before the
             # frontend applies the public trap/drop policy at graph tail.
             graph_kernel_config = replace(
@@ -290,14 +249,8 @@ class Mxfp8Backend:
                 return
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "MoeEp MXFP8 backend cannot be closed during "
-                        "CUDA graph capture"
-                    )
-                if (
-                    self._plan is not None
-                    or self._training_resource_owner is not None
-                ):
+                    raise RuntimeError("MoeEp MXFP8 backend cannot be closed during " "CUDA graph capture")
+                if self._plan is not None or self._training_resource_owner is not None:
                     torch.cuda.synchronize(self.device)
                 self._adapter.close()
                 if self._training_resource_owner is not None:

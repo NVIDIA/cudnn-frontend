@@ -21,6 +21,7 @@ from ._compile import (
     _pre_reduced_workspace_metadata,
 )
 from ._config import Mxfp8KernelConfig
+from ._cutedsl import require_rubin_cutedsl
 from ._formats import combine_wire_format
 from ._launch import _to_cute, _to_cute_ptr
 
@@ -88,20 +89,16 @@ def prepare_backward_kernel(
 ) -> PreparedMxfp8BackwardKernel:
     """Instantiate the fixed Rubin dGLU specialization."""
 
+    require_rubin_cutedsl()
     torch.cuda.set_device(device)
     architecture = torch.cuda.get_device_capability(device)
     if architecture != (10, 7):
-        raise RuntimeError(
-            "Rubin MXFP8 backward requires compute capability (10, 7), "
-            f"got {architecture}"
-        )
+        raise RuntimeError("Rubin MXFP8 backward requires compute capability (10, 7), " f"got {architecture}")
     configured_architecture = os.environ.get("CUTE_DSL_ARCH")
     if configured_architecture is None:
         os.environ["CUTE_DSL_ARCH"] = "sm_107a"
     elif configured_architecture not in ("sm_107", "sm_107a"):
-        raise RuntimeError(
-            "CUTE_DSL_ARCH must target SM107 for the Rubin MXFP8 backward"
-        )
+        raise RuntimeError("CUTE_DSL_ARCH must target SM107 for the Rubin MXFP8 backward")
     import cutlass
     import cutlass.utils as utils
 
@@ -110,18 +107,10 @@ def prepare_backward_kernel(
     )
     from ..cutedsl_src.quant_def import CombineFormat
 
-    launch_cluster_count = int(
-        utils.HardwareInfo().get_max_active_clusters(config.cluster_size)
-    )
+    launch_cluster_count = int(utils.HardwareInfo().get_max_active_clusters(config.cluster_size))
     if launch_cluster_count <= 0:
-        raise RuntimeError(
-            "hardware occupancy query returned no launchable Rubin clusters"
-        )
-    group_hint = (
-        launch_cluster_count
-        if config.group_hint is None
-        else config.group_hint
-    )
+        raise RuntimeError("hardware occupancy query returned no launchable Rubin clusters")
+    group_hint = launch_cluster_count if config.group_hint is None else config.group_hint
     operands_mode = forward_config.backward_wgrad_mode == "operands"
     dfc2_recompute = operands_mode
     dfc2_col_output = operands_mode
@@ -156,9 +145,7 @@ def prepare_backward_kernel(
         token_back_mode="epi_warps",
         epi_flag_batch=config.epi_flag_batch,
         flag_batch=config.flag_batch,
-        combine_format=CombineFormat.parse(
-            combine_wire_format(forward_config.combine_format)
-        ),
+        combine_format=CombineFormat.parse(combine_wire_format(forward_config.combine_format)),
         act_func=config.act_func,
         gate_up_clamp=config.gate_up_clamp,
         dfc2_recompute=dfc2_recompute,
@@ -170,36 +157,32 @@ def prepare_backward_kernel(
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
     device_workspace = kernel._mega_device_workspace
     pool_capacity = int(kernel.pool_token_capacity)
-    fc1_preact_shape = tuple(
-        int(extent) for extent in kernel.get_fc1_preact_shape()
-    )
+    fc1_preact_shape = tuple(int(extent) for extent in kernel.get_fc1_preact_shape())
     expected_preact_shape = (
         pool_capacity,
         2 * config.intermediate,
     )
     if fc1_preact_shape != expected_preact_shape:
-        raise RuntimeError(
-            "Rubin dGLU fc1_preact shape mismatch: "
-            f"{fc1_preact_shape} != {expected_preact_shape}"
-        )
-    aux_shapes = {
-        name: tuple(int(extent) for extent in shape)
-        for name, shape in kernel.get_aux_output_shapes().items()
-    }
-    fc1_preact_bytes = (
-        math.prod(fc1_preact_shape) * torch.bfloat16.itemsize
-    )
+        raise RuntimeError("Rubin dGLU fc1_preact shape mismatch: " f"{fc1_preact_shape} != {expected_preact_shape}")
+    aux_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in kernel.get_aux_output_shapes().items()}
+    fc1_preact_bytes = math.prod(fc1_preact_shape) * torch.bfloat16.itemsize
     dprob_bytes = math.prod(aux_shapes["dprob"]) * torch.float32.itemsize
-    aux_data_bytes = max(
-        math.prod(aux_shapes["fc1_recompute"]),
-        math.prod(aux_shapes["fc1_col_output"]),
-        math.prod(aux_shapes["grad_y2"]),
-    ) * torch.float8_e4m3fn.itemsize
-    aux_scale_bytes = max(
-        math.prod(aux_shapes["fc1_recompute_sf"]),
-        math.prod(aux_shapes["fc1_col_output_sf"]),
-        math.prod(aux_shapes["grad_y2_sf"]),
-    ) * torch.float8_e8m0fnu.itemsize
+    aux_data_bytes = (
+        max(
+            math.prod(aux_shapes["fc1_recompute"]),
+            math.prod(aux_shapes["fc1_col_output"]),
+            math.prod(aux_shapes["grad_y2"]),
+        )
+        * torch.float8_e4m3fn.itemsize
+    )
+    aux_scale_bytes = (
+        max(
+            math.prod(aux_shapes["fc1_recompute_sf"]),
+            math.prod(aux_shapes["fc1_col_output_sf"]),
+            math.prod(aux_shapes["grad_y2_sf"]),
+        )
+        * torch.float8_e8m0fnu.itemsize
+    )
     requirements = WorkspaceRequirements.for_mxfp8(
         forward_config,
         kernel_local_workspace_bytes=local_bytes,
@@ -209,23 +192,17 @@ def prepare_backward_kernel(
         backward_aux_data_bytes=aux_data_bytes,
         backward_aux_scale_bytes=aux_scale_bytes,
     )
-    pre_reduced_offset, pre_reduced_bytes_per_token = (
-        _pre_reduced_workspace_metadata(
-            device_workspace,
-            config,
-            shared_bytes,
-        )
+    pre_reduced_offset, pre_reduced_bytes_per_token = _pre_reduced_workspace_metadata(
+        device_workspace,
+        config,
+        shared_bytes,
     )
     if pre_reduced_offset is None or pre_reduced_bytes_per_token <= 0:
-        raise RuntimeError(
-            "Rubin MXFP8 backward requires standalone pre-reduced activation"
-        )
-    pre_reduced_sf_offset, pre_reduced_sf_bytes_per_token = (
-        _pre_reduced_sf_workspace_metadata(
-            device_workspace,
-            config,
-            shared_bytes,
-        )
+        raise RuntimeError("Rubin MXFP8 backward requires standalone pre-reduced activation")
+    pre_reduced_sf_offset, pre_reduced_sf_bytes_per_token = _pre_reduced_sf_workspace_metadata(
+        device_workspace,
+        config,
+        shared_bytes,
     )
     return PreparedMxfp8BackwardKernel(
         config=config,
@@ -238,9 +215,7 @@ def prepare_backward_kernel(
         pre_reduced_activation_offset=pre_reduced_offset,
         pre_reduced_activation_bytes_per_token=pre_reduced_bytes_per_token,
         pre_reduced_activation_sf_offset=pre_reduced_sf_offset,
-        pre_reduced_activation_sf_bytes_per_token=(
-            pre_reduced_sf_bytes_per_token
-        ),
+        pre_reduced_activation_sf_bytes_per_token=(pre_reduced_sf_bytes_per_token),
         local_workspace_zero_bytes=int(local_zero),
         shared_workspace_zero_bytes=int(shared_zero),
         dfc2_recompute=dfc2_recompute,
@@ -250,15 +225,8 @@ def prepare_backward_kernel(
 
 
 def _layout_signature(inputs: Mxfp8BackwardLaunchInputs) -> tuple:
-    tensors = tuple(
-        value
-        for value in inputs.__dict__.values()
-        if isinstance(value, torch.Tensor)
-    )
-    return tuple(
-        (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-        for tensor in tensors
-    )
+    tensors = tuple(value for value in inputs.__dict__.values() if isinstance(value, torch.Tensor))
+    return tuple((tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in tensors)
 
 
 def build_backward_runtime_kwargs(
@@ -321,9 +289,7 @@ def build_backward_runtime_kwargs(
         ),
         "local_workspace": _to_cute_ptr(inputs.local_workspace),
         "shared_workspace": _to_cute_ptr(inputs.shared_workspace),
-        "peer_rank_ptr_mapper_host": (
-            resources.workspace.peer_mapping.to_sym_buffer_host()
-        ),
+        "peer_rank_ptr_mapper_host": (resources.workspace.peer_mapping.to_sym_buffer_host()),
         "stream": cuda.CUstream(stream.cuda_stream),
     }
 
@@ -349,9 +315,7 @@ def compile_backward_or_get(
         if cached is not None:
             return cached
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MXFP8 backward kernel must be compiled before capture"
-            )
+            raise RuntimeError("MXFP8 backward kernel must be compiled before capture")
         import cutlass.cute as cute
 
         runtime_kwargs = build_backward_runtime_kwargs(inputs, resources)

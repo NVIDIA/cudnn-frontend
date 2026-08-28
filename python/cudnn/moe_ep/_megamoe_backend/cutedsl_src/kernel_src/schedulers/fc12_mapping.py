@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """FC12 work-tile ABI and grouped or phase-interleaved task mapping."""
 
 import dataclasses

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """NVLink-domain pointer mapping and token communication."""
 
 from ...helpers.software_sync import NvlinkBarrier, SoftwareGridSync

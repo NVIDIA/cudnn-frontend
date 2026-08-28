@@ -69,13 +69,10 @@ cutedsl = [
     "cuda-python",
     "apache-tvm-ffi>=0.1.11",
 ]
-moe_ep = [
-    "nvidia-cutlass-dsl[cu13]>=4.8.0",
+comm = [
+    # Communication runtimes are grouped by backend so future distributed
+    # operation graphs can reuse the same installation extra.
     "nvshmem4py-cu13>=0.3.1",
-    "cuda-python",
-    "torch",
-    "apache-tvm-ffi>=0.1.11",
-    "torch-c-dlpack-ext",
 ]
 cutile = [
     # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
@@ -130,5 +127,5 @@ version = {attr = "cudnn.__version__"}
 include = ["**/*"]
 "cudnn.moe_ep._megamoe_backend.cutedsl_src" = [
     "LICENSE.Apache-2.0",
-    "VENDOR_INFO.md",
+    "VENDOR.md",
 ]

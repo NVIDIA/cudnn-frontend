@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Cross-rank communication protocols and implementations."""
 
 from ..quant_def import CombineFormat, QuantKind

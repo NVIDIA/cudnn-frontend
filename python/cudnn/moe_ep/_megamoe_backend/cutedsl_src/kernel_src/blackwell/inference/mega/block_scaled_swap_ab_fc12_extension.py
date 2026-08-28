@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Block-scaled SwapAb adapter between FC12 scheduling and kernel tensor views."""
 
 import dataclasses

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Small integer and layout helpers shared by workspace implementations."""
 
 from typing import Iterable, List, Tuple, Union
