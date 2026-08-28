@@ -178,8 +178,10 @@ def _exp2_emulated_scalar(x):
     return value
 
 
-_E5_SINK = CFG.HAS_SINK and CFG.DTYPE_QKV == 1
-_E5_SINK_WIDE_OUTPUT = _E5_SINK and CFG.DTYPE_O >= 2
+# Sink-seeded maxima shift the quantized-P trajectory. E4M3 keeps the first
+# real-KV max for every output; E5M2 does so only for wide outputs because its
+# FP8-output path is more accurate with the sink-seeded max.
+_FIRST_REAL_KV_MAX = CFG.HAS_SINK and (CFG.DTYPE_QKV == 0 or CFG.DTYPE_O >= 2)
 
 
 # Storage dtype + MMA kind dispatch keyed off CFG.DTYPE_QKV.
@@ -1448,7 +1450,7 @@ def _softmax_kv_body(
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
     NEG_INF = cutlass.Float32(-3.4028235e38)
-    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD * (1.4426950408889634 if _E5_SINK else 1.0))
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD * (1.4426950408889634 if CFG.HAS_SINK and CFG.DTYPE_QKV == 1 else 1.0))
 
     # tcgen05.ld/st auto-derives row from warp_id; address needs col only.
     s_addr_base = tmem_base + cutlass.Int32(tmem_S_off)
@@ -1481,7 +1483,7 @@ def _softmax_kv_body(
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
-                mask_value=float("-inf") if _E5_SINK else -3.4028235e38,
+                mask_value=float("-inf") if CFG.HAS_SINK else -3.4028235e38,
                 window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
@@ -1524,7 +1526,9 @@ def _softmax_kv_body(
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-    if cutlass.const_expr(_E5_SINK_WIDE_OUTPUT):
+    if cutlass.const_expr(CFG.HAS_SINK):
+        update_cond = update_cond & (current_max != cutlass.Float32(float("-inf")))
+    if cutlass.const_expr(_FIRST_REAL_KV_MAX):
         update_cond = update_cond | (is_first_real_kv & (current_max > total_max))
     total_max = cutlass.Float32(
         arith.select(
@@ -1656,7 +1660,7 @@ def _softmax_warp_group(
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
-    if cutlass.const_expr(_E5_SINK):
+    if cutlass.const_expr(CFG.HAS_SINK):
         sinks_arr = cutlass.make_array_view(sinks_tensor)
 
     while is_valid_tile > cutlass.Int32(0):
@@ -1670,13 +1674,21 @@ def _softmax_warp_group(
             (cutlass.Float32(0.0), cutlass.Float32(0.0)),
             cutlass.Float32,
         )
-        if cutlass.const_expr(_E5_SINK):
+        if cutlass.const_expr(CFG.HAS_SINK):
             sink_log2 = cutlass.Float32(sinks_arr[head_idx * cutlass.Int32(HEADS_PER_TILE) + tid_in_wg % cutlass.Int32(HEADS_PER_TILE)]) * cutlass.Float32(
                 1.4426950408889634
             )
-            total_max = sink_log2
+            sink_is_neg_inf = sink_log2 == cutlass.Float32(float("-inf"))
+            total_max = cutlass.Float32(arith.select(sink_is_neg_inf.ir_value(), NEG_INF.ir_value(), sink_log2.ir_value()))
+            sink_weight = cutlass.Float32(
+                arith.select(
+                    sink_is_neg_inf.ir_value(),
+                    cutlass.Float32(0.0).ir_value(),
+                    cutlass.Float32(1.0).ir_value(),
+                )
+            )
             total_sum = cutlass.Vector.from_elements(
-                (cutlass.Float32(1.0), cutlass.Float32(0.0)),
+                (sink_weight, cutlass.Float32(0.0)),
                 cutlass.Float32,
             )
         # PackGQA: token-unit row base; the row's token index feeds the mask
@@ -1954,10 +1966,11 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
-            # E5M2+sinks seeds total_sum with the sink contribution, so its
-            # empty-numerator predicate must come from the KV bounds instead.
-            if cutlass.const_expr(_E5_SINK):
-                row_dead = bounds.right <= bounds.left
+            # A finite online sink makes total_sum nonzero even when no BMM2
+            # produced O. A -inf sink contributes zero and can leave a masked
+            # row with a zero denominator.
+            if cutlass.const_expr(CFG.HAS_SINK):
+                row_dead = (bounds.right <= bounds.left) | (total_sum <= cutlass.Float32(0.0))
             else:
                 row_dead = total_sum <= cutlass.Float32(0.0)
             # Row identity (PackGQA): this lane's row decodes to (token,
@@ -1968,19 +1981,15 @@ def _correction_warp_group(
                 q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + cutlass.Int32(qs * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
             )
             row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
-            if cutlass.const_expr(_E5_SINK):
+            if cutlass.const_expr(CFG.HAS_SINK):
+                sinks_arr = cutlass.make_array_view(sinks_tensor)
+                sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
+                sink_log2 = sink_logit * cutlass.Float32(1.4426950408889634)
+                use_sink_lse = row_dead | (sink_log2 == cutlass.Float32(float("inf")))
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                lse_val = cutlass.Float32(arith.select(use_sink_lse.ir_value(), sink_logit.ir_value(), lse_val.ir_value()))
                 beta = cute.arch.rcp_approx(cute.math.max(total_sum, cutlass.Float32(1e-30)))
                 inv_sum = o_scale_fused * beta
-            elif cutlass.const_expr(CFG.HAS_SINK):
-                sinks_arr = cutlass.make_array_view(sinks_tensor)
-                sink_logit = sinks_arr[row_head_idx]
-                new_max = cute.math.max(total_max_nat, sink_logit)
-                scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
-                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
-                lse_val = new_max + cute.math.log(new_sum, fastmath=True)
-                inv_sum = (scale * o_scale_fused) / new_sum
-                beta = inv_sum / o_scale_fused
             else:
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
