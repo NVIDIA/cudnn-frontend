@@ -19,9 +19,11 @@ d_qk=192/d_v=128 while preserving the FP8-on-Blackwell K-path:
      ``CFG.TILE_K_HW_BMM2`` (→ 4 k-steps at TILE_K_HW=32).  Confirmed by the
      cuDNN f8 reference (UTCMMA_TILE_K=32, BMM_XMMAS_K=4, kind::f8f6f4).
 
-THD / varlen is not supported here: the legacy THD leg was removed by #622
-because it predates the device-built-metadata plus plan-time-envelope design.
-The adapter rejects FP8 THD, and ``CFG.THD_VARLEN=1`` fails at trace time.
+THD / varlen (``CFG.THD_VARLEN=1``) follows the device-built-metadata plus
+plan-time-envelope design used by the d128 FP8 and d192 f16 siblings: packed
+``[1,T,H,D]`` operands with dynamic token extents, device-built sequence
+metadata and runtime TMA descriptors, and a plan-time envelope grid. Dense
+specializations fold the THD path out.
 """
 
 import os
@@ -91,7 +93,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
-from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
+from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
     apply_mask_chunk,
@@ -283,11 +285,17 @@ def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
     return scalar_seqlen_kv
 
 
-# Flat-grid decode dispatch + seq-offset helper from the shared factory. The
-# latter folds to dense identity because the legacy THD leg is unsupported.
+# Flat-grid decode dispatch + sequence offsets from the shared factory.
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
+
+# THD metadata and descriptor setup. D192 exposes K as a rank-5 tensor map
+# (three 64-element D chunks), so its sequence extent is descriptor dimension
+# 1; V remains rank-4 with sequence extent dimension 2.
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+
+_TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
 # PackGQA geometry: query heads sharing one Q tile and the tokens the tile
 # covers.  At HEADS_PER_TILE == 1 (unpacked) packed arithmetic (//, %, *)
@@ -440,6 +448,7 @@ def _kernel(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
+    o_desc_words: cute.Tensor,
     seqlen_q: cutlass.Int32,
     seqlen_kv: cutlass.Int32,
     n_q_supers: cutlass.Int32,
@@ -747,6 +756,7 @@ def _kernel(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            o_desc_words=o_desc_words,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
@@ -768,6 +778,7 @@ def _kernel(
             n_batch=n_batch,
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            o_desc_words=o_desc_words,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
@@ -805,6 +816,7 @@ def _tmaldg_warp_group(
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
+    o_desc_words,
     n_q_supers,
     n_qh,
     n_batch,
@@ -823,8 +835,14 @@ def _tmaldg_warp_group(
     kv_state = PipelineState.start(phase=1)
 
     tma_q = GmemTileTma(tma_q_desc)
-    tma_k = GmemTileTma(tma_k_desc)
-    tma_v = GmemTileTma(tma_v_desc)
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
+        tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
+    else:
+        tma_k = GmemTileTma(tma_k_desc)
+        tma_v = GmemTileTma(tma_v_desc)
     kv_l2_hint = nvvm.inline_ptx(
         "createpolicy.fractional.L2::evict_last.b64 {$w0}, 1.0;",
         write_only_types=[cutlass.Int64],
@@ -1018,6 +1036,7 @@ def _tmastg_warp_group(
     n_batch,
     cta_in_pair,
     seq_kv_lens_tensor,
+    o_desc_words,
 ):
     """Persistent O-store warp; tiles claimed via scheduler's try_cancel.async."""
     o_full_phase = cutlass.Int32(0)
@@ -1039,11 +1058,27 @@ def _tmastg_warp_group(
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             _wait_mbarrier(bars.mb_o_full[qs], o_full_phase)
 
-            # O TMA params follow O's swizzle, not V's (V and O swizzles may differ).
-            tma_store_tile(
-                sO[qs],
-                tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), batch_idx),
-            )
+            # THD uses one runtime O descriptor per logical sequence. Its base
+            # is the packed cu_q offset and its row extent is the sequence's
+            # own Q length, so tail rows are hardware-clipped. Envelope-only
+            # dead units decode batch_idx == n_batch and skip the store while
+            # preserving the barrier protocol.
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                if batch_idx < n_batch:
+                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                    o_slice = tma_slice_runtime_desc(
+                        o_desc_ptr,
+                        cutlass.Int32(0),
+                        q_head_idx,
+                        q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
+                        cutlass.Int32(0),
+                    )
+                    tma_store_tile(sO[qs], o_slice)
+            else:
+                tma_store_tile(
+                    sO[qs],
+                    tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), batch_idx),
+                )
 
             tma_store_commit()
             tma_store_wait(0)
@@ -2010,12 +2045,29 @@ def _correction_warp_group(
                 )
                 inv_sum = o_scale_fused * beta
 
-            # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
-            _row_valid = q_row_global < seqlen_q
-            if _row_valid:
+            # cga2 OOB-row guard: cluster Q rows can exceed the live sequence.
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                # THD rows are sequence-local. Metadata carries cu_q, so both
+                # live-row validation and ragged LSE placement stay on device;
+                # a dead envelope unit has batch_idx == n_batch and therefore
+                # a negative derived length, making every row invalid.
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                _row_valid = q_row_global < _s_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_arr[batch_idx, row_head_idx, q_row_global] = lse_val
+                    if _row_valid:
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
+                        else:
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
+            else:
+                _row_valid = q_row_global < seqlen_q
+                if _row_valid:
+                    if cutlass.const_expr(lse_tensor is not None):
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_arr[batch_idx, row_head_idx, q_row_global] = lse_val
 
             # amax_o is defined over the fp32 pre-cast output.
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
@@ -2192,9 +2244,6 @@ def _host(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
-    # SM100 FP8-family shared ABI: the THD slots ride every flavor so the
-    # adapter's launch shape is uniform; this dense-only kernel never reads
-    # them (o_desc_words is the 1-elem dense dummy, n_thd_units is 0).
     o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
@@ -2210,9 +2259,10 @@ def _host(
     thd_lens_form: Optional[cutlass.Int32] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    if cutlass.const_expr(CFG.THD_VARLEN):
-        raise NotImplementedError("prefill_d192_d128_fp8_sm100: THD is unsupported; port the write_thd_meta envelope design first")
     B, QH, KH, SQ, SKV, _ = problem_size
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        SQ = q_tensor.shape[1]
+        SKV = k_tensor.shape[1]
 
     # K box rows are per-CTA (TILE_N/CTA_MMA); O box inner must match O's swizzle, not V's.
     # O box sized in BPE_O — O may be written at BF16/FP16 (DTYPE_O != DTYPE_QKV).
@@ -2282,11 +2332,35 @@ def _host(
     q_clusters = (SQ * HEADS_PER_TILE + rows_per_cluster - 1) // rows_per_cluster
     grid_q_supers = q_clusters * CFG.CTA_MMA
     q_supers = grid_q_supers
-    grid_shape = (
-        (grid_q_supers, QH // HEADS_PER_TILE, B)
-        if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
-        else (grid_q_supers * (QH // HEADS_PER_TILE) * B, 1, 1)
-    )
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # Build metadata, per-sequence O descriptors, and packed-total-clamped
+        # K/V descriptors on device. D192 K is rank-5, so its sequence extent
+        # is TensorMap dimension 1; V remains rank-4 at dimension 2.
+        _build_thd_meta_o_kv_descs_kernel(
+            o_tensor,
+            tma_o_desc,
+            tma_k_desc,
+            tma_v_desc,
+            o_desc_words,
+            seq_kv_lens_tensor,
+            thd_q_lens_tensor,
+            thd_kv_lens_tensor,
+            thd_lens_form,
+            cutlass.Int32(QH // HEADS_PER_TILE),
+            cutlass.Int32(B),
+            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
+            1,
+            2,
+        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
+    else:
+        grid_shape = (
+            (grid_q_supers, QH // HEADS_PER_TILE, B)
+            if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL)
+            else (grid_q_supers * (QH // HEADS_PER_TILE) * B, 1, 1)
+        )
     _kernel(
         tma_q_desc,
         tma_k_desc,
@@ -2295,6 +2369,7 @@ def _host(
         lse_tensor,
         sinks_tensor,
         seq_kv_lens_tensor,
+        o_desc_words,
         cutlass.Int32(SQ),
         cutlass.Int32(SKV),
         cutlass.Int32(q_supers),
@@ -2324,6 +2399,8 @@ def compile(  # noqa: A001
     sq: int = 256,
     skv: int = 128,
     has_lse: bool = True,
+    lse_head_major: bool = False,
+    lse_head_stride: int = 0,
     lse_stride: Optional[tuple[int, int, int]] = None,
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
@@ -2337,15 +2414,23 @@ def compile(  # noqa: A001
     statically-offset second Q/K chunk) and O stores past ``d_v`` are
     OOB-clipped.
 
-    ``has_lse=False`` specializes the LSE argument to ``None`` and removes
-    the Stats store while retaining the independent amax writes."""
+    Under THD, ``sq``/``skv`` become dynamic packed-token extents and ``b``
+    remains the logical sequence count. ``has_lse=False`` specializes the LSE
+    argument to ``None`` and removes the Stats store while retaining amax."""
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"fp8 d192 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE) % 16 != 0:
         # d_v strides BOTH V (BPE) and O (BPE_O >= BPE); the fp8 input side is
         # the binding TMA 16-byte global-stride constraint.
         raise ValueError(f"fp8 d192 envelope: d_qk/d_v global strides must be 16-byte multiples (TMA rule at BPE={CFG.BPE}); got ({d_qk}, {d_v})")
-    _fake_batch = b
+    if CFG.THD_VARLEN and (d_qk != CFG.TILE_K or d_v != CFG.TILE_O):
+        raise ValueError("fp8 d192 THD requires the native (192, 128) head shape")
+    if lse_stride is not None and CFG.THD_VARLEN:
+        raise ValueError("dense LSE strides are not valid for THD")
+    _fake_batch = 1 if CFG.THD_VARLEN else b
+    if CFG.THD_VARLEN:
+        sq = cute.sym_int(divisibility=1)
+        skv = cute.sym_int(divisibility=1)
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
         (_fake_batch, sq, qh, d_qk),
@@ -2371,10 +2456,34 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     if not has_lse:
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
         fake_lse = None
+    elif CFG.THD_VARLEN:
+        if lse_head_major:
+            _lse_hs = lse_head_stride if lse_head_stride else sq
+            fake_lse = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (1, qh, _lse_hs),
+                stride_order=(2, 1, 0),
+                assumed_align=4,
+            )
+        else:
+            if lse_head_stride:
+                raise ValueError("lse_head_stride is head-major-only")
+            fake_lse = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (sq, qh),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
     elif lse_stride is not None:
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride are THD-only")
         fake_lse = cute.runtime.make_fake_tensor(cutlass.Float32, (_fake_batch, qh, sq), lse_stride, assumed_align=4)
     else:
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride are THD-only")
         fake_lse = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
             (_fake_batch, qh, sq),
@@ -2390,7 +2499,7 @@ def compile(  # noqa: A001
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (b,),
+        ((4 * b + 4) if CFG.THD_VARLEN else b,),
         stride_order=(0,),
         assumed_align=16,
     )
@@ -2409,14 +2518,20 @@ def compile(  # noqa: A001
             assumed_align=4,
         )
 
-    # SM100 FP8-family shared ABI: dense 1-elem o_desc dummy + n_thd_units=0
-    # (this flavor is dense-only; the kernel never reads either).
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
-        (1,),
+        (((b + 3) * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1,),
         stride_order=(0,),
         assumed_align=16,
     )
+    if CFG.THD_VARLEN:
+        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_lens_form = cutlass.Int32(0)
+    else:
+        fake_thd_q_lens = None
+        fake_thd_kv_lens = None
+        fake_thd_lens_form = None
     return cute.compile(
         _host,
         fake_q,
@@ -2427,7 +2542,7 @@ def compile(  # noqa: A001
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,
-        (b, qh, kh, sq, skv, 0),
+        (b, qh, kh, 0, 0, 0) if CFG.THD_VARLEN else (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
@@ -2436,9 +2551,9 @@ def compile(  # noqa: A001
         _fake_scale(),
         _fake_scale(),
         fake_amax_o,
-        None,
-        None,
-        None,
+        fake_thd_q_lens,
+        fake_thd_kv_lens,
+        fake_thd_lens_form,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi --ptxas-options -uumn",
     )

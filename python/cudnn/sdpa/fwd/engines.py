@@ -663,10 +663,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
     fully-masked row can poison the global amax.  THD/varlen (d128/d128 only —
-    the d192/d128 kernel is dense-only) rides the shared packed lowering
-    (write_thd_meta envelope design, issue #552; packed Q/K/V/O contract
-    only) — on cc10.7 (Rubin) through the SM107 sibling kernel, which carries
-    the same THD leg.
+    the d192/d128 kernel is also wired on SM100) rides the shared packed
+    lowering (write_thd_meta envelope design, issue #552; packed Q/K/V/O
+    contract only). Rubin keeps the d128-only SM107 sibling.
     """
 
     rubin_row = arch == "sm107"
@@ -687,7 +686,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # graph onto a kernel whose cga4x1 role-split geometry is tuned for
             # d = 512. Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
             d_envelope_floors=() if rubin_row else (((512, 512), 256),),
-            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (512, 512)}),
+            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
