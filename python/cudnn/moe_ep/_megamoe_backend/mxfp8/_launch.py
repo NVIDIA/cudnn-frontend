@@ -28,9 +28,7 @@ def _to_cute(
     )
     if not dynamic_layout:
         return cute_tensor
-    return cute_tensor.mark_layout_dynamic(
-        leading_dim=cutlass_torch.get_leading_dim(tensor)
-    )
+    return cute_tensor.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(tensor))
 
 
 def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 128):
@@ -42,10 +40,7 @@ def _to_cute_ptr(tensor: torch.Tensor, assumed_align: int = 128):
 
     address = int(tensor.data_ptr())
     if address % assumed_align:
-        raise ValueError(
-            f"Rubin workspace address {address:#x} is not "
-            f"{assumed_align}-byte aligned"
-        )
+        raise ValueError(f"Rubin workspace address {address:#x} is not " f"{assumed_align}-byte aligned")
     return make_ptr(
         cutlass.Uint8,
         address,
@@ -71,11 +66,7 @@ def build_runtime_kwargs(
         "fc1_weight_sf": _to_cute(weights.fc1_weight_sf),
         "fc2_weight": _to_cute(weights.fc2_weight),
         "fc2_weight_sf": _to_cute(weights.fc2_weight_sf),
-        "fc1_c": (
-            None
-            if inputs.fc1_c is None
-            else _to_cute(inputs.fc1_c, dynamic_layout=False)
-        ),
+        "fc1_c": (None if inputs.fc1_c is None else _to_cute(inputs.fc1_c, dynamic_layout=False)),
         "output_activation": _to_cute(inputs.output_data),
         "col_quant_data": (
             None
@@ -101,9 +92,7 @@ def build_runtime_kwargs(
         ),
         "local_workspace": _to_cute_ptr(inputs.local_workspace),
         "shared_workspace": _to_cute_ptr(inputs.shared_workspace),
-        "peer_rank_ptr_mapper_host": (
-            resources.workspace.peer_mapping.to_sym_buffer_host()
-        ),
+        "peer_rank_ptr_mapper_host": (resources.workspace.peer_mapping.to_sym_buffer_host()),
         "stream": cuda.CUstream(stream.cuda_stream),
     }
     return kwargs
@@ -127,28 +116,17 @@ def layout_signature(inputs: Mxfp8LaunchInputs) -> tuple:
         inputs.local_workspace,
         inputs.shared_workspace,
     )
-    return tuple(
-        None
-        if tensor is None
-        else (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-        for tensor in tensors
-    )
+    return tuple(None if tensor is None else (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in tensors)
 
 
 def _check_overflow(overflow_flag: torch.Tensor) -> None:
-    message = (
-        "Rubin MegaMoE receive route-pool overflow; the output is invalid for "
-        "this routing distribution"
-    )
+    message = "Rubin MegaMoE receive route-pool overflow; the output is invalid for " "this routing distribution"
     assert_async = getattr(torch, "_assert_async", None)
     if assert_async is not None:
         assert_async(overflow_flag == 0, message)
         return
     if torch.cuda.is_current_stream_capturing():
-        raise NotImplementedError(
-            "CUDA graph capture requires torch._assert_async to surface "
-            "Rubin MegaMoE overflow"
-        )
+        raise NotImplementedError("CUDA graph capture requires torch._assert_async to surface " "Rubin MegaMoE overflow")
     # Compatibility fallback for PyTorch builds without a device-side assert.
     value = int(overflow_flag.item())
     if value != 0:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from ..._types import MoeFormat, parse_format
 
-
 _COMBINE_WIRE_FORMATS = {
     MoeFormat.BF16: "bf16",
     MoeFormat.MXFP8: "32e4m3xe8m0",

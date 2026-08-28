@@ -137,18 +137,12 @@ def _distributed_subgroup_output_worker(
     )
     try:
         subgroup_memberships = ((0, 2), (1, 3))
-        subgroups = [
-            dist.new_group(list(members), backend="nccl")
-            for members in subgroup_memberships
-        ]
+        subgroups = [dist.new_group(list(members), backend="nccl") for members in subgroup_memberships]
         subgroup_index = global_rank % 2
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(
-            dist.get_global_rank(ep_group, group_rank)
-            for group_rank in range(ep_size)
-        )
+        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
 
         _run_forward_output_case(
             device=device,
@@ -373,10 +367,7 @@ def _distributed_subgroup_backward_reference_worker(
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(
-            dist.get_global_rank(ep_group, group_rank)
-            for group_rank in range(ep_size)
-        )
+        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
         assert ep_size == len(expected_global_ranks)
         assert ep_rank == expected_global_ranks.index(global_rank)
         assert actual_global_ranks == expected_global_ranks

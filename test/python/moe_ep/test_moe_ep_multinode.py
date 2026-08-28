@@ -22,7 +22,6 @@ from moe_ep.moe_ep_test_support import (
     make_distributed_forward_inputs,
 )
 
-
 pytestmark = [
     pytest.mark.L1,
     pytest.mark.gpu_exclusive,
@@ -59,10 +58,7 @@ class _TorchrunWorld:
 def _require_torchrun_environment() -> tuple[int, int, int, int]:
     missing = [name for name in _TORCHRUN_ENV if name not in os.environ]
     if missing:
-        pytest.skip(
-            "multi-node MoE EP tests require torchrun environment variables: "
-            + ", ".join(missing)
-        )
+        pytest.skip("multi-node MoE EP tests require torchrun environment variables: " + ", ".join(missing))
     return (
         int(os.environ["RANK"]),
         int(os.environ["WORLD_SIZE"]),
@@ -76,20 +72,13 @@ def torchrun_world():
     if not dist.is_available() or not dist.is_nccl_available():
         pytest.skip("multi-node Rubin MXFP8 tests require NCCL")
 
-    rank, world_size, local_rank, local_world_size = (
-        _require_torchrun_environment()
-    )
+    rank, world_size, local_rank, local_world_size = _require_torchrun_environment()
     if local_rank < 0 or local_rank >= torch.cuda.device_count():
-        pytest.skip(
-            f"torchrun LOCAL_RANK={local_rank} is not backed by a visible GPU"
-        )
+        pytest.skip(f"torchrun LOCAL_RANK={local_rank} is not backed by a visible GPU")
 
     device = torch.device("cuda", local_rank)
     if torch.cuda.get_device_capability(device) != (10, 7):
-        pytest.skip(
-            "multi-node Rubin MXFP8 tests require exactly SM107 "
-            "(compute capability 10.7) on every rank"
-        )
+        pytest.skip("multi-node Rubin MXFP8 tests require exactly SM107 " "(compute capability 10.7) on every rank")
     try:
         import nvshmem.core  # noqa: F401
     except (ImportError, OSError):
@@ -99,9 +88,7 @@ def torchrun_world():
     torch.cuda.set_device(device)
     if dist.is_initialized():
         if dist.get_rank() != rank or dist.get_world_size() != world_size:
-            raise RuntimeError(
-                "existing process group does not match torchrun RANK/WORLD_SIZE"
-            )
+            raise RuntimeError("existing process group does not match torchrun RANK/WORLD_SIZE")
     else:
         dist.init_process_group(
             backend="nccl",
@@ -181,10 +168,7 @@ def test_mxfp8_forward_multinode_matches_reference(
     combine_format,
 ):
     world = torchrun_world
-    if (
-        world.world_size != required_world_size
-        or world.local_world_size != required_local_world_size
-    ):
+    if world.world_size != required_world_size or world.local_world_size != required_local_world_size:
         pytest.skip(
             f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}, "
             f"LOCAL_WORLD_SIZE={required_local_world_size}; got "
@@ -275,10 +259,7 @@ def test_fixed_training_resources_multinode_match_independent_reference(
 ):
     world = torchrun_world
     if world.world_size != required_world_size:
-        pytest.skip(
-            f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}; "
-            f"got WORLD_SIZE={world.world_size}"
-        )
+        pytest.skip(f"EP{ep_size} requires torchrun WORLD_SIZE={required_world_size}; " f"got WORLD_SIZE={world.world_size}")
 
     _run_backward_reference_case(
         device=world.device,
@@ -332,9 +313,7 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
     )
     caught_error = None
     try:
-        lane_count = (
-            rank_zero_lane_count if world.rank == 0 else other_lane_count
-        )
+        lane_count = rank_zero_lane_count if world.rank == 0 else other_lane_count
         try:
             op.prepare_training_resources(
                 weights,
@@ -352,14 +331,8 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
             device_ids=[world.local_rank],
         )
 
-        assert isinstance(caught_error, RuntimeError), (
-            f"rank {world.rank} expected RuntimeError from collective prepare, "
-            f"got {caught_error!r}"
-        )
+        assert isinstance(caught_error, RuntimeError), f"rank {world.rank} expected RuntimeError from collective prepare, " f"got {caught_error!r}"
         message = str(caught_error)
-        assert (
-            "symmetric workspace region counts differ" in message
-            or "ABI differs" in message
-        ), f"rank {world.rank} got unexpected prepare error: {message}"
+        assert "symmetric workspace region counts differ" in message or "ABI differs" in message, f"rank {world.rank} got unexpected prepare error: {message}"
     finally:
         op.close()

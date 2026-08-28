@@ -46,9 +46,7 @@ def _debug_phase(rank: int, phase: str) -> None:
     if os.environ.get("MOE_EP_DEBUG_RUNTIME", "0") != "1":
         return
     print(
-        "[moe-ep-probe] "
-        f"time={time.monotonic():.6f} host={socket.gethostname()} "
-        f"pid={os.getpid()} rank={rank} phase={phase}",
+        "[moe-ep-probe] " f"time={time.monotonic():.6f} host={socket.gethostname()} " f"pid={os.getpid()} rank={rank} phase={phase}",
         flush=True,
     )
 
@@ -85,28 +83,19 @@ def _parse_args() -> argparse.Namespace:
         "--multistream-replays",
         type=int,
         default=10,
-        help=(
-            "two-lane cross-stream graph replays; use a larger value such as "
-            "100 for dedicated stress runs"
-        ),
+        help=("two-lane cross-stream graph replays; use a larger value such as " "100 for dedicated stress runs"),
     )
     parser.add_argument(
         "--max-recv-size-per-rank",
         type=int,
         default=1,
-        help=(
-            "bounded receive capacity; must remain below the forced-overflow "
-            "route count so the probe retains overflow coverage"
-        ),
+        help=("bounded receive capacity; must remain below the forced-overflow " "route count so the probe retains overflow coverage"),
     )
     parser.add_argument(
         "--cycles",
         type=int,
         default=2,
-        help=(
-            "create/capture/destroy cycles; the first is exhaustive and later "
-            "cycles use a minimal replay to verify teardown/re-init"
-        ),
+        help=("create/capture/destroy cycles; the first is exhaustive and later " "cycles use a minimal replay to verify teardown/re-init"),
     )
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument(
@@ -117,10 +106,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expect-overflow-assert",
         action="store_true",
-        help=(
-            "run only the fatal drop_on_overflow=False graph assertion probe; "
-            "success requires every rank to observe the expected CUDA error"
-        ),
+        help=("run only the fatal drop_on_overflow=False graph assertion probe; " "success requires every rank to observe the expected CUDA error"),
     )
     return parser.parse_args()
 
@@ -147,9 +133,7 @@ def _assert_replay_tensor(
     }
     if actual.dtype in low_precision:
         if not torch.equal(actual, expected):
-            raise AssertionError(
-                f"{name} is not bitwise equal after graph replay"
-            )
+            raise AssertionError(f"{name} is not bitwise equal after graph replay")
         return
     torch.testing.assert_close(
         actual,
@@ -434,20 +418,20 @@ def _run_training_resource_probe(
             for name, tensor in zip(
                 comparison_names,
                 (
-                y0,
-                y1,
-                dx0,
-                dx1,
-                dp0,
-                dp1,
-                operands0.fc1_a,
-                operands0.fc1_b,
-                operands0.fc2_a,
-                operands0.fc2_b,
-                operands1.fc1_a,
-                operands1.fc1_b,
-                operands1.fc2_a,
-                operands1.fc2_b,
+                    y0,
+                    y1,
+                    dx0,
+                    dx1,
+                    dp0,
+                    dp1,
+                    operands0.fc1_a,
+                    operands0.fc1_b,
+                    operands0.fc2_a,
+                    operands0.fc2_b,
+                    operands1.fc1_a,
+                    operands1.fc1_b,
+                    operands1.fc2_a,
+                    operands1.fc2_b,
                 ),
             )
         }
@@ -542,9 +526,7 @@ def _run_training_resource_probe(
                 stream.synchronize()
                 dist.barrier(group=group)
                 if int(graph_overflow.item()) != 0:
-                    raise AssertionError(
-                        "fixed-resource diagnostic replay overflowed"
-                    )
+                    raise AssertionError("fixed-resource diagnostic replay overflowed")
                 torch.testing.assert_close(
                     graph_dp0,
                     dprob_reference,
@@ -604,8 +586,7 @@ def _run_training_resource_probe(
             mode = "full" if full_probe else "reinit"
             effective_burst = burst_replays if full_probe else 0
             print(
-                f"MOE_EP_EP{world_size}_TRAINING_RESOURCES_GRAPH_PASS "
-                f"mode={mode} burst={effective_burst}",
+                f"MOE_EP_EP{world_size}_TRAINING_RESOURCES_GRAPH_PASS " f"mode={mode} burst={effective_burst}",
                 flush=True,
             )
     finally:
@@ -650,9 +631,7 @@ def _run_multistream_resource_probe(
             resources.refresh_weights()
 
         with _debug_phase_scope(rank, "multistream.lane0-forward"):
-            eager_y0 = resources.forward(
-                slot0, lane0, args0[0], args0[3], args0[4]
-            )
+            eager_y0 = resources.forward(slot0, lane0, args0[0], args0[3], args0[4])
         with _debug_phase_scope(rank, "multistream.lane0-backward"):
             eager_dx0, eager_dp0, _ = resources.backward(
                 slot0,
@@ -670,9 +649,7 @@ def _run_multistream_resource_probe(
             dist.barrier(group=group)
 
         with _debug_phase_scope(rank, "multistream.lane1-forward"):
-            eager_y1 = resources.forward(
-                slot1, lane1, args1[0], args1[3], args1[4]
-            )
+            eager_y1 = resources.forward(slot1, lane1, args1[0], args1[3], args1[4])
         with _debug_phase_scope(rank, "multistream.lane1-backward"):
             eager_dx1, eager_dp1, _ = resources.backward(
                 slot1,
@@ -767,9 +744,7 @@ def _run_multistream_resource_probe(
             with torch.cuda.stream(capture_stream):
                 for _ in range(replays):
                     graph.replay()
-            replay_watchdog = _RuntimeWatchdog(
-                "multistream.replay-synchronize"
-            )
+            replay_watchdog = _RuntimeWatchdog("multistream.replay-synchronize")
             replay_watchdog.start()
             with _debug_phase_scope(
                 rank,
@@ -800,8 +775,7 @@ def _run_multistream_resource_probe(
             )
         if rank == 0:
             print(
-                f"MOE_EP_EP{world_size}_MULTISTREAM_GRAPH_PASS "
-                f"replays={replays}",
+                f"MOE_EP_EP{world_size}_MULTISTREAM_GRAPH_PASS " f"replays={replays}",
                 flush=True,
             )
     finally:
@@ -884,8 +858,7 @@ def _run_error_mode_assert_probe(
         stream.synchronize()
     except BaseException as exc:
         print(
-            f"MOE_EP_EP{world_size}_ERROR_MODE_ASSERT_PASS "
-            f"rank={rank} error={type(exc).__name__}",
+            f"MOE_EP_EP{world_size}_ERROR_MODE_ASSERT_PASS " f"rank={rank} error={type(exc).__name__}",
             flush=True,
         )
         # CUDA device assertions poison the process context. Do not run Python
@@ -914,9 +887,7 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     if world_size < 2:
-        raise RuntimeError(
-            f"this probe requires WORLD_SIZE >= 2, got {world_size}"
-        )
+        raise RuntimeError(f"this probe requires WORLD_SIZE >= 2, got {world_size}")
     forced_overflow_routes = world_size * 8 * 2
     if args.max_recv_size_per_rank >= forced_overflow_routes:
         raise ValueError(
@@ -929,10 +900,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     capability = torch.cuda.get_device_capability(device)
     if capability != (10, 7):
-        raise RuntimeError(
-            "this probe requires Rubin SM107; "
-            f"rank {rank} found compute capability {capability}"
-        )
+        raise RuntimeError("this probe requires Rubin SM107; " f"rank {rank} found compute capability {capability}")
     os.environ.setdefault("CUTE_DSL_ARCH", "sm_107a")
 
     dist.init_process_group(

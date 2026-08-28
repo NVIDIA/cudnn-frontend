@@ -52,10 +52,7 @@ class Mxfp8KernelConfig:
     fc2_tma_stages: int | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.max_recv_size_per_rank is not None
-            and self.max_recv_size_per_rank <= 0
-        ):
+        if self.max_recv_size_per_rank is not None and self.max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         if self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
@@ -65,19 +62,11 @@ class Mxfp8KernelConfig:
         if config.ep_size < 1:
             raise ValueError("MXFP8 execution requires a positive EP size")
         if config.ep_rank < 0 or config.ep_rank >= config.ep_size:
-            raise ValueError(
-                f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}"
-            )
+            raise ValueError(f"ep_rank {config.ep_rank} is outside EP size {config.ep_size}")
         if config.max_tokens_per_rank is None:
             raise ValueError("MXFP8 execution requires max_tokens_per_rank")
-        worst_case_recv_size = (
-            config.ep_size * config.max_tokens_per_rank * config.top_k
-        )
-        max_recv_size_per_rank = (
-            worst_case_recv_size
-            if config.max_recv_size_per_rank is None
-            else min(config.max_recv_size_per_rank, worst_case_recv_size)
-        )
+        worst_case_recv_size = config.ep_size * config.max_tokens_per_rank * config.top_k
+        max_recv_size_per_rank = worst_case_recv_size if config.max_recv_size_per_rank is None else min(config.max_recv_size_per_rank, worst_case_recv_size)
         if max_recv_size_per_rank <= 0:
             raise ValueError("max_recv_size_per_rank must be positive")
         return cls(
@@ -94,22 +83,16 @@ class Mxfp8KernelConfig:
             max_recv_size_per_rank=max_recv_size_per_rank,
             drop_on_overflow=config.drop_on_overflow,
             combine_format=combine_wire_format(config.combine_format),
-            enable_col_quant=(
-                config.backward_wgrad_mode == "operands"
-            ),
+            enable_col_quant=(config.backward_wgrad_mode == "operands"),
             token_padding_block=(
-                config.token_padding_size
-                if config.backward_wgrad_mode == "operands"
-                else 128 if config.generate_c else config.token_padding_size
+                config.token_padding_size if config.backward_wgrad_mode == "operands" else 128 if config.generate_c else config.token_padding_size
             ),
             sf_padding_block=config.sf_padding_size,
             group_hint=config.tuning.group_hint,
             token_back_mode=config.tuning.token_back_mode,
             epi_flag_batch=config.tuning.epi_flag_batch,
             flag_batch=config.tuning.token_in_flag_batch,
-            fc2_in_kernel_topk_reduce=(
-                config.tuning.reduce_topk_in_kernel
-            ),
+            fc2_in_kernel_topk_reduce=(config.tuning.reduce_topk_in_kernel),
         )
 
     @property
@@ -126,11 +109,7 @@ class Mxfp8KernelConfig:
     ) -> tuple[str, tuple[int, int], int, int, bool]:
         """Return the effective rank-independent transport/scheduler knobs."""
 
-        group_hint = (
-            launch_cluster_count
-            if self.group_hint is None
-            else self.group_hint
-        )
+        group_hint = launch_cluster_count if self.group_hint is None else self.group_hint
         return (
             self.token_back_mode,
             self.epi_flag_batch,
@@ -142,11 +121,7 @@ class Mxfp8KernelConfig:
     def effective_config(self, launch_cluster_count: int) -> dict[str, object]:
         """Return the complete JSON-safe compile-time configuration."""
 
-        effective_group_hint = (
-            launch_cluster_count
-            if self.group_hint is None
-            else self.group_hint
-        )
+        effective_group_hint = launch_cluster_count if self.group_hint is None else self.group_hint
         return {
             "num_experts_per_rank": self.num_experts,
             "world_size": self.world_size,

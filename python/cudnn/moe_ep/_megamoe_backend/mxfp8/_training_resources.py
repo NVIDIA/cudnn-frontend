@@ -42,22 +42,15 @@ from ._training_stage import Mxfp8TrainingStager
 from ._training_weights import Mxfp8TrainingWeightBindings
 from ._training_wgrad import Mxfp8TrainingWgradExporter
 
-
 _DATA_DTYPE = torch.float8_e4m3fn
 _SCALE_DTYPE = torch.float8_e8m0fnu
 
 _ROUTING_SYMMETRIC = frozenset({"topk_weights"})
 _ROUTING_LOCAL = frozenset({"topk_idx"})
 _FORWARD_SLOT_SYMMETRIC = frozenset({"output_data", *_ROUTING_SYMMETRIC})
-_FORWARD_SLOT_LOCAL = frozenset(
-    {"overflow_flag", "col_quant_data", "col_quant_sf", *_ROUTING_LOCAL}
-)
-_BACKWARD_SLOT_SYMMETRIC = frozenset(
-    {"output_data", "backward_dprob", *_ROUTING_SYMMETRIC}
-)
-_BACKWARD_SLOT_LOCAL = frozenset(
-    {"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL}
-)
+_FORWARD_SLOT_LOCAL = frozenset({"overflow_flag", "col_quant_data", "col_quant_sf", *_ROUTING_LOCAL})
+_BACKWARD_SLOT_SYMMETRIC = frozenset({"output_data", "backward_dprob", *_ROUTING_SYMMETRIC})
+_BACKWARD_SLOT_LOCAL = frozenset({"overflow_flag", "backward_aux_data", "backward_aux_scale", *_ROUTING_LOCAL})
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -106,11 +99,7 @@ def _region_map(
     requirements: WorkspaceRequirements,
     space: str,
 ) -> dict[str, BufferRegion]:
-    regions = (
-        requirements.symmetric_regions
-        if space == "symmetric"
-        else requirements.local_regions
-    )
+    regions = requirements.symmetric_regions if space == "symmetric" else requirements.local_regions
     return {region.name: region for region in regions}
 
 
@@ -122,9 +111,7 @@ def _required_region(
     try:
         return _region_map(requirements, space)[name]
     except KeyError as exc:
-        raise ValueError(
-            f"{space} workspace requirements do not contain {name!r}"
-        ) from exc
+        raise ValueError(f"{space} workspace requirements do not contain {name!r}") from exc
 
 
 def _add_lane_regions(
@@ -136,17 +123,11 @@ def _add_lane_regions(
     space: str,
     slot_names: frozenset[str],
 ) -> None:
-    regions = (
-        requirements.symmetric_regions
-        if space == "symmetric"
-        else requirements.local_regions
-    )
+    regions = requirements.symmetric_regions if space == "symmetric" else requirements.local_regions
     for region in regions:
         if region.name in slot_names:
             continue
-        if phase == "backward" and space == "local" and region.name == (
-            "backward_fc1_preact"
-        ):
+        if phase == "backward" and space == "local" and region.name == ("backward_fc1_preact"):
             # The graph path aliases forward's raw receiver pool directly.
             continue
         output.append(
@@ -173,11 +154,7 @@ def build_training_workspace_requirements(
     if not config.generate_c:
         raise ValueError("training resources require generate_c=True")
     if forward.pool_token_capacity != backward.pool_token_capacity:
-        raise ValueError(
-            "forward/backward pool capacities must match, got "
-            f"{forward.pool_token_capacity} and "
-            f"{backward.pool_token_capacity}"
-        )
+        raise ValueError("forward/backward pool capacities must match, got " f"{forward.pool_token_capacity} and " f"{backward.pool_token_capacity}")
 
     forward_requirements = forward.workspace_requirements
     backward_requirements = backward.workspace_requirements
@@ -246,10 +223,7 @@ def build_training_workspace_requirements(
     forward_local = _region_map(forward_requirements, "local")
     backward_symmetric = _region_map(backward_requirements, "symmetric")
     backward_local = _region_map(backward_requirements, "local")
-    fc1_c_shape = tuple(
-        int(extent)
-        for extent in forward.kernel.get_aux_output_shapes()["fc1_c"]
-    )
+    fc1_c_shape = tuple(int(extent) for extent in forward.kernel.get_aux_output_shapes()["fc1_c"])
     fc1_c_bytes = math.prod(fc1_c_shape) * torch.bfloat16.itemsize
     backward_preact = _required_region(
         backward_requirements,
@@ -257,14 +231,8 @@ def build_training_workspace_requirements(
         "backward_fc1_preact",
     )
     if fc1_c_bytes != backward_preact.nbytes:
-        raise ValueError(
-            "forward fc1_c and backward preactivation byte sizes differ: "
-            f"{fc1_c_bytes} != {backward_preact.nbytes}"
-        )
-    aux_shapes = {
-        name: tuple(int(extent) for extent in shape)
-        for name, shape in backward.kernel.get_aux_output_shapes().items()
-    }
+        raise ValueError("forward fc1_c and backward preactivation byte sizes differ: " f"{fc1_c_bytes} != {backward_preact.nbytes}")
+    aux_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in backward.kernel.get_aux_output_shapes().items()}
     aux_dtypes = {
         "fc1_recompute": _DATA_DTYPE,
         "fc1_recompute_sf": _SCALE_DTYPE,
@@ -349,9 +317,7 @@ def build_training_workspace_requirements(
                 ),
                 BufferRegion(
                     _custom_slot_name(slot, "routing_topk_idx"),
-                    int(config.max_tokens_per_rank)
-                    * config.top_k
-                    * torch.int32.itemsize,
+                    int(config.max_tokens_per_rank) * config.top_k * torch.int32.itemsize,
                     alignment=16,
                 ),
                 BufferRegion(
@@ -366,9 +332,7 @@ def build_training_workspace_requirements(
                 ),
                 BufferRegion(
                     _custom_slot_name(slot, "grad_activation"),
-                    int(config.max_tokens_per_rank)
-                    * config.hidden_size
-                    * torch.float32.itemsize,
+                    int(config.max_tokens_per_rank) * config.hidden_size * torch.float32.itemsize,
                     alignment=16,
                 ),
             )
@@ -376,9 +340,7 @@ def build_training_workspace_requirements(
         symmetric_regions.append(
             BufferRegion(
                 _custom_slot_symmetric_name(slot, "routing_topk_weights"),
-                int(config.max_tokens_per_rank)
-                * config.top_k
-                * torch.float32.itemsize,
+                int(config.max_tokens_per_rank) * config.top_k * torch.float32.itemsize,
                 alignment=16,
             )
         )
@@ -423,14 +385,9 @@ def _harmonize_symmetric_regions(
     dist.all_reduce(minimum_count, op=dist.ReduceOp.MIN, group=runtime.group)
     dist.all_reduce(maximum_count, op=dist.ReduceOp.MAX, group=runtime.group)
     if int(minimum_count.item()) != int(maximum_count.item()):
-        raise RuntimeError(
-            "symmetric workspace region counts differ across EP ranks: "
-            f"min={int(minimum_count.item())}, max={int(maximum_count.item())}"
-        )
+        raise RuntimeError("symmetric workspace region counts differ across EP ranks: " f"min={int(minimum_count.item())}, max={int(maximum_count.item())}")
 
-    metadata = "\0".join(
-        f"{region.name}:{region.alignment}" for region in regions
-    ).encode()
+    metadata = "\0".join(f"{region.name}:{region.alignment}" for region in regions).encode()
     signature_value = int.from_bytes(
         hashlib.blake2b(metadata, digest_size=8).digest(),
         "little",
@@ -470,9 +427,7 @@ def _harmonize_symmetric_regions(
     dist.all_reduce(maximum_sizes, op=dist.ReduceOp.MAX, group=runtime.group)
     harmonized_sizes = tuple(int(value) for value in maximum_sizes.cpu().tolist())
     changes = tuple(
-        f"{region.name}:{region.nbytes}->{harmonized_size}"
-        for region, harmonized_size in zip(regions, harmonized_sizes)
-        if region.nbytes != harmonized_size
+        f"{region.name}:{region.nbytes}->{harmonized_size}" for region, harmonized_size in zip(regions, harmonized_sizes) if region.nbytes != harmonized_size
     )
     _runtime_debug(
         "training-resources.symmetric-layout-harmonized",
@@ -537,9 +492,7 @@ def _prepared_kernel_abi(prepared) -> dict[str, object]:
     return {
         "name": str(kernel.name()),
         "architecture": list(prepared.architecture),
-        "effective_config": prepared.config.effective_config(
-            prepared.launch_cluster_count
-        ),
+        "effective_config": prepared.config.effective_config(prepared.launch_cluster_count),
         "launch": {
             "cluster_count": int(prepared.launch_cluster_count),
             "threads_per_cta": int(kernel.threads_per_cta),
@@ -590,9 +543,7 @@ def _build_training_abi_facts(
             "intermediate": int(config.intermediate_size),
             "top_k": int(config.top_k),
             "max_tokens_per_rank": int(config.max_tokens_per_rank),
-            "max_recv_size_per_rank": int(
-                forward.config.max_recv_size_per_rank
-            ),
+            "max_recv_size_per_rank": int(forward.config.max_recv_size_per_rank),
         },
         "policy": {
             "drop_on_overflow": bool(config.drop_on_overflow),
@@ -633,9 +584,7 @@ def _verify_training_abi_across_ranks(
     rank_digests: list[Any] = [None] * runtime.world_size
     dist.all_gather_object(rank_digests, digest, group=runtime.group)
     raise RuntimeError(
-        "MoeEp training ABI differs across expert-parallel ranks before "
-        "workspace allocation: "
-        f"digests={rank_digests}, local_facts={facts}"
+        "MoeEp training ABI differs across expert-parallel ranks before " "workspace allocation: " f"digests={rank_digests}, local_facts={facts}"
     )
 
 
@@ -735,12 +684,7 @@ class Mxfp8TrainingResourceOwner:
 
     @property
     def prepared(self) -> bool:
-        return (
-            not self._closed
-            and self._runtime is not None
-            and self._workspace is not None
-            and self._workspace.allocated
-        )
+        return not self._closed and self._runtime is not None and self._workspace is not None and self._workspace.allocated
 
     def prepare(self) -> None:
         with self._lock:
@@ -749,21 +693,17 @@ class Mxfp8TrainingResourceOwner:
             if self.prepared:
                 return
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "training resources must be prepared before CUDA graph capture"
-                )
+                raise RuntimeError("training resources must be prepared before CUDA graph capture")
             _runtime_debug(
                 "training-resources.prepare.begin",
                 slot_count=self.slot_count,
                 lane_count=self.lane_count,
-                local_bytes=self.requirements.local_layout.total_bytes
-                if hasattr(self.requirements, "local_layout")
-                else sum(
-                    region.nbytes for region in self.requirements.local_regions
+                local_bytes=(
+                    self.requirements.local_layout.total_bytes
+                    if hasattr(self.requirements, "local_layout")
+                    else sum(region.nbytes for region in self.requirements.local_regions)
                 ),
-                symmetric_bytes=sum(
-                    region.nbytes for region in self.requirements.symmetric_regions
-                ),
+                symmetric_bytes=sum(region.nbytes for region in self.requirements.symmetric_regions),
             )
             _runtime_debug("training-resources.runtime-acquire.begin")
             runtime = self._runtime_manager.acquire(self.config, self.device)
@@ -777,13 +717,9 @@ class Mxfp8TrainingResourceOwner:
             )
             self._runtime = runtime
             try:
-                layout_watchdog = _RuntimeWatchdog(
-                    "training-resources.symmetric-layout-harmonize"
-                )
+                layout_watchdog = _RuntimeWatchdog("training-resources.symmetric-layout-harmonize")
                 layout_watchdog.start()
-                _runtime_debug(
-                    "training-resources.symmetric-layout-harmonize.begin"
-                )
+                _runtime_debug("training-resources.symmetric-layout-harmonize.begin")
                 try:
                     self.requirements = _harmonize_symmetric_regions(
                         self.requirements,
@@ -792,13 +728,9 @@ class Mxfp8TrainingResourceOwner:
                     )
                 finally:
                     layout_watchdog.close()
-                _runtime_debug(
-                    "training-resources.symmetric-layout-harmonize.end"
-                )
+                _runtime_debug("training-resources.symmetric-layout-harmonize.end")
                 if runtime.world_size > 1:
-                    abi_watchdog = _RuntimeWatchdog(
-                        "training-resources.abi-handshake"
-                    )
+                    abi_watchdog = _RuntimeWatchdog("training-resources.abi-handshake")
                     abi_watchdog.start()
                     _runtime_debug("training-resources.abi-handshake.begin")
                     try:
@@ -811,12 +743,10 @@ class Mxfp8TrainingResourceOwner:
                             slot_count=self.slot_count,
                             lane_count=self.lane_count,
                         )
-                        self._abi_fingerprint = (
-                            _verify_training_abi_across_ranks(
-                                abi_facts,
-                                runtime,
-                                self.device,
-                            )
+                        self._abi_fingerprint = _verify_training_abi_across_ranks(
+                            abi_facts,
+                            runtime,
+                            self.device,
                         )
                     finally:
                         abi_watchdog.close()
@@ -837,9 +767,7 @@ class Mxfp8TrainingResourceOwner:
                     symmetric_bytes=workspace.symmetric_layout.total_bytes,
                 )
                 self._workspace = workspace
-                allocation_watchdog = _RuntimeWatchdog(
-                    "training-resources.workspace-allocate"
-                )
+                allocation_watchdog = _RuntimeWatchdog("training-resources.workspace-allocate")
                 allocation_watchdog.start()
                 try:
                     workspace.ensure_allocated()
@@ -850,22 +778,16 @@ class Mxfp8TrainingResourceOwner:
                     # Symmetric-root zeroing is asynchronous. No rank may
                     # enter the first device barrier until every peer has
                     # completed allocation and root initialization.
-                    stream_watchdog = _RuntimeWatchdog(
-                        "training-resources.stream-synchronize"
-                    )
+                    stream_watchdog = _RuntimeWatchdog("training-resources.stream-synchronize")
                     stream_watchdog.start()
-                    _runtime_debug(
-                        "training-resources.stream-synchronize.begin"
-                    )
+                    _runtime_debug("training-resources.stream-synchronize.begin")
                     try:
                         torch.cuda.current_stream(self.device).synchronize()
                     finally:
                         stream_watchdog.close()
                     _runtime_debug("training-resources.stream-synchronize.end")
 
-                    barrier_watchdog = _RuntimeWatchdog(
-                        "training-resources.rank-barrier"
-                    )
+                    barrier_watchdog = _RuntimeWatchdog("training-resources.rank-barrier")
                     barrier_watchdog.start()
                     _runtime_debug("training-resources.rank-barrier.begin")
                     try:
@@ -898,44 +820,24 @@ class Mxfp8TrainingResourceOwner:
     ) -> WorkspaceViews:
         symmetric = {}
         local = {}
-        slot_symmetric = (
-            _FORWARD_SLOT_SYMMETRIC
-            if phase == "forward"
-            else _BACKWARD_SLOT_SYMMETRIC
-        )
-        slot_local = (
-            _FORWARD_SLOT_LOCAL
-            if phase == "forward"
-            else _BACKWARD_SLOT_LOCAL
-        )
+        slot_symmetric = _FORWARD_SLOT_SYMMETRIC if phase == "forward" else _BACKWARD_SLOT_SYMMETRIC
+        slot_local = _FORWARD_SLOT_LOCAL if phase == "forward" else _BACKWARD_SLOT_LOCAL
         for region in requirements.symmetric_regions:
             if region.name in _ROUTING_SYMMETRIC:
-                symmetric[region.name] = flat.symmetric[
-                    _custom_slot_symmetric_name(slot, "routing_topk_weights")
-                ]
+                symmetric[region.name] = flat.symmetric[_custom_slot_symmetric_name(slot, "routing_topk_weights")]
                 continue
             scope_name = (
-                _slot_name(slot, phase, "symmetric", region.name)
-                if region.name in slot_symmetric
-                else _lane_name(lane, phase, "symmetric", region.name)
+                _slot_name(slot, phase, "symmetric", region.name) if region.name in slot_symmetric else _lane_name(lane, phase, "symmetric", region.name)
             )
             symmetric[region.name] = flat.symmetric[scope_name]
         for region in requirements.local_regions:
             if region.name in _ROUTING_LOCAL:
-                local[region.name] = flat.local[
-                    _custom_slot_name(slot, "routing_topk_idx")
-                ]
+                local[region.name] = flat.local[_custom_slot_name(slot, "routing_topk_idx")]
                 continue
             if phase == "backward" and region.name == "backward_fc1_preact":
-                local[region.name] = flat.local[
-                    _custom_slot_name(slot, "fc1_preact")
-                ]
+                local[region.name] = flat.local[_custom_slot_name(slot, "fc1_preact")]
                 continue
-            scope_name = (
-                _slot_name(slot, phase, "local", region.name)
-                if region.name in slot_local
-                else _lane_name(lane, phase, "local", region.name)
-            )
+            scope_name = _slot_name(slot, phase, "local", region.name) if region.name in slot_local else _lane_name(lane, phase, "local", region.name)
             local[region.name] = flat.local[scope_name]
         return WorkspaceViews(
             token_count=flat.token_count,
@@ -951,17 +853,9 @@ class Mxfp8TrainingResourceOwner:
     ) -> Mxfp8TrainingSlotViews:
         config = self.config
         capacity = int(config.max_tokens_per_rank)
-        fwd_shapes = {
-            name: tuple(int(extent) for extent in shape)
-            for name, shape in self.forward_prepared.kernel.get_aux_output_shapes().items()
-        }
-        bwd_shapes = {
-            name: tuple(int(extent) for extent in shape)
-            for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()
-        }
-        scale_columns = _align_scale_columns(
-            self.forward_prepared.pool_token_capacity
-        )
+        fwd_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.forward_prepared.kernel.get_aux_output_shapes().items()}
+        bwd_shapes = {name: tuple(int(extent) for extent in shape) for name, shape in self.backward_prepared.kernel.get_aux_output_shapes().items()}
+        scale_columns = _align_scale_columns(self.forward_prepared.pool_token_capacity)
 
         def local_bytes(name: str) -> torch.Tensor:
             return flat.local[_custom_slot_name(slot, name)]
@@ -1175,13 +1069,9 @@ class Mxfp8TrainingResourceOwner:
     ) -> Mxfp8TrainingExecutionViews:
         with self._lock:
             if slot < 0 or slot >= self.slot_count:
-                raise ValueError(
-                    f"slot {slot} is outside [0, {self.slot_count})"
-                )
+                raise ValueError(f"slot {slot} is outside [0, {self.slot_count})")
             if lane < 0 or lane >= self.lane_count:
-                raise ValueError(
-                    f"lane {lane} is outside [0, {self.lane_count})"
-                )
+                raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
             flat = self._flat_views(token_count)
             forward_workspace = self._phase_workspace(
                 flat,
@@ -1199,9 +1089,7 @@ class Mxfp8TrainingResourceOwner:
             )
             snapshot = None
             if self.forward_prepared.col_quant_sizes_offset is not None:
-                snapshot_bytes = forward_workspace.local[
-                    "kernel_local_workspace"
-                ].narrow(
+                snapshot_bytes = forward_workspace.local["kernel_local_workspace"].narrow(
                     0,
                     self.forward_prepared.col_quant_sizes_offset,
                     self.forward_prepared.col_quant_sizes_bytes,
@@ -1259,9 +1147,7 @@ class Mxfp8TrainingResourceOwner:
             raise ValueError("finalize_overflow slots must be unique")
         for slot in slots:
             if slot < 0 or slot >= self.slot_count:
-                raise ValueError(
-                    f"slot {slot} is outside [0, {self.slot_count})"
-                )
+                raise ValueError(f"slot {slot} is outside [0, {self.slot_count})")
         if lane < 0 or lane >= self.lane_count:
             raise ValueError(f"lane {lane} is outside [0, {self.lane_count})")
         flat = self._flat_views(0)
@@ -1303,10 +1189,7 @@ class Mxfp8TrainingResourceOwner:
         if not self.config.drop_on_overflow:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
-                raise RuntimeError(
-                    "drop_on_overflow=False training resources require "
-                    "torch._assert_async"
-                )
+                raise RuntimeError("drop_on_overflow=False training resources require " "torch._assert_async")
             overflow_ok = _typed_view(
                 flat.local[
                     _lane_name(
@@ -1322,8 +1205,7 @@ class Mxfp8TrainingResourceOwner:
             torch.eq(global_overflow, 0, out=overflow_ok)
             assert_async(
                 overflow_ok,
-                "Rubin MegaMoE receive route-pool overflow; "
-                "the fixed-slot outputs are invalid",
+                "Rubin MegaMoE receive route-pool overflow; " "the fixed-slot outputs are invalid",
             )
         return global_overflow
 

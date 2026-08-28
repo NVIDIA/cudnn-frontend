@@ -44,9 +44,7 @@ class ExecutionPlanOwner:
         local_provider: Optional[LocalMemoryProvider] = None,
     ) -> None:
         if config.max_tokens_per_rank != requirements.max_tokens_per_rank:
-            raise ValueError(
-                "workspace capacity must match ForwardConfig.max_tokens_per_rank"
-            )
+            raise ValueError("workspace capacity must match ForwardConfig.max_tokens_per_rank")
         self.config = config
         self.device = torch.device(device)
         self.requirements = requirements
@@ -61,12 +59,7 @@ class ExecutionPlanOwner:
 
     @property
     def prepared(self) -> bool:
-        return (
-            not self._cleanup_required
-            and self._runtime is not None
-            and self._workspace is not None
-            and self._workspace.allocated
-        )
+        return not self._cleanup_required and self._runtime is not None and self._workspace is not None and self._workspace.allocated
 
     @property
     def cleanup_required(self) -> bool:
@@ -84,28 +77,15 @@ class ExecutionPlanOwner:
             if self._closed:
                 raise RuntimeError("MegaMoE execution plan is closed")
             if self._cleanup_required:
-                raise RuntimeError(
-                    "MegaMoE execution plan requires cleanup before prepare"
-                )
+                raise RuntimeError("MegaMoE execution plan requires cleanup before prepare")
             if request.config is not self.config:
                 raise ValueError("request does not belong to this static plan")
             if torch.device(request.device) != self.device:
-                raise ValueError(
-                    f"execution plan is bound to {self.device}, got {request.device}"
-                )
+                raise ValueError(f"execution plan is bound to {self.device}, got {request.device}")
             if request.token_count > self.requirements.max_tokens_per_rank:
-                raise ValueError(
-                    f"token count {request.token_count} exceeds "
-                    f"max_tokens_per_rank={self.requirements.max_tokens_per_rank}"
-                )
-            if (
-                not self.prepared
-                and torch.cuda.is_current_stream_capturing()
-            ):
-                raise RuntimeError(
-                    "MegaMoE runtime/workspace must be warmed up before "
-                    "CUDA graph capture"
-                )
+                raise ValueError(f"token count {request.token_count} exceeds " f"max_tokens_per_rank={self.requirements.max_tokens_per_rank}")
+            if not self.prepared and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("MegaMoE runtime/workspace must be warmed up before " "CUDA graph capture")
 
             if not self.prepared:
                 runtime = self._runtime_manager.acquire(self.config, self.device)

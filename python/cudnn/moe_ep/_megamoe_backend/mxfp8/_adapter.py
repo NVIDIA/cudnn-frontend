@@ -62,15 +62,8 @@ def _quantize_plain_mxfp8(
         scale_for_math.reciprocal(),
         0.0,
     )
-    normalized = (
-        blocks * reciprocal.unsqueeze(-1)
-    ).clamp(-448.0, 448.0)
-    data = (
-        normalized.to(_MXFP8_DATA_DTYPE)
-        .reshape(*moved.shape)[..., :logical_extent]
-        .movedim(-1, axis)
-        .contiguous()
-    )
+    normalized = (blocks * reciprocal.unsqueeze(-1)).clamp(-448.0, 448.0)
+    data = normalized.to(_MXFP8_DATA_DTYPE).reshape(*moved.shape)[..., :logical_extent].movedim(-1, axis).contiguous()
     return BlockScaledTensor(
         data=data,
         scale=scale.movedim(-1, axis).contiguous(),
@@ -83,10 +76,7 @@ def _quantize_plain_mxfp8(
 def _as_mxfp8(tensor: torch.Tensor | BlockScaledTensor) -> BlockScaledTensor:
     if isinstance(tensor, BlockScaledTensor):
         if tensor.format is not MoeFormat.MXFP8:
-            raise NotImplementedError(
-                "MXFP8 staging cannot convert "
-                f"{tensor.format.value!r} block-scaled input"
-            )
+            raise NotImplementedError("MXFP8 staging cannot convert " f"{tensor.format.value!r} block-scaled input")
         return tensor
     return _quantize_plain_mxfp8(tensor)
 
@@ -101,10 +91,7 @@ def _typed_view(
         expected_bytes *= extent
     expected_bytes *= dtype.itemsize
     if byte_tensor.numel() != expected_bytes:
-        raise ValueError(
-            f"byte region has {byte_tensor.numel()} bytes, "
-            f"expected {expected_bytes} for shape={shape}, dtype={dtype}"
-        )
+        raise ValueError(f"byte region has {byte_tensor.numel()} bytes, " f"expected {expected_bytes} for shape={shape}, dtype={dtype}")
     return byte_tensor.view(dtype).reshape(shape)
 
 
@@ -135,14 +122,8 @@ def _validate_int32_downcast(tensor: torch.Tensor) -> None:
     if tensor.dtype is torch.int32:
         return
     if tensor.dtype is not torch.int64:
-        raise TypeError(
-            "topk_idx staging requires torch.int32 or torch.int64, "
-            f"got {tensor.dtype}"
-        )
-    capturing = (
-        tensor.device.type == "cuda"
-        and torch.cuda.is_current_stream_capturing()
-    )
+        raise TypeError("topk_idx staging requires torch.int32 or torch.int64, " f"got {tensor.dtype}")
+    capturing = tensor.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
     if capturing or tensor.numel() == 0:
         # The public validator checked the same tensor before capture. During
         # replay callers must preserve its documented expert-id invariant.
@@ -160,9 +141,7 @@ def _zero_workspace_prefix(
     name: str,
 ) -> None:
     if nbytes < 0 or nbytes > workspace.numel():
-        raise ValueError(
-            f"{name} zero prefix {nbytes} exceeds {workspace.numel()} bytes"
-        )
+        raise ValueError(f"{name} zero prefix {nbytes} exceeds {workspace.numel()} bytes")
     workspace[:nbytes].zero_()
 
 
@@ -174,10 +153,7 @@ def _zero_workspace_range(
     name: str,
 ) -> None:
     if offset < 0 or nbytes < 0 or offset + nbytes > workspace.numel():
-        raise ValueError(
-            f"{name} byte range [{offset}, {offset + nbytes}) exceeds "
-            f"{workspace.numel()} bytes"
-        )
+        raise ValueError(f"{name} byte range [{offset}, {offset + nbytes}) exceeds " f"{workspace.numel()} bytes")
     workspace.narrow(0, offset, nbytes).zero_()
 
 
@@ -188,15 +164,9 @@ def _interleave_gate_up_rows(
     """Convert gate-half/up-half rows to 32-row gate/up pairs."""
 
     if intermediate % _GATE_UP_INTERLEAVE:
-        raise ValueError(
-            "MXFP8 gate/up interleave requires intermediate_size to be "
-            f"divisible by {_GATE_UP_INTERLEAVE}, got {intermediate}"
-        )
+        raise ValueError("MXFP8 gate/up interleave requires intermediate_size to be " f"divisible by {_GATE_UP_INTERLEAVE}, got {intermediate}")
     if tensor.ndim != 3 or tensor.shape[1] != 2 * intermediate:
-        raise ValueError(
-            f"expected (experts, {2 * intermediate}, K) tensor, "
-            f"got {tuple(tensor.shape)}"
-        )
+        raise ValueError(f"expected (experts, {2 * intermediate}, K) tensor, " f"got {tuple(tensor.shape)}")
 
     experts, _gate_up, reduction = tensor.shape
     pairs = intermediate // _GATE_UP_INTERLEAVE
@@ -212,11 +182,7 @@ def _interleave_gate_up_rows(
         _GATE_UP_INTERLEAVE,
         reduction,
     )
-    return (
-        torch.stack((gate, up), dim=2)
-        .reshape(experts, 2 * intermediate, reduction)
-        .contiguous()
-    )
+    return torch.stack((gate, up), dim=2).reshape(experts, 2 * intermediate, reduction).contiguous()
 
 
 def _to_blocked_bytes(scale_2d: torch.Tensor) -> torch.Tensor:
@@ -245,12 +211,7 @@ def _to_blocked_bytes(scale_2d: torch.Tensor) -> torch.Tensor:
         1,
         3,
     )
-    return (
-        blocks.reshape(-1, 4, 32, 4)
-        .transpose(1, 2)
-        .reshape(-1, 32, 16)
-        .flatten()
-    )
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
 
 
 def _stack_blocked_scales(raw_scales: torch.Tensor) -> torch.Tensor:
@@ -381,16 +342,8 @@ class Mxfp8InputAdapter:
     def _request_weight_key(
         request: ValidatedForwardRequest,
     ) -> tuple | None:
-        fc1 = (
-            _block_scaled_fingerprint(request.fc1_weight)
-            if isinstance(request.fc1_weight, BlockScaledTensor)
-            else _tensor_fingerprint(request.fc1_weight)
-        )
-        fc2 = (
-            _block_scaled_fingerprint(request.fc2_weight)
-            if isinstance(request.fc2_weight, BlockScaledTensor)
-            else _tensor_fingerprint(request.fc2_weight)
-        )
+        fc1 = _block_scaled_fingerprint(request.fc1_weight) if isinstance(request.fc1_weight, BlockScaledTensor) else _tensor_fingerprint(request.fc1_weight)
+        fc2 = _block_scaled_fingerprint(request.fc2_weight) if isinstance(request.fc2_weight, BlockScaledTensor) else _tensor_fingerprint(request.fc2_weight)
         if fc1 is None or fc2 is None:
             return None
         return fc1, fc2
@@ -422,16 +375,8 @@ class Mxfp8InputAdapter:
         # Retain the source storages while this entry is cached so allocator
         # pointer reuse cannot produce a false cache hit.
         self._weight_sources = (
-            *(
-                (request.fc1_weight.data, request.fc1_weight.scale)
-                if isinstance(request.fc1_weight, BlockScaledTensor)
-                else (request.fc1_weight,)
-            ),
-            *(
-                (request.fc2_weight.data, request.fc2_weight.scale)
-                if isinstance(request.fc2_weight, BlockScaledTensor)
-                else (request.fc2_weight,)
-            ),
+            *((request.fc1_weight.data, request.fc1_weight.scale) if isinstance(request.fc1_weight, BlockScaledTensor) else (request.fc1_weight,)),
+            *((request.fc2_weight.data, request.fc2_weight.scale) if isinstance(request.fc2_weight, BlockScaledTensor) else (request.fc2_weight,)),
         )
         self._weight_refresh_count += 1
         return weights
@@ -465,10 +410,7 @@ class Mxfp8InputAdapter:
                 or fc1_c.shape[1] != config.fc1_out
                 or not fc1_c.is_contiguous()
             ):
-                raise ValueError(
-                    "fc1_c buffer must be contiguous BF16 on the request "
-                    f"device with shape (capacity, {config.fc1_out})"
-                )
+                raise ValueError("fc1_c buffer must be contiguous BF16 on the request " f"device with shape (capacity, {config.fc1_out})")
         elif fc1_c is not None:
             raise ValueError("generate_c=False must not receive an fc1_c buffer")
         hidden_sf_columns = (config.hidden + 31) // 32
@@ -514,9 +456,7 @@ class Mxfp8InputAdapter:
         )
         if config.enable_col_quant:
             if col_quant_data_rows <= 0 or col_quant_sf_elements <= 0:
-                raise ValueError(
-                    "enabled column requant requires positive output capacities"
-                )
+                raise ValueError("enabled column requant requires positive output capacities")
             col_quant_data = _typed_k_major_view(
                 local["col_quant_data"],
                 _MXFP8_DATA_DTYPE,
@@ -529,9 +469,7 @@ class Mxfp8InputAdapter:
             )
         else:
             if col_quant_data_rows != 0 or col_quant_sf_elements != 0:
-                raise ValueError(
-                    "disabled column requant must not reserve output capacity"
-                )
+                raise ValueError("disabled column requant must not reserve output capacity")
             col_quant_data = None
             col_quant_sf = None
         local_workspace = local["kernel_local_workspace"]
@@ -539,13 +477,9 @@ class Mxfp8InputAdapter:
 
         staged_activation = _as_mxfp8(request.activation)
         _as_bytes(activation).zero_()
-        _as_bytes(activation[:token_count]).copy_(
-            _as_bytes(staged_activation.data)
-        )
+        _as_bytes(activation[:token_count]).copy_(_as_bytes(staged_activation.data))
         _as_bytes(activation_sf).zero_()
-        _as_bytes(
-            activation_sf[:token_count, :hidden_sf_columns]
-        ).copy_(_as_bytes(staged_activation.scale))
+        _as_bytes(activation_sf[:token_count, :hidden_sf_columns]).copy_(_as_bytes(staged_activation.scale))
         _validate_int32_downcast(request.topk_idx)
         topk_indices.fill_(-1)
         topk_indices[:token_count].copy_(request.topk_idx)
@@ -584,21 +518,12 @@ class Mxfp8InputAdapter:
                 or pre_reduced_activation_sf_offset is not None
                 or pre_reduced_activation_sf_bytes_per_token != 0
             ):
-                raise ValueError(
-                    "in-kernel top-k reduction must not receive a "
-                    "standalone pre-reduced activation workspace"
-                )
+                raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
             # output_data is the in-kernel REDG accumulation base and was
             # cleared above.
         else:
-            if (
-                pre_reduced_activation_offset is None
-                or pre_reduced_activation_bytes_per_token <= 0
-            ):
-                raise ValueError(
-                    "standalone top-k reduction requires a pre-reduced "
-                    "activation workspace"
-                )
+            if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
+                raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")
             # The kernel writes only valid routes into this persistent combine
             # plane. Clear the active token rows so dropped routes cannot reuse
             # contributions from a previous launch.
@@ -610,29 +535,16 @@ class Mxfp8InputAdapter:
             )
             quantized_combine = config.combine_format != "bf16"
             if quantized_combine:
-                if (
-                    pre_reduced_activation_sf_offset is None
-                    or pre_reduced_activation_sf_bytes_per_token <= 0
-                ):
-                    raise ValueError(
-                        "quantized standalone top-k reduction requires a "
-                        "pre-reduced scale workspace"
-                    )
+                if pre_reduced_activation_sf_offset is None or pre_reduced_activation_sf_bytes_per_token <= 0:
+                    raise ValueError("quantized standalone top-k reduction requires a " "pre-reduced scale workspace")
                 _zero_workspace_range(
                     shared_workspace,
                     pre_reduced_activation_sf_offset,
-                    token_count
-                    * pre_reduced_activation_sf_bytes_per_token,
+                    token_count * pre_reduced_activation_sf_bytes_per_token,
                     name="pre-reduced activation scale workspace",
                 )
-            elif (
-                pre_reduced_activation_sf_offset is not None
-                or pre_reduced_activation_sf_bytes_per_token != 0
-            ):
-                raise ValueError(
-                    "BF16 standalone top-k reduction must not receive a "
-                    "pre-reduced scale workspace"
-                )
+            elif pre_reduced_activation_sf_offset is not None or pre_reduced_activation_sf_bytes_per_token != 0:
+                raise ValueError("BF16 standalone top-k reduction must not receive a " "pre-reduced scale workspace")
 
         weights = self._prepare_weights(request, config)
         return Mxfp8LaunchInputs(

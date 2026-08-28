@@ -426,13 +426,9 @@ def _padded_expert_rows(
             as_tuple=False,
         ).flatten()
         if int(positions.numel()) != int(count):
-            raise ValueError(
-                f"expert {expert} has {positions.numel()} rows, expected {count}"
-            )
+            raise ValueError(f"expert {expert} has {positions.numel()} rows, expected {count}")
         if count:
-            padded[begin : begin + count].copy_(
-                rows.index_select(0, positions)
-            )
+            padded[begin : begin + count].copy_(rows.index_select(0, positions))
         begin = int(end)
     return padded
 
@@ -484,23 +480,13 @@ class MoeEpReference:
         if max_tokens_per_rank is not None and max_tokens_per_rank < 0:
             raise ValueError("max_tokens_per_rank must be non-negative")
         if backward_wgrad_mode not in ("none", "operands"):
-            raise ValueError(
-                "backward_wgrad_mode must be 'none' or 'operands'"
-            )
+            raise ValueError("backward_wgrad_mode must be 'none' or 'operands'")
         if backward_wgrad_mode == "operands" and not generate_c:
-            raise ValueError(
-                "backward_wgrad_mode='operands' requires generate_c=True"
-            )
+            raise ValueError("backward_wgrad_mode='operands' requires generate_c=True")
         if not isinstance(token_padding_size, int) or token_padding_size <= 0:
             raise ValueError("token_padding_size must be a positive integer")
-        if (
-            backward_wgrad_mode == "operands"
-            and token_padding_size != 256
-        ):
-            raise ValueError(
-                "backward_wgrad_mode='operands' requires "
-                "token_padding_size=256"
-            )
+        if backward_wgrad_mode == "operands" and token_padding_size != 256:
+            raise ValueError("backward_wgrad_mode='operands' requires " "token_padding_size=256")
 
         if ep_group is None:
             ep_size, ep_rank = 1, 0
@@ -523,14 +509,8 @@ class MoeEpReference:
         self.max_tokens_per_rank = max_tokens_per_rank
         self.output_format = _parse_format(output_format)
         self.combine_format = _parse_format(combine_format)
-        self.intermediate_format = (
-            None if intermediate_format is None else _parse_format(intermediate_format)
-        )
-        self.backward_operand_format = (
-            None
-            if backward_operand_format is None
-            else _parse_format(backward_operand_format)
-        )
+        self.intermediate_format = None if intermediate_format is None else _parse_format(intermediate_format)
+        self.backward_operand_format = None if backward_operand_format is None else _parse_format(backward_operand_format)
         self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
         self.gate_up_clamp = None if gate_up_clamp is None else abs(float(gate_up_clamp))
         self.generate_c = bool(generate_c)
@@ -787,11 +767,7 @@ class MoeEpReference:
         send_token_idx = plan.send_token_idx
         send_slot_idx = plan.send_slot_idx
         send_counts, recv_counts = plan.send_counts, plan.recv_counts
-        forward_activation_float = (
-            wgrad_activation_float
-            if wgrad_activation_float is not None
-            else activation_float
-        )
+        forward_activation_float = wgrad_activation_float if wgrad_activation_float is not None else activation_float
         send_tokens = forward_activation_float.index_select(
             0,
             send_token_idx,
@@ -855,15 +831,20 @@ class MoeEpReference:
                     for value in torch.bincount(
                         recv_expert,
                         minlength=self.experts_per_rank,
-                    ).cpu().tolist()
+                    )
+                    .cpu()
+                    .tolist()
                 )
                 padded_ends = []
                 total = 0
                 for count in valid_counts:
-                    total += _ceil_div(
-                        count,
-                        self.token_padding_size,
-                    ) * self.token_padding_size
+                    total += (
+                        _ceil_div(
+                            count,
+                            self.token_padding_size,
+                        )
+                        * self.token_padding_size
+                    )
                     padded_ends.append(total)
                 ordered_tokens = recv_wgrad_tokens.index_select(
                     0,
@@ -908,9 +889,7 @@ class MoeEpReference:
         fc1_c: torch.Tensor,
         route_metadata: torch.Tensor,
         *,
-        wgrad_forward_stash: Optional[
-            WgradForwardStashReference
-        ] = None,
+        wgrad_forward_stash: Optional[WgradForwardStashReference] = None,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[
@@ -943,22 +922,14 @@ class MoeEpReference:
                 wgrad_forward_stash,
                 WgradForwardStashReference,
             ):
-                raise TypeError(
-                    "wgrad_forward_stash must be a "
-                    "WgradForwardStashReference"
-                )
+                raise TypeError("wgrad_forward_stash must be a " "WgradForwardStashReference")
             if not torch.equal(
                 wgrad_forward_stash.route_metadata,
                 route_metadata,
             ):
-                raise ValueError(
-                    "wgrad_forward_stash route identity does not match "
-                    "route_metadata"
-                )
+                raise ValueError("wgrad_forward_stash route identity does not match " "route_metadata")
         elif wgrad_forward_stash is not None:
-            raise ValueError(
-                "wgrad_forward_stash is only accepted in operands mode"
-            )
+            raise ValueError("wgrad_forward_stash is only accepted in operands mode")
         token_count = topk_idx.shape[0]
         if tuple(grad_output.shape) != (token_count, self.hidden_size):
             raise ValueError(f"grad_output shape must be {(token_count, self.hidden_size)}, got {tuple(grad_output.shape)}")
@@ -981,10 +952,7 @@ class MoeEpReference:
         )
         semantic_fc2_float = fc2_float
         effective_backward_format = self.backward_operand_format
-        if (
-            effective_backward_format is None
-            and self.backward_wgrad_mode == "operands"
-        ):
+        if effective_backward_format is None and self.backward_wgrad_mode == "operands":
             effective_backward_format = MoeFormat.MXFP8
         if effective_backward_format is not None:
             # The dGLU adapter requantizes both transposed weights along the
@@ -1086,16 +1054,11 @@ class MoeEpReference:
             d_h_fc2 = d_y_pre @ fc2_float[expert].transpose(0, 1)
             if self.apply_topk_in_fc1:
                 d_h = d_h_fc2 * w
-                semantic_d_h = (
-                    semantic_d_y
-                    @ semantic_fc2_float[expert].transpose(0, 1)
-                )
+                semantic_d_h = semantic_d_y @ semantic_fc2_float[expert].transpose(0, 1)
                 d_w_rows[positions] = (semantic_d_h * h).sum(dim=-1)
             else:
                 d_h = d_h_fc2
-                d_w_rows[positions] = (
-                    semantic_d_y * (h @ semantic_fc2_float[expert])
-                ).sum(dim=-1)
+                d_w_rows[positions] = (semantic_d_y * (h @ semantic_fc2_float[expert])).sum(dim=-1)
 
             d_g = d_h * u * (sig * (1 + g * (1 - sig)))
             d_u = d_h * s
@@ -1128,14 +1091,8 @@ class MoeEpReference:
         )
         if self.backward_wgrad_mode == "operands":
             stash = wgrad_forward_stash
-            padded_ends = tuple(
-                int(value)
-                for value in stash.expert_offsets.cpu().tolist()
-            )
-            valid_counts = tuple(
-                int(value)
-                for value in stash.valid_route_counts.cpu().tolist()
-            )
+            padded_ends = tuple(int(value) for value in stash.expert_offsets.cpu().tolist())
+            valid_counts = tuple(int(value) for value in stash.valid_route_counts.cpu().tolist())
             padded_dc = _padded_expert_rows(
                 dc_rows,
                 expert_rows,

@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 FINGERPRINT_SCHEMA_VERSION = 1
 _KERNEL_IDENTITY_FIELDS = (
     "kernel_name",
@@ -38,12 +37,7 @@ def canonical_json_sha256(value: object) -> str:
 def kernel_identity_sha256(fingerprint: dict[str, Any]) -> str:
     """Hash fields that must match across AOT and in-process JIT paths."""
 
-    return canonical_json_sha256(
-        {
-            field: fingerprint.get(field)
-            for field in _KERNEL_IDENTITY_FIELDS
-        }
-    )
+    return canonical_json_sha256({field: fingerprint.get(field) for field in _KERNEL_IDENTITY_FIELDS})
 
 
 def source_tree_sha256(root: Path) -> str:
@@ -53,9 +47,7 @@ def source_tree_sha256(root: Path) -> str:
     if not resolved.is_dir():
         raise RuntimeError(f"kernel source tree does not exist: {resolved}")
     digest = hashlib.sha256()
-    sources = sorted(
-        path for path in resolved.rglob("*.py") if path.is_file()
-    )
+    sources = sorted(path for path in resolved.rglob("*.py") if path.is_file())
     if not sources:
         raise RuntimeError(f"kernel source tree contains no Python files: {resolved}")
     for path in sources:
@@ -84,13 +76,15 @@ def _cutlass_version() -> str:
 
 def _json_layout_signature(signature: tuple) -> list[object]:
     return [
-        None
-        if entry is None
-        else {
-            "shape": list(entry[0]),
-            "stride": list(entry[1]),
-            "dtype": str(entry[2]),
-        }
+        (
+            None
+            if entry is None
+            else {
+                "shape": list(entry[0]),
+                "stride": list(entry[1]),
+                "dtype": str(entry[2]),
+            }
+        )
         for entry in signature
     ]
 
@@ -105,9 +99,7 @@ def build_kernel_fingerprint(
 
     kernel = prepared.kernel
     source_root = Path(__file__).resolve().parents[1] / "cutedsl_src"
-    effective_config = prepared.config.effective_config(
-        prepared.launch_cluster_count
-    )
+    effective_config = prepared.config.effective_config(prepared.launch_cluster_count)
     launch_geometry = {
         "grid": [
             prepared.config.cluster_shape_mnk[0],
@@ -117,9 +109,7 @@ def build_kernel_fingerprint(
         "block": [int(kernel.threads_per_cta), 1, 1],
         "cluster": list(prepared.config.cluster_shape_mnk),
         "min_blocks_per_mp": int(getattr(kernel, "occupancy", 1)),
-        "dynamic_shared_memory_bytes": int(
-            getattr(kernel, "smem_capacity", 0)
-        ),
+        "dynamic_shared_memory_bytes": int(getattr(kernel, "smem_capacity", 0)),
     }
     layout = _json_layout_signature(layout_signature)
     fingerprint = {
@@ -134,9 +124,7 @@ def build_kernel_fingerprint(
         "layout_signature_sha256": canonical_json_sha256(layout),
         "compiled_binary_sha256": compiled_binary_sha256,
     }
-    fingerprint["kernel_identity_sha256"] = kernel_identity_sha256(
-        fingerprint
-    )
+    fingerprint["kernel_identity_sha256"] = kernel_identity_sha256(fingerprint)
     fingerprint["fingerprint_sha256"] = canonical_json_sha256(fingerprint)
     return fingerprint
 

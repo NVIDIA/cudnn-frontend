@@ -34,6 +34,7 @@ from ._types import (
 )
 from ._validation import validate_forward, validate_training_weights
 
+
 def _resolve_ep_topology(
     ep_group: Optional[dist.ProcessGroup],
 ) -> tuple[int, int, tuple[int, ...]]:
@@ -42,25 +43,18 @@ def _resolve_ep_topology(
     if ep_group is None:
         return 1, 0, ()
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError(
-            "ep_group requires an initialized torch.distributed process group"
-        )
+        raise RuntimeError("ep_group requires an initialized torch.distributed process group")
 
     ep_size = dist.get_world_size(ep_group)
     ep_rank = dist.get_rank(ep_group)
     if ep_size <= 0 or ep_rank < 0 or ep_rank >= ep_size:
         raise ValueError("the current process must be a member of ep_group")
 
-    ep_global_ranks = tuple(
-        dist.get_global_rank(ep_group, group_rank)
-        for group_rank in range(ep_size)
-    )
+    ep_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
     if len(set(ep_global_ranks)) != ep_size:
         raise RuntimeError("ep_group returned duplicate global ranks")
     if ep_global_ranks[ep_rank] != dist.get_rank():
-        raise RuntimeError(
-            "ep_group rank mapping is inconsistent with the current global rank"
-        )
+        raise RuntimeError("ep_group rank mapping is inconsistent with the current global rank")
     return ep_size, ep_rank, ep_global_ranks
 
 
@@ -70,18 +64,12 @@ def _validate_training_assert_capability(config: ForwardConfig) -> None:
     if config.drop_on_overflow:
         return
     if not callable(getattr(torch, "_assert_async", None)):
-        raise RuntimeError(
-            "drop_on_overflow=False training resources require callable "
-            "torch._assert_async before CUDA Graph capture"
-        )
+        raise RuntimeError("drop_on_overflow=False training resources require callable " "torch._assert_async before CUDA Graph capture")
     if config.ep_size <= 1:
         return
     backend = dist.get_backend(config.ep_group)
     if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
-        raise NotImplementedError(
-            "drop_on_overflow=False EP2+ training resources require an NCCL "
-            "process group for the captured scalar global overflow OR"
-        )
+        raise NotImplementedError("drop_on_overflow=False EP2+ training resources require an NCCL " "process group for the captured scalar global overflow OR")
 
 
 class MoeEp:
@@ -141,22 +129,12 @@ class MoeEp:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
         if top_k > num_experts:
             raise ValueError(f"top_k ({top_k}) cannot exceed num_experts ({num_experts})")
-        if max_tokens_per_rank is not None and (
-            isinstance(max_tokens_per_rank, bool)
-            or not isinstance(max_tokens_per_rank, int)
-            or max_tokens_per_rank < 0
-        ):
-            raise ValueError(
-                "max_tokens_per_rank must be a non-negative integer or None"
-            )
+        if max_tokens_per_rank is not None and (isinstance(max_tokens_per_rank, bool) or not isinstance(max_tokens_per_rank, int) or max_tokens_per_rank < 0):
+            raise ValueError("max_tokens_per_rank must be a non-negative integer or None")
         if max_recv_size_per_rank is not None and (
-            isinstance(max_recv_size_per_rank, bool)
-            or not isinstance(max_recv_size_per_rank, int)
-            or max_recv_size_per_rank <= 0
+            isinstance(max_recv_size_per_rank, bool) or not isinstance(max_recv_size_per_rank, int) or max_recv_size_per_rank <= 0
         ):
-            raise ValueError(
-                "max_recv_size_per_rank must be a positive integer or None"
-            )
+            raise ValueError("max_recv_size_per_rank must be a positive integer or None")
         if not isinstance(drop_on_overflow, bool):
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
@@ -166,19 +144,11 @@ class MoeEp:
             ("sf_padding_size", sf_padding_size),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(
-                    f"{name} must be a positive integer, got {value!r}"
-                )
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
         if sf_padding_size % 128:
-            raise ValueError(
-                "sf_padding_size must be a positive multiple of 128, "
-                f"got {sf_padding_size}"
-            )
+            raise ValueError("sf_padding_size must be a positive multiple of 128, " f"got {sf_padding_size}")
         if tuning is not None and not isinstance(tuning, MoeEpTuningConfig):
-            raise TypeError(
-                "tuning must be a MoeEpTuningConfig or None, "
-                f"got {type(tuning).__name__}"
-            )
+            raise TypeError("tuning must be a MoeEpTuningConfig or None, " f"got {type(tuning).__name__}")
         if gate_up_clamp is not None:
             if isinstance(gate_up_clamp, bool) or not isinstance(gate_up_clamp, Real):
                 raise ValueError("gate_up_clamp must be a finite real number or None")
@@ -187,10 +157,7 @@ class MoeEp:
                 raise ValueError("gate_up_clamp must be a finite real number or None")
 
         if ep_group is not None and not isinstance(ep_group, dist.ProcessGroup):
-            raise ValueError(
-                f"ep_group must be a torch.distributed.ProcessGroup or None, "
-                f"got {type(ep_group).__name__}"
-            )
+            raise ValueError(f"ep_group must be a torch.distributed.ProcessGroup or None, " f"got {type(ep_group).__name__}")
         ep_size, ep_rank, ep_global_ranks = _resolve_ep_topology(ep_group)
         if num_experts % ep_size != 0:
             raise ValueError(f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})")
@@ -215,14 +182,9 @@ class MoeEp:
         self.sf_padding_size = sf_padding_size
         self.tuning = MoeEpTuningConfig() if tuning is None else tuning
         if self.tuning.reduce_topk_in_kernel and (
-            self.combine_format is not MoeFormat.BF16
-            or self.output_format is not MoeFormat.BF16
-            or not self.apply_topk_in_fc1
+            self.combine_format is not MoeFormat.BF16 or self.output_format is not MoeFormat.BF16 or not self.apply_topk_in_fc1
         ):
-            raise ValueError(
-                "reduce_topk_in_kernel requires BF16 combine/output and "
-                "apply_topk_in_fc1=True"
-            )
+            raise ValueError("reduce_topk_in_kernel requires BF16 combine/output and " "apply_topk_in_fc1=True")
 
         for name, fmt in (
             ("output_format", self.output_format),
@@ -280,14 +242,8 @@ class MoeEp:
                 raise RuntimeError("MoeEp is closed")
             from . import _backend
 
-            if (
-                self._forward_backend is not None
-                and request.device != self._forward_backend_device
-            ):
-                raise ValueError(
-                    f"MoeEp backend is bound to {self._forward_backend_device}; "
-                    f"create a separate MoeEp instance for {request.device}"
-                )
+            if self._forward_backend is not None and request.device != self._forward_backend_device:
+                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"create a separate MoeEp instance for {request.device}")
 
             _backend.validate_config(self._forward_config)
             _backend.validate_request(request)
@@ -322,11 +278,7 @@ class MoeEp:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
             topk_version = self._tensor_version(topk_idx)
-            validate_expert_ids = not (
-                self._validated_topk_idx is topk_idx
-                and topk_version is not None
-                and topk_version == self._validated_topk_version
-            )
+            validate_expert_ids = not (self._validated_topk_idx is topk_idx and topk_version is not None and topk_version == self._validated_topk_version)
             request = validate_forward(
                 self._forward_config,
                 activation,
@@ -337,10 +289,7 @@ class MoeEp:
                 validate_expert_ids=validate_expert_ids,
             )
             version_after_validation = self._tensor_version(topk_idx)
-            if (
-                topk_version is not None
-                and topk_version == version_after_validation
-            ):
+            if topk_version is not None and topk_version == version_after_validation:
                 self._validated_topk_idx = topk_idx
                 self._validated_topk_version = topk_version
             else:
@@ -406,21 +355,12 @@ class MoeEp:
                 ("slot_count", slot_count),
                 ("lane_count", lane_count),
             ):
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or value <= 0
-                ):
-                    raise ValueError(
-                        f"{name} must be a positive integer, got {value!r}"
-                    )
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer, got {value!r}")
             if self._training_resources is not None:
                 if not self._training_resources.closed:
                     raise RuntimeError("MoeEp training resources already exist")
-                raise RuntimeError(
-                    "MoeEp training resources were closed; create a new "
-                    "MoeEp instance before preparing replacement weights"
-                )
+                raise RuntimeError("MoeEp training resources were closed; create a new " "MoeEp instance before preparing replacement weights")
 
             device = validate_training_weights(
                 self._forward_config,
@@ -430,14 +370,8 @@ class MoeEp:
             from . import _backend
 
             _backend.validate_config(self._forward_config)
-            if (
-                self._forward_backend is not None
-                and device != self._forward_backend_device
-            ):
-                raise ValueError(
-                    f"MoeEp backend is bound to "
-                    f"{self._forward_backend_device}; got {device}"
-                )
+            if self._forward_backend is not None and device != self._forward_backend_device:
+                raise ValueError(f"MoeEp backend is bound to " f"{self._forward_backend_device}; got {device}")
             if self._forward_backend is None:
                 self._forward_backend = _backend.create_backend(
                     self._forward_config,

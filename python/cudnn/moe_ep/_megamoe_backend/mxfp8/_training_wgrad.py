@@ -91,10 +91,7 @@ class Mxfp8TrainingWgradExporter:
             compiled = self._compiled.get(key)
             if compiled is None:
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "WGrad scale expansion must be compiled before "
-                        "CUDA graph capture"
-                    )
+                    raise RuntimeError("WGrad scale expansion must be compiled before " "CUDA graph capture")
                 import cutlass.cute as cute
 
                 from ._training_wgrad_kernel import (

@@ -30,9 +30,7 @@ def parse_format(value: Union[MoeFormat, str]) -> MoeFormat:
         return MoeFormat(value.lower())
     except (AttributeError, ValueError) as exc:
         choices = ", ".join(item.value for item in MoeFormat)
-        raise ValueError(
-            f"unsupported format {value!r}; expected one of: {choices}"
-        ) from exc
+        raise ValueError(f"unsupported format {value!r}; expected one of: {choices}") from exc
 
 
 def _normalize_axis(axis: int, ndim: int) -> int:
@@ -60,53 +58,34 @@ class BlockScaledTensor:
 
     def __post_init__(self) -> None:
         if not isinstance(self.data, torch.Tensor):
-            raise ValueError(
-                f"data must be a torch.Tensor, got {type(self.data).__name__}"
-            )
+            raise ValueError(f"data must be a torch.Tensor, got {type(self.data).__name__}")
         if not isinstance(self.scale, torch.Tensor):
-            raise ValueError(
-                f"scale must be a torch.Tensor, got {type(self.scale).__name__}"
-            )
+            raise ValueError(f"scale must be a torch.Tensor, got {type(self.scale).__name__}")
         fmt = parse_format(self.format)
         if fmt is MoeFormat.BF16:
             raise ValueError("BlockScaledTensor only represents mxfp8 or nvfp4")
         if self.data.device != self.scale.device:
-            raise ValueError(
-                f"data device {self.data.device} does not match "
-                f"scale device {self.scale.device}"
-            )
+            raise ValueError(f"data device {self.data.device} does not match " f"scale device {self.scale.device}")
         try:
             raw_logical_shape = tuple(self.logical_shape)
         except TypeError as exc:
-            raise ValueError(
-                "logical_shape must be an iterable of integers"
-            ) from exc
+            raise ValueError("logical_shape must be an iterable of integers") from exc
         logical_shape = []
         for dim in raw_logical_shape:
             if isinstance(dim, bool):
-                raise ValueError(
-                    f"logical_shape dimensions must be integers, got {dim!r}"
-                )
+                raise ValueError(f"logical_shape dimensions must be integers, got {dim!r}")
             try:
                 dim = operator.index(dim)
             except TypeError as exc:
-                raise ValueError(
-                    f"logical_shape dimensions must be integers, got {dim!r}"
-                ) from exc
+                raise ValueError(f"logical_shape dimensions must be integers, got {dim!r}") from exc
             if dim < 0:
-                raise ValueError(
-                    f"logical_shape dimensions must be non-negative, got {dim}"
-                )
+                raise ValueError(f"logical_shape dimensions must be non-negative, got {dim}")
             logical_shape.append(dim)
         normalized_shape = tuple(logical_shape)
         axis = _normalize_axis(self.axis, len(normalized_shape))
         logical_extent = normalized_shape[axis]
         block_size = 32 if fmt is MoeFormat.MXFP8 else 16
-        payload_extent = (
-            logical_extent
-            if fmt is MoeFormat.MXFP8
-            else (logical_extent + 1) // 2
-        )
+        payload_extent = logical_extent if fmt is MoeFormat.MXFP8 else (logical_extent + 1) // 2
         scale_extent = (logical_extent + block_size - 1) // block_size
         expected_data_shape = list(normalized_shape)
         expected_data_shape[axis] = payload_extent
@@ -115,15 +94,9 @@ class BlockScaledTensor:
         expected_data_shape = tuple(expected_data_shape)
         expected_scale_shape = tuple(expected_scale_shape)
         if tuple(self.data.shape) != expected_data_shape:
-            raise ValueError(
-                f"{fmt.value} data shape must be {expected_data_shape}, "
-                f"got {tuple(self.data.shape)}"
-            )
+            raise ValueError(f"{fmt.value} data shape must be {expected_data_shape}, " f"got {tuple(self.data.shape)}")
         if tuple(self.scale.shape) != expected_scale_shape:
-            raise ValueError(
-                f"{fmt.value} scale shape must be {expected_scale_shape}, "
-                f"got {tuple(self.scale.shape)}"
-            )
+            raise ValueError(f"{fmt.value} scale shape must be {expected_scale_shape}, " f"got {tuple(self.scale.shape)}")
         e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
         if e4m3_dtype is None:
             raise RuntimeError("this PyTorch build does not provide torch.float8_e4m3fn")
@@ -131,22 +104,14 @@ class BlockScaledTensor:
             expected_data_dtype = e4m3_dtype
             expected_scale_dtype = getattr(torch, "float8_e8m0fnu", None)
             if expected_scale_dtype is None:
-                raise RuntimeError(
-                    "this PyTorch build does not provide torch.float8_e8m0fnu"
-                )
+                raise RuntimeError("this PyTorch build does not provide torch.float8_e8m0fnu")
         else:
             expected_data_dtype = torch.uint8
             expected_scale_dtype = e4m3_dtype
         if self.data.dtype is not expected_data_dtype:
-            raise ValueError(
-                f"{fmt.value} data must have dtype {expected_data_dtype}, "
-                f"got {self.data.dtype}"
-            )
+            raise ValueError(f"{fmt.value} data must have dtype {expected_data_dtype}, " f"got {self.data.dtype}")
         if self.scale.dtype is not expected_scale_dtype:
-            raise ValueError(
-                f"{fmt.value} scale must have dtype {expected_scale_dtype}, "
-                f"got {self.scale.dtype}"
-            )
+            raise ValueError(f"{fmt.value} scale must have dtype {expected_scale_dtype}, " f"got {self.scale.dtype}")
         object.__setattr__(self, "format", fmt)
         object.__setattr__(self, "logical_shape", normalized_shape)
         object.__setattr__(self, "axis", axis)
@@ -179,9 +144,7 @@ class BlockScaledTensor:
             packed = self.data.movedim(self.axis, -1)
             low = packed & 0x0F
             high = packed >> 4
-            codes = torch.stack((low, high), dim=-1).flatten(-2)[
-                ..., :logical_extent
-            ]
+            codes = torch.stack((low, high), dim=-1).flatten(-2)[..., :logical_extent]
             table = torch.tensor(
                 [
                     0.0,
@@ -277,14 +240,8 @@ class MoeEpTrainingResources:
         self._resource_token = object()
         self.weights = weights
         self.device = torch.device(device)
-        self.slots = tuple(
-            MoeEpTrainingSlot(index, self._resource_token)
-            for index in range(slot_count)
-        )
-        self.lanes = tuple(
-            MoeEpExecutionLane(index, self._resource_token)
-            for index in range(lane_count)
-        )
+        self.slots = tuple(MoeEpTrainingSlot(index, self._resource_token) for index in range(slot_count))
+        self.lanes = tuple(MoeEpExecutionLane(index, self._resource_token) for index in range(lane_count))
         self._closed = False
 
     @property
@@ -301,15 +258,9 @@ class MoeEpTrainingResources:
             raise RuntimeError("MoeEp training resources are closed")
         if self._operator_token is not operator_token:
             raise ValueError("training resources belong to another MoeEp instance")
-        if (
-            slot._resource_token is not self._resource_token
-            or slot not in self.slots
-        ):
+        if slot._resource_token is not self._resource_token or slot not in self.slots:
             raise ValueError("training slot does not belong to these resources")
-        if (
-            lane._resource_token is not self._resource_token
-            or lane not in self.lanes
-        ):
+        if lane._resource_token is not self._resource_token or lane not in self.lanes:
             raise ValueError("execution lane does not belong to these resources")
 
     def refresh_weights(self) -> None:
@@ -379,12 +330,10 @@ class MoeEpTrainingResources:
             launch_training_backward,
         )
 
-        grad_activation, grad_topk_weights, operands = (
-            launch_training_backward(
-                self._owner,
-                execution,
-                grad_output,
-            )
+        grad_activation, grad_topk_weights, operands = launch_training_backward(
+            self._owner,
+            execution,
+            grad_output,
         )
         return grad_activation, grad_topk_weights, operands
 
@@ -399,24 +348,12 @@ class MoeEpTrainingResources:
             raise RuntimeError("MoeEp training resources are closed")
         if lane is None:
             lane = self.lanes[0]
-        if (
-            not isinstance(lane, MoeEpExecutionLane)
-            or lane._resource_token is not self._resource_token
-            or lane not in self.lanes
-        ):
-            raise ValueError(
-                "overflow execution lane does not belong to these resources"
-            )
+        if not isinstance(lane, MoeEpExecutionLane) or lane._resource_token is not self._resource_token or lane not in self.lanes:
+            raise ValueError("overflow execution lane does not belong to these resources")
         slot_indices = []
         for slot in slots:
-            if (
-                not isinstance(slot, MoeEpTrainingSlot)
-                or slot._resource_token is not self._resource_token
-                or slot not in self.slots
-            ):
-                raise ValueError(
-                    "overflow slot does not belong to these resources"
-                )
+            if not isinstance(slot, MoeEpTrainingSlot) or slot._resource_token is not self._resource_token or slot not in self.slots:
+                raise ValueError("overflow slot does not belong to these resources")
             slot_indices.append(slot.index)
         return self._owner.finalize_overflow(
             tuple(slot_indices),

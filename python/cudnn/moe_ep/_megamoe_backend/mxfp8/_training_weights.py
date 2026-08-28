@@ -19,9 +19,7 @@ def _round_up(value: int, multiple: int) -> int:
 
 def _empty_k_major_like(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim != 3:
-        raise ValueError(
-            f"K-major training weight must be rank 3, got {tensor.ndim}"
-        )
+        raise ValueError(f"K-major training weight must be rank 3, got {tensor.ndim}")
     experts, reduction, output = tensor.shape
     return torch.empty_strided(
         tensor.shape,
@@ -52,9 +50,7 @@ def _copy_k_major(
     source: torch.Tensor,
 ) -> None:
     if target.shape != source.shape:
-        raise ValueError(
-            f"K-major copy shape mismatch: {target.shape} != {source.shape}"
-        )
+        raise ValueError(f"K-major copy shape mismatch: {target.shape} != {source.shape}")
     target.copy_(source)
 
 
@@ -131,28 +127,25 @@ def _copy_blocked_scales_plain(
 
     experts = source.shape[0]
     if tuple(source.shape) != (experts, raw_columns, raw_rows):
-        raise ValueError(
-            "plain training scale shape mismatch: "
-            f"{tuple(source.shape)} != "
-            f"{(experts, raw_columns, raw_rows)}"
-        )
+        raise ValueError("plain training scale shape mismatch: " f"{tuple(source.shape)} != " f"{(experts, raw_columns, raw_rows)}")
     if raw_rows % 128 or raw_columns % 4:
-        raise ValueError(
-            "training scale pack requires rows divisible by 128 and "
-            "columns divisible by 4"
-        )
+        raise ValueError("training scale pack requires rows divisible by 128 and " "columns divisible by 4")
     row_blocks = raw_rows // 128
     column_blocks = raw_columns // 4
-    source_view = source.view(
-        torch.uint8,
-    ).view(
-        experts,
-        column_blocks,
-        4,
-        row_blocks,
-        4,
-        32,
-    ).permute(0, 3, 1, 5, 4, 2)
+    source_view = (
+        source.view(
+            torch.uint8,
+        )
+        .view(
+            experts,
+            column_blocks,
+            4,
+            row_blocks,
+            4,
+            32,
+        )
+        .permute(0, 3, 1, 5, 4, 2)
+    )
     target.view(torch.uint8).view(
         experts,
         row_blocks,
@@ -178,21 +171,22 @@ def _copy_blocked_scales_gate_up_rows(
     if tuple(source.shape) != (experts, raw_columns, raw_rows):
         raise ValueError("forward FC1 training scale shape mismatch")
     if intermediate % 64 or raw_columns % 4:
-        raise ValueError(
-            "forward FC1 scale pack requires intermediate divisible by 64 "
-            "and reduction blocks divisible by 4"
-        )
+        raise ValueError("forward FC1 scale pack requires intermediate divisible by 64 " "and reduction blocks divisible by 4")
     row_blocks = raw_rows // 128
     column_blocks = raw_columns // 4
-    source_view = source.view(torch.uint8).view(
-        experts,
-        column_blocks,
-        4,
-        2,
-        row_blocks,
-        2,
-        32,
-    ).permute(0, 4, 1, 6, 5, 3, 2)
+    source_view = (
+        source.view(torch.uint8)
+        .view(
+            experts,
+            column_blocks,
+            4,
+            2,
+            row_blocks,
+            2,
+            32,
+        )
+        .permute(0, 4, 1, 6, 5, 3, 2)
+    )
     target.view(torch.uint8).view(
         experts,
         row_blocks,
@@ -222,21 +216,22 @@ def _copy_blocked_scales_gate_up_columns(
     ):
         raise ValueError("backward W1-transpose training scale shape mismatch")
     if output % 128 or reduction_blocks % 2:
-        raise ValueError(
-            "backward W1-transpose scale pack requires output divisible by "
-            "128 and intermediate divisible by 64"
-        )
+        raise ValueError("backward W1-transpose scale pack requires output divisible by " "128 and intermediate divisible by 64")
     row_blocks = output // 128
     column_blocks = reduction_blocks // 2
-    source_view = source.view(torch.uint8).view(
-        experts,
-        2,
-        column_blocks,
-        2,
-        row_blocks,
-        4,
-        32,
-    ).permute(0, 4, 2, 6, 5, 3, 1)
+    source_view = (
+        source.view(torch.uint8)
+        .view(
+            experts,
+            2,
+            column_blocks,
+            2,
+            row_blocks,
+            4,
+            32,
+        )
+        .permute(0, 4, 2, 6, 5, 3, 1)
+    )
     target.view(torch.uint8).view(
         experts,
         row_blocks,

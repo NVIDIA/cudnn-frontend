@@ -47,8 +47,7 @@ def _runtime_debug(event: str, **details: object) -> None:
         **details,
     }
     print(
-        "[moe-ep-runtime] "
-        + " ".join(f"{name}={value}" for name, value in fields.items()),
+        "[moe-ep-runtime] " + " ".join(f"{name}={value}" for name, value in fields.items()),
         file=sys.stderr,
         flush=True,
     )
@@ -71,9 +70,7 @@ class _RuntimeWatchdog:
         self._event = event
         self._stopped = threading.Event()
         try:
-            self._interval = float(
-                os.environ.get("MOE_EP_RUNTIME_WATCHDOG_SECONDS", "30")
-            )
+            self._interval = float(os.environ.get("MOE_EP_RUNTIME_WATCHDOG_SECONDS", "30"))
         except ValueError:
             self._interval = 30.0
         self._thread: Optional[threading.Thread] = None
@@ -116,9 +113,7 @@ class _RuntimeWatchdog:
                 except OSError as exc:
                     wait_channels.append(f"{task_dir.name}:unavailable({exc.errno})")
                 else:
-                    wait_channels.append(
-                        f"{task_dir.name}:{thread_name}:{wait_channel or '-'}"
-                    )
+                    wait_channels.append(f"{task_dir.name}:{thread_name}:{wait_channel or '-'}")
             _runtime_debug(
                 "watchdog",
                 blocked_event=self._event,
@@ -174,40 +169,23 @@ class NvshmemRuntimeProvider(Protocol):
 
 def _resolve_world(config: ForwardConfig) -> RuntimeWorld:
     if config.ep_group is None:
-        if (
-            config.ep_size != 1
-            or config.ep_rank != 0
-            or config.ep_global_ranks
-        ):
-            raise ValueError(
-                "ep_group=None requires ep_size=1, ep_rank=0, and no "
-                "distributed rank membership"
-            )
+        if config.ep_size != 1 or config.ep_rank != 0 or config.ep_global_ranks:
+            raise ValueError("ep_group=None requires ep_size=1, ep_rank=0, and no " "distributed rank membership")
         return RuntimeWorld(rank=0, size=1, group=None, global_ranks=())
 
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError(
-            "distributed MegaMoE runtime requires torch.distributed to be initialized"
-        )
+        raise RuntimeError("distributed MegaMoE runtime requires torch.distributed to be initialized")
 
     group = config.ep_group
     rank = dist.get_rank(group)
     size = dist.get_world_size(group)
-    global_ranks = tuple(
-        dist.get_global_rank(group, group_rank)
-        for group_rank in range(size)
-    )
+    global_ranks = tuple(dist.get_global_rank(group, group_rank) for group_rank in range(size))
     if (rank, size) != (config.ep_rank, config.ep_size):
         raise RuntimeError(
-            "ForwardConfig EP geometry does not match its process group: "
-            f"config=({config.ep_rank}, {config.ep_size}), "
-            f"runtime=({rank}, {size})"
+            "ForwardConfig EP geometry does not match its process group: " f"config=({config.ep_rank}, {config.ep_size}), " f"runtime=({rank}, {size})"
         )
     if global_ranks != config.ep_global_ranks:
-        raise RuntimeError(
-            "ForwardConfig EP membership does not match its process group: "
-            f"config={config.ep_global_ranks}, runtime={global_ranks}"
-        )
+        raise RuntimeError("ForwardConfig EP membership does not match its process group: " f"config={config.ep_global_ranks}, runtime={global_ranks}")
     return RuntimeWorld(
         rank=rank,
         size=size,
@@ -237,9 +215,7 @@ def _load_nvshmem_core():
     try:
         import nvshmem.core as core
     except (ImportError, OSError) as exc:
-        raise RuntimeUnavailableError(
-            "MegaMoE distributed runtime requires nvshmem4py and NVSHMEM libraries"
-        ) from exc
+        raise RuntimeUnavailableError("MegaMoE distributed runtime requires nvshmem4py and NVSHMEM libraries") from exc
     return core
 
 
@@ -249,9 +225,7 @@ def _normalize_nvshmem_init_state(status) -> RuntimeInitState:
     name = getattr(status, "name", "")
     if name.endswith("NOT_INITIALIZED"):
         return RuntimeInitState.NOT_INITIALIZED
-    if name.endswith("IS_INITIALIZED") or name.endswith(
-        ("LIMITED_MPG", "FULL_MPG")
-    ):
+    if name.endswith("IS_INITIALIZED") or name.endswith(("LIMITED_MPG", "FULL_MPG")):
         return RuntimeInitState.INITIALIZED
     if name.endswith("IS_BOOTSTRAPPED"):
         return RuntimeInitState.PARTIAL
@@ -275,9 +249,7 @@ class _DefaultNvshmemRuntimeProvider:
         try:
             status = core.init_status()
         except Exception as exc:
-            raise RuntimeUnavailableError(
-                "failed to query NVSHMEM initialization status"
-            ) from exc
+            raise RuntimeUnavailableError("failed to query NVSHMEM initialization status") from exc
         return _normalize_nvshmem_init_state(status)
 
     def initialize(self, device: torch.device, world: RuntimeWorld) -> None:
@@ -313,16 +285,11 @@ class _DefaultNvshmemRuntimeProvider:
             uid_bytes = uid._data.view(np.uint8).copy()
             uid_tensor = torch.from_numpy(uid_bytes)
             group_backend = dist.get_backend(world.group)
-            if (
-                group_backend == dist.Backend.NCCL
-                or str(group_backend).lower() == "nccl"
-            ):
+            if group_backend == dist.Backend.NCCL or str(group_backend).lower() == "nccl":
                 uid_tensor = uid_tensor.to(device=device)
             root_global_rank = dist.get_global_rank(world.group, 0)
             if root_global_rank != world.global_ranks[0]:
-                raise RuntimeError(
-                    "EP subgroup root changed during NVSHMEM bootstrap"
-                )
+                raise RuntimeError("EP subgroup root changed during NVSHMEM bootstrap")
             _runtime_debug(
                 "initialize.uid-broadcast.begin",
                 backend=group_backend,
@@ -368,9 +335,7 @@ class _DefaultNvshmemRuntimeProvider:
                 error=repr(exc),
                 elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
             )
-            raise RuntimeUnavailableError(
-                "failed to initialize the NVSHMEM EP subgroup runtime"
-            ) from exc
+            raise RuntimeUnavailableError("failed to initialize the NVSHMEM EP subgroup runtime") from exc
 
     def rank(self) -> int:
         try:
@@ -382,9 +347,7 @@ class _DefaultNvshmemRuntimeProvider:
         try:
             return int(_load_nvshmem_core().n_pes())
         except Exception as exc:
-            raise RuntimeUnavailableError(
-                "failed to query the NVSHMEM PE world size"
-            ) from exc
+            raise RuntimeUnavailableError("failed to query the NVSHMEM PE world size") from exc
 
     def device(self) -> torch.device:
         try:
@@ -395,9 +358,7 @@ class _DefaultNvshmemRuntimeProvider:
                 raise RuntimeError("NVSHMEM cached device is empty")
             return torch.device("cuda", int(cached.device_id))
         except Exception as exc:
-            raise RuntimeUnavailableError(
-                "failed to query the NVSHMEM initialization device"
-            ) from exc
+            raise RuntimeUnavailableError("failed to query the NVSHMEM initialization device") from exc
 
     def finalize(self) -> None:
         core = _load_nvshmem_core()
@@ -501,9 +462,7 @@ class RuntimeManager:
     def __init__(
         self,
         *,
-        provider_factory: Callable[[], NvshmemRuntimeProvider] = (
-            _DefaultNvshmemRuntimeProvider
-        ),
+        provider_factory: Callable[[], NvshmemRuntimeProvider] = (_DefaultNvshmemRuntimeProvider),
         world_resolver: Callable[[ForwardConfig], RuntimeWorld] = _resolve_world,
         keep_alive: bool = False,
     ) -> None:
@@ -541,19 +500,11 @@ class RuntimeManager:
                     cleanup_required=active.cleanup_required,
                 )
                 if active.cleanup_required:
-                    raise RuntimeError(
-                        "MegaMoE process runtime requires cleanup before reacquire"
-                    )
+                    raise RuntimeError("MegaMoE process runtime requires cleanup before reacquire")
                 if active.device != device:
-                    raise ValueError(
-                        f"MegaMoE process runtime is bound to {active.device}; "
-                        f"cannot acquire it for {device}"
-                    )
+                    raise ValueError(f"MegaMoE process runtime is bound to {active.device}; " f"cannot acquire it for {device}")
                 if active.world.identity != world.identity:
-                    raise RuntimeError(
-                        "MegaMoE process runtime is already bound to a different "
-                        "EP subgroup"
-                    )
+                    raise RuntimeError("MegaMoE process runtime is already bound to a different " "EP subgroup")
                 active.ref_count += 1
                 _runtime_debug(
                     "manager.acquire-reuse.end",
@@ -583,13 +534,8 @@ class RuntimeManager:
                     init_status=status.value,
                 )
                 if status is RuntimeInitState.PARTIAL:
-                    raise RuntimeError(
-                        "cannot attach to a partially initialized NVSHMEM runtime"
-                    )
-                if (
-                    status is RuntimeInitState.INITIALIZED
-                    and not _spans_default_distributed_world(world)
-                ):
+                    raise RuntimeError("cannot attach to a partially initialized NVSHMEM runtime")
+                if status is RuntimeInitState.INITIALIZED and not _spans_default_distributed_world(world):
                     raise RuntimeError(
                         "cannot safely attach an externally initialized NVSHMEM "
                         "runtime to a non-WORLD EP subgroup because its ordered "
@@ -629,20 +575,11 @@ class RuntimeManager:
                             device,
                             world,
                             RuntimeError(
-                                "NVSHMEM initialization device does not match "
-                                f"the requested device: nvshmem={provider_device}, "
-                                f"requested={device}"
+                                "NVSHMEM initialization device does not match " f"the requested device: nvshmem={provider_device}, " f"requested={device}"
                             ),
                         )
-                    ownership = (
-                        "owned"
-                        if owns_runtime
-                        else "externally initialized"
-                    )
-                    raise RuntimeError(
-                        f"{ownership} NVSHMEM runtime is bound to "
-                        f"{provider_device}, not the requested device {device}"
-                    )
+                    ownership = "owned" if owns_runtime else "externally initialized"
+                    raise RuntimeError(f"{ownership} NVSHMEM runtime is bound to " f"{provider_device}, not the requested device {device}")
                 if (provider_rank, provider_size) != (world.rank, world.size):
                     if owns_runtime:
                         self._cleanup_owned_runtime_after_error(
@@ -702,9 +639,7 @@ class RuntimeManager:
                 provider.finalize()
         except Exception as cleanup_error:
             cls._mark_cleanup_required(provider, device, world)
-            raise RuntimeError(
-                "NVSHMEM initialization failed and rollback requires retry"
-            ) from cleanup_error
+            raise RuntimeError("NVSHMEM initialization failed and rollback requires retry") from cleanup_error
         _logger.debug(
             "rolled back failed NVSHMEM initialization: %s",
             initialization_error,
@@ -722,9 +657,7 @@ class RuntimeManager:
             provider.finalize()
         except Exception as cleanup_error:
             cls._mark_cleanup_required(provider, device, world)
-            raise RuntimeError(
-                "NVSHMEM validation failed and cleanup requires retry"
-            ) from cleanup_error
+            raise RuntimeError("NVSHMEM validation failed and cleanup requires retry") from cleanup_error
         _logger.debug(
             "finalized owned NVSHMEM after validation failure: %s",
             original_error,
@@ -738,13 +671,9 @@ class RuntimeManager:
             if active is None:
                 return
             if not active.cleanup_required or active.ref_count != 0:
-                raise RuntimeError(
-                    "MegaMoE process runtime does not have retryable cleanup"
-                )
+                raise RuntimeError("MegaMoE process runtime does not have retryable cleanup")
             if active.provider is None:
-                raise RuntimeError(
-                    "retryable MegaMoE runtime cleanup has no provider"
-                )
+                raise RuntimeError("retryable MegaMoE runtime cleanup has no provider")
             active.provider.finalize()
             _PROCESS_RUNTIME_REGISTRY.active = None
 
@@ -756,13 +685,8 @@ class RuntimeManager:
             if active is None:
                 return
             if active.ref_count != 0:
-                raise RuntimeError(
-                    "cannot shut down the MegaMoE process runtime while "
-                    f"{active.ref_count} handles remain active"
-                )
-            if active.provider is not None and (
-                active.owns_runtime or active.cleanup_required
-            ):
+                raise RuntimeError("cannot shut down the MegaMoE process runtime while " f"{active.ref_count} handles remain active")
+            if active.provider is not None and (active.owns_runtime or active.cleanup_required):
                 _runtime_debug(
                     "manager.shutdown-finalize.begin",
                     cleanup_required=active.cleanup_required,
@@ -779,9 +703,7 @@ class RuntimeManager:
                 _runtime_debug("manager.release-stale")
                 return
             if active.ref_count <= 0:
-                raise RuntimeError(
-                    "MegaMoE process runtime has invalid release state"
-                )
+                raise RuntimeError("MegaMoE process runtime has invalid release state")
 
             _runtime_debug(
                 "manager.release.begin",
@@ -791,9 +713,7 @@ class RuntimeManager:
             )
             if active.cleanup_required:
                 if active.ref_count != 1 or active.provider is None:
-                    raise RuntimeError(
-                        "MegaMoE process runtime has invalid retry state"
-                    )
+                    raise RuntimeError("MegaMoE process runtime has invalid retry state")
                 active.provider.finalize()
                 _PROCESS_RUNTIME_REGISTRY.active = None
                 _runtime_debug("manager.release.cleanup-retry.end")

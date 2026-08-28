@@ -45,13 +45,9 @@ class BufferRegion:
         if not self.name:
             raise ValueError("workspace region name must not be empty")
         if self.nbytes < 0:
-            raise ValueError(
-                f"workspace region {self.name!r} has negative size {self.nbytes}"
-            )
+            raise ValueError(f"workspace region {self.name!r} has negative size {self.nbytes}")
         if self.alignment <= 0 or self.alignment & (self.alignment - 1):
-            raise ValueError(
-                f"workspace region {self.name!r} alignment must be a power of two"
-            )
+            raise ValueError(f"workspace region {self.name!r} alignment must be a power of two")
 
 
 @dataclass(frozen=True)
@@ -122,10 +118,7 @@ class WorkspaceRequirements:
         local_names = {region.name for region in self.local_regions}
         duplicates = symmetric_names & local_names
         if duplicates:
-            raise ValueError(
-                "workspace region names must be unique across roots: "
-                f"{sorted(duplicates)}"
-            )
+            raise ValueError("workspace region names must be unique across roots: " f"{sorted(duplicates)}")
 
     @classmethod
     def for_mxfp8(
@@ -156,9 +149,7 @@ class WorkspaceRequirements:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
         if bool(col_quant_data_bytes) != bool(col_quant_sf_bytes):
-            raise ValueError(
-                "column requant data and scale workspace must be enabled together"
-            )
+            raise ValueError("column requant data and scale workspace must be enabled together")
         backward_sizes = (
             backward_fc1_preact_bytes,
             backward_dprob_bytes,
@@ -166,21 +157,14 @@ class WorkspaceRequirements:
             backward_aux_scale_bytes,
         )
         if any(backward_sizes) and not all(backward_sizes):
-            raise ValueError(
-                "backward preactivation, dprob, data, and scale workspace "
-                "must be enabled together"
-            )
+            raise ValueError("backward preactivation, dprob, data, and scale workspace " "must be enabled together")
 
         tokens = config.max_tokens_per_rank
         hidden = config.hidden_size
         top_k = config.top_k
         kernel_sf_columns = padded_mxfp8_scale_columns(hidden)
 
-        backward_symmetric_regions = (
-            (BufferRegion("backward_dprob", backward_dprob_bytes),)
-            if backward_dprob_bytes
-            else ()
-        )
+        backward_symmetric_regions = (BufferRegion("backward_dprob", backward_dprob_bytes),) if backward_dprob_bytes else ()
         symmetric_regions = (
             BufferRegion("activation_data", tokens * hidden),
             BufferRegion("activation_scale", tokens * kernel_sf_columns),
@@ -238,6 +222,7 @@ class WorkspaceRequirements:
             local_regions=local_regions,
         )
 
+
 class LocalMemoryProvider(Protocol):
     """Injectable local allocation boundary."""
 
@@ -269,15 +254,9 @@ class _LocalSlab:
             if not isinstance(root, torch.Tensor):
                 raise TypeError("local memory provider must return a torch.Tensor")
             if root.dtype is not torch.uint8 or root.numel() < nbytes:
-                raise ValueError(
-                    "local root must be a uint8 tensor with at least "
-                    f"{nbytes} elements"
-                )
+                raise ValueError("local root must be a uint8 tensor with at least " f"{nbytes} elements")
             if root.device != device:
-                raise ValueError(
-                    "local root device does not match runtime device: "
-                    f"root={root.device}, runtime={device}"
-                )
+                raise ValueError("local root device does not match runtime device: " f"root={root.device}, runtime={device}")
             if not root.is_contiguous():
                 raise ValueError("local root tensor must be contiguous")
             _runtime_debug("local-slab.zero.begin", nbytes=nbytes)
@@ -297,10 +276,7 @@ class _LocalSlab:
 
     def byte_view(self, offset: int, nbytes: int) -> torch.Tensor:
         if offset < 0 or nbytes < 0 or offset + nbytes > self._nbytes:
-            raise ValueError(
-                f"byte view [{offset}, {offset + nbytes}) exceeds "
-                f"local slab size {self._nbytes}"
-            )
+            raise ValueError(f"byte view [{offset}, {offset + nbytes}) exceeds " f"local slab size {self._nbytes}")
         return self.root.narrow(0, offset, nbytes)
 
     def close(self) -> None:
@@ -334,9 +310,7 @@ class WorkspaceOwner:
     ) -> None:
         self.requirements = requirements
         self.runtime = runtime
-        self.symmetric_layout = BufferLayout.build(
-            requirements.symmetric_regions
-        )
+        self.symmetric_layout = BufferLayout.build(requirements.symmetric_regions)
         self.local_layout = BufferLayout.build(requirements.local_regions)
         if self.symmetric_layout.total_bytes <= 0:
             raise ValueError("workspace requires at least one symmetric byte")
@@ -353,12 +327,7 @@ class WorkspaceOwner:
 
     @property
     def allocated(self) -> bool:
-        return (
-            not self._cleanup_required
-            and self._symmetric is not None
-            and self._symmetric.allocated
-            and self._local is not None
-        )
+        return not self._cleanup_required and self._symmetric is not None and self._symmetric.allocated and self._local is not None
 
     @property
     def cleanup_required(self) -> bool:
@@ -373,9 +342,7 @@ class WorkspaceOwner:
             if self._closed:
                 raise RuntimeError("workspace owner is closed")
             if self._cleanup_required:
-                raise RuntimeError(
-                    "workspace owner requires cleanup before allocation"
-                )
+                raise RuntimeError("workspace owner requires cleanup before allocation")
             if self.allocated:
                 return
             self.runtime.ensure_open()
@@ -419,14 +386,9 @@ class WorkspaceOwner:
     def views(self, token_count: int) -> WorkspaceViews:
         with self._lock:
             if token_count < 0:
-                raise ValueError(
-                    f"token_count must be non-negative, got {token_count}"
-                )
+                raise ValueError(f"token_count must be non-negative, got {token_count}")
             if token_count > self.requirements.max_tokens_per_rank:
-                raise ValueError(
-                    f"token count {token_count} exceeds "
-                    f"max_tokens_per_rank={self.requirements.max_tokens_per_rank}"
-                )
+                raise ValueError(f"token count {token_count} exceeds " f"max_tokens_per_rank={self.requirements.max_tokens_per_rank}")
             self.ensure_allocated()
             assert self._symmetric is not None
             assert self._local is not None

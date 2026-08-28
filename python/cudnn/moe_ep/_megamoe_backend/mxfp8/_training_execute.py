@@ -54,11 +54,7 @@ def _activation_views(
     capacity: int,
     hidden: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    workspace = (
-        execution.backward.workspace
-        if backward
-        else execution.forward.workspace
-    )
+    workspace = execution.backward.workspace if backward else execution.forward.workspace
     return (
         _typed_view(
             workspace.symmetric["activation_data"],
@@ -79,9 +75,7 @@ def _write_expert_offsets(
 ) -> None:
     snapshot = execution.forward_expert_size_snapshot
     if snapshot is None:
-        raise RuntimeError(
-            "training forward requires the persistent expert-size snapshot"
-        )
+        raise RuntimeError("training forward requires the persistent expert-size snapshot")
     counts = execution.slot.valid_route_counts
     offsets = execution.slot.expert_offsets
     counts.copy_(snapshot)
@@ -159,9 +153,7 @@ def launch_training_forward(
     )
     _runtime_debug("training-forward.compile.end", slot=execution.slot.index)
     _runtime_debug("training-forward.launch.begin", slot=execution.slot.index)
-    compiled.callable(
-        **build_runtime_kwargs(inputs, execution.forward)
-    )
+    compiled.callable(**build_runtime_kwargs(inputs, execution.forward))
     _runtime_debug("training-forward.launch.end", slot=execution.slot.index)
     _runtime_debug("training-forward.offsets.begin", slot=execution.slot.index)
     _write_expert_offsets(execution, config.token_padding_block)
@@ -256,9 +248,7 @@ def launch_training_backward(
     )
     _runtime_debug("training-backward.compile.end", slot=execution.slot.index)
     _runtime_debug("training-backward.launch.begin", slot=execution.slot.index)
-    compiled.callable(
-        **build_backward_runtime_kwargs(inputs, execution.backward)
-    )
+    compiled.callable(**build_backward_runtime_kwargs(inputs, execution.backward))
     _runtime_debug("training-backward.launch.end", slot=execution.slot.index)
     slot.grad_activation.copy_(slot.backward_output)
     _runtime_debug("training-backward.wgrad-export.begin", slot=execution.slot.index)

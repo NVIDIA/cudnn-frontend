@@ -40,9 +40,7 @@ def launch_backward_dglu(
     _check_overflow(inputs.overflow_flag)
 
     return Mxfp8DgluResult(
-        grad_activation=inputs.output_activation[
-            : inputs.token_count
-        ].float(),
+        grad_activation=inputs.output_activation[: inputs.token_count].float(),
         # The dGLU epilogue has already returned source-order dprob through
         # the symmetric token-communication plane. Own the public result so a
         # later launch cannot overwrite it.

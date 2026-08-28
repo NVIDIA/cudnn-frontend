@@ -25,14 +25,9 @@ class Mxfp8TrainingStageKernel:
         self.hidden = int(hidden)
         self.top_k = int(top_k)
         if self.hidden <= 0 or self.hidden % self._sf_vec:
-            raise ValueError(
-                "MXFP8 training stage requires hidden divisible by 32"
-            )
+            raise ValueError("MXFP8 training stage requires hidden divisible by 32")
         if self.top_k <= 0 or self.top_k > self._threads_per_cta:
-            raise ValueError(
-                "MXFP8 training stage requires "
-                f"1 <= top_k <= {self._threads_per_cta}"
-            )
+            raise ValueError("MXFP8 training stage requires " f"1 <= top_k <= {self._threads_per_cta}")
 
     @cute.jit
     def __call__(
@@ -78,9 +73,7 @@ class Mxfp8TrainingStageKernel:
         sf_vec: cutlass.Constexpr[int] = self._sf_vec
         threads: cutlass.Constexpr[int] = self._threads_per_cta
         block_count: cutlass.Constexpr[int] = hidden // sf_vec
-        rounds: cutlass.Constexpr[int] = (
-            block_count + threads - 1
-        ) // threads
+        rounds: cutlass.Constexpr[int] = (block_count + threads - 1) // threads
 
         for block_round in cutlass.range_constexpr(rounds):
             block = tid + Int32(block_round * threads)
@@ -126,9 +119,7 @@ class Mxfp8TrainingStageKernel:
 
         if tid < Int32(self.top_k):
             output_topk_idx[token, tid] = Int32(topk_idx[token, tid])
-            output_topk_weights[token, tid] = Float32(
-                topk_weights[token, tid]
-            )
+            output_topk_weights[token, tid] = Float32(topk_weights[token, tid])
 
 
 __all__ = ["Mxfp8TrainingStageKernel"]
