@@ -709,6 +709,16 @@ CuTe DSL forward and explicit backward kernels driven by per-query-block lists
 of selected key/value blocks. It is a standalone Python FE OSS API and is
 separate from the cuDNN Graph API described above.
 
+### HSTU Attention FE OSS API (SM100/SM103)
+
+The experimental [HSTU Attention API](../fe-oss-apis/attention/hstu.md)
+provides packed-variable-length forward and backward CuTe DSL kernels for
+Blackwell SM100/SM103 GPUs. HSTU applies SiLU to scaled QK scores without
+softmax, supports its specialized mask modes, and exposes the sequence
+normalization factor separately as `scaling_seqlen`. FP16 and BF16 arbitrary-mask
+forward and backward automatically build private block metadata on the active
+CUDA stream without adding public API parameters; D256 backward builds both
+Q-to-K and K-to-Q views from one coarse classification.
 
 (scaled-dot-product-attention-pytorch-op)=
 ### SDPA PyTorch Custom Op (Experimental)
