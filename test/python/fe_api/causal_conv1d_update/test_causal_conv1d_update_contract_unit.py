@@ -3,6 +3,7 @@
 
 """Host-contract tests that do not compile or launch a GPU kernel."""
 
+import inspect
 import os
 from pathlib import Path
 import shutil
@@ -87,6 +88,17 @@ assert cudnn.ops.causal_conv1d_update is causal_conv1d_update
         capture_output=True,
         text=True,
     )
+
+
+def test_public_helpers_use_state_before_weight_positional_order():
+    from cudnn.causal_conv1d_update_sm100 import (
+        causal_conv1d_update,
+        causal_conv1d_update_wrapper_sm100,
+    )
+
+    expected = ("x", "state", "weight", "state_indices")
+    assert tuple(inspect.signature(causal_conv1d_update).parameters)[:4] == expected
+    assert tuple(inspect.signature(causal_conv1d_update_wrapper_sm100).parameters)[:4] == expected
 
 
 def test_valid_descriptor_contract_without_kernel(monkeypatch):

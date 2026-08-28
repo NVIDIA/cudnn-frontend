@@ -57,12 +57,12 @@ def _is_compiling() -> bool:
     return bool(dynamo is not None and dynamo.is_compiling())
 
 
-def _call_native(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+def _call_native(x: torch.Tensor, cache: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # Resolve lazily so importing cudnn.fla does not import the optional
     # CuTeDSL stack or compile a kernel.
     from cudnn.causal_conv1d_update_sm100 import causal_conv1d_update
 
-    return causal_conv1d_update(x, weight, cache)
+    return causal_conv1d_update(x, cache, weight)
 
 
 def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
@@ -143,7 +143,7 @@ def make_causal_conv1d_update(real_fn):
             return fallback(str(error) or type(error).__name__)
 
         try:
-            native_y = _call_native(native_x, weight, cache)
+            native_y = _call_native(native_x, cache, weight)
         except _DECLINE_ERRORS as error:
             return fallback(type(error).__name__)
         except Exception as error:

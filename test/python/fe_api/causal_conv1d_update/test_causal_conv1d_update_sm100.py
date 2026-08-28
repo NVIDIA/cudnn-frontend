@@ -94,7 +94,7 @@ def test_n128_no_index_row_batch_specialization(n_channels):
     for _ in range(2):
         x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
         expected_output, expected_state = _reference_step(x, weight, expected_state)
-        output = causal_conv1d_update(x, weight, state)
+        output = causal_conv1d_update(x, state, weight)
         torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
         _assert_state_bits_equal(state, expected_state)
 
@@ -128,7 +128,7 @@ def test_n128_row_batch_state_shift_is_bitwise(n_channels):
             device="cuda",
             dtype=torch.int16,
         )
-        causal_conv1d_update(x_bits.view(torch.bfloat16), weight, state)
+        causal_conv1d_update(x_bits.view(torch.bfloat16), state, weight)
         expected_bits = torch.cat((expected_bits[..., 1:], x_bits.unsqueeze(-1)), dim=-1)
         torch.testing.assert_close(state.view(torch.int16), expected_bits, rtol=0, atol=0)
 
@@ -144,7 +144,7 @@ def test_paged_state_slots_and_untouched_rows():
     state_indices = torch.tensor([6, 1, 4], device="cuda", dtype=torch.int32)
     expected_output, expected_state = _reference_step(x, weight, state, state_indices)
 
-    output = causal_conv1d_update(x, weight, state, state_indices)
+    output = causal_conv1d_update(x, state, weight, state_indices)
 
     torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
     _assert_state_bits_equal(state, expected_state)
@@ -167,7 +167,7 @@ def test_standard_wrapper_returns_tupledict():
     state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
     expected_output, expected_state = _reference_step(x, weight, state)
 
-    result = causal_conv1d_update_wrapper_sm100(x, weight, state)
+    result = causal_conv1d_update_wrapper_sm100(x, state, weight)
 
     assert isinstance(result, TupleDict)
     assert list(result.keys()) == ["output_tensor"]
@@ -204,7 +204,7 @@ def test_state_shift_and_append_are_bitwise():
     weight = torch.zeros(n_channels, 4, device="cuda", dtype=torch.bfloat16)
     expected_bits = torch.cat((state_bits[..., 1:], x_bits.unsqueeze(-1)), dim=-1)
 
-    causal_conv1d_update(x, weight, state)
+    causal_conv1d_update(x, state, weight)
 
     torch.testing.assert_close(state.view(torch.int16), expected_bits, rtol=0, atol=0)
 
@@ -237,7 +237,7 @@ def test_silu_special_values_and_tails():
     weight[:, -1] = 1
     expected, expected_state = _reference_step(x, weight, state)
 
-    output = causal_conv1d_update(x, weight, state)
+    output = causal_conv1d_update(x, state, weight)
 
     torch.testing.assert_close(output, expected, atol=3e-2, rtol=3e-2, equal_nan=True)
     _assert_state_bits_equal(state, expected_state)
@@ -299,7 +299,7 @@ def test_wrapper_respects_explicit_cuda_stream():
     # Warm the exact signature so this test isolates stream ordering rather
     # than JIT compilation behavior.
     warm_state = state_real.clone()
-    causal_conv1d_update_wrapper_sm100(x_real, weight, warm_state)
+    causal_conv1d_update_wrapper_sm100(x_real, warm_state, weight)
     torch.cuda.synchronize()
 
     x = torch.full_like(x_real, float("nan"))
@@ -313,8 +313,8 @@ def test_wrapper_respects_explicit_cuda_stream():
 
     result = causal_conv1d_update_wrapper_sm100(
         x,
-        weight,
         state,
+        weight,
         current_stream=cuda.CUstream(side.cuda_stream),
     )
     side.synchronize()

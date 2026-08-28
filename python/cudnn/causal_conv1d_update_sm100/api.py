@@ -358,8 +358,8 @@ class CausalConv1dUpdateSm100(APIBase):
 
 def _cache_key(
     x_tensor: torch.Tensor,
-    weight_tensor: torch.Tensor,
     state_tensor: torch.Tensor,
+    weight_tensor: torch.Tensor,
     state_indices_tensor: Optional[torch.Tensor],
 ):
     return (
@@ -374,8 +374,8 @@ def _cache_key(
 
 def causal_conv1d_update(
     x: torch.Tensor,
-    weight: torch.Tensor,
     state: torch.Tensor,
+    weight: torch.Tensor,
     state_indices: Optional[torch.Tensor] = None,
     *,
     current_stream: Optional[cuda.CUstream] = None,
@@ -394,7 +394,7 @@ def causal_conv1d_update(
         raise TypeError("State indices must be a torch.Tensor or None, " f"got {type(state_indices).__name__}")
     if not x.is_cuda:
         raise ValueError(f"X must be a CUDA tensor, got device {x.device}")
-    key = _cache_key(x, weight, state, state_indices)
+    key = _cache_key(x, state, weight, state_indices)
 
     with torch.cuda.device(x.device), _torch_stream_context(current_stream, x.device):
         output = torch.empty_like(x, memory_format=torch.contiguous_format)
@@ -428,8 +428,8 @@ def causal_conv1d_update(
 
 def causal_conv1d_update_wrapper_sm100(
     x: torch.Tensor,
-    weight: torch.Tensor,
     state: torch.Tensor,
+    weight: torch.Tensor,
     state_indices: Optional[torch.Tensor] = None,
     *,
     current_stream: Optional[cuda.CUstream] = None,
@@ -442,8 +442,8 @@ def causal_conv1d_update_wrapper_sm100(
 
     output = causal_conv1d_update(
         x,
-        weight,
         state,
+        weight,
         state_indices,
         current_stream=current_stream,
     )

@@ -63,14 +63,15 @@ x = torch.randn(8, 2048, device="cuda", dtype=torch.bfloat16)
 weight = torch.randn(2048, 4, device="cuda", dtype=torch.bfloat16)
 state = torch.randn(8, 2048, 4, device="cuda", dtype=torch.bfloat16)
 
-result = causal_conv1d_update_wrapper_sm100(x, weight, state)
+result = causal_conv1d_update_wrapper_sm100(x, state, weight)
 output = result["output_tensor"]
 ```
 
-`cudnn.causal_conv1d_update(...)` and
+`cudnn.causal_conv1d_update(x, state, weight, ...)` and
 `cudnn.ops.causal_conv1d_update(...)` expose the same mutation but return the
-output Tensor directly. They are convenient for model-integration shims and
-are not drop-in replacements for APIs with different argument order, bias, or
+output Tensor directly. The state-before-weight positional order matches the
+common decode-update convention used by the FLA and causal-conv1d ecosystems.
+The helpers are not drop-in replacements for APIs with bias or different
 return-state conventions.
 
 Both helpers cache compiled kernels by device, shape, and indexed/non-indexed

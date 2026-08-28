@@ -51,8 +51,8 @@ def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(
     fallback_calls = []
     native_calls = []
 
-    def native(native_x, native_weight, native_cache):
-        native_calls.append((native_x, native_weight, native_cache))
+    def native(native_x, native_cache, native_weight):
+        native_calls.append((native_x, native_cache, native_weight))
         assert native_x.data_ptr() == x.data_ptr()
         return native_x.clone()
 
@@ -66,8 +66,8 @@ def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(
     assert len(native_calls) == 1
     assert native_calls[0][0].data_ptr() == x.data_ptr()
     assert native_calls[0][0].shape == (cache.shape[0], weight.shape[0])
-    assert native_calls[0][1] is weight
-    assert native_calls[0][2] is cache
+    assert native_calls[0][1] is cache
+    assert native_calls[0][2] is weight
     assert fallback_calls == []
     assert short_conv.last_path() == "native"
 
