@@ -178,8 +178,16 @@ def make_chunk_gated_delta_rule(real_fn):
         # for a stateless (training) call; decline only when a state is exchanged.
         if not state_v_first and (initial_state is not None or output_final_state):
             return fallback("state_v_first=False")
-        if not (q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10):
+        if not q.is_cuda:
             return fallback("pre-Blackwell")
+        cc_major = torch.cuda.get_device_capability(q.device)[0]
+        if cc_major < 10:
+            return fallback("pre-Blackwell")
+        # FROST has not been validated on SM11x, while a cuTile plan can fail
+        # only after this wrapper's typed-decline boundary.  Preserve functional
+        # compatibility by staying on the saved FLA implementation there.
+        if cc_major == 11:
+            return fallback("sm11")
         try:
             out = _to_native(
                 q,

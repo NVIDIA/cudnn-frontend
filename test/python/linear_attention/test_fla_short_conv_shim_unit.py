@@ -72,6 +72,31 @@ def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(
     assert short_conv.last_path() == "native"
 
 
+def test_sm110_calls_original_once_without_native_and_preserves_cache_identity(monkeypatch):
+    x, weight, cache = _inputs()
+    fallback_calls = []
+    native_calls = []
+    monkeypatch.setattr(short_conv, "_is_cuda_tensor", lambda tensor: True)
+    monkeypatch.setattr(short_conv, "_device_capability", lambda device: (11, 0))
+    monkeypatch.setattr(short_conv, "_is_compiling", lambda: False)
+
+    def native(*args):
+        native_calls.append(args)
+        pytest.fail("SM110 must not enter the SM100 native route")
+
+    monkeypatch.setattr(short_conv, "_call_native", native)
+    wrapped = short_conv.make_causal_conv1d_update(_original_spy(fallback_calls))
+
+    output, returned_cache = wrapped(x, cache, weight=weight, activation="silu")
+
+    assert output.shape == x.shape
+    assert returned_cache is cache
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0][1] is cache
+    assert native_calls == []
+    assert short_conv.last_path() == "fallback:non-sm100"
+
+
 @pytest.mark.parametrize(
     "mutation,reason",
     [

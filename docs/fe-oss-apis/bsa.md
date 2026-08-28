@@ -25,6 +25,11 @@ pipeline.
 
 BSA is implemented with Python CuTe DSL/JIT kernels.
 
+The Python dispatch currently admits SM110 and selects the same contracts as
+the SM100/SM103 paths described below. These SM110 routes have not yet been
+validated on SM110 hardware, so their inclusion documents intended functional
+coverage only; it is not a correctness or performance claim.
+
 ## Installation
 
 Install the CuTe DSL optional dependencies:
@@ -99,8 +104,8 @@ is consumed. Values in the inactive suffix are ignored.
   `[0, K_max]` when `allow_empty_block_nums=True`, and in `[1, K_max]`
   otherwise. Backward variable counts may be in `[0, K_max]`.
 - With fixed counts, `block_sparse_num` must be in `[1, K_max]`. The
-  SM100/SM103 blk128 path additionally requires an even value, i.e. an even
-  `block_sparse_num` in `[2, K_max]`.
+  SM100/SM103/SM110 blk128 path additionally requires an even value, i.e. an
+  even `block_sparse_num` in `[2, K_max]`.
 - The `block_sizes` entry for every physical KV block referenced by an active
   `q2k_block_index` value must be in `[1, sparse_block_size]`. Entries for
   unreferenced physical KV blocks are ignored. A zero-sized referenced block is
@@ -111,8 +116,8 @@ Tensor value ranges and per-row uniqueness are not validated at runtime.
 Violating the contract is unsupported and may produce invalid results or
 invalid device memory accesses.
 
-On the SM100/SM103 blk128 path, `pack_gqa=None` automatically packs GQA when
-the GQA ratio `r = H_q / H_kv` divides 128. Packed metadata has shape
+On the SM100/SM103/SM110 blk128 path, `pack_gqa=None` automatically packs GQA
+when the GQA ratio `r = H_q / H_kv` divides 128. Packed metadata has shape
 `(B, H_kv, ceil(S_q * r / 128), K_max)`. Pass `pack_gqa=False` to use the
 unpacked `(B, H_q, ceil(S_q / 128), K_max)` contract on every architecture.
 Explicit `pack_gqa=True` requires `r` to divide 128.
@@ -122,16 +127,17 @@ Provide `block_sizes` whenever a referenced final block is only partially
 valid.
 
 `sparse_block_size=None` chooses blk64 on SM90/SM120 and blk128 on
-SM100/SM103. Passing `sparse_block_size=64` explicitly selects the SM100/SM103
-blk64 CuTe DSL path, whose shape support is narrower. `kv_splits` is available
-on SM90 and the explicit Blackwell blk64 path; `use_clc` applies only to the
-explicit Blackwell blk64 path.
+SM100/SM103/SM110. Passing `sparse_block_size=64` explicitly selects the
+SM100/SM103/SM110 blk64 CuTe DSL path, whose shape support is narrower.
+`kv_splits` is available on SM90 and the explicit Blackwell blk64 path;
+`use_clc` applies only to the explicit Blackwell blk64 path.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
-split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
-compatible with split execution. Pass `use_clc=True` to use persistent CLC
-scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
+split count. The SM100/SM103/SM110 blk64 path also accepts
+`kv_splits="auto"`; CLC is compatible with split execution. Pass `use_clc=True`
+to use persistent CLC scheduling with `kv_splits>1`, or `use_clc=False` to use
+one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
 automatic scheduler policy has not been tuned for that combination. Automatic
 split selection uses metadata capacity rather than per-row count values. It
@@ -168,11 +174,11 @@ backward implementation.
 
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 requires `B=1`, `H` equal to 4 or 8, and both sequence lengths
-  to be multiples of 64. It uses fixed `block_sparse_num` with full 64-token
-  KV blocks; `q2k_block_nums` and `block_sizes` are not supported. Split-KV is
-  selected internally, and the public FP8 API does not expose `kv_splits` or
-  `use_clc`.
+- SM100/SM103/SM110 requires `B=1`, `H` equal to 4 or 8, and both sequence
+  lengths to be multiples of 64. It uses fixed `block_sparse_num` with full
+  64-token KV blocks; `q2k_block_nums` and `block_sizes` are not supported.
+  Split-KV is selected internally, and the public FP8 API does not expose
+  `kv_splits` or `use_clc`.
 - SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
   tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
   `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
@@ -210,10 +216,11 @@ The backward implementation builds a bucketed K-to-Q CSR task layout on the
 GPU. `bucket_size_blocks` is an optional tuning override; leaving it unset uses
 the backend default.
 
-Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
-explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
-path. SM100/SM103 blk128 backward does not yet consume `block_sizes`; it
-therefore requires full physical KV blocks and `block_sizes=None`.
+Backward defaults to blk64 on SM90 and blk128 on SM100/SM103/SM110. Pass the
+same explicit `sparse_block_size` used by forward when selecting the Blackwell
+blk64 path. SM100/SM103/SM110 blk128 backward does not yet consume
+`block_sizes`; it therefore requires full physical KV blocks and
+`block_sizes=None`.
 
 ## Current support
 
@@ -222,15 +229,18 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | Architecture | Sparse block | Public input / kernel dtype | QK / V dimensions | Attention |
 | --- | ---: | --- | --- | --- |
 | SM90 | 64 | FP16, BF16 | each of 64, 96, 128 | MHA, GQA, MQA |
-| SM100/SM103 | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
-| SM100/SM103 | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
-| SM100/SM103 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA (B=1, H=4 or 8) |
+| SM100/SM103/SM110* | 128 | FP16, BF16 | QK=V=64, 96, or 128 | MHA, GQA, MQA |
+| SM100/SM103/SM110* | 64 (explicit) | BF16 | QK=128, V=128 | MHA |
+| SM100/SM103/SM110* | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA (B=1, H=4 or 8) |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
+`*` SM110 is admitted by the implementation but has not yet been validated on
+SM110 hardware. The same qualification applies to the backward rows below.
+
 SM90 currently requires `S_q` to be a multiple of 64. Its fixed count may be
-any positive value. The SM100/SM103 blk128 fixed count must be even and at
-least two; SM120 and the explicit Blackwell blk64 path accept any positive
+any positive value. The SM100/SM103/SM110 blk128 fixed count must be even and
+at least two; SM120 and the explicit Blackwell blk64 path accept any positive
 fixed count. Variable counts use `q2k_block_nums`. `allow_empty_block_nums`
 defaults to `False`; when it is `True`, empty rows (`q2k_block_nums == 0`)
 produce `O = 0` and `LSE = -inf`. SM90 selects the empty-row handling as a
@@ -242,8 +252,8 @@ branch-free fast path. Split-KV execution therefore excludes empty rows.
 | Architecture | Sparse block | Dtype | Head dimension | Attention |
 | --- | ---: | --- | ---: | --- |
 | SM90 | 64 | BF16 | 128 | MHA |
-| SM100/SM103 | 64 | BF16 | 128 | MHA |
-| SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
+| SM100/SM103/SM110* | 64 | BF16 | 128 | MHA |
+| SM100/SM103/SM110* | 128 | BF16 | 64 or 128 | MHA |
 
 Backward is not implemented for SM120. It requires equal QK/V dimensions and
 does not currently support GQA/MQA.
