@@ -4,6 +4,12 @@
 from importlib import import_module
 
 _SYMBOLS = {
+    "FlashMLABridgeUnavailableError": (".flashmla_bridge", "FlashMLABridgeUnavailableError"),
+    "FlashMLASparseForwardPlan": (".flashmla_bridge", "FlashMLASparseForwardPlan"),
+    "plan_flashmla_sparse_forward": (".flashmla_bridge", "plan_flashmla_sparse_forward"),
+    "flashmla_sparse_forward_wrapper": (".flashmla_bridge", "flashmla_sparse_forward_wrapper"),
+    "flashmla_cudnn_sparse_attention_wrapper": (".flashmla_bridge", "flashmla_cudnn_sparse_attention_wrapper"),
+    "flashmla_sparse_score_recompute_wrapper": (".flashmla_bridge", "flashmla_sparse_score_recompute_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
