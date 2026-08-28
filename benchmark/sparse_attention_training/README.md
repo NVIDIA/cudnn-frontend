@@ -1,13 +1,13 @@
-# Generic Sparse Attention Forward Benchmark
+# Sparse Attention Training Forward Benchmark
 
 Microbenchmark for `cudnn.sparse_attention_forward_wrapper` under the
 geometry of three production sparse-attention architectures:
 
 | variant | model | heads (Q/KV) | d_k/d_v | granularity | top-k | index scope | sink |
 |---|---|---|---|---|---|---|---|
-| `dsa` | DeepSeek-V3.2 | 64/1 (MQA latent, K≡V) | 576/512 | 1 (token) | 2048 | shared | yes |
-| `qsa` | Qwen3.8-Flash-Next | 24/2 | 256/256 | 4 (micro-block) | 512 entries (2048 tok) | shared | no |
-| `msa` | MiniMax-M3 | 64/4 | 128/128 | 128 (block) | 16 blocks (2048 tok) | per KV-head group | no |
+| `dsv4` | DeepSeek-V4 DSA/CSA | 64/1 (MQA latent, K≡V) | 512/512 (RoPE in-place, dims 448-511) | 1 (token) | 2048 | shared | yes |
+| `qwen3.8` | Qwen3.8-Flash-Next QSA | 24/2 | 256/256 | 4 (micro-block) | 512 entries (2048 tok) | shared | no |
+| `minimax` | MiniMax-M3 MSA | 64/4 | 128/128 | 128 (block) | 16 blocks (2048 tok) | per KV-head group | no |
 
 Indices are causal-realistic: query row `i` selects unique random entries
 from its causal prefix (up to the variant's top-k), with `topk_length`
@@ -28,7 +28,7 @@ the harness runs against the PyTorch reference — functional only,
 reference-speed:
 
 ```bash
-python benchmark_sparse_attention_forward.py --variant dsa,qsa,msa \
+python benchmark_sparse_attention_forward.py --variant dsv4,qwen3.8,minimax \
     --seqlens 4096 --backend reference --q-chunk 1024
 ```
 
@@ -38,7 +38,7 @@ warmed call in `cudaProfilerStart/Stop` + NVTX for nsys/ncu:
 
 ```bash
 nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=stop -o safwd \
-  python benchmark_sparse_attention_forward.py profile --variant dsa --seqlens 8192
+  python benchmark_sparse_attention_forward.py profile --variant dsv4 --seqlens 8192
 ```
 
 Options: `--seqlens` (comma-separated, `seqlen_kv = seqlen_q`), `--variant`

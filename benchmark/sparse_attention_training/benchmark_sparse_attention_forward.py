@@ -7,12 +7,13 @@
 Times ``cudnn.sparse_attention_forward_wrapper`` under the geometry of three
 production sparse-attention architectures:
 
-* ``dsa`` — DeepSeek Sparse Attention (V3.2): MQA over a shared 576-d latent
-  (K aliased as V, ``D_v = 512``), token-level top-2048, attention sink.
-* ``qsa`` — Qwen Sparse Attention (Qwen3.8-Flash-Next): GQA 24Q/2KV, d=256,
-  micro-block granularity 4, 2048-token budget (512 entries), shared indices.
-* ``msa`` — MiniMax Sparse Attention (M3): GQA 64Q/4KV, d=128, block
-  granularity 128, top-16 blocks per KV-head group (per-group indices).
+* ``dsv4`` — DeepSeek-V4 DSA/CSA core attention: MQA over a shared 512-d
+  latent (K aliased as V, ``D_k = D_v = 512``; RoPE lives in-place on dims
+  448-511, no widened head), token-level top-2048, attention sink.
+* ``qwen3.8`` — Qwen3.8-Flash-Next QSA: GQA 24Q/2KV, d=256, micro-block
+  granularity 4, 2048-token budget (512 entries), shared indices.
+* ``minimax`` — MiniMax-M3 MSA: GQA 64Q/4KV, d=128, block granularity 128,
+  top-16 blocks per KV-head group (per-group indices).
 
 Indices are causal-realistic: query row ``i`` selects unique random entries
 from its causal prefix (``i // granularity + 1`` candidates), up to the
@@ -26,9 +27,9 @@ storage-native (global) ids, so a row's selection is independent of how rows
 are batched into calls.
 
 Usage:
-    python benchmark_sparse_attention_forward.py --variant dsa --backend reference --seqlens 4096
-    python benchmark_sparse_attention_forward.py --variant qsa,msa --seqlens 4096,8192 --csv out.csv
-    python benchmark_sparse_attention_forward.py profile --variant dsa --seqlens 8192
+    python benchmark_sparse_attention_forward.py --variant dsv4 --backend reference --seqlens 4096
+    python benchmark_sparse_attention_forward.py --variant qwen3.8,minimax --seqlens 4096,8192 --csv out.csv
+    python benchmark_sparse_attention_forward.py profile --variant dsv4 --seqlens 8192
 
 ``profile`` mode runs one warmed-up forward call wrapped in
 ``cudaProfilerStart/Stop`` and an NVTX range for nsys/ncu capture; it uses
@@ -68,13 +69,14 @@ class VariantConfig:
 
 
 VARIANTS = {
-    # DeepSeek-V3.2 DSA: 64-head bench default (matches benchmark/dsa bwd); the
-    # production model runs 128 query heads over the same shared latent.
-    "dsa": VariantConfig("dsa", h_q=64, h_kv=1, d_k=576, d_v=512, granularity=1, topk=2048, group_scope=1, attn_sink=True, kv_aliased=True),
+    # DeepSeek-V4 DSA/CSA core attention: 64-head geometry, shared 512-d
+    # latent (K = V, RoPE in-place on dims 448-511 — head is NOT widened to
+    # 576 as in V3.2).
+    "dsv4": VariantConfig("dsv4", h_q=64, h_kv=1, d_k=512, d_v=512, granularity=1, topk=2048, group_scope=1, attn_sink=True, kv_aliased=True),
     # Qwen3.8-Flash-Next QSA: 24Q/2KV @ 256, r=4 micro-blocks, K=2048 tokens.
-    "qsa": VariantConfig("qsa", h_q=24, h_kv=2, d_k=256, d_v=256, granularity=4, topk=512, group_scope=1, attn_sink=False, kv_aliased=False),
+    "qwen3.8": VariantConfig("qwen3.8", h_q=24, h_kv=2, d_k=256, d_v=256, granularity=4, topk=512, group_scope=1, attn_sink=False, kv_aliased=False),
     # MiniMax-M3 MSA: 64Q/4KV @ 128, block=128, top-16 blocks per GQA group.
-    "msa": VariantConfig("msa", h_q=64, h_kv=4, d_k=128, d_v=128, granularity=128, topk=16, group_scope=4, attn_sink=False, kv_aliased=False),
+    "minimax": VariantConfig("minimax", h_q=64, h_kv=4, d_k=128, d_v=128, granularity=128, topk=16, group_scope=4, attn_sink=False, kv_aliased=False),
 }
 
 
@@ -198,7 +200,7 @@ def profile_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, backen
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", nargs="?", default="bench", choices=["bench", "profile"])
-    parser.add_argument("--variant", default="dsa,qsa,msa", help="comma-separated subset of: " + ",".join(VARIANTS))
+    parser.add_argument("--variant", default="dsv4,qwen3.8,minimax", help="comma-separated subset of: " + ",".join(VARIANTS))
     parser.add_argument("--seqlens", default="4096,8192", help="comma-separated seqlen_q (= seqlen_kv) values")
     parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPES))
     parser.add_argument("--backend", default="default", help='"default" (device kernels) or "reference" (PyTorch)')
