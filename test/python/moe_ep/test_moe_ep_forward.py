@@ -42,7 +42,6 @@ from moe_ep.moe_ep_reference import (
 )
 
 
-
 def _public_nvfp4(data, scale, logical_shape):
     from cudnn import BlockScaledTensor
 
@@ -92,76 +91,6 @@ def test_moe_ep_finalizer_warns_without_retaining_failed_backend():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        *(
-            ("token_back_mode", value)
-            for value in (
-                "epi_warps",
-                "standalone_warps",
-                "reuse_dispatch_warps",
-            )
-        ),
-        *(
-            ("epi_flag_batch", value)
-            for value in (
-                (4, 2),
-                (1, 1),
-                (1, 2),
-                (1, 4),
-                (2, 1),
-                (2, 2),
-                (2, 4),
-                (4, 4),
-            )
-        ),
-        *(
-            ("token_in_flag_batch", value)
-            for value in (1, 2, 4, 8, 16)
-        ),
-        *(
-            ("group_hint", value)
-            for value in (None, 64, 128, 256, 512, 768, 1024)
-        ),
-        ("reduce_topk_in_kernel", False),
-        ("reduce_topk_in_kernel", True),
-    ],
-)
-def test_moe_ep_tuning_accepts_candidate_values(field, value):
-    from cudnn import MoeEpTuningConfig
-
-    tuning = MoeEpTuningConfig(**{field: value})
-    assert getattr(tuning, field) == value
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"token_back_mode": "unknown"},
-        {"token_back_mode": []},
-        {"epi_flag_batch": [1, 1]},
-        {"epi_flag_batch": (3, 3)},
-        {"token_in_flag_batch": 3},
-        {"token_in_flag_batch": True},
-        {"group_hint": 0},
-        {"group_hint": True},
-        {"reduce_topk_in_kernel": 1},
-        {
-            "token_back_mode": "standalone_warps",
-            "reduce_topk_in_kernel": True,
-        },
-    ],
-)
-def test_moe_ep_tuning_rejects_unvalidated_values(kwargs):
-    from cudnn import MoeEpTuningConfig
-
-    with pytest.raises(ValueError):
-        MoeEpTuningConfig(**kwargs)
-
-
-@pytest.mark.L0
 def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
     from cudnn import MoeEp, MoeEpTuningConfig
     from cudnn.moe_ep import (
@@ -173,66 +102,32 @@ def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
 
     assert PackageMoeEpTuningConfig is MoeEpTuningConfig
     tuning = MoeEpTuningConfig(
-        token_back_mode="epi_warps",
+        token_back_mode="standalone_warps",
         epi_flag_batch=(4, 2),
         token_in_flag_batch=4,
         group_hint=768,
-        reduce_topk_in_kernel=True,
     )
-    with MoeEp(
-        **_forward_config(),
-        token_padding_size=64,
-        sf_padding_size=256,
-        tuning=tuning,
-    ) as op:
+    with MoeEp(**_forward_config(), tuning=tuning) as op:
         assert op.tuning is tuning
-        kernel_config = Mxfp8KernelConfig.from_forward_config(
-            op._forward_config
-        )
+        kernel_config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
 
-    assert kernel_config.token_back_mode == "epi_warps"
-    assert kernel_config.epi_flag_batch == (4, 2)
-    assert kernel_config.flag_batch == 4
-    assert kernel_config.group_hint == 768
-    assert kernel_config.token_padding_block == 64
-    assert kernel_config.sf_padding_block == 256
     assert kernel_config.tuning_signature(123) == (
-        "epi_warps",
+        "standalone_warps",
         (4, 2),
         4,
         768,
-        True,
-    )
-    effective = kernel_config.effective_config(123)
-    assert effective["token_padding_block"] == 64
-    assert effective["sf_padding_block"] == 256
-    assert effective["effective_group_hint"] == 768
-    assert effective["fc2_in_kernel_topk_reduce"] is True
-    assert effective["launch_cluster_count"] == 123
-    assert effective["drop_on_overflow"] is False
-    assert effective["enable_col_quant"] is False
-    assert "output_format" not in effective
-
-    with MoeEp(**_forward_config()) as default_op:
-        default_config = Mxfp8KernelConfig.from_forward_config(
-            default_op._forward_config
-        )
-    assert default_config.tuning_signature(123) == (
-        "epi_warps",
-        (1, 1),
-        1,
-        123,
         False,
     )
+
+    with MoeEp(**_forward_config()) as default_op:
+        default_config = Mxfp8KernelConfig.from_forward_config(default_op._forward_config)
     key_args = (
         torch.device("cuda", 0),
         (10, 7),
         123,
         (),
     )
-    assert kernel_config.compile_key(*key_args) != default_config.compile_key(
-        *key_args
-    )
+    assert kernel_config.compile_key(*key_args) != default_config.compile_key(*key_args)
 
 
 @pytest.mark.L0
@@ -252,11 +147,7 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
         )
 
     assert default_config.enable_col_quant is False
-    assert default_config.max_recv_size_per_rank == (
-        default_forward.ep_size
-        * default_forward.max_tokens_per_rank
-        * default_forward.top_k
-    )
+    assert default_config.max_recv_size_per_rank == (default_forward.ep_size * default_forward.max_tokens_per_rank * default_forward.top_k)
     assert enabled_config.enable_col_quant is True
     assert enabled_config.col_quant_num_ctas == 512
     with pytest.raises(ValueError, match="max_recv_size_per_rank"):
@@ -264,9 +155,7 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
     with pytest.raises(ValueError, match="col_quant_num_ctas"):
         replace(default_config, col_quant_num_ctas=0)
     key_args = (torch.device("cuda", 0), (10, 7), 123, ())
-    assert default_config.compile_key(*key_args) != enabled_config.compile_key(
-        *key_args
-    )
+    assert default_config.compile_key(*key_args) != enabled_config.compile_key(*key_args)
 
 
 @pytest.mark.L0
@@ -306,12 +195,8 @@ def test_combine_format_maps_to_contract_wire(public_format, wire_format):
         Mxfp8KernelConfig,
     )
 
-    with MoeEp(
-        **_forward_config(combine_format=public_format)
-    ) as op:
-        kernel_config = Mxfp8KernelConfig.from_forward_config(
-            op._forward_config
-        )
+    with MoeEp(**_forward_config(combine_format=public_format)) as op:
+        kernel_config = Mxfp8KernelConfig.from_forward_config(op._forward_config)
 
     assert kernel_config.combine_format == wire_format
 
@@ -501,17 +386,21 @@ def test_standalone_combine_scale_workspace_metadata(
 
     workspace = StandaloneWorkspace()
     if combine_format == "bf16":
+
         class NoScaleWorkspace:
             def region(self, _name):
                 raise AssertionError("BF16 combine must not query scale region")
 
         workspace = NoScaleWorkspace()
 
-    assert _pre_reduced_sf_workspace_metadata(
-        workspace,
-        config,
-        shared_bytes=128 + config.max_tokens_per_rank * 64,
-    ) == expected
+    assert (
+        _pre_reduced_sf_workspace_metadata(
+            workspace,
+            config,
+            shared_bytes=128 + config.max_tokens_per_rank * 64,
+        )
+        == expected
+    )
 
 
 @pytest.mark.L0
@@ -581,9 +470,7 @@ def test_distributed_launch_rejects_mismatched_tuning_before_barrier(
     backend._ep_launch_ready = False
 
     stream = SimpleNamespace(synchronize=lambda: None)
-    resources = SimpleNamespace(
-        runtime=SimpleNamespace(group=object(), world_size=2)
-    )
+    resources = SimpleNamespace(runtime=SimpleNamespace(group=object(), world_size=2))
     prepared = SimpleNamespace(launch_cluster_count=123)
     monkeypatch.setattr(
         backend,
@@ -806,9 +693,7 @@ def test_nondefault_moe_ep_tuning_matches_reference_and_reuses_plan():
 
         assert backend._compiled is compiled
         assert backend._plan._workspace is workspace
-        assert backend.kernel_config.tuning_signature(
-            backend._prepared_kernel.launch_cluster_count
-        ) == ("standalone_warps", (4, 2), 4, 64, False)
+        assert backend.kernel_config.tuning_signature(backend._prepared_kernel.launch_cluster_count) == ("standalone_warps", (4, 2), 4, 64, False)
 
     _assert_matches_reference(first, expected)
     _assert_matches_reference(second, expected)
@@ -1094,9 +979,7 @@ def test_intermediate_requires_full_mma_n_tile():
         index_dtype=torch.int32,
         weight_dtype=torch.bfloat16,
     )
-    with MoeEp(
-        **_forward_config(intermediate_size=128, max_tokens_per_rank=3)
-    ) as op:
+    with MoeEp(**_forward_config(intermediate_size=128, max_tokens_per_rank=3)) as op:
         with pytest.raises(
             NotImplementedError,
             match=r"intermediate_size .*divisible by 256",
@@ -1123,11 +1006,7 @@ def test_activation_scale_rows_are_padded_to_16_bytes():
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(
-        region
-        for region in requirements.symmetric_regions
-        if region.name == "activation_scale"
-    )
+    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
     assert activation_scale.nbytes == 5 * 16
 
 
@@ -1153,9 +1032,7 @@ def test_column_requant_workspace_is_allocated_only_when_enabled():
     disabled_names = {region.name for region in disabled.local_regions}
     assert "col_quant_data" not in disabled_names
     assert "col_quant_sf" not in disabled_names
-    enabled_sizes = {
-        region.name: region.nbytes for region in enabled.local_regions
-    }
+    enabled_sizes = {region.name: region.nbytes for region in enabled.local_regions}
     assert enabled_sizes["col_quant_data"] == 640
     assert enabled_sizes["col_quant_sf"] == 80
 

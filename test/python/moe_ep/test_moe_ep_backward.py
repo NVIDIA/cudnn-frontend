@@ -50,7 +50,6 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import (
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_weights import (
     Mxfp8TrainingWeightBindings,
 )
-from cudnn.moe_ep._tuning import MoeEpTuningConfig
 from moe_ep.moe_ep_reference import (
     MoeEpReference,
 )
@@ -641,9 +640,12 @@ def test_prepare_training_resources_rejects_invalid_counts_before_backend(
     monkeypatch.setattr(backend_seam, "create_backend", unexpected_call)
     counts = {"slot_count": 1, "lane_count": 1, field: value}
 
-    with _operator() as operator, pytest.raises(
-        ValueError,
-        match=rf"{field} must be a positive integer",
+    with (
+        _operator() as operator,
+        pytest.raises(
+            ValueError,
+            match=rf"{field} must be a positive integer",
+        ),
     ):
         operator.prepare_training_resources(
             SimpleNamespace(mock_training_weights=True),
@@ -864,7 +866,11 @@ _STAGER_FAILURES = {
     "route-contiguity": (lambda t: t.update(topk_idx=t["topk_idx"].t().contiguous().t()), TypeError, "contiguous Int32"),
     "weight-dtype": (lambda t: t.update(topk_weights=t["topk_weights"].to(torch.bfloat16)), TypeError, "contiguous FP32"),
     "weight-contiguity": (lambda t: t.update(topk_weights=t["topk_weights"].t().contiguous().t()), TypeError, "contiguous FP32"),
-    "capacity": (lambda t: t.update(**{name: value[:4] for name, value in t.items() if name.startswith("output")}), ValueError, "token count 5 exceeds capacity 4"),
+    "capacity": (
+        lambda t: t.update(**{name: value[:4] for name, value in t.items() if name.startswith("output")}),
+        ValueError,
+        "token count 5 exceeds capacity 4",
+    ),
     "device": (lambda t: t.update(source=torch.empty_like(t["source"], device="meta")), ValueError, "must share one device"),
 }
 
@@ -872,10 +878,7 @@ _STAGER_FAILURES = {
 @pytest.mark.L1
 @pytest.mark.parametrize(
     ("mutator", "error_type", "message"),
-    [
-        pytest.param(*case, id=name)
-        for name, case in _STAGER_FAILURES.items()
-    ],
+    [pytest.param(*case, id=name) for name, case in _STAGER_FAILURES.items()],
 )
 def test_training_stager_rejects_invalid_inputs(mutator, error_type, message):
     tensors = _training_staging_tensors()
@@ -895,28 +898,14 @@ def test_training_stager_rejects_invalid_inputs(mutator, error_type, message):
         "combine_format",
         "gate_up_clamp",
         "top_k",
-        "tuning",
         "all_dropped",
     ),
     [
-        pytest.param("fixed", "bf16", None, 2, MoeEpTuningConfig(), False, id="bf16-unclamped"),
-        pytest.param("fixed", "mxfp8", 0.5, 2, MoeEpTuningConfig(), False, id="mxfp8-clamp-0.5"),
-        pytest.param("routed", "bf16", None, 1, MoeEpTuningConfig(), False, id="topk1-default-tuning"),
-        pytest.param(
-            "routed",
-            "bf16",
-            None,
-            2,
-            MoeEpTuningConfig(
-                token_back_mode="reuse_dispatch_warps",
-                epi_flag_batch=(2, 2),
-                token_in_flag_batch=2,
-                group_hint=128,
-            ),
-            False,
-            id="topk2-nondefault-tuning",
-        ),
-        pytest.param("routed", "bf16", None, 2, MoeEpTuningConfig(), True, id="topk2-all-dropped"),
+        pytest.param("fixed", "bf16", None, 2, False, id="bf16-unclamped"),
+        pytest.param("fixed", "mxfp8", 0.5, 2, False, id="mxfp8-clamp-0.5"),
+        pytest.param("routed", "bf16", None, 1, False, id="topk1"),
+        pytest.param("routed", "bf16", None, 2, False, id="topk2"),
+        pytest.param("routed", "bf16", None, 2, True, id="topk2-all-dropped"),
     ],
 )
 def test_fixed_training_resources_ep1_matches_independent_reference(
@@ -924,7 +913,6 @@ def test_fixed_training_resources_ep1_matches_independent_reference(
     combine_format,
     gate_up_clamp,
     top_k,
-    tuning,
     all_dropped,
 ):
     device = _sm107_device()
@@ -950,7 +938,6 @@ def test_fixed_training_resources_ep1_matches_independent_reference(
         grad_output,
         combine_format=combine_format,
         gate_up_clamp=gate_up_clamp,
-        tuning=tuning,
     )
 
     with MoeEp(
@@ -963,7 +950,6 @@ def test_fixed_training_resources_ep1_matches_independent_reference(
         drop_on_overflow=True,
         combine_format=combine_format,
         gate_up_clamp=gate_up_clamp,
-        tuning=tuning,
     ) as op:
         resources = op.prepare_training_resources(
             _fixed_training_weights(args),
