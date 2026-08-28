@@ -37,7 +37,8 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 - [MoE + Expert Parallel API](moe_ep.md) — Rubin SM107 fused SwiGLU with
-  fixed-resource training and CUDA Graph support
+  fixed-resource training and CUDA Graph support; see the
+  [MoeEP operation reference](../operations/MoeEp.md) for support details
 
 ## Installation and setup
 
@@ -53,14 +54,14 @@ pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, ship
 ```
 (For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
 
-MoE + Expert Parallel requires its dedicated optional dependencies:
+MoE + Expert Parallel composes the reusable CuTeDSL and communication extras:
 ```bash
-pip install nvidia-cudnn-frontend[moe_ep]
+pip install "nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext
 ```
 
 MoeEP is currently CUDA/PyTorch-only and targets Rubin SM107. EP2+ execution
 also requires NCCL, NVSHMEM, and a direct-P2P MNNVL peer-access domain. See the
-[MoeEP support matrix and tensor contracts](moe_ep.md#supported-configuration)
+[MoeEP support matrix and tensor contracts](../operations/MoeEp.md)
 before integrating it.
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`

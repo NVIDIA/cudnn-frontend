@@ -2,43 +2,23 @@
 
 `cudnn.moe_ep` provides a fused SwiGLU MoE implementation for Rubin SM107.
 Experts are sharded contiguously across an optional expert-parallel process
-group.
-
-## Supported configuration
-
-- CUDA execution on Rubin SM107 (compute capability 10.7)
-- fused SwiGLU with contiguous expert sharding across `ep_group`
-- BF16 output, including when the combine path uses MXFP8
-- BF16 or MXFP8 combine
-- plain BF16, FP16, or FP32 inference operands, or MXFP8
-  `BlockScaledTensor` operands
-- `apply_topk_in_fc1=True`
-- `hidden_size` divisible by 128
-- `intermediate_size` divisible by 256
-- `top_k <= min(32, num_experts)`
-- `num_experts` divisible by the EP group size
-- explicit positive `max_tokens_per_rank`
-
-`output_format` is currently executable only as `"bf16"`. NVFP4 is represented
-by the public format types but NVFP4 operands, combine, and output are not
-executable by the current MegaMoE backend.
-
-The fixed-resource CUDA Graph path has hardware acceptance through EP32 within
-one direct-P2P MNNVL peer-access domain. The Python capability layer does not
-impose an EP-size ceiling; this statement describes validated hardware scope,
-not support for cross-MNNVL execution.
+group. This page documents the Python API and lifecycle. See the
+[MoeEP operation reference](../operations/MoeEp.md) for supported
+architectures, data formats, tensor contracts, and expert-parallel topology.
 
 ## Installation
 
-Install the dedicated optional dependencies:
+Install the reusable CuTeDSL and communication extras, then the PyTorch
+integration dependencies:
 
 ```bash
-pip install nvidia-cudnn-frontend[moe_ep]
+pip install "nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext
 ```
 
-The extra supplies the CuTeDSL and NVSHMEM Python dependencies. PyTorch with
-CUDA support is also required. EP2+ additionally requires an initialized NCCL
-process group and a usable NVSHMEM peer topology.
+The package keeps the general CuTeDSL installation floor at 4.5.0. Rubin
+MegaMoE execution checks for `nvidia-cutlass-dsl>=4.8.0` when preparing its
+kernels. EP2+ additionally requires an initialized NCCL process group and a
+usable NVSHMEM peer topology.
 
 ## Public API and constructor
 
@@ -477,6 +457,7 @@ Run host-side and local tests:
 
 ```bash
 python -m pytest \
+  test/python/moe_ep/test_moe_ep_cutedsl.py \
   test/python/moe_ep/test_moe_ep_forward.py \
   test/python/moe_ep/test_moe_ep_backward.py \
   -m L0
