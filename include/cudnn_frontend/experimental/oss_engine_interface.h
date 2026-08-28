@@ -13,58 +13,12 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <fstream>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
 namespace cudnn_frontend {
 namespace experimental {
-
-// ============================================================
-// IOssSdpaEngine — virtual interface for OSS SDPA engines
-// Implemented by Sm90SdpaPrefillEngine and Sm100SdpaPrefillEngine.
-// ============================================================
-
-class IOssSdpaEngine {
-   public:
-    virtual ~IOssSdpaEngine() = default;
-
-    virtual error_t
-    check_support(AttentionShape_t shape, int sm_version) = 0;
-    virtual error_t
-    build() = 0;
-
-    virtual error_t
-    execute(int batch,
-            int heads_q,
-            int heads_kv,
-            int seq_q,
-            int seq_kv,
-            int d,
-            void* d_Q,
-            std::vector<int64_t> const& q_strides,
-            void* d_K,
-            std::vector<int64_t> const& k_strides,
-            void* d_V,
-            std::vector<int64_t> const& v_strides,
-            void* d_O,
-            std::vector<int64_t> const& o_strides,
-            void* d_max,
-            std::vector<int64_t> const& max_strides,
-            void* d_sum_exp,
-            std::vector<int64_t> const& se_strides,
-            void* workspace,
-            int device,
-            cudaStream_t stream,
-            std::optional<float> user_attn_scale = std::nullopt) = 0;
-
-    static int64_t
-    get_workspace_size() {
-        return 16;
-    }
-};
 
 // ============================================================
 // IOssNormEngine — virtual interface for OSS norm+activation engines.
@@ -137,108 +91,6 @@ class IOssNormEngine {
     virtual int64_t
     get_workspace_size() const = 0;
 };
-
-// ============================================================
-// Shared NVRTC compilation + module loading
-// Used by both Sm90 and Sm100 engines to avoid code duplication.
-// ============================================================
-
-inline error_t
-compile_and_load_kernel(const KernelSpec* spec,
-                        cudaLibrary_t& module,
-                        cudaKernel_t& kernelPtr,
-                        std::unique_ptr<char[]>& cubin,
-                        size_t& cubinSize,
-                        std::string& kernelName) {
-    // Ensure NVRTC library is available
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        !detail::nvrtc_is_loaded(), error_code_t::CUDA_API_FAILED, "NVRTC library could not be loaded");
-
-    // Parse flags from embedded string
-    std::vector<std::string> flags = parse_flags_string(spec->flags_raw, spec->flags_len);
-    std::vector<const char*> flag_ptrs;
-    flag_ptrs.reserve(flags.size());
-    for (auto& f : flags) {
-        flag_ptrs.push_back(f.c_str());
-    }
-
-    // Create NVRTC program from embedded source
-    nvrtcProgram prog;
-    nvrtcResult nvrtc_err;
-
-    nvrtc_err = detail::nvrtc_create_program(&prog, spec->source, "kernel.cu", 0, nullptr, nullptr);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        nvrtc_err != NVRTC_SUCCESS, error_code_t::CUDA_API_FAILED, "nvrtcCreateProgram failed");
-
-    // Compile
-    nvrtcResult compResult = detail::nvrtc_compile_program(prog, (int)flag_ptrs.size(), flag_ptrs.data());
-
-    if (cudnn_frontend::isLoggingEnabled()) {
-        // Write the source to a file for debugging
-        std::ofstream ofs("kernel.cu");
-        ofs << spec->source;
-
-        // Try to dump PTX (cicc may have succeeded even if ptxas failed)
-        size_t ptxSize = 0;
-        if (detail::nvrtc_get_ptx_size(prog, &ptxSize) == NVRTC_SUCCESS && ptxSize > 1) {
-            std::vector<char> ptx(ptxSize);
-            if (detail::nvrtc_get_ptx(prog, ptx.data()) == NVRTC_SUCCESS) {
-                std::ofstream ptx_ofs("kernel.ptx");
-                ptx_ofs.write(ptx.data(), static_cast<std::streamsize>(ptxSize - 1));
-            }
-        }
-    }
-
-    if (compResult != NVRTC_SUCCESS) {
-        // Try to retrieve the compilation log for diagnostics
-        size_t logSize = 0;
-        detail::nvrtc_get_program_log_size(prog, &logSize);
-        std::string log_msg = "NVRTC compilation failed";
-        if (logSize > 1) {
-            std::vector<char> log(logSize);
-            detail::nvrtc_get_program_log(prog, log.data());
-            log_msg += ": ";
-            log_msg += log.data();
-        }
-
-        CUDNN_FE_LOG_LABEL_ENDL("ERROR: NVRTC compilation failed: " << log_msg);
-        detail::nvrtc_destroy_program(&prog);
-        return {error_code_t::CUDA_API_FAILED, log_msg};
-    }
-
-    // Extract CUBIN
-    nvrtc_err = detail::nvrtc_get_cubin_size(prog, &cubinSize);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        nvrtc_err != NVRTC_SUCCESS, error_code_t::CUDA_API_FAILED, "nvrtcGetCUBINSize failed");
-
-    cubin = std::make_unique<char[]>(cubinSize);
-
-    nvrtc_err = detail::nvrtc_get_cubin(prog, cubin.get());
-    RETURN_CUDNN_FRONTEND_ERROR_IF(nvrtc_err != NVRTC_SUCCESS, error_code_t::CUDA_API_FAILED, "nvrtcGetCUBIN failed");
-
-    nvrtc_err = detail::nvrtc_destroy_program(&prog);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        nvrtc_err != NVRTC_SUCCESS, error_code_t::CUDA_API_FAILED, "nvrtcDestroyProgram failed");
-
-    // Load module + extract kernel function
-    cudaError_t cuda_err;
-
-    cuda_err = detail::cuda_library_load_data(&module, cubin.get(), nullptr, nullptr, 0, nullptr, nullptr, 0);
-    RETURN_CUDNN_FRONTEND_ERROR_IF(cuda_err != cudaSuccess,
-                                   error_code_t::CUDA_API_FAILED,
-                                   "cudaLibraryLoadData failed (cubin_size=" + std::to_string(cubinSize) +
-                                       ", error=" + detail::cuda_error_to_string(cuda_err) + ")");
-
-    kernelName = spec->kernel_name;
-    cuda_err   = detail::cuda_library_get_kernel(&kernelPtr, module, kernelName.c_str());
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        cuda_err != cudaSuccess,
-        error_code_t::CUDA_API_FAILED,
-        "cudaLibraryGetKernel failed: " + detail::cuda_error_to_string(cuda_err) + " (kernel: " + kernelName + ")");
-
-    CUDNN_FE_LOG_LABEL_ENDL("INFO: NVRTC compilation successful, kernel: " << kernelName);
-    return {error_code_t::OK, ""};
-}
 
 }  // namespace experimental
 }  // namespace cudnn_frontend
