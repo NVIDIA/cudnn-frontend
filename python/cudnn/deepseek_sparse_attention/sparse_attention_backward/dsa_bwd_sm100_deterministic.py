@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded-wave deterministic policy for the SM100 H64 DSA backward kernel."""
+"""Bounded-wave deterministic policy for the SM100 M64 DSA backward kernel."""
 
 import math
 from typing import Tuple, Type
@@ -15,7 +15,7 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
 
 class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100):
-    """Deterministic dKV/dSink reduction layered on the ordinary H64 kernel.
+    """Deterministic dKV/dSink reduction layered on the ordinary M64 kernel.
 
     Each launch contains 128 query CTAs. CTA ``i`` is the only writer of dKV
     shard ``i`` in that wave, and same-stream launch ordering serializes reuse
@@ -25,6 +25,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
     num_dkv_shards = 128
     dkv_fold_group_size = 8
     num_dkv_fold_groups = num_dkv_shards // dkv_fold_group_size
+    serialize_head_blocks = True
 
     def __init__(
         self,
@@ -41,7 +42,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
             block_tile=block_tile,
             max_topk=max_topk,
         )
-        assert block_tile == 64, "bounded-wave deterministic DSA backward requires the H64 M64 kernel"
+        assert block_tile == 64, "bounded-wave deterministic DSA backward requires the M64 kernel"
         self.q_wave_ctas = self.num_dkv_shards
 
     @staticmethod

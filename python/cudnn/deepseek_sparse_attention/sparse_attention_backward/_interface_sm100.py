@@ -21,6 +21,7 @@ torch2cute_dtype_map = {
 }
 
 _WORKSPACE_ALIGNMENT = 128
+_DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
 
 def _align_workspace_bytes(num_bytes: int) -> int:
@@ -140,7 +141,7 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
-        deterministic: use the bounded-wave deterministic H64 kernel
+        deterministic: use the bounded-wave deterministic M64 kernel
         workspace: reusable uint8 scratch sized by
             ``flash_attn_bwd_sm100_workspace_size``
 
@@ -153,7 +154,9 @@ def flash_attn_bwd_sm100(
     # head_dim in {512, 576}; any other value indexes shared memory out of
     # bounds and crashes inside the kernel.
     assert head_dim in (512, 576), f"head_dim must be 512 or 576, got {head_dim}"
-    assert not deterministic or num_head == 64, f"deterministic SM100 DSA backward requires H64, got H{num_head}"
+    assert (
+        not deterministic or num_head in _DETERMINISTIC_HEAD_COUNTS
+    ), f"deterministic SM100 DSA backward supports heads in {_DETERMINISTIC_HEAD_COUNTS}, got H{num_head}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
@@ -186,7 +189,10 @@ def flash_attn_bwd_sm100(
 
     # H16 KV-major specialization can use the full M128 UMMA tile.  This
     # halves the top-k loop count while keeping one CTA per query token.
-    backend, block_tile = _select_sm100_backend(num_head, head_dim)
+    # Deterministic execution always uses the generic M64 kernel. Head counts
+    # below 64 use its masked tail, while counts above 64 serialize their M64
+    # head blocks so each dKV shard retains a single writer.
+    backend, block_tile = ("generic_m64", 64) if deterministic else _select_sm100_backend(num_head, head_dim)
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 

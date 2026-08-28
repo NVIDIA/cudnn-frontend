@@ -89,13 +89,18 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert issubclass(FlashAttentionDSABackwardSm100Deterministic, FlashAttentionDSABackwardSm100)
     assert FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards == 128
     assert FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size == 8
+    assert FlashAttentionDSABackwardSm100Deterministic.serialize_head_blocks
+    assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=419)
-@pytest.mark.parametrize("head_dim", [512, 576])
-def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_dim):
-    """Three waves and reused dirty scratch must be bitwise reproducible."""
+@pytest.mark.parametrize(
+    "num_heads,head_dim",
+    [(16, 576), (32, 512), (64, 512), (64, 576), (96, 512), (128, 576)],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim):
+    """Masked and multi-block heads must be bitwise reproducible."""
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
@@ -104,7 +109,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_di
 
     _require_sm100()
     device = torch.device("cuda")
-    s_q, s_kv, num_heads = 257, 256, 64
+    s_q, s_kv = 257, 256
     topk = 64
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
@@ -1077,8 +1082,16 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
     deterministic_h32["sample_dout"] = dout[:, :32].contiguous()
     deterministic_h32["sample_lse"] = lse[:, :32].contiguous()
     deterministic_h32["sample_attn_sink"] = attn_sink[:32].contiguous()
-    with pytest.raises(ValueError, match="requires the SM100 H64 path"):
-        SparseAttentionBackward(**deterministic_h32, deterministic=True).check_support()
+    assert SparseAttentionBackward(**deterministic_h32, deterministic=True).check_support()
+
+    deterministic_h48 = dict(good)
+    deterministic_h48["sample_q"] = q[:, :48].contiguous()
+    deterministic_h48["sample_out"] = out[:, :48].contiguous()
+    deterministic_h48["sample_dout"] = dout[:, :48].contiguous()
+    deterministic_h48["sample_lse"] = lse[:, :48].contiguous()
+    deterministic_h48["sample_attn_sink"] = attn_sink[:48].contiguous()
+    with pytest.raises(ValueError, match="heads in"):
+        SparseAttentionBackward(**deterministic_h48, deterministic=True).check_support()
 
     fp16_good = dict(good)
     for name in ("sample_q", "sample_kv", "sample_out", "sample_dout"):

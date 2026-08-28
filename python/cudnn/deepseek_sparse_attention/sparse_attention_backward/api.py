@@ -111,8 +111,8 @@ class SparseAttentionBackward(APIBase):
         # writes out of place at execution time instead of failing.
         total_s_q, num_heads, head_dim = self.q_desc.shape
         self._value_error_if(
-            self.deterministic and (major != 10 or num_heads != 64),
-            f"deterministic DSA backward requires the SM100 H64 path, found SM{major} H{num_heads}",
+            self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
+            f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
         )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
@@ -256,7 +256,8 @@ def sparse_attention_backward_wrapper(
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
     ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
-    ``deterministic=True`` for bitwise-reproducible H64 gradients on SM100.
+    ``deterministic=True`` for bitwise-reproducible
+    H16/H32/H64/H96/H128 gradients on SM100.
     """
     key = (
         q.dtype,

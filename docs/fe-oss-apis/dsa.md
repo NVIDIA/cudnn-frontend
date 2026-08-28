@@ -130,12 +130,15 @@ sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
 use the generic M64 pipeline. No backend or tile-size argument is required.
 SM90 continues to use its Hopper-specific implementation.
 
-On SM100 H64, `deterministic=True` selects a bounded-wave implementation.
-Queries run in same-stream waves of 128 CTAs; CTA lane `i` is the sole writer
-of FP32 dKV shard `i` in each wave. Kernel launch ordering serializes shard
-reuse across waves, so the protocol needs neither semaphores nor cooperative
-launch. A fixed-order two-stage reduction combines the 128 shards, and one CTA
-per head reduces `d_sink`. The additional dKV workspace is
+On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
+M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
+`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
+M64 head tile. H96/H128 split each query wave into ordered M64 head-block
+launches, preserving single-writer ownership without multiplying the number
+of shards. Kernel launch ordering serializes both head blocks and shard reuse
+across waves, so the protocol needs neither semaphores nor cooperative launch.
+A fixed-order two-stage reduction combines the 128 shards, and one CTA per
+head reduces `d_sink`. The additional dKV workspace is
 `128 * total_S_kv * round_up(D, 8) * sizeof(float)` bytes.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
@@ -153,7 +156,7 @@ result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
-    deterministic=True,  # optional; SM100 H64 only
+    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
