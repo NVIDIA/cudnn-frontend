@@ -189,6 +189,11 @@ def parse_args():
         help="Dump the recurrent state every chunk plus the per-sequence final state from the forward pass (backends without a per-chunk state output are rejected; with backward, the final state's gradient feeds the backward pass)",
     )
     parser.add_argument(
+        "--batch_invariant",
+        action="store_true",
+        help="Run cuDNN in batch-invariant mode: one work item per (sequence, head), so a sequence's result does not depend on how the batch was packed (cudnn backend only)",
+    )
+    parser.add_argument(
         "--initial_state",
         action="store_true",
         help="Provide a per-sequence initial recurrent state (its gradient is produced in the backward pass)",
@@ -217,6 +222,12 @@ def parse_args():
         action="store_true",
         help="Skip reference linear attention implementation",
     )
+    parser.add_argument(
+        "--seed",
+        default=0,
+        type=int,
+        help="RNG seed for the input draws. The gate values decide the split-K partition, so an unseeded run is not a reproducible measurement",
+    )
     return parser.parse_args()
 
 
@@ -236,6 +247,7 @@ def run_benchmark(
     num_warmup_iterations: int = 0,
     skip_ref: bool = True,
     store_on: bool = False,
+    batch_invariant: bool = False,
     initial_state: bool = False,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -261,6 +273,7 @@ def run_benchmark(
         num_warmup_iterations: Warmup iterations before measurement
         skip_ref: Skip reference validation
         store_on: Dump per-chunk states plus the final recurrent state from the forward pass
+        batch_invariant: Run cuDNN with one work item per (sequence, head) (cudnn backend only)
         initial_state: Provide an initial recurrent state
         verbose: Print verbose output
 
@@ -323,6 +336,8 @@ def run_benchmark(
         cmd.append("--skip_ref")
     if store_on:
         cmd.append("--store_on")
+    if batch_invariant:
+        cmd.append("--batch_invariant")
     if initial_state:
         cmd.append("--initial_state")
     if verbose:
@@ -460,6 +475,12 @@ else:
         if run_bwd:
             raise ValueError("flash_kda is forward only; use --profile_pass fwd")
 
+    if args.batch_invariant:
+        if args.la_backend != "cudnn":
+            raise ValueError(f"--batch_invariant is a cudnn backend mode; {args.la_backend} has no batch-invariance control")
+        if args.store_on:
+            raise ValueError("--batch_invariant and --store_on are separate legs: each names its own backend tag in the results CSV")
+
     if args.store_on:
         if args.la_backend in ("flash_kda", "flash_qla"):
             raise ValueError(f"--store_on dumps the state every chunk; {args.la_backend} only outputs the final state")
@@ -533,6 +554,7 @@ else:
                     output_final_state=args.store_on,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    batch_invariant=args.batch_invariant,
                 )
             elif args.variant == "kda":
                 out = kimi_delta_attention(
@@ -547,6 +569,7 @@ else:
                     output_final_state=args.store_on,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    batch_invariant=args.batch_invariant,
                     **kda_safe_gate_kwargs,
                 )
             else:  # gdn2
@@ -563,6 +586,7 @@ else:
                     output_final_state=args.store_on,
                     use_qk_l2norm_in_kernel=use_qk_l2norm,
                     checkpoint_every_n_tokens=ckpt_tokens,
+                    batch_invariant=args.batch_invariant,
                 )
             return out[0], out[1]
 
@@ -931,6 +955,9 @@ else:
     # boost clock the kernel ran at rather than nvml's (often-stale) max.
     _clock_sampler = _SmClockSampler()
     _clock_sampler.start()
+    # Seed here rather than at startup so the draws do not depend on whatever
+    # backend-specific setup ran first: every backend sees the same inputs.
+    torch.manual_seed(args.seed)
     for i in range(total_iters):
         query = torch.randn(batch_size, seqlen, num_q_heads, head_dim_qk, dtype=target_dtype, device=device)
         key = torch.nn.functional.normalize(torch.randn(batch_size, seqlen, num_q_heads, head_dim_qk, dtype=torch.float32, device=device), dim=-1).to(
@@ -1162,7 +1189,12 @@ else:
     fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
     bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
 
-    backend_tag = f"{args.la_backend}_state_on" if (args.store_on and args.la_backend == "cudnn") else args.la_backend
+    backend_tag = args.la_backend
+    if args.la_backend == "cudnn":
+        if args.store_on:
+            backend_tag = "cudnn_state_on"
+        elif args.batch_invariant:
+            backend_tag = "cudnn_batch_invariant"
     if args.format_output:
         print(
             f"{args.case_tag},{backend_tag},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{fwd_bw:.2f},{bwd_bw:.2f}"
