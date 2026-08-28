@@ -718,6 +718,7 @@ def _run_thd(
     *,
     scale,
     causal=False,
+    bottom_right=False,
     swa_window=None,
     sink=None,
     stats=False,
@@ -825,7 +826,9 @@ def _run_thd(
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    if causal:
+    if bottom_right:
+        kw["use_causal_mask_bottom_right"] = True
+    elif causal:
         kw["use_causal_mask"] = True
     if swa_window is not None:
         kw["use_causal_mask"] = True
@@ -895,7 +898,11 @@ def _run_thd(
         qb = (q8[cu_q[b] : cu_q[b + 1]].float() * dq).permute(1, 0, 2).unsqueeze(0)
         kb = (k8[cu_k[b] : cu_k[b + 1]].float() * dk).permute(1, 0, 2).unsqueeze(0)
         vb = (v8[cu_k[b] : cu_k[b + 1]].float() * dv).permute(1, 0, 2).unsqueeze(0)
-        ref_kw = dict(is_causal=True) if causal or swa_window is not None else {}
+        ref_kw = {}
+        if bottom_right:
+            ref_kw.update(is_causal=True, bottom_right=True)
+        elif causal or swa_window is not None:
+            ref_kw["is_causal"] = True
         if swa_window is not None:
             ref_kw["swa_window"] = swa_window
         if sink is not None:
@@ -907,7 +914,8 @@ def _run_thd(
                 qb,
                 kb,
                 scale=scale,
-                causal=causal or swa_window is not None,
+                causal=bottom_right or causal or swa_window is not None,
+                bottom_right=bottom_right,
                 swa_window=swa_window,
                 sinks=(sink.flatten() if sink is not None else None),
             ).squeeze(0).T
@@ -917,7 +925,7 @@ def _run_thd(
     return o_out, o_ref, amax_o.item(), o_ref.abs().max().item(), lse_out, (lse_ref if stats else None)
 
 
-def _ref_lse(qd, kd, *, scale, causal, swa_window=None, sinks=None):
+def _ref_lse(qd, kd, *, scale, causal, bottom_right=False, swa_window=None, sinks=None):
     """Natural-log LSE reference over per-sequence scores, [1, H, S_q]."""
     _, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = kd.shape
@@ -927,7 +935,8 @@ def _ref_lse(qd, kd, *, scale, causal, swa_window=None, sinks=None):
     if causal:
         i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
         j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-        scores = scores.masked_fill(j > i, float("-inf"))
+        lim = i + (s_kv - s_q) if bottom_right else i
+        scores = scores.masked_fill(j > lim, float("-inf"))
     if swa_window is not None:
         i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
         j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
@@ -973,9 +982,12 @@ def test_fp8_thd(in_key, causal):
 
 @_skip_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize(("in_key", "causal"), [("e4m3", False), ("e5m2", True)])
+@pytest.mark.parametrize(
+    ("in_key", "causal", "bottom_right"),
+    [("e4m3", False, False), ("e5m2", True, False), ("e4m3", False, True)],
+)
 @torch_fork_set_rng(seed=0)
-def test_fp8_d192_d128_thd(in_key, causal):
+def test_fp8_d192_d128_thd(in_key, causal, bottom_right):
     """D192/D128 THD core path for both FP8 input formats and mask modes."""
     scale = 1.0 / math.sqrt(192)
     out, o_ref, a_o, a_o_ref, _, _ = _run_thd(
@@ -986,6 +998,7 @@ def test_fp8_d192_d128_thd(in_key, causal):
         in_key,
         scale=scale,
         causal=causal,
+        bottom_right=bottom_right,
         d_qk=192,
         d_v=128,
     )
