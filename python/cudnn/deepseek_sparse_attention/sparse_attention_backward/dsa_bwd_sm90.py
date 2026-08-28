@@ -1541,10 +1541,18 @@ class FlashAttentionDSABackwardSm90:
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
+                col = tScS_mn[r, c][COL]
                 if is_first:
-                    p = Float32(0.0) if tScS_mn[r, c][COL] >= num_valid_rows else p
+                    p = Float32(0.0) if col >= num_valid_rows else p
                 if const_expr(not self.have_topk_length):
-                    if mTopkIdxs_cur[n_block * self.tile_n + tScS_mn[r, c][COL]] < 0:
+                    # `col` still runs to tile_n - 1 in the peeled partial tile,
+                    # and max_topk need not be a multiple of tile_n, so clamp
+                    # before the load or the row is read past its end. Lanes
+                    # past the tail were zeroed just above and this guard only
+                    # ever zeroes, so the clamped entry cannot change the result.
+                    idx = n_block * self.tile_n + col
+                    idx = idx if idx < self.max_topk else Int32(self.max_topk - 1)
+                    if mTopkIdxs_cur[idx] < 0:
                         p = Float32(0.0)
                 acc_S_mn[r, c] = p
 

@@ -1013,11 +1013,15 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
     kv = (-2.0 + torch.randn(s_kv, head_dim, device=device) * 0.01).to(torch.bfloat16)
     attn_sink = torch.full((num_heads,), -400.0, dtype=torch.float32, device=device)
 
-    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    # The non-compact case sizes topk_idxs to a non-multiple of the 64-row tile
+    # on purpose: the peeled tile still spans all 64 columns, so the per-column
+    # index read has to stay inside the row.
+    max_topk = topk if compact else n_valid + 18
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:max_topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = None
     if compact:
         topk_length = torch.full((s_q,), n_valid, dtype=torch.int32, device=device)
-        topk_idxs[torch.arange(topk, device=device).unsqueeze(0) >= topk_length.unsqueeze(1)] = -1
+        topk_idxs[torch.arange(max_topk, device=device).unsqueeze(0) >= topk_length.unsqueeze(1)] = -1
     else:
         # Padding interleaved with live entries, not only a trailing run.
         topk_idxs[:, n_valid:] = -1
