@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """FROST GDN-2 engine: GDN2 nodes on the chunked prefill kernel
-(``kernel/gdn2_prefill_f16.py``, Blackwell SM100/SM103, bf16/fp16, BT=16).
+(``kernel/gdn2_prefill_f16.py``, SM100/SM103/SM107, bf16/fp16, BT=16).
 Forward + backward (GDN2_BWD on ``kernel/gdn2_bprop_f16.py`` with a
 checkpoint recompute on ``kernel/gdn2_recompute_f16.py``); the only GDN-2 engine — no cuTile
 fallback."""
@@ -41,7 +41,7 @@ def build_gdn2(graph):
 class Gdn2FrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node GDN-2 graphs (THD layout).
 
-    The only GDN-2 engine (SM100/SM103); GDN2_BWD runs on the FROST backward
+    The only GDN-2 engine (SM100/SM103/SM107); GDN2_BWD runs on the FROST backward
     kernel with a forward checkpoint recompute when the graph has no ``state_checkpoints`` input."""
 
     name = "gdn2_frost"
@@ -57,6 +57,8 @@ class Gdn2FrostEngine(BaseEngine):
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the GDN-2 node (got {checkpoint})")
         if not facts.gates_at_ho:
             raise NotImplementedError(f"Gdn2FrostEngine: g/beta/w must carry HO = max(q, v) heads ({facts.h_o})")
+        if facts.beta_guard and not facts.use_qk_l2norm:
+            raise NotImplementedError("Gdn2FrostEngine: beta_guard requires use_qk_l2norm (the sensor is defined on the normalized key)")
         fp32 = cudnn.data_type.FLOAT
         if facts.io_dtype is not None:
             for port, got in (("beta", facts.beta_dtype), ("w", facts.w_dtype)):
@@ -121,6 +123,7 @@ class CompiledGdn2:
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.beta_guard = bool(node.params.get("beta_guard", False))
         glb = node.params.get("gate_lower_bound")
         self.gate_lower_bound = float(glb) if glb is not None else kernel_module.DEFAULT_GATE_LOWER_BOUND
         self.has_final_state = "final_state" in node.outputs
@@ -285,6 +288,7 @@ class CompiledGdn2:
             a_log=a_log,
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
+            beta_guard=self.beta_guard,
             work_items=work_items,
             work_count=work_count,
             scheduler_counter=scheduler_counter,
@@ -324,6 +328,7 @@ class CompiledGdn2Bwd:
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.beta_guard = bool(node.params.get("beta_guard", False))
         glb = node.params.get("gate_lower_bound")
         self.gate_lower_bound = float(glb) if glb is not None else bwd_module.DEFAULT_GATE_LOWER_BOUND
         self.gate_bwd_blocks = GATE_BWD_BLOCKS
@@ -597,6 +602,7 @@ class CompiledGdn2Bwd:
                 a_log=a_log,
                 dt_bias=dt_bias,
                 use_beta_sigmoid=self.use_beta_sigmoid,
+                beta_guard=self.beta_guard,
                 work_items=work_items,
                 work_count=work_count,
                 scheduler_counter=scheduler_recompute,
@@ -641,6 +647,7 @@ class CompiledGdn2Bwd:
             a_log=a_log,
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
+            beta_guard=self.beta_guard,
             work_items=work_items,
             work_count=work_count,
             scheduler_counter=scheduler_bwd if self.bwd_dynamic_scheduling else None,

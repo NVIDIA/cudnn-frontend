@@ -121,7 +121,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -1606,8 +1606,7 @@ def _correction_warp_group(
                 # TMA-STG put the chunk's O.  The pair (O_s, lse_s) is everything
                 # the combine needs.
                 lse_batch = _partial_batch(batch_idx, split_idx, n_batch)
-                lse_row = lse_arr[lse_batch, row_head_idx, :]
-                lse_row[q_row_global] = lse_val
+                lse_arr[lse_batch, row_head_idx, q_row_global] = lse_val
 
         parity_last_rt = cutlass.Int32(0)
         if bounds.right > bounds.left:
@@ -1776,10 +1775,12 @@ def _host(
             thd_q_lens_tensor,
             thd_kv_lens_tensor,
             thd_lens_form,
-            cutlass.Int32(QH),
+            cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+            n_thd_units,  # CLC path: envelope units; the counter goes unused
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # KV split rides the BATCH axis: z = batch + split*B.  The decode
@@ -1831,6 +1832,7 @@ def compile(  # noqa: A001
     k_stride: Optional[tuple] = None,
     v_stride: Optional[tuple] = None,
     o_stride: Optional[tuple] = None,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = full
     TILE_K / TILE_O). TMA descriptors carry these extents while the tile box
@@ -1852,6 +1854,8 @@ def compile(  # noqa: A001
         # Each split's LSE is not optional under KV split — it IS the weight
         # the combine reduces with.  Without it the partials cannot be recombined.
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
+        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and
@@ -1918,12 +1922,16 @@ def compile(  # noqa: A001
             )
     else:
         if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+            raise ValueError("lse_head_major / lse_head_stride are THD-only")
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_lse_batch, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -1931,7 +1939,7 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

@@ -50,7 +50,7 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
     _, cta_group = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -114,8 +114,8 @@ def _build_spec_map():
     chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 

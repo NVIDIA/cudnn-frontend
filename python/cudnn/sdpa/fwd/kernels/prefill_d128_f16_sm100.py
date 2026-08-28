@@ -118,6 +118,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -197,6 +198,10 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+CTA_MMA = CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). Only this flavor is converted so far.
+THD_PERSISTENT = True
 
 
 # SM100 llama is always cga2 (CTA_MMA=2) → the SCHED_LPT/LPT_L2 reverse-row
@@ -216,9 +221,10 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
 # kernels/dsl/common/sdpa/thd.py.  Gated by CFG.THD_VARLEN (folds out otherwise).
 # Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
-# seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
+# seq_kv_lens overloaded as the THD metadata buffer (int32 len 4B+4):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
+#   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -623,7 +629,27 @@ def _kernel(
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout. seq_kv_lens_tensor is not always a flat
+            # 1-D view (the llama THD configs bind a nested one, where shape[0]
+            # is itself a tuple), so the arithmetic below has to use the value
+            # the caller already threads through every other THD helper.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
 
 
 # === TMA-LDG warp ===
@@ -1987,8 +2013,7 @@ def _correction_warp_group(
                     # the chunk's O.  The pair (O_s, lse_s) is everything the
                     # combine needs.  Folds to batch_idx at SPLIT_KV == 1.
                     lse_batch = _partial_batch(batch_idx, split_idx, n_batch)
-                    lse_row = lse_arr[lse_batch, row_head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[lse_batch, row_head_idx, q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2160,11 +2185,14 @@ def _host(
         # DEVICE-side from the caller's length tensors (no host cumsum, no
         # H2D — issue #552), then the per-batch O descriptor array (reuse
         # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
-        # PLAN-TIME ENVELOPE (n_thd_units = B * ceil(S_q_decl/CGA_TILE_M) * QH,
-        # from the DECLARED S_q — no runtime length reaches the host); units
-        # past a sequence's live tiles decode the batch == n_batch sentinel
-        # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
-        # Works at cga1 (CGA_M=1).
+        # PERSISTENT cluster count — the adapter hands down n_thd_units already
+        # capped to what the device holds resident, min(plan-time envelope,
+        # SMs / CTA_MMA), NOT the envelope itself. It doubles as the claim
+        # counter's seed: cluster c runs unit c off its blockIdx, then pulls
+        # from the counter, so the grid and the seed must be the same number.
+        # Dispatching past the live total stays safe either way — such a unit
+        # decodes the batch == n_batch sentinel and drains without loads or
+        # stores. grid_x = n_thd_units * CGA_M. Works at cga1 (CGA_M=1).
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.
@@ -2176,10 +2204,12 @@ def _host(
             thd_q_lens_tensor,
             thd_kv_lens_tensor,
             thd_lens_form,
-            cutlass.Int32(QH),
+            cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # Grid Python-folds on Cfg constant (avoids DSL if staging).
@@ -2233,6 +2263,7 @@ def compile(  # noqa: A001
     k_stride: Optional[tuple] = None,
     v_stride: Optional[tuple] = None,
     o_stride: Optional[tuple] = None,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
@@ -2270,6 +2301,8 @@ def compile(  # noqa: A001
         # Each split's LSE is not optional under KV split — it IS the weight the
         # combine reduces with.  Without it the partials cannot be recombined.
         raise ValueError("d128: split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
+        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     if CFG.THD_VARLEN:
         # Dynamic packed token totals: one symbol per ragged group (Q/O and
@@ -2337,12 +2370,16 @@ def compile(  # noqa: A001
             )
     else:
         if lse_head_major or lse_head_stride:
-            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+            raise ValueError("lse_head_major / lse_head_stride are THD-only")
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_lse_batch, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     # Sinks tensor always part of the ABI; read only when CFG.HAS_SINK == 1 (compile-time fold).
     fake_sinks = cute.runtime.make_fake_compact_tensor(
@@ -2353,8 +2390,8 @@ def compile(  # noqa: A001
     )
     # seq_kv_lens always part of the ABI; read only when CFG.SEQ_KV_LENS_PRESENT == 1
     # (compile-time fold).  THD overloads it as the [seq_kv_lens(B)|cu_q(B+1)|
-    # cu_k(B+1)] metadata buffer (length 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # cu_k(B+1)|batch_remap(B)|live|ctr] metadata buffer (length 4B+4).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

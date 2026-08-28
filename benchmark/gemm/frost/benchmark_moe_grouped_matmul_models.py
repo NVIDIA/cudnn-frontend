@@ -355,10 +355,10 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -420,7 +420,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph(S, N, K, E, variant, args.dtype, offsets)
-            plan = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+            plan = jit_from_cudnn_graph(g, config=cfg)
         except (NotImplementedError, ValueError) as e:
             print(f"  {label:64s} SKIP: {type(e).__name__}: {str(e)[:40]}", flush=True)
             continue

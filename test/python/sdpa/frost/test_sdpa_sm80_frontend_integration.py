@@ -35,9 +35,6 @@ def _is_sm80() -> bool:
 
 _SM80 = pytest.mark.skipif(not _is_sm80(), reason="needs an SM80 (A100) GPU")
 
-# The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
-pytestmark = pytest.mark.L0
-
 B, H, S, D = 2, 4, 512, 128
 _HALF = cudnn.data_type.HALF
 _SCALE = 1.0 / math.sqrt(D)
@@ -47,20 +44,29 @@ def _bshd_stride(b, h, s, d):
     return (s * h * d, d, h * d, 1)
 
 
-def _buf():
-    return torch.randn(B, S, H, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+def _buf(d=D):
+    return torch.randn(B, S, H, d, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
 
 
-def _build_fwd_graph(**sdpa_kwargs):
+def _build_fwd_graph(*, d=D, stats_stride=None, **sdpa_kwargs):
     g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    st = _bshd_stride(B, H, S, D)
-    q = g.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    k = g.tensor(name="k", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    v = g.tensor(name="v", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True, **sdpa_kwargs)
-    o.set_output(True).set_dim((B, H, S, D)).set_stride(st).set_data_type(_HALF)
+    st = _bshd_stride(B, H, S, d)
+    q = g.tensor(name="q", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    k = g.tensor(name="k", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    v = g.tensor(name="v", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=1.0 / math.sqrt(d), use_causal_mask=True, generate_stats=True, **sdpa_kwargs)
+    o.set_output(True).set_dim((B, H, S, d)).set_stride(st).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    if stats_stride is not None:
+        stats.set_dim((B, H, S, 1)).set_stride(stats_stride)
     return g, q, k, v, o, stats
+
+
+def _ws(g):
+    """The graph's carved-scratch workspace (issue #514): a non-zero
+    workspace_bytes executor carves from the caller's buffer."""
+    n = g.get_workspace_size()
+    return torch.empty(n, dtype=torch.uint8, device="cuda") if n else None
 
 
 def _native_then_pin(g, engine):
@@ -72,6 +78,7 @@ def _native_then_pin(g, engine):
     g.build_plans()
 
 
+@pytest.mark.L0
 def test_sm80_engines_registered():
     from cudnn.sdpa.bwd.engine import FrostSdpaBwdEngines
     from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngines
@@ -88,6 +95,7 @@ def test_sm80_engines_registered():
     assert is_python_engine(fwd[_FWD].engine_id) and is_python_engine(bwd[_BWD].engine_id)
 
 
+@pytest.mark.L0
 def test_probe_rejects_unsupported_features():
     """A dropout graph must leave the SM80 forward engine ineligible for a
     feature (not an arch) reason — normalize device_cc so this runs anywhere."""
@@ -109,6 +117,7 @@ def test_probe_rejects_unsupported_features():
     assert reason is not None and "dropout" in reason
 
 
+@pytest.mark.L0
 def test_direction_cross_rejection():
     """The fwd engine must reject sdpa_backward graphs and vice versa."""
     g, *_ = _build_fwd_graph()
@@ -118,6 +127,7 @@ def test_direction_cross_rejection():
 
 
 @_SM80
+@pytest.mark.L0
 def test_fwd_engine_end_to_end():
     g, q, k, v, o, stats = _build_fwd_graph()
     _native_then_pin(g, _FWD)
@@ -126,7 +136,7 @@ def test_fwd_engine_end_to_end():
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
     torch.cuda.synchronize()
 
     ref = torch.nn.functional.scaled_dot_product_attention(q_buf.float(), k_buf.float(), v_buf.float(), is_causal=True, scale=_SCALE).to(torch.float16)
@@ -134,7 +144,51 @@ def test_fwd_engine_end_to_end():
     assert torch.isfinite(stats_buf).all()
 
 
+def _check_fwd_engine_strided_stats(d):
+    sentinel = -12345.0
+    stats_storage = torch.full((S + 7, H + 2, B), sentinel, dtype=torch.float32, device="cuda")
+    strided_stats_buf = stats_storage.permute(2, 1, 0)[:, :H, :S].unsqueeze(-1)
+    compact_stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
+    compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride())
+    strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride())
+    _native_then_pin(compact_graph[0], _FWD)
+    _native_then_pin(strided_graph[0], _FWD)
+
+    torch.manual_seed(0)
+    q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
+    for graph_tensors, stats_buf in ((compact_graph, compact_stats_buf), (strided_graph, strided_stats_buf)):
+        graph, q, k, v, o, stats = graph_tensors
+        graph.execute({q: q_buf, k: k_buf, v: v_buf, o: torch.empty_like(q_buf), stats: stats_buf}, None)
+    torch.cuda.synchronize()
+
+    scale = 1.0 / math.sqrt(d)
+    scores = torch.matmul(q_buf.float(), k_buf.float().transpose(-1, -2)) * scale
+    causal_mask = torch.ones(S, S, dtype=torch.bool, device="cuda").triu(diagonal=1)
+    stats_ref = torch.logsumexp(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
+    torch.testing.assert_close(strided_stats_buf, compact_stats_buf, rtol=0, atol=0)
+    torch.testing.assert_close(strided_stats_buf.squeeze(-1), stats_ref, rtol=3e-2, atol=5e-2)
+
+    gaps = torch.ones_like(stats_storage, dtype=torch.bool)
+    gaps[:S, :H, :] = False
+    assert torch.all(stats_storage[gaps] == sentinel), "the LSE store touched padding outside its declared view"
+
+
 @_SM80
+@pytest.mark.L0
+def test_fwd_engine_strided_stats():
+    """The SM80 L0 half flavor writes LSE into a permuted, gapped layout."""
+    _check_fwd_engine_strided_stats(128)
+
+
+@_SM80
+@pytest.mark.L1
+def test_fwd_engine_strided_stats_d256():
+    """The SM80 D256 half flavor preserves dense Stats strides."""
+    _check_fwd_engine_strided_stats(256)
+
+
+@_SM80
+@pytest.mark.L0
 def test_bwd_engine_end_to_end():
     # Forward via the SM80 engine to produce O / stats.
     g, q, k, v, o, stats = _build_fwd_graph()
@@ -143,7 +197,7 @@ def test_bwd_engine_end_to_end():
     q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
 
     gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     st = _bshd_stride(B, H, S, D)
@@ -162,7 +216,7 @@ def test_bwd_engine_end_to_end():
     dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
     gb.execute(
         {qb: q_buf, kb: k_buf, vb: v_buf, ob: o_buf, dob: do_buf, statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf},
-        None,
+        _ws(gb),
     )
     torch.cuda.synchronize()
 
@@ -178,6 +232,7 @@ def test_bwd_engine_end_to_end():
 
 
 @_SM80
+@pytest.mark.L0
 @pytest.mark.parametrize("gqa", [1, 4], ids=["mha", "gqa4x"])
 def test_fwd_engine_bhsd_contiguous_layout(gqa):
     """dense_flex delivery: BHSD-contiguous buffers (the test_mhas_v2 norm)
@@ -201,7 +256,7 @@ def test_fwd_engine_bhsd_contiguous_layout(gqa):
     v_buf = torch.randn(B, h_kv, S, D, dtype=torch.float16, device="cuda")
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, None)
+    g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
     torch.cuda.synchronize()
 
     ref = torch.nn.functional.scaled_dot_product_attention(
@@ -211,6 +266,7 @@ def test_fwd_engine_bhsd_contiguous_layout(gqa):
 
 
 @_SM80
+@pytest.mark.L0
 def test_bwd_engine_bhsd_contiguous_layout():
     """Backward counterpart of the dense_flex layout regression."""
     st = (H * S * D, S * D, D, 1)  # BHSD-contiguous
@@ -243,7 +299,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     dq_buf, dk_buf, dv_buf = (torch.empty(dims, dtype=torch.float16, device="cuda") for _ in range(3))
     gb.execute(
         {qb: bufs["q"], kb: bufs["k"], vb: bufs["v"], ob: o_buf, dob: bufs["do"], statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf},
-        None,
+        _ws(gb),
     )
     torch.cuda.synchronize()
 
@@ -255,3 +311,79 @@ def test_bwd_engine_bhsd_contiguous_layout():
     torch.testing.assert_close(dq_buf.float(), q_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dk_buf.float(), k_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dv_buf.float(), v_ref.grad, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
+@_SM80
+def test_engine_execute_does_not_allocate():
+    """Issue #514: after the first (JIT + cache-warming) execute, re-executing
+    either SM80 engine must not touch the CUDA caching allocator — every
+    per-execute buffer is carved from the caller's workspace.  Asserted on the
+    allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
+    clone/contiguous on the execute path would advance.  The geometry is
+    chosen to force real staging on both directions: GQA (fwd K/V head
+    expansion) and a strided stats buffer (fwd LSE staging + bwd gather),
+    so the fwd workspace is non-zero too."""
+    H_KV = H // 2
+    st_kv = _bshd_stride(B, H_KV, S, D)
+    # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
+    # layout mhas draws under randomized stats strides (cuDNN >= 9.26, #304).
+    stats_stride = (2 * H * S, 2 * S, 2, 1)
+
+    g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = _bshd_stride(B, H, S, D)
+    q = g.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    k = g.tensor(name="k", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
+    v = g.tensor(name="v", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
+    o, stats = g.sdpa(q=q, k=k, v=v, attn_scale=_SCALE, use_causal_mask=True, generate_stats=True)
+    o.set_output(True).set_data_type(_HALF)
+    stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
+    _native_then_pin(g, _FWD)
+    assert g.get_workspace_size() > 0, "GQA expansion + strided-LSE staging must be carved, not allocated"
+    torch.manual_seed(0)
+    q_buf = _buf()
+    k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    v_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    o_buf = torch.empty_like(q_buf)
+    stats_buf = torch.empty(2 * B * H * S, dtype=torch.float32, device="cuda").as_strided((B, H, S, 1), stats_stride)
+    ws = _ws(g)
+    vp = {q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}
+
+    # Backward graph on the same geometry (GQA + the same strided stats input).
+    gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    qb = gb.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    kb = gb.tensor(name="k", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
+    vb = gb.tensor(name="v", dim=(B, H_KV, S, D), stride=st_kv, data_type=_HALF)
+    ob = gb.tensor(name="o", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=stats_stride, data_type=cudnn.data_type.FLOAT)
+    dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
+    for t in (dq, dk, dv):
+        t.set_output(True).set_data_type(_HALF)
+    _native_then_pin(gb, _BWD)
+    assert gb.get_workspace_size() > 0, "the SM80 bwd executor must report its carved scratch"
+    do_buf = _buf()
+    dq_buf = torch.empty_like(q_buf)
+    dk_buf, dv_buf = torch.empty_like(k_buf), torch.empty_like(v_buf)
+    wsb = _ws(gb)
+    vpb = {qb: q_buf, kb: k_buf, vb: v_buf, ob: o_buf, dob: do_buf, statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf}
+
+    # Warm run: kernel JIT, dummy caches, cublas handles, everything.
+    g.execute(vp, ws)
+    gb.execute(vpb, wsb)
+    torch.cuda.synchronize()
+
+    ref_o = o_buf.clone()
+    ref_dq, ref_dk, ref_dv = dq_buf.clone(), dk_buf.clone(), dv_buf.clone()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        g.execute(vp, ws)
+        gb.execute(vpb, wsb)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert after == before, f"execute allocated {after - before} times; the SM80 engine paths must carve from the workspace only"
+    # And the carved re-executes still compute the same thing.
+    torch.testing.assert_close(o_buf, ref_o, rtol=0, atol=0)
+    torch.testing.assert_close(dq_buf, ref_dq, rtol=0, atol=0)
+    torch.testing.assert_close(dk_buf, ref_dk, rtol=0, atol=0)
+    torch.testing.assert_close(dv_buf, ref_dv, rtol=0, atol=0)

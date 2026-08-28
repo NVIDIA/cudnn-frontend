@@ -29,7 +29,7 @@ BLOCK = 256
 
 
 @cute.kernel
-def head_reduce_kernel(
+def frost_head_reduce(
     mIn: cute.Tensor,
     mOut: cute.Tensor,
     total_words: cutlass.Int64,
@@ -82,7 +82,7 @@ def launch(
     io_dtype: cutlass.Constexpr,
     stream: cuda.CUstream,
 ) -> None:
-    head_reduce_kernel(mIn, mOut, total_words, out_row_words, out_head_words, h_count, r, inner_words, io_dtype).launch(
+    frost_head_reduce(mIn, mOut, total_words, out_row_words, out_head_words, h_count, r, inner_words, io_dtype).launch(
         grid=(grid_x, 1, 1),
         block=(BLOCK, 1, 1),
         stream=stream,
@@ -156,3 +156,6 @@ def head_group_reduce(src, dst, *, stream) -> None:
             options="--enable-tvm-ffi",
         )
     compiled_cache[key](src, dst, total_words, out_row_words, out_head_words, grid_x, cu_stream)
+
+
+frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=True)

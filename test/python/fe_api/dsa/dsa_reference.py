@@ -16,7 +16,7 @@ sink is folded into the softmax denominator by the backward kernel.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -575,7 +575,8 @@ def _indexer_predict_distribution(
     weights: torch.Tensor,  # (B, S_q, H)
     topk_indices: torch.Tensor,  # (B, S_q, topk) INT32
     sm_scale: float,
-) -> torch.Tensor:
+    return_scores: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Differentiable predict-distribution computation for autograd reference.
 
     Mirrors the cudnn ``sparse_indexer_score_recompute`` math, but as a plain
@@ -603,7 +604,8 @@ def _indexer_predict_distribution(
 
     valid = topk_indices >= 0
     scores = scores.masked_fill(~valid, float("-inf"))
-    return torch.softmax(scores, dim=-1)
+    predict = torch.softmax(scores, dim=-1)
+    return (predict, scores) if return_scores else predict
 
 
 def ref_indexer_backward(
@@ -611,46 +613,60 @@ def ref_indexer_backward(
     weights: torch.Tensor,  # (B, S_q, H)   bf16
     index_k: torch.Tensor,  # (B, S_k, D)   bf16
     attn_score: torch.Tensor,  # (B, S_q, topk) target FP32
-    index_score: torch.Tensor,  # (B, S_q, topk) predict FP32 (unused — recomputed)
+    index_score: torch.Tensor,  # (B, S_q, topk) predict FP32 (kernel 1 signal operand)
     topk_indices: torch.Tensor,  # (B, S_q, topk) INT32
     sm_scale: float = 1.0,
     grad_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """PyTorch autograd reference for ``DSA.indexer_backward_wrapper``.
 
-    Recomputes the predict distribution from ``(index_q, weights, index_k,
-    topk_indices)`` and takes the gradient of
-    ``-grad_scale * sum(attn_score * log(predict))`` (the clipped-log KL
-    ``d/d(predict)`` contracted against ``-target``, mirroring the kernel's
-    ``_score_grad_inplace`` stage) with respect to ``index_q``, ``weights``,
-    and ``index_k``. Returns gradients in the same dtype as the inputs.
+    Forms the clipped-log KL grad signal from the supplied fp32
+    ``index_score`` exactly as the kernel's ``_score_grad_inplace`` stage
+    does (same ``exp(-100)`` clip constant, same fp32 operand), then
+    backpropagates it through scores recomputed from ``(index_q, weights,
+    index_k, topk_indices)`` to ``index_q``, ``weights``, and ``index_k``.
+    Returns gradients in the same dtype as the inputs.
 
-    Inputs remain in their original dtype through the forward / softmax so
-    the internal predict distribution matches the kernel's bf16 GEMMs with
-    fp32 accumulator — otherwise the two would disagree purely because
+    Inputs remain in their original dtype through the recomputed score
+    chain so the VJP models the kernel's bf16 GEMMs with fp32 accumulator —
+    otherwise the two would disagree purely because
     ``fp32(bf16(x)) * fp32(bf16(y))`` ≠ ``fp32(x) * fp32(y)``.
     """
     q = index_q.detach().clone().requires_grad_(True)
     w = weights.detach().clone().requires_grad_(True)
     k = index_k.detach().clone().requires_grad_(True)
 
-    predict = _indexer_predict_distribution(
+    _, scores = _indexer_predict_distribution(
         q,
         k,
         w,
         topk_indices,
         sm_scale,
-    )  # (B, S_q, topk) — dtype follows inputs, cast to fp32 inside softmax
+        return_scores=True,
+    )  # scores: (B, S_q, topk) — dtype follows inputs (the kernel GEMMs are bf16)
 
-    eps = torch.finfo(torch.float32).tiny
-    predict_clipped = predict.to(torch.float32).clamp(min=eps)
-    target = attn_score.to(torch.float32).clamp(min=eps)
-
-    # KL gradient stage: d/d(logits) of KL = g - predict * sum(g) where
-    # g = -target. We sum g * log(predict) directly so autograd gives the
-    # identical gradient w.r.t. (q, w, k).
-    loss = -grad_scale * (target * torch.log(predict_clipped)).sum()
-    grads = torch.autograd.grad(loss, (q, w, k))
+    # KL gradient stage, evaluated analytically exactly like the kernel's
+    # ``_score_grad_inplace``: g = -max(target, eps) * [predict >= eps] and
+    # grad_signal = g - predict * sum(g), with eps = exp(CLIP_LOG_MIN) — the
+    # kernel's clip constant — and predict = the supplied fp32 ``index_score``,
+    # the exact tensor the kernel reads (a recomputed bf16 predict would flush
+    # kernel-eligible subnormal probabilities to zero and move the clip mask
+    # off the kernel's). Autograd through ``log(predict.clamp(min=eps))`` is
+    # NOT equivalent either: at eps = exp(-100) the log backward's 1/predict
+    # overflows fp32 (predict can be subnormal), and clipping at
+    # ``float32.tiny`` instead also moves the clip mask — on sharply peaked
+    # predict distributions (large valid top-k with wide score range) the mask
+    # difference alone dominates the comparison (measured ~0.55 rms_rel vs the
+    # kernel where this construction measures <= 0.005).
+    # ``ref_dense_indexer_backward`` below uses the same analytic construction.
+    eps = math.exp(-100.0)  # kernel CLIP_LOG_MIN = -100.0
+    predict_f32 = index_score.detach().to(torch.float32)
+    target_eff = attn_score.to(torch.float32).clamp(min=eps)
+    log_clip_mask = (predict_f32 >= eps).to(torch.float32)
+    g = -target_eff * log_clip_mask * grad_scale
+    grad_signal = g - predict_f32 * g.sum(dim=-1, keepdim=True)
+    grad_signal = grad_signal.masked_fill(topk_indices < 0, 0.0)
+    grads = torch.autograd.grad(scores, (q, w, k), grad_outputs=grad_signal.to(scores.dtype))
 
     dq, dw, dk = grads
     return (

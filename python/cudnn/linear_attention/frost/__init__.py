@@ -4,7 +4,7 @@
 """cudnn.linear_attention.frost: the FROST linear-attention engines —
 Gated DeltaNet, Kimi Delta Attention, and Gated DeltaNet v2 on the SM100
 chunked kernels built on Cutlass primitives. All three serve forward and
-backward on SM100/SM103 and rank ahead of the cuTile fallbacks, except
+backward on SM100/SM103/SM107 and rank ahead of the cuTile fallbacks, except
 GDN-2, which does not have a cuTile fallback."""
 
 # Lazy: importing one family's engine must not drag its neighbours in.

@@ -68,7 +68,11 @@ ensure_cuda_runtime_context() {
 }  // namespace
 
 void
-init_gnn_submodule(py::module_ &m) {
+init_gnn_submodule([[maybe_unused]] py::module_ &m) {
+    // maybe_unused: with pre-9.26 cuDNN headers (or on Windows) the #if body
+    // below compiles away entirely and -Werror=unused-parameter breaks the
+    // build (seen with the pip source build inside containers shipping older
+    // cuDNN headers).
 #if CUDNN_VERSION >= 92600 && !defined(_WIN32)
     py::enum_<cudnnGnnAggOp_t>(m, "gnn_agg_op")
         .value("SUM", CUDNN_GNN_AGG_SUM)

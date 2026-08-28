@@ -535,6 +535,19 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 "tensor.");
         }
 
+        // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
+        {
+            bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+                                   attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+                                   attributes.outputs.at(output_names::O)->get_ragged_offset();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) &&
+                    !is_ragged,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
+        }
+
 #undef CUDNN_FE_VALIDATE_STRIDE
 
         return {error_code_t::OK, ""};
@@ -1280,6 +1293,15 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "cuDNN 9.14.0 has a known bug with non-causal + s_kv > 1024 + sliding window attention. "
             "Please consider upgrading to 9.14.1 or newer.");
+
+        // Pre-9.26 backward bug on ragged graphs with a sink token
+        auto const& sink_token = attributes.inputs.find(input_names::SINK_TOKEN);
+        bool const has_sink    = (sink_token != attributes.inputs.end() && sink_token->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            is_ragged && has_sink && detail::get_backend_version() < 92600,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "SDPA backward with ragged offsets and a sink token requires cuDNN 9.26.0 or newer "
+            "(older versions hit an out-of-bounds read in the compute_dot_do_o pre-pass).");
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         int32_t const sm_version = context.get_sm_version();

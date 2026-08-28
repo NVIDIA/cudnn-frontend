@@ -246,8 +246,11 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # is (0, 0, batch_idx) and _thd_sf_tile_bases (0, 0) dense — TMA coords
 # byte-identical).  Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs /
 # O stores per tile).  seq_kv_lens overloaded as the THD metadata buffer
-# (int32 len 3B+2): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1)
-# — built DEVICE-side by the setup kernel (issue #552).
+# (int32 len 4B+4): [0..B-1]=seq_kv_lens [B..2B]=cu_q(B+1) [2B+1..3B+1]=cu_k(B+1)
+# [3B+2..4B+1]=batch_remap(B) [4B+2]=live units [4B+3]=claim counter
+# — built DEVICE-side by the setup kernel (issue #552).  The decode walks
+# batch_remap on EVERY THD flavor, so the setup kernel must fill it; the
+# trailing two words are read only by the persistent schedulers.
 # MXFP8-only: _thd_sf_tile_bases returns the per-sequence SF-tile prefix bases
 # (cu_sf_q_base / cu_sf_k_base) for the packed scale-factor layout.
 from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
@@ -2320,8 +2323,7 @@ def _correction_warp_group(
                         # TMA-STG put the chunk's O.  The pair (O_s, lse_s) is everything
                         # the combine needs.  Folds to batch_idx at SPLIT_KV == 1.
                         lse_batch = _partial_batch(batch_idx, split_idx, n_batch)
-                        lse_row = lse_arr[lse_batch, head_idx, :]
-                        lse_row[q_row_global] = lse_val
+                        lse_arr[lse_batch, head_idx, q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2623,6 +2625,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
 
@@ -2736,11 +2739,15 @@ def compile(  # noqa: A001
     else:
         if lse_head_major or lse_head_stride:
             raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (_lse_batch, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (_lse_batch, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None and SPLIT_KV == 1
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (_lse_batch, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -2755,8 +2762,9 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     # seq_kv_lens always part of the ABI; unread when CFG.SEQ_KV_LENS_PRESENT
-    # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)] (len 3B+2).
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # == 0.  THD overloads it as [seq_kv_lens(B)|cu_q(B+1)|cu_k(B+1)|
+    # batch_remap(B)|live|ctr] (len 4B+4).
+    _skv_len = (4 * b + 4) if CFG.THD_VARLEN else b
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),

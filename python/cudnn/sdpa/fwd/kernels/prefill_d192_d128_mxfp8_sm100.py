@@ -2428,6 +2428,9 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(0.0)
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
+            # A dead row must select literal zero after normalization because
+            # multiplying an unwritten TMEM NaN by zero does not sanitize it.
+            row_dead = total_sum <= cutlass.Float32(0.0)
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
@@ -2440,6 +2443,20 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 (rows fully masked).
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
+                lse_val = cutlass.Float32(
+                    arith.select(
+                        row_dead.ir_value(),
+                        cutlass.Float32(float("-inf")).ir_value(),
+                        lse_val.ir_value(),
+                    )
+                )
+                inv_sum = cutlass.Float32(
+                    arith.select(
+                        row_dead.ir_value(),
+                        cutlass.Float32(0.0).ir_value(),
+                        inv_sum.ir_value(),
+                    )
+                )
 
             # OOB-row guard: under cga2 cluster Q rows can exceed seqlen_q (else write aliases next head's LSE slot).
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
@@ -2449,8 +2466,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if _row_valid:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    lse_arr[batch_idx, head_idx, q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2466,6 +2482,11 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
+                _zero_f = cutlass.Float32(0.0)
+                o_scaled = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
+                    cutlass.Float32,
+                )
                 _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
                 o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
@@ -2702,6 +2723,7 @@ def compile(  # noqa: A001
     sq: int = 256,
     skv: int = 128,
     has_lse: bool = True,
+    lse_stride: Optional[tuple[int, int, int]] = None,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
 
@@ -2764,11 +2786,15 @@ def compile(  # noqa: A001
         # is compiled out entirely — no dummy buffer exists at any level.
         fake_lse = None
     else:
-        fake_lse = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (b, qh, sq),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        fake_lse = (
+            cute.runtime.make_fake_tensor(cutlass.Float32, (b, qh, sq), lse_stride, assumed_align=4)
+            if lse_stride is not None
+            else cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (b, qh, sq),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
         )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

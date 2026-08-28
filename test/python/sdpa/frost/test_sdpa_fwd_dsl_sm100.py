@@ -12,7 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import make_dense_stats, requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -169,7 +169,21 @@ def _bhsd(b, h, s, d, dtype, device="cuda"):
     return torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
 
 
-def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q=None, sink=None, pack_gqa=None, return_stats=False):
+def _run_dsl_graph(
+    q_gpu,
+    k_gpu,
+    v_gpu,
+    *,
+    scale,
+    dtype,
+    sdpa_kwargs,
+    seq_len_kv=None,
+    seq_len_q=None,
+    sink=None,
+    pack_gqa=None,
+    return_stats=False,
+    stats_layout="contiguous",
+):
     """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
     import cudnn
 
@@ -203,10 +217,9 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
     stats_gpu = None
     if return_stats:
-        stats_gpu = torch.empty(b, h_q, s_q, dtype=torch.float32, device="cuda")
-        stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-        stats.set_dim((b, h_q, s_q, 1)).set_stride((h_q * s_q, s_q, 1, 1))
-        vp[stats] = stats_gpu
+        assert stats is not None
+        stats_gpu = make_dense_stats(b, h_q, s_q, stats_layout)
+        stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
     g.build_operation_graph()
@@ -215,11 +228,47 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
+    if stats_gpu is not None:
+        vp[stats] = stats_gpu
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
     torch.cuda.synchronize()
     if return_stats:
         return o_gpu, stats_gpu
     return o_gpu
+
+
+def _check_dsl_sm100_strided_stats(d_qk, d_v):
+    _require_dsl()
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves only the per-tensor FP8 d128 forward path")
+    b, h, s = 2, 4, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h, s, d_qk, dtype)
+    k = _bhsd(b, h, s, d_qk, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+
+    _, contiguous_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True)
+    o, strided_stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True), return_stats=True, stats_layout="strided")
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(strided_stats, contiguous_stats, atol=0, rtol=0)
+    torch.testing.assert_close(strided_stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm100_strided_stats():
+    """The SM100 half L0 flavor writes permuted, gapped LSE directly."""
+    _check_dsl_sm100_strided_stats(128, 128)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(("d_qk", "d_v"), [(192, 128), (256, 256), (512, 512)], ids=["d192_d128", "d256", "d512"])
+@torch_fork_set_rng(seed=59)
+def test_dsl_sm100_strided_stats_other_flavors(d_qk, d_v):
+    """The remaining SM100 half flavors preserve dense Stats strides."""
+    _check_dsl_sm100_strided_stats(d_qk, d_v)
 
 
 @pytest.mark.L0
@@ -743,7 +792,7 @@ def test_dsl_sm100_pack_gqa_features(mask):
     o, lse = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, sink=sink, pack_gqa=True, return_stats=True)
     o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **ref)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
@@ -771,7 +820,7 @@ def test_dsl_sm100_pack_gqa_qtrim():
         o_ref[i, :, ql:, :] = 0.0
         lse_ref[i, :, ql:] = float("-inf")
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
@@ -1642,6 +1691,172 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     graph.replay()
     torch.cuda.synchronize()
     _check([64, 33])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
+    """``sdpa(max_total_seq_len_q/kv=...)`` makes the THD token extent EXACT.
+
+    A ragged graph declares ``(B, H, S_max, D)`` plus device ragged offsets, so
+    the packed total is not expressible as a dim: without the attribute the
+    execute path infers an upper bound from buffer geometry. That bound is
+    memory-safe but loose, and the rows between the real total and the capacity
+    are masked yet still multiplied (``P == 0`` times V), so they must be
+    FINITE. A caller that over-allocates and leaves the tail unwritten
+    therefore poisons whole tiles through ``0 * NaN`` (issue #624).
+
+    Declaring the total clamps the TMA extent to the packed total, putting that
+    tail out of reach. Same graph, same data, only the tail fill differs: with
+    the declaration a NaN tail must be inert."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H, d = 8, 128
+    dtype = torch.bfloat16
+    seq_lens = [200, 150, 47]  # total 397 -- deliberately not a TILE_N multiple
+    B, S_max, T = len(seq_lens), max(seq_lens), sum(seq_lens)
+    CAP = 640  # > T: rows [T, CAP) are the over-allocated, unwritten tail
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d)
+
+    q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    k_live = torch.randn(T, H, d, device=dev, dtype=dtype)
+    v_live = torch.randn(T, H, d, device=dev, dtype=dtype)
+
+    def _run(tail_value, declare_total):
+        k_buf = torch.full((CAP, H, d), tail_value, device=dev, dtype=dtype)
+        v_buf = torch.full((CAP, H, d), tail_value, device=dev, dtype=dtype)
+        k_buf[:T], v_buf[:T] = k_live, v_live
+
+        stride = (S_max * H * d, d, H * d, 1)
+        io = cudnn.data_type.BFLOAT16
+        g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="q")
+        tk = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="k")
+        tv = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="v")
+        slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+        cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+        ro = (cu_t * H * d).view(B + 1, 1, 1, 1)
+        sq, skv = g.tensor_like(slq), g.tensor_like(slq)
+        qro, kro, vro, oro = (g.tensor_like(ro) for _ in range(4))
+        tq.set_ragged_offset(qro)
+        tk.set_ragged_offset(kro)
+        tv.set_ragged_offset(vro)
+        totals = dict(max_total_seq_len_q=T, max_total_seq_len_kv=T) if declare_total else {}
+        o, _ = g.sdpa(
+            name="sdpa",
+            q=tq,
+            k=tk,
+            v=tv,
+            generate_stats=False,
+            attn_scale=scale,
+            use_causal_mask=True,
+            use_padding_mask=True,
+            seq_len_q=sq,
+            seq_len_kv=skv,
+            **totals,
+        )
+        o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(stride))
+        o.set_ragged_offset(oro)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        _select_engine(g, engine_name())
+        g.check_support()
+        g.build_plans()
+        o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
+        vp = {tq: q_pk, tk: k_buf, tv: v_buf, o: o_buf, sq: slq, skv: slq, qro: ro, kro: ro, vro: ro, oro: ro}
+        g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+        torch.cuda.synchronize()
+        return o_buf
+
+    declared_nan = _run(float("nan"), declare_total=True)
+    declared_zero = _run(0.0, declare_total=True)
+    assert not torch.isnan(declared_nan).any(), (
+        f"declared max_total_seq_len must clamp the TMA extent to the packed total, but the "
+        f"unwritten capacity tail still reached P@V: {int(torch.isnan(declared_nan).sum())} NaNs in O"
+    )
+    assert torch.equal(declared_nan, declared_zero), "O must not depend on the capacity tail once the total is declared"
+
+    # Control: the tail is genuinely reachable without the declaration, so the
+    # assertions above are testing the clamp rather than a benign shape.
+    undeclared_nan = _run(float("nan"), declare_total=False)
+    assert torch.isnan(undeclared_nan).any(), (
+        "expected the undeclared path to read the capacity tail (issue #624); if this no longer "
+        "holds the extent is exact by other means and this test needs rethinking"
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_interleaved_kv_views():
+    """THD K/V bound as strided VIEWS of one fused [T, 2, H, D] record — the
+    layout torch.nn.attention.varlen users produce by slicing a fused KV
+    projection (declared token stride 2*H*D, V at element offset H*D).
+
+    Regression for issue #613: the execute-time token capacity must come from
+    the view's element SPAN. numel()-derived extents HALVE for these views
+    (the TMA descriptors then cut off half the tokens — silently wrong O),
+    and storage-derived extents over-claim into allocator slack, whose NaN
+    bit patterns poison masked rows through P(=0) * V."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H, d = 8, 128
+    dtype = torch.bfloat16
+    seq_lens = [200, 150, 47]
+    B, S_max, T = len(seq_lens), max(seq_lens), sum(seq_lens)
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d)
+
+    q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    kv_rec = torch.randn(T, 2, H, d, device=dev, dtype=dtype)  # fused record
+    k_view, v_view = kv_rec[:, 0], kv_rec[:, 1]  # token stride 2*H*d, V offset H*d
+
+    def _graph_run(k_buf, v_buf, kv_token_stride):
+        q_stride = (S_max * H * d, d, H * d, 1)
+        kv_stride = (S_max * kv_token_stride, d, kv_token_stride, 1)
+        io = cudnn.data_type.BFLOAT16
+        g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        tq = g.tensor(dim=[B, H, S_max, d], stride=list(q_stride), data_type=io, name="q")
+        tk = g.tensor(dim=[B, H, S_max, d], stride=list(kv_stride), data_type=io, name="k")
+        tv = g.tensor(dim=[B, H, S_max, d], stride=list(kv_stride), data_type=io, name="v")
+        slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+        cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+        ro_q = (cu_t * H * d).view(B + 1, 1, 1, 1)
+        ro_kv = (cu_t * kv_token_stride).view(B + 1, 1, 1, 1)
+        sq, skv = g.tensor_like(slq), g.tensor_like(slq)
+        qro, kro, vro, oro = (g.tensor_like(ro_q) for _ in range(4))
+        tq.set_ragged_offset(qro)
+        tk.set_ragged_offset(kro)
+        tv.set_ragged_offset(vro)
+        o, _ = g.sdpa(
+            name="sdpa", q=tq, k=tk, v=tv, generate_stats=False, attn_scale=scale, use_causal_mask=True, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv
+        )
+        o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(q_stride))
+        o.set_ragged_offset(oro)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        _select_engine(g, engine_name())
+        g.check_support()
+        g.build_plans()
+        o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
+        vp = {tq: q_pk, tk: k_buf, tv: v_buf, o: o_buf, sq: slq, skv: slq, qro: ro_q, kro: ro_kv, vro: ro_kv, oro: ro_q}
+        g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+        torch.cuda.synchronize()
+        return o_buf
+
+    o_views = _graph_run(k_view, v_view, 2 * H * d)
+    o_packed = _graph_run(k_view.contiguous(), v_view.contiguous(), H * d)
+    assert torch.equal(o_views, o_packed), f"interleaved K/V views diverge from packed binding: max|diff|={(o_views - o_packed).abs().max().item()}"
 
 
 @pytest.mark.L1

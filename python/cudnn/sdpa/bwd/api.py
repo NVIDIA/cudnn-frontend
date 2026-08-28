@@ -288,6 +288,72 @@ class SdpabwdSm80(APIBase):
         return True
 
     # ------------------------------------------------------------------
+    def _needs_bshd_stage(self, desc) -> bool:
+        """Whether ``desc``'s BSHD transpose is non-contiguous — i.e. execute's
+        kernel-facing view would need a gather into staging."""
+        b, h, sq, d = desc.shape
+        expect = (sq * h * d, d, h * d, 1)  # BHSD-logical view of a compact BSHD buffer
+        return tuple(desc.stride) != expect
+
+    def scratch_workspace_bytes(
+        self,
+        *,
+        has_bias: Optional[bool] = None,
+        bias_batch: int = 1,
+        has_sink: bool = False,
+        deterministic: bool = False,
+        need_do_dot: bool = True,
+    ) -> int:
+        """Per-execute scratch requirement (issue #514): head-dim pad / BSHD
+        gather staging for Q/K/V/O/dO plus the kernel's internal scratch
+        (``bprop_f16_sm80.scratch_bytes``; the generic kernel's buffer set
+        covers the d64 fast path's). The feature flags must match what
+        execute() will be called with — the engine lowering passes its graph
+        facts; the default reads the constructor's ``has_bias``."""
+        self._ensure_support_checked()
+        from ..fwd.api_dsl import ws_align
+        from .kernels import bprop_f16_sm80 as _kmod
+
+        elem = 2  # fp16/bf16 — check_support admits no other input dtype
+        b, hq, sq, _ = self.q_desc.shape
+        _, hkv, skv, _ = self.k_desc.shape
+        fdqk, fdv = self.flavor_d_qk, self.flavor_d_v
+        pad_qk = self.head_dim_qk < fdqk
+        pad_v = self.head_dim_v < fdv
+        if has_bias is None:
+            has_bias = self.has_bias
+        total = 0
+        # Pad / gather staging, in execute()'s carve order (Q, K, V, O, dO).
+        for desc, s_len, hh, pad, fd in (
+            (self.q_desc, sq, hq, pad_qk, fdqk),
+            (self.k_desc, skv, hkv, pad_qk, fdqk),
+            (self.v_desc, skv, hkv, pad_v, fdv),
+            (self.o_desc, sq, hq, pad_v, fdv),
+            (self.do_desc, sq, hq, pad_v, fdv),
+        ):
+            if pad:
+                total += ws_align(b * s_len * hh * fd * elem)
+            elif self._needs_bshd_stage(desc):
+                total += ws_align(math.prod(desc.shape) * elem)
+        # Kernel-internal scratch at the PADDED (flavor) head dims.
+        total += _kmod.scratch_bytes(
+            B=b,
+            SQ=sq,
+            SKV=skv,
+            H=hq,
+            Hk=hkv,
+            d_qk=fdqk,
+            d_v=fdv,
+            io_bytes=elem,
+            deterministic=deterministic,
+            has_bias=bool(has_bias),
+            bias_batch=bias_batch,
+            has_sink=has_sink,
+            need_do_dot=need_do_dot,
+        )
+        return total
+
+    # ------------------------------------------------------------------
     def compile(self) -> None:
         """No-op — the kernel module owns its own per-shape ``lru_cache``;
         first ``execute()`` JITs and reuses thereafter."""
@@ -318,6 +384,7 @@ class SdpabwdSm80(APIBase):
         sinks: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
         deterministic: bool = False,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute (bwd)")
         if self._compiled_kernel is None:
@@ -326,19 +393,57 @@ class SdpabwdSm80(APIBase):
 
         kernel = _load_kernel_module()
 
-        # BHSD → BSHD for the kernel.
-        Q, K, V = _bshd(q_tensor), _bshd(k_tensor), _bshd(v_tensor)
-        O, dO = _bshd(o_tensor), _bshd(do_tensor)
+        # Per-execute scratch: carved from the caller's workspace when one is
+        # provided (the engine executor always passes one sized by
+        # scratch_workspace_bytes(); issue #514), otherwise allocated (the
+        # standalone wrapper paths).
+        carver = None
+        if workspace is not None:
+            from ..fwd.api_dsl import WorkspaceCarver
+
+            carver = WorkspaceCarver(
+                workspace,
+                self.scratch_workspace_bytes(
+                    has_bias=bias_tensor is not None,
+                    bias_batch=(bias_tensor.shape[0] if bias_tensor is not None else 1),
+                    has_sink=sinks is not None,
+                    deterministic=bool(deterministic),
+                ),
+                "SdpabwdSm80",
+            )
 
         pad_v = self.head_dim_v < self.flavor_d_v
         pad_qk = self.head_dim_qk < self.flavor_d_qk
-        if pad_qk:
-            Q = _pad_last_dim(Q, self.flavor_d_qk)
-            K = _pad_last_dim(K, self.flavor_d_qk)
-        if pad_v:
-            V = _pad_last_dim(V, self.flavor_d_v)
-            O = _pad_last_dim(O, self.flavor_d_v)
-            dO = _pad_last_dim(dO, self.flavor_d_v)
+
+        def _stage(t: torch.Tensor, pad: bool, fd: int) -> torch.Tensor:
+            """Kernel-facing BSHD view of BHSD-logical ``t``: zero-copy when the
+            transpose is contiguous, otherwise gathered (and head-dim padded)
+            into carved staging — or allocated when no workspace was given."""
+            view = t.transpose(1, 2)
+            d = view.shape[-1]
+            if pad:
+                if carver is not None:
+                    bb, ss, hh, _ = view.shape
+                    dst = carver.take(bb * ss * hh * fd, t.dtype).view(bb, ss, hh, fd)
+                    dst[..., :d].copy_(view)
+                    dst[..., d:].zero_()
+                    return dst
+                return _pad_last_dim(view.contiguous() if not view.is_contiguous() else view, fd)
+            if view.is_contiguous():
+                return view
+            if carver is not None:
+                dst = carver.take(t.numel(), t.dtype).view(view.shape)
+                dst.copy_(view)
+                return dst
+            return view.contiguous()
+
+        # BHSD → BSHD for the kernel, in scratch_workspace_bytes()'s sizing
+        # order (Q, K, V, O, dO).
+        Q = _stage(q_tensor, pad_qk, self.flavor_d_qk)
+        K = _stage(k_tensor, pad_qk, self.flavor_d_qk)
+        V = _stage(v_tensor, pad_v, self.flavor_d_v)
+        O = _stage(o_tensor, pad_v, self.flavor_d_v)
+        dO = _stage(do_tensor, pad_v, self.flavor_d_v)
 
         # Build the feature-kwarg superset; drop any the kernel doesn't accept.
         bw_kwargs = dict(
@@ -353,6 +458,8 @@ class SdpabwdSm80(APIBase):
             sinks=sinks,
             rope_freqs=rope_freqs,
             deterministic=bool(deterministic),
+            # Kernel-internal scratch: the unconsumed workspace tail (issue #514).
+            workspace=carver.remaining() if carver is not None else None,
         )
         # Route plain dense MHA d=64 calls to the dedicated perf kernel
         # (~2x faster on A100).  The gate must stay exhaustive: the d64
@@ -402,9 +509,10 @@ class SdpabwdSm80(APIBase):
         dv_tensor.copy_(dV_k.transpose(1, 2))
         if dbias_tensor is not None and dBias_k is not None:
             # dBias is head-major [., H, SQ, SKV] (like bias) — no transpose.
-            dbias_tensor.copy_(dBias_k.to(dbias_tensor.dtype))
+            # copy_ casts in place; a .to() would allocate a staging tensor.
+            dbias_tensor.copy_(dBias_k)
         if dsink_tensor is not None and dSink_k is not None:
-            dsink_tensor.copy_(dSink_k.to(dsink_tensor.dtype))
+            dsink_tensor.copy_(dSink_k)
         self._logger.debug("execute (bwd) completed")
 
 

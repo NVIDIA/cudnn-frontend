@@ -175,6 +175,15 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "sdpa fp8 backward with THD is not supported on Hopper architecture.");
 
+        // Pre-9.26 backward bug on ragged graphs with a sink token
+        auto const& sink_it  = attributes.inputs.find(input_names::SINK_TOKEN);
+        bool const has_sink  = (sink_it != attributes.inputs.end() && sink_it->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            is_ragged && has_sink && detail::get_backend_version() < 92600,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "SDPA backward with ragged offsets and a sink token requires cuDNN 9.26.0 or newer "
+            "(older versions hit an out-of-bounds read in the compute_dot_do_o pre-pass).");
+
         // validate basic dimension requirements
         if(prop_major >= 10) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 16 != 0)) && !(d_qk == 192 && d_v == 128),

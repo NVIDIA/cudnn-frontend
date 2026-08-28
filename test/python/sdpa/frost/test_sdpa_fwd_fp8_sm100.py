@@ -19,6 +19,7 @@ Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (fp8 SDPA). Skips otherw
 """
 
 import math
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -44,6 +45,27 @@ _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
 _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
+
+
+class _ReferenceWithStats(NamedTuple):
+    output: torch.Tensor
+    stats: torch.Tensor
+
+
+class _RunResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+
+
+class _RunWithStatsResult(NamedTuple):
+    output: torch.Tensor
+    reference: torch.Tensor
+    amax: float
+    reference_amax: float
+    stats: torch.Tensor
+    reference_stats: torch.Tensor
 
 
 def _quant(x, in_key):
@@ -79,14 +101,14 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         probs = torch.softmax(ext, dim=-1)
         o = torch.matmul(probs[..., :s_kv], v_e)
         if return_stats:
-            return o, torch.logsumexp(ext, dim=-1)
+            return _ReferenceWithStats(o, torch.logsumexp(ext, dim=-1))
         return o
     row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
     probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
     o = torch.matmul(probs, v_e)
     if return_stats:
-        return o, torch.logsumexp(scores, dim=-1)
+        return _ReferenceWithStats(o, torch.logsumexp(scores, dim=-1))
     return o
 
 
@@ -110,7 +132,9 @@ def _run(
     d_qk=128,
     d_v=128,
     pack_gqa=None,
+    stats_layout="contiguous",
     return_lse=False,
+    poison_tmem_before_execute: bool = False,
 ):
     import cudnn
 
@@ -127,7 +151,7 @@ def _run(
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
-    lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
+    lse = make_dense_stats(B, H_q, S_q, stats_layout)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -167,7 +191,7 @@ def _run(
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     if stats:
-        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -186,6 +210,14 @@ def _run(
     if stats:
         vp[stats_t] = lse
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    if poison_tmem_before_execute:
+        assert seq_lens_kv is not None
+        poison_vp = dict(vp)
+        poison_vp[v] = torch.full_like(Vb, float("nan"))
+        poison_vp[skv_h] = torch.full_like(slk, S_kv)
+        g.execute(poison_vp, ws)
+        torch.cuda.synchronize()
+        amax_o.zero_()
     if sync_debug:
         # Rule 3 pin: execute must not read the scale tensors (or anything
         # else) back to the host.
@@ -204,9 +236,9 @@ def _run(
     if return_lse:
         assert stats, "return_lse requires stats=True"
         o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, return_stats=True, **ref_kw)
-        return Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.view(B, H_q, S_q), lse_ref
+        return _RunWithStatsResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref)
     o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
-    return Ob, o_ref, amax_o.item(), o_ref.abs().max().item()
+    return _RunResult(Ob, o_ref, amax_o.item(), o_ref.abs().max().item())
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -222,8 +254,12 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
+def _half_atol(in_key):
+    return 7e-2 if in_key == "e5m2" else 5e-2
+
+
 def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
-    atol = 7e-2 if in_key == "e5m2" else 5e-2
+    atol = _half_atol(in_key)
     diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
         floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
@@ -243,6 +279,51 @@ _MASKS = {
     # diagonal_band_left_bound node param that the analyzer reads).
     "swa": dict(use_causal_mask=True, left_bound=65),
 }
+
+
+def _check_fp8_strided_stats(d_qk, d_v, in_key):
+    if torch.cuda.get_device_capability() == (10, 7) and d_qk != 128:
+        pytest.skip("SM107 per-tensor FP8 supports only d128")
+    kwargs = dict(
+        B=2,
+        H_q=4,
+        H_kv=2,
+        S_q=128,
+        S_kv=128,
+        in_key=in_key,
+        out_dt=torch.float16,
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d_qk,
+        d_v=d_v,
+        return_lse=True,
+    )
+    torch.manual_seed(59)
+    contiguous = _run(**kwargs, stats_layout="contiguous")
+    torch.manual_seed(59)
+    strided = _run(**kwargs, stats_layout="strided")
+    _check(strided.output, strided.reference, torch.float16, in_key, strided.amax, strided.reference_amax)
+    torch.testing.assert_close(strided.stats, contiguous.stats, rtol=0, atol=0)
+    torch.testing.assert_close(strided.stats, strided.reference_stats, rtol=3e-2, atol=_half_atol(in_key))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_fp8_strided_stats():
+    """The per-tensor FP8 L0 flavor preserves dense Stats strides."""
+    _check_fp8_strided_stats(128, 128, "e4m3")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("d_qk", "d_v", "in_key"),
+    [(128, 128, "e5m2"), (192, 128, "e4m3"), (192, 128, "e5m2")],
+    ids=["d128_e5m2", "d192_d128_e4m3", "d192_d128_e5m2"],
+)
+@torch_fork_set_rng(seed=59)
+def test_fp8_strided_stats_other_flavors(d_qk, d_v, in_key):
+    """The remaining per-tensor FP8 flavors preserve dense Stats strides."""
+    _check_fp8_strided_stats(d_qk, d_v, in_key)
 
 
 @pytest.mark.L0
@@ -314,25 +395,40 @@ def test_fp8_d192_d128_masks(mask):
 
 @_skip_on_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("in_key", "out_key", "with_sink"),
+    [
+        ("e4m3", "fp16", False),
+        ("e4m3", "e4m3", True),
+        ("e5m2", "fp16", True),
+    ],
+    ids=["e4m3-fp16-nosink", "e4m3-fp8-sink", "e5m2-fp16-sink"],
+)
 @torch_fork_set_rng(seed=0)
-def test_fp8_d192_d128_zero_length_kv():
-    """A zero-length KV batch must produce a finite zero output."""
+def test_fp8_d192_d128_leading_zero_length_kv(in_key: str, out_key: str, with_sink: bool):
+    """A leading zero-length KV batch must produce zero O and valid Stats."""
     scale = 1.0 / math.sqrt(192)
-    out, o_ref, a_o, a_o_ref = _run(
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    result = _run(
         2,
         8,
         8,
         256,
         256,
-        "e4m3",
-        torch.float16,
+        in_key,
+        _OUT[out_key],
         scale=scale,
         sdpa_kwargs={},
-        seq_lens_kv=[256, 0],
+        sink=sink,
+        seq_lens_kv=[0, 256],
         d_qk=192,
         d_v=128,
+        return_lse=True,
+        poison_tmem_before_execute=True,
     )
-    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    _check(result.output, result.reference, _OUT[out_key], in_key, result.amax, result.reference_amax)
+    assert (result.output[0] == 0).all()
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
@@ -613,7 +709,7 @@ def test_fp8_stats_less_zero_workspace(in_key):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False):
+def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False):
     """THD/varlen: packed [T,H,D] Q/K/V/O + per-operand ragged_offset + per-batch
     lengths (or their cu prefix-sum form).
 
@@ -731,6 +827,10 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
+    if declare_totals:
+        # Packed token totals: makes the THD extents exact instead of inferred
+        # from the bound buffers' capacity.
+        kw.update(max_total_seq_len_q=sum(seq_lens_q), max_total_seq_len_kv=sum(seq_lens_kv))
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
     o.set_output(True).set_dim([B, H_q, S_max_q, D]).set_stride(list(stride_q)).set_data_type(cudnn.data_type.HALF)
     o.set_ragged_offset(oro)
@@ -799,6 +899,28 @@ def _ref_lse(qd, kd, *, scale, causal, sinks=None):
         col = sinks.view(1, h_q, 1, 1).float().expand(1, h_q, s_q, 1).to(dev)
         scores = torch.cat([scores, col], dim=-1)
     return torch.logsumexp(scores, dim=-1)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_declared_totals():
+    """The FP8 THD path accepts ``sdpa_fp8(max_total_seq_len_q/kv=...)``.
+
+    A ragged graph cannot express its packed token total (dims stay
+    ``(B, H, S_max, D)`` with the starts in a device offset tensor), so the
+    execute path otherwise infers an upper bound from the bound buffers.
+    Declaring the totals binds exact extents; results must be unchanged."""
+    scale = 1.0 / math.sqrt(128)
+    seq_q, seq_kv = [200, 150], [200, 150]
+
+    def _run(declare):
+        torch.manual_seed(0)  # each call draws its own inputs -- pin them so the two runs are comparable
+        return _run_thd(seq_q, seq_kv, 8, 8, _INS[0], scale=scale, declare_totals=declare)
+
+    declared = _run(True)
+    inferred = _run(False)
+    _check(declared[0], declared[1], torch.float16, _INS[0], declared[2], declared[3])
+    assert torch.equal(declared[0], inferred[0]), "declaring the packed totals must not change O"
 
 
 @pytest.mark.L0

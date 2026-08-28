@@ -80,6 +80,7 @@ To add a new frontend-only API, follow these steps:
 - `Grouped Gemm + Wgrad`
 - `Block Sparse Attention (BSA)`
 - `Flex Attention`
+- `HSTU Attention (Blackwell SM100/SM103)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
 

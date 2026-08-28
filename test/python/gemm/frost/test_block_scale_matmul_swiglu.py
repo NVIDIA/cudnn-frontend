@@ -470,8 +470,8 @@ def test_dual_block_scale_matmul_reduction_rejects_int32():
 @pytest.mark.parametrize(
     "config_name",
     [
-        "CONFIG_sm107_128x128x128_128x128x64_cluster1x1_1ctamma",
-        "CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma",
     ],
 )
 def test_sm107_dual_block_scale_matmul_numerics(combo, config_name):
@@ -484,4 +484,4 @@ def test_sm107_dual_block_scale_matmul_numerics(combo, config_name):
 @requires_sm107
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
 def test_sm107_dual_block_scale_matmul_swiglu_quant_epilogue(combo):
-    test_dual_block_scale_matmul_swiglu_quant_epilogue(combo, "CONFIG_sm107_128x128x128_128x128x64_cluster1x1_1ctamma")
+    test_dual_block_scale_matmul_swiglu_quant_epilogue(combo, "CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma")

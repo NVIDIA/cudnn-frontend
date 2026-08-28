@@ -21,58 +21,69 @@ _MARKER = re.compile(r"^[ \t]*# *@@EPILOGUE_(SETUP|DRAIN):(BEGIN|END)@@[ \t]*$")
 # Groups the region must be identical within. A template must appear in exactly
 # one group per region; adding a template makes the completeness test fail until
 # its group is declared here.
+# Entries are (template file, cta_group). A merged template serves both MMA
+# modes from one file, so it appears once per mode -- the region compared is the
+# one left after its @@CTA{1,2}_ONLY@@ blocks resolve.
 _PLAIN_1 = [
-    "sm100_matmul_1ctamma.py",
-    "sm100_matmul_mainloop_1ctamma.py",
+    ("sm100_matmul.py", 1),
+    ("sm100_matmul_mainloop.py", 1),
 ]
 _PLAIN_2 = [
-    "sm100_matmul_2ctamma.py",
-    "sm100_matmul_mainloop_2ctamma.py",
+    ("sm100_matmul.py", 2),
+    ("sm100_matmul_mainloop.py", 2),
 ]
 _BS_1 = [
-    "sm100_block_scale_matmul_1ctamma.py",
-    "sm103_block_scale_matmul_1ctamma.py",
-    "sm107_block_scale_matmul_1ctamma.py",
+    ("sm100_block_scale_matmul.py", 1),
+    ("sm103_block_scale_matmul.py", 1),
 ]
 _BS_2 = [
-    "sm100_block_scale_matmul_2ctamma.py",
-    "sm103_block_scale_matmul_2ctamma.py",
-    "sm107_block_scale_matmul_2ctamma.py",
+    ("sm100_block_scale_matmul.py", 2),
+    ("sm103_block_scale_matmul.py", 2),
 ]
-_MOE_PLAIN_1 = ["sm100_moe_grouped_matmul_fwd_1ctamma.py"]
-_MOE_PLAIN_2 = ["sm100_moe_grouped_matmul_fwd_2ctamma.py"]
+_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1)]
+_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2)]
 _MOE_BS_1 = [
-    "sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
-    "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
+    ("sm100_moe_grouped_block_scale_matmul_fwd.py", 1),
 ]
 _MOE_BS_2 = [
-    "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
-    "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
+    ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
 ]
 
-# SETUP (LDTM shape + row base + span list) depends only on cta_group and on
-# whether the pipeline is block-scaled, so MoE joins its family.
+# sm120 is warp-scoped MMA: the accumulators are already in registers, so there
+# is no LDTM shape, no TMEM row base and no span list to share -- and its store
+# is transposed-STG only. It shares no epilogue region with the tcgen05
+# families, so it is its own family here rather than a member of one.
+_SM120 = [("sm120_matmul.py", 1)]
+
+# SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which
+# the compiler hands down as `epi_packed_lanes` / `epi_dp22` -- not on the MMA
+# mode. The plain pipeline is on that form, so it has ONE setup for both modes.
+# MoE has not been moved onto it yet and keeps a group per mode; block-scale has
+# no hardware-M=64 arm at all (validate_block_scale_config rejects
+# mma_inst_m % 128 != 0), so its two modes never differed here.
 _SETUP_GROUPS = {
-    "1ctamma": _PLAIN_1 + _MOE_PLAIN_1,
-    "2ctamma": _PLAIN_2 + _MOE_PLAIN_2,
+    "plain": _PLAIN_1 + _PLAIN_2,
+    "moe_1ctamma": _MOE_PLAIN_1,
+    "moe_2ctamma": _MOE_PLAIN_2,
     "block_scale_1ctamma": _BS_1 + _MOE_BS_1,
     "block_scale_2ctamma": _BS_2 + _MOE_BS_2,
+    "sm120": _SM120,
 }
 
 # DRAIN additionally splits on MoE: no TMA-store half, no mixed CGA, and the
 # store is bounded by the routed group rather than by M.
 _DRAIN_GROUPS = {
-    "1ctamma": _PLAIN_1,
-    "2ctamma": _PLAIN_2,
+    "plain": _PLAIN_1 + _PLAIN_2,
     "block_scale_1ctamma": _BS_1,
     "block_scale_2ctamma": _BS_2,
     "moe_1ctamma": _MOE_PLAIN_1,
     "moe_2ctamma": _MOE_PLAIN_2,
     "moe_block_scale_1ctamma": _MOE_BS_1,
     "moe_block_scale_2ctamma": _MOE_BS_2,
+    "sm120": _SM120,
 }
 
-_BLOCK_SCALE = set(_BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2)
+_BLOCK_SCALE = {f for f, _ in _BS_1 + _BS_2 + _MOE_BS_1 + _MOE_BS_2}
 
 
 def _template_dir():
@@ -85,8 +96,31 @@ def _templates():
     return sorted(p for p in _template_dir().glob("sm*.py"))
 
 
-def _region(path, name):
-    """The marked region's text, dedented (MoE nests one level deeper)."""
+_IMPLIED_GROUP = re.compile(r"_([12])ctamma\.py$")
+
+
+def _template_variants():
+    """(path, cta_group, source) for every MMA mode a template serves.
+
+    A merged template renders one kernel per mode, so a per-template invariant
+    has to hold for each of them separately."""
+    for path in _templates():
+        src = path.read_text()
+        m = _IMPLIED_GROUP.search(path.name)
+        if m is not None:
+            groups = (int(m.group(1)),)
+        else:
+            # A merged template says so itself: it switches on cta_group.
+            groups = (1, 2) if "cutlass.const_expr(cta_group " in src else (1,)
+        for cta_group in groups:
+            yield path, cta_group, src
+
+
+def _region(path, name, cta_group=1):
+    """The marked region's text, dedented (MoE nests one level deeper).
+
+    ``cta_group`` selects which mode a merged template is compared as; the text
+    itself is mode-agnostic, so it only picks the group the region belongs to."""
     src = path.read_text().splitlines(keepends=True)
     begin = end = None
     for i, line in enumerate(src):
@@ -110,13 +144,14 @@ def _diff(name_a, text_a, name_b, text_b):
 
 @pytest.mark.parametrize("region,groups", [("SETUP", _SETUP_GROUPS), ("DRAIN", _DRAIN_GROUPS)])
 def test_every_template_is_assigned_to_exactly_one_group(region, groups):
-    declared = [f for names in groups.values() for f in names]
-    assert len(declared) == len(set(declared)), f"{region}: a template is in two groups"
+    declared = [entry for names in groups.values() for entry in names]
+    assert len(declared) == len(set(declared)), f"{region}: a (template, cta_group) is in two groups"
     on_disk = {p.name for p in _templates()}
-    assert set(declared) == on_disk, (
+    declared = {f for f, _ in declared}
+    assert declared == on_disk, (
         f"{region} group table is out of date -- declare the group of every template.\n"
-        f"  missing from the table: {sorted(on_disk - set(declared))}\n"
-        f"  no longer on disk:      {sorted(set(declared) - on_disk)}"
+        f"  missing from the table: {sorted(on_disk - declared)}\n"
+        f"  no longer on disk:      {sorted(declared - on_disk)}"
     )
 
 
@@ -126,31 +161,41 @@ def test_every_template_is_assigned_to_exactly_one_group(region, groups):
 )
 def test_the_region_is_identical_within_its_group(region, group):
     names = (_SETUP_GROUPS if region == "SETUP" else _DRAIN_GROUPS)[group]
+    if {n for n, _ in names} <= _STANDALONE:
+        pytest.skip(f"{group} is a family of one -- it shares no region to compare")
     d = _template_dir()
-    ref_name = names[0]
-    ref = _region(d / ref_name, region)
+    ref_name, ref_group = names[0]
+    ref = _region(d / ref_name, region, ref_group)
     assert ref.strip(), f"{ref_name}: empty {region} region"
-    for name in names[1:]:
-        got = _region(d / name, region)
+    for name, cta_group in names[1:]:
+        got = _region(d / name, region, cta_group)
         assert got == ref, (
-            f"{region} region of {name} has drifted from its group '{group}'.\n"
+            f"{region} region of {name} (cta_group={cta_group}) has drifted from its group '{group}'.\n"
             f"A new epilogue feature lands in EVERY template of the group, in the same shape.\n" + _diff(ref_name, ref, name, got)
         )
 
 
-def test_the_packed_ldtm_arm_keys_on_the_hardware_mma_m():
+def test_the_packed_ldtm_arm_keys_on_the_drain_layout():
     """foot-gun #18: a 2-CTA cluster-MMA m=128 tile also has
     epi_rows_per_mma_m == 64, but must NOT take the packed 16x32bx2 path --
-    keying the LDTM shape on it is a silent miscompute, not a fault."""
+    keying the LDTM shape on it is a silent miscompute, not a fault.
+
+    Two spellings are correct: `epi_packed_lanes`, the condition computed once
+    host-side (compiler._epi_packed_lanes = mma_inst_m == 64 and cta_group == 1),
+    and `mma_inst_shape_mnk[0] == 64`, the hardware M -- equivalent in a template
+    that serves one mode. `epi_rows_per_mma_m` is the per-CTA M and is the one
+    that must never appear here."""
+    ok = ("epi_packed_lanes", "mma_inst_shape_mnk[0] == 64")
     offenders = []
     for path in _templates():
-        for i, line in enumerate(path.read_text().splitlines(), 1):
+        lines = path.read_text().splitlines()
+        for i, line in enumerate(lines, 1):
             if "SHAPE_16X32BX2" not in line:
                 continue
-            window = path.read_text().splitlines()[max(0, i - 3) : i]
-            if not any("mma_inst_shape_mnk[0] == 64" in w for w in window):
+            window = lines[max(0, i - 3) : i]
+            if not any(tok in w for w in window for tok in ok):
                 offenders.append(f"{path.name}:{i}")
-    assert not offenders, "packed LDTM shape not guarded by the HARDWARE MMA M:\n  " + "\n  ".join(offenders)
+    assert not offenders, "packed LDTM shape guarded by neither epi_packed_lanes nor the hardware MMA M:\n  " + "\n  ".join(offenders)
 
 
 def test_block_scale_templates_carry_no_m64_path():
@@ -168,7 +213,7 @@ def test_the_retired_fixed_width_drain_name_is_gone():
 
 
 def test_cols_per_acc_stage_has_one_meaning():
-    """It briefly named two different quantities: `num_mma_m * epi_cols_per_mma_m`
+    """It briefly named two different quantities: `mma_size_m * epi_cols_per_mma_m`
     in the plain pipeline and `epi_cols_per_mma_m` in block-scale."""
     bad_def, bad_use = [], []
     for path in _templates():
@@ -178,10 +223,10 @@ def test_cols_per_acc_stage_has_one_meaning():
         if path.name in _BLOCK_SCALE:
             bad_use.append(path.name)
             continue
-        if "cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m" not in src:
+        if "cols_per_acc_stage = mma_size_m * epi_cols_per_mma_m" not in src:
             bad_def.append(path.name)
     assert not bad_use, f"block-scale means epi_cols_per_mma_m -- say so: {bad_use}"
-    assert not bad_def, f"cols_per_acc_stage must be num_mma_m * epi_cols_per_mma_m: {bad_def}"
+    assert not bad_def, f"cols_per_acc_stage must be mma_size_m * epi_cols_per_mma_m: {bad_def}"
 
 
 def test_the_overlap_arm_never_indexes_the_span_list():
@@ -204,8 +249,9 @@ def test_the_markers_do_not_break_the_template_parse():
         ast.parse(path.read_text())
 
 
-_MIXED_CGA = set(_PLAIN_1 + _PLAIN_2 + _BS_1 + _BS_2)
-_MOE = set(_MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2)
+_MIXED_CGA = {f for f, _ in _PLAIN_1 + _PLAIN_2 + _BS_1 + _BS_2}
+_MOE = {f for f, _ in _MOE_PLAIN_1 + _MOE_PLAIN_2 + _MOE_BS_1 + _MOE_BS_2}
+_STANDALONE = {f for f, _ in _SM120}
 
 
 def _call_endswith(node, suffix):
@@ -239,9 +285,11 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
 
     expected_identity = _expr_dump("tile_swizzle_n == 1")
     offenders = []
-    for path in _templates():
-        tree = ast.parse(path.read_text())
+    for path, cta_group, src in _template_variants():
+        tree = ast.parse(src)
         calls = [node for node in ast.walk(tree) if _call_endswith(node, "_l2_swizzle_tile")]
+        if path.name in _STANDALONE:
+            continue  # its own in-file raster; no mixed CGA to specialize for
         if path.name not in _MIXED_CGA:
             if calls:
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
@@ -249,7 +297,7 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
 
         expected_count = 4 if path.name.startswith("sm103_") else 3
         if len(calls) != expected_count:
-            offenders.append(f"{path.name}: expected {expected_count} L2-swizzle calls, found {len(calls)}")
+            offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:
             identities = [keyword.value for keyword in call.keywords if keyword.arg == "identity"]
             if len(identities) != 1 or ast.dump(identities[0], include_attributes=False) != expected_identity:
@@ -263,13 +311,12 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
     tile/K loops.  Pin both the full template inventory and the root shape so
     deleting a build cannot make the no-build-in-a-loop check pass vacuously."""
 
-    paths = _templates()
-    assert {path.name for path in paths} == _MIXED_CGA | _MOE
+    assert {path.name for path in _templates()} == _MIXED_CGA | _MOE | _STANDALONE
     total_builds = 0
     total_expected = 0
     offenders = []
-    for path in paths:
-        tree = ast.parse(path.read_text())
+    for path, _cta_group, src in _template_variants():
+        tree = ast.parse(src)
         parents = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
@@ -277,13 +324,19 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
 
         builds = [node for node in ast.walk(tree) if _call_endswith(node, "Tcgen05SmemDesc.build")]
         total_builds += len(builds)
-        if path.name in _BLOCK_SCALE:
+        if path.name in _STANDALONE:
+            # warp-scoped MMA reads SMEM through ldmatrix, not an SMEM descriptor.
+            expected_bases = []
+        elif path.name in _BLOCK_SCALE:
             expected_bases = sorted(("smem_a_list[i]", "smem_b_list[j]", "smem_sfa_list[i]", "smem_sfb_list[j]"))
         elif "mainloop" in path.name:
             expected_bases = ["smem_a", "smem_b"]
         else:
             expected_bases = ["smem_a_list[i]", "smem_b_list[j]"]
-        total_expected += len(expected_bases)
+        # The MoE ctamma merge left the MMA warp arm-split -- the 2-CTA arm's
+        # pair leader carries its own copy of the roots -- so those templates
+        # hold one full set per MMA mode. Everything else unified to one.
+        total_expected += len(expected_bases) * (2 if path.name in _MOE else 1)
 
         actual_bases = []
         for build in builds:
@@ -302,6 +355,8 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
             if in_runtime_loop or not target_names or not all("root" in name for name in target_names):
                 offenders.append(f"{path.name}:{build.lineno}")
 
+        if path.name in _MOE:
+            expected_bases = sorted(expected_bases * 2)
         if sorted(actual_bases) != expected_bases:
             offenders.append(f"{path.name}: descriptor bases {sorted(actual_bases)!r}, expected {expected_bases!r}")
 
@@ -312,6 +367,8 @@ def test_every_template_hoists_its_complete_smem_descriptor_inventory():
                 "desc_sfa_roots": {"mma_sf_stage"},
                 "desc_sfb_roots": {"mma_sf_stage"},
             }
+        elif path.name in _STANDALONE:
+            expected_root_stages = {}
         else:
             expected_root_stages = {
                 ("desc_a_root" if "mainloop" in path.name else "desc_a_roots"): {"stage"},
@@ -465,8 +522,7 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
     that the backend eliminates the selected shift SSA in PTX or SASS.
     """
 
-    paths = _templates()
-    actual_mixed = {path.name for path in paths if "fallback_cluster_shape_mnk" in path.read_text()}
+    actual_mixed = {path.name for path in _templates() if "fallback_cluster_shape_mnk" in path.read_text()}
     assert actual_mixed == _MIXED_CGA
 
     preferred_guard = _expr_dump("any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in cluster_shape_mnk[:2])")
@@ -483,10 +539,10 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
     }
     live_cluster_names = {"cluster_m", "cluster_n", "cluster_size", "cdim_x", "cdim_y"}
     offenders = []
-    for path in paths:
+    for path, cta_group, src in _template_variants():
         if path.name not in _MIXED_CGA:
             continue
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(src)
         guarded_tests = {
             ast.dump(statement.test, include_attributes=False)
             for statement in tree.body
@@ -585,7 +641,13 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
             site="A multicast slices",
             offenders=offenders,
         )
-        b_shift_adjust = " - 1" if "2ctamma" in path.name else ""
+        # The MMA pair consumes one factor of two of cluster_m, so B's slice count
+        # shifts one less. A template that serves both modes spells that as the
+        # host constant; a single-mode one folds it to a literal.
+        if "_cta_group_shift" in src:
+            b_shift_adjust = " - _cta_group_shift"
+        else:
+            b_shift_adjust = " - 1" if cta_group == 2 else ""
         _check_preferred_fallback_pair(
             path=path,
             kernel=kernel,

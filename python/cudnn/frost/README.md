@@ -810,6 +810,6 @@ Asserts:
     frontend-integration test that it appears in `graph.plans` and runs when
     pinned. Mark test modules `pytest.mark.L0` -- the default pytest addopts
     is `-m L0` and unmarked tests silently never run. Run
-    `ci/run_style_check_diff.sh --apply` (black, 160 cols) before pushing.
+    `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
