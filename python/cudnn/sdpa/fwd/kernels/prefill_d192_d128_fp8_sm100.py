@@ -180,6 +180,24 @@ def _exp2_emulated_scalar(x):
     return value
 
 
+@cute.jit
+def _apply_padding_mask_if_needed(reg_s, kv_col_base, eff_seqlen_kv, mask_value: cutlass.Constexpr[float]):
+    """Apply the per-element padding predicate only to a partial KV chunk."""
+    result = reg_s
+    if kv_col_base + cutlass.Int32(int(reg_s.shape[0])) > eff_seqlen_kv:
+        result = apply_mask_chunk(
+            reg_s,
+            cutlass.Int32(0),
+            kv_col_base,
+            eff_seqlen_kv,
+            0,
+            MASK_PADDED,
+            N=int(reg_s.shape[0]),
+            mask_value=mask_value,
+        )
+    return result
+
+
 # Sink-seeded maxima shift the quantized-P trajectory. E4M3 keeps the first
 # real-KV max for every output; E5M2 does so only for wide outputs because its
 # FP8-output path is more accurate with the sink-seeded max.
@@ -1461,6 +1479,7 @@ def _mma_warp_group(
 @cute.jit
 def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
+    may_need_padding: cutlass.Constexpr[bool],
     sub_tile_id: cutlass.Constexpr[int],
     kv_loop,
     is_first_real_kv,
@@ -1518,6 +1537,8 @@ def _softmax_kv_body(
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+        mask_value = float("-inf") if CFG.HAS_SINK else -3.4028235e38
+        chunk_mask_flags = CFG.MASK_FLAGS & ~MASK_PADDED if CFG.MASK_FLAGS & MASK_SWA else CFG.MASK_FLAGS
         chunks_S = [
             apply_mask_chunk(
                 raw_chunks[c],
@@ -1525,15 +1546,25 @@ def _softmax_kv_body(
                 cutlass.Int32(0),
                 eff_seqlen_kv - (kv_col_base + cutlass.Int32(c * CHUNK)),
                 CFG.WINDOW_LEFT,
-                CFG.MASK_FLAGS,
+                chunk_mask_flags,
                 N=CHUNK,
                 bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
-                mask_value=float("-inf") if CFG.HAS_SINK else -3.4028235e38,
+                mask_value=mask_value,
                 window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
         ]
+        if cutlass.const_expr(may_need_padding and (CFG.MASK_FLAGS & MASK_PADDED) and (CFG.MASK_FLAGS & MASK_SWA)):
+            chunks_S = [
+                _apply_padding_mask_if_needed(
+                    chunks_S[c],
+                    kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    mask_value,
+                )
+                for c in range(N_CHUNKS)
+            ]
         chunks_max = [row_max_reduction(chunks_S[c]) for c in range(N_CHUNKS)]
         reg_S_vec = vec_concat(chunks_S)
         current_max_unscaled = chunks_max[0]
@@ -1758,6 +1789,7 @@ def _softmax_warp_group(
                 bmm1_phase = bmm1_phase ^ 1
                 total_max, total_sum, inplace_phase = _softmax_kv_body(
                     False,
+                    False,
                     sub_tile_id,
                     kv_loop,
                     kv_loop == bounds.left,
@@ -1783,6 +1815,7 @@ def _softmax_warp_group(
                 bmm1_phase = bmm1_phase ^ 1
                 total_max, total_sum, inplace_phase = _softmax_kv_body(
                     True,
+                    False,
                     sub_tile_id,
                     kv_loop,
                     kv_loop == bounds.left,
@@ -1807,6 +1840,7 @@ def _softmax_warp_group(
                 bmm1_phase = bmm1_phase ^ 1
                 total_max, total_sum, inplace_phase = _softmax_kv_body(
                     False,
+                    False,
                     sub_tile_id,
                     kv_loop,
                     kv_loop == bounds.left,
@@ -1830,6 +1864,7 @@ def _softmax_warp_group(
                 _wait_mbarrier(bars.mb_bmm1_done[sub_tile_id], bmm1_phase)
                 bmm1_phase = bmm1_phase ^ 1
                 total_max, total_sum, inplace_phase = _softmax_kv_body(
+                    True,
                     True,
                     sub_tile_id,
                     kv_loop,
