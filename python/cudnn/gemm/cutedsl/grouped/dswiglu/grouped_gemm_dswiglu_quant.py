@@ -2580,7 +2580,7 @@ class BlockScaledContiguousGroupedGemmKernel:
                 # Note, it always assumes T2R_M/EPI_M is 1, otherwise it will break the result.
                 #
                 mPosition = tile_info[0] * self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape) + tidx
-                mProb = prob[mPosition, 0, 0]
+                mProb = prob[mPosition, 0, 0].to(cutlass.Float32)
                 if cutlass.const_expr(self.generate_dprob):
                     dProbVal = cutlass.Float32(0.0)
 

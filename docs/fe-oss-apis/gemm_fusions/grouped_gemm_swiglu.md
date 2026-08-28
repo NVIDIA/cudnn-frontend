@@ -340,6 +340,24 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 - `C`, `D`, and `D_col` must be **N-major** (contiguous along N dimension)
 - All tensors must be **16-byte aligned** along the contiguous dimension
 
+### Canonical layouts (additive)
+
+Each input is also accepted in its natural row-major form, normalized internally;
+the pre-permuted kernel-facing forms above keep working unchanged:
+
+- `A`: `(valid_m, K)` row-major
+- `B`: `(L, N, K)` C-contiguous
+- `SFA`/`SFB`: any dense C-contiguous buffer with the MMA-tiled element count,
+  e.g. flat 1-D or the physical `(L, ceil(mn/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)`
+  allocation — no `.view().permute()` gymnastics required. The kernel rebuilds the
+  MMA-tiled SF layouts from the GEMM shapes and reads only the base pointer.
+- `prob`: `(valid_m,)`, `float32` or `bfloat16`
+- `alpha_tensor` may be omitted (defaults to cached ones)
+
+When `A` is canonical (2-D), the wrapper returns natural-shaped outputs:
+`c (valid_m, N)`, `d`/`d_col (valid_m, N/2)` row-major, and `sfd_row`/`sfd_col` as
+C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
+
 ### Data Types
 
 #### Input/Weight Types (ab_dtype)

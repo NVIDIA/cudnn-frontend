@@ -2311,7 +2311,7 @@ class BlockScaledContiguousGroupedGemmKernel:
                 #
                 if cutlass.const_expr(prob is not None):
                     mPosition = tile_info[0] * self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape) + tidx
-                    mProb = prob[mPosition, 0, 0]
+                    mProb = prob[mPosition, 0, 0].to(cutlass.Float32)
                 else:
                     mProb = cutlass.Float32(1.0)
 
