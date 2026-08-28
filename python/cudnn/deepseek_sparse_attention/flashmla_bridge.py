@@ -19,9 +19,10 @@ BF16, one flat MQA KV stream, QK dimension 512 or 576, V dimension 512, and
 16/32/64/128 query heads.  FlashMLA itself launches 64- or 128-head kernels, so smaller
 cuDNN backward head counts are zero-padded to 64 for forward and sliced back
 before returning.  KV and aligned raw-forward Top-K inputs use zero-copy
-singleton-head views.  The training and score-recompute paths materialize
-safety-normalized indices because FlashMLA's invalid-index contract is wider
-than the current cuDNN backward contract.
+singleton-head views.  Safe-default training and score-recompute calls
+materialize safety-normalized indices because FlashMLA's invalid-index
+contract is wider than the current cuDNN backward contract.  Training callers
+with an explicitly trusted compact producer may bypass that metadata work.
 """
 
 from __future__ import annotations
@@ -299,6 +300,7 @@ def _normalize_cudnn_sparse_metadata(
     topk_length: Optional[torch.Tensor],
     s_kv: int,
     *,
+    trusted_compact_metadata: bool = False,
     _compactify: Optional[Callable[[torch.Tensor], Any]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Make FlashMLA metadata safe for cuDNN backward and recompute.
@@ -315,7 +317,18 @@ def _normalize_cudnn_sparse_metadata(
     envelope before masking.  An asynchronous device assert would poison the
     CUDA context on failure, while a strict host check would synchronize the
     hot path; clamping gives the downstream kernels a memory-safe contract.
+
+    ``trusted_compact_metadata`` is the explicit zero-work normalization
+    alternative for a producer that already satisfies the narrower cuDNN
+    backward contract.  Later launch preparation can still pad an unaligned
+    Top-K or make metadata contiguous where the downstream kernel requires it.
     """
+
+    if trusted_compact_metadata:
+        # This is an explicit caller contract, not a property inferred from
+        # device data.  Inspecting the values here would either synchronize or
+        # launch the same metadata kernels this fast path exists to avoid.
+        return indices, topk_length
 
     normalized = _mask_invalid_sparse_indices(indices, topk_length, s_kv)
     if topk_length is None:
@@ -360,6 +373,32 @@ def _validate_flashmla_outputs(
     return output, max_logits, lse
 
 
+def _launch_flashmla_sparse_forward(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    plan: FlashMLASparseForwardPlan,
+    scale: float,
+    sparse_fwd: Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> TupleDict:
+    """Launch a dependency and contract that the caller already validated."""
+
+    launch = _prepare_flashmla_launch_inputs(q, kv, indices, attn_sink, topk_length, plan)
+    outputs = sparse_fwd(
+        launch.q,
+        launch.kv,
+        launch.indices,
+        sm_scale=scale,
+        d_v=plan.value_dim,
+        attn_sink=launch.attn_sink,
+        topk_length=launch.topk_length,
+    )
+    output, max_logits, lse = _validate_flashmla_outputs(outputs, launch)
+    return TupleDict(output=output, max_logits=max_logits, lse=lse)
+
+
 def _run_flashmla_sparse_forward(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -375,18 +414,17 @@ def _run_flashmla_sparse_forward(
     # device guard so a multi-GPU caller does not accidentally route by another
     # device or enqueue adapter work on another device's current stream.
     with torch.cuda.device(q.device):
-        launch = _prepare_flashmla_launch_inputs(q, kv, indices, attn_sink, topk_length, plan)
-        outputs = sparse_fwd(
-            launch.q,
-            launch.kv,
-            launch.indices,
-            sm_scale=scale,
-            d_v=plan.value_dim,
-            attn_sink=launch.attn_sink,
-            topk_length=launch.topk_length,
+        result = _launch_flashmla_sparse_forward(
+            q,
+            kv,
+            indices,
+            attn_sink,
+            topk_length,
+            plan,
+            scale,
+            sparse_fwd,
         )
-        output, max_logits, lse = _validate_flashmla_outputs(outputs, launch)
-    return TupleDict(output=output, max_logits=max_logits, lse=lse), scale
+    return result, scale
 
 
 def flashmla_sparse_forward_wrapper(
@@ -414,14 +452,28 @@ def flashmla_sparse_forward_wrapper(
 
 class _FlashMLACudnnSparseAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, indices, attn_sink, topk_length, softmax_scale):
-        _validate_flashmla_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
+    def forward(ctx, q, kv, indices, attn_sink, topk_length, softmax_scale, trusted_compact_metadata):
+        plan, scale = _validate_flashmla_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
         # Fail before launching metadata-normalization kernels when the
         # optional external forward is absent or incompatible.
-        _resolve_flashmla_sparse_fwd()
+        sparse_fwd = _resolve_flashmla_sparse_fwd()
         with torch.cuda.device(q.device):
-            safe_indices, safe_topk_length = _normalize_cudnn_sparse_metadata(indices, topk_length, kv.shape[0])
-            result, scale = _run_flashmla_sparse_forward(q, kv, safe_indices, attn_sink, safe_topk_length, softmax_scale)
+            safe_indices, safe_topk_length = _normalize_cudnn_sparse_metadata(
+                indices,
+                topk_length,
+                kv.shape[0],
+                trusted_compact_metadata=trusted_compact_metadata,
+            )
+            result = _launch_flashmla_sparse_forward(
+                q,
+                kv,
+                safe_indices,
+                attn_sink,
+                safe_topk_length,
+                plan,
+                scale,
+                sparse_fwd,
+            )
         output, max_logits, lse = result
         ctx.softmax_scale = scale
         ctx.has_topk_length = safe_topk_length is not None
@@ -436,7 +488,7 @@ class _FlashMLACudnnSparseAttention(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, dout, _dmax_logits, _dlse):
         if dout is None:
-            return (None,) * 6
+            return (None,) * 7
         saved = ctx.saved_tensors
         q, kv, output, lse, attn_sink, indices = saved[:6]
         topk_length = saved[6] if ctx.has_topk_length else None
@@ -465,6 +517,7 @@ class _FlashMLACudnnSparseAttention(torch.autograd.Function):
             result["d_sink"] if needs[3] else None,
             None,
             None,
+            None,
         )
 
 
@@ -475,6 +528,7 @@ def flashmla_cudnn_sparse_attention_wrapper(
     attn_sink: torch.Tensor,
     softmax_scale: Optional[float] = None,
     topk_length: Optional[torch.Tensor] = None,
+    trusted_compact_metadata: bool = False,
 ) -> TupleDict:
     """Training bridge: external FlashMLA forward plus cuDNN DSA backward.
 
@@ -485,11 +539,30 @@ def flashmla_cudnn_sparse_attention_wrapper(
     invalid indices are normalized to the current cuDNN backward contract;
     with ``topk_length``, valid active entries are compacted and a safe length
     is derived.  Forward and backward therefore consume identical metadata.
+
+    Set ``trusted_compact_metadata=True`` only when the producer guarantees
+    that every active-prefix index is in ``[0, S_kv)`` and every length is in
+    ``[0, K]``.  Without lengths, every nonnegative index must be below
+    ``S_kv``.  The explicit fast path skips the device scan, mask, and
+    compactification.  FlashMLA Top-K alignment padding and a downstream
+    kernel's required contiguous copy can still occur; violating the trusted
+    contract can cause an illegal memory access in the tuned cuDNN backward
+    kernel.
     """
 
     if attn_sink is None:
         raise ValueError("attn_sink is required by the cuDNN DSA training backward")
-    output, max_logits, lse = _FlashMLACudnnSparseAttention.apply(q, kv, indices, attn_sink, topk_length, softmax_scale)
+    if not isinstance(trusted_compact_metadata, bool):
+        raise TypeError("trusted_compact_metadata must be a bool, got " f"{type(trusted_compact_metadata).__name__}")
+    output, max_logits, lse = _FlashMLACudnnSparseAttention.apply(
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        softmax_scale,
+        trusted_compact_metadata,
+    )
     return TupleDict(output=output, max_logits=max_logits, lse=lse)
 
 

@@ -169,6 +169,35 @@ def test_flashmla_training_metadata_masks_compacts_and_bounds_lengths():
     assert torch.equal(safe_length, torch.tensor([3, 2, 0], dtype=torch.int32))
 
 
+def test_flashmla_training_trusted_compact_metadata_is_identity_fast_path():
+    indices = torch.tensor([[4, 3, 2, 1, 0]], dtype=torch.int32)
+    lengths = torch.tensor([5], dtype=torch.int32)
+
+    def must_not_compact(_normalized):
+        pytest.fail("trusted compact metadata must not launch compactification")
+
+    safe_indices, safe_length = bridge._normalize_cudnn_sparse_metadata(
+        indices,
+        lengths,
+        s_kv=5,
+        trusted_compact_metadata=True,
+        _compactify=must_not_compact,
+    )
+    assert safe_indices is indices
+    assert safe_length is lengths
+
+
+def test_flashmla_training_trusted_compact_metadata_requires_bool():
+    with pytest.raises(TypeError, match="trusted_compact_metadata must be a bool"):
+        bridge.flashmla_cudnn_sparse_attention_wrapper(
+            None,
+            None,
+            None,
+            object(),
+            trusted_compact_metadata=1,
+        )
+
+
 def _require_b200_flashmla():
     if not torch.cuda.is_available():
         pytest.skip("exact NVIDIA B200 and official FlashMLA required")
@@ -311,6 +340,7 @@ def test_flashmla_cudnn_deepseek_v32_h128_d576_k2048_contract():
         sink,
         softmax_scale=scale,
         topk_length=lengths,
+        trusted_compact_metadata=True,
     )
     dout = torch.randn_like(result["output"])
     result["output"].backward(dout)

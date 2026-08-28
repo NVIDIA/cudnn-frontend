@@ -136,6 +136,14 @@ and score paths must first safety-normalize indices because FlashMLA accepts
 high invalid sentinels that current cuDNN backward cannot address safely.
 For training with lengths, valid active entries are compacted and a safe
 length is derived; without lengths, every invalid sentinel becomes `-1`.
+This safe default launches metadata work. Producers that already emit a
+compact, bounded active prefix can opt into `trusted_compact_metadata=True`:
+every active index must then satisfy `0 <= index < S_kv`, every length must be
+in `[0, K]`, and without lengths every nonnegative index must be below `S_kv`.
+That explicit contract skips the device scan, mask, and compactification.
+FlashMLA Top-K alignment padding and a downstream kernel's required contiguous
+copy can still occur. The contract is not inferred from device values;
+violating it can cause an illegal memory access in the tuned backward kernel.
 Score recompute instead preserves every original slot, masks invalid/inactive
 positions to `-1`, and returns those effective `indices` beside the aligned
 `target`. No D2H validation or synchronization is introduced. Launch-only
@@ -146,6 +154,7 @@ result = DSA.flashmla_cudnn_sparse_attention_wrapper(
     q, kv, topk_idxs, attn_sink,
     softmax_scale=1.0 / math.sqrt(q.shape[-1]),
     topk_length=topk_length,
+    trusted_compact_metadata=True,  # only for a producer satisfying the contract above
 )
 loss = result["output"].float().square().mean()
 loss.backward()  # cuDNN DSA backward: q.grad, kv.grad, attn_sink.grad

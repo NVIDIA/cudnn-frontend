@@ -32,6 +32,8 @@ def main():
 
     # H32 is padded to the official FlashMLA H64 launch, K65 to K128.  The
     # returned tensors and all cuDNN gradients retain the original H32/K65 ABI.
+    # This sample constructs a bounded active prefix, so it can explicitly
+    # skip the safe-default metadata scan and compactification.
     result = DSA.flashmla_cudnn_sparse_attention_wrapper(
         q,
         kv,
@@ -39,6 +41,7 @@ def main():
         attn_sink,
         softmax_scale=scale,
         topk_length=topk_length,
+        trusted_compact_metadata=True,
     )
     result["output"].float().square().mean().backward()
 
