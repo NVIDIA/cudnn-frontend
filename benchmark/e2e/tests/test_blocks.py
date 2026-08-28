@@ -13,10 +13,9 @@ import unittest
 
 E2E_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(E2E_DIR))
-sys.path.insert(0, str(E2E_DIR / "Qwen3.5"))
 
 from _blocks import compose  # noqa: E402
-from configs import ALIASES, MODELS, get  # noqa: E402
+from _qwen_configs import ALIASES, MODELS, QWEN4EXP, get  # noqa: E402
 
 # name -> (hidden, layers, conv_dim, linear layers, full-attn layers, q heads, kv heads)
 PUBLISHED = {
@@ -28,6 +27,7 @@ PUBLISHED = {
     "Qwen3.5-35B-A3B": (2048, 40, 8192, 30, 10, 16, 2),
     "Qwen3.5-122B-A10B": (3072, 48, 12288, 36, 12, 32, 2),
     "Qwen3.5-397B-A17B": (4096, 60, 12288, 45, 15, 32, 2),
+    "Qwen3.8-2.4T-A95B": (8192, 92, 20480, 69, 23, 64, 4),
 }
 
 
@@ -54,7 +54,7 @@ class TestConfigs(unittest.TestCase):
                 self.assertEqual(c["linear_num_key_heads"], 16)
                 self.assertEqual(c["linear_conv_kernel_dim"], 4)
                 self.assertEqual(c["head_dim"], 256)
-        self.assertEqual({get(n)["conv_dim"] for n in MODELS}, {6144, 8192, 10240, 12288})
+        self.assertEqual({get(n)["conv_dim"] for n in MODELS}, {6144, 8192, 10240, 12288, 20480})
 
     def test_attention_cannot_be_expressed_by_deriving_head_dim(self):
         """Why blocks are instantiated directly: `num_attention_heads * 256 > hidden_size`.
@@ -62,13 +62,30 @@ class TestConfigs(unittest.TestCase):
         A model config that derives `head_dim = hidden_size // num_attention_heads` -- FLA's
         does -- cannot reproduce the published pair for six of the eight architectures.
         """
-        inexpressible = [n for n in MODELS if get(n)["hidden_size"] // 256 != get(n)["num_attention_heads"]]
-        self.assertEqual(len(inexpressible), 6, f"expected six, got {inexpressible}")
+        expressible = [n for n in MODELS if get(n)["hidden_size"] // 256 == get(n)["num_attention_heads"]]
+        self.assertEqual(sorted(expressible), ["Qwen3.5-2B", "Qwen3.5-9B"], "only these two happen to satisfy num_attention_heads * 256 == hidden_size")
 
-    def test_qwen36_aliases_resolve(self):
+    def test_reused_geometries_are_aliases(self):
+        """Qwen3.5-27B, Qwen3.6-27B and Qwen3.8-27B are one architecture, not three."""
+        for alias in ALIASES:
+            self.assertIn(get(alias)["name"], MODELS)
         self.assertEqual(get("Qwen3.6-27B")["name"], "Qwen3.5-27B")
+        self.assertEqual(get("Qwen3.8-27B")["name"], "Qwen3.5-27B")
         self.assertEqual(get("Qwen3.6-35B-A3B")["name"], "Qwen3.5-35B-A3B")
-        self.assertEqual(sorted(ALIASES), ["Qwen3.6-27B", "Qwen3.6-35B-A3B"])
+
+    def test_qwen4exp_is_kept_out_of_the_qwen35_block_composition(self):
+        """Qwen3.8-Flash-Next shares the GDN, short-conv and MoE shapes but its decoder layer
+        carries a QSA indexer, a PLE layer and gated residuals as well. Composing it from the
+        Qwen3.5 blocks would omit all three and still print a plausible table."""
+        self.assertNotIn("Qwen3.8-Flash-Next", MODELS)
+        cfg = get("Qwen3.8-Flash-Next")
+        self.assertEqual(cfg["kind"], "qwen4exp")
+        self.assertEqual(cfg["extra_components"], ("qsa_indexer", "ple", "gated_residual"))
+        # block top-k for the sparse selection, the same family as the DSA / NSA indexers
+        self.assertEqual(cfg["indexer"]["budget"] // cfg["indexer"]["compress_ratio"], 512)
+        # the PLE convolution is dilated, and it is one site: layer 2 of 48
+        self.assertEqual(cfg["ple"]["dilation"], 3)
+        self.assertEqual(cfg["ple"]["layer_ids"], [2])
 
     def test_unknown_model_raises(self):
         with self.assertRaises(KeyError):

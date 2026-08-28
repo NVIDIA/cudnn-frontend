@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-block perf share for any published Qwen3.5 / Qwen3.6 configuration.
+"""Per-block perf share for any published Qwen3.5 / Qwen3.6 / Qwen3.8 configuration.
 
 Times one linear-attention block, one full-attention block, and the non-per-layer head,
 then weights them by the model's real layer counts. Nothing larger than a single block is
 ever resident, so the 397B-A17B configuration is as cheap to measure as the 0.8B one.
 
-    python benchmark/e2e/Qwen3.5/run_blocks.py --model Qwen3.5-27B --seq 16384
+    python benchmark/e2e/Qwen3.8/run_blocks.py --model Qwen3.5-27B --seq 16384
 
 Attention head_dim is set explicitly rather than derived from hidden_size, so the published
-(num_attention_heads, head_dim) pair is reproduced exactly; six of the eight configurations
+(num_attention_heads, head_dim) pair is reproduced exactly; most of these configurations
 have ``num_attention_heads * 256 > hidden_size`` and cannot be expressed otherwise.
 """
 
@@ -27,8 +27,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _blocks import report, time_block, time_step  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from configs import ALIASES, MODELS, get  # noqa: E402
+from _qwen_configs import ALIASES, MODELS, QWEN4EXP, get  # noqa: E402
 
 
 class FullAttentionBlock(nn.Module):
@@ -110,7 +109,7 @@ class Head(nn.Module):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen3.5-27B", choices=sorted(MODELS) + sorted(ALIASES))
+    ap.add_argument("--model", default="Qwen3.5-27B", choices=sorted(MODELS) + sorted(QWEN4EXP) + sorted(ALIASES))
     ap.add_argument("--seq", type=int, default=16384, help="tokens per microbatch; for a packed THD workload use its effective length")
     ap.add_argument("--bs", type=int, default=1)
     ap.add_argument("--forwards-per-backward", type=int, default=1, help="GRPO-style recipes run several; 1 keeps a plain training step")
@@ -118,6 +117,13 @@ def main():
     args = ap.parse_args()
 
     cfg = get(args.model)
+    if cfg["kind"] == "qwen4exp":
+        raise SystemExit(
+            f"{cfg['name']} is a Qwen4Exp model. Its Gated DeltaNet, short convolution and MoE block match the "
+            f"shapes here, but its decoder layer also carries {', '.join(cfg['extra_components'])}, and composing it "
+            "from the Qwen3.5 blocks alone would omit all three while still printing a plausible table. It needs its "
+            "own runner; see QWEN4EXP in _qwen_configs.py for the parameters."
+        )
     if cfg["kind"] == "moe":
         raise SystemExit(
             f"{cfg['name']} is a mixture-of-experts configuration and its MoE block is not implemented yet. "
