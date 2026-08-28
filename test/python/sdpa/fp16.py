@@ -18,6 +18,7 @@ from .helpers import (
     convert_packed_to_uniform,
     convert_uniform_to_packed,
     create_container_and_page_table,
+    inject_negative_score_rows,
     time_execution,
     time_execution_cupti,
     profile_execution,
@@ -150,6 +151,12 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.q] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, strides=q_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        if not perf:
+            # keep at least a few q rows in the deeply-negative-score regime
+            # (see inject_negative_score_rows); 0.125 matches this file's attn_scale.
+            # slice to the valid packed prefixes: max_t_* is rounded-up capacity,
+            # so sampling the full buffer could land only on ignored padding rows
+            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], allocs[TensorUid.k][0][: sum(cfg.seq_len_kv)], rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
@@ -166,6 +173,8 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.q] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        if not perf:
+            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o)
         allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.is_train else (None, None, None)
         allocs[TensorUid.score_max] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_max else (None, None, None)
@@ -769,8 +778,13 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                 score_sum_exp_gpu[i, :, m:, :] = 0
 
     if cfg.is_train:
+        # Use the O the bwd kernel actually consumes for D = rowsum(dO * O): a separately
+        # rounded o_ref shifts D, which injected negative-score rows amplify into dK/dQ.
+        o_bwd_ref = o_gpu.detach().float()
+        if cfg.is_ragged:
+            o_bwd_ref = convert_packed_to_uniform(o_bwd_ref, seq_len_q_ref, cfg.s_q)
         bwd_ret = compute_ref_backward(
-            q_ref, k_ref, v_ref, o_ref, dO_ref,
+            q_ref, k_ref, v_ref, o_bwd_ref, dO_ref,
             attn_scale=attn_scale,
             bias=bias_ref,
             is_alibi=cfg.is_alibi,

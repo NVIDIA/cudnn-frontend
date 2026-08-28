@@ -38,7 +38,7 @@ from benchmark_utils import (
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -234,10 +234,10 @@ def _build_spec_map():
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline not in ("sm100", "sm107") or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.mma_tile_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 

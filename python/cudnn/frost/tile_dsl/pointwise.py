@@ -176,6 +176,16 @@ def pack_fp8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.In
     )
 
 
+@cute.jit
+def pack_u16x2(lo: cutlass.Uint16, hi: cutlass.Uint16) -> cutlass.Int32:
+    """Two 16-bit patterns into one 32-bit word (lo = low half)."""
+    return cute.arch.inline_ptx(
+        "mov.b32 $0, {$1, $2};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[lo, hi],
+    )
+
+
 def vec_scale_pair(vec, scalar, N):
     assert N % 2 == 0, f"vec_scale_pair: N={N} must be even"
     pair_ty = _ir.VectorType.get([2], T_.f32())

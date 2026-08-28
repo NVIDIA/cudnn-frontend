@@ -1945,16 +1945,18 @@ def _correction_warp_group(
             total_sum = sStats_raw.subview(stats_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
 
             bars.mb_stat_empty[qs].arrive()
-            # Preserve the persistent-tile phase protocol used by the MMA
-            # prologue; stats now live in SMEM rather than the S accumulator.
-            if cutlass.const_expr(not _E5_SINK):
-                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             beta = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
+            # E5M2+sinks seeds total_sum with the sink contribution, so its
+            # empty-numerator predicate must come from the KV bounds instead.
+            if cutlass.const_expr(_E5_SINK):
+                row_dead = bounds.right <= bounds.left
+            else:
+                row_dead = total_sum <= cutlass.Float32(0.0)
             # Row identity (PackGQA): this lane's row decodes to (token,
             # head-in-group) — q_row_global is the TOKEN index and
             # row_head_idx the row's true query head (lane-varying under
@@ -1980,22 +1982,20 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 beta = cute.arch.rcp_approx(cute.math.max(total_sum, cutlass.Float32(1e-30)))
-                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT):
-                    row_dead = total_sum <= cutlass.Float32(0.0)
-                    beta = cutlass.Float32(
-                        arith.select(
-                            row_dead.ir_value(),
-                            cutlass.Float32(0.0).ir_value(),
-                            beta.ir_value(),
-                        )
+                beta = cutlass.Float32(
+                    arith.select(
+                        row_dead.ir_value(),
+                        cutlass.Float32(0.0).ir_value(),
+                        beta.ir_value(),
                     )
-                    lse_val = cutlass.Float32(
-                        arith.select(
-                            row_dead.ir_value(),
-                            cutlass.Float32(float("-inf")).ir_value(),
-                            lse_val.ir_value(),
-                        )
+                )
+                lse_val = cutlass.Float32(
+                    arith.select(
+                        row_dead.ir_value(),
+                        cutlass.Float32(float("-inf")).ir_value(),
+                        lse_val.ir_value(),
                     )
+                )
                 inv_sum = o_scale_fused * beta
 
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
@@ -2033,9 +2033,14 @@ def _correction_warp_group(
                         num=O_CHUNK,
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    if cutlass.const_expr(_E5_SINK and chunk_idx == N_CHUNKS_O - 1):
+                    if cutlass.const_expr(chunk_idx == N_CHUNKS_O - 1):
                         bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                     o_scaled = o_chunk * inv_sum
+                    _zero_f = cutlass.Float32(0.0)
+                    o_scaled = cutlass.Vector.from_elements(
+                        tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
+                        cutlass.Float32,
+                    )
 
                     for _i in cutlass.range_constexpr(O_CHUNK):
                         _e = o_scaled[_i]
@@ -2079,6 +2084,11 @@ def _correction_warp_group(
 
                 o_chunk1 = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(o_addr1, cutlass.Float32), num=O_EPI_BLOCK_SIZE)
                 o_scaled0 = o_chunk0 * inv_sum
+                _zero_f = cutlass.Float32(0.0)
+                o_scaled0 = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled0[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)),
+                    cutlass.Float32,
+                )
                 _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled0), ftz=True)
                 o_half0 = o_scaled0.to(OUT_STORAGE_DTYPE)
                 _wait_mbarrier(bars.mb_o_empty[qs], o_empty_phase)
@@ -2087,6 +2097,10 @@ def _correction_warp_group(
 
                 o_chunk2 = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(o_addr2, cutlass.Float32), num=O_EPI_BLOCK_SIZE)
                 o_scaled1 = o_chunk1 * inv_sum
+                o_scaled1 = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled1[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)),
+                    cutlass.Float32,
+                )
                 _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled1), ftz=True)
                 o_half1 = o_scaled1.to(OUT_STORAGE_DTYPE)
                 sO_sub_base.subview(cutlass.Int32(O_EPI_BLOCK_SIZE) + tid_in_wg * cutlass.Int32(O_D_BLOCK)).data_ptr().store_swizzled(
@@ -2096,6 +2110,10 @@ def _correction_warp_group(
 
                 o_chunk3 = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(o_addr3, cutlass.Float32), num=O_EPI_BLOCK_SIZE)
                 o_scaled2 = o_chunk2 * inv_sum
+                o_scaled2 = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled2[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)),
+                    cutlass.Float32,
+                )
                 _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled2), ftz=True)
                 o_half2 = o_scaled2.to(OUT_STORAGE_DTYPE)
                 sO_sub_base.subview(cutlass.Int32(O_TMA_GRANU_ELEMS) + tid_in_wg * cutlass.Int32(O_D_BLOCK)).data_ptr().store_swizzled(
@@ -2103,10 +2121,13 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
 
-                if cutlass.const_expr(_E5_SINK):
-                    bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 o_scaled3 = o_chunk3 * inv_sum
+                o_scaled3 = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled3[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)),
+                    cutlass.Float32,
+                )
                 o_half3 = o_scaled3.to(OUT_STORAGE_DTYPE)
                 sO_sub_base.subview(cutlass.Int32(O_TMA_GRANU_ELEMS + O_EPI_BLOCK_SIZE) + tid_in_wg * cutlass.Int32(O_D_BLOCK)).data_ptr().store_swizzled(
                     o_half3, alignment=64, swizzle=_O_SMEM_SWIZZLE

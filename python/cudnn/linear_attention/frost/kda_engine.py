@@ -3,7 +3,7 @@
 
 """FROST KDA engine: KDA nodes on the chunked prefill kernel
 (``kernel/kda_prefill_f16.py``) and KDA_BWD nodes on the chunked backward
-kernel (``kernel/kda_bprop_f16.py``), Blackwell SM100/SM103, bf16/fp16,
+kernel (``kernel/kda_bprop_f16.py``), SM100/SM103/SM107, bf16/fp16,
 BT=16.  The backward regenerates the per-chunk state checkpoints with the recompute
 kernel (``kernel/kda_recompute_f16.py``) when the graph does not provide
 one."""
@@ -42,7 +42,7 @@ def build_kda(graph):
 class KdaFrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node KDA graphs (THD layout).
 
-    Default KDA engine on SM100/SM103 (lowest KDA engine_id); serves KDA
+    Default KDA engine on SM100/SM103/SM107 (lowest KDA engine_id); serves KDA
     forward and KDA_BWD (with a forward checkpoint recompute when ``state_checkpoints`` is absent)."""
 
     name = "kda_frost"

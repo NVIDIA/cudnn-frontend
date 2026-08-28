@@ -134,6 +134,7 @@ def _run(
     pack_gqa=None,
     stats_layout="contiguous",
     return_lse=False,
+    poison_tmem_before_execute: bool = False,
 ):
     import cudnn
 
@@ -209,6 +210,14 @@ def _run(
     if stats:
         vp[stats_t] = lse
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    if poison_tmem_before_execute:
+        assert seq_lens_kv is not None
+        poison_vp = dict(vp)
+        poison_vp[v] = torch.full_like(Vb, float("nan"))
+        poison_vp[skv_h] = torch.full_like(slk, S_kv)
+        g.execute(poison_vp, ws)
+        torch.cuda.synchronize()
+        amax_o.zero_()
     if sync_debug:
         # Rule 3 pin: execute must not read the scale tensors (or anything
         # else) back to the host.
@@ -386,25 +395,40 @@ def test_fp8_d192_d128_masks(mask):
 
 @_skip_on_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("in_key", "out_key", "with_sink"),
+    [
+        ("e4m3", "fp16", False),
+        ("e4m3", "e4m3", True),
+        ("e5m2", "fp16", True),
+    ],
+    ids=["e4m3-fp16-nosink", "e4m3-fp8-sink", "e5m2-fp16-sink"],
+)
 @torch_fork_set_rng(seed=0)
-def test_fp8_d192_d128_zero_length_kv():
-    """A zero-length KV batch must produce a finite zero output."""
+def test_fp8_d192_d128_leading_zero_length_kv(in_key: str, out_key: str, with_sink: bool):
+    """A leading zero-length KV batch must produce zero O and valid Stats."""
     scale = 1.0 / math.sqrt(192)
-    out, o_ref, a_o, a_o_ref = _run(
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    result = _run(
         2,
         8,
         8,
         256,
         256,
-        "e4m3",
-        torch.float16,
+        in_key,
+        _OUT[out_key],
         scale=scale,
         sdpa_kwargs={},
-        seq_lens_kv=[256, 0],
+        sink=sink,
+        seq_lens_kv=[0, 256],
         d_qk=192,
         d_v=128,
+        return_lse=True,
+        poison_tmem_before_execute=True,
     )
-    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    _check(result.output, result.reference, _OUT[out_key], in_key, result.amax, result.reference_amax)
+    assert (result.output[0] == 0).all()
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0

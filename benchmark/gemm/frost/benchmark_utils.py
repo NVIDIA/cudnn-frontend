@@ -36,7 +36,7 @@ def spec_for(label, spec_map):
     """(geometry cfg, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
-    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
+    geometry outside it (e.g. a mma_size_m > 1 tile, which `by_name` synthesizes) is
     still runnable, so parse it rather than calling it unsweepable."""
     spec = spec_map.get(label)
     if spec is not None:
@@ -53,7 +53,7 @@ def spec_for(label, spec_map):
 
 def select_configs(arg, spec_map):
     """--configs value -> concrete label list. A token carrying a glob
-    (`CONFIG_sm107_*`) is expanded against the sweep map; anything else is kept
+    (`CONFIG_sm100_*`) is expanded against the sweep map; anything else is kept
     verbatim so `spec_for` can still synthesize an off-catalog geometry."""
     if not arg:
         return list(spec_map)
@@ -73,7 +73,7 @@ def select_configs(arg, spec_map):
 
 # Argument surface
 
-CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm107_*' (default: sweep all)"
+CONFIGS_HELP = "comma-separated config names or globs, e.g. 'CONFIG_sm100_*' (default: sweep all)"
 
 ROTATE_HELP = (
     "allocate N independent copies of every tensor and rotate the timed launches "
@@ -216,10 +216,12 @@ def time_ms(timed_fn: Callable, warmup_fn: Callable | None = None, *, warmup: in
 
 def kernel_match_token(cfg, cta_group: int) -> str:
     """The substring the demangled symbol carries. `compiler` names the kernel
-    `<template_file_stem>_<geometry_name>`, so it reads `..._1ctamma_128x256x128_...`.
-    The --configs LABEL is not usable here at all: it spells the pipeline before
-    the geometry and the cta_group after it, so it is never a substring."""
-    return f"{cta_group}ctamma_{cfg.geometry_name}"
+    `<template_stem>_<geometry_name>`, and geometry_name now ends in the MMA
+    mode, so it reads
+    `..._128x256x128_128x256x32_cluster2x1_1ctamma`. The --configs LABEL is not
+    usable here at all: it spells the pipeline before the geometry, so it is
+    never a substring."""
+    return cfg.geometry_name
 
 
 def parse_nsys_stats(text: str) -> dict[str, float]:

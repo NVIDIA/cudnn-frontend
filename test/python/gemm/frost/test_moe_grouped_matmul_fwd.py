@@ -48,10 +48,10 @@ _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
-    # CTA tiles split across several MMA instructions along M (num_mma_m).
-    ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 2),  # num_mma_m=2 on the pair
-    ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),  # num_mma_m=2
-    ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),  # num_mma_m=2 at mma_inst_m=64
+    # CTA tiles split across several MMA instructions along M (mma_size_m).
+    ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 2),  # mma_size_m=2 on the pair
+    ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),  # mma_size_m=2
+    ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),  # mma_size_m=2 at mma_inst_m=64
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x2", 1),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster4x2", 2),
 ]
@@ -527,14 +527,14 @@ def test_select_config_lifts_the_n_tile_for_n_major_b() -> None:
     must not hand back a per-CTA N tile smaller than one group."""
     from cudnn.gemm.frost.tile_config import select_config
 
-    cfg_k, cta_group_k = select_config(64, 32, 1)
-    assert (cfg_k.cta_tile_n, cta_group_k) == (32, 1)
+    cfg_k = select_config(64, 32, 1)
+    assert (cfg_k.cta_tile_n, cfg_k.cta_group) == (32, 1)
 
-    cfg_n, cta_group_n = select_config(64, 32, 1, b_n_major=True)
-    assert (cfg_n.cta_tile_n, cta_group_n) == (64, 1)
+    cfg_n = select_config(64, 32, 1, b_n_major=True)
+    assert (cfg_n.cta_tile_n, cfg_n.cta_group) == (64, 1)
 
-    cfg_2, cta_group_2 = select_config(256, 32, 1, b_n_major=True)
-    assert (cfg_2.cta_tile_n, cta_group_2) == (128, 2)
+    cfg_2 = select_config(256, 32, 1, b_n_major=True)
+    assert (cfg_2.cta_tile_n, cfg_2.cta_group) == (128, 2)
 
 
 @requires_sm100
@@ -589,7 +589,7 @@ def test_moe_m_major_output(cta_group: int) -> None:
     g, _, _, _, _ = build()
     chain = analyze(g)
     assert chain.out_major == "m"
-    assert _store_modes(chain, cfg, cta_group) == ("stg",)
+    assert _store_modes(chain, cfg) == ("stg",)
 
     torch.manual_seed(0)
     tk = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)
@@ -601,7 +601,7 @@ def test_moe_m_major_output(cta_group: int) -> None:
     out.zero_()
     tail = raw[2 * S * N :].clone()
     gg, tt, ww, ff, oo = build()
-    jit_from_cudnn_graph(gg, config=cfg, cta_group=cta_group)({tt: tk, ww: wt, ff: ft, oo: out})
+    jit_from_cudnn_graph(gg, config=cfg)({tt: tk, ww: wt, ff: ft, oo: out})
     torch.cuda.synchronize()
 
     ref = torch.zeros(1, S, N, device="cuda", dtype=torch.float32)
@@ -628,7 +628,7 @@ def test_moe_grouped_matmul_fwd_rejects_m_major_token() -> None:
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
     with pytest.raises(NotImplementedError, match="K-major token"):
-        jit_from_cudnn_graph(g, config=by_name(_CFG), cta_group=2)
+        jit_from_cudnn_graph(g, config=by_name(_CFG))
 
 
 @requires_sm100
@@ -963,7 +963,7 @@ def test_moe_int8(cta_group):
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     cfg_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if cta_group == 1 else "CONFIG_sm100_128x128x128_128x128x32_cluster2x1"
-    compiled = jit_from_cudnn_graph(g, config=by_name(cfg_name), cta_group=cta_group)
+    compiled = jit_from_cudnn_graph(g, config=by_name(cfg_name))
     assert compiled.chain.matmul.accum_dtype == "int32"
 
     torch.manual_seed(0)

@@ -240,6 +240,7 @@ class SM120FusedMultiHeadAttentionForward:
         seq_kv_lens_present: bool = False,
         has_sink: bool = False,
         thd_varlen: bool = False,
+        split_kv: int = 1,
         thd_lse_head_major: bool = False,
         thd_batch: int = 1,
         head_tile_qk: int = 128,
@@ -324,6 +325,9 @@ class SM120FusedMultiHeadAttentionForward:
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
         self.thd_varlen = thd_varlen
+        # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
+        # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
+        self.split_kv = split_kv
         self.thd_lse_head_major = thd_lse_head_major
         self.thd_batch = thd_batch
 
@@ -1012,6 +1016,18 @@ class SM120FusedMultiHeadAttentionForward:
         """
         tidx, _, _ = cute.arch.thread_idx()
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
+        # KV split rides the BATCH axis: grid.y = batch + split*B.  Q/K/V and the
+        # per-batch seqlens must use the REAL batch; only the O/LSE partial slot
+        # uses the composite.  Folds away entirely at split_kv == 1.  NATURAL-only
+        # (config_sm120 enforces it): LPT / LPT_L2 flatten the grid to 1-D and
+        # derive the batch from the linear tile id, leaving no axis to ride.
+        split_idx = cutlass.Int32(0)
+        o_batch_idx = batch_idx
+        if cutlass.const_expr(self.split_kv > 1):
+            n_batch_real = cutlass.Int32(q.shape[0])
+            split_idx = batch_idx // n_batch_real
+            batch_idx = batch_idx % n_batch_real
+            o_batch_idx = split_idx * n_batch_real + batch_idx
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             _n_qh = cutlass.Int32((q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]))
             _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
@@ -1031,6 +1047,7 @@ class SM120FusedMultiHeadAttentionForward:
                 )
             else:
                 q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
+            o_batch_idx = batch_idx
         elif cutlass.const_expr(self.is_causal):
             # Causal work grows with the Q tile. Launch long tiles first to
             # avoid leaving a few expensive CTAs in the final scheduler waves.
@@ -1095,7 +1112,9 @@ class SM120FusedMultiHeadAttentionForward:
             o_head_off = q_row_base * o_seq_stride + q_head_base * o_head_stride
         else:
             q_head_off = batch_idx * q_batch_stride + q_head_base * q_head_stride
-            o_head_off = batch_idx * o_batch_stride + q_head_base * o_head_stride
+            # O rides the COMPOSITE batch (B*split_kv) so each split lands in its
+            # own partial slot; Q keeps the real batch above.
+            o_head_off = o_batch_idx * o_batch_stride + q_head_base * o_head_stride
         kv_head_idx = q_head_base // (num_heads_q // num_heads_kv)
 
         num_kv_tiles = ceil_div(seqlen_k, self.kv_tile)
@@ -1121,6 +1140,20 @@ class SM120FusedMultiHeadAttentionForward:
                 first_q_position += seqlen_k - seqlen_q
             first_valid_col = cute.math.max(cutlass.Int32(0), first_q_position - self.window_size_left)
             min_kv_tile = first_valid_col // self.kv_tile
+        if cutlass.const_expr(self.split_kv > 1):
+            # Cut the ALREADY-masked [min_kv_tile, num_kv_tiles) into SPLIT_KV
+            # near-equal chunks; the first `rem` splits take one extra tile so
+            # the slowest split (which sets the critical path) is minimal.  A
+            # split past the end collapses to lo == hi, which drives has_kv_work
+            # false below -- the epilogue then produces row_sum = 0, i.e.
+            # O := 0 / LSE := -inf, the identity of the combine's log-sum-exp.
+            _span = num_kv_tiles - min_kv_tile
+            _per = _span // cutlass.Int32(self.split_kv)
+            _rem = _span % cutlass.Int32(self.split_kv)
+            _lo = min_kv_tile + split_idx * _per + cute.math.min(split_idx, _rem)
+            _extra = cutlass.Int32(1) if split_idx < _rem else cutlass.Int32(0)
+            min_kv_tile = _lo
+            num_kv_tiles = _lo + _per + _extra
         has_kv_work = num_kv_tiles > 0 and (num_kv_tiles - 1) >= min_kv_tile
 
         # Shared-memory layout (BYTE-sized: KV elements are 1 byte, O staging
@@ -1366,7 +1399,13 @@ class SM120FusedMultiHeadAttentionForward:
                         )
                     kv_tile_idx -= 1
             else:
-                if kv_tile_idx >= 0:
+                # Guard against the split's START, not 0. Without KV split
+                # min_kv_tile is 0 on this branch so the two agree, but a split
+                # begins partway into the KV range -- and the load warp bounds
+                # its loop by min_kv_tile, so testing >= 0 here makes the compute
+                # warps run one tile the loader never fetches and the CTA
+                # deadlocks on the TMA barrier.
+                if kv_tile_idx >= min_kv_tile:
                     self.compute_one_kv_tile(
                         basic_params,
                         mma_params,
@@ -1452,7 +1491,9 @@ class SM120FusedMultiHeadAttentionForward:
                             if lse_q_idx >= seqlen_q:
                                 lse_out = -cutlass.Float32.inf
                             if lse_q_idx < q.shape[1]:
-                                lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
+                                # Composite batch, same as O: the per-split LSE is
+                                # what weights that split in the combine.
+                                lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
 
             prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
@@ -1527,12 +1568,18 @@ class SM120FusedMultiHeadAttentionForward:
                 cute.arch.fmax(lane_amax_half[0], lane_amax_half[1]) * row_valid[0],
                 cute.arch.fmax(lane_amax_half[2], lane_amax_half[3]) * row_valid[1],
             )
+            # Under KV split this epilogue sees only its OWN partial, and the
+            # recombined O is a convex combination of the partials -- so a max
+            # over partials over-reports the output amax.  split_combine_sm100
+            # computes it over the recombined O instead; this write has to stay
+            # out of the way, since atomicMax only grows.
             amax_o_arr = cutlass.make_array_view(amax_o)
-            prims.atomicrmw(
-                prims.AtomicOp.MAX,
-                amax_o_arr,
-                lane_amax_o.bitcast(cutlass.Int32),
-            )
+            if cutlass.const_expr(self.split_kv == 1):
+                prims.atomicrmw(
+                    prims.AtomicOp.MAX,
+                    amax_o_arr,
+                    lane_amax_o.bitcast(cutlass.Int32),
+                )
 
             if cutlass.const_expr(self.out_dtype.bytes != 1):
                 store_row = lane_mod8 + ((lane_div8) % 2) * 8
@@ -1654,10 +1701,13 @@ class SM120FusedMultiHeadAttentionForward:
         def _static_neq(a, b):
             return isinstance(a, int) and isinstance(b, int) and a != b
 
+        # Under KV split, O is the split-major PARTIAL workspace: its batch mode
+        # is B*SPLIT_KV while Q/K/V keep the real batch, so O's batch is checked
+        # against that multiple rather than against Q's.
         if cutlass.const_expr(
             _static_neq(q.shape[0], k.shape[0])
             or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
-            or _static_neq(q.shape[0], o.shape[0])
+            or _static_neq(q.shape[0] * self.split_kv, o.shape[0])
             or _static_neq(q.shape[1], o.shape[1])
             or _static_neq(q.shape[2], o.shape[2])
             or q.shape[2] % k.shape[2] != 0
@@ -1688,8 +1738,8 @@ class SM120FusedMultiHeadAttentionForward:
                     if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
                         raise ValueError("THD LSE must be compact token-major")
             else:
-                if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
-                    raise ValueError("LSE must have shape (B, H, Sq)")
+                if cutlass.const_expr(lse.shape != (q.shape[0] * self.split_kv, q.shape[2], q.shape[1])):
+                    raise ValueError("LSE must have shape (B * split_kv, H, Sq)")
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
@@ -1763,7 +1813,9 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             grid = (n_q_tiles * n_batch * n_head, 1, 1)
         else:
-            grid = (n_q_tiles, n_batch, n_head)
+            # KV split rides the batch axis: y = batch + split*B (config_sm120
+            # allows split_kv > 1 only under NATURAL, whose 3-D grid has one).
+            grid = (n_q_tiles, n_batch * self.split_kv, n_head)
         self.kernel(
             q,
             k,
@@ -1848,12 +1900,21 @@ def compile(  # noqa: A001
         head_tile_v=round_up_head_tile(d_v),
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
+        split_kv=PARAMS.split_kv,
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
-    if has_lse and lse_stride is not None and PARAMS.thd_varlen:
+    # A caller-supplied dense LSE stride describes the REAL output; under a split
+    # the LSE is the compact split-major partial workspace instead.
+    if has_lse and lse_stride is not None and (PARAMS.thd_varlen or PARAMS.split_kv > 1):
         raise ValueError("dense LSE strides are not valid for THD")
+    if PARAMS.split_kv > 1 and not has_lse:
+        raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
     fake_batch = 1 if PARAMS.thd_varlen else b
+    # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on the
+    # batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.
+    o_fake_batch = fake_batch * PARAMS.split_kv
+    lse_fake_batch = fake_batch * PARAMS.split_kv
     if PARAMS.thd_varlen:
         # Dynamic packed token totals: one symbol per ragged group (Q/O share
         # t_q; K/V share t_kv), so a new total re-binds the same compiled
@@ -1880,11 +1941,11 @@ def compile(  # noqa: A001
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_DTYPE,
-        (fake_batch, sq, qh, d_v),
+        (o_fake_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse_shape = ((qh, lse_head_stride) if lse_head_major else (sq, qh)) if PARAMS.thd_varlen else (fake_batch, qh, sq)
+    fake_lse_shape = ((qh, lse_head_stride) if lse_head_major else (sq, qh)) if PARAMS.thd_varlen else (lse_fake_batch, qh, sq)
     if not has_lse:
         # No Stats output: the LSE argument is None-specialized and the store
         # is compiled out entirely — no dummy buffer exists at any level.

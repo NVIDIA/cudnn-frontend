@@ -630,9 +630,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
-    - split_kv_supported / split_d_shapes: only the SM100 d128 kernel wires
-      SplitHelpers; the SM107 sibling has no split path yet, and the
-      d192x128 file forks its own scheduler and has none either.
+    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers
+      (the SM107 sibling carries the same plumbing as its SM100 twin), so both
+      rows advertise the split; the d192x128 file forks its own scheduler and
+      has none, which is what split_d_shapes pins.
     - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
       sibling (issue #653); {NATURAL} keeps requests honest AND routes the
       graph path around the un-ported derivation (place() hands the adapter
@@ -699,7 +700,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # Split partials reduce in half precision, so mismatch()'s
             # facts x knobs gate additionally requires a bf16/fp16 O on the
             # quantized rows; split_d_shapes pins it to the d128 flavor.
-            split_kv_supported=not rubin_row,
+            split_kv_supported=True,
             split_d_shapes=frozenset({(128, 128)}),
             pack_gqas=frozenset({False, True}),
         ),
@@ -1152,6 +1153,10 @@ def _sm120_fp8_spec() -> EngineSpec:
             # back for O; zero-copy when already BSHD-physical).
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The kernel's inline chunking (same shape as the f16 sibling) + the
+            # shared split_combine pass. Under a split the kernel stands its amax
+            # down and the combine reports the amax of the RECOMBINED O.
+            split_kv_supported=True,
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),

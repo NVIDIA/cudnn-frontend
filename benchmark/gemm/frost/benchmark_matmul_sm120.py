@@ -73,7 +73,7 @@ def setup_frost(M: int, N: int, K: int, data, args):
     B = g.tensor(name="B", dim=[1, K, N], stride=[N * K, 1, K])
     C = g.matmul(A=A, B=B, name="mm")
     C.set_output(True)
-    compiled = jit_from_cudnn_graph(g, by_name(args.frost_config), cta_group=1)
+    compiled = jit_from_cudnn_graph(g, by_name(args.frost_config))
     a, b, c = data
     bd = compiled.binding
     pack = {bd.a_operands[0]: a, bd.b_operands[0]: b, bd.outputs[0]: c}
@@ -185,7 +185,10 @@ def setup_flashinfer(M: int, N: int, K: int, data, args):
     backends = [args.flashinfer_backend] if args.flashinfer_backend else ["cublaslt", "cudnn", "cutlass", "tgv", "tinygemm"]
     errs = []
     for bk in backends:
-        run = lambda _bk=bk: mm_bf16(a2, bt, out=c2, backend=_bk)
+
+        def run(_bk=bk):
+            return mm_bf16(a2, bt, out=c2, backend=_bk)
+
         try:
             run()
             torch.cuda.synchronize()
@@ -315,13 +318,13 @@ def main() -> int:
         del data
         torch.cuda.empty_cache()
 
-    active = [l for l in libs if l not in skip_reasons]
+    active = [lib for lib in libs if lib not in skip_reasons]
     width = 11
     print("\n" + "=" * (22 + width * len(active)))
-    print(f"  {'M x N x K':20s}" + "".join(f"{l:>{width}s}" for l in active))
+    print(f"  {'M x N x K':20s}" + "".join(f"{lib:>{width}s}" for lib in active))
     print("=" * (22 + width * len(active)))
     for (M, N, K), row in results.items():
-        cells = "".join(f"{row.get(l, float('nan')):>{width}.2f}" for l in active)
+        cells = "".join(f"{row.get(lib, float('nan')):>{width}.2f}" for lib in active)
         print(f"  {f'{M}x{N}x{K}':20s}" + cells)
     print("=" * (22 + width * len(active)))
     print("  (TFLOPS; higher is better)")
@@ -332,7 +335,7 @@ def main() -> int:
         with open(args.csv, "w") as f:
             f.write("M,N,K," + ",".join(active) + "\n")
             for (M, N, K), row in results.items():
-                f.write(f"{M},{N},{K}," + ",".join(f"{row.get(l, float('nan')):.2f}" for l in active) + "\n")
+                f.write(f"{M},{N},{K}," + ",".join(f"{row.get(lib, float('nan')):.2f}" for lib in active) + "\n")
         print(f"  CSV written to {args.csv}")
     print(f"total: {time.time() - t0:.1f} s")
     return 0

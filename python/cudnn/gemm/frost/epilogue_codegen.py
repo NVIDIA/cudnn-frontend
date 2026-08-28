@@ -240,17 +240,17 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
 
     if op.op in _CMP_OPS:
         if op.op == "cmp_le":
-            l, v = _step01(f"{b} - {a}", f"_{idx}")
-            return lines + l + [f"{new} = {v}"], new
+            step, v = _step01(f"{b} - {a}", f"_{idx}")
+            return lines + step + [f"{new} = {v}"], new
         if op.op == "cmp_ge":
-            l, v = _step01(f"{a} - {b}", f"_{idx}")
-            return lines + l + [f"{new} = {v}"], new
+            step, v = _step01(f"{a} - {b}", f"_{idx}")
+            return lines + step + [f"{new} = {v}"], new
         if op.op == "cmp_lt":
-            l, v = _step01(f"{a} - {b}", f"_{idx}")
-            return lines + l + [f"{new} = {_fl(a, 1.0)} - {v}"], new
+            step, v = _step01(f"{a} - {b}", f"_{idx}")
+            return lines + step + [f"{new} = {_fl(a, 1.0)} - {v}"], new
         if op.op == "cmp_gt":
-            l, v = _step01(f"{b} - {a}", f"_{idx}")
-            return lines + l + [f"{new} = {_fl(a, 1.0)} - {v}"], new
+            step, v = _step01(f"{b} - {a}", f"_{idx}")
+            return lines + step + [f"{new} = {_fl(a, 1.0)} - {v}"], new
         l1, v1 = _step01(f"{a} - {b}", f"_{idx}e1")
         l2, v2 = _step01(f"{b} - {a}", f"_{idx}e2")
         if op.op == "cmp_eq":
@@ -645,7 +645,6 @@ def _emit_tap_store(
     stride,
     vsize: int,
     offset_expr: str = "linear_idx",
-    spec_idx: int = 0,
     *,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -677,12 +676,12 @@ def _reduction_output_offset_expr(red_idx: int, red: ReductionSpec, value_idx: s
     internal `(M, N, B)` order; the runtime wrapper passes matching strides."""
     b_extent, m_extent, n_extent = red.dim
     if red.grouped_by_moe:
-        l = "cutlass.Int64(group_idx)"
+        batch = "cutlass.Int64(group_idx)"
     else:
-        l = "cutlass.Int64(0)" if b_extent == 1 else "tile_l"
+        batch = "cutlass.Int64(0)" if b_extent == 1 else "tile_l"
     m = "cutlass.Int64(0)" if m_extent == 1 else "row"
     n = "cutlass.Int64(0)" if n_extent == 1 else f"(col_j + {value_idx})"
-    return f"(({m}) * red_stride_m_{red_idx} + " f"({n}) * red_stride_n_{red_idx} + " f"({l}) * red_stride_l_{red_idx})"
+    return f"(({m}) * red_stride_m_{red_idx} + " f"({n}) * red_stride_n_{red_idx} + " f"({batch}) * red_stride_l_{red_idx})"
 
 
 def _emit_reduction_local_combine(
@@ -1434,7 +1433,7 @@ def generate(
                 body_lines.append(f"if ({store_row_pred}) & (col_j + {vsize} <= N):")
                 body_lines.append(f"    {_st}")
         else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_pred=store_row_pred))
+            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)

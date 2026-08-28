@@ -8,10 +8,12 @@ from __future__ import annotations
 import re
 
 import cudnn
+from dataclasses import replace
+
 import pytest
 import torch
 
-from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, jit_from_cudnn_graph
 from cudnn.gemm.frost.tile_config import by_name
 
 # --- GPU / arch gate -------------------------------------------------------
@@ -41,6 +43,14 @@ requires_sm100 = pytest.mark.skipif(
     reason="needs a Blackwell-family GPU (100 <= SM < 120), have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
+# test_matmul.py sweeps every matmul family (sm100 tcgen05 + sm120 warp-MMA), so
+# its module gate is the union of their arch ranges; a config whose own family
+# does not cover the active part is skipped per-case by `_compatible`.
+requires_matmul_gpu = pytest.mark.skipif(
+    _SM is None or not (100 <= _SM < 130),
+    reason="needs a Blackwell-family GPU (100 <= SM < 130), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
+
 # The int8 tcgen05 MMA is narrower than its family — SM 10.7 has no such
 # instruction, and NVVM fails to lower it rather than the JIT rejecting it.
 # Read the ranges off the registry so the suite never holds a second copy.
@@ -50,11 +60,12 @@ requires_int8_mma = pytest.mark.skipif(
     reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
-# The sm107 templates render anywhere (the 64-byte-K mode is an idesc field, and
-# the OMMA descriptor is a host-side bit-pack); they RUN only on 107 <= SM < 110.
-requires_sm107 = pytest.mark.skipif(
+# A K=64 block-scale geometry RENDERS anywhere (the width is an idesc field and
+# the OMMA descriptor is a host-side bit-pack); it RUNS only on 107 <= SM < 110,
+# which is what validate_block_scale_config gates on.
+requires_mma_k64 = pytest.mark.skipif(
     _SM is None or not (107 <= _SM < 110),
-    reason="sm107 kernels run only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    reason="the 64-byte block-scale MMA runs only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -66,12 +77,15 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=2, force_stg_epi=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False):
         self.g = graph
-        kw = dict(cta_group=cta_group, force_stg_epi=force_stg_epi)
+        kw = {}
         if config is not None:
+            if cta_group is not None and "cta_group" in type(config).__dataclass_fields__ and cta_group != config.cta_group:
+                config = replace(config, cta_group=cta_group)
             kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        with _force_stg_epi(force_stg_epi):
+            self._compiled = jit_from_cudnn_graph(graph, **kw)
         self.chain = self._compiled.chain
         self.binding = self._compiled.binding
         self.block_scale = self.chain.has_block_scale
@@ -82,21 +96,16 @@ class Plan:
         return self._compiled(variant_pack)
 
 
-LEGACY_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
+def resolve(name):
+    """Config-name -> config. The ``_Nctamma`` token is part of the canonical
+    name now (``cta_group`` is geometry), so this is just ``by_name`` — kept as
+    the one place the suite spells the lookup."""
+    return by_name(name)
 
 
-def resolve(legacy_name):
-    """Legacy config-name (with _Nctamma, kept as readable test IDs) ->
-    (pure-geometry config, cta_group)."""
-    m = LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return by_name(m.group(1)), int(m.group(2))
-
-
-def kw(legacy_name):
+def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
-    config, cta_group = resolve(legacy_name)
-    return dict(config=config, cta_group=cta_group)
+    return dict(config=by_name(name))
 
 
 # --- variant packs ----------------------------------------------------------
@@ -308,3 +317,7 @@ FULL_EXPERT_REDUCE_OFFSETS = [
     1800,
     1900,
 ]
+
+
+# Retired name; the gate is about the MMA-inst K width, not a pipeline family.
+requires_sm107 = requires_mma_k64

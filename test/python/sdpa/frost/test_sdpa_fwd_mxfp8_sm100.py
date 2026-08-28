@@ -119,7 +119,10 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         if return_stats:
             return _ReferenceWithStats(o, torch.logsumexp(ext, dim=-1))
         return o
-    o = torch.matmul(torch.softmax(scores, dim=-1), v_e)
+    row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
+    probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
+    o = torch.matmul(probs, v_e)
     if return_stats:
         return _ReferenceWithStats(o, torch.logsumexp(scores, dim=-1))
     return o
@@ -142,6 +145,7 @@ def _run(
     d_v=128,
     stats_layout="contiguous",
     return_lse=False,
+    poison_tmem_before_execute: bool = False,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -224,7 +228,16 @@ def _run(
     vp.update({o: Ob, amax_o: amax})
     if stats:
         vp[stats_t] = lse
-    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    if poison_tmem_before_execute:
+        assert seq_lens_kv is not None
+        poison_vp = dict(vp)
+        poison_vp[v] = torch.full_like(Vb, float("nan"))
+        poison_vp[skv_h] = torch.full_like(slk, S)
+        g.execute(poison_vp, workspace)
+        torch.cuda.synchronize()
+        amax.zero_()
+    g.execute(vp, workspace)
     torch.cuda.synchronize()
 
     ref_kwargs = {k2: v2 for k2, v2 in _ref_from_sdpa(sdpa_kwargs).items()}
@@ -429,6 +442,40 @@ def test_mxfp8_d192_d128_gqa_sink():
         d_v=d_v,
     )
     _check(O, O_ref, torch.float16, "e5m2", d_qk=d_qk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("out_key", "with_sink"),
+    [("fp16", False), ("e4m3", True)],
+    ids=["fp16-nosink", "fp8-sink"],
+)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_leading_zero_length_kv(out_key: str, with_sink: bool):
+    """A leading zero-length KV batch must produce zero O and a finite amax."""
+    d_qk, d_v = 192, 128
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    result = _run(
+        2,
+        8,
+        8,
+        256,
+        "e4m3",
+        _OUT[out_key],
+        scale=1.0 / math.sqrt(d_qk),
+        sdpa_kwargs={},
+        sink=sink,
+        seq_lens_kv=[0, 256],
+        # The MXFP8 engine intentionally declines padding plus Stats; O and
+        # amax exercise the affected epilogue independently of that contract.
+        stats=False,
+        d_qk=d_qk,
+        d_v=d_v,
+        poison_tmem_before_execute=True,
+    )
+    _check(result.output, result.reference, _OUT[out_key], "e4m3", d_qk=d_qk)
+    assert (result.output[0] == 0).all()
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
 
 
 @pytest.mark.L0
