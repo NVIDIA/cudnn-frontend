@@ -36,7 +36,8 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
-- [MoE + Expert Parallel API](moe_ep.md)
+- [MoE + Expert Parallel API](moe_ep.md) — Rubin SM107 fused SwiGLU with
+  fixed-resource training and CUDA Graph support
 
 ## Installation and setup
 
@@ -57,11 +58,22 @@ MoE + Expert Parallel requires its dedicated optional dependencies:
 pip install nvidia-cudnn-frontend[moe_ep]
 ```
 
+MoeEP is currently CUDA/PyTorch-only and targets Rubin SM107. EP2+ execution
+also requires NCCL, NVSHMEM, and a direct-P2P MNNVL peer-access domain. See the
+[MoeEP support matrix and tensor contracts](moe_ep.md#supported-configuration)
+before integrating it.
+
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
 ## API Usage
 
 Each operation exposes two APIs:
+
+MoeEP is an exception to the generic wrapper/kernel pattern below. It exposes
+an object API: `MoeEp.__call__` for inference and
+`MoeEp.prepare_training_resources` for fixed-resource training. See
+[MoE + Expert Parallel API](moe_ep.md) for its lifecycle and CUDA Graph
+contract.
 
 ### 1. High-level wrapper
 
