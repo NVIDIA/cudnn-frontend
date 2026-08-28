@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import math
 
 import pytest
@@ -2232,7 +2233,7 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
         pytest.skip("SM100+ required")
 
     try:
-        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100
+        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import IndexerBackwardSm100, _HAS_TMA_GATHER4
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -2260,7 +2261,9 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
         )
         assert not short.use_persistent
         assert long.use_persistent
-        assert long.use_cross_row_persistent
+        assert short.use_tma_gather is _HAS_TMA_GATHER4
+        assert long.use_tma_gather is _HAS_TMA_GATHER4
+        assert long.use_cross_row_persistent is _HAS_TMA_GATHER4
 
 
 @pytest.mark.L1
@@ -2407,17 +2410,36 @@ def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("topk", [128, 256, 384])
-@pytest.mark.parametrize("topk_indices_global", [True, False], ids=["global", "local"])
-def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(topk, topk_indices_global):
-    """Exercise cross-row barrier phases for one through three TopK blocks."""
+@pytest.mark.parametrize(
+    "topk,topk_indices_global,force_manual_k_load",
+    [
+        pytest.param(topk, topk_indices_global, False, id=f"{'global' if topk_indices_global else 'local'}-{topk}")
+        for topk_indices_global in (True, False)
+        for topk in (128, 256, 384)
+    ]
+    + [pytest.param(512, True, True, id="global-512-manual-k-load")],
+)
+def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
+    topk,
+    topk_indices_global,
+    force_manual_k_load,
+    monkeypatch,
+    request,
+):
+    """Check persistent phases and the manual K-load fallback against the reference."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("SM100+ required")
 
     try:
-        from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100 import indexer_backward_sm100
+        indexer_backward_sm100_module = importlib.import_module("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100")
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if force_manual_k_load:
+        monkeypatch.setattr(indexer_backward_sm100_module, "_HAS_TMA_GATHER4", False)
+        indexer_backward_sm100_module._compile_cache.clear()
+        request.addfinalizer(indexer_backward_sm100_module._compile_cache.clear)
+    indexer_backward_sm100 = indexer_backward_sm100_module.indexer_backward_sm100
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260825 + topk + int(topk_indices_global))

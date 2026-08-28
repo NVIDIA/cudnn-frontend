@@ -106,6 +106,17 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
 )
 
+_HAS_TMA_GATHER4 = all(
+    hasattr(_cute_nvgpu_ir, name)
+    for name in (
+        "atom_make_non_exec_2d_gather4_tma_load",
+        "GatherScatterTmaLoadEnum",
+        "TmaDescriptorTiledType",
+        "atom_make_exec_tma",
+        "get_tma_desc_addr",
+    )
+)
+
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
 
@@ -247,12 +258,14 @@ def _make_tiled_tma_gather4_atom(
     loc=None,
     ip=None,
 ):
-    """Build the SM100 2-D ``tile::gather4`` atom missing from DSL 4.6.1.
+    """Build the SM100 2-D ``tile::gather4`` atom exposed by DSL 4.6.1+.
 
     The 4.6.1 wheel already ships the Gather4 MLIR operation and lowering, but
     its public Python helper/export is absent.  This is the minimal equivalent
     of ``make_tiled_tma_atom(..., gmem_coord_tensor=...)`` documented by that
     same wheel; it deliberately reuses the standard executable TMA-load trait.
+    DSL 4.5.x lacks the underlying MLIR operation, so callers capability-gate
+    this helper and retain the equivalent manual ``cp.async`` K-load path.
     """
     smem_rank = cute_core.rank(smem_layout)
     assert smem_rank == 3 or smem_rank == 4
@@ -432,7 +445,11 @@ class IndexerBackwardSm100:
         # established TopK=512 local-ID fallback unchanged; the new policy is
         # deliberately scoped to the 128/256/384 specializations evaluated
         # here.
-        self.use_tma_gather = topk_indices_global or (self.use_persistent and topk in (128, 256, 384))
+        # Public DSL 4.5.x wheels do not contain the private MLIR operation
+        # needed to construct a Gather4 descriptor. Keep those wheels on the
+        # existing manual cp.async loader; both paths feed identical BF16 K
+        # tiles into the same FP32 GEMMs.
+        self.use_tma_gather = _HAS_TMA_GATHER4 and (topk_indices_global or (self.use_persistent and topk in (128, 256, 384)))
         self.use_cross_row_persistent = self.use_persistent and self.use_tma_gather
 
         # GEMM tilers (M, N, K) — cute.gemm, SMEM operands, TMEM acc
@@ -595,33 +612,35 @@ class IndexerBackwardSm100:
         )
         self.tma_copy_Q_bytes = cute.size_in_bytes(self.q_dtype, Q_smem_layout_tma)
 
-        # Hardware sparse gather. The index-coordinate tensor has the
-        # same logical 2-D shape as K, but its D mode is broadcast (stride 0):
-        # each group of four row coordinates supplies one Gather4 instruction.
-        # The coordinate tensor is descriptor metadata; the issuing lanes pass
-        # row IDs explicitly to the Gather4 instruction.
-        gI_desc = cute.make_tensor(
-            mTopkIdx.iterator,
-            cute.make_layout(
-                (self.total_seqlen_k, self.head_dim_padded),
-                stride=(1, 0),
-            ),
-        )
-        mK_gather = cute.make_tensor(
-            mK.iterator,
-            cute.make_layout(
-                (self.total_seqlen_k, self.head_dim_padded),
-                stride=(self.head_dim_padded, 1),
-            ),
-        )
-        K_smem_layout_tma = cute.select(sK_layout, mode=[0, 1, 2])
-        tma_atom_K_gather, _ = _make_tiled_tma_gather4_atom(
-            mK_gather,
-            gI_desc,
-            K_smem_layout_tma,
-            self.gemm1_tiler,
-            tmma1,
-        )
+        tma_atom_K_gather = None
+        if const_expr(self.use_tma_gather):
+            # Hardware sparse gather. The index-coordinate tensor has the
+            # same logical 2-D shape as K, but its D mode is broadcast
+            # (stride 0): each group of four row coordinates supplies one
+            # Gather4 instruction. The coordinate tensor is descriptor
+            # metadata; the issuing lanes pass row IDs explicitly.
+            gI_desc = cute.make_tensor(
+                mTopkIdx.iterator,
+                cute.make_layout(
+                    (self.total_seqlen_k, self.head_dim_padded),
+                    stride=(1, 0),
+                ),
+            )
+            mK_gather = cute.make_tensor(
+                mK.iterator,
+                cute.make_layout(
+                    (self.total_seqlen_k, self.head_dim_padded),
+                    stride=(self.head_dim_padded, 1),
+                ),
+            )
+            K_smem_layout_tma = cute.select(sK_layout, mode=[0, 1, 2])
+            tma_atom_K_gather, _ = _make_tiled_tma_gather4_atom(
+                mK_gather,
+                gI_desc,
+                K_smem_layout_tma,
+                self.gemm1_tiler,
+                tmma1,
+            )
 
         # Epilogue SMEM layout for dQ store (bf16, row-major = D contiguous)
         sdQ_epi_layout = _make_smem_layout_epi(
@@ -732,8 +751,9 @@ class IndexerBackwardSm100:
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_dQ)
-        if const_expr(self.use_tma_gather) and warp_idx == self.k_load_warp_id[0]:
-            cpasync.prefetch_descriptor(tma_atom_K_gather)
+        if const_expr(self.use_tma_gather):
+            if warp_idx == self.k_load_warp_id[0]:
+                cpasync.prefetch_descriptor(tma_atom_K_gather)
 
         # SMEM allocation
         sQ_size = cute.cosize(sQ_layout)
