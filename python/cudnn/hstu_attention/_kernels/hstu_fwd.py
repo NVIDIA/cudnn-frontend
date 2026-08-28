@@ -3121,6 +3121,9 @@ class HSTUAttentionForwardSm100:
                 cute.arch.fence_view_async_tmem_load()
                 pipeline_o.consumer_release(o_consumer_state)
 
+        if const_expr(self.use_tma_O):
+            # Publish regular SMEM writes before the async proxy reads sO for the TMA store.
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier(barrier_id=EPILOGUE_BARRIER_BASE + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
         logical_stage_start = m_block * self.kBlockM - offset_dynamic
