@@ -17,6 +17,7 @@ from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 
 class FlashAttentionDSABackwardSm100:
     arch = 100
+    num_dkv_shards = 1
 
     def __init__(
         self,
@@ -253,6 +254,34 @@ class FlashAttentionDSABackwardSm100:
     def prepare_dKV_workspace(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor):
         """Return the ordinary dKV workspace view."""
         return cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+
+    @cute.kernel
+    def clear_dKV_workspace(self, mdKV_acc: cute.Tensor, num_rows: Int32):
+        """Clear caller-owned FP32 dKV scratch before atomic accumulation."""
+        tidx, tidy, _ = cute.arch.thread_idx()
+        row_block, _, _ = cute.arch.block_idx()
+        rows_per_cta = 64
+        for row_in_block in cutlass.range(tidy, rows_per_cta, 8, unroll_full=True):
+            row_idx = row_block * rows_per_cta + row_in_block
+            if row_idx < num_rows:
+                for dim_idx in cutlass.range(tidx, self.head_dim, 32):
+                    mdKV_acc[dim_idx, row_idx, (0, 0)] = Float32(0.0)
+
+    @cute.jit
+    def initialize_dKV_workspace(
+        self,
+        mdKV_acc: cute.Tensor,
+        seqlen: Int32,
+        stream: cuda.CUstream,
+    ):
+        """Initialize every shard without an execute-side Torch launch."""
+        rows_per_cta = 64
+        num_rows = seqlen * self.num_dkv_shards
+        self.clear_dKV_workspace(mdKV_acc, num_rows).launch(
+            grid=[cute.ceil_div(num_rows, rows_per_cta), 1, 1],
+            block=[32, 8, 1],
+            stream=stream,
+        )
 
     @cute.jit
     def select_dKV_accumulator(
@@ -533,6 +562,7 @@ class FlashAttentionDSABackwardSm100:
             self.acc_dtype,
         )
         mdKV_acc = self.prepare_dKV_workspace(mdKV_acc, mdKV)
+        self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)
@@ -831,9 +861,11 @@ class FlashAttentionDSABackwardSm100:
 
         max_seqlen_q, max_seqlen_kv, head_dim, (num_heads, batch_size) = problem_shape
 
-        # Deterministic waves pad the last launch to a fixed 128-CTA grid.
-        if token_idx >= max_seqlen_q:
-            cute.arch.nvvm.exit()
+        # Only deterministic waves pad the last launch. Compile this guard out
+        # of the ordinary single-launch kernel, where every token is in range.
+        if cutlass.const_expr(self.q_wave_ctas > 0):
+            if token_idx >= max_seqlen_q:
+                cute.arch.nvvm.exit()
 
         if cutlass.const_expr(mTopkLength is not None):
             topk = mTopkLength[token_idx]

@@ -16,6 +16,7 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
 from . import _interface_sm100 as _iface_sm100
 
@@ -161,6 +162,22 @@ class SparseAttentionBackward(APIBase):
         # Priming requires real tensors, so compilation is deferred to execute().
         self._compiled_kernel = True
 
+    def scratch_workspace_bytes(self) -> int:
+        """Return reusable per-execution scratch for the selected backend."""
+        self._ensure_support_checked()
+        major, _ = torch.cuda.get_device_capability(self.q_desc.device)
+        if major == 9:
+            return 0
+        total_s_q, num_heads, head_dim = self.q_desc.shape
+        total_s_kv = self.kv_desc.shape[0]
+        return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
+            total_s_q,
+            total_s_kv,
+            head_dim,
+            num_heads,
+            self.deterministic,
+        )
+
     def execute(
         self,
         q: torch.Tensor,
@@ -175,6 +192,7 @@ class SparseAttentionBackward(APIBase):
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
@@ -209,6 +227,7 @@ class SparseAttentionBackward(APIBase):
             dq=dq,
             dkv=dkv,
             deterministic=self.deterministic,
+            workspace=workspace,
             current_stream=current_stream,
         )
 
@@ -231,6 +250,7 @@ def sparse_attention_backward_wrapper(
     block_tile: int = 64,
     deterministic: bool = False,
     stream: Optional[cuda.CUstream] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
@@ -271,6 +291,13 @@ def sparse_attention_backward_wrapper(
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
 
+    launch_stream = resolve_stream(stream)
+    if workspace is None:
+        workspace_bytes = obj.scratch_workspace_bytes()
+        if workspace_bytes:
+            with torch_stream_context(launch_stream):
+                workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
+
     dq_out, dkv_out, d_sink_out = obj.execute(
         q,
         kv,
@@ -283,6 +310,7 @@ def sparse_attention_backward_wrapper(
         dkv=dkv,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
-        current_stream=stream,
+        workspace=workspace,
+        current_stream=launch_stream,
     )
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)

@@ -235,6 +235,18 @@ class FlashAttentionDSABackwardSm100H16:
 
         return sum_OdO, scaled_lse, dKV_acc
 
+    @cute.kernel
+    def clear_dKV_workspace(self, mdKV_acc: cute.Tensor, num_rows: Int32):
+        """Clear caller-owned FP32 dKV scratch before atomic accumulation."""
+        tidx, tidy, _ = cute.arch.thread_idx()
+        row_block, _, _ = cute.arch.block_idx()
+        rows_per_cta = 64
+        for row_in_block in cutlass.range(tidy, rows_per_cta, 8, unroll_full=True):
+            row_idx = row_block * rows_per_cta + row_in_block
+            if row_idx < num_rows:
+                for dim_idx in cutlass.range(tidx, self.head_dim, 32):
+                    mdKV_acc[dim_idx, row_idx, (0, 0)] = Float32(0.0)
+
     @staticmethod
     def _compute_sum_OdO_grid(
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
@@ -465,6 +477,12 @@ class FlashAttentionDSABackwardSm100H16:
             self.acc_dtype,
         )
         mdKV_acc = cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+        rows_per_cta = 64
+        self.clear_dKV_workspace(mdKV_acc, mKV.shape[0]).launch(
+            grid=[cute.ceil_div(mKV.shape[0], rows_per_cta), 1, 1],
+            block=[32, 8, 1],
+            stream=stream,
+        )
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)

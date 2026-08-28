@@ -95,9 +95,10 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
 @torch_fork_set_rng(seed=419)
 @pytest.mark.parametrize("head_dim", [512, 576])
 def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_dim):
-    """Three waves, including an empty row, must be bitwise reproducible."""
+    """Three waves and reused dirty scratch must be bitwise reproducible."""
     try:
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -122,8 +123,30 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_di
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
+    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True)
+    api = DSA.SparseAttentionBackward(
+        sample_q=q,
+        sample_kv=kv,
+        sample_out=out,
+        sample_dout=dout,
+        sample_lse=lse,
+        sample_attn_sink=attn_sink,
+        sample_topk_idxs=topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+    )
+    assert api.check_support()
+    assert api.scratch_workspace_bytes() == workspace_bytes
+    expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
+    expected_dkv_bytes = 128 * math.ceil(s_kv / 8) * 8 * math.ceil(head_dim / 8) * 8 * torch.float32.itemsize
+    assert workspace_bytes == expected_lse_odo_bytes + expected_dkv_bytes
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 
     def run():
+        # The compiled kernel, not execute-side Torch code, must initialize
+        # caller-owned scratch on every reuse.
+        workspace.fill_(0xA5)
         result = DSA.sparse_attention_backward_wrapper(
             q,
             kv,
@@ -135,6 +158,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(head_di
             softmax_scale=softmax_scale,
             topk_length=topk_length,
             deterministic=True,
+            workspace=workspace,
         )
         torch.cuda.synchronize()
         return result["dq"].clone(), result["dkv"].clone(), result["d_sink"].clone()
@@ -854,6 +878,11 @@ def test_DSA_sparse_attention_backward_noncontiguous_aux_inputs():
         softmax_scale=softmax_scale,
     )
     dout = torch.randn_like(out)
+    workspace = torch.empty(
+        _interface_sm100.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads),
+        dtype=torch.uint8,
+        device=device,
+    )
 
     def run(attn_sink_, topk_idxs_, topk_length_):
         dq, dkv, d_sink = _interface_sm100.flash_attn_bwd_sm100(
@@ -866,6 +895,7 @@ def test_DSA_sparse_attention_backward_noncontiguous_aux_inputs():
             topk_idxs_,
             softmax_scale=softmax_scale,
             topk_length=topk_length_,
+            workspace=workspace,
         )
         torch.cuda.synchronize()
         return dq.clone(), dkv.clone(), d_sink.clone()
@@ -947,6 +977,11 @@ def test_DSA_sparse_attention_backward_cross_shape_validation():
         topk_length=topk_length,
         dq=None,
         dkv=None,
+        workspace=torch.empty(
+            _interface_sm100.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads),
+            dtype=torch.uint8,
+            device=device,
+        ),
     )
 
     def call(args):
@@ -962,6 +997,7 @@ def test_DSA_sparse_attention_backward_cross_shape_validation():
             topk_length=args["topk_length"],
             dq=args["dq"],
             dkv=args["dkv"],
+            workspace=args["workspace"],
         )
 
     shape_cases = {

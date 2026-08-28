@@ -138,6 +138,13 @@ launch. A fixed-order two-stage reduction combines the 128 shards, and one CTA
 per head reduces `d_sink`. The additional dKV workspace is
 `128 * total_S_kv * round_up(D, 8) * sizeof(float)` bytes.
 
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
+scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
+size to `execute(..., workspace=workspace)` and reuse it across calls; the
+compiled kernel initializes the dKV accumulator on every execution. The
+high-level wrapper accepts the same optional `workspace=` argument and only
+allocates convenience scratch when it is omitted.
+
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
 
