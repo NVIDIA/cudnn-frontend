@@ -14,6 +14,12 @@ production sparse-attention architectures:
   granularity 4, 2048-token budget (512 entries), shared indices.
 * ``minimax`` — MiniMax-M3 MSA: GQA 64Q/4KV, d=128, block granularity 128,
   top-16 blocks per KV-head group (per-group indices).
+* ``glm5.2`` — GLM-5/5.1/5.2 DSA: V3.2-shaped MQA latent (576-d K = 512
+  latent + 64 RoPE, 512-d V), token top-2048, no sink. (5.2's IndexShare is
+  indexer-side only; the core attention call shape is unchanged.)
+* ``glm5.3-flash`` — GLM-5.3-Flash DSA layers: NoPE MLA, rope-free
+  ``D_k = D_v = 512`` shared latent, token top-2048, no sink (11 of 45
+  layers; the rest are KDA linear attention, out of scope here).
 
 Indices are causal-realistic: query row ``i`` selects unique random entries
 from its causal prefix (``i // granularity + 1`` candidates), up to the
@@ -77,6 +83,12 @@ VARIANTS = {
     "qwen3.8": VariantConfig("qwen3.8", h_q=24, h_kv=2, d_k=256, d_v=256, granularity=4, topk=512, group_scope=1, attn_sink=False, kv_aliased=False),
     # MiniMax-M3 MSA: 64Q/4KV @ 128, block=128, top-16 blocks per GQA group.
     "minimax": VariantConfig("minimax", h_q=64, h_kv=4, d_k=128, d_v=128, granularity=128, topk=16, group_scope=4, attn_sink=False, kv_aliased=False),
+    # GLM-5/5.1/5.2 DSA (V3.2 shape): 64 heads over 512-latent + 64-RoPE =
+    # 576-d K, 512-d V, token top-2048, no sink.
+    "glm5.2": VariantConfig("glm5.2", h_q=64, h_kv=1, d_k=576, d_v=512, granularity=1, topk=2048, group_scope=1, attn_sink=False, kv_aliased=True),
+    # GLM-5.3-Flash DSA layers: NoPE MLA, rope-free 512-d shared latent
+    # (qk_rope_head_dim=0), token top-2048, no sink.
+    "glm5.3-flash": VariantConfig("glm5.3-flash", h_q=64, h_kv=1, d_k=512, d_v=512, granularity=1, topk=2048, group_scope=1, attn_sink=False, kv_aliased=True),
 }
 
 
@@ -200,7 +212,7 @@ def profile_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, backen
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", nargs="?", default="bench", choices=["bench", "profile"])
-    parser.add_argument("--variant", default="dsv4,qwen3.8,minimax", help="comma-separated subset of: " + ",".join(VARIANTS))
+    parser.add_argument("--variant", default="dsv4,qwen3.8,minimax,glm5.2,glm5.3-flash", help="comma-separated subset of: " + ",".join(VARIANTS))
     parser.add_argument("--seqlens", default="4096,8192", help="comma-separated seqlen_q (= seqlen_kv) values")
     parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPES))
     parser.add_argument("--backend", default="default", help='"default" (device kernels) or "reference" (PyTorch)')

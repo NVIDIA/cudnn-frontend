@@ -8,6 +8,8 @@ geometry of three production sparse-attention architectures:
 | `dsv4` | DeepSeek-V4 DSA/CSA | 64/1 (MQA latent, K≡V) | 512/512 (RoPE in-place, dims 448-511) | 1 (token) | 2048 | shared | yes |
 | `qwen3.8` | Qwen3.8-Flash-Next QSA | 24/2 | 256/256 | 4 (micro-block) | 512 entries (2048 tok) | shared | no |
 | `minimax` | MiniMax-M3 MSA | 64/4 | 128/128 | 128 (block) | 16 blocks (2048 tok) | per KV-head group | no |
+| `glm5.2` | GLM-5/5.1/5.2 DSA | 64/1 (MQA latent, K≡V) | 576/512 (512 latent + 64 RoPE) | 1 (token) | 2048 | shared | no |
+| `glm5.3-flash` | GLM-5.3-Flash DSA layers | 64/1 (MQA latent, K≡V) | 512/512 (NoPE, rope-free) | 1 (token) | 2048 | shared | no |
 
 Indices are causal-realistic: query row `i` selects unique random entries
 from its causal prefix (up to the variant's top-k), with `topk_length`
@@ -28,7 +30,7 @@ the harness runs against the PyTorch reference — functional only,
 reference-speed:
 
 ```bash
-python benchmark_sparse_attention_forward.py --variant dsv4,qwen3.8,minimax \
+python benchmark_sparse_attention_forward.py --variant dsv4,qwen3.8,minimax,glm5.2,glm5.3-flash \
     --seqlens 4096 --backend reference --q-chunk 1024
 ```
 
