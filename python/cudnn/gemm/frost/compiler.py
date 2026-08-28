@@ -789,6 +789,7 @@ def _render_tile_constants(
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
         f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=smem_fixed_reserve)}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
@@ -1077,6 +1078,14 @@ def _b_collector_supported(arch: int | None = None) -> bool:
     """Whether this GPU's MMA can hold B in a collector buffer across MMAs."""
     a = _current_arch() if arch is None else arch
     return a is not None and any(lo <= a < hi for lo, hi in _B_COLLECTOR_ARCH_RANGES)
+
+
+def _b_collector_ok(cfg, arch: int | None = None) -> bool:
+    """...and whether THIS geometry may ask for it. The 64-row MMA may not: measured
+    `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under both CTA groups, so it
+    is the per-CTA instruction M that decides, not the hardware M. Block-scale never
+    reaches it (`validate_block_scale_config` requires `mma_tile_m % 128 == 0`)."""
+    return _b_collector_supported(arch) and cfg.mma_tile_m == 128
 
 
 def _tmem_cols_for_arch(arch: int | None = None) -> int:
@@ -1673,7 +1682,7 @@ def _render_block_scale_tile_constants(
         f"sf_block_desc_stride = {sf_block_desc_stride}",
         f"num_tmem_alloc_cols = {num_tmem_alloc_cols}",
         f"tmem_alloc_exclusive = {num_tmem_alloc_cols > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
-        f"b_collector_ok = {_b_collector_supported()}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
