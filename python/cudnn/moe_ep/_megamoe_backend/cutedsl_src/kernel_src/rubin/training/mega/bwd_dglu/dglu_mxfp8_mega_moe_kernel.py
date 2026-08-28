@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int32, Int64
 
 from ......api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
 from ......helpers.device_workspace import DeviceWorkspace
@@ -167,7 +167,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             stream=make_fake_stream(),
         )
         fake_arguments["grad_y2"] = fake_tensor(
-            self.ab_dtype, aux_shapes["grad_y2"], (1, 0), {0}, 16
+            self.ab_dtype, aux_shapes["grad_y2"], (0, 1), set(), 128
         )
         fake_arguments["grad_y2_sf"] = fake_tensor(
             cutlass.Uint8, aux_shapes["grad_y2_sf"], (0,), set(), 16
@@ -525,6 +525,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 num_persistent_ctas=self.num_ctas_grad_y2_col_quant,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
+                dst_k_major=True,
             )
 
     def _smem_misc_budget_bytes(self) -> int:
@@ -533,16 +534,20 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         return super()._smem_misc_budget_bytes() + self._token_comm_smem_bytes + _sched + self._SMEM_ALLOC_MARGIN
 
     def get_aux_output_shapes(self) -> dict:
-        """Shapes of the fixed-ABI dFC2 auxiliary outputs."""
+        """Shapes of the fixed-ABI dFC2 auxiliary outputs.
+
+        Data planes are compact token-major matrices. Column-quantized scale
+        planes retain the WGrad 128x4 atom layout.
+        """
         data_token_capacity = self.token_comm.worst_case_token_count
         sf_token_capacity = self.token_comm.worst_case_sf_token_count
         column_sf_row_count = sf_token_capacity // self.sf_vec_size
         return {
             "dprob": (self.max_tokens_per_rank, self.num_topk),
             "fc1_recompute": (data_token_capacity, self.intermediate_downproj),
-            "fc1_recompute_sf": (column_sf_row_count, self.intermediate_downproj),
+            "fc1_recompute_sf": (round_up(self.intermediate_downproj, 128), column_sf_row_count),
             "fc1_col_output": (data_token_capacity, self.intermediate_gateup),
-            "fc1_col_output_sf": (column_sf_row_count, self.intermediate_gateup),
+            "fc1_col_output_sf": (round_up(self.intermediate_gateup, 128), column_sf_row_count),
             "grad_y2": (data_token_capacity, self.hidden),
             "grad_y2_sf": (sf_token_capacity * (self.hidden // self.sf_vec_size),),
         }
@@ -552,7 +557,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         return (self.token_comm.worst_case_token_count, self.intermediate_gateup)
 
     @cute.jit
-    def _validate_fixed_pool_tensor(self, tensor: cute.Tensor, dtype, expected_shape) -> None:
+    def _validate_fixed_pool_tensor(self, tensor: cute.Tensor, dtype, expected_shape, expected_stride=None) -> None:
         if cutlass.const_expr(tensor.element_type is not dtype):
             raise TypeError("pool-domain tensor has an unexpected element type.")
         if cutlass.const_expr(cute.rank(tensor.layout) != 2):
@@ -564,8 +569,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             or tensor.shape[1] != expected_shape[1]
         ):
             raise ValueError(f"pool-domain tensor must have static shape {expected_shape}.")
-        if cutlass.const_expr(tensor.stride[0] != expected_shape[1] or tensor.stride[1] != 1):
-            raise ValueError("pool-domain tensor must be compact row-major.")
+        stride = (expected_shape[1], 1) if expected_stride is None else expected_stride
+        if cutlass.const_expr(tensor.stride[0] != stride[0] or tensor.stride[1] != stride[1]):
+            raise ValueError("pool-domain tensor has an unexpected stride.")
 
     def _build_megamoe_device_workspace(self) -> DeviceWorkspace:
         """Register internal dGLU pools, counters, and token-comm regions."""
@@ -730,8 +736,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     @cute.jit
     def _snapshot_grad_y2_expert_sizes(self, tidx) -> None:
         """Preserve local expert counts before token_comm tail reset."""
-        from cutlass.cutlass_dsl import Int32
-
         dw = self._mega_device_workspace
         if self.token_comm._linear_cta_idx == Int32(0):
             sizes = self.token_comm.local_expert_sizes(dw, self.token_comm._local_rank)
@@ -762,10 +766,10 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         output_activation: cute.Tensor,  # (max_tokens_per_rank, topk, hidden) BF16
         overflow_flag: cute.Tensor,  # (1,) Int32, per-rank FC12 overflow output
         dprob: cute.Tensor,  # (max_tokens_per_rank, topk) Float32; symmetric, pre-zeroed
-        fc1_recompute: cute.Tensor,  # (pool_token_capacity, inter_downproj)
-        fc1_recompute_sf: cute.Tensor,  # (col_sf_rows, inter_downproj) E8M0
-        fc1_col_output: cute.Tensor,  # (pool_token_capacity, intermediate_gateup)
-        fc1_col_output_sf: cute.Tensor,  # (col_sf_rows, intermediate_gateup) E8M0
+        fc1_recompute: cute.Tensor,  # (pool_token_capacity, inter_downproj), token-major
+        fc1_recompute_sf: cute.Tensor,  # WGrad2 SFA: (inter_padded, col_sf_rows)
+        fc1_col_output: cute.Tensor,  # (pool_token_capacity, gateup), token-major
+        fc1_col_output_sf: cute.Tensor,  # WGrad1 SFB: (gateup_padded, col_sf_rows)
         grad_y2: cute.Tensor,  # (pool_token_capacity, hidden) token-axis MXFP8
         grad_y2_sf: cute.Tensor,  # flat MN-major E8M0 bytes
         local_workspace: cute.Pointer,
@@ -790,13 +794,27 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             aux_shapes["fc1_recompute_sf"],
         )
         self._validate_fixed_pool_tensor(
-            fc1_col_output, self.ab_dtype, aux_shapes["fc1_col_output"]
+            fc1_col_output,
+            self.ab_dtype,
+            aux_shapes["fc1_col_output"],
         )
         self._validate_fixed_pool_tensor(
             fc1_col_output_sf,
             self.token_comm.activation_sf_dtype,
             aux_shapes["fc1_col_output_sf"],
         )
+        self._validate_fixed_pool_tensor(
+            grad_y2,
+            self.ab_dtype,
+            aux_shapes["grad_y2"],
+            (1, aux_shapes["grad_y2"][0]),
+        )
+        if cutlass.const_expr(
+            grad_y2_sf.element_type is not cutlass.Uint8
+            or cute.rank(grad_y2_sf.layout) != 1
+            or grad_y2_sf.shape[0] != aux_shapes["grad_y2_sf"][0]
+        ):
+            raise ValueError("grad_y2_sf must be the fixed-size flat Uint8 carrier.")
         self.token_comm.launch_router(
             topk_indices=topk_idx,
             topk_scores=topk_weights,

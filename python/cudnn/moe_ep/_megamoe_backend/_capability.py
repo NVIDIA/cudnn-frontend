@@ -15,7 +15,6 @@ import torch
 
 from .._contracts import (
     ForwardConfig,
-    ValidatedBackwardRequest,
     ValidatedForwardRequest,
 )
 from .._types import BlockScaledTensor, MoeFormat
@@ -73,10 +72,10 @@ def _validate_wgrad_config(config: ForwardConfig) -> None:
             raise ValueError(
                 "backward_wgrad_mode='operands' requires generate_c=True"
             )
-        if config.token_padding_size != 256:
+        if config.token_padding_size != 128:
             raise ValueError(
                 "backward_wgrad_mode='operands' requires "
-                "token_padding_size=256"
+                "token_padding_size=128"
             )
         if config.sf_padding_size != 128:
             raise ValueError(
@@ -144,33 +143,7 @@ def validate_request(request: ValidatedForwardRequest) -> None:
     _validate_device(request.device)
 
 
-def validate_backward_request(request: ValidatedBackwardRequest) -> None:
-    """Reject backward requests outside the Rubin MXFP8 training path."""
-
-    _validate_wgrad_config(request.config)
-    for name, tensor in (
-        ("fc1_weight", request.fc1_weight),
-        ("fc2_weight", request.fc2_weight),
-    ):
-        _validate_operand(name, tensor)
-    _validate_device(request.device)
-    config = request.config
-    if config.output_format != MoeFormat.BF16.value:
-        raise NotImplementedError(
-            "MoeEp MXFP8 backward currently requires output_format='bf16'"
-        )
-    if not config.apply_topk_in_fc1:
-        raise NotImplementedError(
-            "MoeEp MXFP8 backward currently requires apply_topk_in_fc1=True"
-        )
-    if _is_cuda_stream_capturing(request.device):
-        raise NotImplementedError(
-            "MoeEp MXFP8 backward does not support CUDA graph capture"
-        )
-
-
 __all__ = [
-    "validate_backward_request",
     "validate_config",
     "validate_request",
 ]

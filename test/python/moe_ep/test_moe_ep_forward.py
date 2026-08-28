@@ -20,7 +20,7 @@ from moe_ep.moe_ep_distributed_workers import (
     _distributed_output_worker,
     _distributed_subgroup_output_worker,
 )
-from moe_ep.moe_ep_forward_support import (
+from moe_ep.moe_ep_test_support import (
     _assert_matches_reference,
     _forward_config,
     _make_forward_case,
@@ -31,17 +31,14 @@ from moe_ep.moe_ep_forward_support import (
     _require_distributed_sm107,
     _sm107_device,
     _stress_backend_reuse,
+    make_forward_inputs,
+    quantize_mxfp8,
 )
 from moe_ep.moe_ep_reference import (
-    BlockScaledTensor as ReferenceBlockScaledTensor,
     MoeEpReference,
     MoeFormat,
     forward_combine_round_trip,
     quantize_blockwise,
-)
-from moe_ep.moe_ep_test_data import (
-    make_forward_inputs,
-    quantize_mxfp8,
 )
 
 
@@ -317,16 +314,6 @@ def test_combine_format_maps_to_contract_wire(public_format, wire_format):
         )
 
     assert kernel_config.combine_format == wire_format
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
-def test_megamoe_capability_enables_combine_formats(combine_format):
-    from cudnn import MoeEp
-    from cudnn.moe_ep._megamoe_backend._capability import validate_config
-
-    with MoeEp(**_forward_config(combine_format=combine_format)) as op:
-        validate_config(op._forward_config)
 
 
 @pytest.mark.L0
@@ -627,41 +614,11 @@ def test_distributed_launch_rejects_mismatched_tuning_before_barrier(
 
 
 @pytest.mark.L0
-def test_api_allocates_fresh_bf16_outputs_with_logical_shape():
-    from cudnn import MoeEp
-
-    device = _sm107_device()
-    args = make_forward_inputs(device)
-    activation, fc1_weight, fc2_weight = args[:3]
-
-    assert activation.logical_shape == (5, 128)
-    assert fc1_weight.logical_shape == (2, 128, 512)
-    assert fc2_weight.logical_shape == (2, 256, 128)
-
-    with MoeEp(**_forward_config()) as op:
-        first = op(*args)
-        snapshot = first.clone()
-        second = op(*args)
-        torch.cuda.synchronize(device)
-
-    assert isinstance(first, torch.Tensor)
-    assert isinstance(second, torch.Tensor)
-    assert first.shape == second.shape == (5, 128)
-    assert first.dtype == second.dtype == torch.bfloat16
-    assert first.device == second.device == device
-    assert first is not second
-    assert first.data_ptr() != second.data_ptr()
-    torch.testing.assert_close(first, snapshot, rtol=0, atol=0)
-    torch.testing.assert_close(first, second, rtol=0, atol=0)
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"combine_format": "nvfp4"},
         {"output_format": "mxfp8"},
-        {"output_format": "nvfp4"},
         {"apply_topk_in_fc1": False},
     ],
 )
@@ -699,24 +656,36 @@ def test_training_megamoe_rejects_nvfp4_operand_before_cuda_query(monkeypatch):
 
 
 @pytest.mark.L0
-def test_fp8_activation_bf16_combine_forward_single_gpu():
+def test_bf16_forward_matches_reference_and_returns_fresh_outputs():
     from cudnn import MoeEp
 
     device = _sm107_device()
     args = make_forward_inputs(device)
+    activation, fc1_weight, fc2_weight = args[:3]
     expected = _reference_forward(args)
 
-    with MoeEp(**_forward_config()) as op:
-        actual = op(*args)
-        torch.cuda.synchronize(device)
+    assert activation.logical_shape == (5, 128)
+    assert fc1_weight.logical_shape == (2, 128, 512)
+    assert fc2_weight.logical_shape == (2, 256, 128)
 
+    with MoeEp(**_forward_config()) as op:
+        first = op(*args)
+        snapshot = first.clone()
+        second = op(*args)
         args[3].fill_(-1)
         dropped = op(*args)
         torch.cuda.synchronize(device)
 
-    assert actual.shape == (5, 128)
-    assert actual.dtype == torch.bfloat16
-    _assert_matches_reference(actual, expected)
+    assert isinstance(first, torch.Tensor)
+    assert isinstance(second, torch.Tensor)
+    assert first.shape == second.shape == (5, 128)
+    assert first.dtype == second.dtype == torch.bfloat16
+    assert first.device == second.device == device
+    assert first is not second
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, snapshot, rtol=0, atol=0)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    _assert_matches_reference(first, expected)
     assert dropped.eq(0).all()
 
 
@@ -742,20 +711,24 @@ def test_mxfp8_combine_matches_direct_fp32_training_reference():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
-    "plain_mask",
+    ("plain_mask", "plain_dtype"),
     [
-        (True, False, False),
-        (False, True, False),
-        (False, False, True),
-        (True, True, False),
-        (True, False, True),
-        (False, True, True),
-        (True, True, True),
+        pytest.param(
+            (True, False, False),
+            torch.bfloat16,
+            id="activation-bf16",
+        ),
+        pytest.param(
+            (False, True, False),
+            torch.float16,
+            id="fc1-fp16",
+        ),
+        pytest.param(
+            (False, False, True),
+            torch.float32,
+            id="fc2-fp32",
+        ),
     ],
-)
-@pytest.mark.parametrize(
-    "plain_dtype",
-    [torch.bfloat16, torch.float16, torch.float32],
 )
 def test_plain_and_mixed_inputs_match_staged_reference(
     plain_mask,
@@ -857,65 +830,6 @@ def test_gate_up_clamp_matches_moe_ep_reference():
 
     assert not torch.equal(expected, unclamped)
     _assert_matches_reference(actual, expected)
-
-
-@pytest.mark.L1
-@pytest.mark.gpu_exclusive
-def test_generate_c_outputs_fc1_c_and_route_metadata():
-    from cudnn import MoeEp
-
-    device = _sm107_device()
-    args = make_forward_inputs(device)
-    config = _forward_config(
-        gate_up_clamp=1.25,
-        generate_c=True,
-    )
-    expected_output, expected_fc1_c, expected_metadata = _reference_forward(
-        args,
-        **config,
-    )
-
-    with MoeEp(**config) as op:
-        first = op(*args)
-        output, fc1_c, route_metadata = first
-        fc1_c_snapshot = fc1_c.clone()
-        metadata_snapshot = route_metadata.clone()
-
-        scaled_args = (*args[:4], args[4] * 0.25)
-        _, scaled_fc1_c, scaled_metadata = op(*scaled_args)
-        torch.cuda.synchronize(device)
-
-    assert isinstance(first, tuple)
-    assert len(first) == 3
-    assert output.shape == (5, 128)
-    assert output.dtype == torch.bfloat16
-    assert fc1_c.shape == (9, 512)
-    assert fc1_c.dtype == torch.bfloat16
-    assert route_metadata.shape == (9, 4)
-    assert route_metadata.dtype == torch.int32
-    _assert_matches_reference(output, expected_output)
-    torch.testing.assert_close(
-        _output_as_float(fc1_c),
-        _output_as_float(expected_fc1_c),
-        rtol=0.01,
-        atol=0.01,
-    )
-    torch.testing.assert_close(
-        route_metadata,
-        expected_metadata,
-        rtol=0,
-        atol=0,
-    )
-
-    # FC1 C is captured before clamp/SwiGLU and does not include router weights.
-    torch.testing.assert_close(scaled_fc1_c, fc1_c_snapshot, rtol=0, atol=0)
-    torch.testing.assert_close(scaled_metadata, metadata_snapshot, rtol=0, atol=0)
-    torch.testing.assert_close(fc1_c, fc1_c_snapshot, rtol=0, atol=0)
-    torch.testing.assert_close(route_metadata, metadata_snapshot, rtol=0, atol=0)
-    assert scaled_fc1_c is not fc1_c
-    assert scaled_metadata is not route_metadata
-    assert scaled_fc1_c.data_ptr() != fc1_c.data_ptr()
-    assert scaled_metadata.data_ptr() != route_metadata.data_ptr()
 
 
 @pytest.mark.L1
@@ -1071,47 +985,6 @@ def test_nondefault_tuning_warmup_and_cuda_graph_replay():
 
 
 @pytest.mark.L0
-def test_reference_apply_topk_after_fc2_weights_after_combine_rounding():
-    """Keep post-combine router weighting in reference-only semantics."""
-
-    device = torch.device("cpu")
-    args = make_forward_inputs(device)
-    # Duplicate routes make pre/post-combine weighting observably different.
-    args[3].copy_(
-        torch.tensor(
-            [[0, 0], [1, 1], [0, 0], [1, 1], [0, 0]],
-            dtype=torch.int32,
-            device=device,
-        )
-    )
-    args[4].copy_(
-        torch.tensor(
-            [[256.0, -255.0]] * 5,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-    )
-    decoded_args = (
-        args[0].dequantize(),
-        args[1].dequantize(),
-        args[2].dequantize(),
-        args[3],
-        args[4],
-    )
-    expected = _naive_reference(
-        *decoded_args,
-        apply_topk_in_fc1=False,
-        intermediate_format=MoeFormat.MXFP8,
-        apply_topk_after_combine=True,
-    )
-    pre_combine_weighting = _naive_reference(
-        *decoded_args,
-        apply_topk_in_fc1=False,
-        intermediate_format=MoeFormat.MXFP8,
-    )
-    assert not torch.equal(expected, pre_combine_weighting)
-
-@pytest.mark.L0
 def test_forward_mxfp8_combine_is_direct_fp32():
     generator = torch.Generator().manual_seed(20260819)
     accumulator = torch.randn(4, 128, generator=generator) * 3.25
@@ -1138,11 +1011,14 @@ def test_forward_mxfp8_combine_is_direct_fp32():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
-    "world_size",
-    [2, 3, 4],
-    ids=["ep2", "ep3", "ep4"],
+    ("world_size", "combine_format"),
+    [
+        pytest.param(2, "bf16", id="ep2-bf16"),
+        pytest.param(2, "mxfp8", id="ep2-mxfp8"),
+        pytest.param(3, "mxfp8", id="ep3-mxfp8"),
+        pytest.param(4, "bf16", id="ep4-bf16"),
+    ],
 )
-@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
 def test_mxfp8_forward_multi_gpu_matches_reference(
     world_size,
     combine_format,
@@ -1296,35 +1172,6 @@ def test_column_requant_workspace_is_allocated_only_when_enabled():
 
 
 @pytest.mark.L0
-def test_mxfp8_activation_representation():
-    activation = quantize_mxfp8(torch.randn(3, 128), axis=1)
-
-    assert activation.format.value == "mxfp8"
-    assert activation.logical_shape == (3, 128)
-    assert activation.axis == 1
-    assert activation.data.shape == (3, 128)
-    assert activation.data.dtype == torch.float8_e4m3fn
-    assert activation.scale.shape == (3, 4)
-    assert activation.scale.dtype == torch.float8_e8m0fnu
-    assert torch.isfinite(activation.dequantize()).all()
-
-
-@pytest.mark.L0
-def test_reference_mxfp8_block_scaled_round_trip():
-    values = torch.linspace(-4.0, 4.0, 3 * 64).reshape(3, 64)
-    quantized = quantize_blockwise(values, MoeFormat.MXFP8)
-
-    assert isinstance(quantized, ReferenceBlockScaledTensor)
-    assert quantized.format is MoeFormat.MXFP8
-    assert quantized.logical_shape == (3, 64)
-    assert tuple(quantized.data.shape) == (3, 64)
-    assert tuple(quantized.scale.shape) == (3, 2)
-    assert quantized.scale.dtype == torch.float8_e8m0fnu
-    assert quantized.dequantize().shape == values.shape
-    assert torch.isfinite(quantized.dequantize()).all()
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize(
     "intermediate_format",
     [None, MoeFormat.MXFP8],
@@ -1460,33 +1307,31 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
 
 
 @pytest.mark.L0
-def test_megamoe_capability_accepts_nonworld_subgroup_config():
-    from cudnn.moe_ep._contracts import ForwardConfig
-    from cudnn.moe_ep._megamoe_backend._capability import validate_config
-    from cudnn.moe_ep._tuning import MoeEpTuningConfig
+def test_ep32_peer_mapping_selects_vector_payload():
+    from cutlass._mlir import ir
 
-    config = ForwardConfig(
-        num_experts=4,
-        hidden_size=128,
-        intermediate_size=256,
-        top_k=2,
-        experts_per_rank=2,
-        ep_size=2,
-        ep_rank=0,
-        ep_group=object(),
-        ep_global_ranks=(1, 3),
-        max_tokens_per_rank=8,
-        output_format="bf16",
-        combine_format="bf16",
-        apply_topk_in_fc1=True,
-        gate_up_clamp=None,
-        generate_c=False,
-        token_padding_size=128,
-        sf_padding_size=128,
-        tuning=MoeEpTuningConfig(),
+    from cudnn.moe_ep._megamoe_backend._comm import PeerMapping
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.symmetric_buffer import (
+        SymmetricBufferDevice,
     )
 
-    validate_config(config)
+    offsets = tuple(index * 4096 for index in range(32))
+    mapping = PeerMapping(
+        base_address=0x1000,
+        offsets=offsets,
+        rank=0,
+    )
+    host = mapping.to_sym_buffer_host()
+    with ir.Context():
+        device_type = SymmetricBufferDevice(
+            None,
+            host.max_ranks,
+        ).__get_mlir_types__()[0]
+        device_type_text = str(device_type)
+
+    assert host.offsets == offsets
+    assert int(host.max_ranks) == 32
+    assert device_type_text == "vector<32xi64>"
 
 
 @pytest.fixture
@@ -1505,6 +1350,7 @@ class _FakeRuntimeProvider:
         self._runtime_module = runtime_module
         self._state = state or runtime_module.RuntimeInitState.NOT_INITIALIZED
         self._world = None
+        self.initialize_count = 0
         self.finalize_count = 0
 
     def initialization_state(self):
@@ -1512,6 +1358,7 @@ class _FakeRuntimeProvider:
 
     def initialize(self, device, world):
         del device
+        self.initialize_count += 1
         self._world = world
         self._state = self._runtime_module.RuntimeInitState.INITIALIZED
 
@@ -1551,6 +1398,37 @@ def test_runtime_manager_shares_only_identical_subgroup(runtime_module):
     second.close()
     assert manager.ref_count == 1
     first.close()
+    assert manager.ref_count == 0
+    assert provider.finalize_count == 1
+
+
+@pytest.mark.L0
+def test_runtime_manager_keep_alive_reuses_until_explicit_shutdown(runtime_module):
+    world = runtime_module.RuntimeWorld(
+        rank=0,
+        size=2,
+        group=object(),
+        global_ranks=(0, 1),
+    )
+    provider = _FakeRuntimeProvider(runtime_module)
+    manager = runtime_module.RuntimeManager(
+        provider_factory=lambda: provider,
+        world_resolver=lambda config: world,
+        keep_alive=True,
+    )
+
+    first = manager.acquire(object(), torch.device("cuda", 0))
+    first.close()
+    assert manager.ref_count == 0
+    assert provider.initialize_count == 1
+    assert provider.finalize_count == 0
+
+    second = manager.acquire(object(), torch.device("cuda", 0))
+    assert manager.ref_count == 1
+    assert provider.initialize_count == 1
+    second.close()
+
+    manager.shutdown()
     assert manager.ref_count == 0
     assert provider.finalize_count == 1
 

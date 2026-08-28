@@ -21,6 +21,7 @@ from ._launch import _check_overflow
 @dataclass(frozen=True)
 class Mxfp8DgluResult:
     grad_activation: torch.Tensor
+    grad_topk_weights: torch.Tensor
     fc1_recompute: torch.Tensor
     fc1_recompute_sf: torch.Tensor
     fc1_col_output: torch.Tensor
@@ -42,6 +43,10 @@ def launch_backward_dglu(
         grad_activation=inputs.output_activation[
             : inputs.token_count
         ].float(),
+        # The dGLU epilogue has already returned source-order dprob through
+        # the symmetric token-communication plane. Own the public result so a
+        # later launch cannot overwrite it.
+        grad_topk_weights=inputs.dprob[: inputs.token_count].clone(),
         fc1_recompute=inputs.fc1_recompute,
         fc1_recompute_sf=inputs.fc1_recompute_sf,
         fc1_col_output=inputs.fc1_col_output,

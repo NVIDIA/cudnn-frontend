@@ -10,10 +10,16 @@ when a distributed runtime is actually acquired.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
+import os
+import socket
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 import torch
@@ -22,6 +28,104 @@ import torch.distributed as dist
 from .._contracts import ForwardConfig
 
 _logger = logging.getLogger(__name__)
+
+
+def _runtime_debug_enabled() -> bool:
+    return os.environ.get("MOE_EP_DEBUG_RUNTIME", "0") == "1"
+
+
+def _runtime_debug(event: str, **details: object) -> None:
+    if not _runtime_debug_enabled():
+        return
+    fields = {
+        "time": f"{time.monotonic():.6f}",
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "rank": os.environ.get("RANK", "?"),
+        "local_rank": os.environ.get("LOCAL_RANK", "?"),
+        "event": event,
+        **details,
+    }
+    print(
+        "[moe-ep-runtime] "
+        + " ".join(f"{name}={value}" for name, value in fields.items()),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _runtime_debug_init_status(core) -> object:
+    if not _runtime_debug_enabled():
+        return "debug-disabled"
+    try:
+        status = core.init_status()
+    except (AttributeError, RuntimeError):
+        return "unavailable"
+    return getattr(status, "name", status)
+
+
+class _RuntimeWatchdog:
+    """Emit Python stacks and kernel wait channels while NVSHMEM init is blocked."""
+
+    def __init__(self, event: str) -> None:
+        self._event = event
+        self._stopped = threading.Event()
+        try:
+            self._interval = float(
+                os.environ.get("MOE_EP_RUNTIME_WATCHDOG_SECONDS", "30")
+            )
+        except ValueError:
+            self._interval = 30.0
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not _runtime_debug_enabled() or self._interval <= 0:
+            return
+        # faulthandler's timer is implemented outside the Python interpreter
+        # lock, so it still emits the main-thread stack if a native NVSHMEM
+        # call holds the GIL. The Python thread adds /proc wait-channel data
+        # whenever the GIL remains schedulable.
+        faulthandler.dump_traceback_later(
+            self._interval,
+            repeat=True,
+            file=sys.stderr,
+        )
+        self._thread = threading.Thread(
+            target=self._run,
+            name="moe-ep-runtime-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stopped.set()
+        if _runtime_debug_enabled() and self._interval > 0:
+            faulthandler.cancel_dump_traceback_later()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        sample = 0
+        while not self._stopped.wait(self._interval):
+            sample += 1
+            wait_channels: list[str] = []
+            for task_dir in sorted(Path("/proc/self/task").glob("[0-9]*")):
+                try:
+                    thread_name = (task_dir / "comm").read_text().strip()
+                    wait_channel = (task_dir / "wchan").read_text().strip()
+                except OSError as exc:
+                    wait_channels.append(f"{task_dir.name}:unavailable({exc.errno})")
+                else:
+                    wait_channels.append(
+                        f"{task_dir.name}:{thread_name}:{wait_channel or '-'}"
+                    )
+            _runtime_debug(
+                "watchdog",
+                blocked_event=self._event,
+                sample=sample,
+                threads=";".join(wait_channels),
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
 
 
 class RuntimeUnavailableError(RuntimeError):
@@ -183,6 +287,14 @@ class _DefaultNvshmemRuntimeProvider:
             raise ValueError("NVSHMEM initialization requires a process group")
 
         core = _load_nvshmem_core()
+        started_at = time.monotonic()
+        _runtime_debug(
+            "initialize.begin",
+            device=device,
+            ep_rank=world.rank,
+            ep_size=world.size,
+            global_ranks=world.global_ranks,
+        )
         try:
             import numpy as np
 
@@ -194,8 +306,10 @@ class _DefaultNvshmemRuntimeProvider:
             torch.cuda.set_device(device)
             cuda_device = Device(device.index)
             cuda_device.set_current()
+            _runtime_debug("initialize.cuda-current", device=device)
 
             uid = core.get_unique_id(empty=(world.rank != 0))
+            _runtime_debug("initialize.uid-created")
             uid_bytes = uid._data.view(np.uint8).copy()
             uid_tensor = torch.from_numpy(uid_bytes)
             group_backend = dist.get_backend(world.group)
@@ -209,24 +323,51 @@ class _DefaultNvshmemRuntimeProvider:
                 raise RuntimeError(
                     "EP subgroup root changed during NVSHMEM bootstrap"
                 )
+            _runtime_debug(
+                "initialize.uid-broadcast.begin",
+                backend=group_backend,
+                root_global_rank=root_global_rank,
+                tensor_device=uid_tensor.device,
+                tensor_bytes=uid_tensor.numel() * uid_tensor.element_size(),
+            )
             dist.broadcast(
                 uid_tensor,
                 src=root_global_rank,
                 group=world.group,
             )
+            _runtime_debug("initialize.uid-broadcast.end")
+            _runtime_debug("initialize.torch-barrier.begin")
             dist.barrier(group=world.group)
+            _runtime_debug("initialize.torch-barrier.end")
             uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
 
-            core.init(
-                device=cuda_device,
-                uid=uid,
-                rank=world.rank,
-                nranks=world.size,
-                initializer_method="uid",
+            watchdog = _RuntimeWatchdog("core.init")
+            _runtime_debug("initialize.core-init.begin")
+            watchdog.start()
+            try:
+                core.init(
+                    device=cuda_device,
+                    uid=uid,
+                    rank=world.rank,
+                    nranks=world.size,
+                    initializer_method="uid",
+                )
+            finally:
+                watchdog.close()
+            _runtime_debug(
+                "initialize.core-init.end",
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+                init_status=_runtime_debug_init_status(core),
             )
         except RuntimeUnavailableError:
             raise
         except Exception as exc:
+            _runtime_debug(
+                "initialize.error",
+                error_type=type(exc).__name__,
+                error=repr(exc),
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            )
             raise RuntimeUnavailableError(
                 "failed to initialize the NVSHMEM EP subgroup runtime"
             ) from exc
@@ -259,10 +400,31 @@ class _DefaultNvshmemRuntimeProvider:
             ) from exc
 
     def finalize(self) -> None:
+        core = _load_nvshmem_core()
+        started_at = time.monotonic()
+        _runtime_debug(
+            "finalize.begin",
+            init_status=_runtime_debug_init_status(core),
+        )
+        watchdog = _RuntimeWatchdog("core.finalize")
+        watchdog.start()
         try:
-            _load_nvshmem_core().finalize()
+            core.finalize()
         except Exception as exc:
+            _runtime_debug(
+                "finalize.error",
+                error_type=type(exc).__name__,
+                error=repr(exc),
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            )
             raise RuntimeUnavailableError("failed to finalize NVSHMEM") from exc
+        finally:
+            watchdog.close()
+        _runtime_debug(
+            "finalize.end",
+            elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            init_status=_runtime_debug_init_status(core),
+        )
 
 
 @dataclass
@@ -343,9 +505,11 @@ class RuntimeManager:
             _DefaultNvshmemRuntimeProvider
         ),
         world_resolver: Callable[[ForwardConfig], RuntimeWorld] = _resolve_world,
+        keep_alive: bool = False,
     ) -> None:
         self._provider_factory = provider_factory
         self._world_resolver = world_resolver
+        self._keep_alive = keep_alive
 
     @property
     def ref_count(self) -> int:
@@ -370,6 +534,12 @@ class RuntimeManager:
         with _PROCESS_RUNTIME_REGISTRY.lock:
             if _PROCESS_RUNTIME_REGISTRY.active is not None:
                 active = _PROCESS_RUNTIME_REGISTRY.active
+                _runtime_debug(
+                    "manager.acquire-reuse.begin",
+                    ref_count=active.ref_count,
+                    owns_runtime=active.owns_runtime,
+                    cleanup_required=active.cleanup_required,
+                )
                 if active.cleanup_required:
                     raise RuntimeError(
                         "MegaMoE process runtime requires cleanup before reacquire"
@@ -385,6 +555,10 @@ class RuntimeManager:
                         "EP subgroup"
                     )
                 active.ref_count += 1
+                _runtime_debug(
+                    "manager.acquire-reuse.end",
+                    ref_count=active.ref_count,
+                )
                 return RuntimeHandle(
                     self,
                     active.token,
@@ -395,9 +569,19 @@ class RuntimeManager:
 
             provider: Optional[NvshmemRuntimeProvider] = None
             owns_runtime = False
+            _runtime_debug(
+                "manager.acquire-new.begin",
+                device=device,
+                ep_rank=world.rank,
+                ep_size=world.size,
+            )
             if world.size > 1:
                 provider = self._provider_factory()
                 status = provider.initialization_state()
+                _runtime_debug(
+                    "manager.acquire-new.state",
+                    init_status=status.value,
+                )
                 if status is RuntimeInitState.PARTIAL:
                     raise RuntimeError(
                         "cannot attach to a partially initialized NVSHMEM runtime"
@@ -481,6 +665,11 @@ class RuntimeManager:
                 provider=provider,
                 owns_runtime=owns_runtime,
             )
+            _runtime_debug(
+                "manager.acquire-new.end",
+                owns_runtime=owns_runtime,
+                ref_count=1,
+            )
             return RuntimeHandle(self, token, device, world, owns_runtime)
 
     @staticmethod
@@ -559,16 +748,47 @@ class RuntimeManager:
             active.provider.finalize()
             _PROCESS_RUNTIME_REGISTRY.active = None
 
+    def shutdown(self) -> None:
+        """Finalize an idle process runtime at a caller-controlled collective point."""
+
+        with _PROCESS_RUNTIME_REGISTRY.lock:
+            active = _PROCESS_RUNTIME_REGISTRY.active
+            if active is None:
+                return
+            if active.ref_count != 0:
+                raise RuntimeError(
+                    "cannot shut down the MegaMoE process runtime while "
+                    f"{active.ref_count} handles remain active"
+                )
+            if active.provider is not None and (
+                active.owns_runtime or active.cleanup_required
+            ):
+                _runtime_debug(
+                    "manager.shutdown-finalize.begin",
+                    cleanup_required=active.cleanup_required,
+                )
+                active.provider.finalize()
+                _runtime_debug("manager.shutdown-finalize.end")
+            _PROCESS_RUNTIME_REGISTRY.active = None
+            _runtime_debug("manager.shutdown.end")
+
     def _release(self, token: object) -> None:
         with _PROCESS_RUNTIME_REGISTRY.lock:
             active = _PROCESS_RUNTIME_REGISTRY.active
             if active is None or active.token is not token:
+                _runtime_debug("manager.release-stale")
                 return
             if active.ref_count <= 0:
                 raise RuntimeError(
                     "MegaMoE process runtime has invalid release state"
                 )
 
+            _runtime_debug(
+                "manager.release.begin",
+                ref_count=active.ref_count,
+                owns_runtime=active.owns_runtime,
+                cleanup_required=active.cleanup_required,
+            )
             if active.cleanup_required:
                 if active.ref_count != 1 or active.provider is None:
                     raise RuntimeError(
@@ -576,22 +796,39 @@ class RuntimeManager:
                     )
                 active.provider.finalize()
                 _PROCESS_RUNTIME_REGISTRY.active = None
+                _runtime_debug("manager.release.cleanup-retry.end")
                 return
 
             if active.ref_count > 1:
                 active.ref_count -= 1
+                _runtime_debug(
+                    "manager.release-retained",
+                    ref_count=active.ref_count,
+                )
+                return
+
+            if self._keep_alive and not active.cleanup_required:
+                active.ref_count = 0
+                _runtime_debug(
+                    "manager.release-idle",
+                    owns_runtime=active.owns_runtime,
+                )
                 return
 
             if active.owns_runtime and active.provider is not None:
+                _runtime_debug("manager.release-finalize.begin")
                 try:
                     active.provider.finalize()
                 except Exception:
                     active.cleanup_required = True
+                    _runtime_debug("manager.release-finalize.error")
                     raise
+                _runtime_debug("manager.release-finalize.end")
             _PROCESS_RUNTIME_REGISTRY.active = None
+            _runtime_debug("manager.release.end", ref_count=0)
 
 
-_DEFAULT_RUNTIME_MANAGER = RuntimeManager()
+_DEFAULT_RUNTIME_MANAGER = RuntimeManager(keep_alive=True)
 
 
 def get_runtime_manager() -> RuntimeManager:

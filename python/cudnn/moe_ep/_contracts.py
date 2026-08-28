@@ -11,7 +11,7 @@ from typing import Any, Literal, Optional
 import torch
 
 from ._tuning import MoeEpTuningConfig
-from ._types import MoeEpWgradForwardStash, MoeTensor
+from ._types import MoeTensor
 
 
 @dataclass(frozen=True)
@@ -55,26 +55,7 @@ class ValidatedForwardRequest:
     device: torch.device
 
 
-@dataclass(frozen=True)
-class ValidatedBackwardRequest:
-    """Runtime inputs that have passed the public backward contract."""
-
-    config: ForwardConfig
-    grad_output: torch.Tensor
-    fc1_weight: MoeTensor
-    fc2_weight: MoeTensor
-    topk_idx: torch.Tensor
-    topk_weights: torch.Tensor
-    fc1_c: torch.Tensor
-    route_metadata: torch.Tensor
-    token_count: int
-    local_routes: int
-    device: torch.device
-    wgrad_forward_stash: Optional[MoeEpWgradForwardStash] = None
-
-
 __all__ = [
     "ForwardConfig",
-    "ValidatedBackwardRequest",
     "ValidatedForwardRequest",
 ]

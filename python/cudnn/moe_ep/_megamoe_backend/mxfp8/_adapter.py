@@ -108,6 +108,23 @@ def _typed_view(
     return byte_tensor.view(dtype).reshape(shape)
 
 
+def _typed_k_major_view(
+    byte_tensor: torch.Tensor,
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+) -> torch.Tensor:
+    """Return a rank-2 ``(K,N)`` view with K as the unit-stride mode."""
+
+    if len(shape) != 2:
+        raise ValueError(f"K-major view requires rank-2 shape, got {shape}")
+    rows, columns = shape
+    return _typed_view(
+        byte_tensor,
+        dtype,
+        (columns, rows),
+    ).transpose(0, 1)
+
+
 def _as_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.uint8)
 
@@ -500,7 +517,7 @@ class Mxfp8InputAdapter:
                 raise ValueError(
                     "enabled column requant requires positive output capacities"
                 )
-            col_quant_data = _typed_view(
+            col_quant_data = _typed_k_major_view(
                 local["col_quant_data"],
                 _MXFP8_DATA_DTYPE,
                 (col_quant_data_rows, config.hidden),
@@ -536,7 +553,7 @@ class Mxfp8InputAdapter:
         topk_weights[:token_count].copy_(request.topk_weights)
         _as_bytes(output_data).zero_()
         if col_quant_data is not None:
-            _as_bytes(col_quant_data).zero_()
+            local["col_quant_data"].zero_()
         if col_quant_sf is not None:
             col_quant_sf.zero_()
         overflow_flag.zero_()

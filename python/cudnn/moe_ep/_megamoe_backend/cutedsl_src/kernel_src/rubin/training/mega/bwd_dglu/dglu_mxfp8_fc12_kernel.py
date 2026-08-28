@@ -418,7 +418,8 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.num_c_stage = 2
         assert self.num_c_stage % 2 == 0, f"num_c_stage must be even, got {self.num_c_stage}"
         self.num_c_pipe_stage = self.num_c_stage // 2
-        self.num_d_stage = 2
+        # One PipelineTmaStore stage contains every dFC2 data output tile.
+        self.num_d_stage = self.epilogue.d_output_slots
         c_bytes_total = self.num_c_stage * self.epilogue.preact_bytes_per_stage
         d_bytes_total = self.num_d_stage * self.epilogue.d_bytes_per_stage
         self.c_bytes_total = c_bytes_total
@@ -876,21 +877,19 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # fc1_recompute: forward swiglu recomputed from the fc1 c-tensor.
-        intermediate_downproj_half = fc1_recompute.shape[1]
+        # dFC2 auxiliary data planes use the public token-major ABI.
         fc1_recompute_gemm = cute.make_tensor(
             fc1_recompute.iterator,
             cute.make_layout(
-                (tokens_sum, intermediate_downproj_half, 1),
+                (fc1_recompute.shape[0], fc1_recompute.shape[1], 1),
                 stride=(fc1_recompute.stride[0], fc1_recompute.stride[1], 0),
             ),
         )
 
-        # fc1_col_output: col-quantized grad_y1 alongside row-quant fc1_output.
         fc1_col_output_gemm = cute.make_tensor(
             fc1_col_output.iterator,
             cute.make_layout(
-                (tokens_sum, intermediate_downproj, 1),
+                (fc1_col_output.shape[0], fc1_col_output.shape[1], 1),
                 stride=(fc1_col_output.stride[0], fc1_col_output.stride[1], 0),
             ),
         )
@@ -1071,6 +1070,18 @@ class Sm107Mxfp8DgluDfc21Kernel:
             self.epilogue.d_smem_layout_one_stage,
             self.epilogue.d_epi_tile,
         )
+        tma_atom_fc1_recompute, tma_tensor_fc1_recompute = cpasync.make_tiled_tma_atom(
+            grad_y1_tma_op,
+            fc1_recompute_gemm,
+            self.epilogue.d_smem_layout_one_stage,
+            self.epilogue.d_epi_tile,
+        )
+        tma_atom_fc1_col_output, tma_tensor_fc1_col_output = cpasync.make_tiled_tma_atom(
+            grad_y1_tma_op,
+            fc1_col_output_gemm,
+            self.epilogue.d_smem_layout_one_stage,
+            self.epilogue.d_epi_tile,
+        )
 
         # fc1 SFC GMEM tensor (= fc1_output_sf user view).  No TMA atom; it is
         # per-thread STG.
@@ -1082,23 +1093,19 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # fc1_recompute SFC GMEM storage. The epilogue uses the iterator as the
-        # base of per-expert MN-major 128-column × 4-token-block atoms.
-        fc1_recompute_sf_row_blocks = fc1_recompute_sf.shape[0]
+        # Token-major blocked SF carriers.
         fc1_recompute_sf_gemm = cute.make_tensor(
             fc1_recompute_sf.iterator,
             cute.make_layout(
-                (fc1_recompute_sf_row_blocks, intermediate_downproj_half, 1),
+                (fc1_recompute_sf.shape[0], fc1_recompute_sf.shape[1], 1),
                 stride=(fc1_recompute_sf.stride[0], fc1_recompute_sf.stride[1], 0),
             ),
         )
 
-        # fc1_col_output SFC GMEM storage, likewise atom-packed by the epilogue.
-        fc1_col_output_sf_row_blocks = fc1_col_output_sf.shape[0]
         fc1_col_output_sf_gemm = cute.make_tensor(
             fc1_col_output_sf.iterator,
             cute.make_layout(
-                (fc1_col_output_sf_row_blocks, intermediate_downproj, 1),
+                (fc1_col_output_sf.shape[0], fc1_col_output_sf.shape[1], 1),
                 stride=(fc1_col_output_sf.stride[0], fc1_col_output_sf.stride[1], 0),
             ),
         )
@@ -1216,11 +1223,12 @@ class Sm107Mxfp8DgluDfc21Kernel:
             tma_tensor_fc1_preact,
             tma_atom_grad_y1,
             tma_tensor_grad_y1,
-            # fc1_recompute (forward swiglu) — per-thread STG, N = inter_half
-            fc1_recompute_gemm,
+            # token-major auxiliary data — TMA S2G stores
+            tma_atom_fc1_recompute,
+            tma_tensor_fc1_recompute,
             fc1_recompute_sf_gemm,
-            # fc1_col_output (col-quant grad_y1) — per-thread STG, N = intermediate
-            fc1_col_output_gemm,
+            tma_atom_fc1_col_output,
+            tma_tensor_fc1_col_output,
             fc1_col_output_sf_gemm,
             # topk / beta / dprob + cross-phase sync workspace
             topk_scores,
@@ -1298,11 +1306,12 @@ class Sm107Mxfp8DgluDfc21Kernel:
         # grad_y1 (dfc2 output) — TMA S2G store
         tma_atom_grad_y1: cute.CopyAtom,
         tma_tensor_grad_y1: cute.Tensor,
-        # fc1_recompute (forward swiglu) — per-thread STG, N = inter_half
-        fc1_recompute_gemm: cute.Tensor,
+        # token-major auxiliary data — TMA S2G stores
+        tma_atom_fc1_recompute: cute.CopyAtom,
+        tma_tensor_fc1_recompute: cute.Tensor,
         fc1_recompute_sf_gemm: cute.Tensor,
-        # fc1_col_output (col-quant grad_y1) — per-thread STG, N = intermediate
-        fc1_col_output_gemm: cute.Tensor,
+        tma_atom_fc1_col_output: cute.CopyAtom,
+        tma_tensor_fc1_col_output: cute.Tensor,
         fc1_col_output_sf_gemm: cute.Tensor,
         # topk / beta / dprob + cross-phase sync workspace
         topk_scores: cute.Tensor,
@@ -1349,6 +1358,13 @@ class Sm107Mxfp8DgluDfc21Kernel:
             fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[1] - 1
         ) // self.cta_tile_shape_mnk[1] * self.epilogue._atom_thr_size
 
+        if cutlass.const_expr(self.enable_token_comm):
+            _aux_expert_sizes = self.token_comm.local_expert_sizes(
+                self._mega_device_workspace, mega_local_rank
+            )
+        else:
+            _aux_expert_sizes = expert_token_sizes
+
         ext = DgluMxFp8Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,
@@ -1360,6 +1376,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
             # Fold the 2 CTAs of a cluster onto one fc1_ready slot
             cluster_m=self.epilogue._atom_thr_size,
+            expert_token_sizes=_aux_expert_sizes,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
         )
 
         warp_idx = cute.arch.warp_idx()
@@ -1423,7 +1442,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 ],
                 1024,
             ]
-            # grad_y1 (dfc2 output) store staging — stage 0 = gate, stage 1 = up.
+            # Unified dFC2 data-output staging; slot count is compile-time gated.
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.fc1_output_dtype,
@@ -1502,7 +1521,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             32 * len(self.epilogue_warp_id),
         )
         d_pipeline = pipeline.PipelineTmaStore.create(
-            num_stages=num_d_stage // 2,
+            num_stages=num_d_stage // self.epilogue.d_output_slots,
             producer_group=d_producer_group,
         )
 
@@ -1588,7 +1607,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             swizzle=preact_smem_layout_staged.inner,
         )
 
-        # grad_y1 (dfc2 output) store staging tensor (stage 0 = gate, stage 1 = up).
+        # Unified dFC2 data-output store staging tensor.
         d_smem_layout_staged = self.epilogue.d_staged_smem_layout(num_d_stage)
         sD = storage.sD.get_tensor(
             d_smem_layout_staged.outer,
@@ -2249,9 +2268,11 @@ class Sm107Mxfp8DgluDfc21Kernel:
                 sched_ext=ext,
                 gmem_fc1_output=tma_tensor_grad_y1,
                 gmem_fc1_output_sf=fc1_output_sf_gemm,
-                gmem_fc1_recompute=fc1_recompute_gemm,
+                tma_atom_fc1_recompute=tma_atom_fc1_recompute,
+                gmem_fc1_recompute=tma_tensor_fc1_recompute,
                 gmem_fc1_recompute_sf=fc1_recompute_sf_gemm,
-                gmem_fc1_col_output=fc1_col_output_gemm,
+                tma_atom_fc1_col_output=tma_atom_fc1_col_output,
+                gmem_fc1_col_output=tma_tensor_fc1_col_output,
                 gmem_fc1_col_output_sf=fc1_col_output_sf_gemm,
                 smem_preact_buffer=sPre,
                 c_pipeline=c_pipeline,

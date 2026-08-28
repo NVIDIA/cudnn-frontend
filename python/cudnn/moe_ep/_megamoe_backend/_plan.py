@@ -11,11 +11,7 @@ from typing import Optional
 
 import torch
 
-from .._contracts import (
-    ForwardConfig,
-    ValidatedBackwardRequest,
-    ValidatedForwardRequest,
-)
+from .._contracts import ForwardConfig, ValidatedForwardRequest
 from ._comm import SymmetricMemoryProvider
 from ._runtime import RuntimeHandle, RuntimeManager, get_runtime_manager
 from ._workspace import (
@@ -82,7 +78,7 @@ class ExecutionPlanOwner:
 
     def prepare(
         self,
-        request: ValidatedForwardRequest | ValidatedBackwardRequest,
+        request: ValidatedForwardRequest,
     ) -> PreparedResources:
         with self._lock:
             if self._closed:

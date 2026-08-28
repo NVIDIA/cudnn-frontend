@@ -164,10 +164,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             fake_arguments["fc1_c"] = None
 
         if self.enable_col_quant:
-            # col_quant_data shares the dispatch pool's row-major (token, hidden) layout;
+            # col_quant_data is logically (token, hidden) with token unit stride;
             # col_quant_sf is flat concat_e [hidden_atom][token_atom] E8M0 bytes.
             fake_arguments["col_quant_data"] = fake_tensor(
-                self.ab_dtype, aux_shapes["col_quant_data"], (1, 0), set(), 16
+                self.ab_dtype, aux_shapes["col_quant_data"], (0, 1), set(), 16
             )
             fake_arguments["col_quant_sf"] = fake_tensor(
                 cutlass.Uint8, aux_shapes["col_quant_sf"], (0,), set(), 16
@@ -515,6 +515,7 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 num_persistent_ctas=self._col_quant_num_ctas,
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
+                dst_k_major=True,
             )
 
     def get_aux_output_shapes(self) -> dict:
@@ -529,7 +530,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         }
 
     @cute.jit
-    def _validate_fixed_matrix(self, tensor: cute.Tensor, dtype, expected_shape) -> None:
+    def _validate_fixed_matrix(
+        self, tensor: cute.Tensor, dtype, expected_shape, expected_stride=None
+    ) -> None:
         if cutlass.const_expr(tensor.element_type is not dtype):
             raise TypeError("pool-domain matrix has an unexpected element type.")
         if cutlass.const_expr(cute.rank(tensor.layout) != 2):
@@ -541,8 +544,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             or tensor.shape[1] != expected_shape[1]
         ):
             raise ValueError(f"pool-domain matrix must have static shape {expected_shape}.")
-        if cutlass.const_expr(tensor.stride[0] != expected_shape[1] or tensor.stride[1] != 1):
-            raise ValueError("pool-domain matrix must be compact row-major.")
+        stride = (expected_shape[1], 1) if expected_stride is None else expected_stride
+        if cutlass.const_expr(tensor.stride[0] != stride[0] or tensor.stride[1] != stride[1]):
+            raise ValueError("pool-domain matrix has an unexpected stride.")
 
     @cute.jit
     def _validate_fixed_vector(self, tensor: cute.Tensor, dtype, expected_size: int) -> None:
@@ -739,7 +743,10 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             if cutlass.const_expr(col_quant_data is None or col_quant_sf is None):
                 raise ValueError("enable_col_quant=True requires data and scale outputs.")
             self._validate_fixed_matrix(
-                col_quant_data, self.ab_dtype, aux_shapes["col_quant_data"]
+                col_quant_data,
+                self.ab_dtype,
+                aux_shapes["col_quant_data"],
+                (1, aux_shapes["col_quant_data"][0]),
             )
             self._validate_fixed_vector(
                 col_quant_sf, cutlass.Uint8, aux_shapes["col_quant_sf"][0]

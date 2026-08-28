@@ -4,8 +4,11 @@
 from ._tuning import MoeEpTuningConfig
 from ._types import (
     BlockScaledTensor,
-    MoeEpWgradForwardStash,
-    MoeEpWgradOperands,
+    MoeEpExecutionLane,
+    MoeEpTrainingResources,
+    MoeEpTrainingSlot,
+    MoeEpTrainingWeights,
+    MoeEpTrainingWgradOperands,
     MoeFormat,
     MoeTensor,
 )
@@ -14,9 +17,12 @@ from .api import MoeEp
 __all__ = [
     "BlockScaledTensor",
     "MoeEp",
+    "MoeEpExecutionLane",
+    "MoeEpTrainingResources",
+    "MoeEpTrainingSlot",
+    "MoeEpTrainingWeights",
+    "MoeEpTrainingWgradOperands",
     "MoeEpTuningConfig",
-    "MoeEpWgradForwardStash",
-    "MoeEpWgradOperands",
     "MoeFormat",
     "MoeTensor",
 ]

@@ -148,6 +148,12 @@ class DgluMxfp8Epilogue:
 
         self._dfc2_recompute = dfc2_recompute
         self._dfc2_col_output = dfc2_col_output
+        # One PipelineTmaStore stage holds every data plane produced by a dFC2 subtile
+        self._d_output_slots = (
+            2
+            + (2 if dfc2_col_output else 0)
+            + (1 if dfc2_recompute else 0)
+        )
 
         # combine_format determines the dfc1 (final grad_x) combine encoding.
         if combine_format is None:
@@ -172,7 +178,7 @@ class DgluMxfp8Epilogue:
         )
 
         pass
-
+        
     # -- Codegen-time queries  --
 
     @property
@@ -186,6 +192,10 @@ class DgluMxfp8Epilogue:
     @property
     def num_acc_stage(self) -> int:
         return self._num_acc_stage
+
+    @property
+    def d_output_slots(self) -> int:
+        return self._d_output_slots
 
     @property
     def subtile_cnt(self) -> int:
@@ -281,6 +291,24 @@ class DgluMxfp8Epilogue:
         return cute.size_in_bytes(cutlass.BFloat16, self.preact_smem_layout_one_stage)
 
     @cute.jit
+    def _store_aux_row_smem(self, r_data: cute.Tensor, s_data: cute.Tensor) -> None:
+        """Store one 32-byte token row as two swizzle-safe 128-bit segments."""
+        segment_elements = 16
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.fc1_output_dtype,
+            num_bits_per_copy=128,
+        )
+        r_segments = cute.zipped_divide(r_data, (segment_elements,))
+        s_segments = cute.zipped_divide(s_data, (segment_elements,))
+        for segment in cutlass.range_constexpr(EpilogueTileN // segment_elements):
+            cute.copy(
+                store_atom,
+                cute.coalesce(r_segments[None, segment]),
+                cute.coalesce(s_segments[None, segment]),
+            )
+
+    @cute.jit
     def _run_dfc2_task_tile(
         self,
         work_tile_info,
@@ -290,8 +318,10 @@ class DgluMxfp8Epilogue:
         sched_ext,
         gmem_fc1_output: cute.Tensor,
         gmem_fc1_output_sf: cute.Tensor,
+        tma_atom_fc1_recompute: cute.CopyAtom,
         gmem_fc1_recompute: cute.Tensor,
         gmem_fc1_recompute_sf: cute.Tensor,
+        tma_atom_fc1_col_output: cute.CopyAtom,
         gmem_fc1_col_output: cute.Tensor,
         gmem_fc1_col_output_sf: cute.Tensor,
         c_pipeline,
@@ -461,15 +491,48 @@ class DgluMxfp8Epilogue:
                 (self._cta_tile_m, EpilogueTileN, 1),
                 (base_token_tile, gate_col_idx + cutlass.Int32(1), cutlass.Int32(0)),
             )[(None, None, 0)]
+            g_col_gate = None
+            g_col_up = None
+            if cutlass.const_expr(self._dfc2_col_output):
+                g_col_gate = cute.local_tile(
+                    real_fc1_col_output,
+                    (self._cta_tile_m, EpilogueTileN, 1),
+                    (base_token_tile, gate_col_idx, cutlass.Int32(0)),
+                )[(None, None, 0)]
+                g_col_up = cute.local_tile(
+                    real_fc1_col_output,
+                    (self._cta_tile_m, EpilogueTileN, 1),
+                    (base_token_tile, gate_col_idx + cutlass.Int32(1), cutlass.Int32(0)),
+                )[(None, None, 0)]
+            g_recompute = None
+            if cutlass.const_expr(self._dfc2_recompute):
+                recompute_col_idx = (
+                    work_tile_info.tile_n_idx
+                    * cutlass.Int32(self._cta_tile_n // EpilogueTileN)
+                    + subtile_idx
+                )
+                g_recompute = cute.local_tile(
+                    real_fc1_recompute,
+                    (self._cta_tile_m, EpilogueTileN, 1),
+                    (base_token_tile, recompute_col_idx, cutlass.Int32(0)),
+                )[(None, None, 0)]
             # TMA issue (warp 0 only).
-            d_n_slots = cutlass.const_expr(d_num_stage // 2)
-            d_slot = cutlass.Int32(2) * (cutlass.Int32(i) % cutlass.Int32(d_n_slots))
+            d_outputs_per_stage = cutlass.const_expr(self._d_output_slots)
+            d_n_stages = cutlass.const_expr(d_num_stage // d_outputs_per_stage)
+            d_slot = cutlass.Int32(d_outputs_per_stage) * (
+                cutlass.Int32(i) % cutlass.Int32(d_n_stages)
+            )
             if warp_idx == self._epilogue_warp_ids[0]:
-                self.tma_store_dfc2_output(
+                self.tma_store_dfc2_outputs(
                     smem_d_buffer,
                     tma_atom_grad_y1,
                     g_gate,
                     g_up,
+                    tma_atom_fc1_col_output,
+                    g_col_gate,
+                    g_col_up,
+                    tma_atom_fc1_recompute,
+                    g_recompute,
                     valid_tokens,
                     d_pipeline,
                     d_slot,
@@ -479,7 +542,7 @@ class DgluMxfp8Epilogue:
 
         valid_inter = real_fc1_output.shape[1]
         self._stg_sf_dfc2(rmem_sf, real_fc1_output_sf, work_tile_info, tidx, valid_inter)
-
+    
         # fc1_recompute SFs
         if cutlass.const_expr(self._dfc2_recompute):
             valid_inter_recompute = real_fc1_recompute.shape[1]
@@ -618,7 +681,7 @@ class DgluMxfp8Epilogue:
         c_shape = cute.make_layout(((1, EN,), 1, 1), stride=((0, 1,), 0, 0)).shape
         c_gate = cute.make_rmem_tensor(c_shape, self.fc1_output_dtype)
         c_up   = cute.make_rmem_tensor(c_shape, self.fc1_output_dtype)
-        # c_recompute: flat MXFP8 row for per-thread STG
+        # c_recompute: flat MXFP8 row for token-major output staging
         c_recompute = cute.make_rmem_tensor(cute.make_layout(EN).shape, self.fc1_output_dtype)
 
         is_valid_row = token_row_in_cta < valid_tokens
@@ -667,32 +730,6 @@ class DgluMxfp8Epilogue:
                     rmem_sf_col_output[2 * _k]     = qg_col
                     rmem_sf_col_output[2 * _k + 1] = qu_col
 
-            # STG gate + up MXFP8 cols -- only valid rows and in-range N strips.
-            if is_valid_row:
-                n_col_strips = 2 * (self._cta_tile_n // EN)
-                gate_strip_idx = (
-                    work_tile_info.tile_n_idx * cutlass.Int32(n_col_strips)
-                    + subtile_idx * cutlass.Int32(2)
-                )
-                up_strip_idx = gate_strip_idx + cutlass.Int32(1)
-                token_idx = (
-                    work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m) + token_row_in_cta
-                )
-                for strip_idx, r_data in ((gate_strip_idx, c_gate_col), (up_strip_idx, c_up_col)):
-                    if strip_idx * cutlass.Int32(EN) < real_fc1_col_output.shape[1]:
-                        strip_base = cute.local_tile(
-                            real_fc1_col_output, (1, EN, 1),
-                            (token_idx, strip_idx, cutlass.Int32(0)),
-                        )
-                        strip_ptr = cute.make_ptr(
-                            self.fc1_output_dtype,
-                            strip_base.iterator.toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=EN,
-                        )
-                        gmem_strip = cute.make_tensor(strip_ptr, cute.make_layout(EN))
-                        cute.autovec_copy(r_data, gmem_strip)
-
         # quantize each half to MXFP8 + E8M0 row SF (per-thread, no warp reduction) ----
         qg = quant_sfd_row(
             d_gate, c_gate, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype,
@@ -707,7 +744,7 @@ class DgluMxfp8Epilogue:
                 rmem_sf[2 * _k] = qg
                 rmem_sf[2 * _k + 1] = qu
 
-        # dfc2_recompute: forward swiglu + col quant + per-thread STG
+        # dfc2_recompute: forward swiglu + column quantization
         if cutlass.const_expr(self._dfc2_recompute):
             c_recompute_f32 = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
             if cutlass.const_expr(self._act_func == "swiglu"):
@@ -726,41 +763,35 @@ class DgluMxfp8Epilogue:
                 if subtile_idx == cutlass.Int32(_k):
                     rmem_sf_recompute[_k] = qc
 
-            # STG c_recompute -- only valid rows and in-range N strips.
-            if is_valid_row:
-                c_col_idx = (
-                    work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n // EN)
-                    + subtile_idx
-                )
-                expert_local_token_idx = (
-                    work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m) + token_row_in_cta
-                )
-                if c_col_idx * cutlass.Int32(EN) < real_fc1_recompute.shape[1]:
-                    c_base = cute.local_tile(
-                        real_fc1_recompute, (1, EN, 1),
-                        (expert_local_token_idx, c_col_idx, cutlass.Int32(0)),
-                    )
-                    c_ptr = cute.make_ptr(
-                        self.fc1_output_dtype,
-                        c_base.iterator.toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=EN,
-                    )
-                    gmem_c = cute.make_tensor(c_ptr, cute.make_layout(EN))
-                    cute.autovec_copy(c_recompute, gmem_c)
-
         # BARRIER: drain PREVIOUS subtile's TMA BEFORE R2S.
         if warp_idx == self._epilogue_warp_ids[0]:
             d_pipeline.producer_acquire()
         epilog_sync.arrive_and_wait()
 
         # Write d to smem.
-        d_n_slots = cutlass.const_expr(d_num_stage // 2)
-        d_slot = cutlass.Int32(2) * (subtile_i % cutlass.Int32(d_n_slots))
+        d_outputs_per_stage = cutlass.const_expr(self._d_output_slots)
+        d_n_stages = cutlass.const_expr(d_num_stage // d_outputs_per_stage)
+        d_slot = cutlass.Int32(d_outputs_per_stage) * (
+            subtile_i % cutlass.Int32(d_n_stages)
+        )
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         sd = thr_copy_r2s.partition_D(smem_d)
         cute.copy(tiled_copy_r2s, c_gate, sd[(None, None, None, d_slot)])
         cute.copy(tiled_copy_r2s, c_up,   sd[(None, None, None, d_slot + cutlass.Int32(1))])
+
+        # Auxiliary data planes use the public token-major ABI.
+        next_slot = d_slot + cutlass.Int32(2)
+        if cutlass.const_expr(self._dfc2_col_output):
+            s_col_gate = cute.slice_(smem_d, (token_row_in_cta, None, next_slot))
+            s_col_up = cute.slice_(
+                smem_d, (token_row_in_cta, None, next_slot + cutlass.Int32(1))
+            )
+            self._store_aux_row_smem(c_gate_col, s_col_gate)
+            self._store_aux_row_smem(c_up_col, s_col_up)
+            next_slot = next_slot + cutlass.Int32(2)
+        if cutlass.const_expr(self._dfc2_recompute):
+            s_recompute = cute.slice_(smem_d, (token_row_in_cta, None, next_slot))
+            self._store_aux_row_smem(c_recompute, s_recompute)
 
         iket.range_pop()
         return c_consumer_state, subtile_dprob
@@ -809,33 +840,23 @@ class DgluMxfp8Epilogue:
         self,
         real_sf: cute.Tensor,
         row_block,
-        col,
-        hidden_atoms,
+        feature,
+        _feature_atoms,
         sf_value,
     ) -> None:
-        """Store one col-SF in the MN-major 128-column × 4-token-block atom."""
+        """Store one SF in a 128-feature × 4-token-block atom."""
         token_atom = row_block // cutlass.Int32(4)
         token_bank = row_block % cutlass.Int32(4)
-        hidden_atom = col // cutlass.Int32(128)
-        hidden_bank = (col // cutlass.Int32(32)) % cutlass.Int32(4)
-        hidden_lane = col % cutlass.Int32(32)
-        atom_idx = Int64(token_atom) * Int64(hidden_atoms) + Int64(hidden_atom)
-        byte_offset = (
-            atom_idx * Int64(512)
-            + Int64(hidden_lane) * Int64(16)
-            + Int64(hidden_bank) * Int64(4)
-            + Int64(token_bank)
+        feature_atom = feature // cutlass.Int32(128)
+        feature_bank = (feature // cutlass.Int32(32)) % cutlass.Int32(4)
+        feature_lane = feature % cutlass.Int32(32)
+        atom_byte = (
+            feature_lane * cutlass.Int32(16)
+            + feature_bank * cutlass.Int32(4)
+            + token_bank
         )
-        sf_ptr = cute.make_ptr(
-            self.sf_dtype,
-            real_sf.iterator.toint() + byte_offset,
-            cute.AddressSpace.gmem,
-            assumed_align=1,
-        )
-        gmem_sf1 = cute.make_tensor(sf_ptr, cute.make_layout(1))
-        r_sf1 = cute.make_rmem_tensor(cute.make_layout(1).shape, self.sf_dtype)
-        r_sf1[0] = sf_value.to(self.sf_dtype)
-        cute.autovec_copy(r_sf1, gmem_sf1)
+        if feature_atom < real_sf.shape[0] and token_atom < real_sf.shape[1]:
+            real_sf[feature_atom, token_atom, atom_byte] = sf_value.to(self.sf_dtype)
 
     @cute.jit
     def _stg_sf_recompute(
@@ -863,12 +884,9 @@ class DgluMxfp8Epilogue:
         col_base = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
         )
-        # Row predicate: a warp stores its SF only if its 32-row block overlaps
-        # the CTA tile's valid rows.
-        warp_rows_valid = (warp_idx_local * cutlass.Int32(sf_vec_size)) < valid_tokens
         for s in cutlass.range_constexpr(self._cta_tile_n // EN):
             col = col_base + cutlass.Int32(s * EN) + warp_lane_idx
-            if warp_rows_valid and col < valid_inter:
+            if col < valid_inter:
                 self._stg_col_sf_atom_value(
                     real_fc1_recompute_sf,
                     row_block,
@@ -903,11 +921,10 @@ class DgluMxfp8Epilogue:
         col_base = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n * 2)
         )
-        warp_rows_valid = (warp_idx_local * cutlass.Int32(sf_vec_size)) < valid_tokens
         for s in cutlass.range_constexpr(self._cta_tile_n // EN):
             for gu in cutlass.range_constexpr(2):
                 col = col_base + cutlass.Int32((2 * s + gu) * EN) + warp_lane_idx
-                if warp_rows_valid and col < valid_inter:
+                if col < valid_inter:
                     self._stg_col_sf_atom_value(
                         real_fc1_col_output_sf,
                         row_block,
@@ -917,33 +934,74 @@ class DgluMxfp8Epilogue:
                     )
 
     @cute.jit
-    def tma_store_dfc2_output(
+    def _tma_store_tile(
+        self,
+        smem_tile: cute.Tensor,
+        tma_atom: cute.CopyAtom,
+        gmem_tile: cute.Tensor,
+    ) -> None:
+        tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(smem_tile, 0, 2),
+            cute.group_modes(gmem_tile, 0, 2),
+        )
+        cute.copy(tma_atom, tma_smem_src, tma_gmem_dst)
+
+    @cute.jit
+    def tma_store_dfc2_outputs(
         self,
         smem_d_buffer: cute.Tensor,
-        tma_atom: cute.CopyAtom,
+        tma_atom_grad_y1: cute.CopyAtom,
         g_gate_2d: cute.Tensor,
         g_up_2d: cute.Tensor,
+        tma_atom_col_output: cute.CopyAtom,
+        g_col_gate_2d,
+        g_col_up_2d,
+        tma_atom_recompute: cute.CopyAtom,
+        g_recompute_2d,
         valid_tokens,
         d_pipeline,
         d_slot,
     ) -> None:
-        """TMA-store one subtile's gate+up from shared sD stages to grad_y1 GMEM."""
-        sD_gate = cute.slice_(smem_d_buffer, (None, None, d_slot))
-        sD_up = cute.slice_(smem_d_buffer, (None, None, d_slot + cutlass.Int32(1)))
-        bSG_sD_gate, bSG_g_gate = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1),
-            cute.group_modes(sD_gate, 0, 2),
-            cute.group_modes(g_gate_2d, 0, 2),
-        )
-        bSG_sD_up, bSG_g_up = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1),
-            cute.group_modes(sD_up, 0, 2),
-            cute.group_modes(g_up_2d, 0, 2),
-        )
+        """Issue one TMA store group for every dFC2 data plane."""
         tile_is_valid = valid_tokens > cutlass.Int32(0)
         if tile_is_valid:
-            cute.copy(tma_atom, bSG_sD_gate, bSG_g_gate)
-            cute.copy(tma_atom, bSG_sD_up, bSG_g_up)
+            self._tma_store_tile(
+                cute.slice_(smem_d_buffer, (None, None, d_slot)),
+                tma_atom_grad_y1,
+                g_gate_2d,
+            )
+            self._tma_store_tile(
+                cute.slice_(
+                    smem_d_buffer, (None, None, d_slot + cutlass.Int32(1))
+                ),
+                tma_atom_grad_y1,
+                g_up_2d,
+            )
+            next_slot = d_slot + cutlass.Int32(2)
+            if cutlass.const_expr(self._dfc2_col_output):
+                self._tma_store_tile(
+                    cute.slice_(smem_d_buffer, (None, None, next_slot)),
+                    tma_atom_col_output,
+                    g_col_gate_2d,
+                )
+                self._tma_store_tile(
+                    cute.slice_(
+                        smem_d_buffer,
+                        (None, None, next_slot + cutlass.Int32(1)),
+                    ),
+                    tma_atom_col_output,
+                    g_col_up_2d,
+                )
+                next_slot = next_slot + cutlass.Int32(2)
+            if cutlass.const_expr(self._dfc2_recompute):
+                self._tma_store_tile(
+                    cute.slice_(smem_d_buffer, (None, None, next_slot)),
+                    tma_atom_recompute,
+                    g_recompute_2d,
+                )
         d_pipeline.producer_commit()
 
 
@@ -1333,8 +1391,10 @@ class DgluMxfp8Epilogue:
         sched_ext,
         gmem_fc1_output: cute.Tensor,
         gmem_fc1_output_sf: cute.Tensor,
+        tma_atom_fc1_recompute: cute.CopyAtom,
         gmem_fc1_recompute: Optional[cute.Tensor],
         gmem_fc1_recompute_sf: Optional[cute.Tensor],
+        tma_atom_fc1_col_output: cute.CopyAtom,
         gmem_fc1_col_output: Optional[cute.Tensor],
         gmem_fc1_col_output_sf: Optional[cute.Tensor],
         smem_preact_buffer: cute.Tensor,
@@ -1395,8 +1455,10 @@ class DgluMxfp8Epilogue:
                     sched_ext=sched_ext,
                     gmem_fc1_output=gmem_fc1_output,
                     gmem_fc1_output_sf=gmem_fc1_output_sf,
+                    tma_atom_fc1_recompute=tma_atom_fc1_recompute,
                     gmem_fc1_recompute=gmem_fc1_recompute,
                     gmem_fc1_recompute_sf=gmem_fc1_recompute_sf,
+                    tma_atom_fc1_col_output=tma_atom_fc1_col_output,
                     gmem_fc1_col_output=gmem_fc1_col_output,
                     gmem_fc1_col_output_sf=gmem_fc1_col_output_sf,
                     c_pipeline=c_pipeline,

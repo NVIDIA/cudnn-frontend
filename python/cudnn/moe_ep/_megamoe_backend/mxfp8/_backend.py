@@ -6,19 +6,17 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
 
 from ..._backend import BackendUnavailableError
-from ..._contracts import (
-    ForwardConfig,
-    ValidatedBackwardRequest,
-    ValidatedForwardRequest,
-)
+from ..._contracts import ForwardConfig, ValidatedForwardRequest
+from ..._types import MoeEpTrainingWeights
 from .._plan import ExecutionPlanOwner
 from ._adapter import Mxfp8InputAdapter
-from ._backward import Mxfp8BackwardExecutor
+from ._backward_compile import prepare_backward_kernel
 from ._compile import (
     CompiledMxfp8Kernel,
     PreparedMxfp8Kernel,
@@ -27,7 +25,6 @@ from ._compile import (
 )
 from ._config import Mxfp8KernelConfig
 from ._launch import launch_forward
-from ._stash import Mxfp8ForwardStash
 
 
 class Mxfp8Backend:
@@ -38,11 +35,6 @@ class Mxfp8Backend:
         self.device = torch.device(device)
         self.kernel_config = Mxfp8KernelConfig.from_forward_config(config)
         self._adapter = Mxfp8InputAdapter()
-        self._stash = (
-            Mxfp8ForwardStash(config, self.device)
-            if config.generate_c
-            else None
-        )
         self._prepared_kernel: PreparedMxfp8Kernel | None = None
         self._compiled: CompiledMxfp8Kernel | None = None
         self._plan: ExecutionPlanOwner | None = None
@@ -52,7 +44,7 @@ class Mxfp8Backend:
         self._completion_recorded = False
         self._device_work_may_be_pending = False
         self._ep_launch_ready = config.ep_size == 1
-        self._backward_executor: Mxfp8BackwardExecutor | None = None
+        self._training_resource_owner = None
         self._lock = threading.RLock()
 
     @property
@@ -127,11 +119,6 @@ class Mxfp8Backend:
 
             with torch.cuda.device(self.device):
                 capturing = torch.cuda.is_current_stream_capturing()
-                if capturing and self._stash is not None:
-                    raise NotImplementedError(
-                        "MoeEp generate_c=True is eager-only and does not "
-                        "support CUDA graph capture"
-                    )
                 if (
                     capturing
                     and not self._adapter.weights_have_version_counters(
@@ -176,14 +163,6 @@ class Mxfp8Backend:
                     # a retry on another stream cannot race those writes.
                     device_work_attempted = True
                     resources = self._plan.prepare(request)
-                    stash_plan = (
-                        None
-                        if self._stash is None
-                        else self._stash.prepare(
-                            request,
-                            pool_token_capacity=prepared.pool_token_capacity,
-                        )
-                    )
                     inputs = self._adapter.stage(
                         request,
                         resources,
@@ -208,11 +187,7 @@ class Mxfp8Backend:
                         ),
                         col_quant_data_rows=prepared.col_quant_data_rows,
                         col_quant_sf_elements=prepared.col_quant_sf_elements,
-                        fc1_c=(
-                            None
-                            if stash_plan is None
-                            else stash_plan.buffer
-                        ),
+                        fc1_c=None,
                     )
                     self._compiled = compile_or_get(
                         prepared,
@@ -225,26 +200,6 @@ class Mxfp8Backend:
                         inputs,
                         resources,
                     )
-                    if self._stash is not None:
-                        assert stash_plan is not None
-                        (
-                            fc1_c,
-                            route_metadata,
-                            wgrad_stash,
-                        ) = self._stash.materialize(
-                            stash_plan,
-                            inputs,
-                            prepared,
-                        )
-                        if wgrad_stash is None:
-                            output = (output, fc1_c, route_metadata)
-                        else:
-                            output = (
-                                output,
-                                fc1_c,
-                                route_metadata,
-                                wgrad_stash,
-                            )
                 except (ImportError, OSError) as exc:
                     raise BackendUnavailableError(
                         "MoeEp MXFP8 backend requires the 'moe_ep' optional "
@@ -264,42 +219,70 @@ class Mxfp8Backend:
                 self._warmed_up = True
                 return output
 
-    def backward(self, request: ValidatedBackwardRequest):
-        """Run the restricted explicit dgrad/dprob Rubin MXFP8 path."""
+    def prepare_training_resources(
+        self,
+        weights: MoeEpTrainingWeights,
+        *,
+        slot_count: int,
+        lane_count: int,
+    ):
+        """Allocate the fixed slot/lane roots used by the training graph path."""
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("MoeEp MXFP8 backend is closed")
-            if request.device != self.device:
-                raise ValueError(
-                    f"MoeEp MXFP8 backend is bound to {self.device}, "
-                    f"got {request.device}"
-                )
-            stream = torch.cuda.current_stream(self.device)
-            if self._device_work_may_be_pending:
-                torch.cuda.synchronize(self.device)
-                self._device_work_may_be_pending = False
-            if self._completion_event is None:
-                self._completion_event = torch.cuda.Event()
-            elif self._completion_recorded:
-                stream.wait_event(self._completion_event)
-            if self._backward_executor is None:
-                self._backward_executor = Mxfp8BackwardExecutor(
-                    self.config,
-                    self.device,
-                )
+            if self._training_resource_owner is not None:
+                raise RuntimeError("MoeEp training resources already exist")
+            training_config = replace(
+                self.config,
+                generate_c=True,
+                backward_wgrad_mode="operands",
+                token_padding_size=128,
+                sf_padding_size=128,
+            )
+            training_kernel_config = Mxfp8KernelConfig.from_forward_config(
+                training_config
+            )
+            # Graph transport must complete its cross-rank protocol before the
+            # frontend applies the public trap/drop policy at graph tail.
+            graph_kernel_config = replace(
+                training_kernel_config,
+                drop_on_overflow=True,
+                # Upstream 5b89819's forward col-requant accepts token
+                # padding 128/256 but fixes SF atoms at 128; its dGLU
+                # auxiliaries require token and SF padding to match. The
+                # graph-only fixed-capacity intersection is therefore 128.
+                token_padding_block=128,
+                sf_padding_block=128,
+            )
+            forward = prepare_kernel(
+                training_config,
+                graph_kernel_config,
+                self.device,
+            )
+            backward = prepare_backward_kernel(
+                training_config,
+                graph_kernel_config,
+                self.device,
+            )
+            from ._training_resources import Mxfp8TrainingResourceOwner
+
+            owner = Mxfp8TrainingResourceOwner(
+                training_config,
+                self.device,
+                forward,
+                backward,
+                weights,
+                slot_count=slot_count,
+                lane_count=lane_count,
+            )
             try:
-                result = self._backward_executor.run(request)
-            finally:
-                try:
-                    self._completion_event.record(stream)
-                    self._completion_recorded = True
-                    self._device_work_may_be_pending = False
-                except Exception:
-                    self._completion_recorded = False
-                    self._device_work_may_be_pending = True
-                    raise
-            return result
+                owner.prepare()
+            except Exception:
+                owner.close()
+                raise
+            self._training_resource_owner = owner
+            return owner
 
     def close(self) -> None:
         with self._lock:
@@ -311,14 +294,15 @@ class Mxfp8Backend:
                         "MoeEp MXFP8 backend cannot be closed during "
                         "CUDA graph capture"
                     )
-                if self._plan is not None or self._backward_executor is not None:
+                if (
+                    self._plan is not None
+                    or self._training_resource_owner is not None
+                ):
                     torch.cuda.synchronize(self.device)
                 self._adapter.close()
-                if self._backward_executor is not None:
-                    self._backward_executor.close()
-                    self._backward_executor = None
-                if self._stash is not None:
-                    self._stash.close()
+                if self._training_resource_owner is not None:
+                    self._training_resource_owner.close()
+                    self._training_resource_owner = None
                 if self._plan is not None:
                     self._plan.close()
                     self._plan = None

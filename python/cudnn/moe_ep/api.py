@@ -15,22 +15,24 @@ import math
 import threading
 import warnings
 from numbers import Real
-from typing import Literal, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from ._contracts import ForwardConfig, ValidatedBackwardRequest
+from ._contracts import ForwardConfig
 from ._tuning import MoeEpTuningConfig
 from ._types import (
     BlockScaledTensor,
-    MoeEpWgradForwardStash,
-    MoeEpWgradOperands,
+    MoeEpExecutionLane,
+    MoeEpTrainingResources,
+    MoeEpTrainingSlot,
+    MoeEpTrainingWeights,
     MoeFormat,
     MoeTensor,
     parse_format as _parse_format,
 )
-from ._validation import validate_backward, validate_forward
+from ._validation import validate_forward, validate_training_weights
 
 def _resolve_ep_topology(
     ep_group: Optional[dist.ProcessGroup],
@@ -62,6 +64,26 @@ def _resolve_ep_topology(
     return ep_size, ep_rank, ep_global_ranks
 
 
+def _validate_training_assert_capability(config: ForwardConfig) -> None:
+    """Fail before allocation when graph error-mode primitives are unavailable."""
+
+    if config.drop_on_overflow:
+        return
+    if not callable(getattr(torch, "_assert_async", None)):
+        raise RuntimeError(
+            "drop_on_overflow=False training resources require callable "
+            "torch._assert_async before CUDA Graph capture"
+        )
+    if config.ep_size <= 1:
+        return
+    backend = dist.get_backend(config.ep_group)
+    if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
+        raise NotImplementedError(
+            "drop_on_overflow=False EP2+ training resources require an NCCL "
+            "process group for the captured scalar global overflow OR"
+        )
+
+
 class MoeEp:
     """Fused SwiGLU MoE operator with contiguous expert parallel sharding.
 
@@ -77,24 +99,10 @@ class MoeEp:
     ``apply_topk_in_fc1=True``.
     Native NVFP4 operands and NVFP4 combine/output are not executable.
 
-    With ``generate_c=True`` (training integration), ``__call__`` additionally
-    returns ``fc1_c`` and ``route_metadata``.  ``fc1_c`` is the raw pre-SwiGLU
-    FC1 accumulator for every route this rank's experts processed, BF16, shape
-    ``(local_routes, 2 * intermediate)``.  Rows are grouped by local expert
-    (ascending) and ordered within each expert by source rank, then the source
-    rank's token-major route order.  The rows are captured before the gate/up
-    clamp and carry no router weight.  ``route_metadata`` is Int32
-    ``(local_routes, 4)`` with columns
-    ``(local_expert, src_rank, src_token, src_slot)``, row-aligned with
-    ``fc1_c``, identifying each route for the backward gradient re-dispatch.
-
-    With ``backward_wgrad_mode="operands"``, ``generate_c=True``,
-    ``token_padding_size=256``, and ``sf_padding_size=128`` are required.
-    Forward additionally returns a caller-owned
-    :class:`MoeEpWgradForwardStash`; backward accepts that exact routed-call
-    stash by keyword and additionally returns :class:`MoeEpWgradOperands`.
-    This opt-in path is available under the Rubin MXFP8 backward capability
-    gates documented below.
+    ``__call__`` is the inference-only forward surface. Training uses
+    :meth:`prepare_training_resources`; the returned fixed-slot resource handle
+    provides ordinary/capturable ``forward`` and ``backward`` methods without
+    compact host-visible stashes.
 
     The backend is created lazily on the first supported forward call. Valid
     combinations outside the current backend capability matrix fail explicitly
@@ -118,8 +126,6 @@ class MoeEp:
         combine_format: Union[MoeFormat, str] = MoeFormat.BF16,
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
-        generate_c: bool = False,
-        backward_wgrad_mode: Literal["none", "operands"] = "none",
         token_padding_size: int = 128,
         sf_padding_size: int = 128,
         tuning: Optional[MoeEpTuningConfig] = None,
@@ -155,17 +161,6 @@ class MoeEp:
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
             raise ValueError("apply_topk_in_fc1 must be a bool")
-        if not isinstance(generate_c, bool):
-            raise ValueError("generate_c must be a bool")
-        if backward_wgrad_mode not in ("none", "operands"):
-            raise ValueError(
-                "backward_wgrad_mode must be 'none' or 'operands', "
-                f"got {backward_wgrad_mode!r}"
-            )
-        if backward_wgrad_mode == "operands" and not generate_c:
-            raise ValueError(
-                "backward_wgrad_mode='operands' requires generate_c=True"
-            )
         for name, value in (
             ("token_padding_size", token_padding_size),
             ("sf_padding_size", sf_padding_size),
@@ -174,16 +169,6 @@ class MoeEp:
                 raise ValueError(
                     f"{name} must be a positive integer, got {value!r}"
                 )
-        if backward_wgrad_mode == "operands" and token_padding_size != 256:
-            raise ValueError(
-                "backward_wgrad_mode='operands' requires "
-                "token_padding_size=256"
-            )
-        if backward_wgrad_mode == "operands" and sf_padding_size != 128:
-            raise ValueError(
-                "backward_wgrad_mode='operands' requires "
-                "sf_padding_size=128"
-            )
         if sf_padding_size % 128:
             raise ValueError(
                 "sf_padding_size must be a positive multiple of 128, "
@@ -226,8 +211,6 @@ class MoeEp:
         self.combine_format = _parse_format(combine_format)
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
-        self.generate_c = generate_c
-        self.backward_wgrad_mode = backward_wgrad_mode
         self.token_padding_size = token_padding_size
         self.sf_padding_size = sf_padding_size
         self.tuning = MoeEpTuningConfig() if tuning is None else tuning
@@ -266,16 +249,18 @@ class MoeEp:
             combine_format=self.combine_format.value,
             apply_topk_in_fc1=self.apply_topk_in_fc1,
             gate_up_clamp=self.gate_up_clamp,
-            generate_c=self.generate_c,
+            generate_c=False,
             token_padding_size=self.token_padding_size,
             sf_padding_size=self.sf_padding_size,
             tuning=self.tuning,
-            backward_wgrad_mode=self.backward_wgrad_mode,
+            backward_wgrad_mode="none",
         )
         self._forward_backend = None
         self._forward_backend_device = None
         self._validated_topk_idx = None
         self._validated_topk_version = None
+        self._operator_token = object()
+        self._training_resources: MoeEpTrainingResources | None = None
         self._closed = False
 
     @staticmethod
@@ -287,7 +272,7 @@ class MoeEp:
         except RuntimeError:
             return None
 
-    def _get_backend(self, request, *, backward: bool):
+    def _get_backend(self, request):
         """Create and cache the private backend on first supported use."""
 
         with self._lifecycle_lock:
@@ -305,10 +290,7 @@ class MoeEp:
                 )
 
             _backend.validate_config(self._forward_config)
-            if backward:
-                _backend.validate_backward_request(request)
-            else:
-                _backend.validate_request(request)
+            _backend.validate_request(request)
 
             if self._forward_backend is None:
                 self._forward_backend = _backend.create_backend(
@@ -318,26 +300,6 @@ class MoeEp:
                 self._forward_backend_device = request.device
             return self._forward_backend
 
-    def _count_local_routes(self, request: ValidatedBackwardRequest) -> int:
-        """Number of valid routes this rank's experts receive.
-
-        The request already passed expert-id validation. Data-dependent:
-        single-rank counts locally, while EP exchanges per-rank route counts
-        (the same exchange the device dispatch performs).
-        """
-
-        flat = request.topk_idx.reshape(-1).to(torch.int64)
-        expert = flat[flat != -1]
-        if self.ep_size == 1:
-            return int(expert.numel())
-        destination = torch.div(expert, self.experts_per_rank, rounding_mode="floor")
-        send_counts = torch.bincount(destination, minlength=self.ep_size)
-        if send_counts.device.type != "cpu" and dist.get_backend(self.ep_group) == "gloo":
-            send_counts = send_counts.cpu()
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
-        return int(recv_counts.sum().item())
-
     def __call__(
         self,
         activation: MoeTensor,
@@ -345,26 +307,15 @@ class MoeEp:
         fc2_weight: MoeTensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> Union[
-        MoeTensor,
-        Tuple[MoeTensor, torch.Tensor, torch.Tensor],
-        Tuple[
-            MoeTensor,
-            torch.Tensor,
-            torch.Tensor,
-            MoeEpWgradForwardStash,
-        ],
-    ]:
+    ) -> MoeTensor:
         """Validate and dispatch one fused MoE+EP forward call.
 
         Expected logical shapes are ``activation=(T,H)``,
         ``fc1_weight=(E_local,H,2I)``, ``fc2_weight=(E_local,I,H)``, and
         ``topk_idx=topk_weights=(T,K)``.
 
-        Returns the ``(T, H)`` result, or ``(result, fc1_c, route_metadata)``
-        when constructed with ``generate_c=True``. In
-        ``backward_wgrad_mode="operands"``, the latter tuple has a fourth
-        ``MoeEpWgradForwardStash`` item.
+        Training callers must use :meth:`prepare_training_resources` and the
+        returned fixed-slot resource handle.
         """
 
         with self._lifecycle_lock:
@@ -395,7 +346,7 @@ class MoeEp:
             else:
                 self._validated_topk_idx = None
                 self._validated_topk_version = None
-            return self._get_backend(request, backward=False).forward(request)
+            return self._get_backend(request).forward(request)
 
     def warmup(
         self,
@@ -432,65 +383,82 @@ class MoeEp:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
 
-    def backward(
+    def prepare_training_resources(
         self,
-        grad_output: torch.Tensor,
-        fc1_weight: MoeTensor,
-        fc2_weight: MoeTensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        fc1_c: torch.Tensor,
-        route_metadata: torch.Tensor,
+        weights: MoeEpTrainingWeights,
         *,
-        wgrad_forward_stash: Optional[MoeEpWgradForwardStash] = None,
-    ) -> Union[
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, MoeEpWgradOperands],
-    ]:
-        """Validate and dispatch one device MoE backward call.
+        slot_count: int = 2,
+        lane_count: int = 1,
+    ) -> MoeEpTrainingResources:
+        """Bind MXFP8 weights and allocate fixed-capacity training resources.
 
-        Requires ``generate_c=True``; consumes the forward stash
-        (``fc1_c``, ``route_metadata``) plus the re-supplied weights and
-        routing inputs. Returns float32
-        ``(grad_activation, grad_topk_weights)``. In
-        ``backward_wgrad_mode="operands"``, ``wgrad_forward_stash`` is
-        required and the return tuple has a third ``MoeEpWgradOperands`` item.
-        The Rubin MXFP8 device path supports BF16/MXFP8 combine and BF16 output
-        for any positive EP size under its documented capability gates.
-        Backward has hardware acceptance coverage at EP1/EP2/EP4. Forward and
-        backward both quantize each FP32 route accumulator directly to MXFP8
-        before top-k reduction.
+        This collective preparation must run on every EP rank before CUDA
+        Graph capture. The returned handle owns persistent microbatch slots
+        and mutable per-stream execution lanes; closing the operator also
+        closes the handle. A closed handle cannot be replaced on this
+        operator; create a new ``MoeEp`` instance to bind new weight storage.
         """
 
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
-            if not self.generate_c:
+            for name, value in (
+                ("slot_count", slot_count),
+                ("lane_count", lane_count),
+            ):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                ):
+                    raise ValueError(
+                        f"{name} must be a positive integer, got {value!r}"
+                    )
+            if self._training_resources is not None:
+                if not self._training_resources.closed:
+                    raise RuntimeError("MoeEp training resources already exist")
                 raise RuntimeError(
-                    "backward requires the operator to be constructed with "
-                    "generate_c=True"
+                    "MoeEp training resources were closed; create a new "
+                    "MoeEp instance before preparing replacement weights"
                 )
 
-            backward_request = validate_backward(
+            device = validate_training_weights(
                 self._forward_config,
-                grad_output,
-                fc1_weight,
-                fc2_weight,
-                topk_idx,
-                topk_weights,
-                fc1_c,
-                route_metadata,
-                wgrad_forward_stash=wgrad_forward_stash,
+                weights,
             )
-            local_routes = self._count_local_routes(backward_request)
-            if backward_request.local_routes != local_routes:
+            _validate_training_assert_capability(self._forward_config)
+            from . import _backend
+
+            _backend.validate_config(self._forward_config)
+            if (
+                self._forward_backend is not None
+                and device != self._forward_backend_device
+            ):
                 raise ValueError(
-                    "route_metadata row count must match the routes received "
-                    "from the re-supplied topk_idx"
+                    f"MoeEp backend is bound to "
+                    f"{self._forward_backend_device}; got {device}"
                 )
-            return self._get_backend(backward_request, backward=True).backward(
-                backward_request
+            if self._forward_backend is None:
+                self._forward_backend = _backend.create_backend(
+                    self._forward_config,
+                    device,
+                )
+                self._forward_backend_device = device
+            owner = self._forward_backend.prepare_training_resources(
+                weights,
+                slot_count=slot_count,
+                lane_count=lane_count,
             )
+            resources = MoeEpTrainingResources(
+                owner=owner,
+                operator_token=self._operator_token,
+                weights=weights,
+                slot_count=slot_count,
+                lane_count=lane_count,
+                device=device,
+            )
+            self._training_resources = resources
+            return resources
 
     def close(self) -> None:
         """Release compiled-backend instance resources; idempotent."""
@@ -506,6 +474,9 @@ class MoeEp:
                 self._forward_backend_device = None
             self._validated_topk_idx = None
             self._validated_topk_version = None
+            if self._training_resources is not None:
+                self._training_resources.close()
+                self._training_resources = None
             self._closed = True
 
     def __enter__(self) -> "MoeEp":
@@ -539,8 +510,10 @@ class MoeEp:
 __all__ = [
     "BlockScaledTensor",
     "MoeEp",
-    "MoeEpWgradForwardStash",
-    "MoeEpWgradOperands",
+    "MoeEpExecutionLane",
+    "MoeEpTrainingResources",
+    "MoeEpTrainingSlot",
+    "MoeEpTrainingWeights",
     "MoeFormat",
     "MoeTensor",
 ]

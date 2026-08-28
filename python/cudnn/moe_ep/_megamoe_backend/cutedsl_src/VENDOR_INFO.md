@@ -9,11 +9,10 @@
 - Selected forward updates and backward dGLU upstream revision:
   `92dd334af2eeedb36087834354b58ace08e880c6`
 - Latest synchronized upstream revision:
-  `5a43c8523ea5215923c2fc8d0abae75bd6762011` (merge of source revision
-  `dc05bbdf38350a0eb67e9d9440e3c7c0e21e99fc`)
+  `5b89819cb16069dfe20a1a0ba0778d35cb428352`
 - Vendoring dates: 2026-08-11 (base), 2026-08-17 (selected updates), and
-  2026-08-20 and 2026-08-24 (latest synchronizations).
-- On 2026-08-24 every vendored Python source except the intentionally minimal
+  2026-08-20, 2026-08-24, and 2026-08-28 (latest synchronizations).
+- On 2026-08-28 every vendored Python source except the intentionally minimal
   `kernel_src/rubin/training/__init__.py` was synchronized byte-for-byte with
   the revision above. Other integration-specific behavior lives outside this
   directory.
@@ -110,7 +109,7 @@ quant_def.py
 
 - Every `.py` file listed in the manifest except
   `kernel_src/rubin/training/__init__.py` is a byte-for-byte copy of the same
-  relative path at revision `5a43c8523ea5215923c2fc8d0abae75bd6762011`.
+  relative path at revision `5b89819cb16069dfe20a1a0ba0778d35cb428352`.
 - `kernel_src/rubin/training/__init__.py` is intentionally reduced to a
   package marker. This avoids vendoring and eagerly importing the unused Rubin
   traditional-wgrad product.

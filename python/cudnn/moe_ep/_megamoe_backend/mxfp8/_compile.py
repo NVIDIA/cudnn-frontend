@@ -34,6 +34,8 @@ class PreparedMxfp8Kernel:
     col_quant_sf_elements: int
     token_src_metadata_offset: int
     token_src_metadata_bytes: int
+    col_quant_sizes_offset: int | None
+    col_quant_sizes_bytes: int
     pre_reduced_activation_offset: int | None
     pre_reduced_activation_bytes_per_token: int
     pre_reduced_activation_sf_offset: int | None
@@ -52,6 +54,9 @@ class CompiledMxfp8Kernel:
 _COMPILE_LOCK = threading.RLock()
 _COMPILE_CACHE: dict[tuple, CompiledMxfp8Kernel] = {}
 _TOKEN_SRC_METADATA_REGION = "nvlink.token_comm.token_src_metadata"
+_COL_QUANT_SIZES_REGION = (
+    "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
+)
 _PRE_REDUCED_ACTIVATION_REGION = (
     "nvlink.token_comm.pre_reduced_activation"
 )
@@ -272,6 +277,35 @@ def prepare_kernel(
         if config.enable_col_quant
         else 0
     )
+    if config.enable_col_quant:
+        col_quant_sizes_region = device_workspace.region(
+            _COL_QUANT_SIZES_REGION
+        )
+        if col_quant_sizes_region.buffer_space != "local":
+            raise RuntimeError(
+                "Rubin col-quant expert-size snapshot must reside in "
+                "local workspace"
+            )
+        col_quant_sizes_offset = int(
+            device_workspace.offset(_COL_QUANT_SIZES_REGION)
+        )
+        col_quant_sizes_bytes = int(
+            device_workspace.nbytes(_COL_QUANT_SIZES_REGION)
+        )
+        expected_sizes_bytes = config.num_experts * torch.int32.itemsize
+        if col_quant_sizes_bytes != expected_sizes_bytes:
+            raise RuntimeError(
+                "Rubin col-quant expert-size snapshot has "
+                f"{col_quant_sizes_bytes} bytes, expected "
+                f"{expected_sizes_bytes}"
+            )
+        if col_quant_sizes_offset + col_quant_sizes_bytes > local_bytes:
+            raise RuntimeError(
+                "Rubin col-quant expert-size snapshot exceeds local workspace"
+            )
+    else:
+        col_quant_sizes_offset = None
+        col_quant_sizes_bytes = 0
     requirements = WorkspaceRequirements.for_mxfp8(
         forward_config,
         kernel_local_workspace_bytes=local_bytes,
@@ -307,6 +341,8 @@ def prepare_kernel(
         col_quant_sf_elements=col_quant_sf_elements,
         token_src_metadata_offset=token_src_metadata_offset,
         token_src_metadata_bytes=token_src_metadata_bytes,
+        col_quant_sizes_offset=col_quant_sizes_offset,
+        col_quant_sizes_bytes=col_quant_sizes_bytes,
         pre_reduced_activation_offset=pre_reduced_activation_offset,
         pre_reduced_activation_bytes_per_token=(
             pre_reduced_activation_bytes_per_token

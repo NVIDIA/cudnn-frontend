@@ -8,7 +8,7 @@ from __future__ import annotations
 import operator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Union
+from typing import Any, Tuple, Union
 
 import torch
 
@@ -210,71 +210,26 @@ class BlockScaledTensor:
 
 
 @dataclass(frozen=True)
-class MoeEpWgradForwardStash:
-    """Caller-owned forward state required to form expert-local wgrads.
+class MoeEpTrainingWeights:
+    """Stable MXFP8 bindings for forward and dgrad GEMMs.
 
-    ``fc1_a`` and ``fc1_sfa`` represent the MXFP8 ``x.T`` operand. Valid
-    routes for each local expert occupy the beginning of its padded range;
-    ``expert_offsets`` contains cumulative padded end offsets and
-    ``valid_route_counts`` contains the corresponding unpadded row counts.
-    Scale factors use the blocked layout consumed by grouped wgrad, with
-    logical 1x32 scaling and physical 128x4 scale tiles.
-    ``route_metadata`` is the compact identity table returned by forward,
-    using ``(local_expert, src_rank, src_token, src_slot)`` rows. It validates
-    that the stash belongs to the matching routed call; it is not padded or
-    row-aligned with the operands' K dimension.
+    Forward consumes ``forward_fc1`` with logical shape ``(E,H,2I)`` and
+    ``forward_fc2`` with ``(E,I,H)``. Backward consumes independently
+    quantized transposes: ``backward_w2_transpose=(E,H,I)`` for
+    ``dH=dY@W2.T`` and ``backward_w1_transpose=(E,2I,H)`` for
+    ``dX=dC@W1.T``. Every tensor is block-scaled along logical axis 1, the
+    reduction axis of its corresponding GEMM.
     """
 
-    fc1_a: torch.Tensor
-    fc1_sfa: torch.Tensor
-    expert_offsets: torch.Tensor
-    valid_route_counts: torch.Tensor
-    route_metadata: torch.Tensor
+    forward_fc1: BlockScaledTensor
+    forward_fc2: BlockScaledTensor
+    backward_w2_transpose: BlockScaledTensor
+    backward_w1_transpose: BlockScaledTensor
 
 
 @dataclass(frozen=True)
-class MoeEpWgradOperands:
-    """Caller-owned MXFP8 operands for expert-local grouped wgrad GEMMs.
-
-    The represented operations are ``dW1 = fc1_a @ fc1_b`` and
-    ``dW2 = fc2_a @ fc2_b``. For total padded route extent ``K``, their
-    logical shapes are ``fc1_a=(H,K)``, ``fc1_b=(K,2I)``,
-    ``fc2_a=(I,K)``, and ``fc2_b=(K,H)``. Each scale tensor uses grouped
-    wgrad's blocked 1x32 layout: ``(round_up(non-K,128), round_up(K/32,4))``.
-    The shared expert metadata has the same meaning as in
-    :class:`MoeEpWgradForwardStash`.
-
-    Attributes:
-        fc1_a: E4M3 data for the FC1 A operand, logically ``x.T`` with shape
-            ``(H, K)``. ``x`` is the activation dispatched to each local
-            expert. The K dimension concatenates the experts' independently
-            padded route ranges.
-        fc1_sfa: E8M0 scales for ``fc1_a``. Each logical scale covers 32
-            consecutive K elements of one hidden-feature row.
-        fc1_b: E4M3 data for the FC1 B operand, logically
-            ``dC=[d_gate | d_up]`` with shape ``(K, 2I)``. ``dC`` is the
-            gradient of the pre-SwiGLU FC1 accumulator; columns use the public
-            gate-then-up order rather than the kernel's internal strip
-            interleave.
-        fc1_sfb: E8M0 scales for ``fc1_b``. Each logical scale covers 32
-            consecutive K rows for one gate/up feature column.
-        fc2_a: E4M3 data for the FC2 A operand, logically ``(p*h).T`` with
-            shape ``(I, K)``. ``h=SwiGLU(C)`` and ``p`` is the route's FP32
-            router score, applied exactly once before column quantization.
-        fc2_sfa: E8M0 scales for ``fc2_a``. Each logical scale covers 32
-            consecutive K elements of one intermediate-feature row.
-        fc2_b: E4M3 data for the FC2 B operand, logically unweighted ``dY``
-            with shape ``(K, H)``. ``dY`` is the routed FC2 output gradient.
-        fc2_sfb: E8M0 scales for ``fc2_b``. Each logical scale covers 32
-            consecutive K rows for one hidden-feature column.
-        expert_offsets: Int32 cumulative padded K-end offset for every local
-            expert. Adjacent equal offsets represent an empty expert.
-        valid_route_counts: Int32 unpadded route count for every local expert;
-            valid rows occupy the beginning of each padded expert range.
-        route_metadata: Compact Int32 route identity table with columns
-            ``(local_expert, src_rank, src_token, src_slot)``. It identifies
-            the routed call but is not padded or row-aligned with K.
-    """
+class MoeEpTrainingWgradOperands:
+    """Fixed-capacity MXFP8 operands produced by the training resource path."""
 
     fc1_a: torch.Tensor
     fc1_sfa: torch.Tensor
@@ -286,7 +241,193 @@ class MoeEpWgradOperands:
     fc2_sfb: torch.Tensor
     expert_offsets: torch.Tensor
     valid_route_counts: torch.Tensor
-    route_metadata: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MoeEpTrainingSlot:
+    """Opaque index of one persistent forward/backward training slot."""
+
+    index: int
+    _resource_token: object
+
+
+@dataclass(frozen=True)
+class MoeEpExecutionLane:
+    """Opaque index of one mutable per-stream execution lane."""
+
+    index: int
+    _resource_token: object
+
+
+class MoeEpTrainingResources:
+    """TE-owned lease on fixed-capacity training slots and execution lanes."""
+
+    def __init__(
+        self,
+        *,
+        owner: Any,
+        operator_token: object,
+        weights: MoeEpTrainingWeights,
+        slot_count: int,
+        lane_count: int,
+        device: torch.device,
+    ) -> None:
+        self._owner = owner
+        self._operator_token = operator_token
+        self._resource_token = object()
+        self.weights = weights
+        self.device = torch.device(device)
+        self.slots = tuple(
+            MoeEpTrainingSlot(index, self._resource_token)
+            for index in range(slot_count)
+        )
+        self.lanes = tuple(
+            MoeEpExecutionLane(index, self._resource_token)
+            for index in range(lane_count)
+        )
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _check_binding(
+        self,
+        operator_token: object,
+        slot: MoeEpTrainingSlot,
+        lane: MoeEpExecutionLane,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("MoeEp training resources are closed")
+        if self._operator_token is not operator_token:
+            raise ValueError("training resources belong to another MoeEp instance")
+        if (
+            slot._resource_token is not self._resource_token
+            or slot not in self.slots
+        ):
+            raise ValueError("training slot does not belong to these resources")
+        if (
+            lane._resource_token is not self._resource_token
+            or lane not in self.lanes
+        ):
+            raise ValueError("execution lane does not belong to these resources")
+
+    def refresh_weights(self) -> None:
+        """Enqueue fixed-address weight-layout refreshes on the current stream.
+
+        Call after every in-place data+scale update and before the first
+        forward/backward that consumes that version. The caller must establish
+        stream/event ordering, must not refresh between a matching forward and
+        backward, and must not overlap refresh with any consumer of these
+        resources. Replacing source storage requires closing the old operator,
+        creating a new ``MoeEp`` instance and resources, and capturing a new
+        graph. This method may itself be captured, in which case replay executes
+        only the recorded device transforms.
+        """
+
+        if self._closed:
+            raise RuntimeError("MoeEp training resources are closed")
+        self._owner.refresh_weights()
+
+    def forward(
+        self,
+        slot: MoeEpTrainingSlot,
+        lane: MoeEpExecutionLane,
+        activation: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the fixed-slot forward in ordinary or capture mode."""
+
+        self._check_binding(self._operator_token, slot, lane)
+        execution = self._owner.views(
+            slot=slot.index,
+            lane=lane.index,
+            token_count=int(activation.shape[0]),
+        )
+        from ._megamoe_backend.mxfp8._training_execute import (
+            launch_training_forward,
+        )
+
+        return launch_training_forward(
+            self._owner,
+            execution,
+            activation,
+            topk_idx,
+            topk_weights,
+        )
+
+    def backward(
+        self,
+        slot: MoeEpTrainingSlot,
+        lane: MoeEpExecutionLane,
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        MoeEpTrainingWgradOperands,
+    ]:
+        """Run fixed-slot dgrad/dprob in ordinary or capture mode."""
+
+        self._check_binding(self._operator_token, slot, lane)
+        execution = self._owner.views(
+            slot=slot.index,
+            lane=lane.index,
+            token_count=int(grad_output.shape[0]),
+        )
+        from ._megamoe_backend.mxfp8._training_execute import (
+            launch_training_backward,
+        )
+
+        grad_activation, grad_topk_weights, operands = (
+            launch_training_backward(
+                self._owner,
+                execution,
+                grad_output,
+            )
+        )
+        return grad_activation, grad_topk_weights, operands
+
+    def finalize_overflow(
+        self,
+        slots: Tuple[MoeEpTrainingSlot, ...],
+        lane: MoeEpExecutionLane | None = None,
+    ) -> torch.Tensor:
+        """Aggregate one computation group's flags and apply its policy."""
+
+        if self._closed:
+            raise RuntimeError("MoeEp training resources are closed")
+        if lane is None:
+            lane = self.lanes[0]
+        if (
+            not isinstance(lane, MoeEpExecutionLane)
+            or lane._resource_token is not self._resource_token
+            or lane not in self.lanes
+        ):
+            raise ValueError(
+                "overflow execution lane does not belong to these resources"
+            )
+        slot_indices = []
+        for slot in slots:
+            if (
+                not isinstance(slot, MoeEpTrainingSlot)
+                or slot._resource_token is not self._resource_token
+                or slot not in self.slots
+            ):
+                raise ValueError(
+                    "overflow slot does not belong to these resources"
+                )
+            slot_indices.append(slot.index)
+        return self._owner.finalize_overflow(
+            tuple(slot_indices),
+            lane=lane.index,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._owner.close()
+        self._closed = True
 
 
 MoeTensor = Union[torch.Tensor, BlockScaledTensor]
@@ -294,8 +435,11 @@ MoeTensor = Union[torch.Tensor, BlockScaledTensor]
 
 __all__ = [
     "BlockScaledTensor",
-    "MoeEpWgradForwardStash",
-    "MoeEpWgradOperands",
+    "MoeEpExecutionLane",
+    "MoeEpTrainingResources",
+    "MoeEpTrainingSlot",
+    "MoeEpTrainingWeights",
+    "MoeEpTrainingWgradOperands",
     "MoeFormat",
     "MoeTensor",
     "parse_format",

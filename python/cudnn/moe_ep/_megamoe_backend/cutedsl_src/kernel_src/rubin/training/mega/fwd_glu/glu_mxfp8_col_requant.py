@@ -399,6 +399,7 @@ class Mxfp8ColRequant:
         sf_padding_block: int = SfPaddingBlock,
         *,
         scaled_cvt: "bool | None" = None,
+        dst_k_major: bool = False,
     ) -> None:
         """``scaled_cvt`` selects the requant path: ``None`` asks the
         compilation target, ``True`` and ``False`` force the block-scaled and
@@ -410,6 +411,7 @@ class Mxfp8ColRequant:
         self.quant_type = quant_type
         self.token_padding_block = int(token_padding_block)
         self.sf_padding_block = int(sf_padding_block)
+        self.dst_k_major = bool(dst_k_major)
 
         self._require_token_padding_block(self.token_padding_block)
         if self.sf_padding_block != self.SfAtomNonK:
@@ -627,16 +629,20 @@ class Mxfp8ColRequant:
             (BOX_T, BOX_H),
         )
 
-        dst_u32 = cute.make_tensor(
-            cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint32),
-            cute.make_layout((dst_data.shape[0], HID_U32), stride=(HID_U32, 1)),
-        )
-        tma_atom_st, tma_tensor_st = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            dst_u32,
-            cute.make_layout((BOX_T, BOX_H), stride=(BOX_H, 1)),
-            (BOX_T, BOX_H),
-        )
+        if cutlass.const_expr(self.dst_k_major):
+            tma_atom_st = None
+            tma_tensor_st = None
+        else:
+            dst_u32 = cute.make_tensor(
+                cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint32),
+                cute.make_layout((dst_data.shape[0], HID_U32), stride=(HID_U32, 1)),
+            )
+            tma_atom_st, tma_tensor_st = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                dst_u32,
+                cute.make_layout((BOX_T, BOX_H), stride=(BOX_H, 1)),
+                (BOX_T, BOX_H),
+            )
         k = self.ws_kernel(
             src_data, src_sf_u8, expert_token_sizes, dst_data, dst_sf_u8,
             tma_atom, tma_tensor, tma_atom_st, tma_tensor_st, TOKPAD,
@@ -803,7 +809,7 @@ class Mxfp8ColRequant:
         else:
             self.consume_scaled(
                 smem_data_base, smem_sf_in_base, smem_sf_out_base, mbar_full, mbar_empty,
-                tbl_vend, tbl_data, tbl_sf, dst_sf_base,
+                tbl_vend, tbl_data, tbl_sf, dst_data, dst_sf_base,
                 bidx, grid_dim_x, total_tiles,
                 warp_idx - Int32(self.ProducerWarps), lane_idx,
                 tma_atom_st, tma_tensor_st, TOKPAD,
@@ -904,7 +910,7 @@ class Mxfp8ColRequant:
     @cute.jit
     def consume_scaled(
         self, smem_data_base, smem_sf_in_base, smem_sf_out_base, mbar_full, mbar_empty,
-        tbl_vend, tbl_data, tbl_sf, dst_sf_base,
+        tbl_vend, tbl_data, tbl_sf, dst_data, dst_sf_base,
         bidx, grid_dim_x, total_tiles, cw, lane_idx,
         tma_atom_st=None, tma_tensor_st=None,
         token_padding_block: cutlass.Constexpr = None,
@@ -938,20 +944,29 @@ class Mxfp8ColRequant:
         hb0 = seg * Int32(C) + (lane_idx * Int32(LW)) // Int32(32)
         sf_lane_off = tb * Int32(4)
 
-        BOX_HS = cutlass.const_expr(self.TmaBoxHidU32)
-        sDo = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Uint32, smem_data_base, AddressSpace.smem, assumed_align=128,
-            ),
-            cute.make_layout((TOK, BOX_HS, S), stride=(BOX_HS, 1, TOK * BOX_HS)),
-        )
-        gDo = cute.group_modes(
-            cute.local_tile(tma_tensor_st, (TOK, BOX_HS), (None, None)), 0, 2
-        )
-        tDsDo, tDgDo = cpasync.tma_partition(
-            tma_atom_st, 0, cute.make_layout(1), cute.group_modes(sDo, 0, 2), gDo,
-        )
-        cpasync.prefetch_descriptor(tma_atom_st)
+        if cutlass.const_expr(self.dst_k_major):
+            sDo_u8 = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint8, smem_data_base, AddressSpace.smem, assumed_align=128,
+                ),
+                cute.make_layout((TOK, W, S), stride=(W, 1, TOK * W)),
+            )
+            dst_u8_pointer = cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint8)
+        else:
+            BOX_HS = cutlass.const_expr(self.TmaBoxHidU32)
+            sDo = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint32, smem_data_base, AddressSpace.smem, assumed_align=128,
+                ),
+                cute.make_layout((TOK, BOX_HS, S), stride=(BOX_HS, 1, TOK * BOX_HS)),
+            )
+            gDo = cute.group_modes(
+                cute.local_tile(tma_tensor_st, (TOK, BOX_HS), (None, None)), 0, 2
+            )
+            tDsDo, tDgDo = cpasync.tma_partition(
+                tma_atom_st, 0, cute.make_layout(1), cute.group_modes(sDo, 0, 2), gDo,
+            )
+            cpasync.prefetch_descriptor(tma_atom_st)
 
         t = Int32(0)
         work_idx = Int32(bidx)
@@ -1001,12 +1016,31 @@ class Mxfp8ColRequant:
             # The whole tile goes out, padding rows included; those were
             # neutralised to zero in shared memory, which is what the pool
             # expects to find there.
-            if cw == Int32(0):
-                cute.copy(
-                    tma_atom_st,
-                    tDsDo[(None, stage)],
-                    tDgDo[(None, token_tile, hid_begin // Int32(W))],
-                )
+            if cutlass.const_expr(self.dst_k_major):
+                linear = cw * Int32(32) + lane_idx
+                while linear < Int32(TOK * W):
+                    token_in_tile = linear // Int32(W)
+                    feature_in_tile = linear % Int32(W)
+                    token = data_row0 + token_in_tile
+                    feature = hid_begin + feature_in_tile
+                    if token < dst_data.shape[0] and feature < dst_data.shape[1]:
+                        dst_offset = (
+                            Int64(feature) * Int64(dst_data.shape[0])
+                            + Int64(token)
+                        )
+                        dst_slot = cute.make_tensor(
+                            dst_u8_pointer + dst_offset,
+                            cute.make_layout(1),
+                        )
+                        dst_slot[0] = sDo_u8[token_in_tile, feature_in_tile, stage]
+                    linear = linear + Int32(CONS_THREADS)
+            else:
+                if cw == Int32(0):
+                    cute.copy(
+                        tma_atom_st,
+                        tDsDo[(None, stage)],
+                        tDgDo[(None, token_tile, hid_begin // Int32(W))],
+                    )
             if cw == Int32(0) and lane_idx >= Int32(16) and lane_idx < Int32(16) + Int32(HATOMS) * sf_live:
                 atom = lane_idx - Int32(16)
                 cp_async_bulk_s2g(

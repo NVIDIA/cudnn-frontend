@@ -5,12 +5,17 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import torch
 
-from ._runtime import RuntimeHandle, RuntimeUnavailableError
+from ._runtime import (
+    RuntimeHandle,
+    RuntimeUnavailableError,
+    _runtime_debug,
+)
 
 
 class SymmetricMemoryProvider(Protocol):
@@ -53,34 +58,86 @@ class _NvshmemMemoryProvider:
 
     def allocate(self, nbytes: int, device: torch.device) -> torch.Tensor:
         del device  # NVSHMEM allocates on the device bound during runtime init.
+        started_at = time.monotonic()
+        _runtime_debug("symmetric.allocate.begin", nbytes=nbytes)
         try:
-            return self._core().tensor(
+            tensor = self._core().tensor(
                 (nbytes,),
                 dtype=torch.uint8,
                 release=False,
                 except_on_del=True,
             )
         except Exception as exc:
+            _runtime_debug(
+                "symmetric.allocate.error",
+                nbytes=nbytes,
+                error_type=type(exc).__name__,
+                error=repr(exc),
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            )
             raise RuntimeUnavailableError(
                 f"failed to allocate {nbytes} bytes from the NVSHMEM symmetric heap"
             ) from exc
+        _runtime_debug(
+            "symmetric.allocate.end",
+            nbytes=nbytes,
+            data_ptr=hex(tensor.data_ptr()),
+            elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+        )
+        return tensor
 
     def free(self, tensor: torch.Tensor) -> None:
+        started_at = time.monotonic()
+        _runtime_debug(
+            "symmetric.free.begin",
+            nbytes=tensor.numel() * tensor.element_size(),
+            data_ptr=hex(tensor.data_ptr()),
+        )
         try:
             self._core().free_tensor(tensor)
         except Exception as exc:
+            _runtime_debug(
+                "symmetric.free.error",
+                error_type=type(exc).__name__,
+                error=repr(exc),
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            )
             raise RuntimeUnavailableError(
                 "failed to free the NVSHMEM symmetric root slab"
             ) from exc
+        _runtime_debug(
+            "symmetric.free.end",
+            elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+        )
 
     def peer_address(self, tensor: torch.Tensor, peer: int) -> int:
+        started_at = time.monotonic()
+        _runtime_debug(
+            "symmetric.peer-map.begin",
+            peer=peer,
+            data_ptr=hex(tensor.data_ptr()),
+        )
         try:
             peer_tensor = self._core().get_peer_tensor(tensor, peer)
         except Exception as exc:
+            _runtime_debug(
+                "symmetric.peer-map.error",
+                peer=peer,
+                error_type=type(exc).__name__,
+                error=repr(exc),
+                elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+            )
             raise RuntimeUnavailableError(
                 f"failed to map symmetric root slab for peer {peer}"
             ) from exc
-        return int(peer_tensor.data_ptr())
+        peer_pointer = int(peer_tensor.data_ptr())
+        _runtime_debug(
+            "symmetric.peer-map.end",
+            peer=peer,
+            peer_data_ptr=hex(peer_pointer),
+            elapsed_seconds=f"{time.monotonic() - started_at:.3f}",
+        )
+        return peer_pointer
 
 
 @dataclass(frozen=True)
@@ -159,6 +216,12 @@ class SymmetricSlab:
                 "symmetric slab has an allocation pending cleanup"
             )
 
+        _runtime_debug(
+            "symmetric-slab.ensure.begin",
+            nbytes=self._nbytes,
+            world_size=self._runtime.world_size,
+            ep_rank=self._runtime.rank,
+        )
         root = self._provider.allocate(self._nbytes, self._runtime.device)
         if not isinstance(root, torch.Tensor):
             raise TypeError(
@@ -183,7 +246,13 @@ class SymmetricSlab:
             raise
 
         try:
+            _runtime_debug(
+                "symmetric-slab.zero.begin",
+                nbytes=self._nbytes,
+                data_ptr=hex(root.data_ptr()),
+            )
             root.zero_()
+            _runtime_debug("symmetric-slab.zero.enqueued")
 
             base_address = int(root.data_ptr())
             offsets = []
@@ -211,6 +280,12 @@ class SymmetricSlab:
             raise
 
         self._mapping = mapping
+        _runtime_debug(
+            "symmetric-slab.ensure.end",
+            nbytes=self._nbytes,
+            base_address=hex(mapping.base_address),
+            offsets=mapping.offsets,
+        )
 
     @property
     def nbytes(self) -> int:

@@ -19,7 +19,7 @@ from ._comm import (
     SymmetricSlab,
     _TorchMemoryProvider,
 )
-from ._runtime import RuntimeHandle
+from ._runtime import RuntimeHandle, _runtime_debug
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -257,7 +257,13 @@ class _LocalSlab:
             raise ValueError(f"local slab size must be positive, got {nbytes}")
         self._provider = provider
         self._nbytes = nbytes
+        _runtime_debug("local-slab.allocate.begin", nbytes=nbytes, device=device)
         root = provider.allocate(nbytes, device)
+        _runtime_debug(
+            "local-slab.allocate.end",
+            nbytes=nbytes,
+            data_ptr=hex(root.data_ptr()) if isinstance(root, torch.Tensor) else "?",
+        )
         self._root: Optional[torch.Tensor] = None
         try:
             if not isinstance(root, torch.Tensor):
@@ -274,7 +280,9 @@ class _LocalSlab:
                 )
             if not root.is_contiguous():
                 raise ValueError("local root tensor must be contiguous")
+            _runtime_debug("local-slab.zero.begin", nbytes=nbytes)
             root.zero_()
+            _runtime_debug("local-slab.zero.enqueued", nbytes=nbytes)
         except Exception:
             if isinstance(root, torch.Tensor):
                 provider.free(root)
@@ -372,6 +380,11 @@ class WorkspaceOwner:
                 return
             self.runtime.ensure_open()
 
+            _runtime_debug(
+                "workspace.allocate.begin",
+                local_bytes=self.local_layout.total_bytes,
+                symmetric_bytes=self.symmetric_layout.total_bytes,
+            )
             local = _LocalSlab(
                 self.local_layout.total_bytes,
                 self.runtime.device,
@@ -379,13 +392,16 @@ class WorkspaceOwner:
             )
             self._local = local
             try:
+                _runtime_debug("workspace.symmetric-slab.create.begin")
                 symmetric = SymmetricSlab(
                     self.runtime,
                     self.symmetric_layout.total_bytes,
                     provider=self._symmetric_provider,
                 )
                 self._symmetric = symmetric
+                _runtime_debug("workspace.symmetric-slab.ensure.begin")
                 symmetric.ensure_allocated()
+                _runtime_debug("workspace.symmetric-slab.ensure.end")
             except Exception:
                 try:
                     if self._symmetric is not None:
@@ -398,6 +414,7 @@ class WorkspaceOwner:
                     self._cleanup_required = True
                     raise
                 raise
+            _runtime_debug("workspace.allocate.end")
 
     def views(self, token_count: int) -> WorkspaceViews:
         with self._lock:
