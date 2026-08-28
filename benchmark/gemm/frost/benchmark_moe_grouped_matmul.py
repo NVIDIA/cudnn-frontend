@@ -173,13 +173,13 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
+def _nsys_worker(shape, configs, warmup, iters, nbuf, fto_align_spec) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     wtok, ww, wout = _mkdata(S, N, K, E)  # dedicated warmup buffer
     pool = _mkdata_pool(S, N, K, E, nbuf)  # rotation pool for timed iters
     offsets = group_offsets(S, E)
-    alignment = fto_alignment(args.fto_alignment, offsets)
+    alignment = fto_alignment(fto_align_spec, offsets)
     print(f"[worker] shape G={G} M={M} N={N} K={K} (S={S}), configs={len(configs)}, " f"warmup={warmup}, iters={iters}, rotate_buffers={nbuf}")
 
     # 1. cuBLAS baseline — batched GEMM.
@@ -240,7 +240,7 @@ def main() -> int:
 
     if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, args.fto_alignment)
         return 0
 
     flops = 2 * S * N * K
@@ -261,7 +261,18 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        inner_args = ["--shape", args.shape, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
+        inner_args = [
+            "--shape",
+            args.shape,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+            "--fto-alignment",
+            str(args.fto_alignment),
+        ]
         if config_names:
             inner_args += ["--configs", ",".join(config_names)]
         kern_times = nsys_run_and_parse(__file__, inner_args, tag="bench_moe")

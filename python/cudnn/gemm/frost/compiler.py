@@ -967,16 +967,15 @@ def _render_tile_constants(
 
 def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[str]:
     """A ``fp32 -> <8-bit scale> byte`` helper, emitted into the generated kernel
-    so it stays self-contained. The x2 destination gets the value in both lanes;
-    only the low byte is read back."""
+    so it stays self-contained. The cvt unit is natively x2, so the pair form is
+    the primitive and the scalar one converts a value against itself and drops
+    the high byte -- col-quant, which has one scale per COLUMN, calls the pair."""
     return [
         "",
         "",
-        f"def {fn_name}(x):",
-        "    src = cutlass.Float32(x).ir_value()",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Float32.mlir_type), [src, src])",
-        "    lo = _frost_vector.extract(pair, dynamic_position=[], static_position=[0])",
-        "    hi = _frost_vector.extract(pair, dynamic_position=[], static_position=[1])",
+        f"def {fn_name}_x2(a, b):",
+        "    lo = cutlass.Float32(a).ir_value()",
+        "    hi = cutlass.Float32(b).ir_value()",
         "    packed = _frost_nvvm.convert_f32x2_to_f8x2(",
         "        _frost_ir.VectorType.get([2], cutlass.Int8.mlir_type),",
         "        hi,",
@@ -985,8 +984,11 @@ def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[s
         f"        rnd=_frost_nvvm.FPRoundingMode.{rnd},",
         "        sat=_frost_nvvm.SaturationMode.SATFINITE,",
         "    )",
-        "    byte = _frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed))",
-        "    return cutlass.Int32(byte) & 0xFF",
+        "    return cutlass.Int32(_frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed)))",
+        "",
+        "",
+        f"def {fn_name}(x):",
+        f"    return {fn_name}_x2(x, x) & 0xFF",
     ]
 
 
@@ -998,15 +1000,23 @@ def _cvt_e5m3_bits_to_f32() -> list[str]:
     return [
         "",
         "",
-        "def _frost_e5m3_bits_to_f32(b):",
-        "    byte = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [byte, byte])",
+        "def _frost_e5m3_bits_to_f32_x2(a, b):",
+        "    lo = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(a).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    hi = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [lo, hi])",
         "    widened = _frost_nvvm.convert_f8x2_to_bf16x2(",
         "        _frost_ir.VectorType.get([2], cutlass.BFloat16.mlir_type),",
         "        pair,",
         "        _frost_ir.TypeAttr.get(cutlass.FloatNV8E5M3FNU.mlir_type),",
         "    )",
-        "    return cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0])))",
+        "    return (",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0]))),",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[1]))),",
+        "    )",
+        "",
+        "",
+        "def _frost_e5m3_bits_to_f32(b):",
+        "    return _frost_e5m3_bits_to_f32_x2(b, b)[0]",
     ]
 
 

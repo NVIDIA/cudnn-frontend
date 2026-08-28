@@ -200,11 +200,11 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
 # Worker mode (re-exec'd under nsys).
 
 
-def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) -> None:
+def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, fto_align_spec, no_baseline=False) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     offsets = group_offsets(S, E)
-    alignment = fto_alignment(args.fto_alignment, offsets)
+    alignment = fto_alignment(fto_align_spec, offsets)
     print(f"[worker] shape G={G} M={M} N={N} K={K} (S={S}) combo={combo}, " f"configs={len(configs)}, warmup={warmup}, iters={iters}, rotate={nbuf}")
 
     # 1. BF16 batched-GEMM reference.
@@ -277,7 +277,7 @@ def main() -> int:
 
     if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf, args.no_baseline)
+        _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf, args.fto_alignment, args.no_baseline)
         return 0
 
     flops = 2 * S * N * K
@@ -299,7 +299,20 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        inner = ["--shape", args.shape, "--combo", combo, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
+        inner = [
+            "--shape",
+            args.shape,
+            "--combo",
+            combo,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+            "--fto-alignment",
+            str(args.fto_alignment),
+        ]
         if config_names:
             inner += ["--configs", ",".join(config_names)]
         if args.no_baseline:
