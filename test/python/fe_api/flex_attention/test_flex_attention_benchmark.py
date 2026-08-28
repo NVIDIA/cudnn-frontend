@@ -66,6 +66,13 @@ def test_benchmark_is_flex_only():
     assert "PyTorch" not in help_text
 
 
+def test_environment_has_no_flex_specific_cutlass_version_gate(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(benchmark, "_safe_version", lambda _package: "4.5.0")
+    benchmark._validate_environment()
+
+
 def test_benchmark_dry_run_does_not_query_cuda(monkeypatch, capsys):
     def unexpected_cuda_query():
         raise AssertionError("dry-run must not query the CUDA runtime")

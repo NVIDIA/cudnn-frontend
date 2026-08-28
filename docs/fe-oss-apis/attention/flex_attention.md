@@ -37,8 +37,7 @@ lifecycle is needed.
 
 - SM90, SM100, or SM103 NVIDIA GPU
 - CUDA-enabled PyTorch
-- the `cutedsl` optional dependencies, including
-  `nvidia-cutlass-dsl>=4.5.2`
+- the cuDNN Frontend `cutedsl` optional dependencies
 
 From a source checkout:
 

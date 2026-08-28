@@ -9,7 +9,7 @@ mask patterns.
 
 - NVIDIA Hopper SM90, Blackwell SM100, or Blackwell SM103 GPU
 - CUDA-enabled PyTorch
-- `nvidia-cutlass-dsl>=4.5.2` and the other `cutedsl` dependencies
+- the cuDNN Frontend `cutedsl` optional dependencies
 
 From a source checkout:
 

@@ -702,26 +702,6 @@ def _safe_version(package: str) -> str | None:
         return None
 
 
-def _release_version(value: str) -> tuple[int, ...]:
-    release = value.split("+", 1)[0].split("-", 1)[0]
-    parts = []
-    for part in release.split("."):
-        digits = "".join(character for character in part if character.isdigit())
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
-
-
-def _version_at_least(value: str | None, minimum: str) -> bool:
-    if value is None:
-        return False
-    actual = _release_version(value)
-    required = _release_version(minimum)
-    width = max(len(actual), len(required))
-    return actual + (0,) * (width - len(actual)) >= required + (0,) * (width - len(required))
-
-
 def _git_output(root: Path, *args: str) -> str | None:
     try:
         return subprocess.check_output(("git", "-C", str(root), *args), text=True, stderr=subprocess.DEVNULL).strip()
@@ -848,9 +828,6 @@ def _validate_environment() -> None:
     arch = capability[0] * 10 + capability[1]
     if arch not in SUPPORTED_ARCHES:
         raise RuntimeError("cudnn.flex_attention supports SM90, SM100, and SM103; " f"got {torch.cuda.get_device_name()} SM{arch}")
-    cutlass_version = _safe_version("nvidia-cutlass-dsl")
-    if not _version_at_least(cutlass_version, "4.5.2"):
-        raise RuntimeError("Flex Attention requires nvidia-cutlass-dsl>=4.5.2; " f"got {cutlass_version}")
 
 
 def _default_output_dir() -> Path:
