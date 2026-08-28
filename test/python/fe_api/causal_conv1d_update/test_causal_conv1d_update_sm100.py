@@ -156,6 +156,50 @@ def test_state_shift_and_append_are_bitwise():
 
 
 @torch.no_grad()
+def test_silu_special_values_and_tails():
+    _, causal_conv1d_update = _load_api()
+    values = torch.tensor(
+        [
+            -float("inf"),
+            -100.0,
+            -20.0,
+            -10.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            10.0,
+            20.0,
+            100.0,
+            float("inf"),
+            float("nan"),
+        ],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    x = values.unsqueeze(0)
+    state = torch.zeros(1, values.numel(), 4, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(values.numel(), 4, device="cuda", dtype=torch.bfloat16)
+    weight[:, -1] = 1
+    expected, expected_state = _reference_step(x, weight, state)
+
+    output = causal_conv1d_update(x, weight, state)
+
+    torch.testing.assert_close(output, expected, atol=3e-2, rtol=3e-2, equal_nan=True)
+    _assert_state_bits_equal(state, expected_state)
+    # Signed zero is determined by the four-term convolution reduction, not by
+    # applying SiLU directly to the final x lane.  Compare the observable
+    # reduction result bitwise for both zero inputs.
+    zero_lanes = torch.tensor([5, 6], device="cuda")
+    torch.testing.assert_close(
+        output.view(torch.int16).index_select(1, zero_lanes),
+        expected.view(torch.int16).index_select(1, zero_lanes),
+        rtol=0,
+        atol=0,
+    )
+
+
+@torch.no_grad()
 def test_execute_respects_current_torch_stream():
     CausalConv1dUpdateSm100, _ = _load_api()
     torch.manual_seed(3)

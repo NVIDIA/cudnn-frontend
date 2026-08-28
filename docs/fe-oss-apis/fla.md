@@ -20,8 +20,11 @@ cudnn.fla.accelerate_fla()
 # Incrementally opt the dense FLA GatedMLP into the fused cuDNN SwiGLU MLP.
 cudnn.fla.accelerate_fla(targets="gated_mlp")
 
-# A string or iterable is accepted; "gdn" and "mlp" are aliases.
-cudnn.fla.accelerate_fla(targets=("gdn", "gated_mlp"))
+# Opt FLA 0.5.2 decode short convolution into the native SM100 update.
+cudnn.fla.accelerate_fla(targets="short_conv")
+
+# A string or iterable is accepted; "gdn", "mlp", and "shortconv" are aliases.
+cudnn.fla.accelerate_fla(targets=("gdn", "gated_mlp", "shortconv"))
 ```
 
 `accelerate_fla(verbose=True, *, targets=None)` is incremental and idempotent.
@@ -39,6 +42,34 @@ custom linears, other dtypes/layouts/devices, or graph compilation execute the
 original FLA method. Typed unsupported-kernel declines also fall back;
 unexpected binding, allocation, or launch errors propagate.
 
+The opt-in `short_conv` target patches
+`fla.modules.conv.triton.ops.causal_conv1d_update` and preserves FLA 0.5.2's
+public call and return contract:
+
+```python
+y, cache = causal_conv1d_update(
+    x, cache, residual=None, weight=weight, bias=None, activation="silu"
+)
+```
+
+The native route is deliberately restricted to inference on exact SM100 with
+BF16, a contiguous `[N, D, 4]` cache, contiguous `[D, 4]` weights, no residual
+or bias, and `silu`/`swish`. Contiguous input layouts `[N, D]`, `[N, 1, D]`,
+and `[1, N, D]` are normalized with zero-copy views; output shape and cache
+object identity are preserved. Everything else executes the saved original FLA
+callable. Typed unsupported-kernel declines fall back, while unexpected native
+binding, allocation, and launch failures propagate.
+
+The cuDNN adapter and native kernel are independent NVIDIA implementations.
+They use FLA's documented interface and observable depthwise causal-convolution
+semantics for compatibility; no FLA Triton kernel source is incorporated or
+translated.
+
+Use `benchmark/fla_short_conv_shim_sm100.py` on a ComputeLab B200 for the exact
+patched-callable comparison. It reports CUDA-graph replay separately from
+steady-state eager host enqueue time and refuses to emit timings until route,
+output, mutable-state, cache-identity, and restore gates pass.
+
 ## Inspect and restore
 
 ```python
@@ -49,8 +80,10 @@ cudnn.fla.is_accelerated("gated_mlp") # one target ("mlp" also works)
 
 cudnn.fla.mlp_last_path()  # "native", "fallback:<reason>", or "error:<type>"
 cudnn.fla.last_path()      # most recent Gated Delta Rule route
+cudnn.fla.short_conv_last_path() # most recent short-convolution route
 
 cudnn.fla.restore_fla(targets="gated_mlp") # restore only the MLP target
+cudnn.fla.restore_fla(targets="shortconv") # alias for the short-conv target
 cudnn.fla.restore_fla()                    # restore every target owned by cuDNN
 ```
 
@@ -61,13 +94,13 @@ per-thread state.
 
 ## Installation
 
-Install FLA separately. The dense MLP adapter is version-gated to the validated
-release:
+Install FLA separately. The dense MLP and short-convolution adapters are
+version-gated to the validated release:
 
 ```bash
 pip install flash-linear-attention==0.5.2
 pip install "nvidia-cudnn-frontend[cutedsl]"
 ```
 
-The `cutedsl` extra supplies the optional dependencies required by the fused
-GEMM path used by the native `gated_mlp` target.
+The `cutedsl` extra supplies the optional CUTLASS DSL and CUDA Python
+dependencies required by the native `gated_mlp` and `short_conv` targets.

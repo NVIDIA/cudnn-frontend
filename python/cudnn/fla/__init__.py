@@ -6,13 +6,15 @@
 ``accelerate_fla()`` monkeypatches FLA entry points cuDNN can serve and
 transparently calls the original implementation for unsupported configurations.
 The backward-compatible no-argument call enables the linear-attention targets
-(``gated_delta_rule`` and ``kda``).  The dense MLP adapter is intentionally
-opt-in because it has a narrower FLA 0.5.2/local-module contract::
+(``gated_delta_rule`` and ``kda``).  The dense MLP and decode short-convolution
+adapters are intentionally opt-in because they have narrower FLA 0.5.2
+contracts::
 
     import cudnn.fla
 
     cudnn.fla.accelerate_fla()                    # GDN + KDA, as before
     cudnn.fla.accelerate_fla(targets="gated_mlp") # incremental MLP opt-in
+    cudnn.fla.accelerate_fla(targets="short_conv") # decode short-conv opt-in
 
 Targets can be enabled and restored independently.  Every adapter is
 fail-closed: an incompatible installed FLA target rejects explicit activation,
@@ -32,8 +34,18 @@ from .gated_mlp import last_path as mlp_last_path
 from .gated_mlp import make_gated_mlp_forward
 from .gated_mlp import _supports_installed_fla
 from .kda import make_chunk_kda
+from .short_conv import last_path as short_conv_last_path
+from .short_conv import make_causal_conv1d_update
+from .short_conv import _supports_installed_fla as _supports_short_conv_fla
 
-__all__ = ["accelerate_fla", "is_accelerated", "last_path", "mlp_last_path", "restore_fla"]
+__all__ = [
+    "accelerate_fla",
+    "is_accelerated",
+    "last_path",
+    "mlp_last_path",
+    "restore_fla",
+    "short_conv_last_path",
+]
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,50 @@ def _gated_mlp_replacement(module, owner, original):
     return make_gated_mlp_forward(original, owner, swiglu_linear_cls)
 
 
+_SHORT_CONV_CODE_SUFFIXES = (
+    "torch/_dynamo/eval_frame.py",
+    "fla/ops/backends/__init__.py",
+    "fla/utils/_decorators.py",
+    "fla/modules/conv/triton/ops.py",
+)
+
+
+def _matches_short_conv_target(module, original) -> bool:
+    """Match the exact decorated FLA 0.5.2 callable, not a later wrapper."""
+
+    if (
+        not callable(original)
+        or getattr(original, "__module__", None) != module.__name__
+        or getattr(original, "__name__", None) != "causal_conv1d_update"
+        or getattr(original, "__qualname__", None) != "causal_conv1d_update"
+        or getattr(original, "_torchdynamo_disable", None) is not True
+        or getattr(original, "_torchdynamo_orig_callable", None) is not getattr(original, "__wrapped__", None)
+    ):
+        return False
+
+    current = original
+    for index, suffix in enumerate(_SHORT_CONV_CODE_SUFFIXES):
+        code = getattr(current, "__code__", None)
+        if code is None or not code.co_filename.replace("\\", "/").endswith(suffix):
+            return False
+        wrapped = getattr(current, "__wrapped__", None)
+        if index + 1 == len(_SHORT_CONV_CODE_SUFFIXES):
+            return wrapped is None
+        if wrapped is None:
+            return False
+        current = wrapped
+    return False
+
+
+def _short_conv_replacement(module, owner, original):
+    del owner
+    if not _supports_short_conv_fla():
+        raise ImportError("the cuDNN short-conv shim requires flash-linear-attention==0.5.2")
+    if not _matches_short_conv_target(module, original):
+        raise ImportError("FLA causal_conv1d_update does not match the expected owning module")
+    return make_causal_conv1d_update(original)
+
+
 _TARGETS = {
     "gated_delta_rule": _PatchSpec(
         "fla.ops.gated_delta_rule",
@@ -92,8 +148,14 @@ _TARGETS = {
         owner_attribute="GatedMLP",
         default=False,
     ),
+    "short_conv": _PatchSpec(
+        "fla.modules.conv.triton.ops",
+        "causal_conv1d_update",
+        _short_conv_replacement,
+        default=False,
+    ),
 }
-_ALIASES = {"gdn": "gated_delta_rule", "mlp": "gated_mlp"}
+_ALIASES = {"gdn": "gated_delta_rule", "mlp": "gated_mlp", "shortconv": "short_conv"}
 _DEFAULT_TARGETS = tuple(name for name, spec in _TARGETS.items() if spec.default)
 _ORIGINALS: dict[str, _AppliedPatch] = {}
 
@@ -158,7 +220,9 @@ def accelerate_fla(verbose: bool = True, *, targets: str | Iterable[str] | None 
 
     ``targets=None`` preserves the original behavior and enables only GDN/KDA.
     Use ``targets="gated_mlp"`` (or the ``"mlp"`` alias) for the opt-in dense
-    MLP adapter.  A string or iterable of strings is accepted.
+    MLP adapter, and ``targets="short_conv"`` (or ``"shortconv"``) for the
+    FLA 0.5.2 decode short-convolution adapter.  A string or iterable of
+    strings is accepted.
     """
     requested = _normalize_targets(targets, default=_DEFAULT_TARGETS)
     available = {target for target in requested if is_accelerated(target)}

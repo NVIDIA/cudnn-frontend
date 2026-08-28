@@ -6,7 +6,10 @@
 cache in place and emits the fused-SiLU output for one decode step. It targets
 the no-bias, width-four short convolution used by GDN/KDA-style linear
 attention blocks. It is a standalone native primitive; it does not yet add a
-model adapter or make cuDNN the default route in FLA or a serving framework.
+serving-framework integration or make cuDNN the default route. The optional
+`cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
+decode-update interface and routes only this exact supported subset to the
+native primitive; all other configurations retain FLA's original path.
 
 For row `n`, channel `d`, and selected cache slot `s`, the operation is:
 
