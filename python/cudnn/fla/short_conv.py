@@ -6,7 +6,7 @@
 This adapter was implemented independently against FLA's public call contract.
 It does not include or translate FLA's Triton kernel implementation.  The
 supported path only normalizes FLA's decode layouts into zero-copy 2D views and
-calls :func:`cudnn.causal_conv1d_update`; every other configuration calls the
+calls :func:`cudnn.ops.causal_conv1d_update`; every other configuration calls the
 original FLA function unchanged.
 """
 
@@ -63,9 +63,9 @@ def _is_compiling() -> bool:
 def _call_native(x: torch.Tensor, cache: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # Resolve lazily so importing cudnn.fla does not import the optional
     # CuTeDSL stack or compile a kernel.
-    from cudnn.causal_conv1d_update_sm100 import causal_conv1d_update
+    from cudnn.ops import causal_conv1d_update
 
-    return causal_conv1d_update(x, cache, weight)
+    return causal_conv1d_update(x, cache, weight, activation="silu")
 
 
 def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:

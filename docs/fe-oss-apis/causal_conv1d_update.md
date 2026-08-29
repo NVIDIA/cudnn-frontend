@@ -2,105 +2,141 @@
 
 **This FE-OSS API is experimental and subject to change.**
 
-`cudnn.ops.causal_conv1d_update` advances a four-token depthwise
-causal-convolution cache in place and emits the fused-SiLU output for one
-decode step. It targets
-the width-four short convolution used by GDN/KDA-style linear
-attention blocks. It is a standalone native primitive; it does not yet add a
-serving-framework integration or make cuDNN the default route. The optional
-`cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
-decode-update interface and routes only this exact supported subset to the
-native primitive; all other configurations retain FLA's original path.
-The public API is architecture-neutral; plan compilation, output allocation,
-stream selection, and the current schedule stay inside the implementation.
-Every admitted architecture uses the same portable one-row schedule.
+`cudnn.ops.causal_conv1d_update` advances a mutable depthwise
+causal-convolution cache in place and returns the output for one decode step.
+The semantic tensor contract uses `weight[D, W]` and `conv_state[S, D, L]`,
+where `L >= W - 1`. The first native implementation targets the width-four
+short convolution used by GDN/KDA-style linear-attention blocks. Compilation,
+architecture dispatch, output ownership, streams, and kernel schedules remain
+private implementation details.
 
-For row `n`, channel `d`, and selected cache slot `s`, the operation is:
+Without circular-buffer metadata, row `n`, channel `d`, and selected cache
+slot `s` are updated as follows:
 
 ```text
-updated_state[s, d, :] = [state[s, d, 1], state[s, d, 2],
-                          state[s, d, 3], x[n, d]]
-output[n, d] = SiLU(sum_j updated_state[s, d, j] * weight[d, j] + bias[d])
+history = concat(conv_state[s, d, :], x[n, d])
+conv_state[s, d, :] = history[-L:]
+acc[n, d] = sum_j history[-W + j] * weight[d, j] + bias[d]
+output[n, d] = activation(acc[n, d])
 ```
 
-The optional bias term is zero when `bias` is omitted.
+The bias is zero when omitted. `activation=None` and `"identity"` return the
+accumulator directly; `"silu"` and `"swish"` select the same fused SiLU
+specialization. Identity and SiLU compile as separate kernels, so the unused
+activation work is absent from the identity path.
 
-When `state_indices` is omitted, row `n` selects slot `n`. When it is present,
-`s = state_indices[n]`. Indexed slots must be in range and unique within the
-decode batch because state is mutated. The kernel checks these properties on
-device and traps on violation. The resulting CUDA error is asynchronous and
-the failed update is not transactional.
+When `conv_state_indices` is omitted, row `n` selects slot `n`. When it is
+present, `s = conv_state_indices[n]`. A value of `-1` denotes a padding row:
+its output is zero and it does not mutate `conv_state`. Other selected slots
+must be in range and unique within the decode batch because `conv_state` is
+mutated; repeated padding rows are allowed.
 
-## Supported contract
+`cache_seqlens[n]`, when present, treats the selected state as a circular
+buffer: the new token is written at `cache_seqlens[n] % L`, and the previous
+`W - 1` tokens are read modulo `L`. `cache_seqlens` itself is not mutated.
+The current native kernel declines this circular-buffer mode; it is part of
+the semantic API so adding the implementation does not require another public
+signature.
 
-- GPU: functional support on compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0,
-  10.0, 10.3, 11.0, 12.0, and 12.1
-- performance-characterized GPU: SM100 (compute capability 10.0)
-- `x`: contiguous BF16 `[N, D]`
-- `weight`: contiguous BF16 `[D, 4]`
-- `conv_state`: contiguous BF16 `[S, D, 4]`, updated in place
-- `conv_state_indices`: optional contiguous CUDA int32 `[N]`
-- `bias`: optional contiguous BF16 `[D]`
-- output: contiguous BF16 `[N, D]`
-- activation: SiLU, always fused
-- autograd: unsupported
-- pointer alignment: 16 bytes for BF16 tensors and 4 bytes for indices
-
-The native direct API and current kernel require CUTLASS DSL 4.7 or newer for
-the inline-PTX integration they import. The package-wide `cutedsl` extra keeps
-its broader `>=4.5` floor for unrelated APIs; installing only that minimum is
-not sufficient for this direct API. The FLA adapter treats the resulting
-`ImportError` as a typed decline and executes FLA's original path.
-
-The full correctness suite was run on A100 SM80, L40S SM89, H200 SM90, and
-B200 SM100. The generic and indexed kernels were also executed on a GB110
-board reporting compute capability 10.3 and an RTX 5080 SM120; outputs
-matched the reference and state updates were bit-exact. Thus SM80, SM89, SM90,
-SM100, SM103, and SM120 are runtime-validated. SM86, SM87, SM110, and SM121
-have compile-only validation. In particular, the SM110 kernel cross-compiles
-with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.
-
-This narrow contract does not cover a returned intermediate state for
-speculative decoding, arbitrary convolution width, prefill, training, or a
-general Mamba causal-convolution interface. The indexed path is provided for
-functional paged-state support; its duplicate-index validation has not been
-performance-characterized as a fast path.
-
-Each CTA owns one decode row and a 256-channel tile. Indexed calls use the same
-schedule with device-side index validation and channel-tail handling.
-
-## Public Torch API
-
-The semantic API accepts ordinary tensors, owns its output allocation, and
-returns the output tensor directly:
+## Python API
 
 ```python
 import torch
-from cudnn.ops import causal_conv1d_update
+import cudnn
 
 x = torch.randn(8, 2048, device="cuda", dtype=torch.bfloat16)
 weight = torch.randn(2048, 4, device="cuda", dtype=torch.bfloat16)
 conv_state = torch.randn(8, 2048, 4, device="cuda", dtype=torch.bfloat16)
 
-with torch.no_grad():
-    output = causal_conv1d_update(
-        x,
-        conv_state,
-        weight,
-        activation="silu",
-    )
+output = cudnn.ops.causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    activation="silu",
+)
 ```
 
-`bias` and `activation` follow the mathematical operation. Optional
-`conv_state_indices` is keyword-only because it changes state routing rather
-than tensor math. The alias `cudnn.causal_conv1d_update` resolves to the same
-function. No public parameter exposes a wrapper object, architecture name,
-plan, output buffer, or raw stream.
+The signature is:
 
-The implementation caches compiled kernels by device, shape,
-indexed/non-indexed signature, and bias presence. The cache is bounded. The
-first call for a signature performs JIT compilation, so warm the exact
-signature before latency measurement or CUDA Graph capture.
+```python
+cudnn.ops.causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+    *,
+    cache_seqlens=None,
+    conv_state_indices=None,
+) -> torch.Tensor
+```
+
+`conv_state` is mutated in place and the return value is an ordinary newly
+allocated Tensor, not a wrapper result. The operation registers the mutation
+with `torch.library`, including its FakeTensor contract. It is inference-only;
+autograd inputs are rejected.
+
+The fourth and fifth positional arguments remain `bias` and `activation`.
+State-routing metadata is keyword-only. The first call for a supported device,
+shape, optional-input signature, and activation performs JIT compilation.
+Warm the exact signature before latency measurement or CUDA Graph capture.
+
+## Semantic tensor contract
+
+- `x`: `[N, D]` for one decode token
+- `weight`: `[D, W]`
+- `conv_state`: `[S, D, L]`, updated in place, with `L >= W - 1`
+- `bias`: optional `[D]`
+- `cache_seqlens`: optional int32 `[N]` circular-buffer positions
+- `conv_state_indices`: optional int32 `[N]` state-slot selection; `-1` is padding
+- output: `[N, D]`
+
+A future multi-token extension can admit `x[N, D, Tstep]` without changing
+the state or weight meanings. The current public implementation rejects 3D
+`x` rather than silently interpreting its layout.
+
+## Current native implementation
+
+- GPU: compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0, 10.0, 10.3, 11.0,
+  12.0, and 12.1; the portable one-row schedule is used on every admitted
+  target
+- performance-characterized GPU: B200 SM100
+- `x`: contiguous BF16 `[N, D]`
+- `weight`: contiguous BF16 `[D, 4]`
+- `conv_state`: contiguous BF16 `[S, D, L]` with `L` equal to 3 or 4,
+  updated in place
+- `bias`: optional contiguous BF16 `[D]`
+- `cache_seqlens`: must be omitted
+- `conv_state_indices`: optional contiguous CUDA int32 `[N]`
+- output: contiguous BF16 `[N, D]`
+- activation: identity or SiLU
+- autograd: unsupported
+- pointer alignment: 16 bytes for BF16 tensors and 4 bytes for indices
+
+The native kernel requires CUTLASS DSL 4.7 or newer for the inline-PTX
+integration it imports. The package-wide `cutedsl` extra keeps its broader
+`>=4.5` floor for unrelated APIs; installing only that minimum is not
+sufficient for this operation. The optional FLA 0.5.2 adapter treats the
+resulting `ImportError` as a typed decline and executes FLA's original path.
+
+Runtime correctness was validated on A100 SM80, L40S SM89, H200 SM90, B200
+SM100, a GB110 board reporting SM103, and RTX 5080 SM120. SM86, SM87, SM110,
+and SM121 have compile-only validation. The SM110 path is functional support,
+not a training-performance claim.
+
+For width four, `L=3` is the standard `W - 1` final state handed off by
+prefill; it uses a functionally correct scalar state-access specialization.
+`L=4` retains the original vectorized fast path used by GDN/KDA decode. Other
+semantically valid widths and state lengths, circular-buffer updates,
+multi-token updates, speculative intermediate-state returns, prefill, and
+training currently raise a clear unsupported-configuration error. The indexed
+path is functional paged-state support; its duplicate-index validation is not
+performance-characterized as a fast path. For the current native path, the
+kernel checks indices on device and traps on values below `-1`, out-of-range
+slots, or duplicate non-padding slots;
+the resulting CUDA error is asynchronous and the failed update is not
+transactional.
 
 ## Semantic provenance and benchmarking
 
@@ -110,13 +146,8 @@ public `causal_conv1d_update` contract from Dao-AILab/causal-conv1d at revision
 either project is included. The implementation uses CUTLASS/CuTe DSL, inline
 PTX, and in-tree NVIDIA FROST primitives.
 
-The FE kernel is independently implemented and keeps FE's architecture,
-alignment, alias, index, and cache contracts.
-
 Use `benchmark/causal_conv1d_update_sm100.py` for route-proof, correctness, and
-an interleaved comparison against FLA on any compute capability listed in the
-supported contract. The benchmark records the actual GPU architecture and
-software environment; Slurm job and node metadata are optional when those
-variables are unavailable. Performance measurements should include the exact
-GPU, software environment, shapes, and raw artifacts; the indexed path should
-be reported separately from the no-index decode path.
+an interleaved comparison against FLA. It intentionally uses the private
+preallocated plan so kernel timing does not include public output allocation
+or custom-op dispatch. The benchmark records the actual GPU architecture and
+software environment; Slurm metadata is optional.

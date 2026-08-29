@@ -30,24 +30,35 @@ pytestmark = [
 def _load_api():
     try:
         from cudnn.causal_conv1d_update_sm100 import (
-            CausalConv1dUpdateSm100,
-            causal_conv1d_update,
+            _CausalConv1dUpdatePlan,
         )
+        from cudnn.ops import causal_conv1d_update
     except ImportError as exc:
         pytest.skip(f"CuTe DSL dependencies unavailable: {exc}")
-    return CausalConv1dUpdateSm100, causal_conv1d_update
+    return _CausalConv1dUpdatePlan, causal_conv1d_update
 
 
-def _reference_step(x, weight, state, state_indices=None):
+def _reference_step(x, weight, state, state_indices=None, bias=None, activation=None):
     """Explicit FP32 output reference plus exact BF16 state transition."""
 
     n_rows = x.shape[0]
     slots = torch.arange(n_rows, device=x.device, dtype=torch.long) if state_indices is None else state_indices.long()
-    selected = state.index_select(0, slots)
-    updated = torch.cat((selected[..., 1:], x.unsqueeze(-1)), dim=-1)
-    output = F.silu((updated.float() * weight.float().unsqueeze(0)).sum(dim=-1)).to(torch.bfloat16)
+    valid = slots >= 0
+    output = torch.zeros_like(x)
     expected_state = state.clone()
-    expected_state.index_copy_(0, slots, updated)
+    if valid.any():
+        valid_slots = slots[valid]
+        selected = state.index_select(0, valid_slots)
+        history = torch.cat((selected, x[valid].unsqueeze(-1)), dim=-1)
+        updated = history[..., -state.shape[-1] :]
+        window = history[..., -weight.shape[-1] :]
+        accumulator = (window.float() * weight.float().unsqueeze(0)).sum(dim=-1)
+        if bias is not None:
+            accumulator = accumulator + bias.float()
+        if activation in ("silu", "swish"):
+            accumulator = F.silu(accumulator)
+        output[valid] = accumulator.to(torch.bfloat16)
+        expected_state.index_copy_(0, valid_slots, updated)
     return output, expected_state
 
 
@@ -57,14 +68,14 @@ def _assert_state_bits_equal(actual, expected):
 
 @torch.no_grad()
 def test_nonzero_state_across_consecutive_steps():
-    CausalConv1dUpdateSm100, _ = _load_api()
+    plan_cls, _ = _load_api()
     torch.manual_seed(0)
     n_rows, n_channels = 3, 521
     state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
 
-    api = CausalConv1dUpdateSm100(
+    api = plan_cls(
         sample_x=torch.empty_like(output),
         sample_weight=weight,
         sample_state=state,
@@ -147,7 +158,7 @@ def test_paged_state_slots_and_untouched_rows():
     state_indices = torch.tensor([6, 1, 4], device="cuda", dtype=torch.int32)
     expected_output, expected_state = _reference_step(x, weight, state, state_indices)
 
-    output = causal_conv1d_update(x, state, weight, state_indices)
+    output = causal_conv1d_update(x, state, weight, conv_state_indices=state_indices)
 
     torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
     _assert_state_bits_equal(state, expected_state)
@@ -159,10 +170,72 @@ def test_paged_state_slots_and_untouched_rows():
 
 
 @torch.no_grad()
-def test_standard_wrapper_returns_tupledict():
-    from cudnn.api_base import TupleDict
-    from cudnn.causal_conv1d_update_sm100 import causal_conv1d_update_wrapper_sm100
+@pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
+def test_padding_state_indices_write_zero_and_do_not_mutate_state(state_len):
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(5)
+    n_rows, n_channels, n_slots = 4, 257, 5
+    x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n_channels, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(n_slots, n_channels, state_len, device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor([-1, 3, -1, 1], device="cuda", dtype=torch.int32)
+    expected_output, expected_state = _reference_step(
+        x,
+        weight,
+        state,
+        state_indices,
+        bias=bias,
+        activation="silu",
+    )
 
+    output = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=state_indices,
+    )
+
+    torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(output[[0, 2]], torch.zeros_like(output[[0, 2]]), rtol=0, atol=0)
+    _assert_state_bits_equal(state, expected_state)
+
+
+@torch.no_grad()
+def test_wminus1_state_handoff_from_prefill_matches_next_causal_output():
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(7)
+    n_rows, n_channels, prefix_len = 3, 259, 11
+    prefix = torch.randn(n_rows, n_channels, prefix_len, device="cuda", dtype=torch.bfloat16)
+    next_x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n_channels, device="cuda", dtype=torch.bfloat16)
+
+    # Bulk prefill returns exactly W - 1 history elements. Decode must consume
+    # that state without padding it to the legacy four-element cache layout.
+    state = prefix[..., -3:].contiguous()
+    full_history = torch.cat((prefix, next_x.unsqueeze(-1)), dim=-1)
+    expected_window = full_history[..., -4:]
+    expected_output = F.silu((expected_window.float() * weight.float().unsqueeze(0)).sum(dim=-1) + bias.float()).to(torch.bfloat16)
+    expected_state = full_history[..., -3:].contiguous()
+
+    output = causal_conv1d_update(
+        next_x,
+        state,
+        weight,
+        bias,
+        activation="silu",
+    )
+
+    torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+    _assert_state_bits_equal(state, expected_state)
+
+
+@torch.no_grad()
+def test_public_api_returns_an_ordinary_tensor():
+    _, causal_conv1d_update = _load_api()
     torch.manual_seed(11)
     n_rows, n_channels = 2, 259
     x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
@@ -170,17 +243,16 @@ def test_standard_wrapper_returns_tupledict():
     state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
     expected_output, expected_state = _reference_step(x, weight, state)
 
-    result = causal_conv1d_update_wrapper_sm100(x, state, weight)
+    result = causal_conv1d_update(x, state, weight)
 
-    assert isinstance(result, TupleDict)
-    assert list(result.keys()) == ["output_tensor"]
-    assert result[0] is result["output_tensor"]
-    torch.testing.assert_close(result["output_tensor"], expected_output, atol=3e-2, rtol=3e-2)
+    assert type(result) is torch.Tensor
+    torch.testing.assert_close(result, expected_output, atol=3e-2, rtol=3e-2)
     _assert_state_bits_equal(state, expected_state)
 
 
 @torch.no_grad()
-def test_state_shift_and_append_are_bitwise():
+@pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
+def test_state_shift_and_append_are_bitwise(state_len):
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(2)
     n_rows, n_channels = 2, 257
@@ -191,7 +263,7 @@ def test_state_shift_and_append_are_bitwise():
     state_bits = torch.randint(
         -(2**15),
         2**15,
-        (n_rows, n_channels, 4),
+        (n_rows, n_channels, state_len),
         device="cuda",
         dtype=torch.int16,
     )
@@ -205,7 +277,7 @@ def test_state_shift_and_append_are_bitwise():
     state = state_bits.view(torch.bfloat16)
     x = x_bits.view(torch.bfloat16)
     weight = torch.zeros(n_channels, 4, device="cuda", dtype=torch.bfloat16)
-    expected_bits = torch.cat((state_bits[..., 1:], x_bits.unsqueeze(-1)), dim=-1)
+    expected_bits = torch.cat((state_bits, x_bits.unsqueeze(-1)), dim=-1)[..., -state_len:]
 
     causal_conv1d_update(x, state, weight)
 
@@ -238,9 +310,9 @@ def test_silu_special_values_and_tails():
     state = torch.zeros(1, values.numel(), 4, device="cuda", dtype=torch.bfloat16)
     weight = torch.zeros(values.numel(), 4, device="cuda", dtype=torch.bfloat16)
     weight[:, -1] = 1
-    expected, expected_state = _reference_step(x, weight, state)
+    expected, expected_state = _reference_step(x, weight, state, activation="silu")
 
-    output = causal_conv1d_update(x, state, weight)
+    output = causal_conv1d_update(x, state, weight, activation="silu")
 
     torch.testing.assert_close(output, expected, atol=3e-2, rtol=3e-2, equal_nan=True)
     _assert_state_bits_equal(state, expected_state)
@@ -257,8 +329,91 @@ def test_silu_special_values_and_tails():
 
 
 @torch.no_grad()
+def test_public_custom_op_registration_contract():
+    from cudnn.ops._causal_conv1d_update import _causal_conv1d_update_primitive
+
+    torch.manual_seed(31)
+    n_rows, n_channels, n_slots = 2, 257, 5
+    x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(n_slots, n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n_channels, device="cuda", dtype=torch.bfloat16)
+    state_indices = torch.tensor([4, 1], device="cuda", dtype=torch.int32)
+    test_utils = (
+        "test_schema",
+        "test_faketensor",
+        "test_aot_dispatch_dynamic",
+    )
+
+    results = torch.library.opcheck(
+        _causal_conv1d_update_primitive,
+        (x, state, weight, bias, "silu", None, state_indices),
+        test_utils=test_utils,
+    )
+
+    assert results == {test: "SUCCESS" for test in test_utils}
+
+
+@torch.no_grad()
+def test_public_torch_compile_fullgraph_observes_state_mutation():
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(37)
+    n_rows, n_channels = 2, 257
+    x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    expected_output, expected_state = _reference_step(x, weight, state, activation="silu")
+
+    compiled_update = torch.compile(causal_conv1d_update, fullgraph=True)
+    output = compiled_update(x, state, weight, activation="silu")
+
+    torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+    _assert_state_bits_equal(state, expected_state)
+
+
+@torch.no_grad()
+def test_public_cuda_graph_capture_and_replay_observe_state_mutation():
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(43)
+    n_rows, n_channels = 2, 257
+    x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    initial_state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
+
+    # Compile and cache the exact native specialization before capture.
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        causal_conv1d_update(x, initial_state.clone(), weight, activation="silu")
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    state = initial_state.clone()
+    expected_output, expected_state = _reference_step(x, weight, initial_state, activation="silu")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = causal_conv1d_update(x, state, weight, activation="silu")
+
+    # Capture records the launch; only replay makes its output and mutation
+    # observable. Poison the graph-owned output to prove replay overwrites it.
+    captured_output.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured_output, expected_output, atol=3e-2, rtol=3e-2)
+    _assert_state_bits_equal(state, expected_state)
+
+    expected_output_2, expected_state_2 = _reference_step(x, weight, expected_state, activation="silu")
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, expected_output_2, atol=3e-2, rtol=3e-2)
+    _assert_state_bits_equal(state, expected_state_2)
+
+
+@torch.no_grad()
 def test_execute_respects_current_torch_stream():
-    CausalConv1dUpdateSm100, _ = _load_api()
+    plan_cls, _ = _load_api()
     torch.manual_seed(3)
     n_rows, n_channels = 2, 1024
     x_real = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
@@ -269,7 +424,7 @@ def test_execute_respects_current_torch_stream():
     x = torch.full_like(x_real, float("nan"))
     state = torch.full_like(state_real, float("nan"))
     output = torch.empty_like(x)
-    api = CausalConv1dUpdateSm100(x, weight, state, output)
+    api = plan_cls(x, weight, state, output)
     assert api.check_support()
     api.compile()
     torch.cuda.synchronize()
@@ -289,8 +444,8 @@ def test_execute_respects_current_torch_stream():
 
 
 @torch.no_grad()
-def test_wrapper_respects_explicit_cuda_stream():
-    from cudnn.causal_conv1d_update_sm100 import causal_conv1d_update_wrapper_sm100
+def test_private_allocating_route_respects_explicit_cuda_stream():
+    from cudnn.causal_conv1d_update_sm100 import _causal_conv1d_update
 
     torch.manual_seed(13)
     n_rows, n_channels = 2, 1024
@@ -302,7 +457,7 @@ def test_wrapper_respects_explicit_cuda_stream():
     # Warm the exact signature so this test isolates stream ordering rather
     # than JIT compilation behavior.
     warm_state = state_real.clone()
-    causal_conv1d_update_wrapper_sm100(x_real, warm_state, weight)
+    _causal_conv1d_update(x_real, warm_state, weight)
     torch.cuda.synchronize()
 
     x = torch.full_like(x_real, float("nan"))
@@ -314,7 +469,7 @@ def test_wrapper_respects_explicit_cuda_stream():
         x.copy_(x_real)
         state.copy_(state_real)
 
-    result = causal_conv1d_update_wrapper_sm100(
+    result = _causal_conv1d_update(
         x,
         state,
         weight,
@@ -322,8 +477,8 @@ def test_wrapper_respects_explicit_cuda_stream():
     )
     side.synchronize()
 
-    assert not torch.isnan(result["output_tensor"]).any(), "kernel read poisoned input from the wrong stream"
-    torch.testing.assert_close(result["output_tensor"], expected_output, atol=3e-2, rtol=3e-2)
+    assert not torch.isnan(result).any(), "kernel read poisoned input from the wrong stream"
+    torch.testing.assert_close(result, expected_output, atol=3e-2, rtol=3e-2)
     _assert_state_bits_equal(state, expected_state)
 
 
@@ -338,7 +493,7 @@ case = sys.argv[1]
 source_cudnn = sys.argv[2]
 cudnn.__path__.insert(0, source_cudnn)
 
-from cudnn.causal_conv1d_update_sm100 import CausalConv1dUpdateSm100
+from cudnn.causal_conv1d_update_sm100 import _CausalConv1dUpdatePlan
 
 torch.manual_seed(17)
 n_rows, n_channels, n_slots = 2, 257, 3
@@ -347,14 +502,14 @@ weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
 state = torch.randn(n_slots, n_channels, 4, device="cuda", dtype=torch.bfloat16)
 output = torch.empty_like(x)
 valid_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-api = CausalConv1dUpdateSm100(x, weight, state, output, valid_indices)
+api = _CausalConv1dUpdatePlan(x, weight, state, output, valid_indices)
 api.check_support()
 api.compile()
 api.execute(x, weight, state, output, valid_indices)
 torch.cuda.synchronize()
 
 invalid_indices = {
-    "negative": [-1, 1],
+    "below_padding": [-2, 1],
     "out_of_range": [0, n_slots],
     "duplicate": [1, 1],
 }[case]
@@ -372,7 +527,7 @@ os._exit(9)
 """
 
 
-@pytest.mark.parametrize("case", ["negative", "out_of_range", "duplicate"])
+@pytest.mark.parametrize("case", ["below_padding", "out_of_range", "duplicate"])
 def test_invalid_state_indices_fail_closed_in_fresh_process(case):
     # A CUDA device assert poisons its process context.  Keep each contract
     # case isolated and first prove the same compiled object launches validly.
@@ -420,7 +575,7 @@ def test_invalid_state_indices_fail_closed_in_fresh_process(case):
     ids=["kernel-width", "shape-mismatch", "dtype", "too-few-slots", "index-dtype"],
 )
 def test_bad_host_contracts_fail_closed(mutate, match):
-    CausalConv1dUpdateSm100, _ = _load_api()
+    plan_cls, _ = _load_api()
     n_rows, n_channels = 2, 8
     x = torch.zeros(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
     weight = torch.zeros(n_channels, 4, device="cuda", dtype=torch.bfloat16)
@@ -429,6 +584,6 @@ def test_bad_host_contracts_fail_closed(mutate, match):
     x, weight, state, indices = mutate(x, weight, state, indices)
     output = torch.empty_like(x)
 
-    api = CausalConv1dUpdateSm100(x, weight, state, output, indices)
+    api = plan_cls(x, weight, state, output, indices)
     with pytest.raises((TypeError, ValueError), match=match):
         api.check_support()

@@ -1,14 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from .api import (
-    CausalConv1dUpdateSm100,
-    causal_conv1d_update,
-    causal_conv1d_update_wrapper_sm100,
-)
+"""Private implementation package for :mod:`cudnn.ops` causal-conv update."""
 
-__all__ = [
-    "CausalConv1dUpdateSm100",
-    "causal_conv1d_update",
-    "causal_conv1d_update_wrapper_sm100",
-]
+from .api import _causal_conv1d_update as _causal_conv1d_update
+from .api import _CausalConv1dUpdatePlan as _CausalConv1dUpdatePlan
+
+__all__ = []

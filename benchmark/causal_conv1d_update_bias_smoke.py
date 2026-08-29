@@ -13,7 +13,7 @@ SOURCE_CUDNN = Path(__file__).resolve().parents[1] / "python" / "cudnn"
 if str(SOURCE_CUDNN) not in cudnn.__path__:
     cudnn.__path__.insert(0, str(SOURCE_CUDNN))
 
-from cudnn.causal_conv1d_update_sm100 import causal_conv1d_update  # noqa: E402
+from cudnn.ops import causal_conv1d_update  # noqa: E402
 
 
 @torch.no_grad()
@@ -31,7 +31,7 @@ def main():
         if value is not None:
             accumulator = accumulator + value.float()
         expected = F.silu(accumulator).to(torch.bfloat16)
-        actual = causal_conv1d_update(x, state, weight, bias=value)
+        actual = causal_conv1d_update(x, state, weight, bias=value, activation="silu")
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
         torch.testing.assert_close(state.view(torch.int16), expected_state.view(torch.int16), atol=0, rtol=0)
         rows[name] = float((actual.float() - expected.float()).abs().max())

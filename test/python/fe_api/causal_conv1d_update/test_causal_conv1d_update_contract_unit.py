@@ -3,8 +3,10 @@
 
 """Host-contract tests that do not compile or launch a GPU kernel."""
 
+import importlib
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,16 +34,16 @@ _SUPPORTED_COMPUTE_CAPABILITIES = (
 
 def _api_class():
     try:
-        from cudnn.causal_conv1d_update_sm100 import CausalConv1dUpdateSm100
+        from cudnn.causal_conv1d_update_sm100 import _CausalConv1dUpdatePlan
     except ImportError as exc:
         pytest.skip(f"CuTe DSL dependencies unavailable: {exc}")
-    return CausalConv1dUpdateSm100
+    return _CausalConv1dUpdatePlan
 
 
-def _inputs(*, n_rows=2, n_channels=8, n_slots=3, indexed=True):
+def _inputs(*, n_rows=2, n_channels=8, n_slots=3, state_len=4, indexed=True):
     x = torch.zeros(n_rows, n_channels, dtype=torch.bfloat16)
     weight = torch.zeros(n_channels, 4, dtype=torch.bfloat16)
-    state = torch.zeros(n_slots, n_channels, 4, dtype=torch.bfloat16)
+    state = torch.zeros(n_slots, n_channels, state_len, dtype=torch.bfloat16)
     output = torch.empty_like(x)
     indices = torch.arange(n_rows, dtype=torch.int32) if indexed else None
     return x, weight, state, output, indices
@@ -69,13 +71,14 @@ def _mock_cuda_contract(monkeypatch, api, capability=(10, 0)):
     monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    api_module = sys.modules[api.__class__.__module__]
+    monkeypatch.setattr(api_module, "_as_torch_stream", lambda current_stream, device: object())
+    monkeypatch.setattr(api_module, "_record_streams", lambda tensors, stream: None)
 
 
-def test_public_exports_remain_callables_not_modules(tmp_path):
-    # A same-named ``cudnn.causal_conv1d_update`` package previously replaced
-    # the lazy top-level function with the imported module object. Test a fresh
-    # interpreter against this checkout's __init__.py rather than the prebuilt
-    # package which conftest overlays for the other host-contract tests.
+def test_only_cudnn_ops_exports_the_semantic_api(tmp_path):
+    # Test a fresh interpreter against this checkout's __init__.py rather than
+    # the prebuilt package which conftest overlays for other contract tests.
     import cudnn
 
     source = Path(__file__).resolve().parents[4] / "python" / "cudnn"
@@ -89,23 +92,18 @@ def test_public_exports_remain_callables_not_modules(tmp_path):
 import types
 import cudnn
 import cudnn.ops
-from cudnn.causal_conv1d_update_sm100 import (
-    CausalConv1dUpdateSm100,
-    causal_conv1d_update as implementation,
-    causal_conv1d_update_wrapper_sm100,
-)
+from cudnn.ops import causal_conv1d_update
+import cudnn.causal_conv1d_update_sm100 as implementation
 
-exports = (
-    cudnn.causal_conv1d_update,
-    cudnn.ops.causal_conv1d_update,
-)
-assert all(callable(export) and not isinstance(export, types.ModuleType) for export in exports)
-assert cudnn.causal_conv1d_update is cudnn.ops.causal_conv1d_update
-assert cudnn.ops.causal_conv1d_update is not implementation
+assert callable(causal_conv1d_update) and not isinstance(causal_conv1d_update, types.ModuleType)
+assert cudnn.ops.causal_conv1d_update is causal_conv1d_update
+assert not hasattr(cudnn, "causal_conv1d_update")
 assert not hasattr(cudnn, "causal_conv1d_update_wrapper_sm100")
 assert not hasattr(cudnn, "CausalConv1dUpdateSm100")
-assert callable(causal_conv1d_update_wrapper_sm100)
-assert callable(CausalConv1dUpdateSm100)
+assert implementation.__all__ == []
+assert not hasattr(implementation, "causal_conv1d_update")
+assert not hasattr(implementation, "causal_conv1d_update_wrapper_sm100")
+assert not hasattr(implementation, "CausalConv1dUpdateSm100")
 """
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join((str(tmp_path), environment.get("PYTHONPATH", ""))).rstrip(os.pathsep)
@@ -119,76 +117,190 @@ assert callable(CausalConv1dUpdateSm100)
     )
 
 
-def test_public_helper_is_semantic_and_hides_lifecycle_parameters():
+def test_public_semantic_signature():
     from cudnn.ops import causal_conv1d_update
 
-    signature = inspect.signature(causal_conv1d_update)
-    assert tuple(signature.parameters) == (
+    parameters = inspect.signature(causal_conv1d_update).parameters
+    assert tuple(parameters) == (
         "x",
         "conv_state",
         "weight",
         "bias",
         "activation",
+        "cache_seqlens",
         "conv_state_indices",
     )
-    assert signature.parameters["conv_state_indices"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert signature.parameters["activation"].default == "silu"
-    for implementation_detail in (
-        "current_stream",
-        "output",
-        "plan",
-        "wrapper",
-        "sm100",
-    ):
-        assert implementation_detail not in signature.parameters
+    assert parameters["bias"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert parameters["bias"].default is None
+    assert parameters["activation"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert parameters["activation"].default is None
+    assert parameters["cache_seqlens"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["cache_seqlens"].default is None
+    assert parameters["conv_state_indices"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["conv_state_indices"].default is None
 
 
-def test_public_helper_delegates_tensor_contract_without_lifecycle(monkeypatch):
-    import cudnn.causal_conv1d_update_sm100 as implementation
-    from cudnn.ops import causal_conv1d_update
+def test_public_custom_op_declares_state_mutation():
+    from cudnn.ops import causal_conv1d_update  # noqa: F401
 
+    schema = str(torch.ops.cudnn._causal_conv1d_update.default._schema)
+    assert re.search(r"Tensor\(a\d*!\) conv_state", schema)
+    assert schema.count("!") == 1
+    assert "Tensor? cache_seqlens" in schema
+    assert "Tensor? conv_state_indices" in schema
+    assert schema.endswith(" -> Tensor")
+
+
+def test_private_raw_op_canonicalizes_activation_before_native_call(monkeypatch):
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    implementation = importlib.import_module("cudnn.causal_conv1d_update_sm100")
+    x, weight, state, _, indices = _inputs()
+    calls = []
+    sentinel = object()
+
+    def native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(implementation, "_causal_conv1d_update", native)
+
+    result = ops_module._causal_conv1d_update_primitive._init_fn(x, state, weight, None, "swish", None, indices)
+
+    assert result is sentinel
+    assert calls == [((x, state, weight, None, "silu"), {"conv_state_indices": indices})]
+
+
+def test_semantic_shape_contract_is_not_hard_coded_to_width_four():
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
     x = torch.zeros(2, 8, dtype=torch.bfloat16)
-    state = torch.zeros(3, 8, 4, dtype=torch.bfloat16)
-    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
     bias = torch.zeros(8, dtype=torch.bfloat16)
-    indices = torch.tensor([2, 0], dtype=torch.int32)
-    expected = torch.ones_like(x)
-    observed = {}
+    cache_seqlens = torch.zeros(2, dtype=torch.int32)
+    indices = torch.tensor([4, 1], dtype=torch.int32)
 
-    def run(native_x, native_state, native_weight, state_indices, *, bias):
-        observed.update(
-            x=native_x,
-            state=native_state,
-            weight=native_weight,
-            state_indices=state_indices,
-            bias=bias,
-        )
-        return expected
-
-    monkeypatch.setattr(implementation, "causal_conv1d_update", run)
-    output = causal_conv1d_update(
+    # Minimum legal state length (L = W - 1).
+    ops_module._validate_semantic_contract(
         x,
-        state,
-        weight,
+        torch.zeros(5, 8, 2, dtype=torch.bfloat16),
+        torch.zeros(8, 3, dtype=torch.bfloat16),
         bias,
-        conv_state_indices=indices,
+        cache_seqlens,
+        indices,
+    )
+    # Longer state remains part of the same semantic contract.
+    ops_module._validate_semantic_contract(
+        x,
+        torch.zeros(5, 8, 7, dtype=torch.bfloat16),
+        torch.zeros(8, 4, dtype=torch.bfloat16),
+        bias,
+        None,
+        indices,
     )
 
-    assert output is expected
-    assert observed["x"] is x
-    assert observed["state"] is state
-    assert observed["weight"] is weight
-    assert observed["state_indices"] is indices
-    assert observed["bias"] is bias
+
+def test_semantic_shape_contract_rejects_state_shorter_than_history():
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    state = torch.zeros(2, 8, 2, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=r"L >= W - 1, got L=2, W=4"):
+        ops_module._validate_semantic_contract(x, state, weight, None, None, None)
 
 
-@pytest.mark.parametrize("activation", [None, "identity", "relu"])
-def test_public_helper_rejects_unimplemented_activation(activation):
+@pytest.mark.parametrize(
+    "x_shape,state_shape,match",
+    [
+        ((0, 8), (1, 8, 4), "row count N must be positive"),
+        ((2, 0), (2, 0, 4), "channel count D must be positive"),
+        ((2, 8), (0, 8, 4), "slot count S must be positive"),
+    ],
+)
+def test_semantic_shape_contract_rejects_empty_native_extents(x_shape, state_shape, match):
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    x = torch.zeros(x_shape, dtype=torch.bfloat16)
+    state = torch.zeros(state_shape, dtype=torch.bfloat16)
+    weight = torch.zeros(x_shape[1], 4, dtype=torch.bfloat16)
+    indices = torch.zeros(x_shape[0], dtype=torch.int32) if state_shape[0] == 0 else None
+
+    with pytest.raises(ValueError, match=match):
+        ops_module._validate_semantic_contract(x, state, weight, None, None, indices)
+
+
+def test_public_meta_tensor_uses_registered_fake_kernel():
     from cudnn.ops import causal_conv1d_update
 
-    x, weight, state, _, _ = _inputs(indexed=False)
-    with pytest.raises(NotImplementedError, match="requires activation"):
-        causal_conv1d_update(x, state, weight, activation=activation)
+    x = torch.empty(2, 8, device="meta", dtype=torch.bfloat16)
+    state = torch.empty(2, 8, 4, device="meta", dtype=torch.bfloat16)
+    weight = torch.empty(8, 4, device="meta", dtype=torch.bfloat16)
+
+    output = causal_conv1d_update(x, state, weight)
+
+    assert output.device.type == "meta"
+    assert output.shape == x.shape
+    assert output.stride() == x.stride()
+
+
+@pytest.mark.parametrize(
+    "state_len,width,has_cache",
+    [(2, 3, False), (5, 4, False), (4, 4, True)],
+    ids=["width-three", "state-length-five", "circular-buffer"],
+)
+def test_semantically_valid_unimplemented_configs_decline_clearly(state_len, width, has_cache):
+    from cudnn.ops import causal_conv1d_update
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), pytest.raises(NotImplementedError, match="current native.*supports only"):
+        x = torch.empty(2, 8, device="cuda", dtype=torch.bfloat16)
+        state = torch.empty(2, 8, state_len, device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty(8, width, device="cuda", dtype=torch.bfloat16)
+        cache_seqlens = torch.empty(2, device="cuda", dtype=torch.int32) if has_cache else None
+        causal_conv1d_update(x, state, weight, cache_seqlens=cache_seqlens)
+
+
+def test_multi_token_update_is_reserved_but_not_silently_interpreted():
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    x = torch.zeros(2, 8, 3, dtype=torch.bfloat16)
+    state = torch.zeros(2, 8, 4, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=r"x must have shape \[N, D\]"):
+        ops_module._validate_semantic_contract(x, state, weight, None, None, None)
+
+
+@pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
+def test_public_fake_tensor_contract_preserves_output_metadata(state_len):
+    from cudnn.ops import causal_conv1d_update
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    with FakeTensorMode():
+        x = torch.empty(2, 8, device="cuda", dtype=torch.bfloat16)
+        state = torch.empty(3, 8, state_len, device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty(8, 4, device="cuda", dtype=torch.bfloat16)
+        indices = torch.empty(2, device="cuda", dtype=torch.int32)
+        output = causal_conv1d_update(x, state, weight, activation="swish", conv_state_indices=indices)
+
+    assert isinstance(output, FakeTensor)
+    assert output.shape == x.shape
+    assert output.stride() == x.stride()
+    assert output.dtype == x.dtype
+    assert output.device == x.device
+
+
+def test_activation_aliases_and_cache_keys_are_canonical():
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    api_module = importlib.import_module("cudnn.causal_conv1d_update_sm100.api")
+    x, weight, state, _, indices = _inputs()
+
+    assert ops_module._normalize_activation(None) == "identity"
+    assert ops_module._normalize_activation("identity") == "identity"
+    assert ops_module._normalize_activation("silu") == "silu"
+    assert ops_module._normalize_activation("swish") == "silu"
+    with pytest.raises(ValueError, match="activation must be"):
+        ops_module._normalize_activation("relu")
+
+    identity_key = api_module._cache_key(x, state, weight, indices, None, "identity")
+    silu_key = api_module._cache_key(x, state, weight, indices, None, "silu")
+    assert identity_key != silu_key
 
 
 def test_valid_descriptor_contract_without_kernel(monkeypatch):
@@ -199,6 +311,16 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
+
+
+def test_width_four_minimum_state_descriptor_contract_without_kernel(monkeypatch):
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs(state_len=3)
+    api = cls(x, weight, state, output, indices)
+    _mock_cuda_contract(monkeypatch, api)
+
+    assert api.check_support()
+    assert (api.n_rows, api.n_channels, api.n_slots, api.state_len) == (2, 8, 3, 3)
 
 
 def test_optional_bias_descriptor_contract_without_kernel(monkeypatch):
@@ -262,7 +384,7 @@ def test_bad_descriptor_contract_fails_before_compile(monkeypatch, mutate, match
 
 
 @pytest.mark.parametrize("capability", _SUPPORTED_COMPUTE_CAPABILITIES)
-def test_functional_architecture_allowlist(monkeypatch, capability):
+def test_supported_architecture_gate(monkeypatch, capability):
     cls = _api_class()
     api = cls(*_inputs())
     _mock_cuda_contract(monkeypatch, api, capability=capability)
@@ -270,7 +392,7 @@ def test_functional_architecture_allowlist(monkeypatch, capability):
     assert api.check_support()
 
 
-@pytest.mark.parametrize("capability", [(7, 5), (10, 1), (11, 1), (13, 0)])
+@pytest.mark.parametrize("capability", [(7, 5), (7, 9), (11, 1)])
 def test_unsupported_architecture_gate(monkeypatch, capability):
     cls = _api_class()
     api = cls(*_inputs())
@@ -367,6 +489,91 @@ def test_execute_revalidates_presence_and_aliases(monkeypatch):
             indices4,
             current_stream=stream,
         )
+
+
+def test_overlap_uses_exact_contiguous_byte_spans():
+    api_module = importlib.import_module("cudnn.causal_conv1d_update_sm100.api")
+
+    class Span:
+        def __init__(self, address, numel, element_size):
+            self.address = address
+            self.length = numel
+            self.itemsize = element_size
+
+        def data_ptr(self):
+            return self.address
+
+        def numel(self):
+            return self.length
+
+        def element_size(self):
+            return self.itemsize
+
+    left = Span(0x1000, 4, 2)
+
+    assert api_module._tensors_overlap(left, Span(0x1006, 2, 2))
+    assert api_module._tensors_overlap(Span(0x0FFE, 2, 2), left)
+    assert not api_module._tensors_overlap(left, Span(0x1008, 2, 2))
+
+
+def test_record_streams_covers_every_present_raw_pointer_operand():
+    api_module = importlib.import_module("cudnn.causal_conv1d_update_sm100.api")
+    consumer = object()
+
+    class TensorRecorder:
+        def __init__(self):
+            self.streams = []
+
+        def record_stream(self, stream):
+            self.streams.append(stream)
+
+    first = TensorRecorder()
+    second = TensorRecorder()
+    api_module._record_streams((first, None, second), consumer)
+    api_module._record_streams((first, second), None)
+
+    assert first.streams == [consumer]
+    assert second.streams == [consumer]
+
+
+def test_execute_records_operands_on_resolved_explicit_stream(monkeypatch):
+    api_module = importlib.import_module("cudnn.causal_conv1d_update_sm100.api")
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs()
+    bias = torch.zeros(x.shape[1], dtype=torch.bfloat16)
+    api = cls(x, weight, state, output, indices, bias)
+    _mock_cuda_contract(monkeypatch, api)
+    assert api.check_support()
+
+    launches = []
+    recorded = []
+    resolved = []
+    consumer = object()
+    stream = cuda.CUstream(17)
+    api._compiled_kernel = lambda *args: launches.append(args)
+
+    def resolve(current_stream, device):
+        resolved.append((current_stream, device))
+        return consumer
+
+    monkeypatch.setattr(api_module, "_as_torch_stream", resolve)
+    monkeypatch.setattr(api_module, "_record_streams", lambda tensors, stream: recorded.append((tensors, stream)))
+
+    result = api.execute(
+        x,
+        weight,
+        state,
+        output,
+        indices,
+        current_stream=stream,
+        bias_tensor=bias,
+    )
+
+    assert result is output
+    assert resolved == [(stream, x.device)]
+    assert len(launches) == 1
+    assert launches[0][-1] == stream
+    assert recorded == [((x, weight, bias, state, output, indices), consumer)]
 
 
 def test_execute_rejects_autograd(monkeypatch):

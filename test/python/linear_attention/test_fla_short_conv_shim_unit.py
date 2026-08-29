@@ -57,6 +57,23 @@ def _original_spy(calls):
     return original
 
 
+def test_native_adapter_requests_silu_explicitly(monkeypatch):
+    import cudnn.ops
+
+    x, weight, cache = _inputs()
+    calls = []
+    sentinel = object()
+
+    def semantic_api(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(cudnn.ops, "causal_conv1d_update", semantic_api)
+
+    assert short_conv._call_native(x, cache, weight) is sentinel
+    assert calls == [((x, cache, weight), {"activation": "silu"})]
+
+
 @pytest.mark.parametrize("shape", [(3, 8), (3, 1, 8), (1, 3, 8)])
 def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(mock_supported_arch, monkeypatch, shape):
     x, weight, cache = _inputs(shape)

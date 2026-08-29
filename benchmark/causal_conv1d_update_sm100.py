@@ -46,7 +46,7 @@ from cudnn._causal_conv1d_arch import (
     is_supported_causal_conv1d_update_compute_capability,
     supported_causal_conv1d_update_compute_capabilities_text,
 )
-from cudnn.causal_conv1d_update_sm100 import CausalConv1dUpdateSm100
+from cudnn.causal_conv1d_update_sm100 import _CausalConv1dUpdatePlan
 from fla.modules.conv.triton.ops import causal_conv1d_update as fla_causal_conv1d_update
 
 DEFAULT_SHAPES = (
@@ -284,7 +284,7 @@ def _benchmark_shape(n_rows: int, n_channels: int, *, samples: int, warmup: int,
     fla_state = initial_state.clone()
     native_output = torch.empty_like(x)
 
-    api = CausalConv1dUpdateSm100(x, weight, native_state, native_output)
+    api = _CausalConv1dUpdatePlan(x, weight, native_state, native_output, activation="silu")
     if not api.check_support():
         raise RuntimeError("native check_support unexpectedly returned false")
     api.compile()
@@ -363,7 +363,7 @@ def _benchmark_shape(n_rows: int, n_channels: int, *, samples: int, warmup: int,
 
 
 def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Namespace) -> dict:
-    executed_native_api_path = _module_path(CausalConv1dUpdateSm100.__module__)
+    executed_native_api_path = _module_path(_CausalConv1dUpdatePlan.__module__)
     executed_native_kernel_path = _module_path("cudnn.causal_conv1d_update_sm100.kernel")
     repo_native_api_path = (repo / "python/cudnn/causal_conv1d_update_sm100/api.py").resolve()
     repo_native_kernel_path = (repo / "python/cudnn/causal_conv1d_update_sm100/kernel.py").resolve()
@@ -383,7 +383,7 @@ def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Na
         "timing_contract": "warm cache-hit CUDA-graph replay; one update per sample; compile, capture, allocation, and state reset outside events",
         "comparison_contract": "single process; AB/BA interleaved; identical x/weight/initial state; BF16 N,D,W=4 no-bias SiLU",
         "shape_contract": "Qwen3.5-9B separate short-conv projections: Q D=2048, K D=2048, V D=4096; W=4",
-        "native_route": f"{CausalConv1dUpdateSm100.__module__}.{CausalConv1dUpdateSm100.__qualname__}.execute",
+        "native_route": f"{_CausalConv1dUpdatePlan.__module__}.{_CausalConv1dUpdatePlan.__qualname__}.execute",
         "fla_route": f"{fla_causal_conv1d_update.__module__}.{fla_causal_conv1d_update.__name__}",
         "provenance": {
             "benchmark": {
@@ -455,8 +455,8 @@ def _validate_environment() -> None:
             "benchmark requires a functionally supported causal-conv compute capability "
             f"({supported_causal_conv1d_update_compute_capabilities_text()}), found {capability[0]}.{capability[1]}"
         )
-    if CausalConv1dUpdateSm100.__module__ != "cudnn.causal_conv1d_update_sm100.api":
-        raise RuntimeError(f"unexpected native route: {CausalConv1dUpdateSm100.__module__}")
+    if _CausalConv1dUpdatePlan.__module__ != "cudnn.causal_conv1d_update_sm100.api":
+        raise RuntimeError(f"unexpected native route: {_CausalConv1dUpdatePlan.__module__}")
     if fla_causal_conv1d_update.__module__ != "fla.modules.conv.triton.ops":
         raise RuntimeError(f"unexpected FLA route: {fla_causal_conv1d_update.__module__}")
     if _package_version("flash-linear-attention") != "0.5.2":

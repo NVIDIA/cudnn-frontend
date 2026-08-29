@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental FE-OSS API for causal-convolution decode update.
+"""Private prepared implementation for causal-convolution decode update.
 
-The ``Sm100`` names are retained for API compatibility.  Every admitted
-architecture uses the same portable one-row schedule.
+The model-facing API lives at :func:`cudnn.ops.causal_conv1d_update`. This
+module owns compilation, preallocated output execution, and explicit-stream
+support used by focused benchmarks; none of those mechanics are public API.
 """
 
 import threading
@@ -21,9 +22,9 @@ from cudnn._causal_conv1d_arch import (
     is_supported_causal_conv1d_update_compute_capability,
     supported_causal_conv1d_update_compute_capabilities_text,
 )
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+from cudnn.api_base import APIBase, TensorDesc
 
-from .kernel import CausalConv1dUpdateKernel
+from .kernel import _CausalConv1dUpdateKernel
 
 _API_CACHE = {}
 _API_CACHE_LOCK = threading.Lock()
@@ -41,22 +42,39 @@ def _torch_stream_context(
         yield
         return
 
+    launch_stream = _as_torch_stream(current_stream, device)
+    with torch.cuda.stream(launch_stream):
+        yield
+
+
+def _as_torch_stream(current_stream: cuda.CUstream, device: torch.device) -> torch.cuda.Stream:
+    """Resolve a concrete driver handle to the matching PyTorch stream."""
+
     handle = int(current_stream)
     torch_current = torch.cuda.current_stream(device)
     torch_default = torch.cuda.default_stream(device)
     if handle in (0, 1, torch_default.cuda_stream):
-        launch_stream = torch_default
-    elif handle == 2:
+        return torch_default
+    if handle == 2:
         # CU_STREAM_PER_THREAD cannot be represented safely as a PyTorch
-        # ExternalStream on every supported build.  The class API remains
-        # available to callers that own a preallocated output on that stream.
+        # ExternalStream on every supported build.
         raise ValueError("causal_conv1d_update helpers do not support the " "CU_STREAM_PER_THREAD sentinel; pass a concrete stream handle")
-    elif handle == torch_current.cuda_stream:
-        launch_stream = torch_current
-    else:
-        launch_stream = torch.cuda.ExternalStream(handle, device=device)
-    with torch.cuda.stream(launch_stream):
-        yield
+    if handle == torch_current.cuda_stream:
+        return torch_current
+    return torch.cuda.ExternalStream(handle, device=device)
+
+
+def _record_streams(
+    tensors: tuple[Optional[torch.Tensor], ...],
+    consumer: Optional[torch.cuda.Stream],
+) -> None:
+    """Keep raw-pointer operands alive through an explicit-stream launch."""
+
+    if consumer is None:
+        return
+    for tensor in tensors:
+        if tensor is not None:
+            tensor.record_stream(consumer)
 
 
 def _require_storage_alignment(tensor: torch.Tensor, alignment: int, name: str) -> None:
@@ -68,34 +86,42 @@ def _require_storage_alignment(tensor: torch.Tensor, alignment: int, name: str) 
 
 
 def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    """Conservative storage-overlap check used by the mutating public API."""
+    """Return whether two exact-contiguous tensors share any device bytes.
 
-    overlaps = getattr(torch._C, "_overlaps", None)
-    if overlaps is not None:
-        return bool(overlaps(lhs, rhs))
-    return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+    ``torch._C._overlaps`` only compares PyTorch Storage identity. DLPack can
+    wrap the same device address in a distinct Storage, so use the byte spans
+    guaranteed by this API's exact-contiguous tensor contract instead.
+    """
+
+    lhs_begin = lhs.data_ptr()
+    rhs_begin = rhs.data_ptr()
+    lhs_end = lhs_begin + lhs.numel() * lhs.element_size()
+    rhs_end = rhs_begin + rhs.numel() * rhs.element_size()
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
 
 
-class CausalConv1dUpdateSm100(APIBase):
+class _CausalConv1dUpdatePlan(APIBase):
     """Compile and execute BF16 K=4 causal-convolution decode.
 
-    The class name is retained for compatibility. Compute capabilities 8.0,
-    8.6, 8.7, 8.9, 9.0, 10.0, 10.3, 11.0, 12.0, and 12.1 use the same
-    functional schedule.
+    Every compute capability admitted by the decode architecture policy uses
+    the same functional schedule.
 
     This inference-only API advances ``state`` in place and writes ``output``.
     It deliberately supports one narrow contract:
 
     * ``x`` and ``output``: contiguous ``[N, D]`` BF16
     * ``weight``: contiguous ``[D, 4]`` BF16
-    * ``state``: contiguous ``[S, D, 4]`` BF16, mutated in place
+    * ``state``: contiguous ``[S, D, L]`` BF16 with ``L`` in ``{3, 4}``,
+      mutated in place
     * optional ``state_indices``: contiguous CUDA ``int32[N]``
-    * optional ``bias``: contiguous ``[D]`` BF16; SiLU is always fused
+    * optional ``bias``: contiguous ``[D]`` BF16
+    * ``activation``: compile-time ``"identity"`` or ``"silu"``
 
-    Indexed slots must be in ``[0, S)`` and unique.  The kernel checks both
-    properties on device and executes a PTX trap on violation, so invalid
-    mutable routing never silently races.  The CUDA error is asynchronous and
-    the failed launch is not transactional.
+    Indexed slots must be ``-1`` or in ``[0, S)``.  ``-1`` marks a padding row
+    whose output is zero and whose state is untouched.  Non-padding slots must
+    be unique.  The kernel checks these properties on device and executes a
+    PTX trap on violation, so invalid mutable routing never silently races.
+    The CUDA error is asynchronous and the failed launch is not transactional.
     """
 
     def __init__(
@@ -106,6 +132,8 @@ class CausalConv1dUpdateSm100(APIBase):
         sample_output: Union[torch.Tensor, TensorDesc],
         sample_state_indices: Optional[Union[torch.Tensor, TensorDesc]] = None,
         sample_bias: Optional[Union[torch.Tensor, TensorDesc]] = None,
+        *,
+        activation: str = "identity",
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -116,6 +144,9 @@ class CausalConv1dUpdateSm100(APIBase):
         self.output_desc = self._make_tensor_desc(sample_output, name="sample_output")
         self.state_indices_desc = self._make_tensor_desc(sample_state_indices, name="sample_state_indices")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
+        if activation not in ("identity", "silu"):
+            raise ValueError(f"activation must be 'identity' or 'silu', got {activation!r}")
+        self.activation = activation
 
         # TensorDesc deliberately does not retain sample tensors.  Preserve
         # only the pointer remainders needed to validate the assumed alignment
@@ -137,6 +168,7 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = None
         self.n_channels = None
         self.n_slots = None
+        self.state_len = None
 
     @staticmethod
     def _require_rank(desc: TensorDesc, rank: int, name: str) -> None:
@@ -160,6 +192,7 @@ class CausalConv1dUpdateSm100(APIBase):
 
         n_rows, n_channels = self.x_desc.shape
         n_slots = self.state_desc.shape[0]
+        state_len = self.state_desc.shape[2]
         self._value_error_if(n_rows <= 0, f"N must be positive, got {n_rows}")
         self._value_error_if(n_channels <= 0, f"D must be positive, got {n_channels}")
         self._value_error_if(n_slots <= 0, f"S must be positive, got {n_slots}")
@@ -169,9 +202,13 @@ class CausalConv1dUpdateSm100(APIBase):
             n_channels > 256 * 65535,
             f"D exceeds the CUDA grid-y limit for 256-channel tiles: {n_channels}",
         )
+        self._value_error_if(
+            state_len not in (3, 4),
+            f"State length must be 3 or 4 for width-four decode, got L={state_len}",
+        )
 
         self._check_tensor_shape(self.weight_desc, (n_channels, 4), "Weight")
-        self._check_tensor_shape(self.state_desc, (n_slots, n_channels, 4), "State")
+        self._check_tensor_shape(self.state_desc, (n_slots, n_channels, state_len), "State")
         self._check_tensor_shape(self.output_desc, (n_rows, n_channels), "Output")
         if self.bias_desc is not None:
             self._check_tensor_shape(self.bias_desc, (n_channels,), "Bias")
@@ -197,7 +234,7 @@ class CausalConv1dUpdateSm100(APIBase):
         )
         self._check_tensor_stride(
             self.state_desc,
-            stride=(n_channels * 4, 4, 1),
+            stride=(n_channels * state_len, state_len, 1),
             name="State",
             extra_error_msg="State must be row-major contiguous",
         )
@@ -259,7 +296,7 @@ class CausalConv1dUpdateSm100(APIBase):
         compute_capability = torch.cuda.get_device_capability(self.x_desc.device)
         self._runtime_error_if(
             not is_supported_causal_conv1d_update_compute_capability(compute_capability),
-            "CausalConv1dUpdateSm100 supports compute capabilities "
+            "causal_conv1d_update supports compute capabilities "
             f"{supported_causal_conv1d_update_compute_capabilities_text()}, "
             f"found {compute_capability[0]}.{compute_capability[1]}",
         )
@@ -267,6 +304,7 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = n_rows
         self.n_channels = n_channels
         self.n_slots = n_slots
+        self.state_len = state_len
         self._is_supported = True
         return True
 
@@ -283,7 +321,10 @@ class CausalConv1dUpdateSm100(APIBase):
         fake_state_indices = self._make_fake_cute_tensor_from_desc(self.state_indices_desc, assumed_align=4)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        kernel = CausalConv1dUpdateKernel()
+        kernel = _CausalConv1dUpdateKernel(
+            apply_silu=self.activation == "silu",
+            state_len=self.state_len,
+        )
         # CuTe DSL targets the current CUDA device.  Honor the sample tensor's
         # device even when a multi-GPU caller has another device current.
         with torch.cuda.device(self.x_desc.device):
@@ -326,7 +367,7 @@ class CausalConv1dUpdateSm100(APIBase):
     ) -> torch.Tensor:
         self._runtime_error_if(
             self._compiled_kernel is None,
-            "CausalConv1dUpdateSm100 kernel not compiled; call compile() first",
+            "causal_conv1d_update plan not compiled; call compile() first",
         )
 
         self._validate_runtime_tensor(x_tensor, self.x_desc, "X")
@@ -388,7 +429,11 @@ class CausalConv1dUpdateSm100(APIBase):
             raise ValueError("Output must not overlap State indices")
 
         if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(x_tensor.device).cuda_stream)
+            consumer_stream = torch.cuda.current_stream(x_tensor.device)
+            launch_stream = cuda.CUstream(consumer_stream.cuda_stream)
+        else:
+            consumer_stream = _as_torch_stream(current_stream, x_tensor.device)
+            launch_stream = current_stream
 
         self._compiled_kernel(
             x_tensor,
@@ -399,7 +444,18 @@ class CausalConv1dUpdateSm100(APIBase):
             state_indices_tensor,
             cutlass.Int32(self.n_slots),
             cutlass.Int32(self.n_channels),
-            current_stream,
+            launch_stream,
+        )
+        _record_streams(
+            (
+                x_tensor,
+                weight_tensor,
+                bias_tensor,
+                state_tensor,
+                output_tensor,
+                state_indices_tensor,
+            ),
+            consumer_stream,
         )
         return output_tensor
 
@@ -410,6 +466,7 @@ def _cache_key(
     weight_tensor: torch.Tensor,
     state_indices_tensor: Optional[torch.Tensor],
     bias_tensor: Optional[torch.Tensor],
+    activation: str,
 ):
     return (
         x_tensor.device.type,
@@ -419,36 +476,40 @@ def _cache_key(
         tuple(state_tensor.shape),
         state_indices_tensor is not None,
         bias_tensor is not None,
+        activation,
     )
 
 
-def causal_conv1d_update(
+def _causal_conv1d_update(
     x: torch.Tensor,
-    state: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
-    state_indices: Optional[torch.Tensor] = None,
-    *,
     bias: Optional[torch.Tensor] = None,
+    activation: str = "identity",
+    *,
+    conv_state_indices: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> torch.Tensor:
-    """Advance a BF16 K=4 causal-convolution cache and return fused-SiLU output.
+    """Private allocating route used by the public custom op and FLA adapter.
 
-    ``state`` is updated in place.  This experimental operation is
-    inference-only and always applies SiLU; ``bias`` is optional. Every
-    supported architecture uses the same functional schedule. See
-    :class:`CausalConv1dUpdateSm100` for the exact tensor contract.
+    ``conv_state`` is updated in place. ``activation`` is already normalized
+    to ``"identity"`` or ``"silu"`` by the public semantic API. Explicit
+    streams remain private because the public PyTorch operation follows the
+    current-stream convention.
     """
 
-    for name, tensor in (("X", x), ("Weight", weight), ("State", state)):
+    for name, tensor in (("X", x), ("Weight", weight), ("State", conv_state)):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
-    if state_indices is not None and not isinstance(state_indices, torch.Tensor):
-        raise TypeError("State indices must be a torch.Tensor or None, " f"got {type(state_indices).__name__}")
+    if conv_state_indices is not None and not isinstance(conv_state_indices, torch.Tensor):
+        raise TypeError("State indices must be a torch.Tensor or None, " f"got {type(conv_state_indices).__name__}")
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError("Bias must be a torch.Tensor or None, " f"got {type(bias).__name__}")
+    if activation not in ("identity", "silu"):
+        raise ValueError(f"activation must be 'identity' or 'silu', got {activation!r}")
     if not x.is_cuda:
         raise ValueError(f"X must be a CUDA tensor, got device {x.device}")
-    key = _cache_key(x, state, weight, state_indices, bias)
+    key = _cache_key(x, conv_state, weight, conv_state_indices, bias, activation)
 
     with torch.cuda.device(x.device), _torch_stream_context(current_stream, x.device):
         output = torch.empty_like(x, memory_format=torch.contiguous_format)
@@ -457,13 +518,14 @@ def causal_conv1d_update(
             with _API_CACHE_LOCK:
                 api = _API_CACHE.get(key)
                 if api is None:
-                    api = CausalConv1dUpdateSm100(
+                    api = _CausalConv1dUpdatePlan(
                         sample_x=x,
                         sample_weight=weight,
-                        sample_state=state,
+                        sample_state=conv_state,
                         sample_output=output,
-                        sample_state_indices=state_indices,
+                        sample_state_indices=conv_state_indices,
                         sample_bias=bias,
+                        activation=activation,
                     )
                     api.check_support()
                     api.compile()
@@ -474,36 +536,9 @@ def causal_conv1d_update(
         return api.execute(
             x_tensor=x,
             weight_tensor=weight,
-            state_tensor=state,
+            state_tensor=conv_state,
             output_tensor=output,
-            state_indices_tensor=state_indices,
+            state_indices_tensor=conv_state_indices,
             current_stream=current_stream,
             bias_tensor=bias,
         )
-
-
-def causal_conv1d_update_wrapper_sm100(
-    x: torch.Tensor,
-    state: torch.Tensor,
-    weight: torch.Tensor,
-    state_indices: Optional[torch.Tensor] = None,
-    *,
-    bias: Optional[torch.Tensor] = None,
-    current_stream: Optional[cuda.CUstream] = None,
-) -> TupleDict:
-    """Run the decode update and return ``TupleDict(output_tensor=...)``.
-
-    The function name is retained for compatibility.  ``state`` is updated in
-    place.  Use :func:`causal_conv1d_update` when a direct Tensor return is more
-    convenient for model-integration shims.
-    """
-
-    output = causal_conv1d_update(
-        x,
-        state,
-        weight,
-        state_indices,
-        bias=bias,
-        current_stream=current_stream,
-    )
-    return TupleDict(output_tensor=output)
