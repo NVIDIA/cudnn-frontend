@@ -61,6 +61,7 @@ To add a new frontend-only API, follow these steps:
 4. Add a sample usage/test file in `test/python/fe_api/`.
 
 **Currently implemented frontend-only APIs**:
+- `Bulk Causal Conv1d Forward (SM100)`
 - `GEMM + Amax`
 - `RMSNorm + RHT + Amax`
 - `GEMM + SwiGLU`

@@ -9,6 +9,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
+- [Bulk Causal Conv1d Forward (SM100)](causal_conv1d_bulk_contract.md)
 - [FLA Integration Shims](fla.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
