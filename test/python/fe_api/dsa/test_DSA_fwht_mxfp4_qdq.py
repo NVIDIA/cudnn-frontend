@@ -68,7 +68,7 @@ def _qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
 
 
 def _packed_bf16_qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
-    """Host model of the winner's packed BF16 power-of-two QDQ epilogue."""
+    """Host model of the pinned round-one Kernel Factory candidate's QDQ."""
 
     rows = rotated_bf16.numel() // 128
     groups = rotated_bf16.view(rows, 4, 32)
@@ -99,7 +99,7 @@ def _reference(input_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _legacy_combined_round_reference(input_tensor: torch.Tensor) -> torch.Tensor:
-    """Host model of the pre-winner epilogue, retained only for regression."""
+    """Host model of the earlier round-one candidate, retained for regression."""
 
     rows = input_tensor.numel() // 128
     groups = _fwht_fp32(input_tensor).view(rows, 4, 32)
@@ -163,9 +163,7 @@ def test_packed_bf16_qdq_matches_reference_for_every_finite_bf16_on_host():
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-def test_bf16_boundary_precedes_inverse_scale_on_host():
-    """Lock down the subnormal double-rounding bug fixed by the winner."""
-
+def _subnormal_double_rounding_case():
     input_tensor = torch.zeros((1, 128), dtype=torch.bfloat16)
     input_bits = input_tensor.view(torch.int16)
     input_bits[0, 0] = 0x0191
@@ -174,9 +172,28 @@ def test_bf16_boundary_precedes_inverse_scale_on_host():
     expected = _reference(input_tensor).view(torch.int16)
     legacy = _legacy_combined_round_reference(input_tensor).view(torch.int16)
 
+    return input_tensor, expected, legacy
+
+
+def test_bf16_boundary_precedes_inverse_scale_on_host():
+    """Lock down the case fixed by the pinned round-one Kernel Factory candidate."""
+
+    _, expected, legacy = _subnormal_double_rounding_case()
+
     assert torch.equal(expected[0, 0::2], torch.full((64,), 0x0040, dtype=torch.int16))
     assert torch.equal(expected[0, 1::2], torch.zeros(64, dtype=torch.int16))
     assert torch.equal(legacy, torch.full((1, 128), 0x0040, dtype=torch.int16))
+
+
+def test_actual_kernel_observes_bf16_boundary_before_inverse_scale():
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    input_tensor, expected, legacy = _subnormal_double_rounding_case()
+    actual = fwht_mxfp4_qdq(input_tensor.cuda()).cpu().view(torch.int16)
+
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, legacy)
 
 
 @pytest.mark.parametrize("shape", [(1, 128), (31, 128), (33, 128), (2, 3, 4, 128)])
@@ -196,6 +213,114 @@ def test_fwht_mxfp4_qdq_matches_exact_recipe(shape):
     assert actual.dtype == input_tensor.dtype
     assert actual.is_contiguous()
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [63, 64, 65, 127, 128, 129])
+def test_fwht_mxfp4_qdq_cta_row_boundaries(rows):
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    torch.manual_seed(20260830 + rows)
+    input_tensor = torch.randn((rows, 128), device="cuda", dtype=torch.bfloat16)
+    actual = fwht_mxfp4_qdq(input_tensor)
+
+    assert torch.equal(actual, _reference(input_tensor))
+
+
+@torch.no_grad()
+def test_fwht_mxfp4_qdq_torch_library_contract():
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    input_tensor = torch.randn((65, 128), device="cuda", dtype=torch.bfloat16)
+    # Importing the public function performs the lazy registration.
+    assert callable(fwht_mxfp4_qdq)
+    primitive = torch.ops.cudnn.fwht_mxfp4_qdq_primitive.default
+    test_utils = (
+        "test_schema",
+        "test_faketensor",
+        "test_aot_dispatch_dynamic",
+    )
+
+    results = torch.library.opcheck(
+        primitive,
+        (input_tensor,),
+        test_utils=test_utils,
+    )
+
+    assert results == {test: "SUCCESS" for test in test_utils}
+
+
+@torch.no_grad()
+def test_fwht_mxfp4_qdq_torch_compile_fullgraph():
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    torch.manual_seed(20260901)
+    input_tensor = torch.randn((65, 128), device="cuda", dtype=torch.bfloat16)
+    expected = fwht_mxfp4_qdq(input_tensor)
+    compiled = torch.compile(fwht_mxfp4_qdq, fullgraph=True)
+    actual = compiled(input_tensor)
+
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_fwht_mxfp4_qdq_respects_non_default_torch_stream():
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    torch.manual_seed(20260902)
+    input_tensor = torch.zeros((65, 128), device="cuda", dtype=torch.bfloat16)
+    replacement = torch.randn_like(input_tensor)
+    expected = _reference(replacement)
+
+    # Warm the compile/cache path before placing the side stream behind a gate.
+    fwht_mxfp4_qdq(input_tensor)
+    torch.cuda.synchronize()
+
+    side_stream = torch.cuda.Stream()
+    gate = torch.cuda.Event()
+    with torch.cuda.stream(side_stream):
+        side_stream.wait_event(gate)
+        input_tensor.copy_(replacement)
+        actual = fwht_mxfp4_qdq(input_tensor)
+
+    # A launch incorrectly sent to the default stream would execute before the
+    # gated input update. A launch on the current side stream observes it.
+    gate.record()
+    side_stream.synchronize()
+
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_fwht_mxfp4_qdq_warmed_cuda_graph_capture_and_replay():
+    _require_supported_device()
+    from cudnn.ops import fwht_mxfp4_qdq
+
+    torch.manual_seed(20260903)
+    static_input = torch.zeros((65, 128), device="cuda", dtype=torch.bfloat16)
+    replay_inputs = [torch.randn_like(static_input), torch.randn_like(static_input)]
+    expected = [_reference(value) for value in replay_inputs]
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        fwht_mxfp4_qdq(static_input)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = fwht_mxfp4_qdq(static_input)
+
+    for replay_input, replay_expected in zip(replay_inputs, expected):
+        static_input.copy_(replay_input)
+        captured_output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured_output, replay_expected)
 
 
 def test_fwht_mxfp4_qdq_empty_does_not_launch():

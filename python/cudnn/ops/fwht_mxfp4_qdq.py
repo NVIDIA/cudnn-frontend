@@ -25,11 +25,6 @@ def _validate_input(input_tensor: Tensor) -> None:
         raise NotImplementedError("fwht_mxfp4_qdq is inference-only and does not implement autograd")
 
 
-@torch.library.custom_op(
-    "cudnn::fwht_mxfp4_qdq_primitive",
-    mutates_args=(),
-    device_types="cuda",
-)
 def _fwht_mxfp4_qdq_primitive(input_tensor: Tensor) -> Tensor:
     address_remainder = input_tensor.data_ptr() % _REQUIRED_ALIGNMENT
     if address_remainder != 0:
@@ -45,6 +40,11 @@ def _fwht_mxfp4_qdq_primitive(input_tensor: Tensor) -> Tensor:
         output_tensor.view(-1, _ROW_WIDTH),
     )
     return output_tensor
+
+
+_LIBRARY = torch.library.Library("cudnn", "FRAGMENT")
+_LIBRARY.define("fwht_mxfp4_qdq_primitive(Tensor input_tensor) -> Tensor")
+_LIBRARY.impl("fwht_mxfp4_qdq_primitive", _fwht_mxfp4_qdq_primitive, "CUDA")
 
 
 @torch.library.register_fake("cudnn::fwht_mxfp4_qdq_primitive")
