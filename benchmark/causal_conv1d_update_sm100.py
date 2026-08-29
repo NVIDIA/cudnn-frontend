@@ -4,8 +4,10 @@
 """Decode microbenchmark for the causal-convolution update operation.
 
 This compares the direct low-level cuDNN Frontend API against FLA 0.5.2's
-public Triton update operation at representative Qwen3.5-9B decode shapes.  Q
-and K each have D=2048 channels and V has D=4096 channels; all three use W=4.
+public Triton update operation at representative Qwen3.5/Qwen3.8 decode
+shapes.  The official model applies one fused-QKV depthwise convolution before
+splitting Q, K, and V, so the benchmark uses the full convolution channel
+counts D={6144, 8192, 10240, 12288, 20480}; every model uses W=4.
 It is a single-process, same-input, AB/BA-interleaved comparison.  Both
 implementations are compiled and CUDA-graph-captured before timing; in
 particular, the ``torch.empty_like`` in FLA's wrapper runs during capture rather
@@ -49,16 +51,9 @@ from cudnn._causal_conv1d_arch import (
 from cudnn.causal_conv1d_update_sm100 import _CausalConv1dUpdatePlan
 from fla.modules.conv.triton.ops import causal_conv1d_update as fla_causal_conv1d_update
 
-DEFAULT_SHAPES = (
-    (1, 2048),
-    (8, 2048),
-    (32, 2048),
-    (128, 2048),
-    (1, 4096),
-    (8, 4096),
-    (32, 4096),
-    (128, 4096),
-)
+DEFAULT_BATCH_SIZES = (1, 8, 32, 128)
+DEFAULT_CHANNELS = (6144, 8192, 10240, 12288, 20480)
+DEFAULT_SHAPES = tuple((batch, channels) for channels in DEFAULT_CHANNELS for batch in DEFAULT_BATCH_SIZES)
 OUTPUT_ATOL = 3e-2
 OUTPUT_RTOL = 3e-2
 
@@ -74,7 +69,7 @@ def _parse_shape(value: str) -> tuple[int, int]:
     try:
         n_rows, n_channels = (int(piece) for piece in value.lower().split("x", maxsplit=1))
     except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("shape must be N x D, for example 8x4096") from exc
+        raise argparse.ArgumentTypeError("shape must be N x D, for example 8x8192") from exc
     if n_rows <= 0 or n_channels <= 0:
         raise argparse.ArgumentTypeError("N and D must both be positive")
     return n_rows, n_channels
@@ -382,7 +377,7 @@ def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Na
         "benchmark": "causal_conv1d_update_decode_sm100",
         "timing_contract": "warm cache-hit CUDA-graph replay; one update per sample; compile, capture, allocation, and state reset outside events",
         "comparison_contract": "single process; AB/BA interleaved; identical x/weight/initial state; BF16 N,D,W=4 no-bias SiLU",
-        "shape_contract": "Qwen3.5-9B separate short-conv projections: Q D=2048, K D=2048, V D=4096; W=4",
+        "shape_contract": ("official Qwen3.5/Qwen3.8 fused-QKV short conv: one update over " "D in {6144,8192,10240,12288,20480}; W=4"),
         "native_route": f"{_CausalConv1dUpdatePlan.__module__}.{_CausalConv1dUpdatePlan.__qualname__}.execute",
         "fla_route": f"{fla_causal_conv1d_update.__module__}.{fla_causal_conv1d_update.__name__}",
         "provenance": {

@@ -69,6 +69,15 @@ def _load_benchmark(monkeypatch):
     return module
 
 
+def test_default_matrix_uses_fused_qkv_model_channels(monkeypatch):
+    benchmark = _load_benchmark(monkeypatch)
+
+    assert benchmark.DEFAULT_BATCH_SIZES == (1, 8, 32, 128)
+    assert benchmark.DEFAULT_CHANNELS == (6144, 8192, 10240, 12288, 20480)
+    assert benchmark.DEFAULT_SHAPES == tuple((batch, channels) for channels in benchmark.DEFAULT_CHANNELS for batch in benchmark.DEFAULT_BATCH_SIZES)
+    assert all(channels not in (2048, 4096) for _, channels in benchmark.DEFAULT_SHAPES)
+
+
 def test_benchmark_accepts_supported_architectures_without_slurm(monkeypatch):
     benchmark = _load_benchmark(monkeypatch)
     monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: True)
