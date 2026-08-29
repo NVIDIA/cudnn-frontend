@@ -265,8 +265,6 @@ class SparseAttentionForward(APIBase):
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        lse_out: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._compiled_kernel is None:
@@ -285,8 +283,6 @@ class SparseAttentionForward(APIBase):
             softmax_scale=self.softmax_scale,
             group_scope=self.group_scope,
             is_thd=self.is_thd,
-            out=out,
-            lse_out=lse_out,
         )
 
 
@@ -305,8 +301,6 @@ def _reference_forward(
     softmax_scale: Optional[float],
     group_scope: int,
     is_thd: bool,
-    out: Optional[torch.Tensor],
-    lse_out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     g = index_granularity
 
@@ -390,12 +384,6 @@ def _reference_forward(
         out_t = out_t.reshape(b, s_q, h_q, d_v)
         lse_t = lse_t.reshape(b, s_q, h_q)
 
-    if out is not None:
-        out.copy_(out_t)
-        out_t = out
-    if lse_out is not None:
-        lse_out.copy_(lse_t)
-        lse_t = lse_out
     return out_t, lse_t
 
 
@@ -418,8 +406,6 @@ def sparse_attention_forward_wrapper(
     max_seqlen_q: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    lse_out: Optional[torch.Tensor] = None,
     backend: str = "default",
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
@@ -484,8 +470,6 @@ def sparse_attention_forward_wrapper(
         topk_length=topk_length,
         attn_sink=attn_sink,
         cu_seqlens_q=cu_seqlens_q,
-        out=out,
-        lse_out=lse_out,
         current_stream=stream,
     )
     return TupleDict(out=out_t, lse=lse_t)
