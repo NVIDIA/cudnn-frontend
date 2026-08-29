@@ -4,8 +4,9 @@
 """cuDNN-accelerated drop-in for ``fla.ops.gated_delta_rule.chunk_gated_delta_rule``.
 
 Maps the flash-linear-attention public signature onto cuDNN's native
-``gated_delta_net`` (Blackwell/SM100) and falls back to the wrapped FLA function
-for anything cuDNN does not serve, so results never change and never regress.
+``gated_delta_net`` on the adapter's validated SM100/SM103/SM107 targets and
+falls back to the wrapped FLA function everywhere else, so results never change
+and never regress.
 
 FLA layout is ``[B, T, H, ...]`` batch-first; ``g``/``beta`` are indexed by the
 *value* heads ``HV`` and FLA's grouped-value attention has ``HV >= H``, so native
@@ -33,6 +34,12 @@ from cudnn.linear_attention.ops import gated_delta_net
 
 # Native declines a graph it cannot serve with one of these; treat as a fallback.
 _DECLINE = (cudnn.cudnnGraphNotSupportedError, NotImplementedError)
+
+# The native graph also has an experimental portable cuTile engine, but the FLA
+# compatibility adapter stays fail-closed to targets with end-to-end parity
+# coverage. Compilation or launch failures outside this set are not typed graph
+# declines and therefore cannot be converted safely into an FLA fallback here.
+_VALIDATED_NATIVE_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 
 # Diagnostic: which path the last shimmed call took ("native" | "fallback:<reason>").
 _LAST = {"path": None}
@@ -180,14 +187,11 @@ def make_chunk_gated_delta_rule(real_fn):
             return fallback("state_v_first=False")
         if not q.is_cuda:
             return fallback("pre-Blackwell")
-        cc_major = torch.cuda.get_device_capability(q.device)[0]
-        if cc_major < 10:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability[0] < 10:
             return fallback("pre-Blackwell")
-        # FROST has not been validated on SM11x, while a cuTile plan can fail
-        # only after this wrapper's typed-decline boundary.  Preserve functional
-        # compatibility by staying on the saved FLA implementation there.
-        if cc_major == 11:
-            return fallback("sm11")
+        if capability not in _VALIDATED_NATIVE_CAPABILITIES:
+            return fallback("unsupported-arch")
         try:
             out = _to_native(
                 q,

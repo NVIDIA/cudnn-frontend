@@ -3,8 +3,9 @@
 
 """cuDNN-accelerated drop-in for ``fla.ops.kda.chunk_kda`` (Kimi Delta Attention).
 
-Maps FLA's ``chunk_kda`` onto cuDNN's native ``kimi_delta_attention`` (Blackwell/
-SM100) and falls back to the wrapped FLA function for anything cuDNN does not serve.
+Maps FLA's ``chunk_kda`` onto cuDNN's native ``kimi_delta_attention`` on the
+adapter's validated SM100/SM103/SM107 targets and falls back to the wrapped FLA
+function everywhere else.
 
 KDA uses a **channel-wise** log decay ``g: [B,T,H,K]`` and a **scalar** write
 strength ``beta: [B,T,H]``. cuDNN's KDA kernel L2-normalizes q/k in-kernel and now
@@ -28,6 +29,12 @@ import cudnn
 from cudnn.linear_attention.ops import kimi_delta_attention
 
 _DECLINE = (cudnn.cudnnGraphNotSupportedError, NotImplementedError)
+
+# The native graph also has an experimental portable cuTile engine, but the FLA
+# compatibility adapter stays fail-closed to targets with end-to-end parity
+# coverage. Compilation or launch failures outside this set are not typed graph
+# declines and therefore cannot be converted safely into an FLA fallback here.
+_VALIDATED_NATIVE_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 
 _LAST = {"path": None}
 
@@ -187,14 +194,11 @@ def make_chunk_kda(real_fn):
             return fallback("state_v_first=False")
         if not q.is_cuda:
             return fallback("pre-Blackwell")
-        cc_major = torch.cuda.get_device_capability(q.device)[0]
-        if cc_major < 10:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability[0] < 10:
             return fallback("pre-Blackwell")
-        # FROST has not been validated on SM11x, while a cuTile plan can fail
-        # only after this wrapper's typed-decline boundary.  Preserve functional
-        # compatibility by staying on the saved FLA implementation there.
-        if cc_major == 11:
-            return fallback("sm11")
+        if capability not in _VALIDATED_NATIVE_CAPABILITIES:
+            return fallback("unsupported-arch")
         try:
             out = _to_native(
                 q,

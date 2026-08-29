@@ -23,7 +23,17 @@ pytestmark = pytest.mark.L0
         pytest.param(kda, kda.make_chunk_kda, id="kda"),
     ],
 )
-def test_sm110_calls_saved_fla_once_without_trying_native(monkeypatch, shim_module, factory):
+@pytest.mark.parametrize(
+    "capability,reason",
+    [
+        pytest.param((9, 0), "pre-Blackwell", id="sm90"),
+        pytest.param((10, 1), "unsupported-arch", id="sm101"),
+        pytest.param((11, 0), "unsupported-arch", id="sm110"),
+        pytest.param((12, 0), "unsupported-arch", id="sm120"),
+        pytest.param((13, 0), "unsupported-arch", id="sm130"),
+    ],
+)
+def test_unvalidated_arch_calls_saved_fla_once_without_trying_native(monkeypatch, shim_module, factory, capability, reason):
     q = SimpleNamespace(is_cuda=True, device=object())
     k, v, g, beta = object(), object(), object(), object()
     expected = object()
@@ -36,9 +46,9 @@ def test_sm110_calls_saved_fla_once_without_trying_native(monkeypatch, shim_modu
 
     def native(*args, **kwargs):
         native_calls.append((args, kwargs))
-        pytest.fail("SM110 must not enter the native/cuTile route")
+        pytest.fail(f"{capability} must not enter the native/cuTile route")
 
-    monkeypatch.setattr(shim_module.torch.cuda, "get_device_capability", lambda device: (11, 0))
+    monkeypatch.setattr(shim_module.torch.cuda, "get_device_capability", lambda device: capability)
     monkeypatch.setattr(shim_module, "_to_native", native)
 
     result = factory(original)(q, k, v, g, beta)
@@ -47,7 +57,7 @@ def test_sm110_calls_saved_fla_once_without_trying_native(monkeypatch, shim_modu
     assert len(original_calls) == 1
     assert original_calls[0][0] == (q, k, v, g, beta)
     assert native_calls == []
-    assert shim_module.last_path() == "fallback:sm11"
+    assert shim_module.last_path() == f"fallback:{reason}"
 
 
 @pytest.mark.parametrize(
