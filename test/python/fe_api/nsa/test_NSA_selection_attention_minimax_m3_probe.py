@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in functional probe for MiniMax-M3's exact selected-attention shape.
+"""Opt-in public-API probe for MiniMax-M3 selected attention.
 
-This test deliberately does not widen ``SelectionAttention.check_support()``.
-It exercises the private kernel only, with the token-level causal mask required
-when the current 128-token block is selected. Run it explicitly with::
+The metadata intentionally selects sparse, non-monotonic block sets and places
+the current 128-token block at varying slots. This catches implementations that
+implicitly sort the selected blocks or omit token-level causality inside the
+current block. Run it explicitly with::
 
     pytest -m L4 fe_api/nsa/test_NSA_selection_attention_minimax_m3_probe.py
 """
@@ -23,40 +24,78 @@ _KV_HEADS = 4
 _HEAD_DIM = 128
 _BLOCK_SIZE = 128
 _TOPK_BLOCKS = 16
-
-
-class _MiniMaxM3CausalSelectionAttentionFwd:
-    """Late-binding shim so importing this test does not eagerly import CuTe DSL."""
-
-    def __new__(cls, *args, **kwargs):
-        from cudnn.native_sparse_attention.selection.NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd
-
-        return HopperSelectAttentionFwd(*args, **kwargs, causal_within_selected_blocks=True)
+_REFERENCE_QUERY_CHUNK = 128
 
 
 def _minimax_metadata(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    query_positions = torch.arange(_SEQLEN, device=device, dtype=torch.int32)
-    block_ids = torch.arange(_TOPK_BLOCKS, device=device, dtype=torch.int32)
-    indices = block_ids.view(1, 1, -1).expand(_SEQLEN, _KV_HEADS, -1).contiguous()
-    counts = (query_positions // _BLOCK_SIZE + 1).clamp(max=_TOPK_BLOCKS)
-    return indices, counts.view(-1, 1).expand(-1, _KV_HEADS).contiguous()
+    indices = torch.zeros((_SEQLEN, _KV_HEADS, _TOPK_BLOCKS), dtype=torch.int32)
+    counts = torch.zeros((_SEQLEN, _KV_HEADS), dtype=torch.int32)
+
+    for query in range(_SEQLEN):
+        current_block = query // _BLOCK_SIZE
+        for kv_head in range(_KV_HEADS):
+            if current_block == _TOPK_BLOCKS - 1 and (query + kv_head) % 64 == 0:
+                # Exercise the full MiniMax K=16 metadata capacity on a few rows.
+                selected = list(range(_TOPK_BLOCKS))
+            else:
+                selected = []
+                if current_block > 0:
+                    first_old_block = (query // 19 + 2 * kv_head) % current_block
+                    selected.append(first_old_block)
+                if current_block >= 3:
+                    second_old_block = (first_old_block + current_block // 2 + 1) % current_block
+                    if second_old_block not in selected:
+                        selected.append(second_old_block)
+                selected.append(current_block)
+
+            # Vary the order per query/head. In particular, the current block is
+            # not assigned a distinguished metadata slot.
+            shift = (query // 11 + kv_head) % len(selected)
+            selected = selected[shift:] + selected[:shift]
+            if (query + kv_head) % 2:
+                selected.reverse()
+
+            counts[query, kv_head] = len(selected)
+            indices[query, kv_head, : len(selected)] = torch.tensor(selected, dtype=torch.int32)
+
+    return indices.to(device), counts.to(device)
 
 
-def _causal_reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float):
+def _causal_sparse_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    scale: float,
+):
     q_grouped = q.view(_SEQLEN, _KV_HEADS, _Q_HEADS // _KV_HEADS, _HEAD_DIM)
     out = torch.empty_like(q, dtype=torch.float32).view_as(q_grouped)
     row_sum = torch.empty((_SEQLEN, _KV_HEADS, _Q_HEADS // _KV_HEADS), device=q.device, dtype=torch.float32)
     row_max = torch.empty_like(row_sum)
-    causal = torch.ones((_SEQLEN, _SEQLEN), device=q.device, dtype=torch.bool).tril_()
+
+    query_positions = torch.arange(_SEQLEN, device=q.device)
+    block_offsets = torch.arange(_BLOCK_SIZE, device=q.device)
+    metadata_slots = torch.arange(_TOPK_BLOCKS, device=q.device)
 
     for kv_head in range(_KV_HEADS):
-        scores = torch.einsum("tgd,sd->tgs", q_grouped[:, kv_head].float(), k[:, kv_head].float()) * scale
-        scores.masked_fill_(~causal[:, None, :], -torch.inf)
-        max_for_head = scores.amax(dim=-1)
-        probabilities = torch.softmax(scores, dim=-1)
-        out[:, kv_head] = torch.einsum("tgs,sd->tgd", probabilities, v[:, kv_head].float())
-        row_max[:, kv_head] = max_for_head
-        row_sum[:, kv_head] = torch.exp(scores - max_for_head[..., None]).sum(dim=-1)
+        key_positions = block_indices[:, kv_head, :, None].to(torch.int64) * _BLOCK_SIZE + block_offsets
+        valid_slots = metadata_slots[None, :] < block_counts[:, kv_head, None]
+        valid_tokens = valid_slots[:, :, None] & (key_positions < _SEQLEN) & (key_positions <= query_positions[:, None, None])
+
+        selected_tokens = torch.zeros((_SEQLEN, _SEQLEN), device=q.device, dtype=torch.bool)
+        query_rows = query_positions[:, None, None].expand_as(key_positions)
+        selected_tokens[query_rows[valid_tokens], key_positions[valid_tokens]] = True
+
+        for query_start in range(0, _SEQLEN, _REFERENCE_QUERY_CHUNK):
+            query_end = min(query_start + _REFERENCE_QUERY_CHUNK, _SEQLEN)
+            scores = torch.einsum("tgd,sd->tgs", q_grouped[query_start:query_end, kv_head].float(), k[:, kv_head].float()) * scale
+            scores.masked_fill_(~selected_tokens[query_start:query_end, None, :], -torch.inf)
+            max_for_chunk = scores.amax(dim=-1)
+            probabilities = torch.softmax(scores, dim=-1)
+            out[query_start:query_end, kv_head] = torch.einsum("tgs,sd->tgd", probabilities, v[:, kv_head].float())
+            row_max[query_start:query_end, kv_head] = max_for_chunk
+            row_sum[query_start:query_end, kv_head] = torch.exp(scores - max_for_chunk[..., None]).sum(dim=-1)
 
     return out.view_as(q), row_sum.view(_SEQLEN, _Q_HEADS, 1), row_max.view(_SEQLEN, _Q_HEADS, 1)
 
@@ -102,23 +141,10 @@ def test_minimax_m3_selection_attention_block128_causal_probe():
         max_s_q=_SEQLEN,
         max_s_k=_SEQLEN,
         block_size=_BLOCK_SIZE,
+        is_causal=True,
         scale_softmax=scale,
     )
-
-    # Exact-shape private-kernel probe: preserve the public block-size gate until
-    # this path has target-GPU evidence and a production MiniMax adapter.
-    operation.input_layout = "T,H,D"
-    operation.dtype = dtype
-    operation.h_q = _Q_HEADS
-    operation.h_kv = _KV_HEADS
-    operation.gqa_group_size = _Q_HEADS // _KV_HEADS
-    operation.head_dim = _HEAD_DIM
-    operation.value_dim = _HEAD_DIM
-    operation.l_desc = operation._unpad_tensor_to_ndim(operation.l_desc, 2, "sample_l")
-    operation.m_desc = operation._unpad_tensor_to_ndim(operation.m_desc, 2, "sample_m")
-    operation._kernel = _MiniMaxM3CausalSelectionAttentionFwd
-    operation._is_supported = True
-
+    assert operation.check_support()
     operation.compile()
     operation.execute(
         q_tensor=q,
@@ -134,7 +160,7 @@ def test_minimax_m3_selection_attention_block128_causal_probe():
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
-    o_ref, row_sum_ref, row_max_ref = _causal_reference(q, k, v, scale)
+    o_ref, row_sum_ref, row_max_ref = _causal_sparse_reference(q, k, v, block_indices, block_counts, scale)
     torch.testing.assert_close(o.float(), o_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(row_sum, row_sum_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(row_max, row_max_ref, atol=3e-2, rtol=3e-2)
