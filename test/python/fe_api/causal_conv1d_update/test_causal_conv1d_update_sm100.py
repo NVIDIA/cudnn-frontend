@@ -3,6 +3,7 @@
 
 """GPU correctness and contract tests for the decode-update operation."""
 
+import importlib
 import os
 import subprocess
 import sys
@@ -352,6 +353,45 @@ def test_public_custom_op_registration_contract():
     )
 
     assert results == {test: "SUCCESS" for test in test_utils}
+
+
+@torch.no_grad()
+def test_public_plain_cuda_tensors_use_validated_eager_fast_path(monkeypatch):
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    x = torch.zeros(2, 257, device="cuda", dtype=torch.bfloat16)
+    state = torch.zeros(2, 257, 4, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(257, 4, device="cuda", dtype=torch.bfloat16)
+    sentinel = torch.empty_like(x)
+    calls = []
+
+    def validated_native(*args):
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(ops_module, "_validated_native_update", validated_native)
+
+    output = ops_module.causal_conv1d_update(x, state, weight, activation="swish")
+
+    assert output is sentinel
+    assert calls == [(x, state, weight, None, "silu", None, None)]
+
+
+@torch.no_grad()
+def test_public_eager_fast_path_declines_active_torch_dispatch_mode():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    x = torch.zeros(2, 257, device="cuda", dtype=torch.bfloat16)
+    state = torch.zeros(2, 257, 4, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(257, 4, device="cuda", dtype=torch.bfloat16)
+
+    class PassthroughMode(TorchDispatchMode):
+        def __torch_dispatch__(self, function, types, args=(), kwargs=None):
+            return function(*args, **(kwargs or {}))
+
+    assert ops_module._can_use_eager_native_fast_path(x, state, weight, None, None, None)
+    with PassthroughMode():
+        assert not ops_module._can_use_eager_native_fast_path(x, state, weight, None, None, None)
 
 
 @torch.no_grad()

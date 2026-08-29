@@ -102,6 +102,67 @@ def _require_native_subset(
         )
 
 
+def _validated_native_update(
+    x: Tensor,
+    conv_state: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    activation: str,
+    cache_seqlens: Optional[Tensor],
+    conv_state_indices: Optional[Tensor],
+) -> Tensor:
+    """Validate the semantic contract and enter the prepared native route."""
+
+    _validate_semantic_contract(x, conv_state, weight, bias, cache_seqlens, conv_state_indices)
+    _require_native_subset(x, conv_state, weight, cache_seqlens)
+
+    from cudnn.causal_conv1d_update_sm100 import _causal_conv1d_update
+
+    return _causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=conv_state_indices,
+    )
+
+
+def _is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and compiler.is_compiling():
+        return True
+    dynamo = getattr(torch, "_dynamo", None)
+    return bool(dynamo is not None and dynamo.is_compiling())
+
+
+def _can_use_eager_native_fast_path(
+    x: Tensor,
+    conv_state: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cache_seqlens: Optional[Tensor],
+    conv_state_indices: Optional[Tensor],
+) -> bool:
+    """Keep dispatch-aware tensors on the custom op while avoiding it in plain eager mode."""
+
+    if _is_compiling() or not x.is_cuda or cache_seqlens is not None:
+        return False
+    dispatch_stack_length = getattr(torch._C, "_len_torch_dispatch_stack", None)
+    torch_function_mode_enabled = getattr(torch._C, "_is_torch_function_mode_enabled", None)
+    if dispatch_stack_length is None or dispatch_stack_length() != 0:
+        return False
+    if torch_function_mode_enabled is None or torch_function_mode_enabled():
+        return False
+    if type(x) is not torch.Tensor or type(conv_state) is not torch.Tensor:
+        return False
+    if type(weight) is not torch.Tensor:
+        return False
+    if bias is not None and type(bias) is not torch.Tensor:
+        return False
+    return conv_state_indices is None or type(conv_state_indices) is torch.Tensor
+
+
 @torch.library.custom_op(
     "cudnn::_causal_conv1d_update",
     mutates_args=("conv_state",),
@@ -116,18 +177,15 @@ def _causal_conv1d_update_primitive(
     cache_seqlens: Optional[Tensor],
     conv_state_indices: Optional[Tensor],
 ) -> Tensor:
-    from cudnn.causal_conv1d_update_sm100 import _causal_conv1d_update
-
     activation = _normalize_activation(activation)
-    _validate_semantic_contract(x, conv_state, weight, bias, cache_seqlens, conv_state_indices)
-    _require_native_subset(x, conv_state, weight, cache_seqlens)
-    return _causal_conv1d_update(
+    return _validated_native_update(
         x,
         conv_state,
         weight,
         bias,
         activation,
-        conv_state_indices=conv_state_indices,
+        cache_seqlens,
+        conv_state_indices,
     )
 
 
@@ -196,6 +254,17 @@ def causal_conv1d_update(
     grad_tensors = (x, conv_state, weight, bias)
     if torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in grad_tensors):
         raise RuntimeError("causal_conv1d_update is inference-only; call it under torch.no_grad()")
+
+    if _can_use_eager_native_fast_path(x, conv_state, weight, bias, cache_seqlens, conv_state_indices):
+        return _validated_native_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            normalized_activation,
+            cache_seqlens,
+            conv_state_indices,
+        )
 
     return torch.ops.cudnn._causal_conv1d_update(
         x,
