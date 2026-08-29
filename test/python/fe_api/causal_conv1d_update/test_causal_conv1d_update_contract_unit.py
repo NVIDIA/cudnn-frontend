@@ -47,6 +47,22 @@ def _inputs(*, n_rows=2, n_channels=8, n_slots=3, indexed=True):
     return x, weight, state, output, indices
 
 
+def _metadata_desc(tensor):
+    if tensor is None:
+        return None
+    from cudnn.api_base import TensorDesc
+
+    shape = tuple(tensor.shape)
+    stride = tuple(tensor.stride())
+    return TensorDesc(
+        dtype=tensor.dtype,
+        shape=shape,
+        stride=stride,
+        stride_order=TensorDesc._compute_stride_order(shape, stride),
+        device=torch.device("cuda"),
+    )
+
+
 def _mock_cuda_contract(monkeypatch, api, capability=(10, 0)):
     # These tests exercise descriptor/contract logic on CPU tensors only.  The
     # real GPU suite independently checks the CUDA-device and architecture gate.
@@ -123,6 +139,16 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
     assert api.rows_per_cta == 1
+
+
+def test_metadata_only_descriptors_skip_sample_pointer_alignment(monkeypatch):
+    cls = _api_class()
+    api = cls(*(_metadata_desc(tensor) for tensor in _inputs()))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+
+    assert api._sample_alignment_remainders == {}
+    assert api.check_support()
 
 
 @pytest.mark.parametrize("n_channels", [2048, 4096])

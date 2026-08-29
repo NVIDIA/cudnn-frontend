@@ -10,7 +10,7 @@ schedule.
 
 import threading
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -106,11 +106,11 @@ class CausalConv1dUpdateSm100(APIBase):
 
     def __init__(
         self,
-        sample_x: torch.Tensor,
-        sample_weight: torch.Tensor,
-        sample_state: torch.Tensor,
-        sample_output: torch.Tensor,
-        sample_state_indices: Optional[torch.Tensor] = None,
+        sample_x: Union[torch.Tensor, TensorDesc],
+        sample_weight: Union[torch.Tensor, TensorDesc],
+        sample_state: Union[torch.Tensor, TensorDesc],
+        sample_output: Union[torch.Tensor, TensorDesc],
+        sample_state_indices: Optional[Union[torch.Tensor, TensorDesc]] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -123,15 +123,19 @@ class CausalConv1dUpdateSm100(APIBase):
 
         # TensorDesc deliberately does not retain sample tensors.  Preserve
         # only the pointer remainders needed to validate the assumed alignment
-        # passed to make_fake_cute_tensor_from_desc().
-        self._sample_alignment_remainders = {
-            "X": sample_x.data_ptr() % 16,
-            "Weight": sample_weight.data_ptr() % 16,
-            "State": sample_state.data_ptr() % 16,
-            "Output": sample_output.data_ptr() % 16,
-        }
-        if sample_state_indices is not None:
-            self._sample_alignment_remainders["State indices"] = sample_state_indices.data_ptr() % 4
+        # passed to make_fake_cute_tensor_from_desc().  Metadata-only samples
+        # defer this check to the live tensors validated by execute().
+        self._sample_alignment_remainders = {}
+        for name, sample, alignment in (
+            ("X", sample_x, 16),
+            ("Weight", sample_weight, 16),
+            ("State", sample_state, 16),
+            ("Output", sample_output, 16),
+            ("State indices", sample_state_indices, 4),
+        ):
+            data_ptr = getattr(sample, "data_ptr", None)
+            if callable(data_ptr):
+                self._sample_alignment_remainders[name] = data_ptr() % alignment
 
         self.n_rows = None
         self.n_channels = None
