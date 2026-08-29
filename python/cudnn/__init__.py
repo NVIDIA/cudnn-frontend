@@ -305,10 +305,38 @@ _EAGER_PUBLIC_NAMES = (
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
-_OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_CUTEDSL_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
+_MOE_EP_OPTIONAL_IMPORTS = {
+    "moe_ep",
+    "BlockScaledTensor",
+    "MoeEp",
+    "MoeEpExecutionLane",
+    "MoeEpTrainingResources",
+    "MoeEpTrainingSlot",
+    "MoeEpTrainingWeights",
+    "MoeEpTrainingWgradOperands",
+    "MoeEpTuningConfig",
+    "MoeFormat",
+    "MoeTensor",
+}
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
+    "moe_ep": (".moe_ep", None),
+    "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
+    "MoeEp": (".moe_ep", "MoeEp"),
+    "MoeEpExecutionLane": (".moe_ep", "MoeEpExecutionLane"),
+    "MoeEpTrainingResources": (".moe_ep", "MoeEpTrainingResources"),
+    "MoeEpTrainingSlot": (".moe_ep", "MoeEpTrainingSlot"),
+    "MoeEpTrainingWeights": (".moe_ep", "MoeEpTrainingWeights"),
+    "MoeEpTrainingWgradOperands": (
+        ".moe_ep",
+        "MoeEpTrainingWgradOperands",
+    ),
+    "MoeEpTuningConfig": (".moe_ep", "MoeEpTuningConfig"),
+    "MoeFormat": (".moe_ep", "MoeFormat"),
+    "MoeTensor": (".moe_ep", "MoeTensor"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
@@ -386,7 +414,8 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+        install_hint = _MOE_EP_INSTALL_HINT if name in _MOE_EP_OPTIONAL_IMPORTS else _CUTEDSL_INSTALL_HINT
+        raise ImportError(f"{name} requires optional dependencies. {install_hint}: {e}") from e
 
     globals()[name] = value
     return value

@@ -294,6 +294,23 @@ def grouped_gemm_wgrad_wrapper_sm100(
     )
     if framework == "jax" and backend is GroupedGemmBackend.BLOCK_SCALED:
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
+    explicit_dense_output_identity = None
+    if (
+        backend is GroupedGemmBackend.BLOCK_SCALED
+        and framework == "torch"
+        and output_mode == "dense"
+        and wgrad_tensor is not None
+    ):
+        # Temporary workaround:
+        # 1. Problem behavior: Multiple same-signature launches with explicit
+        #    outputs can corrupt later results when captured in one CUDA graph
+        #    and backed by one cached API instance.
+        # 2. Possible root cause: The launches alias mutable TMA descriptor
+        #    workspace owned by the cached API instance.
+        # 3. Possible long-term fix: Cache compiled kernels by shape, but own
+        #    descriptor workspace independently per graph call site. Then
+        #    remove output identity from the cache key.
+        explicit_dense_output_identity = int(wgrad_tensor.data_ptr())
     if wgrad_tensor is None and wgrad_ptrs is None:
         wgrad_shape = (expert_cnt, hidden, intermediate)
         if framework == "torch":
@@ -332,6 +349,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        explicit_dense_output_identity,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
