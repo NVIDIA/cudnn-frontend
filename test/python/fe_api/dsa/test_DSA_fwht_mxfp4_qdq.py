@@ -25,7 +25,7 @@ def _pow2_ceil_positive(values: torch.Tensor) -> torch.Tensor:
 
 
 def _e2m1_rne(values: torch.Tensor) -> torch.Tensor:
-    sign = torch.where(values < 0, -1.0, 1.0)
+    sign = torch.where(torch.signbit(values), -1.0, 1.0)
     magnitude = values.abs()
     quantized = torch.where(
         magnitude <= 0.25,
@@ -55,7 +55,33 @@ def _e2m1_rne(values: torch.Tensor) -> torch.Tensor:
     return quantized * sign
 
 
-def _reference(input_tensor: torch.Tensor) -> torch.Tensor:
+def _qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
+    """Official FP32 scale/divide path starting at the rounded BF16 boundary."""
+
+    rows = rotated_bf16.numel() // 128
+    groups = rotated_bf16.view(rows, 4, 32).float()
+    amax = groups.abs().amax(dim=-1).clamp_min(6.0 * (2.0**-126))
+    scale = _pow2_ceil_positive(amax * (1.0 / 6.0))
+    normalized = (groups / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
+    output = _e2m1_rne(normalized) * scale.unsqueeze(-1)
+    return output.reshape(rotated_bf16.shape).to(torch.bfloat16)
+
+
+def _packed_bf16_qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
+    """Host model of the winner's packed BF16 power-of-two QDQ epilogue."""
+
+    rows = rotated_bf16.numel() // 128
+    groups = rotated_bf16.view(rows, 4, 32)
+    amax = groups.float().abs().amax(dim=-1).clamp_min(6.0 * (2.0**-126))
+    scale = _pow2_ceil_positive(amax * (1.0 / 6.0))
+    inverse_scale_bf16 = scale.reciprocal().to(torch.bfloat16)
+    normalized_bf16 = (groups * inverse_scale_bf16.unsqueeze(-1)).to(torch.bfloat16)
+    quantized_bf16 = _e2m1_rne(normalized_bf16.float().clamp(-6.0, 6.0)).to(torch.bfloat16)
+    output = quantized_bf16 * scale.to(torch.bfloat16).unsqueeze(-1)
+    return output.reshape(rotated_bf16.shape).to(torch.bfloat16)
+
+
+def _fwht_fp32(input_tensor: torch.Tensor) -> torch.Tensor:
     rows = input_tensor.numel() // 128
     transformed = input_tensor.view(rows, 128).float()
     for half_width in (1, 2, 4, 8, 16, 32, 64):
@@ -63,14 +89,94 @@ def _reference(input_tensor: torch.Tensor) -> torch.Tensor:
         low = pairs[:, :, 0, :]
         high = pairs[:, :, 1, :]
         transformed = torch.cat((low + high, low - high), dim=-1).reshape(rows, 128)
-    transformed = (transformed * (128.0**-0.5)).to(torch.bfloat16).float()
+    return transformed
 
-    groups = transformed.reshape(rows, 4, 32)
-    amax = groups.abs().amax(dim=-1).clamp_min(6.0 * (2.0**-126))
+
+def _reference(input_tensor: torch.Tensor) -> torch.Tensor:
+    transformed = _fwht_fp32(input_tensor)
+    transformed = (transformed * (128.0**-0.5)).to(torch.bfloat16)
+    return _qdq_reference(transformed).reshape(input_tensor.shape)
+
+
+def _legacy_combined_round_reference(input_tensor: torch.Tensor) -> torch.Tensor:
+    """Host model of the pre-winner epilogue, retained only for regression."""
+
+    rows = input_tensor.numel() // 128
+    groups = _fwht_fp32(input_tensor).view(rows, 4, 32)
+    norm = 128.0**-0.5
+    amax = (groups.abs().amax(dim=-1) * norm).to(torch.bfloat16).float()
+    amax = amax.clamp_min(6.0 * (2.0**-126))
     scale = _pow2_ceil_positive(amax * (1.0 / 6.0))
-    normalized = (groups / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    output = _e2m1_rne(normalized) * scale.unsqueeze(-1)
+    normalized_bf16 = (groups * (norm / scale.unsqueeze(-1))).to(torch.bfloat16)
+    output = _e2m1_rne(normalized_bf16.float().clamp(-6.0, 6.0)) * scale.unsqueeze(-1)
     return output.reshape(input_tensor.shape).to(torch.bfloat16)
+
+
+def test_reference_e2m1_rne_ties_and_neighbors_on_host():
+    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32)
+    below = torch.nextafter(boundaries, torch.zeros_like(boundaries))
+    above = torch.nextafter(boundaries, torch.full_like(boundaries, float("inf")))
+
+    assert torch.equal(_e2m1_rne(below), torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]))
+    assert torch.equal(_e2m1_rne(boundaries), torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]))
+    assert torch.equal(_e2m1_rne(above), torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]))
+    assert torch.equal(_e2m1_rne(-boundaries), -torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]))
+
+    signed_zero = torch.tensor([-32768, 0], dtype=torch.int16).view(torch.bfloat16).float()
+    quantized_zero = _e2m1_rne(signed_zero).to(torch.bfloat16)
+    assert torch.equal(quantized_zero.view(torch.int16), torch.tensor([-32768, 0], dtype=torch.int16))
+
+
+def test_reference_ue8m0_power_of_two_boundaries_on_host():
+    exponents = torch.tensor([-125, -64, -1, 0, 1, 64, 125], dtype=torch.int32)
+    exact = torch.ldexp(torch.ones(exponents.shape, dtype=torch.float32), exponents)
+    below = torch.nextafter(exact, torch.zeros_like(exact))
+    above = torch.nextafter(exact, torch.full_like(exact, float("inf")))
+
+    assert torch.equal(_pow2_ceil_positive(below), exact)
+    assert torch.equal(_pow2_ceil_positive(exact), exact)
+    assert torch.equal(_pow2_ceil_positive(above), exact * 2.0)
+
+    minimum_normal = torch.ldexp(torch.ones(1, dtype=torch.float32), torch.tensor([-126]))
+    floor_ratio = torch.tensor([6.0 * (2.0**-126)], dtype=torch.float32) * torch.tensor([1.0 / 6.0], dtype=torch.float32)
+    assert torch.equal(floor_ratio, minimum_normal)
+    assert torch.equal(_pow2_ceil_positive(floor_ratio), minimum_normal)
+
+    maximum_bf16 = torch.tensor([0x7F7F], dtype=torch.int16).view(torch.bfloat16).float()
+    maximum_scale = torch.ldexp(torch.ones(1, dtype=torch.float32), torch.tensor([126]))
+    assert torch.equal(_pow2_ceil_positive(maximum_bf16 * (1.0 / 6.0)), maximum_scale)
+
+
+def test_packed_bf16_qdq_matches_reference_for_every_finite_bf16_on_host():
+    positive_bits = torch.arange(0x0000, 0x7F80, dtype=torch.int32)
+    finite_bits = torch.cat((positive_bits, positive_bits | 0x8000))
+    bit_layouts = (
+        finite_bits,
+        finite_bits.reshape(128, -1).T.contiguous().reshape(-1),
+    )
+
+    for bit_layout in bit_layouts:
+        rotated_bf16 = bit_layout.to(torch.int16).view(torch.bfloat16).reshape(-1, 128)
+        expected = _qdq_reference(rotated_bf16)
+        actual = _packed_bf16_qdq_reference(rotated_bf16)
+
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+def test_bf16_boundary_precedes_inverse_scale_on_host():
+    """Lock down the subnormal double-rounding bug fixed by the winner."""
+
+    input_tensor = torch.zeros((1, 128), dtype=torch.bfloat16)
+    input_bits = input_tensor.view(torch.int16)
+    input_bits[0, 0] = 0x0191
+    input_bits[0, 1] = 0x00D7
+
+    expected = _reference(input_tensor).view(torch.int16)
+    legacy = _legacy_combined_round_reference(input_tensor).view(torch.int16)
+
+    assert torch.equal(expected[0, 0::2], torch.full((64,), 0x0040, dtype=torch.int16))
+    assert torch.equal(expected[0, 1::2], torch.zeros(64, dtype=torch.int16))
+    assert torch.equal(legacy, torch.full((1, 128), 0x0040, dtype=torch.int16))
 
 
 @pytest.mark.parametrize("shape", [(1, 128), (31, 128), (33, 128), (2, 3, 4, 128)])

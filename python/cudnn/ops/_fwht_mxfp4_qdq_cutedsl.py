@@ -4,10 +4,12 @@
 """Internal CuTe DSL implementation of normalized H128 plus MXFP4 QDQ.
 
 This kernel was independently generated for Kernel Factory campaign
-``yy6zxcr9y97kd7bysw2pfhbxaw``.  The initial integrated schedule comes from
-candidate ``5aa0b53a9683291ab31b0fbff978246c2eb0bf5b4ec090ae031a23e7fe5671b6``;
-external implementations are semantic and performance references only and no
-external kernel source is included here.
+``yy6zxcr9y97kd7bysw2pfhbxaw``.  The integrated schedule and epilogue come from candidate
+``5324030bd5c94d309f3994fad7c31001b524796b6d512bf113d3b9ede73e80fd``
+(source hash ``42906a98b9a31db1f2234c509f532467852142f80e9645d845140fc4fa486d76``),
+whose tool trace evolves the same author's earlier candidate ``5aa0b53a9683``
+without reading an external optimized kernel.  External implementations remain
+semantic and performance references only; no external kernel source is included.
 """
 
 import torch
@@ -31,7 +33,6 @@ ROWS_PER_CTA = THREADS // LANES_PER_ROW
 NORM_BITS = 0x3DB504F3  # float32(128 ** -0.5)
 INV6_BITS = 0x3E2AAAAB  # float32(1 / 6)
 FLOOR_BITS = 0x01C00000  # float32(6 * 2**-126)
-CBASE_BITS = NORM_BITS + 0x3F800000
 
 _WORD_INDICES = list(range(WORDS_PER_LANE))
 _ELEMENT_INDICES = list(range(ELEMENTS_PER_LANE))
@@ -47,12 +48,6 @@ _lane_offset = 1
 while _lane_offset < LANES_PER_ROW:
     _CROSS_LANE_STAGES.append((_lane_offset, 31 - _lane_offset.bit_length() + 1))
     _lane_offset *= 2
-
-
-def _tree_max(values):
-    while len(values) > 1:
-        values = [cute.max(values[2 * index], values[2 * index + 1]) for index in range(len(values) // 2)]
-    return values[0]
 
 
 @dsl_user_op
@@ -76,29 +71,77 @@ def _cvt_bf16x2(high: F32, low: F32, *, loc=None, ip=None) -> U32:
 
 
 @dsl_user_op
-def _qdq2(values: U32, packed_scale: U32, *, loc=None, ip=None) -> U32:
-    """Quantize BF16x2 to finite E2M1, dequantize, and apply UE8M0 scale."""
+def _max_abs_bf16x2(left: U32, right: U32, *, loc=None, ip=None) -> U32:
+    """Take the lane-wise BF16x2 maximum magnitude."""
 
     return U32(
         llvm.inline_asm(
             T.i32(),
             [
-                U32(values).ir_value(loc=loc, ip=ip),
-                U32(packed_scale).ir_value(loc=loc, ip=ip),
+                U32(left).ir_value(loc=loc, ip=ip),
+                U32(right).ir_value(loc=loc, ip=ip),
             ],
-            "{\n\t"
-            ".reg .b8 q;\n\t"
-            ".reg .b32 d;\n\t"
-            "cvt.rn.satfinite.e2m1x2.bf16x2 q, $1;\n\t"
-            "cvt.rn.bf16x2.e2m1x2 d, q;\n\t"
-            "mul.rn.bf16x2 $0, d, $2;\n\t"
-            "}",
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@dsl_user_op
+def _max_bf16x2(left: U32, right: U32, *, loc=None, ip=None) -> U32:
+    """Take the lane-wise BF16x2 maximum."""
+
+    return U32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                U32(left).ir_value(loc=loc, ip=ip),
+                U32(right).ir_value(loc=loc, ip=ip),
+            ],
+            "max.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _qdq_packed(values: U32, packed_inverse_scale: U32, packed_scale: U32, *, loc=None, ip=None) -> U32:
+    """Scale, quantize to finite E2M1, dequantize, and rescale BF16x2."""
+
+    return U32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                U32(values).ir_value(loc=loc, ip=ip),
+                U32(packed_inverse_scale).ir_value(loc=loc, ip=ip),
+                U32(packed_scale).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .b8 q;\n\t"
+            ".reg .b32 normalized, dequantized;\n\t"
+            "mul.rn.bf16x2 normalized, $1, $2;\n\t"
+            "cvt.rn.satfinite.e2m1x2.bf16x2 q, normalized;\n\t"
+            "cvt.rn.bf16x2.e2m1x2 dequantized, q;\n\t"
+            "mul.rn.bf16x2 $0, dequantized, $3;\n\t"
+            "}",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _tree_max_bf16x2(values):
+    while len(values) > 1:
+        values = [_max_abs_bf16x2(values[2 * index], values[2 * index + 1]) for index in range(len(values) // 2)]
+    return values[0]
 
 
 @cute.kernel
@@ -141,20 +184,25 @@ def _fwht_mxfp4_kernel(input_tensor: cute.Tensor, output_tensor: cute.Tensor, ro
     inverse_six = U32(INV6_BITS).bitcast(F32)
     scale_floor = U32(FLOOR_BITS).bitcast(F32)
 
-    group_amax = _tree_max([cute.abs(values[index]) for index in _ELEMENT_INDICES])
-    rounded_amax = cute.max((group_amax * norm).to(cutlass.BFloat16).to(F32), scale_floor)
+    # Materialize the official BF16 boundary first.  Reducing these packed
+    # values halves the amax tree and retires the FP32 butterfly fragment before
+    # QDQ, while preserving the exact model recipe.
+    rounded_values = [_cvt_bf16x2(values[2 * word_index + 1] * norm, values[2 * word_index] * norm) for word_index in _WORD_INDICES]
+    packed_amax = _tree_max_bf16x2(rounded_values) & U32(0x7FFF7FFF)
+    packed_amax = _max_bf16x2(packed_amax, packed_amax >> 16)
+    group_amax = (packed_amax << 16).bitcast(F32)
+
+    rounded_amax = cute.max(group_amax, scale_floor)
     biased_scale_exponent = ((rounded_amax * inverse_six).bitcast(U32) + U32(0x7FFFFF)) >> 23
-    scale_bits = biased_scale_exponent << 23
-    packed_scale = (biased_scale_exponent << 7) | scale_bits
-    combined_normalization = (U32(CBASE_BITS) - scale_bits).bitcast(F32)
+    inverse_biased_scale_exponent = U32(254) - biased_scale_exponent
+    packed_scale = (biased_scale_exponent << 7) | (biased_scale_exponent << 23)
+    packed_inverse_scale = (inverse_biased_scale_exponent << 7) | (inverse_biased_scale_exponent << 23)
 
     output_fragment = cute.make_fragment_like(source)
     for word_index in _WORD_INDICES:
-        output_fragment[word_index] = _qdq2(
-            _cvt_bf16x2(
-                values[2 * word_index + 1] * combined_normalization,
-                values[2 * word_index] * combined_normalization,
-            ),
+        output_fragment[word_index] = _qdq_packed(
+            rounded_values[word_index],
+            packed_inverse_scale,
             packed_scale,
         )
 
