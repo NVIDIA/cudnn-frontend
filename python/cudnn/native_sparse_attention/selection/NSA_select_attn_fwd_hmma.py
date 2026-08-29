@@ -30,11 +30,13 @@ class HopperSelectAttentionFwd:
         block_size: int,
         dtype: type[cutlass.Numeric],
         acc_dtype: type[cutlass.Numeric],
+        causal_within_selected_blocks: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.atom_layout_mnk = (1, 1, 1)
         self.block_size = block_size
+        self.causal_within_selected_blocks = causal_within_selected_blocks
 
         assert self.dtype in [cutlass.Float16, cutlass.BFloat16]
         assert self.acc_dtype in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
@@ -807,6 +809,12 @@ class HopperSelectAttentionFwd:
             # predicates for GQA_group_size
             cLM = cute.make_identity_tensor((16, 1))
             cLM_thr = tiled_mma_QK.get_slice(tidx).partition_C(cLM)
+            if cutlass.const_expr(self.causal_within_selected_blocks):
+                # Selection is block-granular, so a selected block containing the
+                # current query still needs token-level causal masking.
+                cQK = cute.make_identity_tensor((16, self.block_size))
+                cQK_thr = tiled_mma_QK.get_slice(tidx).partition_C(cQK)
+                cQK_mn = self._make_acc_tensor_mn_view(cQK_thr)
             gL_thr = tiled_mma_QK.get_slice(tidx).partition_C(gL)
             gM_thr = tiled_mma_QK.get_slice(tidx).partition_C(gM)
 
@@ -898,8 +906,14 @@ class HopperSelectAttentionFwd:
                 row_max_prev = cute.make_fragment_like(row_max, cutlass.Float32)
                 if is_not_first_n_block:  # not first n block
                     cute.basic_copy(row_max, row_max_prev)
+                if cutlass.const_expr(self.causal_within_selected_blocks):
+                    current_block = sIDX[K_tile_cnt - 1 - K_tile]
                 for r in cutlass.range_constexpr(cute.size(gL_thr.shape[0][1])):
                     if cute.elem_less(cLM_thr[(0, r), 0, 0][0], self.GQA_group_size):
+                        if cutlass.const_expr(self.causal_within_selected_blocks):
+                            for c in cutlass.range_constexpr(cute.size(acc_QK_mn, mode=[1])):
+                                if current_block * self.block_size + cQK_mn[r, c][1] > t:
+                                    acc_QK_mn[r, c] = -cutlass.Float32.inf
                         acc_QK_row = acc_QK_mn[r, None].load() * softmax_scale
                         row_max_cur_row = acc_QK_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
                         row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row, mask=(1 << self.GQA_group_size) - 1)
