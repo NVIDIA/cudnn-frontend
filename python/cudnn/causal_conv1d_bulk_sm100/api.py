@@ -112,8 +112,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
     ``B == 1`` and a CUDA int32 ``cu_seqlens[N + 1]`` tensor.  Optional initial
     and final states use the full-width ``[N, D, 4]`` decode-cache layout.
 
-    This first slice has no bias and always applies SiLU.  It is inference-only
-    until the matching backward primitive is available.
+    An optional contiguous BF16 ``bias[D]`` is added before SiLU.  The operation
+    remains inference-only until the matching backward primitive exists.
     """
 
     def __init__(
@@ -124,6 +124,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
         sample_cu_seqlens: Optional[torch.Tensor] = None,
         sample_initial_state: Optional[torch.Tensor] = None,
         sample_final_state: Optional[torch.Tensor] = None,
+        *,
+        sample_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -136,6 +138,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
             if not isinstance(sample, torch.Tensor):
                 raise TypeError(f"{name} must be a torch.Tensor, got {type(sample).__name__}")
         for name, sample in (
+            ("sample_bias", sample_bias),
             ("sample_cu_seqlens", sample_cu_seqlens),
             ("sample_initial_state", sample_initial_state),
             ("sample_final_state", sample_final_state),
@@ -145,6 +148,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
 
         self.x_desc = self._make_tensor_desc(sample_x, name="sample_x")
         self.weight_desc = self._make_tensor_desc(sample_weight, name="sample_weight")
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
         self.output_desc = self._make_tensor_desc(sample_output, name="sample_output")
         self.cu_seqlens_desc = self._make_tensor_desc(sample_cu_seqlens, name="sample_cu_seqlens")
         self.initial_state_desc = self._make_tensor_desc(sample_initial_state, name="sample_initial_state")
@@ -160,6 +164,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
         }
         if sample_cu_seqlens is not None:
             self._sample_alignment_remainders["cu_seqlens"] = sample_cu_seqlens.data_ptr() % 4
+        if sample_bias is not None:
+            self._sample_alignment_remainders["Bias"] = sample_bias.data_ptr() % 16
         if sample_initial_state is not None:
             self._sample_alignment_remainders["Initial state"] = sample_initial_state.data_ptr() % 16
         if sample_final_state is not None:
@@ -199,6 +205,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self._require_rank(self.x_desc, 3, "X")
         self._require_rank(self.weight_desc, 2, "Weight")
         self._require_rank(self.output_desc, 3, "Output")
+        if self.bias_desc is not None:
+            self._require_rank(self.bias_desc, 1, "Bias")
         if self.cu_seqlens_desc is not None:
             self._require_rank(self.cu_seqlens_desc, 1, "cu_seqlens")
         if self.initial_state_desc is not None:
@@ -237,6 +245,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
             )
 
         self._check_tensor_shape(self.weight_desc, (n_channels, 4), "Weight")
+        if self.bias_desc is not None:
+            self._check_tensor_shape(self.bias_desc, (n_channels,), "Bias")
         self._check_tensor_shape(self.output_desc, (batch_size, sequence_length, n_channels), "Output")
         if self.cu_seqlens_desc is not None:
             self._check_tensor_shape(self.cu_seqlens_desc, (num_sequences + 1,), "cu_seqlens")
@@ -257,6 +267,13 @@ class CausalConv1dBulkFwdSm100(APIBase):
             name="Weight",
             extra_error_msg="Weight must be [D, 4] contiguous",
         )
+        if self.bias_desc is not None:
+            self._check_tensor_stride(
+                self.bias_desc,
+                stride=(1,),
+                name="Bias",
+                extra_error_msg="Bias must be [D] contiguous",
+            )
         self._check_tensor_stride(
             self.output_desc,
             stride=(sequence_length * n_channels, n_channels, 1),
@@ -277,6 +294,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         for name, desc in (
             ("X", self.x_desc),
             ("Weight", self.weight_desc),
+            ("Bias", self.bias_desc),
             ("Output", self.output_desc),
             ("Initial state", self.initial_state_desc),
             ("Final state", self.final_state_desc),
@@ -296,6 +314,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         descs = [
             ("X", self.x_desc),
             ("Weight", self.weight_desc),
+            ("Bias", self.bias_desc),
             ("Output", self.output_desc),
             ("cu_seqlens", self.cu_seqlens_desc),
             ("Initial state", self.initial_state_desc),
@@ -353,6 +372,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
             assumed_align=16,
         )
         fake_weight = self._make_fake_cute_tensor_from_desc(self.weight_desc, assumed_align=16)
+        fake_bias = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
         fake_initial_state = self._make_fake_cute_tensor_from_desc(self.initial_state_desc, assumed_align=16)
         fake_cu_seqlens = self._make_fake_cute_tensor_from_desc(self.cu_seqlens_desc, assumed_align=4)
         fake_output = self._make_fake_cute_tensor(
@@ -371,6 +391,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
                 kernel,
                 fake_x,
                 fake_weight,
+                fake_bias,
                 fake_initial_state,
                 fake_cu_seqlens,
                 fake_output,
@@ -427,6 +448,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
         initial_state_tensor: Optional[torch.Tensor] = None,
         final_state_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        bias_tensor: Optional[torch.Tensor] = None,
     ) -> TupleDict:
         self._runtime_error_if(
             self._compiled_kernel is None,
@@ -444,6 +467,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self._validate_runtime_static_tensor(weight_tensor, self.weight_desc, "Weight")
 
         optional_tensors = (
+            ("Bias", bias_tensor, self.bias_desc),
             ("cu_seqlens", cu_seqlens_tensor, self.cu_seqlens_desc),
             ("Initial state", initial_state_tensor, self.initial_state_desc),
             ("Final state", final_state_tensor, self.final_state_desc),
@@ -457,6 +481,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         for name, tensor, alignment in (
             ("X", x_tensor, 16),
             ("Weight", weight_tensor, 16),
+            ("Bias", bias_tensor, 16),
             ("Output", output_tensor, 16),
             ("cu_seqlens", cu_seqlens_tensor, 4),
             ("Initial state", initial_state_tensor, 16),
@@ -466,12 +491,16 @@ class CausalConv1dBulkFwdSm100(APIBase):
                 _require_storage_alignment(tensor, alignment, name)
 
         grad_inputs = [x_tensor, weight_tensor]
+        if bias_tensor is not None:
+            grad_inputs.append(bias_tensor)
         if initial_state_tensor is not None:
             grad_inputs.append(initial_state_tensor)
         if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in grad_inputs):
             raise RuntimeError("causal_conv1d_bulk_fwd is inference-only; call it under torch.no_grad()")
 
         read_tensors = [x_tensor, weight_tensor]
+        if bias_tensor is not None:
+            read_tensors.append(bias_tensor)
         if cu_seqlens_tensor is not None:
             read_tensors.append(cu_seqlens_tensor)
         if initial_state_tensor is not None:
@@ -497,6 +526,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self._compiled_kernel(
             flat_x,
             weight_tensor,
+            bias_tensor,
             initial_state_tensor,
             cu_seqlens_tensor,
             flat_output,
@@ -510,6 +540,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
             (
                 x_tensor,
                 weight_tensor,
+                bias_tensor,
                 output_tensor,
                 cu_seqlens_tensor,
                 initial_state_tensor,
@@ -522,6 +553,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
 
 def _cache_key(
     x_tensor: torch.Tensor,
+    bias_tensor: Optional[torch.Tensor],
     cu_seqlens_tensor: Optional[torch.Tensor],
     initial_state_tensor: Optional[torch.Tensor],
     output_final_state: bool,
@@ -569,6 +601,7 @@ def _cache_key(
         batch_size,
         num_sequences,
         n_channels,
+        bias_tensor is not None,
         cu_seqlens_tensor is not None,
         initial_state_tensor is not None,
         bool(output_final_state),
@@ -583,6 +616,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
     *,
     output_final_state: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    bias_tensor: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Run the BF16 width-four bulk causal-convolution forward.
 
@@ -597,12 +631,16 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
     if initial_state_tensor is not None and not isinstance(initial_state_tensor, torch.Tensor):
         raise TypeError("Initial state must be a torch.Tensor or None, " f"got {type(initial_state_tensor).__name__}")
+    if bias_tensor is not None and not isinstance(bias_tensor, torch.Tensor):
+        raise TypeError("Bias must be a torch.Tensor or None, " f"got {type(bias_tensor).__name__}")
     if not isinstance(output_final_state, bool):
         raise TypeError(f"output_final_state must be bool, got {type(output_final_state).__name__}")
     if not x_tensor.is_cuda:
         raise ValueError(f"X must be a CUDA tensor, got device {x_tensor.device}")
 
     grad_inputs = [x_tensor, weight_tensor]
+    if bias_tensor is not None:
+        grad_inputs.append(bias_tensor)
     if initial_state_tensor is not None:
         grad_inputs.append(initial_state_tensor)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in grad_inputs):
@@ -610,6 +648,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
 
     key = _cache_key(
         x_tensor,
+        bias_tensor,
         cu_seqlens_tensor,
         initial_state_tensor,
         output_final_state,
@@ -640,6 +679,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
                         sample_x=x_tensor,
                         sample_weight=weight_tensor,
                         sample_output=output_tensor,
+                        sample_bias=bias_tensor,
                         sample_cu_seqlens=cu_seqlens_tensor,
                         sample_initial_state=initial_state_tensor,
                         sample_final_state=final_state_tensor if output_final_state else None,
@@ -658,6 +698,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
             initial_state_tensor=initial_state_tensor,
             final_state_tensor=final_state_tensor if output_final_state else None,
             current_stream=current_stream,
+            bias_tensor=bias_tensor,
         )
         if not output_final_state:
             result["final_state_tensor"] = final_state_tensor

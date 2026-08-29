@@ -45,7 +45,7 @@ def test_operation_package_exports_class_and_wrapper():
     assert bulk.causal_conv1d_bulk_fwd_wrapper_sm100 is wrapper
 
 
-def test_public_signatures_keep_optional_state_and_packed_metadata_explicit():
+def test_public_signatures_append_keyword_only_bias_without_moving_existing_parameters():
     _, api_class, wrapper = _load_public_api()
 
     assert tuple(inspect.signature(api_class).parameters) == (
@@ -55,6 +55,7 @@ def test_public_signatures_keep_optional_state_and_packed_metadata_explicit():
         "sample_cu_seqlens",
         "sample_initial_state",
         "sample_final_state",
+        "sample_bias",
     )
     assert tuple(inspect.signature(api_class.execute).parameters) == (
         "self",
@@ -65,6 +66,7 @@ def test_public_signatures_keep_optional_state_and_packed_metadata_explicit():
         "initial_state_tensor",
         "final_state_tensor",
         "current_stream",
+        "bias_tensor",
     )
     assert tuple(inspect.signature(wrapper).parameters) == (
         "x_tensor",
@@ -73,8 +75,12 @@ def test_public_signatures_keep_optional_state_and_packed_metadata_explicit():
         "initial_state_tensor",
         "output_final_state",
         "current_stream",
+        "bias_tensor",
     )
+    assert inspect.signature(api_class).parameters["sample_bias"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(api_class.execute).parameters["bias_tensor"].kind is inspect.Parameter.KEYWORD_ONLY
     assert inspect.signature(wrapper).parameters["output_final_state"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(wrapper).parameters["bias_tensor"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 @pytest.mark.parametrize(
@@ -154,14 +160,83 @@ def test_support_accepts_a_source_dsl_without_distribution_metadata(monkeypatch)
 
     x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
     weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    bias = torch.zeros(8, dtype=torch.bfloat16)
     output = torch.empty_like(x)
-    api = api_class(x, weight, output)
+    api = api_class(x, weight, output, sample_bias=bias)
     monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
     monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
 
     assert api.check_support()
+    assert api.bias_desc.shape == (8,)
+
+
+@pytest.mark.parametrize("case", ["rank", "shape", "dtype", "stride", "alignment"])
+def test_support_rejects_invalid_bias_contract(monkeypatch, case):
+    _, api_class, _ = _load_public_api()
+    import cudnn.causal_conv1d_bulk_sm100.api as api_module
+
+    x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    if case == "rank":
+        bias = torch.zeros(1, 8, dtype=torch.bfloat16)
+    elif case == "shape":
+        bias = torch.zeros(7, dtype=torch.bfloat16)
+    elif case == "dtype":
+        bias = torch.zeros(8, dtype=torch.float32)
+    elif case == "stride":
+        bias = torch.zeros(8, 2, dtype=torch.bfloat16)[:, 0]
+    elif case == "alignment":
+        bias = torch.zeros(9, dtype=torch.bfloat16)[1:]
+    else:
+        raise AssertionError(f"unhandled case {case}")
+
+    api = api_class(x, weight, output, sample_bias=bias)
+    monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
+
+    with pytest.raises(ValueError, match="Bias"):
+        api.check_support()
+
+
+def test_bias_presence_must_match_the_compiled_signature(monkeypatch):
+    _, api_class, _ = _load_public_api()
+    import cudnn.causal_conv1d_bulk_sm100.api as api_module
+
+    x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    bias = torch.zeros(8, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+
+    with_bias = api_class(x, weight, output, sample_bias=bias)
+    monkeypatch.setattr(with_bias, "_require_cuda", lambda desc, name: None)
+    assert with_bias.check_support()
+    with_bias._compiled_kernel = object()
+    with pytest.raises(ValueError, match="Bias presence must match"):
+        with_bias.execute(x, weight, output)
+
+    without_bias = api_class(x, weight, output)
+    monkeypatch.setattr(without_bias, "_require_cuda", lambda desc, name: None)
+    assert without_bias.check_support()
+    without_bias._compiled_kernel = object()
+    with pytest.raises(ValueError, match="Bias presence must match"):
+        without_bias.execute(x, weight, output, bias_tensor=bias)
+
+
+def test_constructor_and_wrapper_reject_non_tensor_bias():
+    _, api_class, wrapper = _load_public_api()
+    x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+
+    with pytest.raises(TypeError, match="sample_bias must be a torch.Tensor"):
+        api_class(x, weight, output, sample_bias=object())
+    with pytest.raises(TypeError, match="Bias must be a torch.Tensor or None"):
+        wrapper(x, weight, bias_tensor=object())
 
 
 @pytest.mark.parametrize(

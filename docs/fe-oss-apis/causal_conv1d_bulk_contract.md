@@ -8,16 +8,17 @@ repacking when both are installed. The API is experimental.
 
 ## First native slice
 
-The first optimized slice is the model-relevant BF16, width-four, no-bias,
-fused-SiLU operation. Functional targets are the exact compute capabilities
-SM80, SM86, SM87, SM89, SM90, SM100, SM103, SM110, SM120, and SM121. The
-public class and wrapper retain their original `Sm100` suffix while this
-experimental API evolves.
+The first optimized slice is the model-relevant BF16, width-four, fused-SiLU
+operation with an optional per-channel bias. Functional targets are the exact
+compute capabilities SM80, SM86, SM87, SM89, SM90, SM100, SM103, SM110,
+SM120, and SM121. The public class and wrapper retain their original `Sm100`
+suffix while this experimental API evolves.
 
 - dense input: contiguous `x[B, T, D]`
 - packed input: contiguous `x[1, total_T, D]` plus contiguous CUDA int32
   `cu_seqlens[N + 1]`
 - filter: contiguous `weight[D, 4]`
+- optional channel bias: contiguous BF16 `bias[D]`
 - optional initial state: contiguous `initial_state[N, D, 4]`
 - output: contiguous `y`, with the same shape as `x`
 - optional final state: contiguous `final_state[N, D, 4]`
@@ -51,11 +52,13 @@ repacking:
 
 ```text
 state = [state[1], state[2], state[3], x_t]
-y_t = SiLU(sum_j state[j] * weight[j])
+preactivation_t[d] = sum_j state[d, j] * weight[d, j] + bias[d]
+y_t[d] = SiLU(preactivation_t[d])
 ```
 
-When `initial_state` is omitted, its observable lanes are zero. Returning a
-final state must not mutate the input state.
+The bias term is omitted when `bias=None`. When `initial_state` is omitted,
+its observable lanes are zero. Returning a final state must not mutate the
+input state.
 
 The high-level wrapper always returns a `TupleDict` in this stable order:
 
@@ -67,6 +70,7 @@ result = causal_conv1d_bulk_fwd_wrapper_sm100(
     weight,
     cu_seqlens_tensor=cu_seqlens,
     initial_state_tensor=initial_state,
+    bias_tensor=bias,  # optional contiguous BF16 [D]
     output_final_state=True,
 )
 y = result["output_tensor"]
@@ -80,18 +84,21 @@ The lower-level class API follows the common FE-OSS lifecycle: construct it
 from representative PyTorch tensors (metadata-only `TensorDesc` inputs are not
 accepted), call `check_support()`, call `compile()` once,
 then call `execute()` with preallocated output tensors. `B`, `D`, packed `N`,
-and optional-tensor presence are compile-signature properties; `T` is symbolic
-and may change between executions within the indexing limits above. Both APIs
-accept an explicit CUDA stream and do not synchronize it on a valid launch.
+and optional-tensor presence, including bias presence, are compile-signature
+properties; `T` is symbolic and may change between executions within the
+indexing limits above. The class constructor uses keyword-only `sample_bias`,
+and `execute()` requires the runtime `bias_tensor` presence to match it. Both
+APIs accept an explicit CUDA stream and do not synchronize it on a valid
+launch.
 
 ## Backward contract
 
 The matching backward is not implemented in this first slice. Its contract is
-to return gradients for `x`, `weight`, and `initial_state` when that input
-participates in autograd. If `final_state` contributes to the loss, backward
-also consumes its upstream gradient. This makes the prefill-to-decode state
-bridge differentiable instead of treating the state output as detached
-metadata.
+to return gradients for `x`, `weight`, optional `bias`, and `initial_state`
+when that input participates in autograd. If `final_state` contributes to the
+loss, backward also consumes its upstream gradient. This makes the
+prefill-to-decode state bridge differentiable instead of treating the state
+output as detached metadata.
 
 All four upstream final-state lanes must flow to the corresponding source in
 `tail_4(initial_state || x_sequence)`, including sequences of length one or
@@ -111,9 +118,10 @@ existing causal-convolution wrappers.
 The native primitive owns one explicit contract; adapters own ecosystem
 differences.
 
-- FLA uses `[B, T, D]`, `[D, W]`, `cu_seqlens`, and full-width `[N, D, W]`
-  cache tensors. The exact contiguous, alignment-compatible, no-bias,
-  no-residual, width-four BF16 SiLU/swish subset can be a zero-copy adapter.
+- FLA uses `[B, T, D]`, `[D, W]`, `cu_seqlens`, an optional `[D]` bias, and
+  full-width `[N, D, W]` cache tensors. The exact contiguous,
+  alignment-compatible, no-residual, width-four BF16 SiLU/swish subset can be
+  a zero-copy adapter when its optional bias is also contiguous BF16.
   Nonstandard QKV views, scheduling hints that cannot be safely ignored,
   duplicate/empty packed segments, or any broader option must retain FLA's
   original route.
@@ -154,15 +162,16 @@ packed boundaries or initial/final state pointers. A separate native path is
 therefore required rather than presenting a Python loop or per-sequence
 fallback as packed-kernel support.
 
-If bias or residual support is added later, the fixed semantic order is
-`residual + SiLU(conv + bias)`.
+Bias is added before SiLU. If residual support is added later, the fixed
+semantic order is `residual + SiLU(conv + bias)`.
 
 ## Delivery order
 
 1. Forward correctness for dense and packed inputs, including exact boundary
    and final-state tests. **Implemented.**
-2. Backward correctness for `dx`, `dweight`, `d_initial_state`, and upstream
-   `d_final_state`, including sequences shorter than the width.
+2. Backward correctness for `dx`, `dweight`, optional `dbias`,
+   `d_initial_state`, and upstream `d_final_state`, including sequences shorter
+   than the width.
 3. FLA and Transformers adapters with explicit route proof and fail-closed
    support checks.
 4. ComputeLab B200 optimization at representative sequence lengths 8192,
@@ -173,6 +182,6 @@ If bias or residual support is added later, the fixed semantic order is
 
 The first performance gate is parity with the best available FLA route while
 adding FE's packed-state forward; the matching backward remains next. FLA
-Triton itself already implements those features. Broader dtype, width, bias,
-and additional architecture support are follow-ups, not hidden fallback
-behavior.
+Triton itself already implements those features. Broader dtype, width,
+residual fusion, and additional architecture support are follow-ups, not
+hidden fallback behavior.

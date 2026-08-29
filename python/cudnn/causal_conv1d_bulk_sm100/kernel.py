@@ -126,6 +126,7 @@ def _validate_cu_seqlens_kernel(
 def _causal_conv1d_bulk_fwd_kernel(
     x: cute.Tensor,
     weight: cute.Tensor,
+    bias: Optional[cute.Tensor],
     initial_state: Optional[cute.Tensor],
     cu_seqlens: Optional[cute.Tensor],
     output: cute.Tensor,
@@ -156,6 +157,7 @@ def _causal_conv1d_bulk_fwd_kernel(
     weight_1 = cutlass.Float32(0.0)
     weight_2 = cutlass.Float32(0.0)
     weight_3 = cutlass.Float32(0.0)
+    bias_value = cutlass.Float32(0.0)
     if channel < n_channels:
         # Vectorize the naturally contiguous four-tap weight row.  Its address
         # is always eight-byte aligned for contiguous BF16 [D, 4] storage.
@@ -168,6 +170,8 @@ def _causal_conv1d_bulk_fwd_kernel(
         )
         weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=cutlass.BFloat16)
         weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=cutlass.BFloat16)
+        if cutlass.const_expr(bias is not None):
+            bias_value = bias[channel].to(cutlass.Float32)
 
     sequence = cutlass.Int32(0)
     sequence_start = cutlass.Int32(0)
@@ -252,6 +256,8 @@ def _causal_conv1d_bulk_fwd_kernel(
             acc = acc + history_1 * weight_1
             acc = acc + history_2 * weight_2
             acc = acc + current * weight_3
+            if cutlass.const_expr(bias is not None):
+                acc = acc + bias_value
             output[token, channel] = (acc * sigmoid(acc)).to(cutlass.BFloat16)
 
             if cutlass.const_expr(final_state is not None):
@@ -272,6 +278,7 @@ def _causal_conv1d_bulk_fwd_kernel(
 def _causal_conv1d_bulk_vec8_fwd_kernel(
     x: cute.Tensor,
     weight: cute.Tensor,
+    bias: Optional[cute.Tensor],
     initial_state: Optional[cute.Tensor],
     cu_seqlens: Optional[cute.Tensor],
     output: cute.Tensor,
@@ -304,12 +311,14 @@ def _causal_conv1d_bulk_vec8_fwd_kernel(
     weight_1 = cutlass.Array(cutlass.Float32, VEC_CHANNELS_PER_THREAD, alignment=16)
     weight_2 = cutlass.Array(cutlass.Float32, VEC_CHANNELS_PER_THREAD, alignment=16)
     weight_3 = cutlass.Array(cutlass.Float32, VEC_CHANNELS_PER_THREAD, alignment=16)
+    bias_values = cutlass.Array(cutlass.Float32, VEC_CHANNELS_PER_THREAD, alignment=16)
     zero = opaque_f32_zero()
     for channel_offset in cutlass.range_constexpr(VEC_CHANNELS_PER_THREAD):
         weight_0[channel_offset] = zero
         weight_1[channel_offset] = zero
         weight_2[channel_offset] = zero
         weight_3[channel_offset] = zero
+        bias_values[channel_offset] = zero
 
     if valid_channel_group:
         for channel_pair in cutlass.range_constexpr(VEC_CHANNELS_PER_THREAD // 2):
@@ -326,6 +335,10 @@ def _causal_conv1d_bulk_vec8_fwd_kernel(
             weight_1[channel_offset + 1] = values[5]
             weight_2[channel_offset + 1] = values[6]
             weight_3[channel_offset + 1] = values[7]
+        if cutlass.const_expr(bias is not None):
+            values = _load_bf16x8(bias.iterator.toint() + cutlass.Int64(channel_base) * cutlass.Int64(2))
+            for channel_offset in cutlass.range_constexpr(VEC_CHANNELS_PER_THREAD):
+                bias_values[channel_offset] = values[channel_offset]
 
     sequence = cutlass.Int32(0)
     sequence_start = cutlass.Int32(0)
@@ -465,6 +478,9 @@ def _causal_conv1d_bulk_vec8_fwd_kernel(
                 acc_lo, acc_hi = ffma2(history_1[lo], history_1[hi], weight_1[lo], weight_1[hi], acc_lo, acc_hi)
                 acc_lo, acc_hi = ffma2(history_2[lo], history_2[hi], weight_2[lo], weight_2[hi], acc_lo, acc_hi)
                 acc_lo, acc_hi = ffma2(current[lo], current[hi], weight_3[lo], weight_3[hi], acc_lo, acc_hi)
+                if cutlass.const_expr(bias is not None):
+                    acc_lo = acc_lo + bias_values[lo]
+                    acc_hi = acc_hi + bias_values[hi]
                 gate_lo, gate_hi = sigmoid2(acc_lo, acc_hi)
                 output_values[lo], output_values[hi] = fmul2(acc_lo, acc_hi, gate_lo, gate_hi)
 
@@ -523,6 +539,7 @@ class CausalConv1dBulkForwardKernel:
         self,
         x: cute.Tensor,
         weight: cute.Tensor,
+        bias: Optional[cute.Tensor],
         initial_state: Optional[cute.Tensor],
         cu_seqlens: Optional[cute.Tensor],
         output: cute.Tensor,
@@ -547,6 +564,7 @@ class CausalConv1dBulkForwardKernel:
             _causal_conv1d_bulk_vec8_fwd_kernel(
                 x,
                 weight,
+                bias,
                 initial_state,
                 cu_seqlens,
                 output,
@@ -563,6 +581,7 @@ class CausalConv1dBulkForwardKernel:
             _causal_conv1d_bulk_fwd_kernel(
                 x,
                 weight,
+                bias,
                 initial_state,
                 cu_seqlens,
                 output,
