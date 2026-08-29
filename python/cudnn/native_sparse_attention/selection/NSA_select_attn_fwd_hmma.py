@@ -17,7 +17,7 @@ A NSA(Native Sparse Attention) attention forward pass example for NVIDIA Ampere 
 There are some constraints for this example:
 * Only Float16 and BFloat16 are supported.
 * Accumulation type is Float32.
-* Supported block sizes(16, 32, 64) combined with GQA group sizes(1, 2, 4, 8, 32, 64) 
+* Supported block sizes(16, 32, 64, 128) combined with GQA group sizes up to 16.
 """
 
 
@@ -642,7 +642,7 @@ class HopperSelectAttentionFwd:
                 tiler=(self.tile_shape_mnk_PV[0], self.tile_shape_mnk_PV[1]),
                 coord=(0, 0),
             )
-            # (M, ) where M=64, block_size=128 not supported yet
+            # (M, )
 
             min_row = int(min(self.tile_shape_mnk_QK[0], self.GQA_group_size))
             gL = cute.local_tile(
