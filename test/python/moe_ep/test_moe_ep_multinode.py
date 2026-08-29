@@ -249,6 +249,12 @@ def test_mxfp8_forward_multinode_matches_reference(
             "bf16",
             id="backward-ep32-world32-bf16-minimal",
         ),
+        pytest.param(
+            32,
+            32,
+            "mxfp8",
+            id="backward-ep32-world32-mxfp8",
+        ),
     ],
 )
 def test_fixed_training_resources_multinode_match_independent_reference(

@@ -24,9 +24,11 @@ from moe_ep.moe_ep_reference import (
 )
 
 __all__ = [
+    "_allocate_dense_grouped_wgrad_outputs",
     "_assert_backward_matches",
     "_assert_fixed_training_drop_overflow_result",
     "_assert_fixed_training_matches_reference",
+    "_assert_grouped_wgrads_match_reference",
     "_assert_matches_reference",
     "_assert_training_graph_tails_are_reset",
     "_assert_training_weight_sources_changed",
@@ -34,6 +36,7 @@ __all__ = [
     "_capture_fixed_training_batch",
     "_copy_training_weight_sources_",
     "_dense_wgrads_from_operands",
+    "_dense_wgrads_from_grouped_kernel",
     "_expected_backward",
     "_fixed_training_case",
     "_fixed_training_drop_overflow_case",
@@ -51,6 +54,7 @@ __all__ = [
     "_replay_cuda_graph",
     "_require_distributed_sm107",
     "_run_fixed_training_batch",
+    "_run_grouped_wgrad_kernel",
     "_sm107_device",
     "_stress_backend_reuse",
     "_training_public_pointers",
@@ -70,6 +74,32 @@ __all__ = [
     "make_forward_inputs",
     "quantize_mxfp8",
 ]
+
+
+def _allocate_dense_grouped_wgrad_outputs(
+    operands,
+    *,
+    fill_value=None,
+):
+    """Allocate fixed-address dense BF16 outputs for FC1 and FC2 WGrad."""
+
+    expert_count = operands.expert_offsets.numel()
+    outputs = tuple(
+        torch.empty(
+            (
+                expert_count,
+                getattr(operands, f"{prefix}_a").shape[0],
+                getattr(operands, f"{prefix}_b").shape[1],
+            ),
+            dtype=torch.bfloat16,
+            device=operands.expert_offsets.device,
+        )
+        for prefix in ("fc1", "fc2")
+    )
+    if fill_value is not None:
+        for output in outputs:
+            output.fill_(fill_value)
+    return outputs
 
 
 # Data
@@ -825,6 +855,7 @@ _BACKWARD_CLOSE_KWARGS = (
     {"rtol": 0.15, "atol": 0.125},  # router-weight gradient.
 )
 _WGRAD_CLOSE_KWARGS = {"rtol": 0.2, "atol": 0.25}
+_GROUPED_WGRAD_CLOSE_KWARGS = {"rtol": 0.1, "atol": 0.1}
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -968,6 +999,108 @@ def _dense_wgrads_from_operands(operands):
         fc2_parts.append(fc2_a[:, previous:valid_end] @ fc2_b[previous:valid_end, :])
         previous = end
     return torch.stack(fc1_parts), torch.stack(fc2_parts)
+
+
+def _run_grouped_wgrad_kernel(
+    operands,
+    prefix: str,
+    *,
+    wgrad_tensor=None,
+    accumulate_on_output: bool = False,
+    current_stream=None,
+):
+    """Run one fixed-capacity operand bundle through production WGrad."""
+
+    import cudnn
+
+    if prefix not in ("fc1", "fc2"):
+        raise ValueError(f"prefix must be 'fc1' or 'fc2', got {prefix!r}")
+    # Graph callers provide one persistent output per training slot. This is
+    # currently also the isolation key for a temporary production-WGrad
+    # workaround: an EP2 graph with two same-signature calls produced correct
+    # operands but corrupted the second WGrad when both calls shared the
+    # cached API object's mutable TMA descriptor workspace. Distinct fixed
+    # outputs make the calls use distinct workspaces. The production fix
+    # should instead share the compiled kernel while owning descriptor
+    # workspace per graph call site, after which output identity must no
+    # longer participate in the compile cache key.
+    return cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=getattr(operands, f"{prefix}_a"),
+        b_tensor=getattr(operands, f"{prefix}_b"),
+        sfa_tensor=getattr(operands, f"{prefix}_sfa"),
+        sfb_tensor=getattr(operands, f"{prefix}_sfb"),
+        offsets_tensor=operands.expert_offsets,
+        output_mode="dense",
+        wgrad_tensor=wgrad_tensor,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        accumulate_on_output=accumulate_on_output,
+        input_order="tensor2d",
+        current_stream=current_stream,
+    )["wgrad_tensor"]
+
+
+def _dense_wgrads_from_grouped_kernel(
+    operands,
+    *,
+    wgrad_tensors=None,
+    accumulate_on_output: bool = False,
+    current_stream=None,
+):
+    """Run both fixed-capacity operand bundles through production WGrad."""
+
+    if wgrad_tensors is None:
+        wgrad_tensors = (None, None)
+    if len(wgrad_tensors) != 2:
+        raise ValueError("wgrad_tensors must contain FC1 and FC2 outputs")
+    return tuple(
+        _run_grouped_wgrad_kernel(
+            operands,
+            prefix,
+            wgrad_tensor=output,
+            accumulate_on_output=accumulate_on_output,
+            current_stream=current_stream,
+        )
+        for prefix, output in zip(("fc1", "fc2"), wgrad_tensors)
+    )
+
+
+def _assert_grouped_wgrads_match_reference(
+    actual,
+    expected,
+    *,
+    reference_name: str,
+    close_kwargs=None,
+) -> None:
+    """Compare grouped-kernel FC1/FC2 outputs and report useful error maxima."""
+
+    if close_kwargs is None:
+        close_kwargs = _GROUPED_WGRAD_CLOSE_KWARGS
+    for name, actual_dw, expected_dw in zip(
+        ("grad_fc1_weight", "grad_fc2_weight"),
+        actual,
+        expected,
+    ):
+        actual_fp32 = actual_dw.float()
+        expected_fp32 = expected_dw.float()
+        absolute_error = (actual_fp32 - expected_fp32).abs()
+        max_absolute_error = absolute_error.max().item()
+        max_relative_error = (
+            (absolute_error / expected_fp32.abs().clamp_min(1.0e-6)).max().item()
+        )
+        torch.testing.assert_close(
+            actual_fp32,
+            expected_fp32,
+            msg=lambda default, name=name: (
+                f"{name} does not match {reference_name}; "
+                f"max_abs_error={max_absolute_error:.6g}, "
+                f"max_rel_error={max_relative_error:.6g}\n{default}"
+            ),
+            **close_kwargs,
+        )
 
 
 def _reference_backward(config) -> MoeEpReference:
@@ -1212,16 +1345,37 @@ def _run_fixed_training_batch(resources, lane, cases):
     )
 
 
-def _capture_fixed_training_batch(resources, lane, cases, capture_stream):
+def _capture_fixed_training_batch(
+    resources,
+    lane,
+    cases,
+    capture_stream,
+    *,
+    grouped_wgrad_outputs=None,
+):
     """Capture the shared fixed-training sequence for one or more slots."""
 
+    if grouped_wgrad_outputs is not None and len(grouped_wgrad_outputs) != len(cases):
+        raise ValueError("grouped_wgrad_outputs must match the captured case count")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         actuals = _run_fixed_training_batch(resources, lane, cases)
+        grouped_wgrads = (
+            None
+            if grouped_wgrad_outputs is None
+            else tuple(
+                _dense_wgrads_from_grouped_kernel(
+                    actual.wgrads,
+                    wgrad_tensors=outputs,
+                )
+                for actual, outputs in zip(actuals, grouped_wgrad_outputs)
+            )
+        )
     capture_stream.synchronize()
     return SimpleNamespace(
         graph=graph,
         actuals=actuals,
+        grouped_wgrads=grouped_wgrads,
         public_pointers=tuple(_training_public_pointers(actual) for actual in actuals),
     )
 

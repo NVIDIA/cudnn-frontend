@@ -58,12 +58,15 @@ from moe_ep.moe_ep_distributed_workers import (
     _distributed_subgroup_backward_reference_worker,
 )
 from moe_ep.moe_ep_test_support import (
+    _allocate_dense_grouped_wgrad_outputs,
     _assert_fixed_training_drop_overflow_result,
     _assert_fixed_training_matches_reference,
+    _assert_grouped_wgrads_match_reference,
     _assert_training_graph_tails_are_reset,
     _assert_training_weight_sources_changed,
     _capture_fixed_training_batch,
     _copy_training_weight_sources_,
+    _dense_wgrads_from_grouped_kernel,
     _dense_wgrads_from_operands,
     _fixed_training_case,
     _fixed_training_drop_overflow_case,
@@ -992,6 +995,186 @@ def test_fixed_training_resources_ep1_matches_independent_reference(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
+def test_fixed_training_resources_ep1_grouped_wgrad_matches_independent_reference():
+    device = _sm107_device()
+    base_args = make_forward_inputs(device)
+    args = (
+        base_args[0].dequantize(torch.bfloat16),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float(),
+    )
+    grad_output = _grad_output(device, args[0].shape[0], seed=20260831)
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+    )
+
+    with MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=args[0].shape[0],
+        max_recv_size_per_rank=args[0].shape[0] * args[3].shape[1],
+        drop_on_overflow=True,
+        combine_format="bf16",
+    ) as op:
+        resources = op.prepare_training_resources(
+            _fixed_training_weights(args),
+            slot_count=1,
+            lane_count=1,
+        )
+        actual = _run_fixed_training_batch(
+            resources,
+            resources.lanes[0],
+            ((resources.slots[0], args, grad_output),),
+        )[0]
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual.wgrads)
+        torch.cuda.synchronize(device)
+
+        assert actual.overflow.eq(0).all()
+        _assert_fixed_training_matches_reference(
+            (actual.y, actual.dx, actual.dprob, actual.wgrads),
+            expected,
+            args[3],
+        )
+        torch.testing.assert_close(
+            actual.wgrads.valid_route_counts,
+            expected[3].valid_route_counts,
+            rtol=0,
+            atol=0,
+        )
+        assert actual.wgrads.valid_route_counts.gt(0).all()
+        expected_offsets = torch.cumsum(
+            torch.div(
+                actual.wgrads.valid_route_counts + 127,
+                128,
+                rounding_mode="floor",
+            )
+            * 128,
+            dim=0,
+            dtype=actual.wgrads.expert_offsets.dtype,
+        )
+        torch.testing.assert_close(
+            actual.wgrads.expert_offsets,
+            expected_offsets,
+            rtol=0,
+            atol=0,
+        )
+
+        expected_wgrads = expected[3].dense_wgrads()
+        _assert_grouped_wgrads_match_reference(
+            grouped_wgrads,
+            expected_wgrads,
+            reference_name="the independent PyTorch MXFP8 reference",
+        )
+        _assert_grouped_wgrads_match_reference(
+            grouped_wgrads,
+            _dense_wgrads_from_operands(actual.wgrads),
+            reference_name="the decoded production operand bundle",
+            close_kwargs={"rtol": 0.1, "atol": 0.1},
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+def test_fixed_training_resources_ep1_grouped_wgrad_accumulates_two_microbatches():
+    device = _sm107_device()
+    base_args = make_forward_inputs(device)
+    args0 = (
+        base_args[0].dequantize(torch.bfloat16),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float(),
+    )
+    args1 = (
+        args0[0].mul(-0.5),
+        args0[1],
+        args0[2],
+        args0[3].roll(1, dims=0),
+        args0[4].roll(1, dims=0),
+    )
+    grad_outputs = (
+        _grad_output(device, args0[0].shape[0], seed=20260902),
+        _grad_output(device, args1[0].shape[0], seed=20260903),
+    )
+    references = tuple(
+        _fixed_training_reference(
+            args,
+            grad_output,
+            combine_format="bf16",
+            gate_up_clamp=None,
+        )
+        for args, grad_output in zip((args0, args1), grad_outputs)
+    )
+
+    with MoeEp(
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size=256,
+        top_k=2,
+        max_tokens_per_rank=args0[0].shape[0],
+        max_recv_size_per_rank=args0[0].shape[0] * args0[3].shape[1],
+        drop_on_overflow=True,
+        combine_format="bf16",
+    ) as op:
+        resources = op.prepare_training_resources(
+            _fixed_training_weights(args0),
+            slot_count=2,
+            lane_count=1,
+        )
+        batch = tuple(
+            (slot, args, grad_output)
+            for slot, args, grad_output in zip(
+                resources.slots,
+                (args0, args1),
+                grad_outputs,
+            )
+        )
+        actuals = _run_fixed_training_batch(resources, resources.lanes[0], batch)
+        accumulated = _allocate_dense_grouped_wgrad_outputs(
+            actuals[0].wgrads,
+            fill_value=0,
+        )
+        output_pointers = tuple(output.data_ptr() for output in accumulated)
+        for actual in actuals:
+            returned = _dense_wgrads_from_grouped_kernel(
+                actual.wgrads,
+                wgrad_tensors=accumulated,
+                accumulate_on_output=True,
+            )
+            assert tuple(output.data_ptr() for output in returned) == output_pointers
+        torch.cuda.synchronize(device)
+
+        for actual, args, reference in zip(actuals, (args0, args1), references):
+            assert actual.overflow.eq(0).all()
+            _assert_fixed_training_matches_reference(
+                (actual.y, actual.dx, actual.dprob, actual.wgrads),
+                reference,
+                args[3],
+            )
+        expected_accumulated = tuple(
+            reference0.float() + reference1.float()
+            for reference0, reference1 in zip(
+                references[0][3].dense_wgrads(),
+                references[1][3].dense_wgrads(),
+            )
+        )
+        _assert_grouped_wgrads_match_reference(
+            accumulated,
+            expected_accumulated,
+            reference_name="the sum of two independent PyTorch MXFP8 references",
+            close_kwargs={"rtol": 0.2, "atol": 0.25},
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
 @pytest.mark.parametrize(
     ("world_size", "combine_format", "gate_up_clamp"),
     [
@@ -1437,8 +1620,13 @@ def test_fixed_training_resources_ep1_drop_overflow_boundary_and_graph_transitio
         batch = ((slot, args, grad_output),)
 
         # Compile the fixed T=1 specialization and validate overflow eagerly
-        # before capturing the same forward/backward/finalize sequence.
+        # before capturing the same forward/backward/finalize/WGrad sequence.
         warmup = _run_fixed_training_batch(resources, lane, batch)[0]
+        grouped_outputs = _allocate_dense_grouped_wgrad_outputs(warmup.wgrads)
+        _dense_wgrads_from_grouped_kernel(
+            warmup.wgrads,
+            wgrad_tensors=grouped_outputs,
+        )
         torch.cuda.synchronize(device)
         assert_result(warmup, 1)
 
@@ -1449,8 +1637,11 @@ def test_fixed_training_resources_ep1_drop_overflow_boundary_and_graph_transitio
             lane,
             batch,
             capture_stream,
+            grouped_wgrad_outputs=(grouped_outputs,),
         )
         graph_actual = captured.actuals[0]
+        graph_grouped_wgrads = captured.grouped_wgrads[0]
+        grouped_output_pointers = tuple(output.data_ptr() for output in grouped_outputs)
 
         for routing, expected_overflow in (
             (overflow_routing, 1),
@@ -1458,6 +1649,8 @@ def test_fixed_training_resources_ep1_drop_overflow_boundary_and_graph_transitio
             (overflow_routing, 1),
         ):
             args[3].copy_(routing)
+            for output in grouped_outputs:
+                output.fill_(float("nan"))
             assert args[3].data_ptr() == routing_pointer
             expected = _fixed_training_drop_overflow_reference(
                 args,
@@ -1471,4 +1664,23 @@ def test_fixed_training_resources_ep1_drop_overflow_boundary_and_graph_transitio
                 *expected,
                 expected_overflow=expected_overflow,
             )
+            assert (
+                tuple(output.data_ptr() for output in graph_grouped_wgrads)
+                == grouped_output_pointers
+            )
+            _assert_grouped_wgrads_match_reference(
+                graph_grouped_wgrads,
+                expected[0][3].dense_wgrads(),
+                reference_name="the independent PyTorch MXFP8 graph reference",
+            )
+            _assert_grouped_wgrads_match_reference(
+                graph_grouped_wgrads,
+                _dense_wgrads_from_operands(graph_actual.wgrads),
+                reference_name="the decoded captured production operand bundle",
+                close_kwargs={"rtol": 0.1, "atol": 0.1},
+            )
+            assert all(torch.isfinite(output).all() for output in graph_grouped_wgrads)
+            if expected_overflow:
+                assert graph_grouped_wgrads[0][1].eq(0).all()
+                assert graph_grouped_wgrads[1][1].eq(0).all()
             assert captured.public_pointers[0] == _training_public_pointers(graph_actual)

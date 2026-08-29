@@ -12,8 +12,11 @@ import torch.distributed as dist
 
 from moe_ep.moe_ep_test_support import (
     _assert_backward_matches,
+    _assert_grouped_wgrads_match_reference,
     _assert_matches_reference,
     _assert_wgrads_match_reference,
+    _dense_wgrads_from_grouped_kernel,
+    _dense_wgrads_from_operands,
     _fixed_training_reference,
     _fixed_training_weights,
     _forward_config,
@@ -296,6 +299,7 @@ def _run_backward_reference_case(
             grad_output,
         )
         overflow = resources.finalize_overflow((slot,), lane)
+        grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
         torch.cuda.synchronize(device)
 
         # No rank may enter a local assertion while a peer is still inside a
@@ -324,6 +328,35 @@ def _run_backward_reference_case(
                 expected_wgrads,
                 expected_dense=expected_dense_wgrads,
             )
+            expected_offsets = torch.cumsum(
+                torch.div(
+                    actual_wgrads.valid_route_counts + 127,
+                    128,
+                    rounding_mode="floor",
+                )
+                * 128,
+                dim=0,
+                dtype=actual_wgrads.expert_offsets.dtype,
+            )
+            torch.testing.assert_close(
+                actual_wgrads.expert_offsets,
+                expected_offsets,
+                rtol=0,
+                atol=0,
+            )
+            _assert_grouped_wgrads_match_reference(
+                grouped_wgrads,
+                expected_dense_wgrads,
+                reference_name="the independent PyTorch MXFP8 reference",
+            )
+            _assert_grouped_wgrads_match_reference(
+                grouped_wgrads,
+                _dense_wgrads_from_operands(actual_wgrads),
+                reference_name="the decoded production operand bundle",
+                close_kwargs={"rtol": 0.1, "atol": 0.1},
+            )
+            assert grouped_wgrads[0][1].eq(0).all()
+            assert grouped_wgrads[1][1].eq(0).all()
         except BaseException as error:
             assertion_error = error
         dist.barrier(group=ep_group)

@@ -16,7 +16,7 @@ reuse the same probe beyond EP2.
 
 The probe exercises only the public fixed-resource ordinary/capture path,
 including fixed-address staging/reset operations, forward/backward CuTeDSL
-callables, and a one-scalar NCCL overflow OR.
+callables, FC1/FC2 production grouped WGrad, and a one-scalar NCCL overflow OR.
 """
 
 from __future__ import annotations
@@ -39,6 +39,11 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._adapter import (
 from cudnn.moe_ep._megamoe_backend._runtime import (
     _RuntimeWatchdog,
     get_runtime_manager,
+)
+from moe_ep.moe_ep_test_support import (
+    _allocate_dense_grouped_wgrad_outputs,
+    _dense_wgrads_from_grouped_kernel,
+    _dense_wgrads_from_operands,
 )
 
 
@@ -104,6 +109,15 @@ def _parse_args() -> argparse.Namespace:
         help="skip the two-lane ordered cross-stream resource probe",
     )
     parser.add_argument(
+        "--wgrad-capture-mode",
+        choices=("both", "slot0", "slot1"),
+        default="both",
+        help=(
+            "capture both grouped-WGrad calls, or isolate exactly one slot to "
+            "diagnose same-signature graph reuse"
+        ),
+    )
+    parser.add_argument(
         "--expect-overflow-assert",
         action="store_true",
         help=("run only the fatal drop_on_overflow=False graph assertion probe; " "success requires every rank to observe the expected CUDA error"),
@@ -133,15 +147,126 @@ def _assert_replay_tensor(
     }
     if actual.dtype in low_precision:
         if not torch.equal(actual, expected):
+            _report_tensor_difference(name, actual, expected)
             raise AssertionError(f"{name} is not bitwise equal after graph replay")
         return
-    torch.testing.assert_close(
-        actual,
-        expected,
-        rtol=1e-5,
-        atol=1e-6,
-        msg=f"{name} differs after graph replay",
+    try:
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+            msg=f"{name} differs after graph replay",
+        )
+    except AssertionError:
+        _report_tensor_difference(name, actual, expected)
+        raise
+
+
+def _report_tensor_difference(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    """Print actionable mismatch statistics without changing pass criteria."""
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        print(
+            "MOE_EP_GRAPH_TENSOR_DIAGNOSTIC "
+            f"rank={rank} name={name} "
+            f"actual_shape={tuple(actual.shape)} expected_shape={tuple(expected.shape)} "
+            f"actual_dtype={actual.dtype} expected_dtype={expected.dtype}",
+            flush=True,
+        )
+        return
+
+    actual_fp32 = actual.float()
+    expected_fp32 = expected.float()
+    finite = torch.isfinite(actual_fp32) & torch.isfinite(expected_fp32)
+    absolute_error = (actual_fp32 - expected_fp32).abs()
+    relative_error = absolute_error / expected_fp32.abs().clamp_min(1.0e-6)
+    finite_absolute = absolute_error.masked_select(finite)
+    finite_relative = relative_error.masked_select(finite)
+    max_absolute = (
+        float(finite_absolute.max().item()) if finite_absolute.numel() else float("nan")
     )
+    max_relative = (
+        float(finite_relative.max().item()) if finite_relative.numel() else float("nan")
+    )
+    exact_mismatch = actual.view(torch.uint8).ne(expected.view(torch.uint8))
+    close_mismatch = ~torch.isclose(
+        actual_fp32,
+        expected_fp32,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+        equal_nan=True,
+    )
+    logical_mismatch = actual.ne(expected)
+    first_indices = logical_mismatch.nonzero()
+    first_description = "none"
+    if first_indices.numel():
+        first_index = tuple(int(value) for value in first_indices[0].tolist())
+        first_description = (
+            f"index={first_index},actual={float(actual[first_index].float().item()):.9g},"
+            f"expected={float(expected[first_index].float().item()):.9g}"
+        )
+
+    print(
+        "MOE_EP_GRAPH_TENSOR_DIAGNOSTIC "
+        f"rank={rank} name={name} dtype={actual.dtype} shape={tuple(actual.shape)} "
+        f"byte_mismatches={int(exact_mismatch.sum().item())} "
+        f"logical_mismatches={int(logical_mismatch.sum().item())} "
+        f"close_mismatches={int(close_mismatch.sum().item())} "
+        f"max_abs={max_absolute:.9g} max_rel={max_relative:.9g} "
+        f"actual_nonfinite={int((~torch.isfinite(actual_fp32)).sum().item())} "
+        f"expected_nonfinite={int((~torch.isfinite(expected_fp32)).sum().item())} "
+        f"first_mismatch={first_description}",
+        flush=True,
+    )
+    if actual.ndim == 3:
+        expert_dims = (1, 2)
+        expert_max_absolute = absolute_error.amax(dim=expert_dims)
+        expert_max_relative = relative_error.amax(dim=expert_dims)
+        expert_close_mismatches = close_mismatch.sum(dim=expert_dims)
+        print(
+            "MOE_EP_GRAPH_EXPERT_DIAGNOSTIC "
+            f"rank={rank} name={name} "
+            f"max_abs={expert_max_absolute.detach().cpu().tolist()} "
+            f"max_rel={expert_max_relative.detach().cpu().tolist()} "
+            f"close_mismatches={expert_close_mismatches.detach().cpu().tolist()}",
+            flush=True,
+        )
+
+
+def _report_grouped_wgrad_operand_consistency(
+    slot_name: str,
+    operands,
+    grouped_wgrads,
+) -> None:
+    """Report whether replayed WGrad agrees with its replayed operand bundle."""
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    try:
+        decoded = _dense_wgrads_from_operands(operands)
+    except BaseException as error:
+        print(
+            "MOE_EP_GRAPH_OPERAND_DECODE_ERROR "
+            f"rank={rank} slot={slot_name} "
+            f"error={type(error).__name__}:{error}",
+            flush=True,
+        )
+        return
+    for prefix, actual, expected in zip(
+        ("fc1", "fc2"),
+        grouped_wgrads,
+        decoded,
+    ):
+        _report_tensor_difference(
+            f"{slot_name}.{prefix}_wgrad_vs_decoded_operands",
+            actual,
+            expected.to(actual.dtype),
+        )
 
 
 def _make_inputs(
@@ -335,6 +460,204 @@ def _close_probe_operator(
     dist.barrier(group=group)
 
 
+def _run_single_wgrad_slot_capture_probe(
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    group,
+    max_recv_size_per_rank: int,
+    slot_index: int,
+) -> None:
+    """Capture the full training chain with one grouped-WGrad invocation."""
+
+    args0, grad0, args1, grad1, _, _ = _make_two_slot_inputs(
+        rank,
+        world_size,
+        device,
+    )
+    op = _make_operator(
+        world_size=world_size,
+        group=group,
+        max_recv_size_per_rank=max_recv_size_per_rank,
+        drop_on_overflow=True,
+    )
+    graph = None
+    try:
+        resources = op.prepare_training_resources(
+            _make_training_weights(args0),
+            slot_count=2,
+            lane_count=1,
+        )
+        slot0, slot1 = resources.slots
+        lane = resources.lanes[0]
+
+        resources.refresh_weights()
+        eager_y0 = resources.forward(slot0, lane, args0[0], args0[3], args0[4])
+        eager_y1 = resources.forward(slot1, lane, args1[0], args1[3], args1[4])
+        eager_dx0, eager_dp0, eager_operands0 = resources.backward(
+            slot0,
+            lane,
+            grad0,
+        )
+        eager_dx1, eager_dp1, eager_operands1 = resources.backward(
+            slot1,
+            lane,
+            grad1,
+        )
+        eager_operands = (eager_operands0, eager_operands1)
+        grouped_outputs = tuple(
+            _allocate_dense_grouped_wgrad_outputs(operands)
+            for operands in eager_operands
+        )
+        eager_grouped_wgrads = tuple(
+            _dense_wgrads_from_grouped_kernel(
+                operands,
+                wgrad_tensors=outputs,
+            )
+            for operands, outputs in zip(eager_operands, grouped_outputs)
+        )
+        eager_overflow = resources.finalize_overflow((slot0, slot1), lane)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+        if int(eager_overflow.item()) != 0:
+            raise AssertionError("single-slot WGrad eager warmup overflowed")
+
+        operand_fields = (
+            "expert_offsets",
+            "valid_route_counts",
+            "fc1_a",
+            "fc1_sfa",
+            "fc1_b",
+            "fc1_sfb",
+            "fc2_a",
+            "fc2_sfa",
+            "fc2_b",
+            "fc2_sfb",
+        )
+        eager_common = tuple(
+            tensor.clone()
+            for tensor in (
+                eager_y0,
+                eager_y1,
+                eager_dx0,
+                eager_dx1,
+                eager_dp0,
+                eager_dp1,
+            )
+        )
+        eager_operand_snapshot = {
+            field: getattr(eager_operands[slot_index], field).clone()
+            for field in operand_fields
+        }
+        eager_wgrad_snapshot = tuple(
+            tensor.clone() for tensor in eager_grouped_wgrads[slot_index]
+        )
+        selected_outputs = grouped_outputs[slot_index]
+        selected_output_pointers = tuple(
+            output.data_ptr() for output in selected_outputs
+        )
+
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            resources.refresh_weights()
+            graph_y0 = resources.forward(
+                slot0,
+                lane,
+                args0[0],
+                args0[3],
+                args0[4],
+            )
+            graph_y1 = resources.forward(
+                slot1,
+                lane,
+                args1[0],
+                args1[3],
+                args1[4],
+            )
+            graph_dx0, graph_dp0, graph_operands0 = resources.backward(
+                slot0,
+                lane,
+                grad0,
+            )
+            graph_dx1, graph_dp1, graph_operands1 = resources.backward(
+                slot1,
+                lane,
+                grad1,
+            )
+            graph_operands = (graph_operands0, graph_operands1)[slot_index]
+            graph_grouped_wgrads = _dense_wgrads_from_grouped_kernel(
+                graph_operands,
+                wgrad_tensors=selected_outputs,
+            )
+            graph_overflow = resources.finalize_overflow((slot0, slot1), lane)
+        dist.barrier(group=group)
+
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        dist.barrier(group=group)
+        if int(graph_overflow.item()) != 0:
+            raise AssertionError("single-slot WGrad graph replay overflowed")
+        if (
+            tuple(output.data_ptr() for output in graph_grouped_wgrads)
+            != selected_output_pointers
+        ):
+            raise AssertionError("single-slot grouped WGrad output addresses changed")
+
+        graph_common = (
+            graph_y0,
+            graph_y1,
+            graph_dx0,
+            graph_dx1,
+            graph_dp0,
+            graph_dp1,
+        )
+        for name, actual, expected in zip(
+            ("y0", "y1", "dx0", "dx1", "dprob0", "dprob1"),
+            graph_common,
+            eager_common,
+        ):
+            _assert_replay_tensor(name, actual, expected)
+        for field in operand_fields:
+            _assert_replay_tensor(
+                f"slot{slot_index}.{field}",
+                getattr(graph_operands, field),
+                eager_operand_snapshot[field],
+            )
+        try:
+            for prefix, actual, expected in zip(
+                ("fc1", "fc2"),
+                graph_grouped_wgrads,
+                eager_wgrad_snapshot,
+            ):
+                _assert_replay_tensor(
+                    f"slot{slot_index}.{prefix}_wgrad",
+                    actual,
+                    expected,
+                )
+        except BaseException:
+            _report_grouped_wgrad_operand_consistency(
+                f"slot{slot_index}",
+                graph_operands,
+                graph_grouped_wgrads,
+            )
+            raise
+
+        if rank == 0:
+            print(
+                f"MOE_EP_EP{world_size}_SINGLE_WGRAD_SLOT_GRAPH_PASS "
+                f"slot=slot{slot_index}",
+                flush=True,
+            )
+    finally:
+        if graph is not None:
+            del graph
+        _close_probe_operator(device=device, group=group, op=op)
+
+
 def _run_training_resource_probe(
     *,
     rank: int,
@@ -391,6 +714,19 @@ def _run_training_resource_probe(
         )
         dx0, dp0, operands0 = resources.backward(slot0, lane0, grad0)
         dx1, dp1, operands1 = resources.backward(slot1, lane0, grad1)
+        grouped_outputs0 = _allocate_dense_grouped_wgrad_outputs(operands0)
+        grouped_outputs1 = _allocate_dense_grouped_wgrad_outputs(operands1)
+        grouped_output_pointers = tuple(
+            output.data_ptr() for output in (*grouped_outputs0, *grouped_outputs1)
+        )
+        grouped_wgrads0 = _dense_wgrads_from_grouped_kernel(
+            operands0,
+            wgrad_tensors=grouped_outputs0,
+        )
+        grouped_wgrads1 = _dense_wgrads_from_grouped_kernel(
+            operands1,
+            wgrad_tensors=grouped_outputs1,
+        )
         overflow_status = resources.finalize_overflow((slot0, slot1))
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
@@ -404,14 +740,30 @@ def _run_training_resource_probe(
             "dx1",
             "dprob0",
             "dprob1",
+            "slot0.expert_offsets",
+            "slot0.valid_route_counts",
             "slot0.fc1_a",
+            "slot0.fc1_sfa",
             "slot0.fc1_b",
+            "slot0.fc1_sfb",
             "slot0.fc2_a",
+            "slot0.fc2_sfa",
             "slot0.fc2_b",
+            "slot0.fc2_sfb",
+            "slot1.expert_offsets",
+            "slot1.valid_route_counts",
             "slot1.fc1_a",
+            "slot1.fc1_sfa",
             "slot1.fc1_b",
+            "slot1.fc1_sfb",
             "slot1.fc2_a",
+            "slot1.fc2_sfa",
             "slot1.fc2_b",
+            "slot1.fc2_sfb",
+            "slot0.fc1_wgrad",
+            "slot0.fc2_wgrad",
+            "slot1.fc1_wgrad",
+            "slot1.fc2_wgrad",
         )
         ordinary = {
             name: tensor.clone()
@@ -424,20 +776,40 @@ def _run_training_resource_probe(
                     dx1,
                     dp0,
                     dp1,
+                    operands0.expert_offsets,
+                    operands0.valid_route_counts,
                     operands0.fc1_a,
+                    operands0.fc1_sfa,
                     operands0.fc1_b,
+                    operands0.fc1_sfb,
                     operands0.fc2_a,
+                    operands0.fc2_sfa,
                     operands0.fc2_b,
+                    operands0.fc2_sfb,
+                    operands1.expert_offsets,
+                    operands1.valid_route_counts,
                     operands1.fc1_a,
+                    operands1.fc1_sfa,
                     operands1.fc1_b,
+                    operands1.fc1_sfb,
                     operands1.fc2_a,
+                    operands1.fc2_sfa,
                     operands1.fc2_b,
+                    operands1.fc2_sfb,
+                    grouped_wgrads0[0],
+                    grouped_wgrads0[1],
+                    grouped_wgrads1[0],
+                    grouped_wgrads1[1],
                 ),
             )
         }
         ordinary_offsets = (
             operands0.expert_offsets.clone(),
             operands1.expert_offsets.clone(),
+        )
+        ordinary_route_counts = (
+            operands0.valid_route_counts.clone(),
+            operands1.valid_route_counts.clone(),
         )
 
         stream = torch.cuda.Stream(device=device)
@@ -469,6 +841,14 @@ def _run_training_resource_probe(
                 lane0,
                 grad1,
             )
+            graph_grouped_wgrads0 = _dense_wgrads_from_grouped_kernel(
+                graph_operands0,
+                wgrad_tensors=grouped_outputs0,
+            )
+            graph_grouped_wgrads1 = _dense_wgrads_from_grouped_kernel(
+                graph_operands1,
+                wgrad_tensors=grouped_outputs1,
+            )
             graph_overflow = resources.finalize_overflow((slot0, slot1))
         dist.barrier(group=group)
 
@@ -490,19 +870,59 @@ def _run_training_resource_probe(
                     graph_dx1,
                     graph_dp0,
                     graph_dp1,
+                    graph_operands0.expert_offsets,
+                    graph_operands0.valid_route_counts,
                     graph_operands0.fc1_a,
+                    graph_operands0.fc1_sfa,
                     graph_operands0.fc1_b,
+                    graph_operands0.fc1_sfb,
                     graph_operands0.fc2_a,
+                    graph_operands0.fc2_sfa,
                     graph_operands0.fc2_b,
+                    graph_operands0.fc2_sfb,
+                    graph_operands1.expert_offsets,
+                    graph_operands1.valid_route_counts,
                     graph_operands1.fc1_a,
+                    graph_operands1.fc1_sfa,
                     graph_operands1.fc1_b,
+                    graph_operands1.fc1_sfb,
                     graph_operands1.fc2_a,
+                    graph_operands1.fc2_sfa,
                     graph_operands1.fc2_b,
+                    graph_operands1.fc2_sfb,
+                    graph_grouped_wgrads0[0],
+                    graph_grouped_wgrads0[1],
+                    graph_grouped_wgrads1[0],
+                    graph_grouped_wgrads1[1],
                 ),
             )
         }
-        for name in comparison_names:
-            _assert_replay_tensor(name, captured[name], ordinary[name])
+        if (
+            tuple(
+                output.data_ptr()
+                for output in (
+                    *graph_grouped_wgrads0,
+                    *graph_grouped_wgrads1,
+                )
+            )
+            != grouped_output_pointers
+        ):
+            raise AssertionError("captured grouped WGrad output addresses changed")
+        try:
+            for name in comparison_names:
+                _assert_replay_tensor(name, captured[name], ordinary[name])
+        except BaseException:
+            _report_grouped_wgrad_operand_consistency(
+                "slot0",
+                graph_operands0,
+                graph_grouped_wgrads0,
+            )
+            _report_grouped_wgrad_operand_consistency(
+                "slot1",
+                graph_operands1,
+                graph_grouped_wgrads1,
+            )
+            raise
         torch.testing.assert_close(
             graph_operands0.expert_offsets,
             ordinary_offsets[0],
@@ -512,6 +932,18 @@ def _run_training_resource_probe(
         torch.testing.assert_close(
             graph_operands1.expert_offsets,
             ordinary_offsets[1],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            graph_operands0.valid_route_counts,
+            ordinary_route_counts[0],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            graph_operands1.valid_route_counts,
+            ordinary_route_counts[1],
             rtol=0,
             atol=0,
         )
@@ -533,6 +965,28 @@ def _run_training_resource_probe(
                     rtol=1e-5,
                     atol=1e-6,
                 )
+                for name in (
+                    "slot0.fc1_wgrad",
+                    "slot0.fc2_wgrad",
+                    "slot1.fc1_wgrad",
+                    "slot1.fc2_wgrad",
+                ):
+                    _assert_replay_tensor(name, captured[name], ordinary[name])
+                for index, graph_operands in enumerate(
+                    (graph_operands0, graph_operands1)
+                ):
+                    torch.testing.assert_close(
+                        graph_operands.expert_offsets,
+                        ordinary_offsets[index],
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        graph_operands.valid_route_counts,
+                        ordinary_route_counts[index],
+                        rtol=0,
+                        atol=0,
+                    )
 
             # Production-like burst: no synchronization or host collective in
             # the loop. The graph contains the captured scalar overflow OR.
@@ -549,6 +1003,13 @@ def _run_training_resource_probe(
                 rtol=1e-5,
                 atol=1e-6,
             )
+            for name in (
+                "slot0.fc1_wgrad",
+                "slot0.fc2_wgrad",
+                "slot1.fc1_wgrad",
+                "slot1.fc2_wgrad",
+            ):
+                _assert_replay_tensor(name, captured[name], ordinary[name])
 
             # Overflow both slots, then restore their distinct valid patterns.
             overflow = _route_pattern("overflow", rank, world_size, device)
@@ -581,12 +1042,24 @@ def _run_training_resource_probe(
                     f"slot1_routing_restored="
                     f"{torch.equal(args1[3], remote[0])}"
                 )
+            for name in (
+                "slot0.fc1_wgrad",
+                "slot0.fc2_wgrad",
+                "slot1.fc1_wgrad",
+                "slot1.fc2_wgrad",
+            ):
+                _assert_replay_tensor(name, captured[name], ordinary[name])
 
         if rank == 0:
             mode = "full" if full_probe else "reinit"
             effective_burst = burst_replays if full_probe else 0
             print(
                 f"MOE_EP_EP{world_size}_TRAINING_RESOURCES_GRAPH_PASS " f"mode={mode} burst={effective_burst}",
+                flush=True,
+            )
+            print(
+                f"MOE_EP_EP{world_size}_GROUPED_WGRAD_GRAPH_PASS "
+                f"mode={mode} burst={effective_burst}",
                 flush=True,
             )
     finally:
@@ -633,10 +1106,15 @@ def _run_multistream_resource_probe(
         with _debug_phase_scope(rank, "multistream.lane0-forward"):
             eager_y0 = resources.forward(slot0, lane0, args0[0], args0[3], args0[4])
         with _debug_phase_scope(rank, "multistream.lane0-backward"):
-            eager_dx0, eager_dp0, _ = resources.backward(
+            eager_dx0, eager_dp0, eager_operands0 = resources.backward(
                 slot0,
                 lane0,
                 grad0,
+            )
+            grouped_outputs0 = _allocate_dense_grouped_wgrad_outputs(eager_operands0)
+            eager_grouped_wgrads0 = _dense_wgrads_from_grouped_kernel(
+                eager_operands0,
+                wgrad_tensors=grouped_outputs0,
             )
         with _debug_phase_scope(rank, "multistream.lane0-finalize"):
             resources.finalize_overflow((slot0,), lane0)
@@ -651,10 +1129,18 @@ def _run_multistream_resource_probe(
         with _debug_phase_scope(rank, "multistream.lane1-forward"):
             eager_y1 = resources.forward(slot1, lane1, args1[0], args1[3], args1[4])
         with _debug_phase_scope(rank, "multistream.lane1-backward"):
-            eager_dx1, eager_dp1, _ = resources.backward(
+            eager_dx1, eager_dp1, eager_operands1 = resources.backward(
                 slot1,
                 lane1,
                 grad1,
+            )
+            grouped_outputs1 = _allocate_dense_grouped_wgrad_outputs(eager_operands1)
+            eager_grouped_wgrads1 = _dense_wgrads_from_grouped_kernel(
+                eager_operands1,
+                wgrad_tensors=grouped_outputs1,
+            )
+            grouped_output_pointers = tuple(
+                output.data_ptr() for output in (*grouped_outputs0, *grouped_outputs1)
             )
         with _debug_phase_scope(rank, "multistream.lane1-finalize"):
             resources.finalize_overflow((slot1,), lane1)
@@ -674,6 +1160,10 @@ def _run_multistream_resource_probe(
                 eager_y1,
                 eager_dx1,
                 eager_dp1,
+                eager_grouped_wgrads0[0],
+                eager_grouped_wgrads0[1],
+                eager_grouped_wgrads1[0],
+                eager_grouped_wgrads1[1],
             )
         )
 
@@ -709,10 +1199,14 @@ def _run_multistream_resource_probe(
                             args0[3],
                             args0[4],
                         )
-                        graph_dx0, graph_dp0, _ = resources.backward(
+                        graph_dx0, graph_dp0, graph_operands0 = resources.backward(
                             slot0,
                             lane0,
                             grad0,
+                        )
+                        graph_grouped_wgrads0 = _dense_wgrads_from_grouped_kernel(
+                            graph_operands0,
+                            wgrad_tensors=grouped_outputs0,
                         )
                         done_event0.record(lane_stream0)
                     lane_stream1.wait_event(done_event0)
@@ -724,10 +1218,14 @@ def _run_multistream_resource_probe(
                             args1[3],
                             args1[4],
                         )
-                        graph_dx1, graph_dp1, _ = resources.backward(
+                        graph_dx1, graph_dp1, graph_operands1 = resources.backward(
                             slot1,
                             lane1,
                             grad1,
+                        )
+                        graph_grouped_wgrads1 = _dense_wgrads_from_grouped_kernel(
+                            graph_operands1,
+                            wgrad_tensors=grouped_outputs1,
                         )
                         done_event1.record(lane_stream1)
                     capture_stream.wait_event(done_event1)
@@ -766,7 +1264,22 @@ def _run_multistream_resource_probe(
             graph_y1,
             graph_dx1,
             graph_dp1,
+            graph_grouped_wgrads0[0],
+            graph_grouped_wgrads0[1],
+            graph_grouped_wgrads1[0],
+            graph_grouped_wgrads1[1],
         )
+        if (
+            tuple(
+                output.data_ptr()
+                for output in (
+                    *graph_grouped_wgrads0,
+                    *graph_grouped_wgrads1,
+                )
+            )
+            != grouped_output_pointers
+        ):
+            raise AssertionError("multistream grouped WGrad output addresses changed")
         for index, (value, reference) in enumerate(zip(actual, expected)):
             _assert_replay_tensor(
                 f"multistream[{index}]",
@@ -919,34 +1432,50 @@ def main() -> None:
                 max_recv_size_per_rank=args.max_recv_size_per_rank,
             )
             raise AssertionError("fatal overflow assertion probe returned")
-        for cycle in range(args.cycles):
+        if args.wgrad_capture_mode == "both":
+            for cycle in range(args.cycles):
+                with _debug_phase_scope(
+                    rank,
+                    f"training-resources-cycle-{cycle}",
+                ):
+                    _run_training_resource_probe(
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        group=dist.group.WORLD,
+                        diagnostic_replays=args.diagnostic_replays,
+                        burst_replays=args.burst_replays,
+                        max_recv_size_per_rank=args.max_recv_size_per_rank,
+                        full_probe=cycle == 0,
+                    )
+            if not args.skip_multistream:
+                with _debug_phase_scope(rank, "multistream"):
+                    _run_multistream_resource_probe(
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        group=dist.group.WORLD,
+                        replays=args.multistream_replays,
+                        max_recv_size_per_rank=args.max_recv_size_per_rank,
+                    )
+        else:
+            slot_index = int(args.wgrad_capture_mode[-1])
             with _debug_phase_scope(
                 rank,
-                f"training-resources-cycle-{cycle}",
+                f"single-wgrad-slot{slot_index}",
             ):
-                _run_training_resource_probe(
+                _run_single_wgrad_slot_capture_probe(
                     rank=rank,
                     world_size=world_size,
                     device=device,
                     group=dist.group.WORLD,
-                    diagnostic_replays=args.diagnostic_replays,
-                    burst_replays=args.burst_replays,
                     max_recv_size_per_rank=args.max_recv_size_per_rank,
-                    full_probe=cycle == 0,
-                )
-        if not args.skip_multistream:
-            with _debug_phase_scope(rank, "multistream"):
-                _run_multistream_resource_probe(
-                    rank=rank,
-                    world_size=world_size,
-                    device=device,
-                    group=dist.group.WORLD,
-                    replays=args.multistream_replays,
-                    max_recv_size_per_rank=args.max_recv_size_per_rank,
+                    slot_index=slot_index,
                 )
         if rank == 0:
             print(
-                f"MOE_EP_EP{world_size}_CUDA_GRAPH_PROBE_PASS",
+                f"MOE_EP_EP{world_size}_CUDA_GRAPH_PROBE_PASS "
+                f"wgrad_capture_mode={args.wgrad_capture_mode}",
                 flush=True,
             )
     finally:
