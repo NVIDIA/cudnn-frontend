@@ -90,7 +90,7 @@ class CausalConv1dUpdateSm100(APIBase):
     * ``weight``: contiguous ``[D, 4]`` BF16
     * ``state``: contiguous ``[S, D, 4]`` BF16, mutated in place
     * optional ``state_indices``: contiguous CUDA ``int32[N]``
-    * no bias; SiLU is always fused
+    * optional ``bias``: contiguous ``[D]`` BF16; SiLU is always fused
 
     Indexed slots must be in ``[0, S)`` and unique.  The kernel checks both
     properties on device and executes a PTX trap on violation, so invalid
@@ -105,6 +105,7 @@ class CausalConv1dUpdateSm100(APIBase):
         sample_state: Union[torch.Tensor, TensorDesc],
         sample_output: Union[torch.Tensor, TensorDesc],
         sample_state_indices: Optional[Union[torch.Tensor, TensorDesc]] = None,
+        sample_bias: Optional[Union[torch.Tensor, TensorDesc]] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -114,6 +115,7 @@ class CausalConv1dUpdateSm100(APIBase):
         self.state_desc = self._make_tensor_desc(sample_state, name="sample_state")
         self.output_desc = self._make_tensor_desc(sample_output, name="sample_output")
         self.state_indices_desc = self._make_tensor_desc(sample_state_indices, name="sample_state_indices")
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
 
         # TensorDesc deliberately does not retain sample tensors.  Preserve
         # only the pointer remainders needed to validate the assumed alignment
@@ -126,6 +128,7 @@ class CausalConv1dUpdateSm100(APIBase):
             ("State", sample_state, 16),
             ("Output", sample_output, 16),
             ("State indices", sample_state_indices, 4),
+            ("Bias", sample_bias, 16),
         ):
             data_ptr = getattr(sample, "data_ptr", None)
             if callable(data_ptr):
@@ -150,6 +153,8 @@ class CausalConv1dUpdateSm100(APIBase):
         self._require_rank(self.weight_desc, 2, "Weight")
         self._require_rank(self.state_desc, 3, "State")
         self._require_rank(self.output_desc, 2, "Output")
+        if self.bias_desc is not None:
+            self._require_rank(self.bias_desc, 1, "Bias")
         if self.state_indices_desc is not None:
             self._require_rank(self.state_indices_desc, 1, "State indices")
 
@@ -168,6 +173,8 @@ class CausalConv1dUpdateSm100(APIBase):
         self._check_tensor_shape(self.weight_desc, (n_channels, 4), "Weight")
         self._check_tensor_shape(self.state_desc, (n_slots, n_channels, 4), "State")
         self._check_tensor_shape(self.output_desc, (n_rows, n_channels), "Output")
+        if self.bias_desc is not None:
+            self._check_tensor_shape(self.bias_desc, (n_channels,), "Bias")
         if self.state_indices_desc is None:
             self._value_error_if(
                 n_slots < n_rows,
@@ -200,6 +207,13 @@ class CausalConv1dUpdateSm100(APIBase):
             name="Output",
             extra_error_msg="Output must be row-major contiguous",
         )
+        if self.bias_desc is not None:
+            self._check_tensor_stride(
+                self.bias_desc,
+                stride=(1,),
+                name="Bias",
+                extra_error_msg="Bias must be contiguous",
+            )
         if self.state_indices_desc is not None:
             self._check_tensor_stride(
                 self.state_indices_desc,
@@ -212,6 +226,8 @@ class CausalConv1dUpdateSm100(APIBase):
         self._check_dtype(self.weight_desc, dtype=torch.bfloat16, name="Weight")
         self._check_dtype(self.state_desc, dtype=torch.bfloat16, name="State")
         self._check_dtype(self.output_desc, dtype=torch.bfloat16, name="Output")
+        if self.bias_desc is not None:
+            self._check_dtype(self.bias_desc, dtype=torch.bfloat16, name="Bias")
         if self.state_indices_desc is not None:
             self._check_dtype(self.state_indices_desc, dtype=torch.int32, name="State indices")
 
@@ -228,6 +244,8 @@ class CausalConv1dUpdateSm100(APIBase):
             ("State", self.state_desc),
             ("Output", self.output_desc),
         ]
+        if self.bias_desc is not None:
+            descs.append(("Bias", self.bias_desc))
         if self.state_indices_desc is not None:
             descs.append(("State indices", self.state_indices_desc))
         for name, desc in descs:
@@ -259,6 +277,7 @@ class CausalConv1dUpdateSm100(APIBase):
 
         fake_x = self._make_fake_cute_tensor_from_desc(self.x_desc, assumed_align=16)
         fake_weight = self._make_fake_cute_tensor_from_desc(self.weight_desc, assumed_align=16)
+        fake_bias = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
         fake_state = self._make_fake_cute_tensor_from_desc(self.state_desc, assumed_align=16)
         fake_output = self._make_fake_cute_tensor_from_desc(self.output_desc, assumed_align=16)
         fake_state_indices = self._make_fake_cute_tensor_from_desc(self.state_indices_desc, assumed_align=4)
@@ -272,6 +291,7 @@ class CausalConv1dUpdateSm100(APIBase):
                 kernel,
                 fake_x,
                 fake_weight,
+                fake_bias,
                 fake_state,
                 fake_output,
                 fake_state_indices,
@@ -302,6 +322,7 @@ class CausalConv1dUpdateSm100(APIBase):
         output_tensor: torch.Tensor,
         state_indices_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._runtime_error_if(
             self._compiled_kernel is None,
@@ -312,6 +333,10 @@ class CausalConv1dUpdateSm100(APIBase):
         self._validate_runtime_tensor(weight_tensor, self.weight_desc, "Weight")
         self._validate_runtime_tensor(state_tensor, self.state_desc, "State")
         self._validate_runtime_tensor(output_tensor, self.output_desc, "Output")
+        if (bias_tensor is None) != (self.bias_desc is None):
+            raise ValueError("bias presence must match the compiled signature")
+        if bias_tensor is not None:
+            self._validate_runtime_tensor(bias_tensor, self.bias_desc, "Bias")
         if (state_indices_tensor is None) != (self.state_indices_desc is None):
             raise ValueError("state_indices presence must match the compiled signature")
         if state_indices_tensor is not None:
@@ -326,24 +351,38 @@ class CausalConv1dUpdateSm100(APIBase):
             ("Weight", weight_tensor),
             ("State", state_tensor),
             ("Output", output_tensor),
+            ("Bias", bias_tensor),
         ):
-            _require_storage_alignment(tensor, 16, name)
+            if tensor is not None:
+                _require_storage_alignment(tensor, 16, name)
         if state_indices_tensor is not None:
             _require_storage_alignment(state_indices_tensor, 4, "State indices")
 
-        if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x_tensor, weight_tensor, state_tensor, output_tensor)):
+        grad_tensors = (
+            x_tensor,
+            weight_tensor,
+            state_tensor,
+            output_tensor,
+            bias_tensor,
+        )
+        if torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in grad_tensors):
             raise RuntimeError("causal_conv1d_update is inference-only; call it under torch.no_grad()")
         for name, tensor in (
             ("X", x_tensor),
             ("Weight", weight_tensor),
             ("Output", output_tensor),
+            ("Bias", bias_tensor),
         ):
-            if _tensors_overlap(state_tensor, tensor):
+            if tensor is not None and _tensors_overlap(state_tensor, tensor):
                 raise ValueError(f"State must not overlap {name}")
         if state_indices_tensor is not None and _tensors_overlap(state_tensor, state_indices_tensor):
             raise ValueError("State must not overlap State indices")
-        for name, tensor in (("X", x_tensor), ("Weight", weight_tensor)):
-            if _tensors_overlap(output_tensor, tensor):
+        for name, tensor in (
+            ("X", x_tensor),
+            ("Weight", weight_tensor),
+            ("Bias", bias_tensor),
+        ):
+            if tensor is not None and _tensors_overlap(output_tensor, tensor):
                 raise ValueError(f"Output must not overlap {name}")
         if state_indices_tensor is not None and _tensors_overlap(output_tensor, state_indices_tensor):
             raise ValueError("Output must not overlap State indices")
@@ -354,6 +393,7 @@ class CausalConv1dUpdateSm100(APIBase):
         self._compiled_kernel(
             x_tensor,
             weight_tensor,
+            bias_tensor,
             state_tensor,
             output_tensor,
             state_indices_tensor,
@@ -369,6 +409,7 @@ def _cache_key(
     state_tensor: torch.Tensor,
     weight_tensor: torch.Tensor,
     state_indices_tensor: Optional[torch.Tensor],
+    bias_tensor: Optional[torch.Tensor],
 ):
     return (
         x_tensor.device.type,
@@ -377,6 +418,7 @@ def _cache_key(
         tuple(weight_tensor.shape),
         tuple(state_tensor.shape),
         state_indices_tensor is not None,
+        bias_tensor is not None,
     )
 
 
@@ -386,13 +428,14 @@ def causal_conv1d_update(
     weight: torch.Tensor,
     state_indices: Optional[torch.Tensor] = None,
     *,
+    bias: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> torch.Tensor:
     """Advance a BF16 K=4 causal-convolution cache and return fused-SiLU output.
 
     ``state`` is updated in place.  This experimental operation is
-    inference-only, no-bias, and always applies SiLU. Every supported
-    architecture uses the same functional schedule. See
+    inference-only and always applies SiLU; ``bias`` is optional. Every
+    supported architecture uses the same functional schedule. See
     :class:`CausalConv1dUpdateSm100` for the exact tensor contract.
     """
 
@@ -401,9 +444,11 @@ def causal_conv1d_update(
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
     if state_indices is not None and not isinstance(state_indices, torch.Tensor):
         raise TypeError("State indices must be a torch.Tensor or None, " f"got {type(state_indices).__name__}")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise TypeError("Bias must be a torch.Tensor or None, " f"got {type(bias).__name__}")
     if not x.is_cuda:
         raise ValueError(f"X must be a CUDA tensor, got device {x.device}")
-    key = _cache_key(x, state, weight, state_indices)
+    key = _cache_key(x, state, weight, state_indices, bias)
 
     with torch.cuda.device(x.device), _torch_stream_context(current_stream, x.device):
         output = torch.empty_like(x, memory_format=torch.contiguous_format)
@@ -418,6 +463,7 @@ def causal_conv1d_update(
                         sample_state=state,
                         sample_output=output,
                         sample_state_indices=state_indices,
+                        sample_bias=bias,
                     )
                     api.check_support()
                     api.compile()
@@ -432,6 +478,7 @@ def causal_conv1d_update(
             output_tensor=output,
             state_indices_tensor=state_indices,
             current_stream=current_stream,
+            bias_tensor=bias,
         )
 
 
@@ -441,6 +488,7 @@ def causal_conv1d_update_wrapper_sm100(
     weight: torch.Tensor,
     state_indices: Optional[torch.Tensor] = None,
     *,
+    bias: Optional[torch.Tensor] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Run the decode update and return ``TupleDict(output_tensor=...)``.
@@ -455,6 +503,7 @@ def causal_conv1d_update_wrapper_sm100(
         state,
         weight,
         state_indices,
+        bias=bias,
         current_stream=current_stream,
     )
     return TupleDict(output_tensor=output)

@@ -4,7 +4,7 @@
 
 `CausalConv1dUpdateSm100` advances a four-token depthwise causal-convolution
 cache in place and emits the fused-SiLU output for one decode step. It targets
-the no-bias, width-four short convolution used by GDN/KDA-style linear
+the width-four short convolution used by GDN/KDA-style linear
 attention blocks. It is a standalone native primitive; it does not yet add a
 serving-framework integration or make cuDNN the default route. The optional
 `cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
@@ -18,8 +18,10 @@ For row `n`, channel `d`, and selected cache slot `s`, the operation is:
 ```text
 updated_state[s, d, :] = [state[s, d, 1], state[s, d, 2],
                           state[s, d, 3], x[n, d]]
-output[n, d] = SiLU(sum_j updated_state[s, d, j] * weight[d, j])
+output[n, d] = SiLU(sum_j updated_state[s, d, j] * weight[d, j] + bias[d])
 ```
+
+The optional bias term is zero when `bias` is omitted.
 
 When `state_indices` is omitted, row `n` selects slot `n`. When it is present,
 `s = state_indices[n]`. Indexed slots must be in range and unique within the
@@ -36,9 +38,10 @@ the failed update is not transactional.
 - `weight`: contiguous BF16 `[D, 4]`
 - `state`: contiguous BF16 `[S, D, 4]`, updated in place
 - `state_indices`: optional contiguous CUDA int32 `[N]`
+- `bias`: optional contiguous BF16 `[D]`
 - output: contiguous BF16 `[N, D]`
 - activation: SiLU, always fused
-- bias and autograd: unsupported
+- autograd: unsupported
 - pointer alignment: 16 bytes for BF16 tensors and 4 bytes for indices
 
 The native direct API and current kernel require CUTLASS DSL 4.7 or newer for
@@ -55,8 +58,8 @@ SM100, SM103, and SM120 are runtime-validated. SM86, SM87, SM110, and SM121
 have compile-only validation. In particular, the SM110 kernel cross-compiles
 with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.
 
-This narrow contract does not cover a bias term, a returned intermediate state
-for speculative decoding, arbitrary convolution width, prefill, training, or a
+This narrow contract does not cover a returned intermediate state for
+speculative decoding, arbitrary convolution width, prefill, training, or a
 general Mamba causal-convolution interface. The indexed path is provided for
 functional paged-state support; its duplicate-index validation has not been
 performance-characterized as a fast path.
@@ -84,13 +87,13 @@ output = result["output_tensor"]
 `cudnn.ops.causal_conv1d_update(...)` expose the same mutation but return the
 output Tensor directly. The state-before-weight positional order matches the
 common decode-update convention used by the FLA and causal-conv1d ecosystems.
-The helpers are not drop-in replacements for APIs with bias or different
-return-state conventions.
+Bias is keyword-only: pass `bias=bias`. The helpers are not drop-in
+replacements for APIs with different return-state conventions.
 
-Both helpers cache compiled kernels by device, shape, and indexed/non-indexed
-signature. The cache is bounded. The first call for a signature performs JIT
-compilation, so warm the exact signature before latency measurement or CUDA
-Graph capture.
+Both helpers cache compiled kernels by device, shape, indexed/non-indexed
+signature, and bias presence. The cache is bounded. The first call for a
+signature performs JIT compilation, so warm the exact signature before latency
+measurement or CUDA Graph capture.
 
 ## Class API
 

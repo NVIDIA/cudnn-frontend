@@ -128,6 +128,8 @@ def test_public_helpers_use_state_before_weight_positional_order():
     expected = ("x", "state", "weight", "state_indices")
     assert tuple(inspect.signature(causal_conv1d_update).parameters)[:4] == expected
     assert tuple(inspect.signature(causal_conv1d_update_wrapper_sm100).parameters)[:4] == expected
+    assert inspect.signature(causal_conv1d_update).parameters["bias"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(causal_conv1d_update_wrapper_sm100).parameters["bias"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_valid_descriptor_contract_without_kernel(monkeypatch):
@@ -138,6 +140,23 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
+
+
+def test_optional_bias_descriptor_contract_without_kernel(monkeypatch):
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs()
+    bias = torch.zeros(x.shape[1], dtype=torch.bfloat16)
+    api = cls(x, weight, state, output, indices, bias)
+    _mock_cuda_contract(monkeypatch, api)
+
+    assert api.check_support()
+    assert api.bias_desc.shape == (x.shape[1],)
+
+    bad_bias = torch.zeros(x.shape[1] + 1, dtype=torch.bfloat16)
+    bad_api = cls(x, weight, state, output, indices, bad_bias)
+    _mock_cuda_contract(monkeypatch, bad_api)
+    with pytest.raises(ValueError, match="Bias tensor shape mismatch"):
+        bad_api.check_support()
 
 
 def test_metadata_only_descriptors_skip_sample_pointer_alignment(monkeypatch):
@@ -229,6 +248,30 @@ def test_execute_revalidates_presence_and_aliases(monkeypatch):
 
     with pytest.raises(ValueError, match="presence must match"):
         api.execute(x, weight, state, output, None, current_stream=stream)
+
+    bias = torch.zeros(x.shape[1], dtype=torch.bfloat16)
+    biased_api = cls(x, weight, state, output, indices, bias)
+    _mock_cuda_contract(monkeypatch, biased_api)
+    assert biased_api.check_support()
+    biased_api._compiled_kernel = lambda *args: None
+    with pytest.raises(ValueError, match="bias presence must match"):
+        biased_api.execute(
+            x,
+            weight,
+            state,
+            output,
+            indices,
+            current_stream=stream,
+        )
+    biased_api.execute(
+        x,
+        weight,
+        state,
+        output,
+        indices,
+        current_stream=stream,
+        bias_tensor=bias,
+    )
 
     storage = torch.empty(x.numel() + 1, dtype=x.dtype)
     misaligned_x = storage[1:].view_as(x)

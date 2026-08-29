@@ -16,7 +16,7 @@ Semantic references consulted:
 * Dao-AILab/causal-conv1d's public ``causal_conv1d_update`` API contract
   (BSD-3-Clause), revision ``cd81f0413cad2fc1e6f17e785ac39f59aae690cd``.
 
-Only the four-wide, BF16, no-bias, SiLU inference specialization lives here.
+Only the four-wide, BF16, optional-bias, SiLU inference specialization lives here.
 One decode row is assigned to each CTA on every admitted architecture. This is
 an independent FE-native implementation using the original inline-PTX data
 path.
@@ -38,6 +38,7 @@ THREADS = 256
 def _causal_conv1d_update_kernel(
     x: cute.Tensor,
     weight: cute.Tensor,
+    bias: Optional[cute.Tensor],
     state: cute.Tensor,
     output: cute.Tensor,
     state_indices: Optional[cute.Tensor],
@@ -105,6 +106,9 @@ def _causal_conv1d_update_kernel(
         state_2, state_3 = f16x2_to_f32(state_23, dtype=cutlass.BFloat16)
         weight_0, weight_1 = f16x2_to_f32(weight_01, dtype=cutlass.BFloat16)
         weight_2, weight_3 = f16x2_to_f32(weight_23, dtype=cutlass.BFloat16)
+        bias_value = cutlass.Float32(0.0)
+        if cutlass.const_expr(bias is not None):
+            bias_value = bias[channel].to(cutlass.Float32)
         x_f32 = inline_ptx(
             "{ .reg .b16 x; mov.b16 x, $1; mov.b32 $0, {0, x}; }",
             write_only_types=[cutlass.Float32],
@@ -128,6 +132,7 @@ def _causal_conv1d_update_kernel(
         acc = acc + state_2 * weight_1
         acc = acc + state_3 * weight_2
         acc = acc + x_f32 * weight_3
+        acc = acc + bias_value
         output[row, channel] = (acc * sigmoid(acc)).to(cutlass.BFloat16)
 
 
@@ -139,6 +144,7 @@ class CausalConv1dUpdateKernel:
         self,
         x: cute.Tensor,
         weight: cute.Tensor,
+        bias: Optional[cute.Tensor],
         state: cute.Tensor,
         output: cute.Tensor,
         state_indices: Optional[cute.Tensor],
@@ -149,6 +155,7 @@ class CausalConv1dUpdateKernel:
         _causal_conv1d_update_kernel(
             x,
             weight,
+            bias,
             state,
             output,
             state_indices,
