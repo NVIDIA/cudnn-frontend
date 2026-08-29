@@ -1,15 +1,18 @@
-# Bulk Causal Conv1d Forward (SM100)
+# Bulk Causal Conv1d Forward (SM100-optimized)
 
 `CausalConv1dBulkFwdSm100` and
 `causal_conv1d_bulk_fwd_wrapper_sm100` expose the first native bulk
 causal-convolution slice. Its full-width output state is designed to match the
-pending companion SM100 decode-update contract, so the two APIs need no state
+companion decode-update contract, so the two APIs need no state
 repacking when both are installed. The API is experimental.
 
 ## First native slice
 
 The first optimized slice is the model-relevant BF16, width-four, no-bias,
-fused-SiLU operation on SM100:
+fused-SiLU operation. Functional targets are the exact compute capabilities
+SM80, SM86, SM87, SM89, SM90, SM100, SM103, SM110, SM120, and SM121. The
+public class and wrapper retain their original `Sm100` suffix while this
+experimental API evolves.
 
 - dense input: contiguous `x[B, T, D]`
 - packed input: contiguous `x[1, total_T, D]` plus contiguous CUDA int32
@@ -25,9 +28,12 @@ This API requires `nvidia-cutlass-dsl>=4.7.0`; the frontend package's broader
 `cutedsl` extra deliberately retains its 4.5.0 floor for unrelated APIs.
 The first slice is inference-only and rejects requires-grad inputs while grad
 mode is enabled. There is no implicit dtype/layout conversion or fallback.
-Channel extents divisible by eight use an aligned 128-bit channel-vector fast
-path; other positive extents use a predicated scalar-tail path with the same
-public semantics.
+On SM100, SM103, SM110, SM120, and SM121, channel extents divisible by eight
+use an aligned 128-bit channel-vector fast path with packed FP32 arithmetic.
+SM80 through SM90, and every positive channel extent not divisible by eight,
+use a predicated scalar path with the same public semantics. Only SM100/B200
+has been performance-characterized; the other targets are functional support,
+not a cross-architecture performance claim.
 
 For dense input, `N == B`. For packed input, `B == 1`,
 `cu_seqlens[0] == 0`, `cu_seqlens[-1] == total_T`, and every sequence length
@@ -159,4 +165,5 @@ If bias or residual support is added later, the fixed semantic order is
 The first performance gate is parity with the best available FLA route while
 adding FE's packed-state forward; the matching backward remains next. FLA
 Triton itself already implements those features. Broader dtype, width, bias,
-and architecture support are follow-ups, not hidden fallback behavior.
+and additional architecture support are follow-ups, not hidden fallback
+behavior.

@@ -96,6 +96,58 @@ def test_support_accepts_a_source_dsl_without_distribution_metadata(monkeypatch)
     assert api.check_support()
 
 
+@pytest.mark.parametrize(
+    "capability,n_channels,expected_vec8",
+    [
+        ((8, 0), 8, False),
+        ((8, 6), 8, False),
+        ((8, 7), 8, False),
+        ((8, 9), 8, False),
+        ((9, 0), 8, False),
+        ((10, 0), 8, True),
+        ((10, 0), 7, False),
+        ((10, 3), 8, True),
+        ((11, 0), 8, True),
+        ((12, 0), 8, True),
+        ((12, 1), 8, True),
+    ],
+)
+def test_support_selects_schedule_from_exact_arch(monkeypatch, capability, n_channels, expected_vec8):
+    _, api_class, _ = _load_public_api()
+    import cudnn.causal_conv1d_bulk_sm100.api as api_module
+
+    x = torch.zeros(1, 2, n_channels, dtype=torch.bfloat16)
+    weight = torch.zeros(n_channels, 4, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    api = api_class(x, weight, output)
+    monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
+    monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    assert api.check_support()
+    assert api.compute_capability == capability
+    assert api.use_vec8_schedule is expected_vec8
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (10, 1), (11, 1)])
+def test_support_rejects_unlisted_arch(monkeypatch, capability):
+    _, api_class, _ = _load_public_api()
+    import cudnn.causal_conv1d_bulk_sm100.api as api_module
+
+    x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    api = api_class(x, weight, output)
+    monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
+    monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    with pytest.raises(RuntimeError, match="does not support compute capability"):
+        api.check_support()
+
+
 def test_constructor_rejects_metadata_only_tensor_descriptors():
     _, api_class, _ = _load_public_api()
     from cudnn.api_base import TensorDesc

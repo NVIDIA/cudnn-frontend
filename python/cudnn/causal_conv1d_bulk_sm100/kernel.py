@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correctness-first SM100 bulk causal-convolution forward kernel.
+"""Correctness-first bulk causal-convolution forward kernels.
 
 This is an independent CuTe DSL implementation of the width-four, BF16,
 depthwise causal-convolution contract documented by cuDNN Frontend.  FLA's
@@ -508,7 +508,15 @@ def _causal_conv1d_bulk_vec8_fwd_kernel(
 
 
 class CausalConv1dBulkForwardKernel:
-    """Host launcher for the fixed BF16, width-four SM100 forward slice."""
+    """Host launcher for the fixed BF16, width-four forward slice.
+
+    ``use_vec8`` is selected from the exact compilation target.  Its packed
+    FP32 arithmetic requires SM100-or-newer instructions; the scalar schedule
+    is the functional fallback on supported pre-Blackwell architectures.
+    """
+
+    def __init__(self, *, use_vec8: bool = True):
+        self.use_vec8 = use_vec8
 
     @cute.jit
     def __call__(
@@ -535,7 +543,7 @@ class CausalConv1dBulkForwardKernel:
                 stream=stream,
             )
 
-        if cutlass.const_expr(x.shape[1] % VEC_CHANNELS_PER_THREAD == 0):
+        if cutlass.const_expr(self.use_vec8 and x.shape[1] % VEC_CHANNELS_PER_THREAD == 0):
             _causal_conv1d_bulk_vec8_fwd_kernel(
                 x,
                 weight,

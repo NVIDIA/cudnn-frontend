@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""L0 GPU correctness for the SM100 bulk causal-convolution forward API."""
+"""L0 GPU correctness for the bulk causal-convolution forward API."""
 
 import os
 from pathlib import Path
@@ -17,16 +17,29 @@ from fe_api.causal_conv1d_bulk.reference import (
     causal_conv1d_update_reference,
 )
 
+_SUPPORTED_COMPUTE_CAPABILITIES = {
+    (8, 0),
+    (8, 6),
+    (8, 7),
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
 
-def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+
+def _is_supported_arch() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in _SUPPORTED_COMPUTE_CAPABILITIES
 
 
 pytestmark = [
     pytest.mark.L0,
     pytest.mark.gpu_exclusive,
     pytest.mark.xdist_group(name="gpu_exclusive"),
-    pytest.mark.skipif(not _is_sm100(), reason="requires exactly SM100 (compute capability 10.0)"),
+    pytest.mark.skipif(not _is_supported_arch(), reason="requires a supported SM80-or-newer architecture"),
 ]
 
 

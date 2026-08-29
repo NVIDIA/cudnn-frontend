@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental FE-OSS API for SM100 bulk causal convolution."""
+"""Experimental FE-OSS API for portable bulk causal convolution.
+
+The public class retains its original ``Sm100`` suffix while this experimental
+API evolves. SM100 uses the measured vector schedule, other listed targets at
+SM100 or newer use the same instruction-compatible path, and supported
+pre-Blackwell targets use the correctness-first scalar schedule.
+"""
 
 from contextlib import contextmanager
 import threading
@@ -26,6 +32,37 @@ _MAX_TOTAL_TOKENS = _INT32_MAX - 15
 # Packed kernels use ``(lower + upper) // 2`` during their device-side search.
 _MAX_PACKED_SEQUENCES = _INT32_MAX // 2
 _MAX_SCALAR_GRID_CHANNELS = 256 * 65535
+_FUNCTIONAL_COMPUTE_CAPABILITIES = frozenset(
+    {
+        (8, 0),
+        (8, 6),
+        (8, 7),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (11, 0),
+        (12, 0),
+        (12, 1),
+    }
+)
+_F32X2_COMPUTE_CAPABILITIES = frozenset(
+    {
+        (10, 0),
+        (10, 3),
+        (11, 0),
+        (12, 0),
+        (12, 1),
+    }
+)
+
+
+def _is_functional_arch(compute_capability: tuple[int, int]) -> bool:
+    return compute_capability in _FUNCTIONAL_COMPUTE_CAPABILITIES
+
+
+def _uses_vec8_schedule(compute_capability: tuple[int, int], n_channels: int) -> bool:
+    return compute_capability in _F32X2_COMPUTE_CAPABILITIES and n_channels % 8 == 0
 
 
 @contextmanager
@@ -94,7 +131,7 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 
 
 class CausalConv1dBulkFwdSm100(APIBase):
-    """Compile and execute BF16 width-four bulk causal convolution on SM100.
+    """Compile and execute BF16 width-four bulk causal convolution.
 
     The native layout is contiguous ``x[B, T, D]`` and ``weight[D, 4]``.
     Dense mode treats each batch row as a sequence.  Packed mode requires
@@ -158,6 +195,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self.sample_sequence_length = None
         self.n_channels = None
         self.num_sequences = None
+        self.compute_capability = None
+        self.use_vec8_schedule = None
         self.is_packed = sample_cu_seqlens is not None
 
     @staticmethod
@@ -222,17 +261,6 @@ class CausalConv1dBulkFwdSm100(APIBase):
                 num_sequences > batch_size * sequence_length,
                 f"Packed N={num_sequences} cannot exceed total_T={batch_size * sequence_length} " "when every sequence must be non-empty",
             )
-
-        if n_channels % 8 != 0:
-            self._value_error_if(
-                batch_size * sequence_length * n_channels > _INT32_MAX,
-                "The scalar-tail path requires X and Output to contain at most " f"{_INT32_MAX} elements",
-            )
-            if self.initial_state_desc is not None or self.final_state_desc is not None:
-                self._value_error_if(
-                    num_sequences * n_channels * 4 > _INT32_MAX,
-                    "The scalar-tail path requires each state tensor to contain at most " f"{_INT32_MAX} elements",
-                )
 
         self._check_tensor_shape(self.weight_desc, (n_channels, 4), "Weight")
         self._check_tensor_shape(self.output_desc, (batch_size, sequence_length, n_channels), "Output")
@@ -308,14 +336,29 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         compute_capability = torch.cuda.get_device_capability(self.x_desc.device)
         self._runtime_error_if(
-            compute_capability != (10, 0),
-            "CausalConv1dBulkFwdSm100 requires exactly SM100 " f"(compute capability 10.0), found {compute_capability[0]}.{compute_capability[1]}",
+            not _is_functional_arch(compute_capability),
+            "CausalConv1dBulkFwdSm100 does not support compute capability "
+            f"{compute_capability[0]}.{compute_capability[1]}; supported capabilities are "
+            f"{sorted(_FUNCTIONAL_COMPUTE_CAPABILITIES)}",
         )
+        use_vec8_schedule = _uses_vec8_schedule(compute_capability, n_channels)
+        if not use_vec8_schedule:
+            self._value_error_if(
+                batch_size * sequence_length * n_channels > _INT32_MAX,
+                "The scalar schedule requires X and Output to contain at most " f"{_INT32_MAX} elements",
+            )
+            if self.initial_state_desc is not None or self.final_state_desc is not None:
+                self._value_error_if(
+                    num_sequences * n_channels * 4 > _INT32_MAX,
+                    "The scalar schedule requires each state tensor to contain at most " f"{_INT32_MAX} elements",
+                )
 
         self.batch_size = batch_size
         self.sample_sequence_length = sequence_length
         self.n_channels = n_channels
         self.num_sequences = num_sequences
+        self.compute_capability = compute_capability
+        self.use_vec8_schedule = use_vec8_schedule
         self._is_supported = True
         return True
 
@@ -347,7 +390,7 @@ class CausalConv1dBulkFwdSm100(APIBase):
         fake_final_state = self._make_fake_cute_tensor_from_desc(self.final_state_desc, assumed_align=16)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        kernel = CausalConv1dBulkForwardKernel()
+        kernel = CausalConv1dBulkForwardKernel(use_vec8=self.use_vec8_schedule)
         dense_tokens_per_sequence = self.sample_sequence_length if not self.is_packed else 0
         with torch.cuda.device(self.x_desc.device):
             self._compiled_kernel = cute.compile(
@@ -390,8 +433,8 @@ class CausalConv1dBulkFwdSm100(APIBase):
             raise ValueError(f"{name} T must be positive, got {sequence_length}")
         if batch_size * sequence_length > _MAX_TOTAL_TOKENS:
             raise ValueError(f"{name} B*T exceeds the safe Int32 tiled-indexing limit")
-        if n_channels % 8 != 0 and batch_size * sequence_length * n_channels > _INT32_MAX:
-            raise ValueError(f"The scalar-tail path requires {name} to contain at most {_INT32_MAX} elements")
+        if not self.use_vec8_schedule and batch_size * sequence_length * n_channels > _INT32_MAX:
+            raise ValueError(f"The scalar schedule requires {name} to contain at most {_INT32_MAX} elements")
         expected_stride = (sequence_length * n_channels, n_channels, 1)
         if tuple(tensor.stride()) != expected_stride:
             raise ValueError(f"{name} must be [B, T, D] contiguous, got stride {tuple(tensor.stride())}")
@@ -537,14 +580,18 @@ def _cache_key(
             raise ValueError(f"Packed N exceeds the safe Int32 search limit: {num_sequences}")
         if num_sequences > total_tokens:
             raise ValueError(f"Packed N={num_sequences} cannot exceed total_T={total_tokens} " "when every sequence must be non-empty")
-    if n_channels % 8 != 0:
+    compute_capability = torch.cuda.get_device_capability(x_tensor.device)
+    use_vec8_schedule = _uses_vec8_schedule(compute_capability, n_channels)
+    if not use_vec8_schedule:
         if x_tensor.numel() > _INT32_MAX:
-            raise ValueError(f"The scalar-tail path requires X to contain at most {_INT32_MAX} elements")
+            raise ValueError(f"The scalar schedule requires X to contain at most {_INT32_MAX} elements")
         if (initial_state_tensor is not None or output_final_state) and num_sequences * n_channels * 4 > _INT32_MAX:
-            raise ValueError(f"The scalar-tail path requires each state tensor to contain at most {_INT32_MAX} elements")
+            raise ValueError(f"The scalar schedule requires each state tensor to contain at most {_INT32_MAX} elements")
     return (
         x_tensor.device.type,
         x_tensor.device.index,
+        compute_capability,
+        use_vec8_schedule,
         batch_size,
         num_sequences,
         n_channels,
@@ -563,7 +610,7 @@ def causal_conv1d_bulk_fwd_wrapper_sm100(
     output_final_state: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    """Run the SM100 BF16 width-four bulk causal-convolution forward.
+    """Run the BF16 width-four bulk causal-convolution forward.
 
     The result always contains ``output_tensor`` and ``final_state_tensor`` in
     that order.  When ``output_final_state`` is false, the latter is a BF16
