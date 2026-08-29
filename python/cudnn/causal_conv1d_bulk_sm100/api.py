@@ -121,6 +121,10 @@ class CausalConv1dBulkFwdSm100(APIBase):
             ("sample_x", sample_x),
             ("sample_weight", sample_weight),
             ("sample_output", sample_output),
+        ):
+            if not isinstance(sample, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor, got {type(sample).__name__}")
+        for name, sample in (
             ("sample_cu_seqlens", sample_cu_seqlens),
             ("sample_initial_state", sample_initial_state),
             ("sample_final_state", sample_final_state),

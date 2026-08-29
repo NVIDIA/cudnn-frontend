@@ -114,6 +114,20 @@ def test_constructor_rejects_metadata_only_tensor_descriptors():
         api_class(sample_x, weight, output)
 
 
+@pytest.mark.parametrize("missing_name", ["sample_x", "sample_weight", "sample_output"])
+def test_constructor_rejects_none_for_required_samples(missing_name):
+    _, api_class, _ = _load_public_api()
+    samples = {
+        "sample_x": torch.zeros(1, 2, 8, dtype=torch.bfloat16),
+        "sample_weight": torch.zeros(8, 4, dtype=torch.bfloat16),
+        "sample_output": torch.zeros(1, 2, 8, dtype=torch.bfloat16),
+    }
+    samples[missing_name] = None
+
+    with pytest.raises(TypeError, match=rf"{missing_name} must be a torch.Tensor, got NoneType"):
+        api_class(**samples)
+
+
 def test_top_level_lazy_exports_resolve_from_a_clean_source_package(tmp_path):
     # The suite normally overlays this operation onto a prebuilt frontend. Use
     # a fresh interpreter and this checkout's __init__.py to exercise the
