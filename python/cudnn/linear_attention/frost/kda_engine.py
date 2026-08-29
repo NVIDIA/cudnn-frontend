@@ -15,10 +15,26 @@ import math
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost.device import build_device, current_device, multiprocessor_count
+from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate
+
+
+def choose_kda_fwd_piece_cap(
+    *, device_cc: tuple[int, int], checkpointed: bool, batch_size: int, n_heads_out: int, n_tiles: int, num_sms: int, ideal_chunks: int
+) -> int:
+    """Return the measured KDA-forward piece cap, or zero for adaptive.
+
+    The cap is deliberately limited to the B200, checkpoint-free,
+    single-sequence, underfilled H=64/H=96 regimes covered by the sweep.
+    ``ideal_chunks`` supplies a shape-derived length boundary without naming a
+    model or fixing a sequence length; the adaptive planner remains in charge
+    outside that evidence.
+    """
+    if device_cc == (10, 0) and not checkpointed and batch_size == 1 and n_heads_out in (64, 96) and n_tiles < num_sms and ideal_chunks <= 5 * num_sms:
+        return 2
+    return 0
 
 
 def build_kda(graph):
@@ -134,11 +150,22 @@ class CompiledKda:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device())
+        device = current_device()
+        self.num_sm = multiprocessor_count(device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
+        self.piece_cap = 0
         if self.split:
             self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
+            self.piece_cap = choose_kda_fwd_piece_cap(
+                device_cc=compute_capability(device),
+                checkpointed=self.checkpoint != 0 or self.has_state_checkpoints,
+                batch_size=B,
+                n_heads_out=HO,
+                n_tiles=self.n_tiles,
+                num_sms=self.num_sm,
+                ideal_chunks=self.ideal,
+            )
             self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
         else:
             self.ideal = None
@@ -255,6 +282,7 @@ class CompiledKda:
                 dt_bias=dt_bias,
                 gate_lower_bound=self.gate_lower_bound if self.safe_gate else None,
                 scheduler_counter=scheduler_counter,
+                piece_cap=self.piece_cap,
                 split=self.split,
                 stream=stream,
             )
