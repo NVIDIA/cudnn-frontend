@@ -1,18 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental FE-OSS API for SM100 causal-convolution decode update."""
+"""Experimental FE-OSS API for causal-convolution decode update.
 
-from contextlib import contextmanager
+The ``Sm100`` names are retained for API compatibility.  SM100 has the tuned
+row-batch schedule; other admitted architectures use the portable one-row
+schedule.
+"""
+
 import threading
+from contextlib import contextmanager
 from typing import Iterator, Optional
 
-from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_fake_stream
 import torch
+from cuda.bindings import driver as cuda
+from cutlass.cute.runtime import make_fake_stream
 
+from cudnn._causal_conv1d_arch import (
+    is_supported_causal_conv1d_update_compute_capability,
+    supported_causal_conv1d_update_compute_capabilities_text,
+    uses_sm100_causal_conv1d_update_schedule,
+)
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
 from .kernel import (
@@ -73,7 +83,11 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 
 
 class CausalConv1dUpdateSm100(APIBase):
-    """Compile and execute BF16 K=4 causal-convolution decode on SM100.
+    """Compile and execute BF16 K=4 causal-convolution decode.
+
+    The class name is retained for compatibility.  SM100 uses the optimized
+    schedule; compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0, 10.3, 11.0, 12.0,
+    and 12.1 use a conservative functional schedule.
 
     This inference-only API advances ``state`` in place and writes ``output``.
     It deliberately supports one narrow contract:
@@ -229,8 +243,10 @@ class CausalConv1dUpdateSm100(APIBase):
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         compute_capability = torch.cuda.get_device_capability(self.x_desc.device)
         self._runtime_error_if(
-            compute_capability != (10, 0),
-            "CausalConv1dUpdateSm100 requires exactly SM100 " f"(compute capability 10.0), found {compute_capability[0]}.{compute_capability[1]}",
+            not is_supported_causal_conv1d_update_compute_capability(compute_capability),
+            "CausalConv1dUpdateSm100 supports compute capabilities "
+            f"{supported_causal_conv1d_update_compute_capabilities_text()}, "
+            f"found {compute_capability[0]}.{compute_capability[1]}",
         )
 
         self.n_rows = n_rows
@@ -240,6 +256,7 @@ class CausalConv1dUpdateSm100(APIBase):
             n_rows,
             n_channels,
             self.state_indices_desc is not None,
+            use_sm100_optimized_schedule=uses_sm100_causal_conv1d_update_schedule(compute_capability),
         )
         self._is_supported = True
         return True
@@ -382,8 +399,9 @@ def causal_conv1d_update(
 ) -> torch.Tensor:
     """Advance a BF16 K=4 causal-convolution cache and return fused-SiLU output.
 
-    ``state`` is updated in place.  This experimental operation is SM100-only,
-    inference-only, no-bias, and always applies SiLU.  See
+    ``state`` is updated in place.  This experimental operation is
+    inference-only, no-bias, and always applies SiLU.  SM100 uses the optimized
+    schedule; other supported architectures use the functional schedule.  See
     :class:`CausalConv1dUpdateSm100` for the exact tensor contract.
     """
 
@@ -434,10 +452,11 @@ def causal_conv1d_update_wrapper_sm100(
     *,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    """Run the SM100 decode update and return ``TupleDict(output_tensor=...)``.
+    """Run the decode update and return ``TupleDict(output_tensor=...)``.
 
-    ``state`` is updated in place.  Use :func:`causal_conv1d_update` when a
-    direct Tensor return is more convenient for model-integration shims.
+    The function name is retained for compatibility.  ``state`` is updated in
+    place.  Use :func:`causal_conv1d_update` when a direct Tensor return is more
+    convenient for model-integration shims.
     """
 
     output = causal_conv1d_update(

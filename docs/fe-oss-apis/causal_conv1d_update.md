@@ -1,4 +1,4 @@
-# Causal Conv1d Decode Update (SM100)
+# Causal Conv1d Decode Update
 
 **This FE-OSS API is experimental and subject to change.**
 
@@ -10,6 +10,9 @@ serving-framework integration or make cuDNN the default route. The optional
 `cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
 decode-update interface and routes only this exact supported subset to the
 native primitive; all other configurations retain FLA's original path.
+The `Sm100` class and wrapper names are retained for API compatibility. SM100
+has the tuned schedule; other admitted architectures use the portable
+functional schedule.
 
 For row `n`, channel `d`, and selected cache slot `s`, the operation is:
 
@@ -27,7 +30,9 @@ the failed update is not transactional.
 
 ## Supported contract
 
-- GPU: exactly SM100 (compute capability 10.0)
+- GPU: functional support on compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0,
+  10.0, 10.3, 11.0, 12.0, and 12.1
+- optimized and performance-characterized GPU: SM100 (compute capability 10.0)
 - `x`: contiguous BF16 `[N, D]`
 - `weight`: contiguous BF16 `[D, 4]`
 - `state`: contiguous BF16 `[S, D, 4]`, updated in place
@@ -37,19 +42,34 @@ the failed update is not transactional.
 - bias and autograd: unsupported
 - pointer alignment: 16 bytes for BF16 tensors and 4 bytes for indices
 
+The native direct API and current kernel require CUTLASS DSL 4.7 or newer for
+the inline-PTX integration they import. The package-wide `cutedsl` extra keeps
+its broader `>=4.5` floor for unrelated APIs; installing only that minimum is
+not sufficient for this direct API. The FLA adapter treats the resulting
+`ImportError` as a typed decline and executes FLA's original path.
+
+The full correctness suite was run on A100 SM80, L40S SM89, H200 SM90, and
+B200 SM100. The generic, indexed, and row-batch kernels were also executed on
+a GB110 board reporting compute capability 10.3 and an RTX 5080 SM120; outputs
+matched the reference and state updates were bit-exact. Thus SM80, SM89, SM90,
+SM100, SM103, and SM120 are runtime-validated. SM86, SM87, SM110, and SM121
+have compile-only validation. In particular, both SM110 schedules cross-compile
+with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.
+
 This narrow contract does not cover a bias term, a returned intermediate state
 for speculative decoding, arbitrary convolution width, prefill, training, or a
 general Mamba causal-convolution interface. The indexed path is provided for
 functional paged-state support; its duplicate-index validation has not been
 performance-characterized as a fast path.
 
-For the two measured Qwen3.5 decode signatures `N=128, D=2048` and
-`N=128, D=4096`, an unindexed call compiles a two-row CTA specialization. It
+On exact SM100, the two measured Qwen3.5 decode signatures `N=128, D=2048` and
+`N=128, D=4096` compile a two-row CTA specialization for unindexed calls. It
 loads each channel's four-tap weight once and reuses it across the two rows,
-while issuing both rows' state/input loads before arithmetic. Indexed calls and
-every other shape retain the original one-row kernel, including its device-side
-index validation and channel-tail handling. This route is an internal schedule
-choice; it does not change the public API or cache key.
+while issuing both rows' state/input loads before arithmetic. Every other
+supported architecture always uses the conservative one-row kernel. Indexed
+calls and every other shape also retain that one-row kernel, including its
+device-side index validation and channel-tail handling. This route is an
+internal schedule choice; it does not change the public API or cache key.
 
 ## High-level wrapper
 
@@ -131,7 +151,9 @@ geometric mean was `1.146x`. The raw result SHA-256 is
 These are direct kernel-active measurements, not single-node CUDA-graph replay
 or end-to-end model latency.
 
-Use `benchmark/causal_conv1d_update_sm100.py` on the target GPU for route-proof,
-correctness, and interleaved comparison against FLA. Performance measurements
-must include the exact GPU, software environment, shapes, and raw artifacts;
-the indexed path should be reported separately from the no-index decode path.
+Use `benchmark/causal_conv1d_update_sm100.py` on a ComputeLab B200 for
+route-proof, correctness, and interleaved comparison against FLA. The
+benchmark intentionally rejects non-SM100 devices: widening functional support
+does not widen the performance claim. Performance measurements must include
+the exact GPU, software environment, shapes, and raw artifacts; the indexed
+path should be reported separately from the no-index decode path.

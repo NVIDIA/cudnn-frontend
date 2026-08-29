@@ -5,16 +5,29 @@
 
 import inspect
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 from cuda.bindings import driver as cuda
 
 pytestmark = pytest.mark.L0
+
+_SUPPORTED_COMPUTE_CAPABILITIES = (
+    (8, 0),
+    (8, 6),
+    (8, 7),
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+)
 
 
 def _api_class():
@@ -36,7 +49,7 @@ def _inputs(*, n_rows=2, n_channels=8, n_slots=3, indexed=True):
 
 def _mock_cuda_contract(monkeypatch, api, capability=(10, 0)):
     # These tests exercise descriptor/contract logic on CPU tensors only.  The
-    # real GPU suite independently checks the CUDA-device and SM100 gates.
+    # real GPU suite independently checks the CUDA-device and architecture gate.
     monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
@@ -113,7 +126,7 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
 
 @pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_no_index_selects_two_row_specialization(monkeypatch, n_channels):
+def test_n128_no_index_selects_two_row_specialization_on_sm100(monkeypatch, n_channels):
     cls = _api_class()
     api = cls(
         *_inputs(
@@ -127,6 +140,23 @@ def test_n128_no_index_selects_two_row_specialization(monkeypatch, n_channels):
 
     assert api.check_support()
     assert api.rows_per_cta == 2
+
+
+@pytest.mark.parametrize("capability", [capability for capability in _SUPPORTED_COMPUTE_CAPABILITIES if capability != (10, 0)])
+def test_n128_no_index_uses_one_row_schedule_off_sm100(monkeypatch, capability):
+    cls = _api_class()
+    api = cls(
+        *_inputs(
+            n_rows=128,
+            n_channels=2048,
+            n_slots=128,
+            indexed=False,
+        )
+    )
+    _mock_cuda_contract(monkeypatch, api, capability=capability)
+
+    assert api.check_support()
+    assert api.rows_per_cta == 1
 
 
 @pytest.mark.parametrize(
@@ -193,12 +223,22 @@ def test_bad_descriptor_contract_fails_before_compile(monkeypatch, mutate, match
         api.check_support()
 
 
-def test_exact_sm100_gate(monkeypatch):
+@pytest.mark.parametrize("capability", _SUPPORTED_COMPUTE_CAPABILITIES)
+def test_functional_architecture_allowlist(monkeypatch, capability):
     cls = _api_class()
     api = cls(*_inputs())
-    _mock_cuda_contract(monkeypatch, api, capability=(10, 3))
+    _mock_cuda_contract(monkeypatch, api, capability=capability)
 
-    with pytest.raises(RuntimeError, match="requires exactly SM100"):
+    assert api.check_support()
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (10, 1), (11, 1), (13, 0)])
+def test_unsupported_architecture_gate(monkeypatch, capability):
+    cls = _api_class()
+    api = cls(*_inputs())
+    _mock_cuda_contract(monkeypatch, api, capability=capability)
+
+    with pytest.raises(RuntimeError, match="supports compute capabilities"):
         api.check_support()
 
 

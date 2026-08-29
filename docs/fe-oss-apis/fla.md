@@ -20,7 +20,7 @@ cudnn.fla.accelerate_fla()
 # Incrementally opt the dense FLA GatedMLP into the fused cuDNN SwiGLU MLP.
 cudnn.fla.accelerate_fla(targets="gated_mlp")
 
-# Opt FLA 0.5.2 decode short convolution into the native SM100 update.
+# Opt FLA 0.5.2 decode short convolution into the native update.
 cudnn.fla.accelerate_fla(targets="short_conv")
 
 # A string or iterable is accepted; "gdn", "mlp", and "shortconv" are aliases.
@@ -52,13 +52,24 @@ y, cache = causal_conv1d_update(
 )
 ```
 
-The native route is deliberately restricted to inference on exact SM100 with
-BF16, a contiguous `[N, D, 4]` cache, contiguous `[D, 4]` weights, no residual
-or bias, and `silu`/`swish`. Contiguous input layouts `[N, D]`, `[N, 1, D]`,
-and `[1, N, D]` are normalized with zero-copy views; output shape and cache
-object identity are preserved. Everything else executes the saved original FLA
-callable. Typed unsupported-kernel declines fall back, while unexpected native
-binding, allocation, and launch failures propagate.
+The native route is deliberately restricted to inference on compute
+capabilities 8.0, 8.6, 8.7, 8.9, 9.0, 10.0, 10.3, 11.0, 12.0, and 12.1 with BF16, a
+contiguous `[N, D, 4]` cache, contiguous `[D, 4]` weights, no residual or bias,
+and `silu`/`swish`. SM100 uses the optimized row-batch schedule; every other
+admitted architecture uses the conservative functional schedule. Contiguous
+input layouts `[N, D]`, `[N, 1, D]`, and `[1, N, D]` are normalized with
+zero-copy views; output shape and cache object identity are preserved.
+Everything else executes the saved original FLA callable. Typed
+unsupported-kernel declines fall back, while unexpected native binding,
+allocation, and launch failures propagate.
+
+The current native kernel requires CUTLASS DSL 4.7 or newer. If only the
+package-wide `cutedsl>=4.5` minimum is present and the native import is
+unavailable, the adapter catches that typed `ImportError` and executes FLA's
+original path. Hardware correctness coverage is SM80, SM89, SM90, and SM100;
+the native kernel is additionally runtime-validated on SM103 and SM120.
+SM86, SM87, SM110, and SM121 are compile-validated only. Both SM110 schedules
+cross-compile with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.
 
 The cuDNN adapter and native kernel are independent NVIDIA implementations.
 They use FLA's documented interface and observable depthwise causal-convolution
@@ -69,6 +80,8 @@ Use `benchmark/fla_short_conv_shim_sm100.py` on a ComputeLab B200 for the exact
 patched-callable comparison. It reports CUDA-graph replay separately from
 steady-state eager host enqueue time and refuses to emit timings until route,
 output, mutable-state, cache-identity, and restore gates pass.
+The benchmark remains intentionally restricted to exact SM100 even though the
+adapter has wider functional support.
 
 ## Inspect and restore
 
@@ -103,4 +116,6 @@ pip install "nvidia-cudnn-frontend[cutedsl]"
 ```
 
 The `cutedsl` extra supplies the optional CUTLASS DSL and CUDA Python
-dependencies required by the native `gated_mlp` and `short_conv` targets.
+dependencies required by the native `gated_mlp` and `short_conv` targets. To
+require the native `short_conv` route instead of its typed fallback, also
+ensure `nvidia-cutlass-dsl[cu13]>=4.7` is installed.

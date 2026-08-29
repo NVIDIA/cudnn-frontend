@@ -82,7 +82,7 @@ To add a new frontend-only API, follow these steps:
 - `HSTU Attention (Blackwell SM100/SM103)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
-- `Causal Conv1d Decode Update (SM100, BF16, K=4)`
+- `Causal Conv1d Decode Update (SM80/86/87/89/90/100/103/110/120/121 functional; SM100 optimized, BF16, K=4)`
 
 **In progress frontend-only APIs**:
 - GEMM + Dswiglu

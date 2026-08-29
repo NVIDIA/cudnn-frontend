@@ -1,26 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correctness and contract tests for the SM100 decode-update operation."""
+"""GPU correctness and contract tests for the decode-update operation."""
 
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 from cuda.bindings import driver as cuda
+from cudnn._causal_conv1d_arch import (
+    is_supported_causal_conv1d_update_compute_capability,
+)
 
 
-def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+def _has_supported_gpu() -> bool:
+    return torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())
 
 
 pytestmark = [
     pytest.mark.L0,
-    pytest.mark.skipif(not _is_sm100(), reason="requires exactly SM100 (compute capability 10.0)"),
+    pytest.mark.skipif(not _has_supported_gpu(), reason="requires a functionally supported GPU architecture"),
 ]
 
 
@@ -81,7 +84,7 @@ def test_nonzero_state_across_consecutive_steps():
 
 @torch.no_grad()
 @pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_no_index_row_batch_specialization(n_channels):
+def test_n128_no_index_measured_shape_correctness(n_channels):
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(29 + n_channels)
     n_rows = 128
@@ -90,7 +93,8 @@ def test_n128_no_index_row_batch_specialization(n_channels):
     expected_state = state.clone()
 
     # Use the public cached route for two updates.  The host-only contract test
-    # independently proves that these two descriptors select rows_per_cta=2.
+    # independently proves that these descriptors select rows_per_cta=2 only
+    # on SM100 and the conservative one-row schedule elsewhere.
     for _ in range(2):
         x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
         expected_output, expected_state = _reference_step(x, weight, expected_state)
@@ -101,14 +105,14 @@ def test_n128_no_index_row_batch_specialization(n_channels):
 
 @torch.no_grad()
 @pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_row_batch_state_shift_is_bitwise(n_channels):
+def test_n128_measured_shape_state_shift_is_bitwise(n_channels):
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(41 + n_channels)
     n_rows = 128
 
-    # Exercise arbitrary BF16 payloads through the specialized public/cache
-    # route.  Ignore output: NaN payloads make only the state mutation contract
-    # meaningful, and that contract must remain bitwise over repeated steps.
+    # Exercise arbitrary BF16 payloads through the public/cache route.  Ignore
+    # output: NaN payloads make only the state mutation contract meaningful,
+    # and that contract must remain bitwise over repeated steps.
     state_bits = torch.randint(
         -(2**15),
         2**15,

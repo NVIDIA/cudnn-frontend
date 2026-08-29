@@ -10,18 +10,30 @@ import importlib
 import sys
 import types
 
+import cudnn.fla as fla_api
 import pytest
 import torch
-
-import cudnn.fla as fla_api
 
 short_conv = importlib.import_module("cudnn.fla.short_conv")
 
 pytestmark = pytest.mark.L0
 
+_SUPPORTED_COMPUTE_CAPABILITIES = (
+    (8, 0),
+    (8, 6),
+    (8, 7),
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+)
+
 
 @pytest.fixture
-def mock_sm100(monkeypatch):
+def mock_supported_arch(monkeypatch):
     monkeypatch.setattr(short_conv, "_is_cuda_tensor", lambda tensor: True)
     monkeypatch.setattr(short_conv, "_device_capability", lambda device: (10, 0))
     monkeypatch.setattr(short_conv, "_is_compiling", lambda: False)
@@ -46,7 +58,7 @@ def _original_spy(calls):
 
 
 @pytest.mark.parametrize("shape", [(3, 8), (3, 1, 8), (1, 3, 8)])
-def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(mock_sm100, monkeypatch, shape):
+def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(mock_supported_arch, monkeypatch, shape):
     x, weight, cache = _inputs(shape)
     fallback_calls = []
     native_calls = []
@@ -72,17 +84,37 @@ def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(
     assert short_conv.last_path() == "native"
 
 
-def test_sm110_calls_original_once_without_native_and_preserves_cache_identity(monkeypatch):
+@pytest.mark.parametrize("capability", _SUPPORTED_COMPUTE_CAPABILITIES)
+def test_supported_architectures_enter_native_route(monkeypatch, capability):
     x, weight, cache = _inputs()
     fallback_calls = []
     native_calls = []
     monkeypatch.setattr(short_conv, "_is_cuda_tensor", lambda tensor: True)
-    monkeypatch.setattr(short_conv, "_device_capability", lambda device: (11, 0))
+    monkeypatch.setattr(short_conv, "_device_capability", lambda device: capability)
+    monkeypatch.setattr(short_conv, "_is_compiling", lambda: False)
+    monkeypatch.setattr(short_conv, "_call_native", lambda *args: native_calls.append(args) or args[0].clone())
+    wrapped = short_conv.make_causal_conv1d_update(_original_spy(fallback_calls))
+
+    output, returned_cache = wrapped(x, cache, weight=weight, activation="silu")
+
+    assert output.shape == x.shape
+    assert returned_cache is cache
+    assert len(native_calls) == 1
+    assert fallback_calls == []
+    assert short_conv.last_path() == "native"
+
+
+def test_unlisted_arch_calls_original_once_without_native_and_preserves_cache_identity(monkeypatch):
+    x, weight, cache = _inputs()
+    fallback_calls = []
+    native_calls = []
+    monkeypatch.setattr(short_conv, "_is_cuda_tensor", lambda tensor: True)
+    monkeypatch.setattr(short_conv, "_device_capability", lambda device: (11, 1))
     monkeypatch.setattr(short_conv, "_is_compiling", lambda: False)
 
     def native(*args):
         native_calls.append(args)
-        pytest.fail("SM110 must not enter the SM100 native route")
+        pytest.fail("an unlisted architecture must not enter the native route")
 
     monkeypatch.setattr(short_conv, "_call_native", native)
     wrapped = short_conv.make_causal_conv1d_update(_original_spy(fallback_calls))
@@ -94,7 +126,7 @@ def test_sm110_calls_original_once_without_native_and_preserves_cache_identity(m
     assert len(fallback_calls) == 1
     assert fallback_calls[0][1] is cache
     assert native_calls == []
-    assert short_conv.last_path() == "fallback:non-sm100"
+    assert short_conv.last_path() == "fallback:unsupported-arch"
 
 
 @pytest.mark.parametrize(
@@ -112,7 +144,7 @@ def test_sm110_calls_original_once_without_native_and_preserves_cache_identity(m
         (lambda x, weight, cache: {"weight": weight[:, :3].contiguous()}, "shape"),
     ],
 )
-def test_unsupported_variants_call_original_unchanged(mock_sm100, monkeypatch, mutation, reason):
+def test_unsupported_variants_call_original_unchanged(mock_supported_arch, monkeypatch, mutation, reason):
     x, weight, cache = _inputs()
     args = {"x": x, "cache": cache, "residual": None, "weight": weight, "bias": None, "activation": "swish"}
     args.update(mutation(x, weight, cache))
@@ -138,7 +170,7 @@ def test_unsupported_variants_call_original_unchanged(mock_sm100, monkeypatch, m
 
 
 @pytest.mark.parametrize("error", [NotImplementedError, short_conv.cudnn.cudnnGraphNotSupportedError, ImportError])
-def test_typed_native_decline_falls_back(mock_sm100, monkeypatch, error):
+def test_typed_native_decline_falls_back(mock_supported_arch, monkeypatch, error):
     x, weight, cache = _inputs()
     fallback_calls = []
     monkeypatch.setattr(short_conv, "_call_native", lambda *unused: (_ for _ in ()).throw(error("declined")))
@@ -156,7 +188,7 @@ def test_typed_native_decline_falls_back(mock_sm100, monkeypatch, error):
     assert short_conv.last_path() == f"fallback:{error.__name__}"
 
 
-def test_unexpected_native_error_is_not_swallowed(mock_sm100, monkeypatch):
+def test_unexpected_native_error_is_not_swallowed(mock_supported_arch, monkeypatch):
     x, weight, cache = _inputs()
     fallback_calls = []
     monkeypatch.setattr(short_conv, "_call_native", lambda *unused: (_ for _ in ()).throw(RuntimeError("launch failed")))

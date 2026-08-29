@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 BF16 causal-convolution decode update kernel.
+"""BF16 causal-convolution decode update kernel.
 
 The state transition follows the public ``causal_conv1d_update`` contract used
 by FLA's ``ShortConvolution.step``: shift the four-element history left, append
@@ -17,10 +17,11 @@ Semantic references consulted:
   (BSD-3-Clause), revision ``cd81f0413cad2fc1e6f17e785ac39f59aae690cd``.
 
 Only the four-wide, BF16, no-bias, SiLU inference specialization lives here.
-The general and indexed kernel assigns one decode row to each CTA.  A narrow
-``N=128`` no-index specialization assigns two rows to a CTA and reuses each
-channel's weight vector across them.  That scheduling idea came from audited
-internal Kernel Factory candidate
+The general and indexed kernel assigns one decode row to each CTA.  On exact
+SM100, a narrow ``N=128`` no-index specialization assigns two rows to a CTA and
+reuses each channel's weight vector across them.  Every other admitted
+architecture uses the one-row schedule.  The two-row scheduling idea came from
+audited internal Kernel Factory candidate
 ``73d90c7fa5ae2e3e2ceb195bfa5af4db87cff8aaaefb7938cdd96b3128dd3a2e``;
 the standalone candidate source is not included here.  This is an independent
 FE-native implementation which retains the original inline-PTX data path.
@@ -44,15 +45,18 @@ def select_rows_per_cta(
     n_rows: int,
     n_channels: int,
     has_state_indices: bool,
+    *,
+    use_sm100_optimized_schedule: bool,
 ) -> int:
-    """Select the audited two-row schedule only for its measured domain.
+    """Select the audited SM100 two-row schedule only for its measured domain.
 
     Indexed calls deliberately retain one-row CTAs: their per-row range and
     duplicate validation is part of the mutation contract, and the Kernel
-    Factory artifact did not implement that ABI.
+    Factory artifact did not implement that ABI.  Non-SM100 architectures also
+    retain one-row CTAs because the two-row schedule was only tuned on SM100.
     """
 
-    if not has_state_indices and (n_rows, n_channels) in ROW_BATCH_SHAPES:
+    if use_sm100_optimized_schedule and not has_state_indices and (n_rows, n_channels) in ROW_BATCH_SHAPES:
         return ROW_BATCH_ROWS
     return 1
 
@@ -84,8 +88,8 @@ def _causal_conv1d_update_kernel(
         slot = cutlass.Int32(state_indices[row])
         if tidx == cutlass.Int32(0):
             # CuTe's testing assert lowers away in release device builds.  PTX
-            # trap is the fail-closed primitive here and is covered by exact
-            # SM100 subprocess tests for every invalid-index class.
+            # trap is the fail-closed primitive here and is covered by GPU
+            # subprocess tests for every invalid-index class.
             inline_ptx("trap;", predicate=slot < cutlass.Int32(0))
             inline_ptx("trap;", predicate=slot >= n_slots)
 
@@ -155,7 +159,7 @@ def _causal_conv1d_update_kernel(
 
 
 class CausalConv1dUpdateKernel:
-    """Host launcher for the fixed SM100 decode specialization."""
+    """Host launcher for the portable one-row decode specialization."""
 
     @cute.jit
     def __call__(

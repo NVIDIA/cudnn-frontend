@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""B200 route and parity gates for the FLA decode short-convolution shim."""
+"""Supported-GPU route and parity gates for the FLA short-convolution shim."""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from importlib import metadata
 
 import pytest
 import torch
+from cudnn._causal_conv1d_arch import (
+    is_supported_causal_conv1d_update_compute_capability,
+)
 
 fla_ops = pytest.importorskip("fla.modules.conv.triton.ops")
 fla_short_conv = pytest.importorskip("fla.modules.conv.short_conv")
@@ -28,8 +31,8 @@ from cudnn.fla import (
 pytestmark = [
     pytest.mark.L0,
     pytest.mark.skipif(
-        not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)),
-        reason="the native decode short-convolution update requires exact SM100",
+        not (torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())),
+        reason="the native decode short-convolution update requires a functionally supported GPU architecture",
     ),
     pytest.mark.skipif(
         _FLA_VERSION != "0.5.2",

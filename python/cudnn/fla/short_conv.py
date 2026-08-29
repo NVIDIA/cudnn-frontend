@@ -18,6 +18,9 @@ from importlib import metadata
 import torch
 
 import cudnn
+from cudnn._causal_conv1d_arch import (
+    is_supported_causal_conv1d_update_compute_capability,
+)
 
 _SUPPORTED_FLA_VERSION = "0.5.2"
 _DECLINE_ERRORS = (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
@@ -78,8 +81,8 @@ def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tenso
         raise ValueError("non-cuda")
     if not (x.device == weight.device == cache.device):
         raise ValueError("device")
-    if _device_capability(x.device) != (10, 0):
-        raise ValueError("non-sm100")
+    if not is_supported_causal_conv1d_update_compute_capability(_device_capability(x.device)):
+        raise ValueError("unsupported-arch")
     if not (x.is_contiguous() and weight.is_contiguous() and cache.is_contiguous()):
         raise ValueError("noncontiguous")
 
