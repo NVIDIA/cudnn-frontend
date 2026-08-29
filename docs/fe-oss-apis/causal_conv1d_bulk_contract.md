@@ -71,7 +71,8 @@ When `output_final_state=False`, `final_state_tensor` is a CUDA BF16 sentinel
 with shape `(0,)`. An FLA adapter must translate that sentinel to `None`.
 
 The lower-level class API follows the common FE-OSS lifecycle: construct it
-from representative tensors, call `check_support()`, call `compile()` once,
+from representative PyTorch tensors (metadata-only `TensorDesc` inputs are not
+accepted), call `check_support()`, call `compile()` once,
 then call `execute()` with preallocated output tensors. `B`, `D`, packed `N`,
 and optional-tensor presence are compile-signature properties; `T` is symbolic
 and may change between executions within the indexing limits above. Both APIs

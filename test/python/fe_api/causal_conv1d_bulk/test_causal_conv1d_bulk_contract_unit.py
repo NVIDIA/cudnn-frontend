@@ -96,6 +96,24 @@ def test_support_accepts_a_source_dsl_without_distribution_metadata(monkeypatch)
     assert api.check_support()
 
 
+def test_constructor_rejects_metadata_only_tensor_descriptors():
+    _, api_class, _ = _load_public_api()
+    from cudnn.api_base import TensorDesc
+
+    sample_x = TensorDesc(
+        dtype=torch.bfloat16,
+        shape=(1, 2, 8),
+        stride=(16, 8, 1),
+        stride_order=(2, 1, 0),
+        device=torch.device("cuda"),
+    )
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    output = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match=r"sample_x must be a torch.Tensor, got TensorDesc"):
+        api_class(sample_x, weight, output)
+
+
 def test_top_level_lazy_exports_resolve_from_a_clean_source_package(tmp_path):
     # The suite normally overlays this operation onto a prebuilt frontend. Use
     # a fresh interpreter and this checkout's __init__.py to exercise the

@@ -159,7 +159,7 @@ def test_dense_class_nonzero_state_final_state_and_decode_recurrence():
         )
     with pytest.raises(TypeError, match="Output dtype mismatch"):
         api.execute(x, weight, output.float(), initial_state_tensor=initial_state, final_state_tensor=final_state)
-    with pytest.raises(ValueError, match="Output must be.*contiguous"):
+    with pytest.raises(ValueError, match=r"Output must be.*contiguous"):
         api.execute(
             x,
             weight,
@@ -547,6 +547,7 @@ os._exit(9)
 def test_invalid_cu_seqlens_fail_closed_in_fresh_process(case):
     # A PTX trap poisons its CUDA context, so isolate each metadata class and
     # first prove that the same compiled object accepts valid boundaries.
+    _load_class()
     source_cudnn = Path(__file__).resolve().parents[4] / "python" / "cudnn"
     environment = os.environ.copy()
     environment["PYTHONNOUSERSITE"] = "1"

@@ -117,6 +117,17 @@ class CausalConv1dBulkFwdSm100(APIBase):
         super().__init__()
         self._warn_experimental_api()
 
+        for name, sample in (
+            ("sample_x", sample_x),
+            ("sample_weight", sample_weight),
+            ("sample_output", sample_output),
+            ("sample_cu_seqlens", sample_cu_seqlens),
+            ("sample_initial_state", sample_initial_state),
+            ("sample_final_state", sample_final_state),
+        ):
+            if sample is not None and not isinstance(sample, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor, got {type(sample).__name__}")
+
         self.x_desc = self._make_tensor_desc(sample_x, name="sample_x")
         self.weight_desc = self._make_tensor_desc(sample_weight, name="sample_weight")
         self.output_desc = self._make_tensor_desc(sample_output, name="sample_output")
