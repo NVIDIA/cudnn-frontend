@@ -81,10 +81,9 @@ from cudnn import DSA
 DSA.SparseAttentionBackward
 DSA.sparse_attention_backward_wrapper
 
-DSA.plan_flashmla_sparse_forward
-DSA.flashmla_sparse_forward_wrapper
-DSA.flashmla_cudnn_sparse_attention_wrapper
-DSA.flashmla_sparse_score_recompute_wrapper
+DSA.flashmla_sparse_forward
+DSA.flashmla_sparse_attention
+DSA.flashmla_sparse_score_recompute
 
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
@@ -124,7 +123,7 @@ The bridge imports `flash_mla` only when called and invokes the external
 `flash_mla_sparse_fwd` symbol. It was developed against official FlashMLA
 commit `15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor
 vLLM implementation source is present in this repository. A missing or
-incompatible optional dependency raises `FlashMLABridgeUnavailableError`
+incompatible optional dependency raises `FlashMLAUnavailableError`
 instead of falling back to a different forward.
 
 The initial functional contract is exact SM100 (validated on ComputeLab B200),
@@ -150,7 +149,7 @@ positions to `-1`, and returns those effective `indices` beside the aligned
 tails are padded with `-1` and removed from returned results.
 
 ```python
-result = DSA.flashmla_cudnn_sparse_attention_wrapper(
+result = DSA.flashmla_sparse_attention(
     q, kv, topk_idxs, attn_sink,
     softmax_scale=1.0 / math.sqrt(q.shape[-1]),
     topk_length=topk_length,
@@ -159,7 +158,7 @@ result = DSA.flashmla_cudnn_sparse_attention_wrapper(
 loss = result["output"].float().square().mean()
 loss.backward()  # cuDNN DSA backward: q.grad, kv.grad, attn_sink.grad
 
-score = DSA.flashmla_sparse_score_recompute_wrapper(
+score = DSA.flashmla_sparse_score_recompute(
     q.detach(), kv.detach(), result["lse"], topk_idxs,
     softmax_scale=1.0 / math.sqrt(q.shape[-1]),
     topk_length=topk_length,

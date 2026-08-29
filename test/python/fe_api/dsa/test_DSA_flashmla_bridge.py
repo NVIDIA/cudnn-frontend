@@ -33,7 +33,7 @@ pytestmark = pytest.mark.L0
     ],
 )
 def test_flashmla_bridge_plan(heads, head_dim, topk, launch_heads, launch_topk, tile):
-    plan = bridge.plan_flashmla_sparse_forward(heads, head_dim, topk)
+    plan = bridge._plan_flashmla_sparse_forward(heads, head_dim, topk)
     assert plan.launch_num_heads == launch_heads
     assert plan.launch_topk == launch_topk
     assert plan.topk_tile == tile
@@ -51,7 +51,7 @@ def test_flashmla_bridge_plan(heads, head_dim, topk, launch_heads, launch_topk, 
 )
 def test_flashmla_bridge_plan_rejects_unsupported_contract(heads, head_dim, topk, error):
     with pytest.raises((TypeError, ValueError), match=error):
-        bridge.plan_flashmla_sparse_forward(heads, head_dim, topk)
+        bridge._plan_flashmla_sparse_forward(heads, head_dim, topk)
 
 
 def test_flashmla_bridge_zero_copy_views_when_aligned():
@@ -59,7 +59,7 @@ def test_flashmla_bridge_zero_copy_views_when_aligned():
     kv = torch.randn(7, 512, dtype=torch.bfloat16)
     indices = torch.zeros(2, 64, dtype=torch.int32)
     sink = torch.randn(64, dtype=torch.float32)
-    plan = bridge.plan_flashmla_sparse_forward(64, 512, 64)
+    plan = bridge._plan_flashmla_sparse_forward(64, 512, 64)
 
     launch = bridge._prepare_flashmla_launch_inputs(q, kv, indices, sink, None, plan)
 
@@ -77,7 +77,7 @@ def test_flashmla_bridge_pads_heads_and_only_the_topk_tail():
     indices = torch.arange(65, dtype=torch.int32).expand(2, -1).contiguous()
     sink = torch.randn(32, dtype=torch.float32)
     lengths = torch.tensor([65, 7], dtype=torch.int32)
-    plan = bridge.plan_flashmla_sparse_forward(32, 576, 65)
+    plan = bridge._plan_flashmla_sparse_forward(32, 576, 65)
 
     launch = bridge._prepare_flashmla_launch_inputs(q, kv, indices, sink, lengths, plan)
 
@@ -101,16 +101,16 @@ def test_flashmla_dependency_is_lazy_and_missing_dependency_fails_closed(monkeyp
         raise ModuleNotFoundError(name)
 
     monkeypatch.setattr(bridge, "import_module", unavailable)
-    bridge.plan_flashmla_sparse_forward(64, 512, 64)
+    bridge._plan_flashmla_sparse_forward(64, 512, 64)
     assert calls == []
-    with pytest.raises(bridge.FlashMLABridgeUnavailableError, match="official deepseek-ai/FlashMLA"):
+    with pytest.raises(bridge.FlashMLAUnavailableError, match="official deepseek-ai/FlashMLA"):
         bridge._resolve_flashmla_sparse_fwd()
     assert calls == ["flash_mla"]
 
 
 def test_flashmla_dependency_without_sparse_entrypoint_fails_closed(monkeypatch):
     monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace())
-    with pytest.raises(bridge.FlashMLABridgeUnavailableError, match="flash_mla_sparse_fwd"):
+    with pytest.raises(bridge.FlashMLAUnavailableError, match="flash_mla_sparse_fwd"):
         bridge._resolve_flashmla_sparse_fwd()
 
 
@@ -123,7 +123,7 @@ def test_flashmla_training_bridge_requires_sink_before_dependency_resolution(
         lambda: pytest.fail("dependency must not be loaded"),
     )
     with pytest.raises(ValueError, match="attn_sink is required"):
-        bridge.flashmla_cudnn_sparse_attention_wrapper(None, None, None, None)
+        bridge.flashmla_sparse_attention(None, None, None, None)
 
 
 def test_flashmla_training_metadata_normalizes_all_invalid_sentinels_without_lengths():
@@ -189,7 +189,7 @@ def test_flashmla_training_trusted_compact_metadata_is_identity_fast_path():
 
 def test_flashmla_training_trusted_compact_metadata_requires_bool():
     with pytest.raises(TypeError, match="trusted_compact_metadata must be a bool"):
-        bridge.flashmla_cudnn_sparse_attention_wrapper(
+        bridge.flashmla_sparse_attention(
             None,
             None,
             None,
@@ -205,7 +205,7 @@ def _require_b200_flashmla():
         pytest.skip("exact NVIDIA B200 required")
     try:
         return bridge._resolve_flashmla_sparse_fwd()
-    except bridge.FlashMLABridgeUnavailableError as exc:
+    except bridge.FlashMLAUnavailableError as exc:
         pytest.skip(str(exc))
 
 
@@ -230,7 +230,7 @@ def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk):
     indices[1, 1] = -9
     lengths = torch.tensor([topk, topk - 1, topk // 2, 1], dtype=torch.int32, device=device)
 
-    actual = bridge.flashmla_sparse_forward_wrapper(
+    actual = bridge.flashmla_sparse_forward(
         q,
         kv,
         indices,
@@ -262,7 +262,7 @@ def test_flashmla_cudnn_training_and_score_recompute_match_references():
     indices[1, 1] = -9
     lengths = torch.tensor([topk + 11, topk - 1, topk // 2, 1], dtype=torch.int32, device=device)
 
-    result = bridge.flashmla_cudnn_sparse_attention_wrapper(
+    result = bridge.flashmla_sparse_attention(
         q,
         kv,
         indices,
@@ -290,7 +290,7 @@ def test_flashmla_cudnn_training_and_score_recompute_match_references():
         rtol=5e-2,
     )
 
-    score = bridge.flashmla_sparse_score_recompute_wrapper(
+    score = bridge.flashmla_sparse_score_recompute(
         q.detach(),
         kv.detach(),
         result["lse"],
@@ -333,7 +333,7 @@ def test_flashmla_cudnn_deepseek_v32_h128_d576_k2048_contract():
     indices = torch.randperm(s_kv, device=device)[:topk].reshape(s_q, topk).to(torch.int32)
     lengths = torch.full((s_q,), topk, dtype=torch.int32, device=device)
 
-    result = bridge.flashmla_cudnn_sparse_attention_wrapper(
+    result = bridge.flashmla_sparse_attention(
         q,
         kv,
         indices,

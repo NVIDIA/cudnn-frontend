@@ -45,12 +45,12 @@ _MAX_C_STRIDE = (1 << 31) - 1
 _SCORE_TOPK_TILE = 128
 
 
-class FlashMLABridgeUnavailableError(RuntimeError):
+class FlashMLAUnavailableError(RuntimeError):
     """The external FlashMLA sparse-forward dependency is unavailable."""
 
 
 @dataclass(frozen=True)
-class FlashMLASparseForwardPlan:
+class _FlashMLASparseForwardPlan:
     """Host-side launch adaptation for the external FlashMLA kernel."""
 
     num_heads: int
@@ -77,7 +77,7 @@ class _FlashMLALaunchInputs:
     indices: torch.Tensor
     attn_sink: Optional[torch.Tensor]
     topk_length: Optional[torch.Tensor]
-    plan: FlashMLASparseForwardPlan
+    plan: _FlashMLASparseForwardPlan
 
 
 def _require_plain_int(value: int, name: str) -> int:
@@ -90,11 +90,11 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def plan_flashmla_sparse_forward(
+def _plan_flashmla_sparse_forward(
     num_heads: int,
     head_dim: int,
     topk: int,
-) -> FlashMLASparseForwardPlan:
+) -> _FlashMLASparseForwardPlan:
     """Plan the minimal H/Top-K padding without importing FlashMLA or CUDA.
 
     On the pinned upstream SM100 implementation, the H64 path consumes Top-K
@@ -116,7 +116,7 @@ def plan_flashmla_sparse_forward(
     launch_num_heads = 64 if num_heads <= 64 else 128
     use_h128_small_topk = launch_num_heads == 128 and head_dim == 512 and topk <= 1280
     topk_tile = 64 if launch_num_heads == 64 or use_h128_small_topk else 128
-    return FlashMLASparseForwardPlan(
+    return _FlashMLASparseForwardPlan(
         num_heads=num_heads,
         launch_num_heads=launch_num_heads,
         head_dim=head_dim,
@@ -133,11 +133,11 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
     try:
         flash_mla = import_module("flash_mla")
     except Exception as exc:
-        raise FlashMLABridgeUnavailableError(f"Cannot import optional dependency 'flash_mla'. {_FLASHMLA_INSTALL_HINT}") from exc
+        raise FlashMLAUnavailableError(f"Cannot import optional dependency 'flash_mla'. {_FLASHMLA_INSTALL_HINT}") from exc
 
     sparse_fwd = getattr(flash_mla, "flash_mla_sparse_fwd", None)
     if not callable(sparse_fwd):
-        raise FlashMLABridgeUnavailableError("The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}")
+        raise FlashMLAUnavailableError("The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}")
     return sparse_fwd
 
 
@@ -161,7 +161,7 @@ def _validate_flashmla_contract(
     attn_sink: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     softmax_scale: Optional[float],
-) -> tuple[FlashMLASparseForwardPlan, float]:
+) -> tuple[_FlashMLASparseForwardPlan, float]:
     q = _check_tensor(q, "q")
     kv = _check_tensor(kv, "kv")
     indices = _check_tensor(indices, "indices")
@@ -184,7 +184,7 @@ def _validate_flashmla_contract(
         raise ValueError(f"kv must have shape (S_kv, {head_dim}), got {tuple(kv.shape)}")
     if indices.shape[0] != s_q:
         raise ValueError(f"indices must have shape ({s_q}, topk), got {tuple(indices.shape)}")
-    plan = plan_flashmla_sparse_forward(num_heads, head_dim, indices.shape[1])
+    plan = _plan_flashmla_sparse_forward(num_heads, head_dim, indices.shape[1])
 
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q must have dtype torch.bfloat16, got {q.dtype}")
@@ -244,7 +244,7 @@ def _prepare_flashmla_launch_inputs(
     indices: torch.Tensor,
     attn_sink: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
-    plan: FlashMLASparseForwardPlan,
+    plan: _FlashMLASparseForwardPlan,
 ) -> _FlashMLALaunchInputs:
     """Apply only the singleton-head views and padding described by ``plan``."""
 
@@ -379,7 +379,7 @@ def _launch_flashmla_sparse_forward(
     indices: torch.Tensor,
     attn_sink: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
-    plan: FlashMLASparseForwardPlan,
+    plan: _FlashMLASparseForwardPlan,
     scale: float,
     sparse_fwd: Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ) -> TupleDict:
@@ -427,7 +427,7 @@ def _run_flashmla_sparse_forward(
     return result, scale
 
 
-def flashmla_sparse_forward_wrapper(
+def flashmla_sparse_forward(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -443,7 +443,7 @@ def flashmla_sparse_forward_wrapper(
     must contain values in ``[0, topk]``.  The returned ``lse`` excludes the
     attention sink, matching cuDNN DSA backward.
 
-    Use :func:`flashmla_cudnn_sparse_attention_wrapper` for training.
+    Use :func:`flashmla_sparse_attention` for an autograd-enabled call.
     """
 
     result, _ = _run_flashmla_sparse_forward(q, kv, indices, attn_sink, topk_length, softmax_scale)
@@ -521,7 +521,7 @@ class _FlashMLACudnnSparseAttention(torch.autograd.Function):
         )
 
 
-def flashmla_cudnn_sparse_attention_wrapper(
+def flashmla_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -566,7 +566,7 @@ def flashmla_cudnn_sparse_attention_wrapper(
     return TupleDict(output=output, max_logits=max_logits, lse=lse)
 
 
-def flashmla_sparse_score_recompute_wrapper(
+def flashmla_sparse_score_recompute(
     q: torch.Tensor,
     kv: torch.Tensor,
     lse: torch.Tensor,
@@ -624,10 +624,8 @@ def flashmla_sparse_score_recompute_wrapper(
 
 
 __all__ = [
-    "FlashMLABridgeUnavailableError",
-    "FlashMLASparseForwardPlan",
-    "plan_flashmla_sparse_forward",
-    "flashmla_sparse_forward_wrapper",
-    "flashmla_cudnn_sparse_attention_wrapper",
-    "flashmla_sparse_score_recompute_wrapper",
+    "FlashMLAUnavailableError",
+    "flashmla_sparse_forward",
+    "flashmla_sparse_attention",
+    "flashmla_sparse_score_recompute",
 ]
