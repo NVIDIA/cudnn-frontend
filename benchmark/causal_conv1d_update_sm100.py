@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""B200-only decode microbenchmark for the SM100 causal-conv operation.
+"""Decode microbenchmark for the causal-convolution update operation.
 
 This compares the direct low-level cuDNN Frontend API against FLA 0.5.2's
 public Triton update operation at representative Qwen3.5-9B decode shapes.  Q
@@ -24,17 +24,16 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import platform
 import statistics
 import subprocess
 import sys
+from pathlib import Path
 from typing import Callable, NamedTuple
 
+import cudnn
 import torch
 import torch.nn.functional as F
-
-import cudnn
 
 # Execute the Python sources from this checkout while retaining the installed
 # package's compiled extension.  This mirrors the focused pytest overlay and
@@ -43,6 +42,10 @@ _SOURCE_CUDNN = Path(__file__).resolve().parents[1] / "python" / "cudnn"
 if str(_SOURCE_CUDNN) not in cudnn.__path__:
     cudnn.__path__.insert(0, str(_SOURCE_CUDNN))
 
+from cudnn._causal_conv1d_arch import (
+    is_supported_causal_conv1d_update_compute_capability,
+    supported_causal_conv1d_update_compute_capabilities_text,
+)
 from cudnn.causal_conv1d_update_sm100 import CausalConv1dUpdateSm100
 from fla.modules.conv.triton.ops import causal_conv1d_update as fla_causal_conv1d_update
 
@@ -103,6 +106,15 @@ def _package_version(name: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return "not-installed"
+
+
+def _slurm_provenance() -> dict[str, str | None]:
+    """Return optional scheduler metadata without restricting where the benchmark runs."""
+
+    return {
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurmd_node_name": os.environ.get("SLURMD_NODENAME"),
+    }
 
 
 def _module_path(module_name: str) -> Path:
@@ -363,6 +375,7 @@ def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Na
     fla_kernel_path = _module_path("fla.modules.conv.triton.kernels")
     device = torch.cuda.current_device()
     properties = torch.cuda.get_device_properties(device)
+    capability = tuple(torch.cuda.get_device_capability(device))
     device_uuid = str(properties.uuid)
     return {
         "schema_version": 1,
@@ -400,16 +413,14 @@ def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Na
         },
         "hardware": {
             "name": properties.name,
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
+            "architecture": f"sm_{capability[0]}{capability[1]}",
+            "compute_capability": list(capability),
             "device_index": device,
             "uuid": device_uuid,
             "driver": _nvidia_driver_for_uuid(device_uuid),
             "total_memory_bytes": properties.total_memory,
         },
-        "computelab": {
-            "slurm_job_id": os.environ["SLURM_JOB_ID"],
-            "slurmd_node_name": os.environ["SLURMD_NODENAME"],
-        },
+        "slurm": _slurm_provenance(),
         "software": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -438,18 +449,12 @@ def _metadata(repo: Path, shapes: tuple[tuple[int, int], ...], args: argparse.Na
 def _validate_environment() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
-    properties = torch.cuda.get_device_properties()
-    capability = torch.cuda.get_device_capability()
-    if properties.name != "NVIDIA B200":
-        raise RuntimeError(f"benchmark requires runtime name exactly 'NVIDIA B200', found {properties.name!r}")
-    if capability != (10, 0):
-        raise RuntimeError(f"benchmark requires exactly SM100, found {capability[0]}.{capability[1]}")
-    slurm_job_id = os.environ.get("SLURM_JOB_ID")
-    if not slurm_job_id or not slurm_job_id.isdecimal():
-        raise RuntimeError("benchmark requires a numeric SLURM_JOB_ID from ComputeLab")
-    node_name = os.environ.get("SLURMD_NODENAME")
-    if not node_name or not node_name.startswith(("umb-b200-", "umbriel-b200-")):
-        raise RuntimeError(f"benchmark requires an umb-b200/umbriel-b200 node, found {node_name!r}")
+    capability = tuple(torch.cuda.get_device_capability())
+    if not is_supported_causal_conv1d_update_compute_capability(capability):
+        raise RuntimeError(
+            "benchmark requires a functionally supported causal-conv compute capability "
+            f"({supported_causal_conv1d_update_compute_capabilities_text()}), found {capability[0]}.{capability[1]}"
+        )
     if CausalConv1dUpdateSm100.__module__ != "cudnn.causal_conv1d_update_sm100.api":
         raise RuntimeError(f"unexpected native route: {CausalConv1dUpdateSm100.__module__}")
     if fla_causal_conv1d_update.__module__ != "fla.modules.conv.triton.ops":

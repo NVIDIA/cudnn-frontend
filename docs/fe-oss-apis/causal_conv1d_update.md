@@ -151,9 +151,10 @@ geometric mean was `1.146x`. The raw result SHA-256 is
 These are direct kernel-active measurements, not single-node CUDA-graph replay
 or end-to-end model latency.
 
-Use `benchmark/causal_conv1d_update_sm100.py` on a ComputeLab B200 for
-route-proof, correctness, and interleaved comparison against FLA. The
-benchmark intentionally rejects non-SM100 devices: widening functional support
-does not widen the performance claim. Performance measurements must include
-the exact GPU, software environment, shapes, and raw artifacts; the indexed
-path should be reported separately from the no-index decode path.
+Use `benchmark/causal_conv1d_update_sm100.py` for route-proof, correctness, and
+an interleaved comparison against FLA on any compute capability listed in the
+supported contract. The benchmark records the actual GPU architecture and
+software environment; Slurm job and node metadata are optional when those
+variables are unavailable. Performance measurements should include the exact
+GPU, software environment, shapes, and raw artifacts; the indexed path should
+be reported separately from the no-index decode path.

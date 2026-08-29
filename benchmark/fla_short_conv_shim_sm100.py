@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exact FLA-shim benchmark for the SM100 causal-convolution decode update.
+"""Exact FLA-shim benchmark for the causal-convolution decode update.
 
 This benchmark measures the public callable installed by
 ``cudnn.fla.accelerate_fla(targets="short_conv")`` against the saved FLA 0.5.2
@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import platform
 import statistics
 import sys
@@ -467,6 +466,7 @@ def _route_and_metadata(repo: Path, benchmark_path: Path, original_fla: Callable
     fla_kernel_path = _base._module_path("fla.modules.conv.triton.kernels")
     device = torch.cuda.current_device()
     properties = torch.cuda.get_device_properties(device)
+    capability = tuple(torch.cuda.get_device_capability(device))
     device_uuid = str(properties.uuid)
     return {
         "schema_version": 1,
@@ -506,16 +506,14 @@ def _route_and_metadata(repo: Path, benchmark_path: Path, original_fla: Callable
         },
         "hardware": {
             "name": properties.name,
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
+            "architecture": f"sm_{capability[0]}{capability[1]}",
+            "compute_capability": list(capability),
             "device_index": device,
             "uuid": device_uuid,
             "driver": _base._nvidia_driver_for_uuid(device_uuid),
             "total_memory_bytes": properties.total_memory,
         },
-        "computelab": {
-            "slurm_job_id": os.environ["SLURM_JOB_ID"],
-            "slurmd_node_name": os.environ["SLURMD_NODENAME"],
-        },
+        "slurm": _base._slurm_provenance(),
         "software": {
             "python": platform.python_version(),
             "torch": torch.__version__,
