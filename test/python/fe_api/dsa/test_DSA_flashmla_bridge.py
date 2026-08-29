@@ -198,15 +198,70 @@ def test_flashmla_training_trusted_compact_metadata_requires_bool():
         )
 
 
-def _require_b200_flashmla():
+def _require_exact_b200():
     if not torch.cuda.is_available():
-        pytest.skip("exact NVIDIA B200 and official FlashMLA required")
+        pytest.skip("exact NVIDIA B200 required")
     if torch.cuda.get_device_capability() != (10, 0) or torch.cuda.get_device_name() != "NVIDIA B200":
         pytest.skip("exact NVIDIA B200 required")
+
+
+def _require_b200_flashmla():
+    _require_exact_b200()
     try:
         return bridge._resolve_flashmla_sparse_fwd()
     except bridge.FlashMLAUnavailableError as exc:
         pytest.skip(str(exc))
+
+
+@pytest.mark.parametrize(
+    "topk,launch_topk",
+    [
+        pytest.param(1, 128, id="k1-padded128"),
+        pytest.param(4, 128, id="k4-padded128"),
+        pytest.param(128, 128, id="k128-native"),
+        pytest.param(129, 256, id="k129-padded256"),
+        pytest.param(1152, 1152, id="k1152-native"),
+    ],
+)
+def test_flashmla_score_recompute_deepseek_v4_h128_d512_launch_envelope(monkeypatch, topk, launch_topk):
+    """Launch score recompute across the DeepSeek-V4 Top-K envelope."""
+
+    _require_exact_b200()
+    from cudnn.deepseek_sparse_attention.score_recompute import api as score_recompute_api
+
+    real_score_recompute = score_recompute_api.sparse_attn_score_recompute_wrapper
+    observed_launch_shapes = []
+
+    def record_launch(q, kv, lse, indices, *args, **kwargs):
+        observed_launch_shapes.append(tuple(indices.shape))
+        return real_score_recompute(q, kv, lse, indices, *args, **kwargs)
+
+    monkeypatch.setattr(score_recompute_api, "sparse_attn_score_recompute_wrapper", record_launch)
+    monkeypatch.setattr(
+        bridge,
+        "_resolve_flashmla_sparse_fwd",
+        lambda: pytest.fail("score recompute must not resolve or launch FlashMLA forward"),
+    )
+
+    device = torch.device("cuda")
+    s_q, s_kv, heads, head_dim = 1, 1152, 128, 512
+    q = torch.zeros((s_q, heads, head_dim), dtype=torch.bfloat16, device=device)
+    kv = torch.zeros((s_kv, head_dim), dtype=torch.bfloat16, device=device)
+    lse = torch.zeros((s_q, heads), dtype=torch.float32, device=device)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).unsqueeze(0)
+
+    result = bridge.flashmla_sparse_score_recompute(q, kv, lse, indices)
+    torch.cuda.synchronize()
+
+    assert observed_launch_shapes == [(1, s_q, launch_topk)]
+    assert torch.equal(result["indices"], indices)
+    assert result["target"].shape == indices.shape
+    torch.testing.assert_close(
+        result["target"],
+        torch.full_like(result["target"], 1.0 / topk),
+        atol=1e-6,
+        rtol=1e-4,
+    )
 
 
 @pytest.mark.parametrize(
