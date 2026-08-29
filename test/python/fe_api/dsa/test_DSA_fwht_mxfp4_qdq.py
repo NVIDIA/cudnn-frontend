@@ -68,7 +68,7 @@ def _qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
 
 
 def _packed_bf16_qdq_reference(rotated_bf16: torch.Tensor) -> torch.Tensor:
-    """Host model of the pinned round-one Kernel Factory candidate's QDQ."""
+    """Host model of the device kernel's packed power-of-two QDQ."""
 
     rows = rotated_bf16.numel() // 128
     groups = rotated_bf16.view(rows, 4, 32)
@@ -99,7 +99,7 @@ def _reference(input_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _legacy_combined_round_reference(input_tensor: torch.Tensor) -> torch.Tensor:
-    """Host model of the earlier round-one candidate, retained for regression."""
+    """Host model of the earlier combined-rounding schedule for regression."""
 
     rows = input_tensor.numel() // 128
     groups = _fwht_fp32(input_tensor).view(rows, 4, 32)
@@ -163,6 +163,37 @@ def test_packed_bf16_qdq_matches_reference_for_every_finite_bf16_on_host():
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+def test_packed_scale_bytes_match_reference_for_every_positive_finite_bf16_on_host():
+    positive_bits = torch.arange(0x0000, 0x7F80, dtype=torch.int32)
+    clamped_bits = torch.maximum(positive_bits, torch.tensor(0x01C0, dtype=torch.int32))
+
+    # The optimized kernel carries two group maxima in one packed word. Pair
+    # ascending and descending values so both halfwords exhaust the BF16 range.
+    packed_amax = clamped_bits.to(torch.int64) | (clamped_bits.flip(0).to(torch.int64) << 16)
+    biased_amax = packed_amax - 0x00C100C1
+    actual_low = (biased_amax & 0xFFFF) >> 7
+    actual_high = biased_amax >> 23
+
+    amax = positive_bits.to(torch.int16).view(torch.bfloat16).float()
+    floor = torch.tensor(6.0 * (2.0**-126), dtype=torch.float32)
+    scale = _pow2_ceil_positive(torch.maximum(amax, floor) * torch.tensor(1.0 / 6.0, dtype=torch.float32))
+    expected = (scale.contiguous().view(torch.int32).to(torch.int64) >> 23) & 0xFF
+
+    assert torch.equal(actual_low, expected)
+    assert torch.equal(actual_high, expected.flip(0))
+
+
+@pytest.mark.parametrize("rows", [15, 16, 17])
+def test_reference_is_row_local_at_current_cta_boundary_on_host(rows):
+    torch.manual_seed(20260829 + rows)
+    input_tensor = torch.randn((rows, 128), dtype=torch.bfloat16)
+
+    batched = _reference(input_tensor)
+    rowwise = torch.cat([_reference(input_tensor[row : row + 1]) for row in range(rows)])
+
+    assert torch.equal(batched, rowwise)
+
+
 def _subnormal_double_rounding_case():
     input_tensor = torch.zeros((1, 128), dtype=torch.bfloat16)
     input_bits = input_tensor.view(torch.int16)
@@ -176,7 +207,7 @@ def _subnormal_double_rounding_case():
 
 
 def test_bf16_boundary_precedes_inverse_scale_on_host():
-    """Lock down the case fixed by the pinned round-one Kernel Factory candidate."""
+    """Lock down the double-rounding case fixed by the baseline implementation."""
 
     _, expected, legacy = _subnormal_double_rounding_case()
 
@@ -215,7 +246,7 @@ def test_fwht_mxfp4_qdq_matches_exact_recipe(shape):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("rows", [63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize("rows", [15, 16, 17, 63, 64, 65, 127, 128, 129])
 def test_fwht_mxfp4_qdq_cta_row_boundaries(rows):
     _require_supported_device()
     from cudnn.ops import fwht_mxfp4_qdq
