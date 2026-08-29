@@ -20,6 +20,11 @@ from cutlass.cute.runtime import make_fake_stream
 import torch
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
+from cudnn._causal_conv1d_bulk_arch import (
+    FUNCTIONAL_COMPUTE_CAPABILITIES,
+    is_functional_arch,
+    uses_vec8_schedule,
+)
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 
 _API_CACHE = {}
@@ -32,37 +37,6 @@ _MAX_TOTAL_TOKENS = _INT32_MAX - 15
 # Packed kernels use ``(lower + upper) // 2`` during their device-side search.
 _MAX_PACKED_SEQUENCES = _INT32_MAX // 2
 _MAX_SCALAR_GRID_CHANNELS = 256 * 65535
-_FUNCTIONAL_COMPUTE_CAPABILITIES = frozenset(
-    {
-        (8, 0),
-        (8, 6),
-        (8, 7),
-        (8, 9),
-        (9, 0),
-        (10, 0),
-        (10, 3),
-        (11, 0),
-        (12, 0),
-        (12, 1),
-    }
-)
-_F32X2_COMPUTE_CAPABILITIES = frozenset(
-    {
-        (10, 0),
-        (10, 3),
-        (11, 0),
-        (12, 0),
-        (12, 1),
-    }
-)
-
-
-def _is_functional_arch(compute_capability: tuple[int, int]) -> bool:
-    return compute_capability in _FUNCTIONAL_COMPUTE_CAPABILITIES
-
-
-def _uses_vec8_schedule(compute_capability: tuple[int, int], n_channels: int) -> bool:
-    return compute_capability in _F32X2_COMPUTE_CAPABILITIES and n_channels % 8 == 0
 
 
 @contextmanager
@@ -336,12 +310,12 @@ class CausalConv1dBulkFwdSm100(APIBase):
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         compute_capability = torch.cuda.get_device_capability(self.x_desc.device)
         self._runtime_error_if(
-            not _is_functional_arch(compute_capability),
+            not is_functional_arch(compute_capability),
             "CausalConv1dBulkFwdSm100 does not support compute capability "
             f"{compute_capability[0]}.{compute_capability[1]}; supported capabilities are "
-            f"{sorted(_FUNCTIONAL_COMPUTE_CAPABILITIES)}",
+            f"{sorted(FUNCTIONAL_COMPUTE_CAPABILITIES)}",
         )
-        use_vec8_schedule = _uses_vec8_schedule(compute_capability, n_channels)
+        use_vec8_schedule = uses_vec8_schedule(compute_capability, n_channels)
         if not use_vec8_schedule:
             self._value_error_if(
                 batch_size * sequence_length * n_channels > _INT32_MAX,
@@ -581,7 +555,7 @@ def _cache_key(
         if num_sequences > total_tokens:
             raise ValueError(f"Packed N={num_sequences} cannot exceed total_T={total_tokens} " "when every sequence must be non-empty")
     compute_capability = torch.cuda.get_device_capability(x_tensor.device)
-    use_vec8_schedule = _uses_vec8_schedule(compute_capability, n_channels)
+    use_vec8_schedule = uses_vec8_schedule(compute_capability, n_channels)
     if not use_vec8_schedule:
         if x_tensor.numel() > _INT32_MAX:
             raise ValueError(f"The scalar schedule requires X to contain at most {_INT32_MAX} elements")
