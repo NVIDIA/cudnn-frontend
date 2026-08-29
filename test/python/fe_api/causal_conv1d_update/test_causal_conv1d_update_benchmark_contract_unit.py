@@ -78,6 +78,24 @@ def test_default_matrix_uses_fused_qkv_model_channels(monkeypatch):
     assert all(channels not in (2048, 4096) for _, channels in benchmark.DEFAULT_SHAPES)
 
 
+def test_fla_shim_smoke_uses_model_faithful_fused_qkv_width():
+    benchmark_path = _REPO_ROOT / "benchmark" / "fla_short_conv_shim_sm100.py"
+    tree = ast.parse(benchmark_path.read_text())
+    assignments = {
+        target.id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id in {"SMOKE_N", "SMOKE_D"}
+    }
+
+    assert assignments == {"SMOKE_N": 8, "SMOKE_D": 8192}
+    docstring = ast.get_docstring(tree)
+    assert docstring is not None
+    assert "D={6144,8192,10240,12288,20480}" in docstring
+    assert "D={2048,4096}" not in docstring
+
+
 def test_benchmark_accepts_supported_architectures_without_slurm(monkeypatch):
     benchmark = _load_benchmark(monkeypatch)
     monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: True)

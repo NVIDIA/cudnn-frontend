@@ -22,9 +22,11 @@ Two intentionally separate steady-state metrics are reported:
 Timing is fail-closed unless the exact monkeypatch route is proven and both
 arms pass full-output FP32-reference, bitwise-state, cache-identity, and cross
 implementation gates.  The timed Qwen decode layout is ``[N, 1, D]`` for
-``N={1,8,32,128}``, ``D={2048,4096}``, and ``W=4``.  The other admitted input
+``N={1,8,32,128}``, ``D={6144,8192,10240,12288,20480}``, and ``W=4``.  These
+are the fused-QKV channel counts used by published Qwen3.5/Qwen3.8 models;
+Q, K, and V are split only after the convolution.  The other admitted input
 layouts, ``[N,D]`` and ``[1,N,D]``, receive additional correctness/route smoke
-coverage.
+coverage at ``D=8192``.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ import fla.modules.conv.triton.ops as fla_ops
 
 DEFAULT_SHAPES = _base.DEFAULT_SHAPES
 SMOKE_N = 8
-SMOKE_D = 2048
+SMOKE_D = 8192
 
 
 class EagerArm(NamedTuple):
