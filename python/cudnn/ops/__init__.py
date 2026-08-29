@@ -16,7 +16,7 @@ _LAZY_EXPORTS = {
     "causal_conv1d": (".causal_conv1d", "causal_conv1d"),
     "causal_conv1d_nwh": (".causal_conv1d", "causal_conv1d_nwh"),
     "b2b_causal_conv1d": (".causal_conv1d", "b2b_causal_conv1d"),
-    "causal_conv1d_update": ("..causal_conv1d_update_sm100", "causal_conv1d_update"),
+    "causal_conv1d_update": (".causal_conv1d", "causal_conv1d_update"),
     "fft_causal_conv1d": (".fft_causal_conv1d", "fft_causal_conv1d"),
 }
 

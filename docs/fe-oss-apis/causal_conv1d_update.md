@@ -2,16 +2,18 @@
 
 **This FE-OSS API is experimental and subject to change.**
 
-`CausalConv1dUpdateSm100` advances a four-token depthwise causal-convolution
-cache in place and emits the fused-SiLU output for one decode step. It targets
+`cudnn.ops.causal_conv1d_update` advances a four-token depthwise
+causal-convolution cache in place and emits the fused-SiLU output for one
+decode step. It targets
 the width-four short convolution used by GDN/KDA-style linear
 attention blocks. It is a standalone native primitive; it does not yet add a
 serving-framework integration or make cuDNN the default route. The optional
 `cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
 decode-update interface and routes only this exact supported subset to the
 native primitive; all other configurations retain FLA's original path.
-The `Sm100` class and wrapper names are retained for API compatibility. Every
-admitted architecture uses the same portable one-row schedule.
+The public API is architecture-neutral; plan compilation, output allocation,
+stream selection, and the current schedule stay inside the implementation.
+Every admitted architecture uses the same portable one-row schedule.
 
 For row `n`, channel `d`, and selected cache slot `s`, the operation is:
 
@@ -36,8 +38,8 @@ the failed update is not transactional.
 - performance-characterized GPU: SM100 (compute capability 10.0)
 - `x`: contiguous BF16 `[N, D]`
 - `weight`: contiguous BF16 `[D, 4]`
-- `state`: contiguous BF16 `[S, D, 4]`, updated in place
-- `state_indices`: optional contiguous CUDA int32 `[N]`
+- `conv_state`: contiguous BF16 `[S, D, 4]`, updated in place
+- `conv_state_indices`: optional contiguous CUDA int32 `[N]`
 - `bias`: optional contiguous BF16 `[D]`
 - output: contiguous BF16 `[N, D]`
 - activation: SiLU, always fused
@@ -67,60 +69,38 @@ performance-characterized as a fast path.
 Each CTA owns one decode row and a 256-channel tile. Indexed calls use the same
 schedule with device-side index validation and channel-tail handling.
 
-## High-level wrapper
+## Public Torch API
 
-The standard FE-OSS wrapper allocates the output and returns a `TupleDict`:
+The semantic API accepts ordinary tensors, owns its output allocation, and
+returns the output tensor directly:
 
 ```python
 import torch
-from cudnn import causal_conv1d_update_wrapper_sm100
+from cudnn.ops import causal_conv1d_update
 
 x = torch.randn(8, 2048, device="cuda", dtype=torch.bfloat16)
 weight = torch.randn(2048, 4, device="cuda", dtype=torch.bfloat16)
-state = torch.randn(8, 2048, 4, device="cuda", dtype=torch.bfloat16)
-
-result = causal_conv1d_update_wrapper_sm100(x, state, weight)
-output = result["output_tensor"]
-```
-
-`cudnn.causal_conv1d_update(x, state, weight, ...)` and
-`cudnn.ops.causal_conv1d_update(...)` expose the same mutation but return the
-output Tensor directly. The state-before-weight positional order matches the
-common decode-update convention used by the FLA and causal-conv1d ecosystems.
-Bias is keyword-only: pass `bias=bias`. The helpers are not drop-in
-replacements for APIs with different return-state conventions.
-
-Both helpers cache compiled kernels by device, shape, indexed/non-indexed
-signature, and bias presence. The cache is bounded. The first call for a
-signature performs JIT compilation, so warm the exact signature before latency
-measurement or CUDA Graph capture.
-
-## Class API
-
-Use the class API for explicit compilation, output ownership, and repeated
-execution:
-
-```python
-import torch
-from cudnn import CausalConv1dUpdateSm100
-
-x = torch.empty(8, 2048, device="cuda", dtype=torch.bfloat16)
-weight = torch.empty(2048, 4, device="cuda", dtype=torch.bfloat16)
-state = torch.empty(8, 2048, 4, device="cuda", dtype=torch.bfloat16)
-output = torch.empty_like(x)
-
-op = CausalConv1dUpdateSm100(x, weight, state, output)
-op.check_support()
-op.compile()
+conv_state = torch.randn(8, 2048, 4, device="cuda", dtype=torch.bfloat16)
 
 with torch.no_grad():
-    op.execute(x, weight, state, output)
+    output = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        activation="silu",
+    )
 ```
 
-`execute(..., current_stream=...)` accepts a CUDA driver stream handle. The
-high-level helpers allocate their output on that stream as well; they require a
-concrete stream handle rather than the `CU_STREAM_PER_THREAD` sentinel. Callers
-remain responsible for cross-stream dependencies and synchronization.
+`bias` and `activation` follow the mathematical operation. Optional
+`conv_state_indices` is keyword-only because it changes state routing rather
+than tensor math. The alias `cudnn.causal_conv1d_update` resolves to the same
+function. No public parameter exposes a wrapper object, architecture name,
+plan, output buffer, or raw stream.
+
+The implementation caches compiled kernels by device, shape,
+indexed/non-indexed signature, and bias presence. The cache is bounded. The
+first call for a signature performs JIT compilation, so warm the exact
+signature before latency measurement or CUDA Graph capture.
 
 ## Semantic provenance and benchmarking
 

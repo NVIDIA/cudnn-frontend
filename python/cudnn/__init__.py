@@ -338,12 +338,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
-    "CausalConv1dUpdateSm100": (".causal_conv1d_update_sm100", "CausalConv1dUpdateSm100"),
-    "causal_conv1d_update": (".causal_conv1d_update_sm100", "causal_conv1d_update"),
-    "causal_conv1d_update_wrapper_sm100": (
-        ".causal_conv1d_update_sm100",
-        "causal_conv1d_update_wrapper_sm100",
-    ),
+    "causal_conv1d_update": (".ops", "causal_conv1d_update"),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
     "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),

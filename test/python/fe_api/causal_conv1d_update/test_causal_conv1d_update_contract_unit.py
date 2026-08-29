@@ -91,21 +91,21 @@ import cudnn
 import cudnn.ops
 from cudnn.causal_conv1d_update_sm100 import (
     CausalConv1dUpdateSm100,
-    causal_conv1d_update,
+    causal_conv1d_update as implementation,
     causal_conv1d_update_wrapper_sm100,
 )
 
 exports = (
     cudnn.causal_conv1d_update,
-    cudnn.causal_conv1d_update_wrapper_sm100,
-    cudnn.CausalConv1dUpdateSm100,
     cudnn.ops.causal_conv1d_update,
 )
 assert all(callable(export) and not isinstance(export, types.ModuleType) for export in exports)
-assert cudnn.causal_conv1d_update is causal_conv1d_update
-assert cudnn.causal_conv1d_update_wrapper_sm100 is causal_conv1d_update_wrapper_sm100
-assert cudnn.CausalConv1dUpdateSm100 is CausalConv1dUpdateSm100
-assert cudnn.ops.causal_conv1d_update is causal_conv1d_update
+assert cudnn.causal_conv1d_update is cudnn.ops.causal_conv1d_update
+assert cudnn.ops.causal_conv1d_update is not implementation
+assert not hasattr(cudnn, "causal_conv1d_update_wrapper_sm100")
+assert not hasattr(cudnn, "CausalConv1dUpdateSm100")
+assert callable(causal_conv1d_update_wrapper_sm100)
+assert callable(CausalConv1dUpdateSm100)
 """
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join((str(tmp_path), environment.get("PYTHONPATH", ""))).rstrip(os.pathsep)
@@ -119,17 +119,76 @@ assert cudnn.ops.causal_conv1d_update is causal_conv1d_update
     )
 
 
-def test_public_helpers_use_state_before_weight_positional_order():
-    from cudnn.causal_conv1d_update_sm100 import (
-        causal_conv1d_update,
-        causal_conv1d_update_wrapper_sm100,
+def test_public_helper_is_semantic_and_hides_lifecycle_parameters():
+    from cudnn.ops import causal_conv1d_update
+
+    signature = inspect.signature(causal_conv1d_update)
+    assert tuple(signature.parameters) == (
+        "x",
+        "conv_state",
+        "weight",
+        "bias",
+        "activation",
+        "conv_state_indices",
+    )
+    assert signature.parameters["conv_state_indices"].kind is inspect.Parameter.KEYWORD_ONLY
+    for implementation_detail in (
+        "current_stream",
+        "output",
+        "plan",
+        "wrapper",
+        "sm100",
+    ):
+        assert implementation_detail not in signature.parameters
+
+
+def test_public_helper_delegates_tensor_contract_without_lifecycle(monkeypatch):
+    import cudnn.causal_conv1d_update_sm100 as implementation
+    from cudnn.ops import causal_conv1d_update
+
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    state = torch.zeros(3, 8, 4, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    bias = torch.zeros(8, dtype=torch.bfloat16)
+    indices = torch.tensor([2, 0], dtype=torch.int32)
+    expected = torch.ones_like(x)
+    observed = {}
+
+    def run(native_x, native_state, native_weight, state_indices, *, bias):
+        observed.update(
+            x=native_x,
+            state=native_state,
+            weight=native_weight,
+            state_indices=state_indices,
+            bias=bias,
+        )
+        return expected
+
+    monkeypatch.setattr(implementation, "causal_conv1d_update", run)
+    output = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        bias,
+        "silu",
+        conv_state_indices=indices,
     )
 
-    expected = ("x", "state", "weight", "state_indices")
-    assert tuple(inspect.signature(causal_conv1d_update).parameters)[:4] == expected
-    assert tuple(inspect.signature(causal_conv1d_update_wrapper_sm100).parameters)[:4] == expected
-    assert inspect.signature(causal_conv1d_update).parameters["bias"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert inspect.signature(causal_conv1d_update_wrapper_sm100).parameters["bias"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert output is expected
+    assert observed["x"] is x
+    assert observed["state"] is state
+    assert observed["weight"] is weight
+    assert observed["state_indices"] is indices
+    assert observed["bias"] is bias
+
+
+@pytest.mark.parametrize("activation", [None, "identity", "relu"])
+def test_public_helper_rejects_unimplemented_activation(activation):
+    from cudnn.ops import causal_conv1d_update
+
+    x, weight, state, _, _ = _inputs(indexed=False)
+    with pytest.raises(NotImplementedError, match="requires activation"):
+        causal_conv1d_update(x, state, weight, activation=activation)
 
 
 def test_valid_descriptor_contract_without_kernel(monkeypatch):

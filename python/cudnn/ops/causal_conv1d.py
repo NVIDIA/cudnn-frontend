@@ -243,6 +243,46 @@ def causal_conv1d(
     return torch.ops.cudnn.causal_conv1d_fwd_primitive(x, weight, bias, activation)
 
 
+def causal_conv1d_update(
+    x: Tensor,
+    conv_state: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+    *,
+    conv_state_indices: Optional[Tensor] = None,
+) -> Tensor:
+    r"""Advance a mutable causal-convolution state by one decode token.
+
+    This is the semantic Torch API. It owns output allocation and kernel-plan
+    caching internally; callers pass tensors and receive a tensor. ``conv_state``
+    is updated in place.
+
+    The current native implementation supports contiguous BF16 ``x[N, D]``,
+    ``conv_state[S, D, 4]``, and ``weight[D, 4]`` tensors with fused SiLU.
+    ``conv_state_indices[N]`` optionally selects a unique state slot for each
+    row. The operation is inference-only.
+    """
+
+    if activation not in ("silu", "swish"):
+        raise NotImplementedError("causal_conv1d_update currently requires activation='silu' or 'swish'")
+
+    # Keep the lifecycle-oriented implementation private to this semantic API.
+    # It validates the complete tensor, mutation, aliasing, and architecture
+    # contract before compiling or launching the kernel.
+    from cudnn.causal_conv1d_update_sm100 import (
+        causal_conv1d_update as _causal_conv1d_update_impl,
+    )
+
+    return _causal_conv1d_update_impl(
+        x,
+        conv_state,
+        weight,
+        conv_state_indices,
+        bias=bias,
+    )
+
+
 # ===========================================================================
 # NWH variant — x is (batch, seq_len, dim)
 # ===========================================================================
