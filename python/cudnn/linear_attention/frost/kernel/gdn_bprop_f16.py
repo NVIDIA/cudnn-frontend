@@ -120,7 +120,6 @@ from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_Q
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -4342,6 +4341,8 @@ def get_compiled_cache(
     beta_dtype_str: str,
     dstate_in_dtype_str: str,
     dstate0_dtype_str: str,
+    device: int,
+    num_sm: int,
     HQ: int,
     HK: int,
     HV: int,
@@ -4475,6 +4476,8 @@ def chunk_gdn_bwd_sm100(
     dt_bias=None,
     use_beta_sigmoid: bool = False,
     workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell chunked GDN bprop kernel (THD / varlen entry).
@@ -4563,6 +4566,8 @@ def chunk_gdn_bwd_sm100(
         str(beta.dtype),
         str(d_final_state.dtype) if d_final_state is not None else "none",
         str(d_initial_state.dtype) if d_initial_state is not None else "none",
+        device,
+        num_sm,
         HQ,
         HK,
         HV,
@@ -4606,7 +4611,7 @@ def chunk_gdn_bwd_sm100(
             safe_gate=safe_gate,
             beta_sigmoid=use_beta_sigmoid,
             dynamic_scheduling=dynamic_scheduling,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             h_q=HQ,
             h_k=HK,
             h_v=HV,

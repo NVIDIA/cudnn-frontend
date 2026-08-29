@@ -88,7 +88,6 @@ from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_Q
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -2360,6 +2359,8 @@ def get_compiled_cache(
     cu_dtype_str: str,
     gate_dtype_str: str,
     beta_dtype_str: str,
+    device: int,
+    num_sm: int,
     HK: int,
     HV: int,
     HO: int,
@@ -2473,6 +2474,8 @@ def chunk_gdn_recompute_sm100(
     use_beta_sigmoid: bool = False,
     *,
     workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell chunked GDN recompute kernel (state/checkpoint-only,
@@ -2553,13 +2556,14 @@ def chunk_gdn_recompute_sm100(
     state_dtype = get_dtype(state_dtype_src) if state_dtype_src is not None else cutlass.Float32
 
     cu_stream = cuda.CUstream(int(stream))
-
     cache = get_compiled_cache(
         str(k.dtype),
         str(state_dtype_src),
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),
+        device,
+        num_sm,
         HK,
         HV,
         HO,
@@ -2615,7 +2619,7 @@ def chunk_gdn_recompute_sm100(
             safe_gate,
             use_beta_sigmoid,
             dynamic_scheduling,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             h_k=HK,
             h_v=HV,
             n_heads_out=HO,

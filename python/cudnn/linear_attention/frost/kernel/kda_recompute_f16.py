@@ -29,7 +29,6 @@ from cutlass.cute.runtime import from_dlpack
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_recompute_config import CFG
 
@@ -2226,6 +2225,8 @@ def get_compiled_cache(
     gate_dtype_str: str,
     cu_dtype_str: str,
     beta_dtype_str: str,
+    device: int,
+    num_sm: int,
     HO: int,
     HK: int,
     HV: int,
@@ -2342,6 +2343,8 @@ def chunk_kda_recompute_sm100(
     order_in_prologue: bool = False,
     *,
     tensormap_workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell BT=16 chunked KDA recompute (state/checkpoints-only)
@@ -2438,6 +2441,8 @@ def chunk_kda_recompute_sm100(
         str(gate.dtype),
         str(cu_seqlens.dtype),
         str(beta.dtype),
+        device,
+        num_sm,
         HO,
         HK,
         HV,
@@ -2498,7 +2503,7 @@ def chunk_kda_recompute_sm100(
             v_ratio,
             HO,
             dynamic_scheduling,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             k_cute=k_cute,
             v_cute=v_cute,
             gate_cute=gate_cute,

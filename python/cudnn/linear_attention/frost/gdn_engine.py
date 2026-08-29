@@ -114,6 +114,7 @@ class CompiledGdn:
         self.table = None
         self.kcache = None
         self.plan_name = "GdnFrostEngine (GDN)"
+        self.device = current_device()
         from .common.l2norm import l2norm_qk
 
         self.l2norm_qk = l2norm_qk
@@ -142,7 +143,7 @@ class CompiledGdn:
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
         self.off_scheduler = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
         if self.split:
@@ -301,6 +302,8 @@ class CompiledGdn:
             use_beta_sigmoid=self.use_beta_sigmoid,
             work_item_scratch=item_scratch,
             workspace=tensormaps,
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         return None
@@ -325,6 +328,7 @@ class CompiledGdnBwd:
         self.kcache = None
         self.recompute_cache = None
         self.plan_name = "GdnFrostEngine (GDN_BWD)"
+        self.device = current_device()
         from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -351,7 +355,7 @@ class CompiledGdnBwd:
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
 
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.split = not self.batch_invariant
@@ -619,6 +623,8 @@ class CompiledGdnBwd:
                 order_in_prologue=self.recompute_orders,
                 log_gate=True,
                 workspace=region["recompute_tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
                 stream=stream,
             )
 
@@ -659,6 +665,8 @@ class CompiledGdnBwd:
             order_in_prologue=self.bwd_orders,
             log_gate=True,
             workspace=region["tensormaps"],
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         if self.safe_gate:

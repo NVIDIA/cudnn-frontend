@@ -75,6 +75,13 @@ class FrostLaPlan(CompiledPlan):
         return self.compiled.workspace_bytes()
 
     def execute(self, graph, variant_pack, ctx) -> None:
+        handle = ctx.handle
+        launch_device = handle.device.ordinal if hasattr(handle, "device") else variant_pack.device
+        if launch_device != self.compiled.device:
+            raise ValueError(
+                f"{self.compiled.plan_name}: plan was built for cuda:{self.compiled.device}, "
+                f"but the execution context targets cuda:{launch_device}; build one plan per device"
+            )
         ports = self.ports
         if ports is None:
             ports = self.ports = bind_ports(graph, variant_pack)

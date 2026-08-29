@@ -113,6 +113,7 @@ class CompiledKda:
         self.table = None
         self.kcache = None
         self.plan_name = "KdaFrostEngine (KDA)"
+        self.device = current_device()
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
@@ -133,7 +134,7 @@ class CompiledKda:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
         if self.split:
@@ -284,6 +285,8 @@ class CompiledKda:
             work_item_scratch=item_scratch,
             tensormap_workspace=tensormaps,
             **checkpoint_kwargs,
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         return None
@@ -308,6 +311,7 @@ class CompiledKdaBwd:
         self.kcache = None
         self.recompute_cache = None
         self.plan_name = "KdaFrostEngine (KDA_BWD)"
+        self.device = current_device()
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -336,7 +340,7 @@ class CompiledKdaBwd:
         self.n_heads_out, self.total = HO, total
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(16)
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.split = not self.batch_invariant
@@ -588,6 +592,8 @@ class CompiledKdaBwd:
                 work_item_scratch=region.get("item_scratch"),
                 order_in_prologue=True,
                 tensormap_workspace=region["recompute_tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
                 stream=stream,
             )
 
@@ -630,6 +636,8 @@ class CompiledKdaBwd:
             work_item_scratch=region.get("item_scratch") if self.has_state_checkpoints else None,
             order_in_prologue=self.has_state_checkpoints,
             tensormap_workspace=region["bwd_tensormaps"],
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         if self.safe_gate:

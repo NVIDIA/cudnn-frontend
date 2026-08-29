@@ -13,7 +13,6 @@ from ..common.beta_guard import beta_guard
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .gdn2_bprop_config import CFG
 
@@ -4127,6 +4126,8 @@ def get_compiled_cache(
     dstate0_dtype_str: str,
     gate_dtype_str: str,
     cu_dtype_str: str,
+    device: int,
+    num_sm: int,
     HQ: int,
     HK: int,
     HV: int,
@@ -4181,6 +4182,8 @@ def chunk_gdn2_bwd_sm100(
     work_item_scratch=None,
     order_in_prologue: bool = False,
     tensormap_workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell BT=16 chunked GDN-2 backward kernel.
@@ -4268,6 +4271,8 @@ def chunk_gdn2_bwd_sm100(
         str(d_initial_state.dtype) if d_initial_state is not None else "none",
         str(gate.dtype),
         str(cu_seqlens.dtype),
+        device,
+        num_sm,
         HQ,
         HK,
         HV,
@@ -4303,7 +4308,7 @@ def chunk_gdn2_bwd_sm100(
             k_ratio=HO // HK,
             v_ratio=HO // HV,
             n_heads_out=HO,
-            max_active_clusters=multiprocessor_count(current_device()),
+            max_active_clusters=num_sm,
             dynamic_scheduling=dynamic_scheduling,
         )
 
