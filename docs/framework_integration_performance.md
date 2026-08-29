@@ -99,6 +99,30 @@ forward+backward versus eager torch. The earlier 1-CTA result did not show this 
 tile sweep held CTA group and cluster shape fixed. Always measure the whole step rather than
 extrapolating from an isolated fused stage.
 
+Kimi K3's bounded SiTU MLP is exposed separately as
+`cudnn.gemm.situ_mlp(x, Wg, Wu, Wd, *, beta=4.0, linear_beta=25.0)` rather
+than overloading `swiglu_mlp` with an activation string. It fuses the two BF16
+input projections with
+`beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)` and
+keeps the down projection as a second kernel. The current FROST backward is
+SwiGLU-specific, so SiTU uses an exact cuDNN pointwise derivative graph.
+
+On B200, same-process interleaved CUDA-graph replay measured the complete
+three-GEMM inference call against the exact PyTorch composition below. These
+fixed-width rows are operation proxies, not an assembled MoE dispatch:
+
+| Kimi K3 role | M | H | I | PyTorch / cuDNN |
+|---|---:|---:|---:|---:|
+| dense | 512 | 7,168 | 33,792 | 1.69-1.70x |
+| shared expert | 2,048 | 7,168 | 6,144 | 1.69-1.71x |
+| routed-expert proxy | 128 | 3,584 | 3,072 | 1.92x |
+
+Across two repeated runs, the corresponding cuDNN graph-replay medians were
+0.552-0.554, 0.369-0.371, and 0.02260 ms. Relative L2 error versus the official
+FP32-activation/BF16-boundary formula was below 0.00075 for all three. This is
+inference-only operator timing; it does not imply full-model or training-step
+speedup.
+
 ### 7. Mixing libraries in a hot eager loop
 Interleaving cuDNN `execute` with cuBLAS/`torch.mm`/other-library calls, op by op, is the
 *worst* eager pattern measured here — worse than either library alone — because each switch
