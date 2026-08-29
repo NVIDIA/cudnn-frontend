@@ -13,6 +13,7 @@ def causal_conv1d_bulk_reference(
     x: torch.Tensor,
     weight: torch.Tensor,
     *,
+    bias: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -28,6 +29,8 @@ def causal_conv1d_bulk_reference(
         raise ValueError(f"x must be 3D, got {tuple(x.shape)}")
     if weight.shape != (x.shape[-1], 4):
         raise ValueError(f"weight must have shape {(x.shape[-1], 4)}, got {tuple(weight.shape)}")
+    if bias is not None and bias.shape != (x.shape[-1],):
+        raise ValueError(f"bias must have shape {(x.shape[-1],)}, got {tuple(bias.shape)}")
 
     batch, tokens, channels = x.shape
     if cu_seqlens is None:
@@ -49,11 +52,14 @@ def causal_conv1d_bulk_reference(
 
     output = torch.empty_like(x)
     weight_fp32 = weight.float()
+    bias_fp32 = bias.float() if bias is not None else None
     for sequence, (row, begin, end) in enumerate(ranges):
         sequence_state = state[sequence]
         for token in range(begin, end):
             sequence_state = torch.cat((sequence_state[:, 1:], x[row, token].unsqueeze(-1)), dim=-1)
             preactivation = (sequence_state.float() * weight_fp32).sum(dim=-1)
+            if bias_fp32 is not None:
+                preactivation = preactivation + bias_fp32
             output[row, token] = F.silu(preactivation).to(x.dtype)
         state[sequence] = sequence_state
 

@@ -105,6 +105,32 @@ def test_dense_channel_tail_without_state_has_stable_outputs():
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("channels,packed", [(264, False), (263, True)])
+def test_optional_bias_matches_reference_for_vec8_and_scalar_paths(channels, packed):
+    wrapper = _load_wrapper()
+    torch.manual_seed(109 + channels)
+    x = torch.randn(1, 11, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor((0, 3, 11), device="cuda", dtype=torch.int32) if packed else None
+    expected, _ = causal_conv1d_bulk_reference(
+        x,
+        weight,
+        bias=bias,
+        cu_seqlens=cu_seqlens,
+    )
+
+    result = wrapper(
+        x,
+        weight,
+        cu_seqlens_tensor=cu_seqlens,
+        bias_tensor=bias,
+    )
+
+    torch.testing.assert_close(result["output_tensor"], expected, atol=3e-2, rtol=3e-2)
+
+
+@torch.no_grad()
 def test_dense_class_nonzero_state_final_state_and_decode_recurrence():
     api_class = _load_class()
     torch.manual_seed(102)
