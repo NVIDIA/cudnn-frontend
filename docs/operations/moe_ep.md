@@ -15,7 +15,7 @@ $$
     = x_t W^{\mathrm{fc1}}_{e_{t,k}},
 \qquad
 h_{t,k}
-    = p_{t,k}\left(\operatorname{SiLU}(g_{t,k}) \odot u_{t,k}\right),
+    = p_{t,k}\left(\mathrm{SiLU}(g_{t,k}) \odot u_{t,k}\right),
 \qquad
 z_{t,k}
     = h_{t,k} W^{\mathrm{fc2}}_{e_{t,k}}.
@@ -29,7 +29,7 @@ $$
 
 When `gate_up_clamp=C`, the operation uses
 $\min(g_{t,k}, C)$ for the gate and
-$\operatorname{clip}(u_{t,k}, -C, C)$ for the up projection. A route whose
+$\mathrm{clip}(u_{t,k}, -C, C)$ for the up projection. A route whose
 expert ID is `-1` contributes zero. Because the executable backend requires
 `apply_topk_in_fc1=True`, it applies $p_{t,k}$ to the SwiGLU result before
 FC2. The backend also stages plain inputs to MXFP8 and requantizes the routed
@@ -41,7 +41,7 @@ stores $E_{\mathrm{local}}=E/P$ consecutive experts. Global expert $e$ is
 owned by group-relative rank
 
 $$
-\operatorname{owner}(e)
+\mathrm{owner}(e)
     = \left\lfloor \frac{e}{E_{\mathrm{local}}} \right\rfloor.
 $$
 
