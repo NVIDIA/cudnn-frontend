@@ -3,12 +3,14 @@
 
 """Host-visible contract checks that do not compile a CuTe kernel."""
 
+import importlib.util
 import inspect
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +24,15 @@ def _load_public_api():
     except (ImportError, OSError) as error:
         pytest.skip(f"CuTe DSL dependencies unavailable: {error}")
     return bulk, bulk.CausalConv1dBulkFwdSm100, bulk.causal_conv1d_bulk_fwd_wrapper_sm100
+
+
+def _load_benchmark_module():
+    path = Path(__file__).with_name("benchmark_causal_conv1d_bulk_sm100.py")
+    spec = importlib.util.spec_from_file_location("_causal_conv1d_bulk_benchmark_contract", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_operation_package_exports_class_and_wrapper():
@@ -64,6 +75,63 @@ def test_public_signatures_keep_optional_state_and_packed_metadata_explicit():
         "current_stream",
     )
     assert inspect.signature(wrapper).parameters["output_final_state"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [
+        (8, 0),
+        (8, 6),
+        (8, 7),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (11, 0),
+        (12, 0),
+        (12, 1),
+    ],
+)
+def test_benchmark_accepts_functional_gpu_without_slurm(monkeypatch, capability):
+    benchmark = _load_benchmark_module()
+    properties = SimpleNamespace(
+        major=capability[0],
+        minor=capability[1],
+        name="Customer GPU",
+    )
+    monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(benchmark.torch.cuda, "get_device_properties", lambda device=None: properties)
+
+    assert benchmark._validate_environment() == (properties, capability)
+    assert benchmark._slurm_metadata({}) == {}
+
+
+def test_benchmark_rejects_unsupported_gpu(monkeypatch):
+    benchmark = _load_benchmark_module()
+    properties = SimpleNamespace(major=10, minor=1, name="Unsupported GPU")
+    monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(benchmark.torch.cuda, "get_device_properties", lambda device=None: properties)
+
+    with pytest.raises(RuntimeError, match="does not support compute capability 10.1"):
+        benchmark._validate_environment()
+
+
+def test_benchmark_requires_cuda(monkeypatch):
+    benchmark = _load_benchmark_module()
+    monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        benchmark._validate_environment()
+
+
+def test_benchmark_slurm_metadata_is_optional():
+    benchmark = _load_benchmark_module()
+
+    assert benchmark._slurm_metadata({}) == {}
+    assert benchmark._slurm_metadata({"SLURM_JOB_ID": "123", "SLURMD_NODENAME": "gpu-node"}) == {
+        "job_id": "123",
+        "node_name": "gpu-node",
+    }
 
 
 def test_support_rejects_the_package_wide_4_5_dsl_floor(monkeypatch):

@@ -134,6 +134,15 @@ differences.
 No external kernel source is to be copied into the implementation. External
 projects are semantic, interface, and performance references only.
 
+## Benchmark harness
+
+`test/python/fe_api/causal_conv1d_bulk/benchmark_causal_conv1d_bulk_sm100.py`
+runs the interleaved FE-versus-FLA comparison on every functional target. It
+requires CUDA and lets the native API perform the authoritative support check;
+neither ComputeLab nor Slurm is required. The JSON always records ordinary
+hardware and software metadata and includes Slurm job/node fields only when
+those environment variables are present.
+
 ## Existing path and gap
 
 `cudnn.ops.causal_conv1d_nwh` already provides dense `[B, T, D]` forward and

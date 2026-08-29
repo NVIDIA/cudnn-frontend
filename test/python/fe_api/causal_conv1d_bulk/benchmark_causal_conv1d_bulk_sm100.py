@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Interleaved B200 benchmark for the bulk causal-convolution forward slice.
+"""Interleaved benchmark for the bulk causal-convolution forward slice.
 
-This script is intentionally not a pytest test.  Run it through the repository's
-ComputeLab wrapper so quoted numbers come from a full NVIDIA B200 rather than a
-local engineering board.
+This script is intentionally not a pytest test.  It runs on every functionally
+supported architecture; the operation's support check remains authoritative.
 
 The ``fe_execute`` arm uses caller-preallocated output tensors, whereas FLA's
 direct API allocates its outputs internally. CUDA events also include any GPU
@@ -17,17 +16,31 @@ wrapper/public arm is the more symmetric allocation-inclusive comparison.
 
 import argparse
 import json
+import os
+import platform
 import statistics
 
 import torch
+from cudnn._causal_conv1d_bulk_arch import is_functional_arch
 
-from cudnn.causal_conv1d_bulk_sm100 import (
-    CausalConv1dBulkFwdSm100,
-    causal_conv1d_bulk_fwd_wrapper_sm100,
-)
-from fla.modules.conv.causal_conv1d import causal_conv1d as fla_causal_conv1d
-from fla.modules.conv.triton.ops import causal_conv1d_fwd as fla_causal_conv1d_fwd
-from fla.ops.utils import prepare_chunk_indices
+
+def _validate_environment():
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable")
+    properties = torch.cuda.get_device_properties(0)
+    capability = (properties.major, properties.minor)
+    if not is_functional_arch(capability):
+        raise RuntimeError("Bulk causal conv1d does not support compute capability " f"{capability[0]}.{capability[1]} on {properties.name}")
+    return properties, capability
+
+
+def _slurm_metadata(environ=None):
+    environ = os.environ if environ is None else environ
+    fields = {
+        "job_id": environ.get("SLURM_JOB_ID"),
+        "node_name": environ.get("SLURMD_NODENAME"),
+    }
+    return {name: value for name, value in fields.items() if value}
 
 
 def _event_us(fn, inner: int) -> float:
@@ -77,9 +90,15 @@ def main() -> None:
     parser.add_argument("--inner", type=int, default=5)
     args = parser.parse_args()
 
-    properties = torch.cuda.get_device_properties(0)
-    if (properties.major, properties.minor) != (10, 0) or properties.name != "NVIDIA B200":
-        raise RuntimeError("Performance measurements require a ComputeLab NVIDIA B200, got " f"{properties.name} SM{properties.major}{properties.minor}")
+    properties, capability = _validate_environment()
+
+    from cudnn.causal_conv1d_bulk_sm100 import (
+        CausalConv1dBulkFwdSm100,
+        causal_conv1d_bulk_fwd_wrapper_sm100,
+    )
+    from fla.modules.conv.causal_conv1d import causal_conv1d as fla_causal_conv1d
+    from fla.modules.conv.triton.ops import causal_conv1d_fwd as fla_causal_conv1d_fwd
+    from fla.ops.utils import prepare_chunk_indices
 
     torch.manual_seed(20260828)
     x = torch.randn(1, args.tokens, args.channels, device="cuda", dtype=torch.bfloat16)
@@ -195,7 +214,19 @@ def main() -> None:
         "initial_state": args.state,
         "final_state": args.final_state,
     }
-    timings["device"] = properties.name
+    timings["hardware"] = {
+        "device": properties.name,
+        "compute_capability": list(capability),
+        "total_memory_bytes": properties.total_memory,
+    }
+    timings["software"] = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    slurm = _slurm_metadata()
+    if slurm:
+        timings["slurm"] = slurm
     print(json.dumps(timings, indent=2, sort_keys=True))
 
 
