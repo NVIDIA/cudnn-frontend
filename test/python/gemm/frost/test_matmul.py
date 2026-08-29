@@ -2944,6 +2944,7 @@ def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
 _VERSION_GATED_KWARGS = {
     "tcgen05_alloc": "is_exclusive",
     "tcgen05_dealloc": "is_exclusive",
+    "tcgen05_mma": "b_collector_op",
     "tcgen05_mma_block_scale": "b_collector_op",
 }
 
@@ -2974,6 +2975,123 @@ def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
             ):
                 offenders.append(f"{path.name}:{node.lineno} nvvm.{node.func.attr}(...)")
     assert not offenders, "call the _tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
+
+
+def test_the_b_collector_is_off_at_the_64_row_mma():
+    """`.collector::b::*` is illegal on the 64-row MMA: measured
+    `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under BOTH cta groups, so it
+    is the per-CTA instruction M that decides, not the hardware M (which is 128 for
+    the 2-CTA case that still faults). Block-scale never reaches it --
+    `validate_block_scale_config` requires `mma_tile_m % 128 == 0` -- which is why
+    this only surfaced once the plain templates grew a B collector."""
+    from cudnn.gemm.frost.compiler import _B_COLLECTOR_ARCH_RANGES, _b_collector_ok
+    from cudnn.gemm.frost.tile_config import by_name
+
+    good_arch = _B_COLLECTOR_ARCH_RANGES[0][0]
+    for name, want in (
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma", True),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma", True),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma", False),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma", False),
+    ):
+        cfg = by_name(name)
+        assert _b_collector_ok(cfg, good_arch) is want, f"{name}: mma_tile_m={cfg.mma_tile_m} mma_size_m={cfg.mma_size_m}"
+    # the silicon gate still bites on its own
+    assert not _b_collector_ok(by_name("CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma"), 100)
+
+
+def test_the_collector_helpers_are_one_text_across_every_template():
+    """Both helpers are the same predicate everywhere, so they are kept textually
+    identical -- same body, same parameter names, same A-then-B order, and both
+    immediately above the kernel. Divergence here is how the epilogue drifted
+    before test_template_epilogue_parity.py started pinning it."""
+    import ast
+
+    blobs = {}
+    for path in sorted(_template_dir().glob("sm*.py")):
+        lines = path.read_text().split("\n")
+        defs = [n for n in ast.parse("\n".join(lines)).body if isinstance(n, ast.FunctionDef) and n.name.endswith("_collector_op")]
+        if not defs:
+            continue
+        names = [n.name for n in defs]
+        assert names == ["_a_collector_op", "_b_collector_op"], f"{path.name}: expected both helpers in A-then-B order, got {names}"
+        blobs.setdefault("\n".join("\n".join(lines[n.lineno - 1 : n.end_lineno]) for n in defs), []).append(path.name)
+    assert blobs, "no template defines the collector helpers -- this check covered nothing"
+    if len(blobs) > 1:
+        groups = "\n  ".join(f"{sorted(v)}" for v in blobs.values())
+        raise AssertionError(f"the collector helpers have diverged into {len(blobs)} variants:\n  {groups}")
+
+
+def _load_collector_helpers(path, consts):
+    """Exec a template's collector helpers alone, with the injected constants
+    supplied and the DSL stubbed. The helpers are pure compile-time predicates,
+    so they run outside a kernel trace."""
+    import ast
+    import types
+
+    ns = dict(consts)
+    ns["cutlass"] = types.SimpleNamespace(const_expr=lambda x: x)
+    ns["nvvm"] = types.SimpleNamespace(Tcgen05MMACollectorOp=types.SimpleNamespace(FILL="FILL", USE="USE", LASTUSE="LASTUSE"))
+    tree = ast.parse(path.read_text())
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in ("_a_collector_op", "_b_collector_op"):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+            found[node.name] = ns[node.name]
+    return found
+
+
+def test_the_a_and_b_collectors_can_never_both_be_live():
+    """A marks an N-stack (A fixed while B varies across the GEMM loop), B marks
+    an M-stack (B fixed while A advances across the mma_size_m loop). The nest is
+    gemm-outer / mi-inner, so an interleaved pair would break the
+    first-marked-is-FILL / last-is-LASTUSE rule on one side. Today they exclude
+    each other only because the two helpers bail on `mma_size_m` from opposite
+    sides -- nothing else pins it, so this does."""
+    both = 0
+    for path in sorted(_template_dir().glob("sm*.py")):
+        fns = _load_collector_helpers(path, {})
+        if len(fns) < 2:
+            continue
+        both += 1
+        for mma_size_m in (1, 2):
+            for num_gemms in (1, 2, 3):
+                for num_a_operands in (1, 2):
+                    for b_ok in (True, False):
+                        fns = _load_collector_helpers(
+                            path,
+                            dict(mma_size_m=mma_size_m, num_gemms=num_gemms, num_a_operands=num_a_operands, b_collector_ok=b_ok),
+                        )
+                        live_a = any(fns["_a_collector_op"](g) is not None for g in range(num_gemms))
+                        live_b = any(fns["_b_collector_op"](mi) is not None for mi in range(mma_size_m))
+                        assert not (
+                            live_a and live_b
+                        ), f"{path.name}: both collectors live at mma_size_m={mma_size_m} num_gemms={num_gemms} num_a={num_a_operands} b_ok={b_ok}"
+    assert both, "no template defines both collector helpers -- the check silently covered nothing"
+
+
+def test_every_a_collector_chain_starts_with_fill_and_ends_with_lastuse():
+    """The ISA's entry gate: the first marked MMA seeds the collector and the last
+    releases it. Both helpers key on a `range_constexpr` index, so this is a
+    compile-time property -- a chain that began with USE would pick up a stale
+    entry and silently multiply in the wrong operand."""
+    seen = 0
+    for path in sorted(_template_dir().glob("sm*.py")):
+        for name, n_key in (("_a_collector_op", "num_gemms"), ("_b_collector_op", "mma_size_m")):
+            for n in (1, 2, 3):
+                consts = dict(mma_size_m=1, num_gemms=1, num_a_operands=1, b_collector_ok=True)
+                consts[n_key] = n
+                fns = _load_collector_helpers(path, consts)
+                if name not in fns:
+                    continue
+                chain = [fns[name](i) for i in range(n)]
+                if all(c is None for c in chain):
+                    continue
+                seen += 1
+                assert chain[0] == "FILL", f"{path.name}:{name} chain of {n} starts with {chain[0]}"
+                assert chain[-1] == "LASTUSE", f"{path.name}:{name} chain of {n} ends with {chain[-1]}"
+                assert all(c == "USE" for c in chain[1:-1]), f"{path.name}:{name} middle of {chain} is not USE"
+    assert seen, "no collector chain was exercised"
 
 
 def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():

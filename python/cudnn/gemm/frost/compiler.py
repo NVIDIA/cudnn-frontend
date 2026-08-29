@@ -15,6 +15,7 @@ import hashlib
 from collections import Counter
 import importlib.util
 import logging
+import math
 import os
 import re
 import sys
@@ -284,12 +285,16 @@ def _epi_row_elems(dt: str, epi_n: int) -> int:
     return _epi_row_bytes(dt, epi_n) * 8 // _cd_view_bits(dt)
 
 
-def _tma_store_issue(chain, j: int, coord: str, ptr: str) -> "list[str]":
+def _tma_store_issue(chain, cfg, j: int, coord: str, ptr: str) -> "list[str]":
+    # MoE rewrites D's `global_dim` per routed group to clip the ragged tail, so
+    # it stores through its per-CTA workspace copy -- unless the offsets promise
+    # says no tile crosses a group, in which case the original descriptor serves.
+    desc = f"tma_c_descs[{j}].get_ptr()" if (not chain.has_moe or _moe_aligned_offsets(chain, cfg)) else f"d_desc_ptr_list[{j}]"
     return [
         "if warp_idx == 0:",
         "    if elect_one:",
         "        nvvm.cp_async_bulk_tensor_global_shared_cta(",
-        f"            {f'd_desc_ptr_list[{j}]' if chain.has_moe else f'tma_c_descs[{j}].get_ptr()'},",
+        f"            {desc},",
         f"            {ptr},",
         f"            {coord},",
         "        )",
@@ -335,10 +340,10 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
         for mb in range(m_rows // atom_m):
-            lines += _tma_store_issue(chain, j, f"(coord_m + {mb * atom_m}, col, tile_l)", f"{v}.data_ptr({mb * atom_m * epi_n})")
+            lines += _tma_store_issue(chain, cfg, j, f"(coord_m + {mb * atom_m}, col, tile_l)", f"{v}.data_ptr({mb * atom_m * epi_n})")
         if _epi_dp22(cfg):
             # the other COLUMN half, not another M block: same rows, further along N
-            lines += _tma_store_issue(chain, j, "(coord_m, col + epi_cols_per_mma_m, tile_l)", f"{v}.data_ptr({atom_m * epi_n})")
+            lines += _tma_store_issue(chain, cfg, j, "(coord_m, col + epi_cols_per_mma_m, tile_l)", f"{v}.data_ptr({atom_m * epi_n})")
     else:
         row_bytes = _epi_row_bytes(dt, epi_n)
         row_elems = _epi_row_elems(dt, epi_n)
@@ -352,11 +357,11 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "cute.arch.fence_view_async_shared()",
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
-        lines += _tma_store_issue(chain, j, f"({col_c}, coord_m, tile_l)", f"{v}.data_ptr()")
+        lines += _tma_store_issue(chain, cfg, j, f"({col_c}, coord_m, tile_l)", f"{v}.data_ptr()")
         if _epi_dp22(cfg):
             # warps 2/3's column half, staged behind the first tile
             half = "(col + epi_cols_per_mma_m) // 2" if DTYPE_BITS[dt] < 8 else "col + epi_cols_per_mma_m"
-            lines += _tma_store_issue(chain, j, f"({half}, coord_m, tile_l)", f"{v}.data_ptr({m_rows * row_elems})")
+            lines += _tma_store_issue(chain, cfg, j, f"({half}, coord_m, tile_l)", f"{v}.data_ptr({m_rows * row_elems})")
     lines += [
         "    if elect_one:",
         "        nvvm.cp_async_bulk_commit_group()",
@@ -784,6 +789,7 @@ def _render_tile_constants(
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
         f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=smem_fixed_reserve)}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
@@ -916,6 +922,7 @@ def _render_tile_constants(
     # (fallback). See _use_tma_store_epi() for gating.
     use_tma = _use_tma_store_epi(chain, cfg)
     lines.append(f"n_tma_outputs = {len(_tma_slots_for(chain, cfg))}")
+    lines.append(f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}")
     lines.append(f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}")
     # The three drain layouts, decided host-side so the templates can key on the
     # LAYOUT rather than re-deriving it from the mode: packed lane<16 (hardware
@@ -961,16 +968,15 @@ def _render_tile_constants(
 
 def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[str]:
     """A ``fp32 -> <8-bit scale> byte`` helper, emitted into the generated kernel
-    so it stays self-contained. The x2 destination gets the value in both lanes;
-    only the low byte is read back."""
+    so it stays self-contained. The cvt unit is natively x2, so the pair form is
+    the primitive and the scalar one converts a value against itself and drops
+    the high byte -- col-quant, which has one scale per COLUMN, calls the pair."""
     return [
         "",
         "",
-        f"def {fn_name}(x):",
-        "    src = cutlass.Float32(x).ir_value()",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Float32.mlir_type), [src, src])",
-        "    lo = _frost_vector.extract(pair, dynamic_position=[], static_position=[0])",
-        "    hi = _frost_vector.extract(pair, dynamic_position=[], static_position=[1])",
+        f"def {fn_name}_x2(a, b):",
+        "    lo = cutlass.Float32(a).ir_value()",
+        "    hi = cutlass.Float32(b).ir_value()",
         "    packed = _frost_nvvm.convert_f32x2_to_f8x2(",
         "        _frost_ir.VectorType.get([2], cutlass.Int8.mlir_type),",
         "        hi,",
@@ -979,8 +985,11 @@ def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[s
         f"        rnd=_frost_nvvm.FPRoundingMode.{rnd},",
         "        sat=_frost_nvvm.SaturationMode.SATFINITE,",
         "    )",
-        "    byte = _frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed))",
-        "    return cutlass.Int32(byte) & 0xFF",
+        "    return cutlass.Int32(_frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed)))",
+        "",
+        "",
+        f"def {fn_name}(x):",
+        f"    return {fn_name}_x2(x, x) & 0xFF",
     ]
 
 
@@ -992,15 +1001,23 @@ def _cvt_e5m3_bits_to_f32() -> list[str]:
     return [
         "",
         "",
-        "def _frost_e5m3_bits_to_f32(b):",
-        "    byte = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [byte, byte])",
+        "def _frost_e5m3_bits_to_f32_x2(a, b):",
+        "    lo = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(a).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    hi = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [lo, hi])",
         "    widened = _frost_nvvm.convert_f8x2_to_bf16x2(",
         "        _frost_ir.VectorType.get([2], cutlass.BFloat16.mlir_type),",
         "        pair,",
         "        _frost_ir.TypeAttr.get(cutlass.FloatNV8E5M3FNU.mlir_type),",
         "    )",
-        "    return cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0])))",
+        "    return (",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0]))),",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[1]))),",
+        "    )",
+        "",
+        "",
+        "def _frost_e5m3_bits_to_f32(b):",
+        "    return _frost_e5m3_bits_to_f32_x2(b, b)[0]",
     ]
 
 
@@ -1061,6 +1078,14 @@ def _b_collector_supported(arch: int | None = None) -> bool:
     """Whether this GPU's MMA can hold B in a collector buffer across MMAs."""
     a = _current_arch() if arch is None else arch
     return a is not None and any(lo <= a < hi for lo, hi in _B_COLLECTOR_ARCH_RANGES)
+
+
+def _b_collector_ok(cfg, arch: int | None = None) -> bool:
+    """...and whether THIS geometry may ask for it. The 64-row MMA may not: measured
+    `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under both CTA groups, so it
+    is the per-CTA instruction M that decides, not the hardware M. Block-scale never
+    reaches it (`validate_block_scale_config` requires `mma_tile_m % 128 == 0`)."""
+    return _b_collector_supported(arch) and cfg.mma_tile_m == 128
 
 
 def _tmem_cols_for_arch(arch: int | None = None) -> int:
@@ -1618,6 +1643,7 @@ def _render_block_scale_tile_constants(
         # output on the TMA-C surface, and on MoE this number also sizes the
         # tensormap scratch and the per-CTA workspace stride.
         f"n_tma_outputs = {len(_tma_slots_for(chain, cfg))}",
+        f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}",
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
@@ -1656,7 +1682,7 @@ def _render_block_scale_tile_constants(
         f"sf_block_desc_stride = {sf_block_desc_stride}",
         f"num_tmem_alloc_cols = {num_tmem_alloc_cols}",
         f"tmem_alloc_exclusive = {num_tmem_alloc_cols > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
-        f"b_collector_ok = {_b_collector_supported()}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
@@ -1935,7 +1961,7 @@ def _render_template(
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
     return src
@@ -2133,7 +2159,7 @@ def _render_block_scale_template(
 
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
     return src
 
@@ -2946,6 +2972,28 @@ def _check_input_alignment(chain: FusionChain) -> None:
 # exceeds one subtile's sts cost, not generally the case on B200.
 _EPI_SMEM_STAGES = 2
 
+
+_SF_ATOM_ROWS = 128  # F8_128x4: the SF blob is padded to whole 128-row blocks
+
+
+def _moe_required_offset_multiple(chain, cfg) -> int:
+    """Divisor every routed-group start must carry for the GLOBAL-descriptor path."""
+    req = cfg.cga_tile_mn[0]
+    if chain.block_scale is not None:
+        req = math.lcm(req, _SF_ATOM_ROWS)
+    return req
+
+
+def _moe_aligned_offsets(chain, cfg) -> bool:
+    """Can this (graph, geometry) address A and SFA globally, skipping the
+    per-routed-group TMA-descriptor rewrite? The promise is the caller's
+    `alignment_value` on the first_token_offset tensor; 1 (the default) never
+    qualifies, so an un-annotated graph keeps the rewrite."""
+    if not chain.has_moe or chain.moe is None:
+        return False
+    return chain.moe.offset_multiple % _moe_required_offset_multiple(chain, cfg) == 0
+
+
 # TMEM accumulator stages: 2 = MMA of tile N+1 overlaps the epilogue of tile N.
 # The TMEM budget is the only thing that can take it back down to 1.
 _ACC_STAGES_MAX = 2
@@ -3088,6 +3136,17 @@ def _output_store_mode(
         if cfg.epi_tile_m % _mmajor_atom_m(out.dtype):
             return "stg"
     return "tma"
+
+
+def _store_mode_tag(store_modes: "tuple[str, ...]") -> str:
+    """Suffix for the kernel symbol naming its store arm, empty for the TMA one.
+
+    Two builds of the SAME geometry that differ only in store mode -- `force_stg_epi`
+    against the gate's own choice -- otherwise carry an IDENTICAL symbol, so nsys
+    reports them as one kernel."""
+    if not store_modes or all(m == "tma" for m in store_modes):
+        return ""
+    return "_stg" if all(m == "stg" for m in store_modes) else "_mixedstore"
 
 
 def _store_modes(
