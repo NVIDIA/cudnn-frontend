@@ -84,7 +84,7 @@ def test_nonzero_state_across_consecutive_steps():
 
 @torch.no_grad()
 @pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_no_index_measured_shape_correctness(n_channels):
+def test_n128_no_index_representative_shape_correctness(n_channels):
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(29 + n_channels)
     n_rows = 128
@@ -92,9 +92,8 @@ def test_n128_no_index_measured_shape_correctness(n_channels):
     state = torch.randn(n_rows, n_channels, 4, device="cuda", dtype=torch.bfloat16)
     expected_state = state.clone()
 
-    # Use the public cached route for two updates.  The host-only contract test
-    # independently proves that these descriptors select rows_per_cta=2 only
-    # on SM100 and the conservative one-row schedule elsewhere.
+    # Use the public cached route for two updates at representative decode
+    # shapes. Every architecture uses the same one-row schedule.
     for _ in range(2):
         x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
         expected_output, expected_state = _reference_step(x, weight, expected_state)
@@ -105,7 +104,7 @@ def test_n128_no_index_measured_shape_correctness(n_channels):
 
 @torch.no_grad()
 @pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_measured_shape_state_shift_is_bitwise(n_channels):
+def test_n128_representative_shape_state_shift_is_bitwise(n_channels):
     _, causal_conv1d_update = _load_api()
     torch.manual_seed(41 + n_channels)
     n_rows = 128

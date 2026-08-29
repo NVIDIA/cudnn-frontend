@@ -17,19 +17,12 @@ SUPPORTED_CAUSAL_CONV1D_UPDATE_COMPUTE_CAPABILITIES = frozenset(
         (12, 1),
     }
 )
-SM100_COMPUTE_CAPABILITY = (10, 0)
 
 
 def is_supported_causal_conv1d_update_compute_capability(compute_capability: tuple[int, int]) -> bool:
     """Return whether the operation admits this functional target."""
 
     return compute_capability in SUPPORTED_CAUSAL_CONV1D_UPDATE_COMPUTE_CAPABILITIES
-
-
-def uses_sm100_causal_conv1d_update_schedule(compute_capability: tuple[int, int]) -> bool:
-    """Return whether the measured SM100-only row-batch schedule is allowed."""
-
-    return compute_capability == SM100_COMPUTE_CAPABILITY
 
 
 def supported_causal_conv1d_update_compute_capabilities_text() -> str:

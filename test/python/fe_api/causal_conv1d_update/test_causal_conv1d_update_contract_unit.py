@@ -138,7 +138,6 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
-    assert api.rows_per_cta == 1
 
 
 def test_metadata_only_descriptors_skip_sample_pointer_alignment(monkeypatch):
@@ -149,71 +148,6 @@ def test_metadata_only_descriptors_skip_sample_pointer_alignment(monkeypatch):
 
     assert api._sample_alignment_remainders == {}
     assert api.check_support()
-
-
-@pytest.mark.parametrize("n_channels", [2048, 4096])
-def test_n128_no_index_selects_two_row_specialization_on_sm100(monkeypatch, n_channels):
-    cls = _api_class()
-    api = cls(
-        *_inputs(
-            n_rows=128,
-            n_channels=n_channels,
-            n_slots=128,
-            indexed=False,
-        )
-    )
-    _mock_cuda_contract(monkeypatch, api)
-
-    assert api.check_support()
-    assert api.rows_per_cta == 2
-
-
-@pytest.mark.parametrize("capability", [capability for capability in _SUPPORTED_COMPUTE_CAPABILITIES if capability != (10, 0)])
-def test_n128_no_index_uses_one_row_schedule_off_sm100(monkeypatch, capability):
-    cls = _api_class()
-    api = cls(
-        *_inputs(
-            n_rows=128,
-            n_channels=2048,
-            n_slots=128,
-            indexed=False,
-        )
-    )
-    _mock_cuda_contract(monkeypatch, api, capability=capability)
-
-    assert api.check_support()
-    assert api.rows_per_cta == 1
-
-
-@pytest.mark.parametrize(
-    "n_rows,n_channels,indexed",
-    [
-        (32, 2048, False),
-        (128, 1024, False),
-        (128, 2048, True),
-        (128, 4096, True),
-    ],
-    ids=["different-rows", "different-width", "indexed-d2048", "indexed-d4096"],
-)
-def test_row_batch_specialization_declines_unmeasured_or_indexed_signatures(
-    monkeypatch,
-    n_rows,
-    n_channels,
-    indexed,
-):
-    cls = _api_class()
-    api = cls(
-        *_inputs(
-            n_rows=n_rows,
-            n_channels=n_channels,
-            n_slots=n_rows + int(indexed),
-            indexed=indexed,
-        )
-    )
-    _mock_cuda_contract(monkeypatch, api)
-
-    assert api.check_support()
-    assert api.rows_per_cta == 1
 
 
 @pytest.mark.parametrize(

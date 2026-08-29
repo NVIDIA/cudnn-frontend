@@ -10,9 +10,8 @@ serving-framework integration or make cuDNN the default route. The optional
 `cudnn.fla.accelerate_fla(targets="short_conv")` adapter preserves FLA 0.5.2's
 decode-update interface and routes only this exact supported subset to the
 native primitive; all other configurations retain FLA's original path.
-The `Sm100` class and wrapper names are retained for API compatibility. SM100
-has the tuned schedule; other admitted architectures use the portable
-functional schedule.
+The `Sm100` class and wrapper names are retained for API compatibility. Every
+admitted architecture uses the same portable one-row schedule.
 
 For row `n`, channel `d`, and selected cache slot `s`, the operation is:
 
@@ -32,7 +31,7 @@ the failed update is not transactional.
 
 - GPU: functional support on compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0,
   10.0, 10.3, 11.0, 12.0, and 12.1
-- optimized and performance-characterized GPU: SM100 (compute capability 10.0)
+- performance-characterized GPU: SM100 (compute capability 10.0)
 - `x`: contiguous BF16 `[N, D]`
 - `weight`: contiguous BF16 `[D, 4]`
 - `state`: contiguous BF16 `[S, D, 4]`, updated in place
@@ -49,11 +48,11 @@ not sufficient for this direct API. The FLA adapter treats the resulting
 `ImportError` as a typed decline and executes FLA's original path.
 
 The full correctness suite was run on A100 SM80, L40S SM89, H200 SM90, and
-B200 SM100. The generic, indexed, and row-batch kernels were also executed on
-a GB110 board reporting compute capability 10.3 and an RTX 5080 SM120; outputs
+B200 SM100. The generic and indexed kernels were also executed on a GB110
+board reporting compute capability 10.3 and an RTX 5080 SM120; outputs
 matched the reference and state updates were bit-exact. Thus SM80, SM89, SM90,
 SM100, SM103, and SM120 are runtime-validated. SM86, SM87, SM110, and SM121
-have compile-only validation. In particular, both SM110 schedules cross-compile
+have compile-only validation. In particular, the SM110 kernel cross-compiles
 with CUTLASS DSL 4.7, but no SM110 hardware execution is claimed.
 
 This narrow contract does not cover a bias term, a returned intermediate state
@@ -62,14 +61,8 @@ general Mamba causal-convolution interface. The indexed path is provided for
 functional paged-state support; its duplicate-index validation has not been
 performance-characterized as a fast path.
 
-On exact SM100, the two measured Qwen3.5 decode signatures `N=128, D=2048` and
-`N=128, D=4096` compile a two-row CTA specialization for unindexed calls. It
-loads each channel's four-tap weight once and reuses it across the two rows,
-while issuing both rows' state/input loads before arithmetic. Every other
-supported architecture always uses the conservative one-row kernel. Indexed
-calls and every other shape also retain that one-row kernel, including its
-device-side index validation and channel-tail handling. This route is an
-internal schedule choice; it does not change the public API or cache key.
+Each CTA owns one decode row and a 256-channel tile. Indexed calls use the same
+schedule with device-side index validation and channel-tail handling.
 
 ## High-level wrapper
 
@@ -134,22 +127,8 @@ public `causal_conv1d_update` contract from Dao-AILab/causal-conv1d at revision
 either project is included. The implementation uses CUTLASS/CuTe DSL, inline
 PTX, and in-tree NVIDIA FROST primitives.
 
-The two-row scheduling idea was selected from audited internal Kernel Factory
-candidate `73d90c7f...`, but that standalone source was not copied into this
-module. The FE specialization is independently implemented on top of the
-existing native inline-PTX path and keeps FE's architecture, alignment, alias,
-index, and cache contracts.
-
-On ComputeLab job `3999943` (B200 SM100, driver `610.57.04`, CUDA `13.0`,
-PyTorch `2.13.0+cu130`, CUTLASS DSL `4.7.0`), an interleaved same-process CUPTI
-run measured the FE specialization against the preceding FE implementation at
-`2.304` versus `2.464` microseconds for `N=128, D=2048`, and `2.848` versus
-`3.328` microseconds for `N=128, D=4096` (201 samples per arm and shape). Paired
-median speedups were `1.134x` and `1.170x`; the `D=2048:D=4096` 2:1 weighted
-geometric mean was `1.146x`. The raw result SHA-256 is
-`fa0d3e7d5fc2d7a0ad2f53362ddf21932dfec109cde119d9dadf4e7fdb9e4cbd`.
-These are direct kernel-active measurements, not single-node CUDA-graph replay
-or end-to-end model latency.
+The FE kernel is independently implemented and keeps FE's architecture,
+alignment, alias, index, and cache contracts.
 
 Use `benchmark/causal_conv1d_update_sm100.py` for route-proof, correctness, and
 an interleaved comparison against FLA on any compute capability listed in the

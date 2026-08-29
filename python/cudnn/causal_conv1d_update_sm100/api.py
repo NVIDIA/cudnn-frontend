@@ -3,9 +3,8 @@
 
 """Experimental FE-OSS API for causal-convolution decode update.
 
-The ``Sm100`` names are retained for API compatibility.  SM100 has the tuned
-row-batch schedule; other admitted architectures use the portable one-row
-schedule.
+The ``Sm100`` names are retained for API compatibility.  Every admitted
+architecture uses the same portable one-row schedule.
 """
 
 import threading
@@ -21,15 +20,10 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn._causal_conv1d_arch import (
     is_supported_causal_conv1d_update_compute_capability,
     supported_causal_conv1d_update_compute_capabilities_text,
-    uses_sm100_causal_conv1d_update_schedule,
 )
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
-from .kernel import (
-    CausalConv1dUpdateKernel,
-    CausalConv1dUpdateRowBatchKernel,
-    select_rows_per_cta,
-)
+from .kernel import CausalConv1dUpdateKernel
 
 _API_CACHE = {}
 _API_CACHE_LOCK = threading.Lock()
@@ -85,9 +79,9 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 class CausalConv1dUpdateSm100(APIBase):
     """Compile and execute BF16 K=4 causal-convolution decode.
 
-    The class name is retained for compatibility.  SM100 uses the optimized
-    schedule; compute capabilities 8.0, 8.6, 8.7, 8.9, 9.0, 10.3, 11.0, 12.0,
-    and 12.1 use a conservative functional schedule.
+    The class name is retained for compatibility. Compute capabilities 8.0,
+    8.6, 8.7, 8.9, 9.0, 10.0, 10.3, 11.0, 12.0, and 12.1 use the same
+    functional schedule.
 
     This inference-only API advances ``state`` in place and writes ``output``.
     It deliberately supports one narrow contract:
@@ -140,7 +134,6 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = None
         self.n_channels = None
         self.n_slots = None
-        self.rows_per_cta = None
 
     @staticmethod
     def _require_rank(desc: TensorDesc, rank: int, name: str) -> None:
@@ -256,12 +249,6 @@ class CausalConv1dUpdateSm100(APIBase):
         self.n_rows = n_rows
         self.n_channels = n_channels
         self.n_slots = n_slots
-        self.rows_per_cta = select_rows_per_cta(
-            n_rows,
-            n_channels,
-            self.state_indices_desc is not None,
-            use_sm100_optimized_schedule=uses_sm100_causal_conv1d_update_schedule(compute_capability),
-        )
         self._is_supported = True
         return True
 
@@ -277,7 +264,7 @@ class CausalConv1dUpdateSm100(APIBase):
         fake_state_indices = self._make_fake_cute_tensor_from_desc(self.state_indices_desc, assumed_align=4)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        kernel = CausalConv1dUpdateRowBatchKernel() if self.rows_per_cta == 2 else CausalConv1dUpdateKernel()
+        kernel = CausalConv1dUpdateKernel()
         # CuTe DSL targets the current CUDA device.  Honor the sample tensor's
         # device even when a multi-GPU caller has another device current.
         with torch.cuda.device(self.x_desc.device):
@@ -404,8 +391,8 @@ def causal_conv1d_update(
     """Advance a BF16 K=4 causal-convolution cache and return fused-SiLU output.
 
     ``state`` is updated in place.  This experimental operation is
-    inference-only, no-bias, and always applies SiLU.  SM100 uses the optimized
-    schedule; other supported architectures use the functional schedule.  See
+    inference-only, no-bias, and always applies SiLU. Every supported
+    architecture uses the same functional schedule. See
     :class:`CausalConv1dUpdateSm100` for the exact tensor contract.
     """
 
