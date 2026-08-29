@@ -38,7 +38,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 - [MoE + Expert Parallel API](moe_ep.md) — Rubin SM107 fused SwiGLU with
   fixed-resource training and CUDA Graph support; see the
-  [MoeEP operation reference](../operations/MoeEp.md) for support details
+  [MoeEP operation reference](../operations/moe_ep.md) for support details
 
 ## Installation and setup
 
@@ -61,7 +61,7 @@ pip install "nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext
 
 MoeEP is currently CUDA/PyTorch-only and targets Rubin SM107. EP2+ execution
 also requires NCCL, NVSHMEM, and a direct-P2P MNNVL peer-access domain. See the
-[MoeEP support matrix and tensor contracts](../operations/MoeEp.md)
+[MoeEP support matrix and tensor contracts](../operations/moe_ep.md)
 before integrating it.
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`

@@ -3,7 +3,7 @@
 `cudnn.moe_ep` provides a fused SwiGLU MoE implementation for Rubin SM107.
 Experts are sharded contiguously across an optional expert-parallel process
 group. This page documents the Python API and lifecycle. See the
-[MoeEP operation reference](../operations/MoeEp.md) for supported
+[MoeEP operation reference](../operations/moe_ep.md) for supported
 architectures, data formats, tensor contracts, and expert-parallel topology.
 
 ## Installation
