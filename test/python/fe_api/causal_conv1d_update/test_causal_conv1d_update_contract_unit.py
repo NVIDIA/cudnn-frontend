@@ -132,6 +132,7 @@ def test_public_helper_is_semantic_and_hides_lifecycle_parameters():
         "conv_state_indices",
     )
     assert signature.parameters["conv_state_indices"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["activation"].default == "silu"
     for implementation_detail in (
         "current_stream",
         "output",
@@ -170,7 +171,6 @@ def test_public_helper_delegates_tensor_contract_without_lifecycle(monkeypatch):
         state,
         weight,
         bias,
-        "silu",
         conv_state_indices=indices,
     )
 

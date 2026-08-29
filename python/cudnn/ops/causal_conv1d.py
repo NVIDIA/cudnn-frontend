@@ -248,7 +248,7 @@ def causal_conv1d_update(
     conv_state: Tensor,
     weight: Tensor,
     bias: Optional[Tensor] = None,
-    activation: Optional[str] = None,
+    activation: str = "silu",
     *,
     conv_state_indices: Optional[Tensor] = None,
 ) -> Tensor:
