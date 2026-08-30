@@ -407,11 +407,17 @@ class ExecutionPlanBuilder_v8 {
 
 #if (CUDNN_VERSION >= 90400)
         if (m_execution_plan.kernel_cache) {
-            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+            // Copy the descriptor pointer by value under the KernelCache lock (defence in depth
+            // against a concurrent build() racing with this pool thread reading &desc). Mirrors the
+            // device_properties copy-then-take-address pattern at line ~513.
+            // IMPORTANT: use get_ptr_locked() here, not get_ptr() — plan build runs on the pool
+            // concurrently with KernelCache::build() on other threads.
+            cudnnBackendDescriptor_t kc_desc = m_execution_plan.kernel_cache->get_ptr_locked();
+            status                           = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
                                            CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE,
                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                            1,
-                                           &m_execution_plan.kernel_cache->get_ptr());
+                                           &kc_desc);
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&m_execution_plan,
                                               status,

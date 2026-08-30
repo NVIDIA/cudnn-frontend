@@ -9,6 +9,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -40,8 +41,19 @@ class KernelCache : public detail::backend_descriptor {
     }
 
     bool
-    is_finalized() {
-        return finalized;
+    is_finalized() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return finalized_unlocked();
+    }
+
+    // Returns the underlying descriptor pointer by VALUE under the lock.
+    // Use this instead of get_ptr() when the cache may still be under concurrent build().
+    // IMPORTANT: build(), from_json(), to_json() must NOT call this — they already hold mutex_
+    // and std::mutex is non-recursive. Use the inherited get_ptr() inside those methods.
+    cudnnBackendDescriptor_t
+    get_ptr_locked() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return get_ptr();
     }
 
     // Used to check kernel cache status (particularly after initialization)
@@ -56,6 +68,7 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     to_json(std::string &str_json) const {
+        std::lock_guard<std::mutex> lk(mutex_);
         str_json.clear();
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
@@ -86,6 +99,7 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     from_json(const std::string &json_cache) {
+        std::lock_guard<std::mutex> lk(mutex_);
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
@@ -113,14 +127,22 @@ class KernelCache : public detail::backend_descriptor {
 #endif
     }
 
-    // Responsible for initializing, setting operation graph attribute, and finalizing kernel cache
-    // Check for both compile-time and runtime cuDNN version
+    // Responsible for initializing, setting operation graph attribute, and finalizing kernel cache.
+    // Check for both compile-time and runtime cuDNN version.
+    // Thread-safe: the entire body is locked so concurrent callers serialize. Idempotent: a second
+    // call after finalization returns OK immediately without re-initializing the descriptor.
+    // NOTE: build() uses get_ptr() (inherited, unlocked) — it MUST NOT call get_ptr_locked() as
+    // mutex_ is non-recursive and is already held for the duration of this call.
     error_t
     build(cudnnBackendDescriptor_t op_graph) {
+        std::lock_guard<std::mutex> lk(mutex_);
 #if (CUDNN_VERSION >= 90400)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90400,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR is only available starting 9.4.");
+        if (finalized_unlocked()) {
+            return {};
+        }
         if (get_ptr() == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(initialize(CUDNN_BACKEND_KERNEL_CACHE_DESCRIPTOR));
         }
@@ -147,5 +169,15 @@ class KernelCache : public detail::backend_descriptor {
 
    private:
     bool finalized = false;
+    // Protects finalized, and the desc/status members inherited from backend_descriptor.
+    // Precedent: cudnn_frontend_ExecutionPlanCache.h uses the same plain mutable mutex pattern.
+    // KernelCache is always heap-allocated via shared_ptr and never moved after construction.
+    mutable std::mutex mutex_;
+
+    // Must only be called with mutex_ already held (by build(), is_finalized(), etc.).
+    bool
+    finalized_unlocked() const {
+        return finalized;
+    }
 };
 }  // namespace cudnn_frontend
