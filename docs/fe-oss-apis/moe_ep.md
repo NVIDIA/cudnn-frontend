@@ -275,27 +275,30 @@ Fixed-resource training uses a narrower, graph-stable staging ABI:
 Expert IDs and finite dynamic values remain a trusted-caller replay contract;
 they are not revalidated by host code after graph capture.
 
-`MoeEpTrainingWeights` contains four contiguous MXFP8 block-scaled tensors:
+`MoeEpTrainingWeights` contains four MXFP8 block-scaled tensors:
 
 - `forward_fc1`: `(E_local, H, 2I)`
 - `forward_fc2`: `(E_local, I, H)`
 - `backward_w2_transpose`: `(E_local, H, I)`
 - `backward_w1_transpose`: `(E_local, 2I, H)`
 
-Each data and scale tensor must be contiguous, reside on one device, and use
-logical block axis 1. Plain FP16 operands are accepted by inference staging,
-but fixed-resource training accepts only BF16 or FP32 `activation` and
-`grad_output`.
+Each data and scale tensor must be contiguous or use compact K-major strides
+`(K*N, 1, K)`, reside on one device, and use logical block axis 1. The K-major
+form lets framework integrations bind transposed weight views without an extra
+copy. Plain FP16 operands are accepted by inference staging, but fixed-resource
+training accepts only BF16 or FP32 `activation` and `grad_output`.
 
 Replacing weight storage requires preparing resources and capturing again.
 Callers must establish stream/event ordering for in-place weight updates.
 
 ### Explicit weight refresh contract
 
-`MoeEpTrainingWeights` uses a public contiguous MXFP8 layout, while the Rubin
-kernels consume fixed-address K-major, gate/up-interleaved, and blocked-scale
-layouts. `resources.refresh_weights()` enqueues the required device-only copies
-and layout transforms into the internal kernel bindings.
+Rubin training recognizes compact K-major forward views plus
+contiguous backward transposes. For that form, weight data is bound directly
+and FC1 gate/up values must already use 32-element interleaving.
+`resources.refresh_weights()` then swizzles only scales into fixed-address,
+kernel-native buffers and never copies the weight payload. Existing contiguous
+public packs retain the compatible data-and-scale staging path.
 
 The caller must obey all of the following:
 
@@ -403,7 +406,7 @@ For fixed-resource training:
 1. all ranks collectively call `prepare_training_resources`;
 2. all ranks perform an ordinary
    `refresh_weights -> forward -> backward -> finalize_overflow` warmup so
-   every staging, MegaMoE, and WGrad-export kernel is compiled;
+   every scale-staging, MegaMoE, and WGrad-export kernel is compiled;
 3. each rank captures its outer graph;
 4. ranks align after capture;
 5. graph execs are submitted in lockstep without host synchronization inside

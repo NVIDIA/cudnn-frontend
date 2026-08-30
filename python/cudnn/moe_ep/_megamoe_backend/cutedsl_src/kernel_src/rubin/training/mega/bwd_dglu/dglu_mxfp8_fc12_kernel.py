@@ -857,8 +857,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # B_gemm (fc1 weights): (experts, hidden, intermediate_gateup) with hidden stride-1 (K-major)
-        # -> (N=intermediate_gateup, K=hidden, L=experts).
+        # B_gemm (W2T): reinterpret public C-contiguous (experts, hidden, inter_half)
+        # as (N=inter_half, K=hidden, L=experts). The stride permutation makes this
+        # an N-major GEMM operand without staging or moving data.
         experts, hidden_b, intermediate_gateup = fc1_weight.shape
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
@@ -924,7 +925,9 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # GEMM-domain transform for fc2 phase ──
+        # GEMM-domain transform for fc2 phase. W1T is public C-contiguous
+        # (experts, 2 * inter_half, hidden), with its reduction rows already in
+        # 32-wide gate/up order. Preserve that K ordering and expose hidden as N.
         experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,

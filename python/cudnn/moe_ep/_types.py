@@ -223,7 +223,7 @@ class MoeEpExecutionLane:
 
 
 class MoeEpTrainingResources:
-    """TE-owned lease on fixed-capacity training slots and execution lanes."""
+    """Caller-owned lease on fixed-capacity training slots and execution lanes."""
 
     def __init__(
         self,
@@ -264,7 +264,7 @@ class MoeEpTrainingResources:
             raise ValueError("execution lane does not belong to these resources")
 
     def refresh_weights(self) -> None:
-        """Enqueue fixed-address weight-layout refreshes on the current stream.
+        """Enqueue fixed-address scale-layout refreshes on the current stream.
 
         Call after every in-place data+scale update and before the first
         forward/backward that consumes that version. The caller must establish

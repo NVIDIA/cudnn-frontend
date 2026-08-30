@@ -227,6 +227,14 @@ def validate_training_weights(
 ) -> torch.device:
     """Validate fixed MXFP8 weight bindings used by training resources."""
 
+    def has_supported_layout(tensor: torch.Tensor) -> bool:
+        if tensor.is_contiguous():
+            return True
+        if tensor.ndim != 3:
+            return False
+        experts, reduction, output = tensor.shape
+        return tensor.stride() == (reduction * output, 1, reduction)
+
     if not isinstance(weights, MoeEpTrainingWeights):
         raise TypeError("weights must be a MoeEpTrainingWeights, " f"got {type(weights).__name__}")
     expected = (
@@ -273,8 +281,11 @@ def validate_training_weights(
             raise TypeError(f"{name} must be an MXFP8 BlockScaledTensor for " "fixed training resources")
         if tensor.format is not MoeFormat.MXFP8:
             raise NotImplementedError(f"{name} must use format='mxfp8', got {tensor.format.value!r}")
-        if not tensor.data.is_contiguous() or not tensor.scale.is_contiguous():
-            raise ValueError(f"{name} data and scale must be contiguous for fixed " "training weight binding")
+        if not has_supported_layout(tensor.data) or not has_supported_layout(tensor.scale):
+            raise ValueError(
+                f"{name} data and scale must be contiguous or compact K-major "
+                "for fixed training weight binding"
+            )
     device = weights.forward_fc1.device
     for name, tensor, _shape in expected[1:]:
         if tensor.device != device:

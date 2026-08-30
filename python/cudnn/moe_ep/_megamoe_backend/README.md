@@ -73,9 +73,13 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 
 `MoeEpTrainingWeights` contains four address-stable MXFP8 block-scaled tensors:
 forward W1/W2 and independently quantized backward W2-transpose/W1-transpose.
-Their public layout differs from the K-major, gate/up-interleaved, and
-blocked-scale kernel bindings. After every in-place data+scale update, the
-caller must enqueue `resources.refresh_weights()` before the first consumer,
+When forward weights use compact K-major storage and backward transpose weights
+use standard contiguous storage, the kernels alias weight data directly. In
+this layout, W1 gate/up values are interleaved in 32-element strips and only
+scales require kernel-native staging. When forward weights use standard
+contiguous storage, weight data and scales are copied and reordered into
+persistent kernel buffers. After every in-place data+scale update, the caller
+must enqueue `resources.refresh_weights()` before the first consumer,
 with explicit stream/event ordering. A matching forward/backward pair must use
 one version; refresh cannot overlap any consumer on another slot/lane. Replacing
 source storage requires closing the old operator, creating a new `MoeEp`

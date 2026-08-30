@@ -368,8 +368,6 @@ def test_training_sources_track_adapter_grad_y2_and_dfc2_contracts():
             "plain_tensor",
             "axis",
             "format",
-            "data_noncontiguous",
-            "scale_noncontiguous",
         )
     ],
 )
@@ -402,6 +400,19 @@ def test_validate_training_weights_accepts_complete_fixed_weight_set():
         _training_config(),
         _training_weights(),
     ) == torch.device("cpu")
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("part", ["data_noncontiguous", "scale_noncontiguous"])
+def test_validate_training_weights_accepts_compact_k_major_views(part):
+    weights, _, _ = _training_weight_defect(
+        _training_weights(),
+        "forward_fc1",
+        part,
+    )
+    assert validate_training_weights(_training_config(), weights) == torch.device("cpu")
+    bindings = Mxfp8TrainingWeightBindings(weights)
+    bindings.refresh()
 
 
 def _operator(**overrides) -> MoeEp:
@@ -534,30 +545,48 @@ def test_distributed_error_mode_requires_nccl(monkeypatch):
 
 
 @pytest.mark.L0
-def test_training_weight_refresh_keeps_destination_addresses_stable():
+def test_training_weight_bindings_alias_data_and_stage_only_scales():
     weights = _training_weights()
+    from cudnn.moe_ep import BlockScaledTensor, MoeEpTrainingWeights
+
+    def compact_k_major(tensor):
+        return BlockScaledTensor(
+            data=tensor.data.transpose(1, 2).contiguous().transpose(1, 2),
+            scale=tensor.scale.transpose(1, 2).contiguous().transpose(1, 2),
+            format=tensor.format,
+            logical_shape=tensor.logical_shape,
+            axis=tensor.axis,
+        )
+
+    weights = MoeEpTrainingWeights(
+        forward_fc1=compact_k_major(weights.forward_fc1),
+        forward_fc2=compact_k_major(weights.forward_fc2),
+        backward_w2_transpose=weights.backward_w2_transpose,
+        backward_w1_transpose=weights.backward_w1_transpose,
+    )
     bindings = Mxfp8TrainingWeightBindings(weights)
     bindings.refresh()
-    tensors = (
-        bindings.forward.fc1_weight,
+    data_pairs = (
+        (bindings.forward.fc1_weight, weights.forward_fc1.data),
+        (bindings.forward.fc2_weight, weights.forward_fc2.data),
+        (bindings.backward.fc1_weight, weights.backward_w2_transpose.data),
+        (bindings.backward.fc2_weight, weights.backward_w1_transpose.data),
+    )
+    scales = (
         bindings.forward.fc1_weight_sf,
-        bindings.forward.fc2_weight,
         bindings.forward.fc2_weight_sf,
-        bindings.backward.fc1_weight,
         bindings.backward.fc1_weight_sf,
-        bindings.backward.fc2_weight,
         bindings.backward.fc2_weight_sf,
     )
-    pointers = tuple(tensor.data_ptr() for tensor in tensors)
-    snapshots = tuple(tensor.clone() for tensor in tensors)
+    scale_pointers = tuple(tensor.data_ptr() for tensor in scales)
+    scale_snapshots = tuple(tensor.clone() for tensor in scales)
 
-    weights.forward_fc1.data.view(torch.uint8).bitwise_xor_(1)
+    weights.forward_fc1.scale.view(torch.uint8).bitwise_xor_(1)
     bindings.refresh()
 
-    assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
-    assert not torch.equal(bindings.forward.fc1_weight, snapshots[0])
-    for tensor in tensors:
-        assert tensor.is_contiguous() or tensor.stride(1) == 1
+    assert all(bound.data_ptr() == source.data_ptr() for bound, source in data_pairs)
+    assert tuple(tensor.data_ptr() for tensor in scales) == scale_pointers
+    assert not torch.equal(bindings.forward.fc1_weight_sf, scale_snapshots[0])
 
 
 @pytest.mark.L0
