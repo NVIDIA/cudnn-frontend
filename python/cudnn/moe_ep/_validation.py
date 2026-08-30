@@ -185,6 +185,14 @@ def validate_forward(
             config.hidden_size,
         ),
     )
+    if config.weight_interleave_size is not None and (
+        not isinstance(fc1_weight, BlockScaledTensor)
+        or fc1_weight.format is not MoeFormat.MXFP8
+    ):
+        raise ValueError(
+            "weight_interleave_size=32 requires an MXFP8 BlockScaledTensor "
+            "for fc1_weight"
+        )
     _validate_routes(
         config,
         token_count,
@@ -230,6 +238,12 @@ def validate_training_weights(
     def has_supported_layout(tensor: torch.Tensor) -> bool:
         if tensor.is_contiguous():
             return True
+        if tensor.ndim != 3:
+            return False
+        experts, reduction, output = tensor.shape
+        return tensor.stride() == (reduction * output, 1, reduction)
+
+    def is_compact_k_major(tensor: torch.Tensor) -> bool:
         if tensor.ndim != 3:
             return False
         experts, reduction, output = tensor.shape
@@ -286,6 +300,16 @@ def validate_training_weights(
                 f"{name} data and scale must be contiguous or compact K-major "
                 "for fixed training weight binding"
             )
+    if config.weight_interleave_size == 32 and not (
+        is_compact_k_major(weights.forward_fc1.data)
+        and is_compact_k_major(weights.forward_fc2.data)
+        and weights.backward_w2_transpose.data.is_contiguous()
+        and weights.backward_w1_transpose.data.is_contiguous()
+    ):
+        raise ValueError(
+            "weight_interleave_size=32 requires compact K-major forward "
+            "weights and contiguous backward transpose weights"
+        )
     device = weights.forward_fc1.device
     for name, tensor, _shape in expected[1:]:
         if tensor.device != device:

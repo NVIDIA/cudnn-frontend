@@ -243,10 +243,6 @@ def build_training_workspace_requirements(
     }
     scale_columns = _align_scale_columns(forward.pool_token_capacity)
     wgrad_shapes = {
-        "wgrad_fc1_b": (
-            forward.pool_token_capacity,
-            2 * config.intermediate_size,
-        ),
         "wgrad_fc1_sfa": (
             _round_up(config.hidden_size, 128),
             scale_columns,
@@ -254,10 +250,6 @@ def build_training_workspace_requirements(
         "wgrad_fc1_sfb": (
             _round_up(2 * config.intermediate_size, 128),
             scale_columns,
-        ),
-        "wgrad_fc2_a": (
-            config.intermediate_size,
-            forward.pool_token_capacity,
         ),
         "wgrad_fc2_sfa": (
             _round_up(config.intermediate_size, 128),
@@ -612,10 +604,8 @@ class Mxfp8TrainingSlotViews:
     fc1_col_output_sf: torch.Tensor
     grad_y2: torch.Tensor
     grad_y2_sf: torch.Tensor
-    wgrad_fc1_b: torch.Tensor
     wgrad_fc1_sfa: torch.Tensor
     wgrad_fc1_sfb: torch.Tensor
-    wgrad_fc2_a: torch.Tensor
     wgrad_fc2_sfa: torch.Tensor
     wgrad_fc2_sfb: torch.Tensor
 
@@ -651,7 +641,10 @@ class Mxfp8TrainingResourceOwner:
         self.device = torch.device(device)
         self.forward_prepared = forward
         self.backward_prepared = backward
-        self.weight_bindings = Mxfp8TrainingWeightBindings(weights)
+        self.weight_bindings = Mxfp8TrainingWeightBindings(
+            weights,
+            weight_interleave_size=config.weight_interleave_size,
+        )
         self.stager = Mxfp8TrainingStager(config.hidden_size, config.top_k)
         self.wgrad_exporter = Mxfp8TrainingWgradExporter(
             experts=config.experts_per_rank,
@@ -1016,14 +1009,6 @@ class Mxfp8TrainingResourceOwner:
                 torch.uint8,
                 bwd_shapes["grad_y2_sf"],
             ),
-            wgrad_fc1_b=_typed_k_major_view(
-                local_bytes("wgrad_fc1_b"),
-                _DATA_DTYPE,
-                (
-                    self.forward_prepared.pool_token_capacity,
-                    2 * config.intermediate_size,
-                ),
-            ),
             wgrad_fc1_sfa=_typed_view(
                 local_bytes("wgrad_fc1_sfa"),
                 _SCALE_DTYPE,
@@ -1035,14 +1020,6 @@ class Mxfp8TrainingResourceOwner:
                 (
                     _round_up(2 * config.intermediate_size, 128),
                     scale_columns,
-                ),
-            ),
-            wgrad_fc2_a=_typed_view(
-                local_bytes("wgrad_fc2_a"),
-                _DATA_DTYPE,
-                (
-                    config.intermediate_size,
-                    self.forward_prepared.pool_token_capacity,
                 ),
             ),
             wgrad_fc2_sfa=_typed_view(

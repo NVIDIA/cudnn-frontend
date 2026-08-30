@@ -113,6 +113,7 @@ class MoeEp:
         output_format: Union[MoeFormat, str] = MoeFormat.BF16,
         combine_format: Union[MoeFormat, str] = MoeFormat.BF16,
         apply_topk_in_fc1: bool = True,
+        weight_interleave_size: Optional[int] = None,
         gate_up_clamp: Optional[float] = None,
         token_padding_size: int = 128,
         sf_padding_size: int = 128,
@@ -139,6 +140,8 @@ class MoeEp:
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
             raise ValueError("apply_topk_in_fc1 must be a bool")
+        if weight_interleave_size not in (None, 32):
+            raise ValueError("weight_interleave_size must be None or 32")
         for name, value in (
             ("token_padding_size", token_padding_size),
             ("sf_padding_size", sf_padding_size),
@@ -177,6 +180,7 @@ class MoeEp:
         self.output_format = _parse_format(output_format)
         self.combine_format = _parse_format(combine_format)
         self.apply_topk_in_fc1 = apply_topk_in_fc1
+        self.weight_interleave_size = weight_interleave_size
         self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
         self.token_padding_size = token_padding_size
         self.sf_padding_size = sf_padding_size
@@ -210,6 +214,7 @@ class MoeEp:
             output_format=self.output_format.value,
             combine_format=self.combine_format.value,
             apply_topk_in_fc1=self.apply_topk_in_fc1,
+            weight_interleave_size=self.weight_interleave_size,
             gate_up_clamp=self.gate_up_clamp,
             generate_c=False,
             token_padding_size=self.token_padding_size,

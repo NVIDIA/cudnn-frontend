@@ -65,12 +65,18 @@ op = MoeEp(
     output_format="bf16",
     combine_format="bf16",             # "bf16" or "mxfp8"
     apply_topk_in_fc1=True,
+    weight_interleave_size=None,       # Or 32 for pre-interleaved MXFP8 W1
     gate_up_clamp=None,
 )
 ```
 
 `topk_idx` contains global expert IDs. Each rank passes its local tokens and
 its contiguous shard of both expert-weight tensors:
+
+`weight_interleave_size=32` declares that MXFP8 FC1 values already use
+alternating 32-element gate/up strips. The default `None` uses conventional
+gate-then-up order. Plain BF16/FP16/FP32 weights remain conventional and reject
+the interleaved contract because they must be quantized and staged internally.
 
 ```python
 output = op(

@@ -73,12 +73,12 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 
 `MoeEpTrainingWeights` contains four address-stable MXFP8 block-scaled tensors:
 forward W1/W2 and independently quantized backward W2-transpose/W1-transpose.
-When forward weights use compact K-major storage and backward transpose weights
-use standard contiguous storage, the kernels alias weight data directly. In
-this layout, W1 gate/up values are interleaved in 32-element strips and only
-scales require kernel-native staging. When forward weights use standard
-contiguous storage, weight data and scales are copied and reordered into
-persistent kernel buffers. After every in-place data+scale update, the caller
+With `weight_interleave_size=32`, compact K-major forward weights and contiguous
+backward transposes are interpreted as already using 32-element W1 gate/up
+strips, and the kernels alias weight data directly; only scales require
+kernel-native staging. With the default `None`, weights use conventional
+gate-then-up order and are copied and interleaved into persistent kernel
+buffers. After every in-place data+scale update, the caller
 must enqueue `resources.refresh_weights()` before the first consumer,
 with explicit stream/event ordering. A matching forward/backward pair must use
 one version; refresh cannot overlap any consumer on another slot/lane. Replacing
@@ -93,8 +93,13 @@ contract and relaxed atomic accumulation order.
 
 `MoeEpTrainingWgradOperands` is a fixed-capacity producer ABI. Device
 `expert_offsets` and `valid_route_counts` describe the current valid K extent;
-padding is zeroed. No specific downstream grouped-WGrad consumer is guaranteed
-by this milestone.
+padding is zeroed. Its data operands alias persistent forward or backward
+outputs, using transpose views where required; exporting them performs no
+full-tensor data copies. Scale operands are expanded into persistent
+grouped-WGrad layouts. FC1 dY data and scales preserve the same 32-element
+gate/up-interleaved row order as W1, so a downstream grouped-WGrad consumer
+writes gradients in parameter storage order. No specific downstream
+grouped-WGrad consumer is guaranteed by this milestone.
 
 ## Overflow policy
 

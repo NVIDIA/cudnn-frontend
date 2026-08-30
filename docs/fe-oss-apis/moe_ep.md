@@ -42,6 +42,7 @@ The `MoeEp` constructor accepts:
 | `output_format` | `"bf16"` only for current execution |
 | `combine_format` | `"bf16"` or `"mxfp8"` |
 | `apply_topk_in_fc1` | Must be `True` |
+| `weight_interleave_size` | `None` for conventional gate-then-up weights or `32` for pre-interleaved MXFP8 weights |
 | `gate_up_clamp` | Optional finite clamp magnitude |
 | `token_padding_size` | Positive; training fixed resources use 128 internally |
 | `sf_padding_size` | Positive multiple of 128; training fixed resources use 128 internally |
@@ -293,12 +294,15 @@ Callers must establish stream/event ordering for in-place weight updates.
 
 ### Explicit weight refresh contract
 
-Rubin training recognizes compact K-major forward views plus
-contiguous backward transposes. For that form, weight data is bound directly
-and FC1 gate/up values must already use 32-element interleaving.
+With `weight_interleave_size=32`, Rubin training recognizes compact K-major
+forward views plus contiguous backward transposes as pre-interleaved. For that
+form, weight data is bound directly and FC1 gate/up values must use alternating
+32-element strips. Layout alone never selects this semantic convention.
 `resources.refresh_weights()` then swizzles only scales into fixed-address,
 kernel-native buffers and never copies the weight payload. Existing contiguous
-public packs retain the compatible data-and-scale staging path.
+public packs with the default `None` retain conventional gate-then-up semantics
+and the compatible data-and-scale staging path. Plain BF16/FP16/FP32 inference
+weights cannot use `weight_interleave_size=32`.
 
 The caller must obey all of the following:
 

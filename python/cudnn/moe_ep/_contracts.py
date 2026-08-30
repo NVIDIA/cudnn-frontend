@@ -39,6 +39,7 @@ class ForwardConfig:
     backward_wgrad_mode: Literal["none", "operands"] = "none"
     max_recv_size_per_rank: Optional[int] = None
     drop_on_overflow: bool = False
+    weight_interleave_size: Optional[int] = None
 
 
 @dataclass(frozen=True)

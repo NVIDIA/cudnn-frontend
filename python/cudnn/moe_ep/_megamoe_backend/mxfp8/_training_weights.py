@@ -182,18 +182,30 @@ class Mxfp8BackwardWeights:
 class Mxfp8TrainingWeightBindings:
     """Direct data bindings with persistent kernel-native scale staging."""
 
-    def __init__(self, weights: MoeEpTrainingWeights) -> None:
+    def __init__(
+        self,
+        weights: MoeEpTrainingWeights,
+        *,
+        weight_interleave_size: int | None = None,
+    ) -> None:
         self.weights = weights
+        self.weight_interleave_size = weight_interleave_size
         fwd_fc1 = weights.forward_fc1
         fwd_fc2 = weights.forward_fc2
         bwd_w2t = weights.backward_w2_transpose
         bwd_w1t = weights.backward_w1_transpose
         self._uses_direct_weight_bindings = (
-            fwd_fc1.data.stride(1) == 1
+            weight_interleave_size == 32
+            and fwd_fc1.data.stride(1) == 1
             and fwd_fc2.data.stride(1) == 1
             and bwd_w2t.data.is_contiguous()
             and bwd_w1t.data.is_contiguous()
         )
+        if weight_interleave_size == 32 and not self._uses_direct_weight_bindings:
+            raise ValueError(
+                "weight_interleave_size=32 requires compact K-major forward "
+                "weights and contiguous backward transpose weights"
+            )
 
         self.forward = Mxfp8Weights(
             fc1_weight=(

@@ -425,6 +425,33 @@ def test_moe_ep_rejects_invalid_padding(kwargs):
 
 
 @pytest.mark.L0
+def test_moe_ep_rejects_unsupported_weight_interleave_size():
+    from cudnn import MoeEp
+
+    with pytest.raises(ValueError, match="weight_interleave_size must be None or 32"):
+        MoeEp(**_forward_config(), weight_interleave_size=16)
+
+
+@pytest.mark.L0
+def test_moe_ep_rejects_interleaved_plain_fc1_weight():
+    from cudnn import MoeEp
+
+    config = _forward_config()
+    activation = torch.zeros((1, config["hidden_size"]))
+    fc1_weight = torch.zeros(
+        (config["num_experts"], config["hidden_size"], 2 * config["intermediate_size"])
+    )
+    fc2_weight = torch.zeros(
+        (config["num_experts"], config["intermediate_size"], config["hidden_size"])
+    )
+    topk_idx = torch.zeros((1, config["top_k"]), dtype=torch.int32)
+    topk_weights = torch.ones((1, config["top_k"]))
+    with MoeEp(**config, weight_interleave_size=32) as op:
+        with pytest.raises(ValueError, match="requires an MXFP8"):
+            op(activation, fc1_weight, fc2_weight, topk_idx, topk_weights)
+
+
+@pytest.mark.L0
 def test_moe_ep_rejects_untyped_tuning():
     from cudnn import MoeEp
 
@@ -1089,6 +1116,70 @@ def test_reference_mxfp8_inputs_bf16_combine_matches_naive(
         intermediate_format=intermediate_format,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+def test_reference_interleaved_fc1_matches_logical_fc1():
+    from cudnn import BlockScaledTensor
+
+    torch.manual_seed(29)
+    experts, tokens, hidden, intermediate = 2, 3, 128, 128
+    activation = quantize_blockwise(
+        torch.randn(tokens, hidden),
+        MoeFormat.MXFP8,
+        axis=1,
+    )
+    logical_fc1 = quantize_blockwise(
+        torch.randn(experts, hidden, 2 * intermediate) / 8,
+        MoeFormat.MXFP8,
+        axis=1,
+    )
+    fc2 = quantize_blockwise(
+        torch.randn(experts, intermediate, hidden) / 8,
+        MoeFormat.MXFP8,
+        axis=1,
+    )
+
+    def interleave_last(tensor):
+        shape = tensor.shape
+        return (
+            tensor.view(*shape[:-1], 2, intermediate // 32, 32)
+            .transpose(-3, -2)
+            .reshape(shape)
+        )
+
+    interleaved_fc1 = BlockScaledTensor(
+        data=interleave_last(logical_fc1.data),
+        scale=interleave_last(logical_fc1.scale),
+        format=logical_fc1.format,
+        logical_shape=logical_fc1.logical_shape,
+        axis=logical_fc1.axis,
+    )
+    topk_idx = torch.tensor([[0], [1], [0]], dtype=torch.int64)
+    topk_weights = torch.ones(tokens, 1)
+    kwargs = dict(
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        top_k=1,
+    )
+
+    logical = MoeEpReference(**kwargs)(
+        activation,
+        logical_fc1,
+        fc2,
+        topk_idx,
+        topk_weights,
+    )
+    interleaved = MoeEpReference(**kwargs, weight_interleave_size=32)(
+        activation,
+        interleaved_fc1,
+        fc2,
+        topk_idx,
+        topk_weights,
+    )
+
+    torch.testing.assert_close(interleaved, logical, atol=0, rtol=0)
 
 
 # Host-side EP topology and runtime bootstrap.

@@ -1268,6 +1268,20 @@ def _assert_wgrads_match_reference(
     actual_dense = _dense_wgrads_from_operands(actual)
     if expected_dense is None:
         expected_dense = expected.dense_wgrads()
+    expected_fc1, expected_fc2 = expected_dense
+    interleave_size = 32
+    fc1_out_features = expected_fc1.shape[-1]
+    expected_fc1 = (
+        expected_fc1.view(
+            *expected_fc1.shape[:-1],
+            2,
+            fc1_out_features // (2 * interleave_size),
+            interleave_size,
+        )
+        .transpose(-3, -2)
+        .reshape(expected_fc1.shape)
+    )
+    expected_dense = (expected_fc1, expected_fc2)
     for name, actual_dw, expected_dw in zip(
         ("grad_fc1_weight", "grad_fc2_weight"),
         actual_dense,

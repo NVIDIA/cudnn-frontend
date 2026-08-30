@@ -25,6 +25,7 @@ class Mxfp8KernelConfig:
     top_k: int
     max_tokens_per_rank: int
     apply_topk_in_fc1: bool
+    weight_interleave_size: int | None
     gate_up_clamp: float | None
     generate_c: bool
     max_recv_size_per_rank: int | None = None
@@ -78,6 +79,7 @@ class Mxfp8KernelConfig:
             top_k=config.top_k,
             max_tokens_per_rank=config.max_tokens_per_rank,
             apply_topk_in_fc1=config.apply_topk_in_fc1,
+            weight_interleave_size=config.weight_interleave_size,
             gate_up_clamp=config.gate_up_clamp,
             generate_c=config.generate_c,
             max_recv_size_per_rank=max_recv_size_per_rank,

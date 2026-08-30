@@ -32,33 +32,8 @@ class Mxfp8TrainingWgradExporter:
         self.hidden = int(hidden)
         self.intermediate = int(intermediate)
         self.sf_padding = int(sf_padding)
-        self._compiled: dict[tuple[int, int, int | None], object] = {}
+        self._compiled: dict[tuple[int, int], object] = {}
         self._lock = threading.RLock()
-
-    @staticmethod
-    def _copy_gate_up_data(
-        target: torch.Tensor,
-        source: torch.Tensor,
-        intermediate: int,
-    ) -> None:
-        pool_rows = source.shape[0]
-        pairs = intermediate // 32
-        source_view = source.view(pool_rows, pairs, 2, 32).permute(
-            0,
-            2,
-            1,
-            3,
-        )
-        target_view = target.as_strided(
-            (pool_rows, 2, pairs, 32),
-            (
-                target.stride(0),
-                intermediate * target.stride(1),
-                32 * target.stride(1),
-                target.stride(1),
-            ),
-        )
-        target_view.copy_(source_view)
 
     def _expand_scales(
         self,
@@ -68,7 +43,6 @@ class Mxfp8TrainingWgradExporter:
         output: torch.Tensor,
         *,
         non_k_size: int,
-        deinterleave_gate_up: int | None = None,
     ) -> None:
         if source.dtype not in (torch.uint8, torch.float8_e8m0fnu):
             raise TypeError("WGrad source scales must use Uint8 or E8M0")
@@ -76,7 +50,7 @@ class Mxfp8TrainingWgradExporter:
             raise TypeError("WGrad output scales must use E8M0")
         source_bytes = source.view(torch.uint8).reshape(-1)
         output_bytes = output.view(torch.uint8).reshape(-1)
-        key = (int(non_k_size), self.sf_padding, deinterleave_gate_up)
+        key = (int(non_k_size), self.sf_padding)
         import cuda.bindings.driver as cuda
 
         stream = torch.cuda.current_stream(output.device)
@@ -102,7 +76,6 @@ class Mxfp8TrainingWgradExporter:
                     non_k_size=non_k_size,
                     expert_count=self.experts,
                     source_sf_padding=self.sf_padding,
-                    deinterleave_gate_up=deinterleave_gate_up,
                 )
                 compiled = cute.compile(kernel, *args)
                 self._compiled[key] = compiled
@@ -120,12 +93,6 @@ class Mxfp8TrainingWgradExporter:
         if slot.col_quant_data.shape[0] != pool_rows:
             raise RuntimeError("forward/backward WGrad pool capacities differ")
 
-        self._copy_gate_up_data(
-            slot.wgrad_fc1_b,
-            slot.fc1_col_output,
-            self.intermediate,
-        )
-        slot.wgrad_fc2_a.copy_(slot.fc1_recompute.transpose(0, 1))
         self._expand_scales(
             slot.col_quant_sf,
             slot.valid_route_counts,
@@ -139,7 +106,6 @@ class Mxfp8TrainingWgradExporter:
             slot.expert_offsets,
             slot.wgrad_fc1_sfb,
             non_k_size=2 * self.intermediate,
-            deinterleave_gate_up=self.intermediate,
         )
         self._expand_scales(
             slot.fc1_recompute_sf,
@@ -159,9 +125,9 @@ class Mxfp8TrainingWgradExporter:
         return MoeEpTrainingWgradOperands(
             fc1_a=slot.col_quant_data.transpose(0, 1),
             fc1_sfa=slot.wgrad_fc1_sfa,
-            fc1_b=slot.wgrad_fc1_b,
+            fc1_b=slot.fc1_col_output,
             fc1_sfb=slot.wgrad_fc1_sfb,
-            fc2_a=slot.wgrad_fc2_a,
+            fc2_a=slot.fc1_recompute.transpose(0, 1),
             fc2_sfa=slot.wgrad_fc2_sfa,
             fc2_b=slot.grad_y2,
             fc2_sfb=slot.wgrad_fc2_sfb,

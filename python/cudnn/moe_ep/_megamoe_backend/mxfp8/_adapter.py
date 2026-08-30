@@ -238,18 +238,25 @@ def _stack_blocked_scales(raw_scales: torch.Tensor) -> torch.Tensor:
 def _prepare_fc1(
     tensor: BlockScaledTensor,
     intermediate: int,
+    *,
+    already_interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Preserve logical bytes while building interleaved K-major FC1 tensors."""
+    """Build kernel-native K-major FC1 tensors."""
 
     payload_nkh = _as_bytes(tensor.data).permute(0, 2, 1).contiguous()
-    payload_interleaved = _interleave_gate_up_rows(
-        payload_nkh,
-        intermediate,
+    payload_interleaved = (
+        payload_nkh
+        if already_interleaved
+        else _interleave_gate_up_rows(payload_nkh, intermediate)
     )
     payload = payload_interleaved.view(_MXFP8_DATA_DTYPE).permute(0, 2, 1)
 
     scales_nk = _as_bytes(tensor.scale).permute(0, 2, 1).contiguous()
-    scales_interleaved = _interleave_gate_up_rows(scales_nk, intermediate)
+    scales_interleaved = (
+        scales_nk
+        if already_interleaved
+        else _interleave_gate_up_rows(scales_nk, intermediate)
+    )
     scale = _stack_blocked_scales(scales_interleaved)
     return payload, scale
 
@@ -362,6 +369,7 @@ class Mxfp8InputAdapter:
         fc1_weight, fc1_weight_sf = _prepare_fc1(
             fc1_source,
             config.intermediate,
+            already_interleaved=config.weight_interleave_size == 32,
         )
         fc2_weight, fc2_weight_sf = _prepare_fc2(fc2_source)
         weights = Mxfp8Weights(
