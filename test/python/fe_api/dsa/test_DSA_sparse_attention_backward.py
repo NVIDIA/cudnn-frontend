@@ -95,13 +95,20 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
-@pytest.mark.L0
 @torch_fork_set_rng(seed=419)
 @pytest.mark.parametrize(
-    "num_heads,head_dim",
-    [(16, 576), (32, 512), (64, 512), (64, 576), (96, 512), (128, 576)],
+    "num_heads,head_dim,repeats",
+    [
+        pytest.param(16, 576, 3, marks=pytest.mark.L0, id="H16-D576-tail-smoke"),
+        pytest.param(16, 576, 1000, marks=pytest.mark.L2, id="H16-D576-repeat1000"),
+        pytest.param(32, 512, 1000, marks=pytest.mark.L2, id="H32-D512-repeat1000"),
+        pytest.param(64, 512, 1000, marks=pytest.mark.L2, id="H64-D512-repeat1000"),
+        pytest.param(64, 576, 1000, marks=pytest.mark.L2, id="H64-D576-repeat1000"),
+        pytest.param(96, 512, 1000, marks=pytest.mark.L2, id="H96-D512-repeat1000"),
+        pytest.param(128, 576, 1000, marks=pytest.mark.L2, id="H128-D576-repeat1000"),
+    ],
 )
-def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim):
+def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim, repeats):
     """Masked and multi-block heads must be bitwise reproducible."""
     try:
         from cudnn import DSA
@@ -172,7 +179,7 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
 
     reference = run()
     output_names = ("dQ", "dKV", "dSink")
-    for repeat in range(1, 1001):
+    for repeat in range(1, repeats + 1):
         actual = run()
         for name, actual_tensor, reference_tensor in zip(output_names, actual, reference):
             assert torch.equal(actual_tensor, reference_tensor), f"{name} differs from the first run at repetition {repeat}"
@@ -1027,6 +1034,18 @@ def test_DSA_sparse_attention_backward_cross_shape_validation():
     args = dict(good)
     args["topk_length"] = topk_length.to(torch.int64)
     with pytest.raises(AssertionError, match="topk_length dtype mismatch"):
+        call(args)
+
+    # A contiguous view may still begin at a four-byte storage offset. The
+    # SM100 loader moves FP32 pairs and must reject that pointer rather than
+    # promising an unverified eight-byte alignment to the compiler.
+    lse_storage = torch.empty(lse.numel() + 1, dtype=lse.dtype, device=device)
+    lse_misaligned = lse_storage[1:].view_as(lse)
+    lse_misaligned.copy_(lse)
+    assert lse_misaligned.is_contiguous() and lse_misaligned.data_ptr() % 8 == 4
+    args = dict(good)
+    args["lse"] = lse_misaligned
+    with pytest.raises(ValueError, match="lse must be 8-byte aligned"):
         call(args)
 
     # Caller-provided out-params must be contiguous (they are not copied).

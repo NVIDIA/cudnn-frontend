@@ -222,6 +222,8 @@ def flash_attn_bwd_sm100(
         # Ensure contiguous
         q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
         lse = lse.contiguous()
+        if lse.data_ptr() % 8 != 0:
+            raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
         attn_sink = attn_sink.contiguous()
         topk_idxs = topk_idxs.contiguous()
         if topk_length is not None:
@@ -263,7 +265,7 @@ def flash_attn_bwd_sm100(
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
         out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
         dout_tensor = to_cute_tensor(dout, divisibility=head_dim_v)
-        lse_tensor = to_cute_tensor(lse, assumed_align=4)
+        lse_tensor = to_cute_tensor(lse, assumed_align=8)
         attn_sink_tensor = to_cute_tensor(attn_sink)
         topk_idxs_tensor = to_cute_tensor(topk_idxs)
         topk_length_tensor = to_cute_tensor(topk_length) if has_topk_length else None

@@ -139,7 +139,8 @@ of shards. Kernel launch ordering serializes both head blocks and shard reuse
 across waves, so the protocol needs neither semaphores nor cooperative launch.
 A fixed-order two-stage reduction combines the 128 shards, and one CTA per
 head reduces `d_sink`. The additional dKV workspace is
-`128 * total_S_kv * round_up(D, 8) * sizeof(float)` bytes.
+`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
+`scratch_workspace_bytes()` as the authoritative full scratch size.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
 scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this

@@ -1270,11 +1270,17 @@ class FlashAttentionDSABackwardSm100:
         gLSE_for_copy = thr_async_copy.partition_S(gLSE[None, head_block_idx, (token_idx, batch_idx)])
         sLSE_for_copy = thr_async_copy.partition_D(sLSE)
 
-        cute.copy(
-            async_copy_atom,
-            gLSE_for_copy[None, 0],
-            sLSE_for_copy[None, 0, load_compute_LSE_producer_state.index],
-        )
+        head_offset = local_tidx * 2
+        valid_heads = mLSE.shape[0] - head_block_idx * self.block_tile
+        if head_offset < valid_heads:
+            cute.copy(
+                async_copy_atom,
+                gLSE_for_copy[None, 0],
+                sLSE_for_copy[None, 0, load_compute_LSE_producer_state.index],
+            )
+        else:
+            sLSE[head_offset, load_compute_LSE_producer_state.index] = Float32(float("-inf"))
+            sLSE[head_offset + 1, load_compute_LSE_producer_state.index] = Float32(float("-inf"))
         load_compute_LSE_pipeline.producer_commit(load_compute_LSE_producer_state)
         load_compute_LSE_producer_state.advance()
 
@@ -1284,11 +1290,15 @@ class FlashAttentionDSABackwardSm100:
         gSum_OdO_for_copy = thr_async_copy.partition_S(gSum_OdO[None, head_block_idx, (token_idx, batch_idx)])
         sSum_OdO_for_copy = thr_async_copy.partition_D(sSum_OdO)
 
-        cute.copy(
-            async_copy_atom,
-            gSum_OdO_for_copy[None, 0],
-            sSum_OdO_for_copy[None, 0, load_compute_sum_OdO_producer_state.index],
-        )
+        if head_offset < valid_heads:
+            cute.copy(
+                async_copy_atom,
+                gSum_OdO_for_copy[None, 0],
+                sSum_OdO_for_copy[None, 0, load_compute_sum_OdO_producer_state.index],
+            )
+        else:
+            sSum_OdO[head_offset, load_compute_sum_OdO_producer_state.index] = Float32(0.0)
+            sSum_OdO[head_offset + 1, load_compute_sum_OdO_producer_state.index] = Float32(0.0)
 
         load_compute_sum_OdO_pipeline.producer_commit(load_compute_sum_OdO_producer_state)
         load_compute_sum_OdO_producer_state.advance()
