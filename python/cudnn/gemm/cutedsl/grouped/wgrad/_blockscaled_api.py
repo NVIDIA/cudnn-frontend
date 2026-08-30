@@ -155,6 +155,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self.accumulate_on_output = accumulate_on_output
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
         self._workspace = None
+        self._workspace_bytes = None
+        self._workspace_arg = None
 
     def _validate_offsets(self, offsets_tensor: torch.Tensor, tokens_sum: int, name: str) -> Tuple[int, ...]:
         self._value_error_if(offsets_tensor.ndim != 1, f"{name} must be rank-1, got shape {tuple(offsets_tensor.shape)}")
@@ -335,7 +337,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device=self.a_desc.device)
+        self._workspace_bytes = max(kernel.get_workspace_bytes(), 1)
+        self._workspace = torch.empty(self._workspace_bytes, dtype=torch.uint8, device=self.a_desc.device)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -419,8 +422,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             None,
             options="--enable-tvm-ffi",
         )
-
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
+        self._workspace_arg = from_dlpack(
+            self._workspace,
+            assumed_align=128,
+            enable_tvm_ffi=True,
+        )
 
         def tensor_api(
             a_tensor: torch.Tensor,
@@ -429,6 +435,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor: torch.Tensor,
             wgrad_tensor: torch.Tensor,
             offsets_tensor: torch.Tensor,
+            workspace,
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
@@ -440,7 +447,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_tensor,
                 offsets_tensor,
-                cached_workspace,
+                workspace,
                 stream,
                 global_scale_a,
                 global_scale_b,
@@ -579,6 +586,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         offsets_tensor: torch.Tensor,
         wgrad_tensor: Optional[torch.Tensor] = None,
         wgrad_ptrs: Optional[torch.Tensor] = None,
+        descriptor_workspace: Optional[torch.Tensor] = None,
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
@@ -590,6 +598,31 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
+            if descriptor_workspace is None:
+                workspace_arg = self._workspace_arg
+            else:
+                self._value_error_if(
+                    descriptor_workspace.dtype != torch.uint8,
+                    f"descriptor_workspace must have dtype uint8, got {descriptor_workspace.dtype}",
+                )
+                self._value_error_if(
+                    descriptor_workspace.device != wgrad_tensor.device,
+                    "descriptor_workspace and wgrad_tensor must be on the same device",
+                )
+                self._value_error_if(
+                    not descriptor_workspace.is_contiguous(),
+                    "descriptor_workspace must be contiguous",
+                )
+                self._value_error_if(
+                    descriptor_workspace.numel() < self._workspace_bytes,
+                    f"descriptor_workspace requires at least {self._workspace_bytes} bytes, "
+                    f"got {descriptor_workspace.numel()}",
+                )
+                workspace_arg = from_dlpack(
+                    descriptor_workspace,
+                    assumed_align=128,
+                    enable_tvm_ffi=True,
+                )
             self._compiled_kernel(
                 a_tensor,
                 b_tensor,
@@ -597,6 +630,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_tensor,
                 offsets_tensor,
+                workspace_arg,
                 current_stream,
                 global_scale_a,
                 global_scale_b,

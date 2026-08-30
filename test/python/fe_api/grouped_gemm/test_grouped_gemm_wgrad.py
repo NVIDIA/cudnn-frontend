@@ -762,6 +762,124 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("caller_owned_workspace", "expected_cache_entries"),
+    [(False, 2), (True, 1)],
+    ids=["compatibility-isolation", "caller-workspace"],
+)
+def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
+    monkeypatch,
+    caller_owned_workspace,
+    expected_cache_entries,
+):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+    compile_count = {"value": 0}
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+    )
+
+    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
+    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16) for _ in range(2)]
+    workspaces = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    try:
+        for output, workspace in zip(outputs, workspaces):
+            workspace_kwargs = (
+                {"descriptor_workspace": workspace} if caller_owned_workspace else {}
+            )
+            cudnn.grouped_gemm_wgrad_wrapper_sm100(
+                **inputs,
+                **workspace_kwargs,
+                output_mode="dense",
+                wgrad_tensor=output,
+                acc_dtype=torch.float32,
+                wgrad_dtype=torch.bfloat16,
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+                sf_vec_size=16,
+            )
+    finally:
+        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
+        grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+
+    assert outputs[0].data_ptr() != outputs[1].data_ptr()
+    assert compile_count["value"] == expected_cache_entries
+    assert cache_entries == expected_cache_entries
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_workspace_size():
+    assert cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2) == 512
+    assert (
+        cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(
+            2,
+            input_order="tensor_ragged",
+        )
+        == 1024
+    )
+
+
+@pytest.mark.L0
+def test_blockscaled_wgrad_execute_uses_caller_workspace(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import _blockscaled_api
+
+    api = object.__new__(_blockscaled_api.GroupedGemmWgradBlockScaledAPI)
+    api._workspace_bytes = 16
+    api._workspace = torch.empty(16, dtype=torch.uint8)
+    api.a_desc = type("TensorDesc", (), {"device": torch.device("cpu")})()
+    api.weight_mode = _blockscaled_api.MoEWeightMode.DENSE
+    api._get_default_stream = lambda stream: stream
+    api._runtime_error_if = lambda condition, message: None
+    api._value_error_if = lambda condition, message: None
+    monkeypatch.setattr(
+        _blockscaled_api,
+        "from_dlpack",
+        lambda tensor, **kwargs: tensor,
+    )
+
+    launch_workspaces = []
+
+    def compiled_kernel(*args):
+        launch_workspaces.append(args[6])
+
+    api._compiled_kernel = compiled_kernel
+    operand = torch.empty((1, 1))
+    offsets = torch.tensor([1], dtype=torch.int32)
+    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16) for _ in range(2)]
+    workspaces = [torch.empty(16, dtype=torch.uint8) for _ in range(2)]
+    for output, workspace in (
+        (outputs[0], workspaces[0]),
+        (outputs[0], workspaces[0]),
+        (outputs[1], workspaces[1]),
+    ):
+        api.execute(
+            operand,
+            operand,
+            operand,
+            operand,
+            offsets,
+            wgrad_tensor=output,
+            descriptor_workspace=workspace,
+            current_stream=object(),
+        )
+
+    assert launch_workspaces[0] is workspaces[0]
+    assert launch_workspaces[1] is workspaces[0]
+    assert launch_workspaces[2] is workspaces[1]
+    assert launch_workspaces[0].data_ptr() != launch_workspaces[2].data_ptr()
+
+
+@pytest.mark.L0
 def test_grouped_gemm_wgrad_wrapper_input_order_cache_key(monkeypatch):
     from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
