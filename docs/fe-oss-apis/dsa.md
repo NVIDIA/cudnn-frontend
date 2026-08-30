@@ -125,10 +125,19 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
 
 On SM100, the public backward entry point automatically selects the tuned
-kernel from `q.shape[1:3]`: H16 with `head_dim=576` uses the dedicated M128
-sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
-use the generic M64 pipeline. No backend or tile-size argument is required.
-SM90 continues to use its Hopper-specific implementation.
+kernel from the device, dtype, and tensor shape. On B200, BF16 H128 with
+`head_dim=head_dim_v=512` and top-k width 128, 512, 1024, or 2048 uses the
+two-CTA specialization. H16 with `head_dim=576` uses the dedicated
+M128 sparse-row pipeline. FP16, other head counts and dimensions, and every
+other top-k width retain the existing generic/H16 selection. SM103+ devices do
+not select the B200-only two-CTA path. No backend or tile-size argument is
+required. SM90 continues to use its Hopper-specific implementation.
+
+The H128 specialization keeps the five tensor-core products in one
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to a
+temporary workspace, converts the FP32 dKV workspace to the public BF16
+output, and completes dSink with a separate FP32 reduction kernel. The helper
+launches do not change the two-CTA topology of the core computation.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`

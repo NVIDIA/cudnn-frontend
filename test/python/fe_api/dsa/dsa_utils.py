@@ -37,6 +37,7 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
         [
             (512, 512, 16),
             (512, 512, 64),
+            (512, 512, 128),
             (576, 512, 16),
             # Regression for a packed-M tile crossing query boundaries. This
             # is the MLA shape that exposed catastrophic dQ/dKV corruption.

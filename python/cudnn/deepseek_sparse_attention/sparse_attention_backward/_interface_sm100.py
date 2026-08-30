@@ -20,11 +20,46 @@ torch2cute_dtype_map = {
 }
 
 
-def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
-    """Return the tuned SM100 kernel variant and its sparse-row tile size."""
+def _select_sm100_backend(
+    num_heads: int,
+    head_dim: int,
+    *,
+    head_dim_v: Optional[int] = None,
+    dtype: Optional[torch.dtype] = None,
+    max_topk: int = 0,
+    device_capability: Optional[Tuple[int, int]] = None,
+) -> Tuple[str, int]:
+    """Return the tuned SM100 kernel variant and its sparse-row tile size.
+
+    The two-CTA specialization is deliberately fail-closed.  It is selected
+    only for the exact B200/BF16/H128/D512 envelope validated by its kernel;
+    every other supported configuration retains the established backend.
+    """
+    if (
+        device_capability == (10, 0)
+        and dtype == torch.bfloat16
+        and num_heads == 128
+        and head_dim == 512
+        and head_dim_v == 512
+        and max_topk in (128, 512, 1024, 2048)
+    ):
+        return "h128_2cta_m64", 64
     if num_heads == 16 and head_dim == 576:
         return "h16_m128", 128
     return "generic_m64", 64
+
+
+def _get_sm100_kernel_class(backend: str):
+    """Load the selected implementation without perturbing other variants."""
+    if backend == "h128_2cta_m64":
+        from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA
+
+        return FlashAttentionDSABackwardSm100H128TwoCTA
+    if backend == "h16_m128":
+        from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
+
+        return FlashAttentionDSABackwardSm100H16
+    return FlashAttentionDSABackwardSm100
 
 
 def flash_attn_bwd_sm100(
@@ -98,10 +133,18 @@ def flash_attn_bwd_sm100(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # H16 KV-major specialization can use the full M128 UMMA tile.  This
-    # halves the top-k loop count while keeping one CTA per query token.
-    backend, block_tile = _select_sm100_backend(num_head, head_dim)
-    num_head_blocks = (num_head + block_tile - 1) // block_tile
+    max_topk = topk_idxs.shape[1]
+    device_capability = torch.cuda.get_device_capability(q.device)
+    backend, block_tile = _select_sm100_backend(
+        num_head,
+        head_dim,
+        head_dim_v=head_dim_v,
+        dtype=q.dtype,
+        max_topk=max_topk,
+        device_capability=device_capability,
+    )
+    kernel_cls = _get_sm100_kernel_class(backend)
+    uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
     current_stream = resolve_stream(current_stream)
@@ -133,50 +176,67 @@ def flash_attn_bwd_sm100(
             # identity).
             assert dq.is_contiguous(), "dq must be contiguous"
         if dkv is None:
-            dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+            dkv = (
+                torch.empty(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+                if uses_h128_two_cta
+                else torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+            )
         else:
             expected_dkv_shape = (total_S_kv, head_dim)
             assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
             assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
             assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
             assert dkv.is_contiguous(), "dkv must be contiguous"
-            dkv.fill_(0)
-        d_sink = torch.zeros_like(attn_sink)
+            # The H128 two-CTA kernel accumulates into a separate zeroed FP32
+            # workspace and its conversion kernel overwrites every public dKV
+            # element. Keep caller poison intact to enforce that contract.
+            if not uses_h128_two_cta:
+                dkv.fill_(0)
+        d_sink = torch.empty_like(attn_sink) if uses_h128_two_cta else torch.zeros_like(attn_sink)
 
         # Allocate workspace tensors
         acc_dtype = cutlass.Float32
-        ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+        ws_lse_odo_shape = kernel_cls._get_workspace_size_LSE_OdO(
             total_S_q,
             head_dim,
             num_head,
             batch_size,
             acc_dtype,
         )
-        workspace_LSE_OdO = torch.zeros(
-            *ws_lse_odo_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
+        if uses_h128_two_cta:
+            # The main kernel uniquely publishes both FP32 statistics planes;
+            # the dSink helper never reads padded query rows.
+            workspace_LSE_OdO = torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
+        else:
+            workspace_LSE_OdO = torch.zeros(
+                *ws_lse_odo_shape,
+                dtype=torch.uint8,
+                device=device,
+            )
 
-        ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+        ws_dkv_shape = kernel_cls._get_workspace_size_dKV(
             total_S_kv,
             head_dim,
             batch_size,
             acc_dtype,
         )
-        workspace_dKV = torch.zeros(
-            *ws_dkv_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
+        if uses_h128_two_cta:
+            # The specialization establishes its own call-local FP32 zero
+            # state in a stream-ordered device kernel.
+            workspace_dKV = torch.empty(*ws_dkv_shape, dtype=torch.uint8, device=device)
+        else:
+            workspace_dKV = torch.zeros(
+                *ws_dkv_shape,
+                dtype=torch.uint8,
+                device=device,
+            )
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
-    max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (backend, dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -193,27 +253,13 @@ def flash_attn_bwd_sm100(
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
 
-        if backend == "h16_m128":
-            from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
-
-            kernel_obj = FlashAttentionDSABackwardSm100H16(
-                element_dtype=dtype,
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                block_tile=block_tile,
-                max_topk=max_topk,
-            )
-        else:
-            # Keep this constructor and class byte-for-byte on the tuned H64
-            # path; embedding H16 conditionals in the same CuTe DSL class
-            # measurably perturbs H64 code generation.
-            kernel_obj = FlashAttentionDSABackwardSm100(
-                element_dtype=dtype,
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                block_tile=block_tile,
-                max_topk=max_topk,
-            )
+        kernel_obj = kernel_cls(
+            element_dtype=dtype,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            block_tile=block_tile,
+            max_topk=max_topk,
+        )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
             flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
