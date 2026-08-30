@@ -653,7 +653,8 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     if s == 0:
         # Zero-length sequence: no tokens, no SF tiles.
         empty = t_1hsd.new_zeros((1, h, 0, d))
-        return empty.to(fp8), empty.float(), torch.zeros((h, 0, 128 * d // _BLOCK), dtype=torch.uint8, device=t_1hsd.device)
+        d_scale = _cdiv(_cdiv(d, _BLOCK), 4) * 4
+        return empty.to(fp8), empty.float(), torch.zeros((h, 0, 128 * d_scale), dtype=torch.uint8, device=t_1hsd.device)
     data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(t_1hsd, 1, h, s, d, _BLOCK, fp8, with_ref=True)
     n_tiles = _cdiv(s, 128)
     if columnwise:
@@ -661,13 +662,30 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False):
+def _run_thd(
+    seq_lens_q,
+    seq_lens_kv,
+    H_q,
+    H_kv,
+    in_key,
+    out_dt,
+    *,
+    scale,
+    causal=False,
+    bottom_right=False,
+    swa_window=None,
+    sink=None,
+    stats=False,
+    cu_lens=False,
+    declare_totals=False,
+    d_qk=128,
+    d_v=128,
+):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
     import cudnn
 
     dev = "cuda"
-    D = 128
     fp8 = _FP8[in_key]
     B = len(seq_lens_q)
     S_max_q, S_max_kv = max(seq_lens_q), max(seq_lens_kv)
@@ -687,12 +705,12 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     sfq_seqs, sfk_seqs, sfv_seqs = [], [], []
     for b in range(B):
         s_q, s_kv = seq_lens_q[b], seq_lens_kv[b]
-        Qf = torch.randn(1, H_q, s_q, D, device=dev) * 0.5
-        Kf = torch.randn(1, H_kv, s_kv, D, device=dev) * 0.5
-        Vf = torch.randn(1, H_kv, s_kv, D, device=dev) * 0.5
-        q8, dqq, sfq = _quantize_seq(Qf, H_q, s_q, D, fp8, columnwise=False)
-        k8, dqk, sfk = _quantize_seq(Kf, H_kv, s_kv, D, fp8, columnwise=False)
-        v8, dqv, sfv = _quantize_seq(Vf, H_kv, s_kv, D, fp8, columnwise=True)
+        Qf = torch.randn(1, H_q, s_q, d_qk, device=dev) * 0.5
+        Kf = torch.randn(1, H_kv, s_kv, d_qk, device=dev) * 0.5
+        Vf = torch.randn(1, H_kv, s_kv, d_v, device=dev) * 0.5
+        q8, dqq, sfq = _quantize_seq(Qf, H_q, s_q, d_qk, fp8, columnwise=False)
+        k8, dqk, sfk = _quantize_seq(Kf, H_kv, s_kv, d_qk, fp8, columnwise=False)
+        v8, dqv, sfv = _quantize_seq(Vf, H_kv, s_kv, d_v, fp8, columnwise=True)
         q8_seqs.append(q8)
         k8_seqs.append(k8)
         v8_seqs.append(v8)
@@ -717,37 +735,40 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     sfk_pk = torch.cat(sfk_seqs, dim=1).contiguous()
     sfv_pk = torch.cat(sfv_seqs, dim=1).contiguous()
 
-    def _dense_buf(packed, s_max, h, dt):
+    def _dense_buf(packed, s_max, h, d, dt):
         # Dense-capacity storage; packed tokens in the leading elements (THD
         # contract). The capacity tail is NaN-POISONED (test_mhas_v2 parity):
         # the last sequence's KV tile steps past the packed total, and those
         # tail loads must land as zeros through the setup kernel's
         # packed-total-clamped K/V descriptors — a leaked NaN would wipe the
         # tile via BMM2's P·V (0 · NaN == NaN).
-        stride = (s_max * h * D, D, h * D, 1)
-        stor = torch.full((B * s_max * h * D,), float("nan"), device=dev, dtype=torch.float32).to(dt)
+        stride = (s_max * h * d, d, h * d, 1)
+        stor = torch.full((B * s_max * h * d,), float("nan"), device=dev, dtype=torch.float32).to(dt)
         stor[: packed.numel()] = packed.reshape(-1)
-        return stor, stor.as_strided((B, h, s_max, D), stride), stride
+        return stor, stor.as_strided((B, h, s_max, d), stride), stride
 
-    _, q_gpu, stride_q = _dense_buf(q_pk, S_max_q, H_q, q_pk.dtype)
-    _, k_gpu, stride_kv = _dense_buf(k_pk, S_max_kv, H_kv, k_pk.dtype)
-    _, v_gpu, _ = _dense_buf(v_pk, S_max_kv, H_kv, v_pk.dtype)
-    o_stor = torch.zeros(B * S_max_q * H_q * D, device=dev, dtype=out_dt)
-    o_gpu = o_stor.as_strided((B, H_q, S_max_q, D), stride_q)
+    _, q_gpu, stride_q = _dense_buf(q_pk, S_max_q, H_q, d_qk, q_pk.dtype)
+    _, k_gpu, stride_k = _dense_buf(k_pk, S_max_kv, H_kv, d_qk, k_pk.dtype)
+    _, v_gpu, stride_v = _dense_buf(v_pk, S_max_kv, H_kv, d_v, v_pk.dtype)
+    stride_o = (S_max_q * H_q * d_v, d_v, H_q * d_v, 1)
+    o_stor = torch.zeros(B * S_max_q * H_q * d_v, device=dev, dtype=out_dt)
+    o_gpu = o_stor.as_strided((B, H_q, S_max_q, d_v), stride_o)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     slq = torch.tensor(seq_lens_q, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     slk = torch.tensor(seq_lens_kv, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     cuq_t = torch.tensor(cu_q, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
     cuk_t = torch.tensor(cu_k, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
-    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * D).view(B + 1, 1, 1, 1)
-    ro_k = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * D).view(B + 1, 1, 1, 1)
+    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * d_qk).view(B + 1, 1, 1, 1)
+    ro_k = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * d_qk).view(B + 1, 1, 1, 1)
+    ro_v = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * d_v).view(B + 1, 1, 1, 1)
+    ro_o = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * d_v).view(B + 1, 1, 1, 1)
 
     io = getattr(cudnn.data_type, _CUDNN_ITYPE[in_key])
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tq = g.tensor(dim=[B, H_q, S_max_q, D], stride=list(stride_q), data_type=io, name="q")
-    tk = g.tensor(dim=[B, H_kv, S_max_kv, D], stride=list(stride_kv), data_type=io, name="k")
-    tv = g.tensor(dim=[B, H_kv, S_max_kv, D], stride=list(stride_kv), data_type=io, name="v")
+    tq = g.tensor(dim=[B, H_q, S_max_q, d_qk], stride=list(stride_q), data_type=io, name="q")
+    tk = g.tensor(dim=[B, H_kv, S_max_kv, d_qk], stride=list(stride_k), data_type=io, name="k")
+    tv = g.tensor(dim=[B, H_kv, S_max_kv, d_v], stride=list(stride_v), data_type=io, name="v")
     sq_h = g.tensor_like(cuq_t if cu_lens else slq)
     skv_h = g.tensor_like(cuk_t if cu_lens else slk)
     qro, kro, vro, oro = (g.tensor_like(ro_q) for _ in range(4))
@@ -765,10 +786,11 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
             reordering_type=cudnn.tensor_reordering.F8_128x4,
         )
 
-    dsc = _cdiv(_cdiv(D, _BLOCK), 4) * 4
-    dvp = dsc * _BLOCK
-    dq = _sf((B, H_q, _cdiv(S_max_q, 128) * 128, dsc))
-    dk = _sf((B, H_kv, _cdiv(S_max_kv, 128) * 128, dsc))
+    dsc_qk = _cdiv(_cdiv(d_qk, _BLOCK), 4) * 4
+    dsc_v = _cdiv(_cdiv(d_v, _BLOCK), 4) * 4
+    dvp = dsc_v * _BLOCK
+    dq = _sf((B, H_q, _cdiv(S_max_q, 128) * 128, dsc_qk))
+    dk = _sf((B, H_kv, _cdiv(S_max_kv, 128) * 128, dsc_qk))
     dv = _sf((B, H_kv, _cdiv(S_max_kv, 128) * 4, dvp))
     kw = dict(
         q=tq,
@@ -785,8 +807,13 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    if causal:
+    assert not (bottom_right and (causal or swa_window is not None))
+    if bottom_right:
+        kw["use_causal_mask_bottom_right"] = True
+    elif causal or swa_window is not None:
         kw["use_causal_mask"] = True
+    if swa_window is not None:
+        kw["diagonal_band_left_bound"] = swa_window + 1
     vp = {
         tq: q_gpu,
         tk: k_gpu,
@@ -798,8 +825,8 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         skv_h: (cuk_t if cu_lens else slk),
         qro: ro_q,
         kro: ro_k,
-        vro: ro_k,
-        oro: ro_q,
+        vro: ro_v,
+        oro: ro_o,
     }
     if sink is not None:
         st = g.tensor_like(sink)
@@ -809,7 +836,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         # Packed token totals: exact THD extents instead of buffer-inferred.
         kw.update(max_total_seq_len_q=sum(seq_lens_q), max_total_seq_len_kv=sum(seq_lens_kv))
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
-    o.set_output(True).set_dim([B, H_q, S_max_q, D]).set_stride(list(stride_q)).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
+    o.set_output(True).set_dim([B, H_q, S_max_q, d_v]).set_stride(list(stride_o)).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     o.set_ragged_offset(oro)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     stats_stor = None
@@ -818,7 +845,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
         stats_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
         stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-        stats_ro_t = (ro_q.flatten() // D).view(B + 1, 1, 1, 1).contiguous()
+        stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
         stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
         stats_t.set_ragged_offset(stats_ro)
         vp[stats_ro] = stats_ro_t
@@ -834,7 +861,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
-    o_ref = torch.zeros(T_q, H_q, D, device=dev, dtype=torch.float32)
+    o_ref = torch.zeros(T_q, H_q, d_v, device=dev, dtype=torch.float32)
     for b in range(B):
         if cu_q[b + 1] == cu_q[b] or cu_k[b + 1] == cu_k[b]:
             # Zero-length Q contributes no rows; zero-length KV leaves every
@@ -843,13 +870,17 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         qd = q8_seqs[b].float() * dq_seqs[b]
         kd = k8_seqs[b].float() * dk_seqs[b]
         vd = v8_seqs[b].float() * dv_seqs[b]
-        ref_kw = dict(is_causal=True) if causal else {}
+        ref_kw = dict(
+            is_causal=causal or bottom_right or swa_window is not None,
+            bottom_right=bottom_right,
+            swa_window=swa_window,
+        )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
         ob = _ref(qd, kd, vd, scale=scale, **ref_kw)
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
 
-    o_out = o_stor[: T_q * H_q * D].reshape(T_q, H_q, D)
+    o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
     return o_out, o_ref, amax, lse_out
 
@@ -955,3 +986,55 @@ def test_mxfp8_thd_cu_seq_len():
     scale = 1.0 / math.sqrt(128)
     o_out, o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True)
     _check(o_out, o_ref, torch.float16, "e4m3")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_thd_cross_gqa_stats(in_key):
+    """D192 THD covers rank-5 K descriptors, packed SF, GQA, and ragged LSE."""
+    d_qk, d_v = 192, 128
+    scale = 1.0 / math.sqrt(d_qk)
+    o_out, o_ref, amax, lse = _run_thd(
+        [129, 257],
+        [385, 193],
+        8,
+        2,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=True,
+        stats=True,
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=d_qk)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse is not None and torch.isfinite(lse).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", ["causal_br", "swa"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d192_d128_thd_mask_variants(in_key, mask):
+    """D192 THD supports bottom-right causal and sliding-window masks."""
+    d_qk, d_v = 192, 128
+    scale = 1.0 / math.sqrt(d_qk)
+    seq_q = [129, 257]
+    seq_kv = [385, 193] if mask == "causal_br" else seq_q
+    mask_kw = {"bottom_right": True} if mask == "causal_br" else {"swa_window": 64}
+    o_out, o_ref, amax, _ = _run_thd(
+        seq_q,
+        seq_kv,
+        8,
+        2,
+        in_key,
+        torch.float16,
+        scale=scale,
+        d_qk=d_qk,
+        d_v=d_v,
+        **mask_kw,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=d_qk)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03

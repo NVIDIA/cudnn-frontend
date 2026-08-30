@@ -571,7 +571,7 @@ def _sm100_spec() -> EngineSpec:
 def _sm100_mxfp8_spec() -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen (d128/d128 only — the d192/d128 kernel is dense-only) rides the
+    THD/varlen on both native shapes rides the
     shared packed lowering (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
@@ -589,10 +589,8 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # not audited for envelope zero-padding.
             d_shapes=frozenset({(128, 128), (192, 128)}),
             d_pad_multiple=0,
-            # Only the d128 kernel carries the write_thd_meta THD leg and
-            # wires SplitHelpers; the d192x128 file is dense-only.
-            thd_d_shapes=frozenset({(128, 128)}),
-            split_d_shapes=frozenset({(128, 128)}),
+            thd_d_shapes=frozenset({(128, 128), (192, 128)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -611,7 +609,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
             # The split path also needs a half-precision O (mismatch's
-            # facts x knobs gate) and rides the d128 flavor (split_d_shapes).
+            # facts x knobs gate).
             split_kv_supported=True,
             # PackGQA is currently not supported for the MXFP8 SDPA engine:
             # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
@@ -647,12 +645,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
-    - thd_d_shapes: the d128 and d512 per-tensor kernels carry the
-      write_thd_meta THD leg; the d192x128 file is dense-only.
+    - thd_d_shapes: the SM100 d128, d192x128, and d512 kernels carry the
+      write_thd_meta THD leg; the SM107 row carries its d128 sibling.
     - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers
-      (the SM107 sibling carries the same plumbing as its SM100 twin), so both
-      rows advertise the split; the d192x128 file forks its own scheduler and
-      has none, which is what split_d_shapes pins.
+      (the SM107 sibling carries the same plumbing as its SM100 twin), and the
+      SM100 d192x128 per-tensor kernel carries the same split contract.
     - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
       (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
       every decode call site, which is what the shared LPT_L2 decode requires,
@@ -662,8 +659,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
-    fully-masked row can poison the global amax.  THD/varlen (d128/d128 only —
-    the d192/d128 kernel is also wired on SM100) rides the shared packed
+    fully-masked row can poison the global amax. THD/varlen rides the shared packed
     lowering (write_thd_meta envelope design, issue #552; packed Q/K/V/O
     contract only). Rubin keeps the d128-only SM107 sibling.
     """
@@ -727,10 +723,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # it). FLOAT is the f32 pipeline every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             # Split partials reduce in half precision, so mismatch()'s
-            # facts x knobs gate additionally requires a bf16/fp16 O on the
-            # quantized rows; split_d_shapes pins it to the d128 flavor.
+            # facts x knobs gate additionally requires a bf16/fp16 O.
             split_kv_supported=True,
-            split_d_shapes=frozenset({(128, 128)}),
+            split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128)})),
             pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),

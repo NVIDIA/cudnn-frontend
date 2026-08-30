@@ -333,9 +333,11 @@ def test_fp8_rows_serve_dense_envelope():
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
     # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
-    # d512 flavor's THD leg.
+    # d192 and d512 flavors' THD legs.
     assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
-    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (512, 512)})
+    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset(
+        {(128, 128), (192, 128), (512, 512)}
+    )
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 
@@ -377,8 +379,8 @@ def test_fp8_envelope_mismatch_rules():
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
-    # THD at the d192 native shape is dense-only (thd_d_shapes excludes it).
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True))
+    # SM100 carries THD at both native per-tensor FP8 shapes.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
     # d512 is a NATIVE shape (accepted exactly, dense and THD) and serves the
     # (256, 512] envelope band on BOTH head dims -- at most 2x zero-padding.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512)) is None

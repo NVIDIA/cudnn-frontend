@@ -359,10 +359,8 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     # Which grid does this flavor launch?  SCHED_NATURAL uses a 3-D
     # (q_super, head, batch) grid; the LPT policy flattens everything into x.
-    # NOTE this is the flavor's EFFECTIVE policy, not the requested one:
-    # make_cfg_d192 hardcodes SCHEDULER_POLICY=1 regardless of params, so a
-    # params-level check would miss it (and did -- d192 silently launched the
-    # unsplit grid because the split multiplier was only on the NATURAL branch).
+    # This must use the flavor's effective CFG policy so the helper and launch
+    # grid follow the same compile-time specialization.
     IS_LPT = CFG.SCHEDULER_POLICY != SCHED_NATURAL
 
     @cute.jit

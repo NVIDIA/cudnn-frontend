@@ -41,12 +41,13 @@ the shared ``_common_sm100`` / ``thd_sm100`` mechanism (same as the SM100 qwen
 """
 
 from functools import lru_cache
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass.experimental.cuda import tensor_map as tmap
-from cutlass._mlir.dialects import arith
+from cutlass._mlir.dialects import arith, llvm
+from cutlass.base_dsl.typing import Pointer
 
 import cutlass
 from cutlass.experimental import primitives as prims
@@ -75,8 +76,10 @@ TMA_O_ITERS_HOST = (CFG.TILE_O * CFG.BPE) // CFG.O_SWZ_BYTES
 from cudnn.frost.tile_dsl.barrier import (
     PipelineState,
     advance,
+    arrive_expect_tx,
     cga_arrive,
     cga_wait,
+    wait,
     WAIT_TIMEOUT,
 )
 from cudnn.frost.tile_dsl.scheduler import (
@@ -107,6 +110,8 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_SWA,
 )
 
+_PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
+
 
 @cute.jit
 def _wait_ptr(mb, phase):
@@ -118,6 +123,28 @@ def _wait_ptr(mb, phase):
 @cute.jit
 def _wait_mbarrier(mb, phase):
     _wait_ptr(mb.smem_ptr, phase)
+
+
+@cute.jit
+def _wait_mbarrier_inline(mb, phase):
+    mbar_addr = cutlass.Int32(cute.arch.make_warp_uniform(mb.smem_ptr.data_ptr().toint(cutlass.Int32)))
+    phase = cutlass.Int32(cute.arch.make_warp_uniform(phase))
+    llvm.inline_asm(
+        None,
+        [mbar_addr.ir_value(), phase.ir_value()],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "LAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n\t"
+        "@p bra.uni DONE;\n\t"
+        "bra.uni LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
@@ -138,6 +165,7 @@ else:
 
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
+    KvLoopBounds,
     make_split_helpers,
     make_classic_bars,
     row_max_for_exp2,
@@ -224,6 +252,16 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 HEADS_PER_TILE = CFG.QH_PER_KH if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 
+# A sufficiently wide causal+SWA band cannot touch its lower and upper
+# boundaries in the same TILE_N-wide score tile.  The four-way partition below
+# assigns a partial KV-tail tile to the lower side when those ranges meet.
+_MASK_TOKENS_PER_CGA = CFG.TILES_Q * TOKENS_PER_TILE * CFG.CTA_MMA
+_SWA_ONE_SIDED_GEOMETRY = bool(
+    (CFG.MASK_FLAGS & MASK_SWA)
+    and (CFG.MASK_FLAGS & MASK_CAUSAL)
+    and CFG.WINDOW_LEFT + CFG.WINDOW_RIGHT >= _MASK_TOKENS_PER_CGA + CFG.TILE_N - 2
+)
+
 # === KV split ===
 #
 # Mechanics live in _common_sm100.make_split_helpers, shared with the other
@@ -254,6 +292,239 @@ _partial_batch = _split_h.partial_batch
 # epilogue's O-store guards) have to compile in under split as well.  Leaving it
 # const-folded to False is what desynchronises the warp groups.
 CAN_HAVE_EMPTY_KV = CAN_HAVE_EMPTY_KV or SPLIT_KV > 1
+
+_PREDECODE_THD_SWA_SEGMENTS = bool(
+    CFG.THD_VARLEN and SPLIT_KV == 1 and not CFG.BOTTOM_RIGHT and _SWA_ONE_SIDED_GEOMETRY
+)
+
+
+@cute.jit
+def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx):
+    bounds = _bounds_for_tile_split(
+        q_super_idx,
+        eff_seqlen_q,
+        eff_seqlen_kv,
+        cta_in_pair,
+        seq_q_lens_tensor,
+        batch_idx,
+        cutlass.Int32(0),
+        CFG.QH_PER_KH,
+    )
+    cga_q_row_coord = (q_super_idx - cta_in_pair) * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
+    causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+    lower_anchor = cga_q_row_coord + causal_diag + cutlass.Int32(_MASK_TOKENS_PER_CGA - 1 - CFG.WINDOW_LEFT)
+    lower_end_if_positive = (lower_anchor + cutlass.Int32(CFG.TILE_N - 1)) // cutlass.Int32(CFG.TILE_N)
+    lower_end_raw = cutlass.Int32(
+        arith.select(
+            (lower_anchor > cutlass.Int32(0)).ir_value(),
+            lower_end_if_positive.ir_value(),
+            cutlass.Int32(0).ir_value(),
+        )
+    )
+    swa_left_end = cute.math.min(cute.math.max(lower_end_raw, bounds.left), bounds.right)
+    pad_start = (
+        eff_seqlen_kv // cutlass.Int32(CFG.TILE_N)
+        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED)
+        else bounds.right
+    )
+    swa_left_pad_start = cute.math.min(cute.math.max(pad_start, bounds.left), swa_left_end)
+    causal_start = (cga_q_row_coord + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)) // cutlass.Int32(CFG.TILE_N)
+    right_start_raw = cute.math.min(causal_start, pad_start)
+    swa_right_start = cute.math.min(
+        cute.math.max(cute.math.max(right_start_raw, swa_left_end), bounds.left),
+        bounds.right,
+    )
+    return bounds.left, swa_left_pad_start, swa_left_end, swa_right_start, bounds.right
+
+
+class _PredecodedSched(NamedTuple):
+    mb_scheduler: object
+    mb_read_tile_id: object
+    mb_decoded: object
+    tile_id_smem: object
+    decoded_smem: object
+    bidx_init: object
+    bidy_init: object
+    bidz_init: object
+
+
+@cute.jit
+def _scheduler_warp_loop_predecode(
+    sched,
+    is_cga_first_cta,
+    cta_in_pair,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    seq_kv_lens_tensor,
+    seq_q_lens_tensor,
+    seqlen_q,
+    seqlen_kv,
+    qh_per_kh,
+):
+    meta = cutlass.make_array_view(seq_kv_lens_tensor)
+    ctr_off = cutlass.Int32(4) * n_batch + cutlass.Int32(3)
+    live_off = cutlass.Int32(4) * n_batch + cutlass.Int32(2)
+    ctr_ptr = Pointer(seq_kv_lens_tensor.iterator.raw_ptr(), dtype=cutlass.Int32) + ctr_off
+    state = PipelineState.start()
+    is_valid = cutlass.Int32(1)
+    while is_valid > cutlass.Int32(0):
+        wait(sched.mb_read_tile_id.subview(state.idx), state.phase)
+        if nvvm.elect_sync():
+            arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+        if nvvm.elect_sync() and is_cga_first_cta:
+            uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
+            live = cutlass.Int32(meta[live_off])
+            valid = cutlass.Int32(
+                arith.select(
+                    (uid < live).ir_value(),
+                    cutlass.Int32(1).ir_value(),
+                    cutlass.Int32(0).ir_value(),
+                )
+            )
+            linear = uid * cutlass.Int32(CFG.CGA_M)
+            tile_ptr = cute.make_ptr(
+                cutlass.Int32,
+                sched.tile_id_smem.subview(state.idx * cutlass.Int32(8)).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=16,
+            )
+            mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                sched.mb_scheduler.subview(state.idx).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=8,
+            )
+            payload = (linear, cutlass.Int32(0), valid, cutlass.Int32(0))
+            for i in cutlass.range_constexpr(CGA_SIZE):
+                for word in cutlass.range_constexpr(4):
+                    cute.arch.store_async_dsmem(tile_ptr + word, payload[word], mbar_ptr, i)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+        wait(sched.mb_scheduler.subview(state.idx), state.phase)
+        payload_base = state.idx * cutlass.Int32(8)
+        nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base).load())
+        nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(1)).load())
+        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+        q_super_idx, head_idx, batch_idx, _ = _decode_payload_split(
+            nxt_q,
+            nxt_hb,
+            cta_in_pair,
+            n_q_supers,
+            n_qh,
+            n_batch,
+            seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
+        )
+        is_valid = nxt_v & cutlass.Int32(1)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
+        segments = _swa_segment_bounds(
+            q_super_idx,
+            eff_seqlen_q,
+            eff_seqlen_kv,
+            cta_in_pair,
+            seq_q_lens_tensor,
+            batch_idx,
+        )
+        if nvvm.elect_sync():
+            decoded_base = state.idx * cutlass.Int32(11)
+            sched.decoded_smem.subview(decoded_base).store(q_super_idx)
+            sched.decoded_smem.subview(decoded_base + cutlass.Int32(1)).store(head_idx)
+            sched.decoded_smem.subview(decoded_base + cutlass.Int32(2)).store(batch_idx)
+            sched.decoded_smem.subview(decoded_base + cutlass.Int32(3)).store(is_valid)
+            sched.decoded_smem.subview(decoded_base + cutlass.Int32(4)).store(eff_seqlen_kv)
+            sched.decoded_smem.subview(decoded_base + cutlass.Int32(5)).store(eff_seqlen_q)
+            for i in cutlass.range_constexpr(5):
+                sched.decoded_smem.subview(decoded_base + cutlass.Int32(6 + i)).store(segments[i])
+            nvvm.mbarrier_arrive(sched.mb_decoded.subview(state.idx))
+        state = advance(state, CFG.SCHEDULER_STAGES)
+
+
+@cute.jit
+def _softmax_next_payload(
+    sched,
+    sched_state,
+    cta_in_pair,
+    n_q_supers,
+    n_qh,
+    n_batch,
+    seq_kv_lens_tensor,
+    seq_q_lens_tensor,
+    seqlen_q,
+    seqlen_kv,
+    qh_per_kh,
+):
+    if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
+        wait(sched.mb_decoded.subview(sched_state.idx), sched_state.phase)
+        base = sched_state.idx * cutlass.Int32(11)
+        payload = tuple(
+            cute.arch.make_warp_uniform(sched.decoded_smem.subview(base + cutlass.Int32(i)).load())
+            for i in range(11)
+        )
+        bounds = KvLoopBounds(
+            left=payload[6],
+            unmasked_lo=payload[8],
+            unmasked_hi=payload[9],
+            right=payload[10],
+        )
+        return (
+            payload[0],
+            payload[1],
+            payload[2],
+            cutlass.Int32(0),
+            payload[3],
+            payload[4],
+            payload[5],
+            bounds,
+            payload[7],
+            payload[8],
+            payload[9],
+        )
+
+    _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+    raw_base = sched_state.idx * cutlass.Int32(8)
+    nxt_q = sched.tile_id_smem.subview(raw_base).load()
+    nxt_hb = sched.tile_id_smem.subview(raw_base + cutlass.Int32(1)).load()
+    nxt_v = sched.tile_id_smem.subview(raw_base + cutlass.Int32(2)).load()
+    q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
+        nxt_q,
+        nxt_hb,
+        cta_in_pair,
+        n_q_supers,
+        n_qh,
+        n_batch,
+        seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
+    )
+    eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
+    bounds = _bounds_for_tile_split(
+        q_super_idx,
+        eff_seqlen_q,
+        eff_seqlen_kv,
+        cta_in_pair,
+        seq_q_lens_tensor,
+        batch_idx,
+        split_idx,
+        CFG.QH_PER_KH,
+    )
+    segments = (bounds.left, bounds.unmasked_lo, bounds.unmasked_lo, bounds.unmasked_hi, bounds.right)
+    return (
+        q_super_idx,
+        head_idx,
+        batch_idx,
+        split_idx,
+        nxt_v & cutlass.Int32(1),
+        eff_seqlen_kv,
+        eff_seqlen_q,
+        bounds,
+        segments[1],
+        segments[2],
+        segments[3],
+    )
 
 
 @cute.jit
@@ -294,6 +565,24 @@ def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag
         for i in range(N)
     ]
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+@cute.jit
+def _apply_padding_mask_if_needed(reg_S, kv_col_base, eff_seqlen_kv):
+    """Apply the per-element padding predicate only to a partial KV chunk."""
+    result = reg_S
+    if kv_col_base + cutlass.Int32(int(reg_S.shape[0])) > eff_seqlen_kv:
+        result = apply_mask_chunk(
+            reg_S,
+            cutlass.Int32(0),
+            kv_col_base,
+            eff_seqlen_kv,
+            0,
+            MASK_PADDED,
+            N=int(reg_S.shape[0]),
+            mask_value=float("-inf"),
+        )
+    return result
 
 
 # P (BMM2 operand) aliases the TAIL of each 128-col S_acc slot since BMM1
@@ -444,15 +733,26 @@ def _kernel(
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
     # tile_id_smem stride 8 Int32/stage (32 B) = 16 B try_cancel payload + 16 B padding.
-    sched = Sched(
-        **{
-            "mb_scheduler": cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
-            "mb_read_tile_id": cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
-            "tile_id_smem": cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 8, alignment=16, space=cutlass.AddressSpace.smem),
-            "bidx_init": bidx,
-            "bidy_init": bidy,
-            "bidz_init": bidz,
-        }
+    sched = (
+        _PredecodedSched(
+            mb_scheduler=cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            mb_read_tile_id=cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            mb_decoded=cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            tile_id_smem=cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 8, alignment=16, space=cutlass.AddressSpace.smem),
+            decoded_smem=cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 11, alignment=16, space=cutlass.AddressSpace.smem),
+            bidx_init=bidx,
+            bidy_init=bidy,
+            bidz_init=bidz,
+        )
+        if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS)
+        else Sched(
+            mb_scheduler=cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            mb_read_tile_id=cutlass.Array(cutlass.Int64, CFG.SCHEDULER_STAGES, alignment=16, space=cutlass.AddressSpace.smem),
+            tile_id_smem=cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 8, alignment=16, space=cutlass.AddressSpace.smem),
+            bidx_init=bidx,
+            bidy_init=bidy,
+            bidz_init=bidz,
+        )
     )
 
     # Scheduler mbar arrive count — stays kernel-local (sched is NOT in Bars).
@@ -487,6 +787,8 @@ def _kernel(
             for s in range(CFG.SCHEDULER_STAGES):
                 nvvm.mbarrier_init(sched.mb_scheduler.subview(s), CFG.ONE_LANE)
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
+                if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
+                    nvvm.mbarrier_init(sched.mb_decoded.subview(s), CFG.ONE_LANE)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
 
@@ -670,7 +972,21 @@ def _kernel(
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        if cutlass.const_expr(CFG.THD_VARLEN):
+        if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
+            _scheduler_warp_loop_predecode(
+                sched,
+                is_cga_first_cta,
+                cta_in_pair,
+                n_q_supers,
+                n_qh,
+                n_batch,
+                seq_kv_lens_tensor,
+                seq_q_lens_tensor,
+                seqlen_q,
+                seqlen_kv,
+                qh_per_kh,
+            )
+        elif cutlass.const_expr(CFG.THD_VARLEN):
             # THD: persistent grid + device-bounded claim counter, so no unit
             # past the live total is ever handed out (the CLC path would need
             # the grid to BE the work list, i.e. the plan-time envelope).
@@ -918,32 +1234,45 @@ def _tmaldg_warp_group(
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
-        # Raw scheduler payload loads avoid extra uniformization on this back-edge.
-        _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
-        nxt_hb = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load()
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
-        q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
-            nxt_q,
-            nxt_hb,
-            cta_in_pair,
-            n_q_supers,
-            n_qh,
-            n_batch,
-            seq_kv_lens_tensor,
-            qh_per_kh,
-            seqlen_kv,
-        )
+        if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
+            wait(sched.mb_decoded.subview(sched_state.idx), sched_state.phase)
+            decoded_base = sched_state.idx * cutlass.Int32(11)
+            q_super_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base).load())
+            head_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(1)).load())
+            batch_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(2)).load())
+            is_valid_tile = cute.arch.make_warp_uniform(
+                sched.decoded_smem.subview(decoded_base + cutlass.Int32(3)).load()
+            )
+            split_idx = cutlass.Int32(0)
+            kv_left = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(6)).load())
+            kv_right = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(10)).load())
+        else:
+            # Raw scheduler payload loads avoid extra uniformization on this back-edge.
+            _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+            nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
+            nxt_hb = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load()
+            nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+            q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
+                nxt_q,
+                nxt_hb,
+                cta_in_pair,
+                n_q_supers,
+                n_qh,
+                n_batch,
+                seq_kv_lens_tensor,
+                qh_per_kh,
+                seqlen_kv,
+            )
+            is_valid_tile = nxt_v & cutlass.Int32(1)
         q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)
         kv_head_idx = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
         # q_row_base compute right after decode drives ptxas R2UR.
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE))
         q_seq_off, kv_seq_off, tma_batch = _thd_tma_offsets(seq_kv_lens_tensor, batch_idx, n_batch)
-        is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV > 1):
             kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
-        elif cutlass.const_expr(CFG.MASK_FLAGS != 0):
+        elif cutlass.const_expr(CFG.MASK_FLAGS != 0 and not _PREDECODE_THD_SWA_SEGMENTS):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
             eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
             bounds_next = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
@@ -1277,13 +1606,13 @@ def _mma_warp_group(
             _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
             _wait_mbarrier(bars.mb_stats_read[0], stats_read_phase)
             desc_K = sK[kv_state.idx].desc()
-            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
             _wait_mbarrier(bars.mb_q_full[1], q_full_phase)
             _wait_mbarrier(bars.mb_stats_read[1], stats_read_phase)
-            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1300,10 +1629,19 @@ def _mma_warp_group(
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
 
                 # BMM2 sub-tile 0
+                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
                 _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P0_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O0_OFF)),
+                        local_k,
+                        accum_b2,
+                        issue_mma=bmm2_issue,
+                    )
                     accum_b2 = cutlass.Boolean(True)
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                     _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
@@ -1315,6 +1653,7 @@ def _mma_warp_group(
                             (tmem_raw.subview(LAYOUT.O0_OFF)),
                             NUM_KPHASES_PV_PER_CHUNK + local_k,
                             cutlass.Boolean(True),
+                            issue_mma=bmm2_issue,
                         )
                 elect_p = nvvm.elect_sync()
                 cute.arch.inline_ptx('.pragma "next knob FenceCode";')
@@ -1323,15 +1662,24 @@ def _mma_warp_group(
                 # BMM1 sub 0 for next kv
                 _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
                 desc_K = sK[kv_state.idx].desc()
-                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                 # BMM2 sub-tile 1
+                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                    mma_ts_step(
+                        bmm2_desc,
+                        (tmem_raw.subview(LAYOUT.P1_OFF)),
+                        desc_V,
+                        (tmem_raw.subview(LAYOUT.O1_OFF)),
+                        local_k,
+                        accum_b2,
+                        issue_mma=bmm2_issue,
+                    )
                     accum_b2 = cutlass.Boolean(True)
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                     _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
@@ -1343,6 +1691,7 @@ def _mma_warp_group(
                             (tmem_raw.subview(LAYOUT.O1_OFF)),
                             NUM_KPHASES_PV_PER_CHUNK + local_k,
                             cutlass.Boolean(True),
+                            issue_mma=bmm2_issue,
                         )
                 elect_p = nvvm.elect_sync()
                 cute.arch.inline_ptx('.pragma "next knob FenceCode";')
@@ -1350,7 +1699,7 @@ def _mma_warp_group(
                 bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                 # BMM1 sub 1 for next kv
-                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1369,10 +1718,19 @@ def _mma_warp_group(
             desc_V = sV[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
 
+            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
             _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O0_OFF)), local_k, accum_b2)
+                mma_ts_step(
+                    bmm2_desc,
+                    (tmem_raw.subview(LAYOUT.P0_OFF)),
+                    desc_V,
+                    (tmem_raw.subview(LAYOUT.O0_OFF)),
+                    local_k,
+                    accum_b2,
+                    issue_mma=bmm2_issue,
+                )
                 accum_b2 = cutlass.Boolean(True)
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                 _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
@@ -1384,14 +1742,24 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O0_OFF)),
                         NUM_KPHASES_PV_PER_CHUNK + local_k,
                         cutlass.Boolean(True),
+                        issue_mma=bmm2_issue,
                     )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
+            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
             _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(bmm2_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_V, (tmem_raw.subview(LAYOUT.O1_OFF)), local_k, accum_b2)
+                mma_ts_step(
+                    bmm2_desc,
+                    (tmem_raw.subview(LAYOUT.P1_OFF)),
+                    desc_V,
+                    (tmem_raw.subview(LAYOUT.O1_OFF)),
+                    local_k,
+                    accum_b2,
+                    issue_mma=bmm2_issue,
+                )
                 accum_b2 = cutlass.Boolean(True)
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
@@ -1403,6 +1771,7 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O1_OFF)),
                         NUM_KPHASES_PV_PER_CHUNK + local_k,
                         cutlass.Boolean(True),
+                        issue_mma=bmm2_issue,
                     )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1456,6 +1825,8 @@ def _mma_warp_group(
 @cute.jit
 def _softmax_kv_body(
     apply_mask: bool,
+    may_need_padding: bool,
+    body_mask_flags: int,
     sub_tile_id: int,
     kv_loop,
     s_addr_base,
@@ -1515,7 +1886,21 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
+        if cutlass.const_expr(_PADDED_CAUSAL):
+            mask_q_abs = q_abs
+            if cutlass.const_expr(CFG.BOTTOM_RIGHT):
+                mask_q_abs = mask_q_abs + causal_diag
+            mask_q_abs = cute.math.min(mask_q_abs, eff_seqlen_kv - cutlass.Int32(1))
+            chunks_S = [
+                _apply_top_left_causal_mask_chunk(
+                    raw_chunks[c],
+                    mask_q_abs,
+                    kv_col_base + cutlass.Int32(c * CHUNK),
+                    N=CHUNK,
+                )
+                for c in range(N_CHUNKS)
+            ]
+        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
             chunks_S = [
                 _apply_top_left_causal_mask_chunk(
                     raw_chunks[c],
@@ -1537,6 +1922,7 @@ def _softmax_kv_body(
                 for c in range(N_CHUNKS)
             ]
         else:
+            chunk_mask_flags = body_mask_flags & ~MASK_PADDED if CFG.MASK_FLAGS & MASK_SWA else body_mask_flags
             chunks_S = [
                 apply_mask_chunk(
                     raw_chunks[c],
@@ -1544,12 +1930,21 @@ def _softmax_kv_body(
                     kv_col_base + cutlass.Int32(c * CHUNK),
                     eff_seqlen_kv,
                     CFG.WINDOW_LEFT,
-                    CFG.MASK_FLAGS,
+                    chunk_mask_flags,
                     N=CHUNK,
                     bottom_right=CFG.BOTTOM_RIGHT,
                     causal_diag=causal_diag,
                     mask_value=float("-inf"),
                     window_right=CFG.WINDOW_RIGHT,
+                )
+                for c in range(N_CHUNKS)
+            ]
+        if cutlass.const_expr(may_need_padding and (CFG.MASK_FLAGS & MASK_PADDED) and (CFG.MASK_FLAGS & MASK_SWA)):
+            chunks_S = [
+                _apply_padding_mask_if_needed(
+                    chunks_S[c],
+                    kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -1683,6 +2078,189 @@ def _softmax_kv_body(
 
 
 @cute.jit
+def _softmax_masked_kv_loops(
+    one_sided_swa: bool,
+    sub_tile_id,
+    bounds,
+    swa_left_end,
+    swa_left_pad_start,
+    swa_right_start,
+    s_addr_base,
+    p_addr_base,
+    stats_addr,
+    bars,
+    q_abs,
+    eff_seqlen_kv,
+    eff_seqlen_q,
+    scale_log2,
+    total_max,
+    total_max_safe,
+    total_sum,
+    bmm1_phase,
+    stat_empty_phase,
+    leader_cta_id,
+):
+    if cutlass.const_expr(one_sided_swa):
+        for kv_loop in cutlass.range(bounds.left, swa_left_pad_start, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                True,
+                False,
+                MASK_SWA,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+        for kv_loop in cutlass.range(swa_left_pad_start, swa_left_end, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                True,
+                True,
+                MASK_SWA,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+        for kv_loop in cutlass.range(swa_left_end, swa_right_start, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                False,
+                False,
+                CFG.MASK_FLAGS,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+        for kv_loop in cutlass.range(swa_right_start, bounds.right, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                True,
+                True,
+                MASK_CAUSAL,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+    else:
+        for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                True,
+                False,
+                CFG.MASK_FLAGS,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+        for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                False,
+                False,
+                CFG.MASK_FLAGS,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+        for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                True,
+                True,
+                CFG.MASK_FLAGS,
+                sub_tile_id,
+                kv_loop,
+                s_addr_base,
+                p_addr_base,
+                stats_addr,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                total_max,
+                total_max_safe,
+                total_sum,
+                bmm1_phase,
+                stat_empty_phase,
+                leader_cta_id,
+            )
+
+    return total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase
+
+
+@cute.jit
 def _softmax_warp_group(
     sub_tile_id: int,
     seqlen_q,
@@ -1751,6 +2329,21 @@ def _softmax_warp_group(
 
     eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
     bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
+    initial_segments = (
+        _swa_segment_bounds(
+            q_super_idx,
+            eff_seqlen_q,
+            eff_seqlen_kv,
+            cta_in_pair,
+            seq_q_lens_tensor,
+            batch_idx,
+        )
+        if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS)
+        else (bounds.left, bounds.unmasked_lo, bounds.unmasked_lo, bounds.unmasked_hi, bounds.right)
+    )
+    swa_left_pad_start = initial_segments[1]
+    swa_left_end = initial_segments[2]
+    swa_right_start = initial_segments[3]
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
@@ -1779,6 +2372,8 @@ def _softmax_warp_group(
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
                     False,
+                    False,
+                    CFG.MASK_FLAGS,
                     sub_tile_id,
                     kv_loop,
                     s_addr_base_softmax,
@@ -1797,51 +2392,91 @@ def _softmax_warp_group(
                     leader_cta_id,
                 )
         else:
-            for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                    True,
-                    sub_tile_id,
-                    kv_loop,
-                    s_addr_base_softmax,
-                    p_addr_base_softmax,
-                    stats_addr_softmax,
-                    bars,
-                    q_abs,
-                    eff_seqlen_kv,
-                    eff_seqlen_q,
-                    scale_log2,
-                    total_max,
-                    total_max_safe,
-                    total_sum,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-            for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+            if cutlass.const_expr(_SWA_ONE_SIDED_GEOMETRY):
+                if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
+                    total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
+                        True,
+                        sub_tile_id,
+                        bounds,
+                        swa_left_end,
+                        swa_left_pad_start,
+                        swa_right_start,
+                        s_addr_base_softmax,
+                        p_addr_base_softmax,
+                        stats_addr_softmax,
+                        bars,
+                        q_abs,
+                        eff_seqlen_kv,
+                        eff_seqlen_q,
+                        scale_log2,
+                        total_max,
+                        total_max_safe,
+                        total_sum,
+                        bmm1_phase,
+                        stat_empty_phase,
+                        leader_cta_id,
+                    )
+                else:
+                    cga_q_row_coord = (q_super_idx - cta_in_pair) * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
+                    causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+                    lower_anchor = (
+                        cga_q_row_coord
+                        + causal_diag
+                        + cutlass.Int32(_MASK_TOKENS_PER_CGA - 1 - CFG.WINDOW_LEFT)
+                    )
+                    lower_end_if_positive = (lower_anchor + cutlass.Int32(CFG.TILE_N - 1)) // cutlass.Int32(CFG.TILE_N)
+                    lower_end_raw = cutlass.Int32(
+                        arith.select(
+                            (lower_anchor > cutlass.Int32(0)).ir_value(),
+                            lower_end_if_positive.ir_value(),
+                            cutlass.Int32(0).ir_value(),
+                        )
+                    )
+                    left_end = cute.math.min(cute.math.max(lower_end_raw, bounds.left), bounds.right)
+                    pad_start = (
+                        eff_seqlen_kv // cutlass.Int32(CFG.TILE_N)
+                        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED)
+                        else bounds.right
+                    )
+                    left_pad_start = cute.math.min(cute.math.max(pad_start, bounds.left), left_end)
+                    causal_start = (
+                        cga_q_row_coord + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)
+                    ) // cutlass.Int32(CFG.TILE_N)
+                    right_start_raw = cute.math.min(causal_start, pad_start)
+                    right_start = cute.math.min(
+                        cute.math.max(cute.math.max(right_start_raw, left_end), bounds.left),
+                        bounds.right,
+                    )
+                    total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
+                        True,
+                        sub_tile_id,
+                        bounds,
+                        left_end,
+                        left_pad_start,
+                        right_start,
+                        s_addr_base_softmax,
+                        p_addr_base_softmax,
+                        stats_addr_softmax,
+                        bars,
+                        q_abs,
+                        eff_seqlen_kv,
+                        eff_seqlen_q,
+                        scale_log2,
+                        total_max,
+                        total_max_safe,
+                        total_sum,
+                        bmm1_phase,
+                        stat_empty_phase,
+                        leader_cta_id,
+                    )
+            else:
+                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
                     False,
                     sub_tile_id,
-                    kv_loop,
-                    s_addr_base_softmax,
-                    p_addr_base_softmax,
-                    stats_addr_softmax,
-                    bars,
-                    q_abs,
-                    eff_seqlen_kv,
-                    eff_seqlen_q,
-                    scale_log2,
-                    total_max,
-                    total_max_safe,
-                    total_sum,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-            for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                    True,
-                    sub_tile_id,
-                    kv_loop,
+                    bounds,
+                    bounds.unmasked_lo,
+                    bounds.unmasked_lo,
+                    bounds.unmasked_hi,
                     s_addr_base_softmax,
                     p_addr_base_softmax,
                     stats_addr_softmax,
@@ -1869,26 +2504,32 @@ def _softmax_warp_group(
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             bars.mb_stat_full[sub_tile_id].arrive()
 
-        _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
-        nxt_hb = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load()
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
-        q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
-            nxt_q,
-            nxt_hb,
+        (
+            q_super_idx,
+            head_idx,
+            batch_idx,
+            split_idx,
+            is_valid_tile,
+            eff_seqlen_kv,
+            eff_seqlen_q,
+            bounds,
+            swa_left_pad_start,
+            swa_left_end,
+            swa_right_start,
+        ) = _softmax_next_payload(
+            sched,
+            sched_state,
             cta_in_pair,
             n_q_supers,
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
-            qh_per_kh,
+            seq_q_lens_tensor,
+            seqlen_q,
             seqlen_kv,
+            qh_per_kh,
         )
-        is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_tensor)
-        bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx, CFG.QH_PER_KH)
 
 
 @cute.jit
@@ -1984,7 +2625,10 @@ def _correction_warp_group(
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
                 stats_addr = tmem_base_iter + cutlass.Int32(stats_off)
 
-                _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
+                if cutlass.const_expr(CFG.THD_VARLEN and (CFG.MASK_FLAGS & MASK_SWA)):
+                    _wait_mbarrier_inline(bars.mb_stat_full[qs], stat_full_phase)
+                else:
+                    _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
 
                 stats_vec = nvvm.tcgen05_ld(
                     "32x32b",

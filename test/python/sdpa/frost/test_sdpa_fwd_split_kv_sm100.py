@@ -493,7 +493,7 @@ def test_cga1_stage_depth_scales_with_cluster_width():
 # cga1 in particular only fits once STAGES_KV halves with the cluster width.
 
 
-def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
+def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=128, skv=2048, causal=False):
     import math as _math
     import os as _os
 
@@ -501,21 +501,28 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
     import cuda.bindings.driver as cuda_driver
 
     from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+    from cudnn.frost.tile_dsl.constants import DTYPE_E5M2, DTYPE_FP16
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
 
-    B, H, SQ, SKV, D = 1, 4, 128, 2048, 128
+    B, H, SQ, SKV = 1, 4, 128, skv
     dev = "cuda"
-    scale = 1.0 / _math.sqrt(D)
+    scale = 1.0 / _math.sqrt(d_qk)
     torch.manual_seed(0)
     kdir = _os.path.join(_os.path.dirname(_os.path.abspath(api_dsl.__file__)), "kernels")
-    params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=DTYPE_FP16, split_kv=splits, cta_mma=cta_mma)
-    mod = load_template(_os.path.join(kdir, kfile), params, tag=f"t_{kfile[:16]}_{splits}_{cta_mma}")
-    fn = mod.compile(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
+    params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=DTYPE_FP16, split_kv=splits, cta_mma=cta_mma, window_right=0 if causal else None)
+    mod = load_template(
+        _os.path.join(kdir, kfile),
+        params,
+        tag=f"t_{d_qk}_{d_v}_{dtype_qkv}_{splits}_{cta_mma}_{int(causal)}",
+    )
+    compile_kwargs = dict(b=B, qh=H, kh=H, sq=SQ, skv=SKV, has_lse=True)
+    if not mx:
+        compile_kwargs.update(d_qk=d_qk, d_v=d_v)
+    fn = mod.compile(**compile_kwargs)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    o_p = torch.zeros(splits * B, SQ, H, D, device=dev, dtype=torch.float16)
+    o_p = torch.zeros(splits * B, SQ, H, d_v, device=dev, dtype=torch.float16)
     lse_p = torch.zeros(splits * B, H, SQ, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, dtype=torch.float32, device=dev)
     zH = torch.zeros(H, dtype=torch.float32, device=dev)
@@ -524,8 +531,9 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
     log2e = cutlass.Float32(scale * _math.log2(_math.e))
 
     if not mx:
-        mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
-        q, k, v = mk(B, SQ, H, D), mk(B, SKV, H, D), mk(B, SKV, H, D)
+        fp8_dtype = torch.float8_e5m2 if dtype_qkv == DTYPE_E5M2 else torch.float8_e4m3fn
+        mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(fp8_dtype)
+        q, k, v = mk(B, SQ, H, d_qk), mk(B, SKV, H, d_qk), mk(B, SKV, H, d_v)
         # The FP8 entry takes four 1-element fp32 DEVICE scale tensors
         # (descale_q/k/v, scale_o) — the scales fold in-kernel — and no Amax_S.
         one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
@@ -536,32 +544,46 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
     else:
         from sdpa.mxfp8_quant import quantize_to_mxfp8
 
-        qr = torch.randn(B, H, SQ, D, device=dev) * 0.5
-        kr = torch.randn(B, H, SKV, D, device=dev) * 0.5
-        vr = torch.randn(B, H, SKV, D, device=dev) * 0.5
-        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(qr, B, H, SQ, D)
-        q8, sfq, qf = a, aswz, adq.reshape(B, H, SQ, D).float()
-        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(kr, B, H, SKV, D)
-        k8, sfk, kf = a, aswz, adq.reshape(B, H, SKV, D).float()
-        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(vr, B, H, SKV, D)
-        v8, sfv, vf = b_, bswz, bdq.reshape(B, H, SKV, D).float()
-        sfq, sfk, sfv = (t.reshape(B, H, -1, 512).view(torch.int8).contiguous() for t in (sfq, sfk, sfv))
-        q8 = q8.reshape(B, H, SQ, D).permute(0, 2, 1, 3).contiguous()
-        k8 = k8.reshape(B, H, SKV, D).permute(0, 2, 1, 3).contiguous()
-        v8 = v8.reshape(B, H, SKV, D).permute(0, 2, 1, 3).contiguous()
+        fp8_dtype = torch.float8_e5m2 if dtype_qkv == DTYPE_E5M2 else torch.float8_e4m3fn
+
+        qr = torch.randn(B, H, SQ, d_qk, device=dev) * 0.5
+        kr = torch.randn(B, H, SKV, d_qk, device=dev) * 0.5
+        vr = torch.randn(B, H, SKV, d_v, device=dev) * 0.5
+        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(qr, B, H, SQ, d_qk, fp8_dtype=fp8_dtype)
+        q8, sfq = a, aswz
+        qf = q8.float() * adq.reshape(B, H, SQ, d_qk)
+        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(kr, B, H, SKV, d_qk, fp8_dtype=fp8_dtype)
+        k8, sfk = a, aswz
+        kf = k8.float() * adq.reshape(B, H, SKV, d_qk)
+        a, adq, aswz, b_, bdq, bswz = quantize_to_mxfp8(vr, B, H, SKV, d_v, fp8_dtype=fp8_dtype)
+        v8, sfv = b_, bswz
+        vf = v8.float() * bdq.reshape(B, H, SKV, d_v)
+        qk_sf_tile_bytes = TILE_N * _math.ceil(d_qk / TILE_N) * TILE_N // 32
+        v_sf_tile_bytes = TILE_N * _math.ceil(d_v / TILE_N) * TILE_N // 32
+        sfq = sfq.reshape(B, H, -1, qk_sf_tile_bytes).view(torch.int8).contiguous()
+        sfk = sfk.reshape(B, H, -1, qk_sf_tile_bytes).view(torch.int8).contiguous()
+        sfv = sfv.reshape(B, H, -1, v_sf_tile_bytes).view(torch.int8).contiguous()
+        q8 = q8.reshape(B, H, SQ, d_qk).permute(0, 2, 1, 3).contiguous()
+        k8 = k8.reshape(B, H, SKV, d_qk).permute(0, 2, 1, 3).contiguous()
+        v8 = v8.reshape(B, H, SKV, d_v).permute(0, 2, 1, 3).contiguous()
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
         fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, o_desc, ps, log2e, cutlass.Int32(0), stream=stream)
 
-    ref = torch.matmul(torch.softmax(torch.matmul(qf, kf.transpose(-1, -2)) * scale, -1), vf).permute(0, 2, 1, 3)
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    if causal:
+        q_pos = torch.arange(SQ, device=dev).view(SQ, 1)
+        kv_pos = torch.arange(SKV, device=dev).view(1, SKV)
+        scores = scores.masked_fill(kv_pos > q_pos, float("-inf"))
+    ref = torch.matmul(torch.softmax(scores, -1), vf).permute(0, 2, 1, 3)
     if splits == 1:
         torch.cuda.synchronize()
         return o_p.float(), ref, amax_o
-    o_out = torch.zeros(B, SQ, H, D, device=dev, dtype=torch.float16)
+    o_out = torch.zeros(B, SQ, H, d_v, device=dev, dtype=torch.float16)
     # has_amax: at splits > 1 the per-split epilogues skip their amax write, so
     # the combine is what reports it -- over the RECOMBINED O.
-    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=D, splits=splits, dtype_o="f16", has_lse=False, has_amax=True)
-    cfn(o_p, lse_p, o_out, None, amax_o, (B, H, SQ, D), cutlass.Int32(splits), stream=stream)
+    cfn = comb.compile(b=B, h=H, sq=SQ, d_v=d_v, splits=splits, dtype_o="f16", has_lse=False, has_amax=True)
+    cfn(o_p, lse_p, o_out, None, amax_o, (B, H, SQ, d_v), cutlass.Int32(splits), stream=stream)
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in combined fp8-family O"
     return o_out.float(), ref, amax_o
@@ -593,6 +615,51 @@ def test_split_kv_fp8(splits, cta_mma):
 
     got, ref, amax_o = _fp8_family_split("prefill_d128_fp8_sm100.py", DTYPE_E4M3, splits, cta_mma, mx=False)
     assert (got - ref).abs().max().item() <= 5e-2
+    _assert_amax_is_of_the_output(amax_o, got)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("splits,causal", [(8, False), (4, True)], ids=["empty_splits", "causal"])
+def test_split_kv_fp8_d192(splits, causal):
+    """D192's predecoded scheduler must carry the split through every warp role."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+
+    got, ref, amax_o = _fp8_family_split(
+        "prefill_d192_d128_fp8_sm100.py",
+        DTYPE_E4M3,
+        splits,
+        2,
+        mx=False,
+        d_qk=192,
+        d_v=128,
+        skv=5 * TILE_N,
+        causal=causal,
+    )
+    assert (got - ref).abs().max().item() <= 5e-2
+    _assert_amax_is_of_the_output(amax_o, got)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("splits,causal", [(8, False), (4, True)], ids=["empty_splits", "causal"])
+def test_split_kv_mxfp8_d192(in_key, splits, causal):
+    """D192 MXFP8 must preserve block-scale addressing across split ranges."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_E5M2
+
+    dtype_qkv = DTYPE_E5M2 if in_key == "e5m2" else DTYPE_E4M3
+
+    got, ref, amax_o = _fp8_family_split(
+        "prefill_d192_d128_mxfp8_sm100.py",
+        dtype_qkv,
+        splits,
+        2,
+        mx=True,
+        d_qk=192,
+        d_v=128,
+        skv=5 * TILE_N,
+        causal=causal,
+    )
+    assert (got - ref).abs().max().item() <= 8e-2
     _assert_amax_is_of_the_output(amax_o, got)
 
 
@@ -1029,14 +1096,14 @@ def test_api_split_writes_strided_recombined_lse():
 # --- the adapter splits the FP8 family too ----------------------------------
 
 
-def _api_fp8_case(h_q, h_kv, s_q, s_kv, *, mx):
+def _api_fp8_case(h_q, h_kv, s_q, s_kv, *, mx, d_qk=128, d_v=128):
     """FP8 / MXFP8 through the adapter; returns (split, O, O_unsplit, amax)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _cc = torch.cuda.get_device_capability()
     if _cc not in ((10, 0), (10, 3)) and not (_cc == (10, 7) and not mx):
         pytest.skip("MXFP8 requires cc10.0 / cc10.3; per-tensor FP8 also runs on cc10.7")
-    b, d, dev = 1, 128, "cuda"
+    b, dev = 1, "cuda"
 
     def build(force_one):
         torch.manual_seed(0)
@@ -1048,19 +1115,19 @@ def _api_fp8_case(h_q, h_kv, s_q, s_kv, *, mx):
                 a, _adq, aswz, *_ = quantize_to_mxfp8(r, shape[0], shape[1], shape[2], shape[3])
                 return a.reshape(*shape), aswz
 
-            q, sf_q = qz((b, h_q, s_q, d))
-            k, sf_k = qz((b, h_kv, s_kv, d))
-            v, sf_v = qz((b, h_kv, s_kv, d))
+            q, sf_q = qz((b, h_q, s_q, d_qk))
+            k, sf_k = qz((b, h_kv, s_kv, d_qk))
+            v, sf_v = qz((b, h_kv, s_kv, d_v))
             extra = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
             kw = {}
         else:
             mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
-            q, k, v = mk(b, h_q, s_q, d), mk(b, h_kv, s_kv, d), mk(b, h_kv, s_kv, d)
+            q, k, v = mk(b, h_q, s_q, d_qk), mk(b, h_kv, s_kv, d_qk), mk(b, h_kv, s_kv, d_v)
             one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
             extra = dict(descale_q=one(), descale_k=one(), descale_v=one(), scale_o=one())
             kw = dict(pertensor_fp8=True)
 
-        o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=torch.float16)  # HALF out
+        o = torch.zeros(b, h_q, s_q, d_v, device=dev, dtype=torch.float16)  # HALF out
         amax = torch.zeros(1, dtype=torch.float32, device=dev)
         split_knob = 1 if force_one else _expected_split(b, h_q, s_q, s_kv)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=torch.float16, split_kv=split_knob, **kw)
@@ -1086,6 +1153,22 @@ def test_api_splits_the_fp8_family(mx):
     split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=mx)
     assert split > 1
     assert (got - unsplit).abs().max().item() <= 5e-2
+
+
+@pytest.mark.L0
+def test_api_splits_per_tensor_fp8_d192():
+    """The SM100 router must expose D192 split-KV, not only its direct kernel."""
+    split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=False, d_qk=192, d_v=128)
+    assert split > 1
+    assert (got - unsplit).abs().max().item() <= 5e-2
+
+
+@pytest.mark.L0
+def test_api_splits_mxfp8_d192():
+    """The standalone adapter must expose D192 MXFP8 split-KV."""
+    split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=True, d_qk=192, d_v=128)
+    assert split > 1
+    assert (got - unsplit).abs().max().item() <= 8e-2
 
 
 @pytest.mark.L0

@@ -170,8 +170,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
     # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor,
-    # but only make_cfg_d128 threads them into a Cfg and only the d128 kernel
-    # reads them.  Accepting them elsewhere would silently ignore them — and for
+    # but a kernel must explicitly read them. Accepting them elsewhere would
+    # silently ignore them — and for
     # split_kv that is not merely surprising but WRONG: the caller sizes an
     # (S*B)-batch partial workspace and runs the combine, while the kernel keeps
     # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
@@ -194,8 +194,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
     if k.lpt_head_group not in (1, 8, 16):
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
-    if fp8 and flavor == "d192" and k.split_kv != 1:
-        raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
@@ -859,7 +857,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 # ---------------------------------------------------------------------------
-# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga2
+# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga1/cga2
 # ---------------------------------------------------------------------------
 
 
@@ -941,6 +939,17 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    mask_flags = _mask_flags_from(params)
+    e4_thd_swa = fp8 and params.dtype_qkv == DTYPE_E4M3 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    e5_thd_swa = fp8 and params.dtype_qkv == DTYPE_E5M2 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    e5_dense_causal_regs = (
+        params.dtype_qkv == DTYPE_E5M2
+        and not params.thd_varlen
+        and params.split_kv == 1
+        and not params.bottom_right
+        and mask_flags == MASK_CAUSAL
+        and (params.window_right or 0) == 0
+    )
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -958,14 +967,15 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
-        MASK_FLAGS=_mask_flags_from(params),
+        SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
+        MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=1,
-        SOFTMAX_REGS=184 if fp8 else 216 if _mask_flags_from(params) == MASK_NONE else 192,
-        CORRECTION_REGS=104 if fp8 else 40 if _mask_flags_from(params) == MASK_NONE else 88,
+        SCHEDULER_POLICY=params.sched_policy,
+        SOFTMAX_REGS=192 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
+        CORRECTION_REGS=88 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
