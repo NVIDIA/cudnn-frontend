@@ -10,12 +10,15 @@ import subprocess
 import sys
 
 import pytest
+import torch
+from cutlass import Boolean
 
 import cudnn
 import cudnn.flex_attention as flex_attention
 import cudnn.flex_attention.api as flex_attention_api
+from cudnn.flex_attention._compat import sm90_utils
 from cudnn.flex_attention.autograd import FlexAttnFunc
-from cudnn.flex_attention.plan.mask_plan import MaskPlan
+from cudnn.flex_attention.plan.mask_plan import ArbitraryPlanRuntimeBinding, MaskPlan, validate_arbitrary_plan_runtime_binding
 from cudnn.flex_attention.plan.validation import is_supported_head_dims, validate_call_options
 from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
 from cudnn.flex_attention.runtime.dsl_utils import _cute_dsl_bulk_copy_self_elects
@@ -92,6 +95,10 @@ def test_supported_arch_and_head_dimension_contracts():
         assert not is_supported_head_dims(*dims)
 
 
+def test_sm90_gemm_zero_init_is_runtime_boolean():
+    assert sm90_utils.gemm.__annotations__["zero_init"] is Boolean
+
+
 def test_call_option_validation():
     validate_call_options(softmax_scale=None, deterministic=False, return_lse=False)
     validate_call_options(softmax_scale=0.125, deterministic=True, return_lse=True)
@@ -115,6 +122,31 @@ def test_mask_plan_mode_is_inferred_from_cumulative_sequence_lengths():
     plan._cu_seqlens_k = None
     with pytest.raises(RuntimeError, match="both cu_seqlens_q and cu_seqlens_k"):
         _ = plan._is_varlen
+
+
+@pytest.mark.parametrize("mutated_name", ("cu_seqlens_q", "cu_seqlens_k"))
+def test_arbitrary_plan_runtime_binding_rejects_in_place_prefix_mutation(mutated_name):
+    prefixes = {
+        "cu_seqlens_q": torch.tensor((0, 96, 160), dtype=torch.int32),
+        "cu_seqlens_k": torch.tensor((0, 80, 128), dtype=torch.int32),
+    }
+    runtime_args = {
+        "is_varlen": True,
+        "batch_size": 2,
+        "seqlen_q": None,
+        "seqlen_k": None,
+        "total_q": 160,
+        "total_k": 128,
+        "max_seqlen_q": 96,
+        "max_seqlen_k": 80,
+        **prefixes,
+    }
+    binding = ArbitraryPlanRuntimeBinding.capture(**runtime_args)
+
+    prefixes[mutated_name].add_(1)
+
+    with pytest.raises(ValueError, match=rf"{mutated_name} was modified in-place"):
+        validate_arbitrary_plan_runtime_binding(binding, context="Flex Attention plan", **runtime_args)
 
 
 def test_functional_return_contract(monkeypatch):

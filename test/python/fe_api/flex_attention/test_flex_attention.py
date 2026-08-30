@@ -107,8 +107,6 @@ def test_varlen_gqa_forward_backward_matches_fp32_reference():
         max_seqlen_k=max(k_lengths),
         build_backward=True,
     )
-    cu_q.add_(1)
-    cu_k.add_(1)
     out, lse = flex_attn_func(q, k, v, mask_plan=plan, return_lse=True)
     out.backward(dout)
 

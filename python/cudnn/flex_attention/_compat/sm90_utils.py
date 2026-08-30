@@ -46,7 +46,7 @@ def gemm(
     acc: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
-    zero_init: cutlass.Constexpr[bool] = False,
+    zero_init: Boolean = False,
     wg_wait: cutlass.Constexpr[int] = 0,
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -57,6 +57,7 @@ def gemm(
         # We make a new mma_atom since we'll be modifying its attribute (accumulate).
         # Otherwise the compiler complains "operand #0 does not dominate this use"
         mma_atom = cute.make_mma_atom(tiled_mma.op)
+        # ACCUMULATE is a runtime field: zero_init flips after the first sparse contribution.
         mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
         for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
             cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
