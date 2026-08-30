@@ -95,31 +95,13 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
-@torch_fork_set_rng(seed=419)
-@pytest.mark.parametrize(
-    "num_heads,head_dim,repeats",
-    [
-        pytest.param(16, 576, 3, marks=pytest.mark.L0, id="H16-D576-tail-smoke"),
-        pytest.param(16, 576, 1000, marks=pytest.mark.L2, id="H16-D576-repeat1000"),
-        pytest.param(32, 512, 1000, marks=pytest.mark.L2, id="H32-D512-repeat1000"),
-        pytest.param(64, 512, 1000, marks=pytest.mark.L2, id="H64-D512-repeat1000"),
-        pytest.param(64, 576, 1000, marks=pytest.mark.L2, id="H64-D576-repeat1000"),
-        pytest.param(96, 512, 1000, marks=pytest.mark.L2, id="H96-D512-repeat1000"),
-        pytest.param(128, 576, 1000, marks=pytest.mark.L2, id="H128-D576-repeat1000"),
-    ],
-)
-def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim, repeats):
-    """Masked and multi-block heads must be bitwise reproducible."""
-    try:
-        from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
 
     _require_sm100()
     device = torch.device("cuda")
-    s_q, s_kv = 257, 256
-    topk = 64
+    topk = min(64, s_kv)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -127,7 +109,8 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
-    topk_length[128] = 0
+    if s_q > 1:
+        topk_length[s_q // 2] = 0
     out, lse = ref_sparse_attention_forward(
         q,
         kv,
@@ -178,6 +161,22 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
         return result["dq"], result["dkv"], result["d_sink"]
 
     reference = run()
+    if check_short_workspace:
+        with pytest.raises(ValueError, match=rf"requires a {workspace_bytes}-byte workspace"):
+            DSA.sparse_attention_backward_wrapper(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+                deterministic=True,
+                workspace=torch.empty(workspace_bytes - 1, dtype=torch.uint8, device=device),
+            )
+
     output_names = ("dQ", "dKV", "dSink")
     for repeat in range(1, repeats + 1):
         actual = run()
@@ -198,6 +197,48 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@torch_fork_set_rng(seed=419)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,repeats",
+    [
+        pytest.param(16, 576, 3, marks=pytest.mark.L0, id="H16-D576-tail-smoke"),
+        pytest.param(16, 576, 1000, marks=pytest.mark.L2, id="H16-D576-repeat1000"),
+        pytest.param(32, 512, 1000, marks=pytest.mark.L2, id="H32-D512-repeat1000"),
+        pytest.param(64, 512, 1000, marks=pytest.mark.L2, id="H64-D512-repeat1000"),
+        pytest.param(64, 576, 1000, marks=pytest.mark.L2, id="H64-D576-repeat1000"),
+        pytest.param(96, 512, 1000, marks=pytest.mark.L2, id="H96-D512-repeat1000"),
+        pytest.param(128, 576, 1000, marks=pytest.mark.L2, id="H128-D576-repeat1000"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim, repeats):
+    """Masked and multi-block heads must be bitwise reproducible."""
+    try:
+        _exercise_deterministic_sm100_case(num_heads, head_dim, 257, 256, repeats)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=421)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,s_q,s_kv",
+    [
+        pytest.param(64, 512, 1, 1, id="H64-q1-kv1"),
+        pytest.param(16, 576, 8, 65, id="H16-q8-kv65"),
+        pytest.param(32, 512, 9, 127, id="H32-q9-kv127"),
+        pytest.param(64, 576, 127, 128, id="H64-q127-kv128"),
+        pytest.param(96, 512, 128, 129, id="H96-q128-kv129"),
+        pytest.param(128, 576, 129, 130, id="H128-q129-kv130"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_boundaries(num_heads, head_dim, s_q, s_kv):
+    """Exercise head tails, vector padding, wave boundaries, and exact scratch."""
+    try:
+        _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats=1, check_short_workspace=True)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
 
 @pytest.mark.L0
