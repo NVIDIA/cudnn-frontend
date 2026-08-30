@@ -23,27 +23,10 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
     """
 
     num_dkv_shards = 128
+    q_wave_ctas = num_dkv_shards
     dkv_fold_group_size = 8
     num_dkv_fold_groups = num_dkv_shards // dkv_fold_group_size
     serialize_head_blocks = True
-
-    def __init__(
-        self,
-        element_dtype: Type[cutlass.Numeric],
-        head_dim: int,
-        head_dim_v: int,
-        block_tile: int,
-        max_topk: int = 0,
-    ):
-        super().__init__(
-            element_dtype=element_dtype,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            block_tile=block_tile,
-            max_topk=max_topk,
-        )
-        assert block_tile == 64, "bounded-wave deterministic DSA backward requires the M64 kernel"
-        self.q_wave_ctas = self.num_dkv_shards
 
     @staticmethod
     def _get_workspace_size_dKV(
@@ -57,37 +40,21 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         workspace_bytes = d * acc_dtype.width // 8
         return (b, FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards, k, workspace_bytes)
 
-    def get_workspace_tensor(
+    @cute.jit
+    def make_dKV_accumulator(
         self,
-        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
-        workspace_LSE_OdO: cute.Tensor,
         workspace_dKV: cute.Tensor,
-        total_seqlen_Q: Int32,
         total_seqlen_KV: Int32,
-        acc_dtype: Type[cutlass.Numeric],
-    ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
-        sum_OdO, scaled_lse, _ = super().get_workspace_tensor(
-            problem_shape,
-            workspace_LSE_OdO,
-            workspace_dKV,
-            total_seqlen_Q,
-            total_seqlen_KV,
-            acc_dtype,
-        )
-        head_dim = cute.round_up(problem_shape[2], 8)
+        head_dim: Int32,
+    ) -> cute.Tensor:
         dkv_iter = cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype)
-        dkv_acc = cute.make_tensor(
+        return cute.make_tensor(
             dkv_iter,
             cute.make_layout(
                 (head_dim, total_seqlen_KV * self.num_dkv_shards, (1, 1)),
                 stride=(1, Int64(head_dim), (0, 0)),
             ),
         )
-        return sum_OdO, scaled_lse, dkv_acc
-
-    @cute.jit
-    def prepare_dKV_workspace(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor):
-        return mdKV_acc
 
     @cute.jit
     def select_dKV_accumulator(

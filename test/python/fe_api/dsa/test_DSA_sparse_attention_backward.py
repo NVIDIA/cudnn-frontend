@@ -88,8 +88,10 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
 
     assert issubclass(FlashAttentionDSABackwardSm100Deterministic, FlashAttentionDSABackwardSm100)
     assert FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards == 128
+    assert FlashAttentionDSABackwardSm100Deterministic.q_wave_ctas == FlashAttentionDSABackwardSm100Deterministic.num_dkv_shards
     assert FlashAttentionDSABackwardSm100Deterministic.dkv_fold_group_size == 8
     assert FlashAttentionDSABackwardSm100Deterministic.serialize_head_blocks
+    assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
@@ -166,12 +168,14 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_hea
             workspace=workspace,
         )
         torch.cuda.synchronize()
-        return result["dq"].clone(), result["dkv"].clone(), result["d_sink"].clone()
+        return result["dq"], result["dkv"], result["d_sink"]
 
     reference = run()
-    for _ in range(3):
+    output_names = ("dQ", "dKV", "dSink")
+    for repeat in range(1, 1001):
         actual = run()
-        assert all(torch.equal(lhs, rhs) for lhs, rhs in zip(actual, reference))
+        for name, actual_tensor, reference_tensor in zip(output_names, actual, reference):
+            assert torch.equal(actual_tensor, reference_tensor), f"{name} differs from the first run at repetition {repeat}"
 
     check_ref_dsa_sparse_attention_backward(
         q,

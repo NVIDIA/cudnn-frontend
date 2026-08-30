@@ -18,6 +18,7 @@ from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 class FlashAttentionDSABackwardSm100:
     arch = 100
     num_dkv_shards = 1
+    q_wave_ctas = 0
     serialize_head_blocks = False
 
     def __init__(
@@ -33,9 +34,6 @@ class FlashAttentionDSABackwardSm100:
         self.same_hdim_kv = head_dim == head_dim_v
         self.block_tile = block_tile
         self.max_topk = max_topk
-        # A deterministic subclass may split the query grid into fixed-size
-        # launches. Zero preserves the ordinary single-launch path.
-        self.q_wave_ctas = 0
         self.QK_mma_tiler = (block_tile, block_tile, head_dim)
         # head_dim_main: 128-aligned portion for the main 4 sub-tiles
         head_dim_main = (head_dim // 128) * 128
@@ -213,16 +211,8 @@ class FlashAttentionDSABackwardSm100:
         total_seqlen_KV: Int32,
         acc_dtype: Type[cutlass.Numeric],
     ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
-        # problem_shape contains the max seqlen of Q and K
-        max_Q, max_K, D, HB = (
-            problem_shape[0],
-            problem_shape[1],
-            problem_shape[2],
-            problem_shape[3],
-        )
-        H, B = cute.size(problem_shape[3][0]), cute.size(problem_shape[3][1])
-
-        D = cute.round_up(D, 8)
+        H = cute.size(problem_shape[3][0])
+        D = cute.round_up(problem_shape[2], 8)
         total_seqlen_Q = cute.round_up(total_seqlen_Q, 8)
 
         acc_bytes = acc_dtype.width // 8
@@ -230,31 +220,33 @@ class FlashAttentionDSABackwardSm100:
 
         sum_OdO_iter = workspace_LSE_OdO.iterator
         scaled_lse_iter = sum_OdO_iter + sum_OdO_bytes
-        dKV_acc_iter = workspace_dKV.iterator
-
         sum_OdO_iter = cute.recast_ptr(sum_OdO_iter, dtype=self.acc_dtype)
         scaled_lse_iter = cute.recast_ptr(scaled_lse_iter, dtype=self.acc_dtype)
-        dKV_acc_iter = cute.recast_ptr(dKV_acc_iter, dtype=self.acc_dtype)
+        # FP32 pair copies require an 8-byte row stride; every supported H is even.
+        aligned_H = cute.assume(H, divby=2)
 
         sum_OdO = cute.make_tensor(
             sum_OdO_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (aligned_H, 0))),
         )
         scaled_lse = cute.make_tensor(
             scaled_lse_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (aligned_H, 0))),
         )
-        dKV_acc = cute.make_tensor(
-            dKV_acc_iter,
-            cute.make_layout((total_seqlen_KV, D, (1, 1)), stride=(D, 1, (0, 0))),
-        )
+        dKV_acc = self.make_dKV_accumulator(workspace_dKV, total_seqlen_KV, D)
 
         return sum_OdO, scaled_lse, dKV_acc
 
     @cute.jit
-    def prepare_dKV_workspace(self, mdKV_acc: cute.Tensor, mdKV: cute.Tensor):
-        """Return the ordinary dKV workspace view."""
-        return cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+    def make_dKV_accumulator(self, workspace_dKV: cute.Tensor, total_seqlen_KV: Int32, head_dim: Int32):
+        dkv_iter = cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype)
+        return cute.make_tensor(
+            dkv_iter,
+            cute.make_layout(
+                (head_dim, total_seqlen_KV, (1, 1)),
+                stride=(1, Int64(head_dim), (0, 0)),
+            ),
+        )
 
     @cute.kernel
     def clear_dKV_workspace(self, mdKV_acc: cute.Tensor, num_rows: Int32):
@@ -562,7 +554,6 @@ class FlashAttentionDSABackwardSm100:
             mKV.shape[0],
             self.acc_dtype,
         )
-        mdKV_acc = self.prepare_dKV_workspace(mdKV_acc, mdKV)
         self.initialize_dKV_workspace(mdKV_acc, mKV.shape[0], stream)
 
         # ============ Sum OdO ============
