@@ -28,10 +28,18 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
 pytestmark = pytest.mark.L0
+
+
+def _with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
+    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
+    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
+    return result
 
 
 def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
@@ -299,7 +307,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
 
     # SFA padded to 128 rows PER GROUP, then concatenated; SFB per-expert.
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
@@ -369,7 +377,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_quant_epilogue(combo, cf
     assert compiled.chain.quants
 
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
@@ -448,7 +456,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_reduction_scalar() -> No
     )
 
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)

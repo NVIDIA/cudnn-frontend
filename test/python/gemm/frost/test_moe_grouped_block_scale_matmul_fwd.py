@@ -12,6 +12,7 @@ import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
+from cudnn.gemm.frost import compiler
 from gemm_test_utils import (
     requires_sm100,
     requires_sm107,
@@ -29,21 +30,33 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
-from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.compiler import _check_block_quant_supported, _render_block_scale_template, jit_from_cudnn_graph
+from cudnn.gemm.frost.epilogue_codegen import _f8_128x4_row_scale_index_expr, generate
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
+from test_matmul import _f8_row_scale_addr
 
 pytestmark = pytest.mark.L0
 
 
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _CFG_1CTA = "CONFIG_sm100_128x256x128_128x256x32_cluster1x1"
+_SEGMENTED_ROW_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma"
+_SEGMENTED_ROW_CFG_2CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
 
 
 def _block_quant_q_atol(scale_dtype) -> float:
     # Non-pow2 E4M3 scales use the kernel's approximate reciprocal → up to one
     # smallest E4M3 output step off the torch reference.
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
+
+
+def _with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
+    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
+    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
+    return result
 
 
 # combo -> (block_size, data dtype, SF dtype).
@@ -166,6 +179,9 @@ def _build_graph(
     quant_scale_dt=cudnn.data_type.FP8_E8M0,
     quant_scale_reorder=False,
     quant_scale_dim=None,
+    quant_block_size=32,
+    quant_axis=None,
+    quant_group_offset=False,
     weight_major="k",
 ):
     block_size, a_dt, sf_dt = _COMBOS[combo]
@@ -223,7 +239,12 @@ def _build_graph(
         R.set_dim(list(reduction_dims)).set_stride(list(stride))
         R.set_output(True).set_data_type(reduction_dt)
     if quant:
-        q, q_scale = g.block_scale_quantize(input=out, block_size=32, name="q")
+        quant_kwargs = {"input": out, "block_size": quant_block_size, "name": "q"}
+        if quant_axis is not None:
+            quant_kwargs["axis"] = quant_axis
+        if quant_group_offset:
+            quant_kwargs["group_offset"] = fto
+        q, q_scale = g.block_scale_quantize(**quant_kwargs)
         q.set_data_type(quant_out_dt).set_output(True)
         if quant_scale_dim is not None:
             q_scale.set_dim(list(quant_scale_dim)).set_stride([quant_scale_dim[1] * quant_scale_dim[2], quant_scale_dim[2], 1])
@@ -293,6 +314,141 @@ def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None
     assert len(chain.reductions) == 1
     assert chain.reductions[0].mode == "add"
     assert [o.source for o in chain.outputs] == ["matmul", "reduction_0"]
+
+
+_SUPER_SEGMENTED_SCALE_DIM = (1, 67840, 168)
+
+
+def _super_segmented_row_quant_graph(*, axis=-1, scale_dim=_SUPER_SEGMENTED_SCALE_DIM, reorder=True):
+    """Metadata-only shape matching Super's routed 1024 -> 2688 up leaf."""
+    return _build_graph(
+        512,
+        2816,
+        2688,
+        1024,
+        num_groups=512,
+        quant=True,
+        quant_out_dt=cudnn.data_type.FP4_E2M1,
+        quant_scale_dt=cudnn.data_type.FP8_E4M3,
+        quant_scale_reorder=reorder,
+        quant_scale_dim=scale_dim,
+        quant_block_size=16,
+        quant_axis=axis,
+        quant_group_offset=True,
+    )
+
+
+@pytest.mark.parametrize("axis", [-1, 2])
+def test_analyzer_accepts_explicit_segmented_row_scale_capacity(axis) -> None:
+    chain = analyze(_super_segmented_row_quant_graph(axis=axis))
+    quant = chain.quants[0]
+    assert chain.has_moe and chain.has_block_scale
+    assert (quant.axis, quant.block_size, quant.scale_dtype) == (axis, 16, "fp8_e4m3")
+    assert quant.scale_reorder == "F8_128x4"
+    assert quant.scale_dim == _SUPER_SEGMENTED_SCALE_DIM
+    assert quant.grouped_by_moe
+
+
+@pytest.mark.parametrize(
+    "scale_dim,message",
+    [
+        (None, "explicit scale dim"),
+        ((2, 67840, 168), "batch=1"),
+        ((1, 67839, 168), "128-row-aligned"),
+        ((1, 65536, 168), "static worst-case capacity"),
+        ((1, 67840, 164), "padded N/block_size"),
+    ],
+)
+def test_segmented_row_quant_rejects_invalid_capacity(scale_dim, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        analyze(_super_segmented_row_quant_graph(scale_dim=scale_dim))
+
+
+def test_segmented_row_quant_requires_f8_128x4() -> None:
+    with pytest.raises(ValueError, match="requires F8_128x4"):
+        analyze(_super_segmented_row_quant_graph(reorder=False))
+
+
+@pytest.mark.parametrize(
+    "total_rows,num_groups,expected_rows",
+    [
+        (0, 512, 0),
+        (1, 512, 128),
+        (127, 1, 128),
+        (128, 1, 128),
+        (129, 1, 256),
+        (255, 1, 256),
+        (256, 1, 256),
+        (257, 1, 384),
+        (258, 1, 384),
+        (128, 2, 256),
+        (2816, 4, 3200),
+        (2816, 23, 5632),
+        (2816, 512, 67840),
+    ],
+)
+def test_segmented_row_scale_static_capacity(total_rows, num_groups, expected_rows) -> None:
+    assert segmented_row_scale_capacity_rows(total_rows, num_groups) == expected_rows
+
+
+def test_segmented_row_quant_codegen_uses_scheduler_prefix_and_group_local_row(monkeypatch) -> None:
+    chain = analyze(_super_segmented_row_quant_graph())
+    cfg = by_name(_SEGMENTED_ROW_CFG)
+    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
+    monkeypatch.setattr(compiler, "_grid_num_clusters", lambda _cfg, device=None: 1)
+    _check_block_quant_supported(chain, compiler._epi_vec_bytes(chain, cfg), cfg)
+    modes = compiler._store_modes(chain, cfg)
+    tma_slots = frozenset(i for i, mode in enumerate(modes) if mode == "tma")
+    snippets = generate(
+        chain,
+        vec_bytes_epi=compiler._epi_chunk_bytes(chain, cfg, bool(tma_slots)),
+        output_elem_bytes=1,
+        tma_slots=tma_slots,
+        packed_lanes=compiler._epi_packed_lanes(cfg),
+    )
+    assert "_q0_local_row = row - group_begin" in snippets.epilogue
+    assert "_q0_base = start_sf_block_m * _q0_ncb * 512" in snippets.epilogue
+    assert "(_q0_local_row // 128)" in snippets.epilogue
+    rendered = _render_block_scale_template(chain, snippets, cfg)
+    assert "start_sf_block_m = (_slot.subview(6)).load()" in rendered
+    assert "start_sf_block_m = (slot.subview(6)).load()" in rendered
+
+
+def test_segmented_row_scale_address_map_is_concatenated_per_group_atoms() -> None:
+    group_rows, scale_cols = (100, 0, 140, 260), 168
+    n_col_quads = scale_cols // 4
+    start_block = 0
+    addresses = []
+    for count in group_rows:
+        for local_row in range(count):
+            for scale_col in (0, 3, 4, 83, 167):
+                base = start_block * n_col_quads * 512
+                expr = _f8_128x4_row_scale_index_expr(str(local_row), str(scale_col), str(n_col_quads), atom_base=str(base))
+                got = eval(expr, {"__builtins__": {}}, {})
+                within = ((local_row // 128) * n_col_quads + scale_col // 4) * 512 + (local_row % 32) * 16 + ((local_row % 128) // 32) * 4 + scale_col % 4
+                assert got == base + within
+                addresses.append(got)
+        start_block += _ceil_div(count, 128)
+    assert start_block * 128 == sum(_ceil_div(count, 128) * 128 for count in group_rows)
+    assert len(addresses) == len(set(addresses))
+
+
+def test_plain_moe_segmented_row_quant_declines_without_prefix_scheduler() -> None:
+    S, N, K, E, G = 512, 256, 256, 4, 4
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    weight = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="fto", dim=[G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    out = g.moe_grouped_matmul(tok, weight, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
+    q, sf = g.block_scale_quantize(input=out, block_size=16, axis=-1, group_offset=fto, name="q")
+    q.set_data_type(cudnn.data_type.FP4_E2M1).set_output(True)
+    capacity_rows = segmented_row_scale_capacity_rows(S, G)
+    sf.set_dim([1, capacity_rows, 16]).set_stride([capacity_rows * 16, 16, 1])
+    sf.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    chain = analyze(g)
+    assert chain.has_moe and not chain.has_block_scale and chain.quants[0].grouped_by_moe
+    with pytest.raises(NotImplementedError, match="requires a block-scaled MoE"):
+        _check_block_quant_supported(chain, 32, by_name(_SEGMENTED_ROW_CFG))
 
 
 # --------------------------------------------------------------------------- #
@@ -392,7 +548,7 @@ def _run_e2e(
         b = offsets_list[gi]
         e = offsets_list[gi + 1] if gi + 1 < num_groups else S
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=offset_torch_dt, device=dev)
     if quant:
@@ -511,9 +667,10 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
         cta_group=cta_group,
     )
 
-    sfa_blk = torch.cat(
+    sfa_live = torch.cat(
         [_to_blocked(sfa_log[offsets_list[gi] : (offsets_list[gi + 1] if gi + 1 < len(offsets_list) else S)]) for gi in range(len(offsets_list))]
-    ).view(1, -1, 1)
+    )
+    sfa_blk = _with_static_segmented_capacity(sfa_live, S, len(offsets_list), sf_k)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
     output_store = torch.zeros(1, S, N + 16, dtype=torch.bfloat16, device=dev)
@@ -657,6 +814,194 @@ def test_e2e_block_quant_epilogue(
         quant_scale_torch_dt=scale_torch_dt,
         quant_scale_reorder=scale_reorder,
     )
+
+
+def _run_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name: str, cta_group: int) -> None:
+    """Direct segmented scales equal today's bridge on every consumer-live byte."""
+    torch.manual_seed(7)
+    dev = "cuda"
+    E, S, N, K, bs = 2, 512, 256, 512, 16
+    offsets_list = [0, 100, 100, 300]
+    counts = [(offsets_list[i + 1] if i + 1 < len(offsets_list) else S) - offsets_list[i] for i in range(len(offsets_list))]
+    scale_cols = N // bs
+    live_segmented_rows = sum(_ceil_div(count, 128) * 128 for count in counts)
+    capacity_rows = segmented_row_scale_capacity_rows(S, len(offsets_list))
+    segmented_dim = (1, capacity_rows, _ceil_div(scale_cols, 4) * 4)
+    common = {
+        "E": E,
+        "S": S,
+        "N": N,
+        "K": K,
+        "num_groups": len(offsets_list),
+        "combo": "nvfp4",
+        "quant": True,
+        "quant_out_dt": cudnn.data_type.FP4_E2M1,
+        "quant_scale_dt": cudnn.data_type.FP8_E4M3,
+        "quant_scale_reorder": True,
+        "quant_block_size": bs,
+        "quant_axis": -1,
+    }
+    direct = _plan(
+        _build_graph(**common, quant_scale_dim=segmented_dim, quant_group_offset=True),
+        config=by_name(config_name),
+        cta_group=cta_group,
+    )
+    global_dim = (1, _ceil_div(S, 128) * 128, segmented_dim[2])
+    global_up = _plan(
+        _build_graph(**common, quant_scale_dim=global_dim),
+        config=by_name(config_name),
+        cta_group=cta_group,
+    )
+
+    tok_u8 = torch.randint(0, 256, (1, S, K // 2), dtype=torch.uint8, device=dev)
+    weight_u8 = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
+    token, weight = tok_u8.view(torch.float4_e2m1fn_x2), weight_u8.view(torch.float4_e2m1fn_x2)
+    sfa_log = torch.randint(1, 4, (S, K // bs), device=dev).to(torch.float8_e4m3fn)
+    sfb_log = torch.randint(1, 4, (E, N, K // bs), device=dev).to(torch.float8_e4m3fn)
+    sfa_live = torch.cat([_to_blocked(sfa_log[begin : begin + count]) for begin, count in zip(offsets_list, counts) if count]).reshape(-1)
+    sfa = torch.full((1, capacity_rows, K // bs), 0x33, dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
+    sfa.view(-1)[: sfa_live.numel()].copy_(sfa_live)
+    sfb = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, K // bs, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    q_direct = torch.full((1, S, N // 2), 0xA5, dtype=torch.uint8, device=dev)
+    q_global = torch.full((1, S, N // 2), 0x5A, dtype=torch.uint8, device=dev)
+    sf_direct = torch.full(segmented_dim, 0x55, dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
+    sf_global = torch.full(global_dim, 0x2A, dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
+    bad_sf_store = torch.empty((1, capacity_rows, segmented_dim[2] + 16), dtype=torch.uint8, device=dev)
+    bad_sf = bad_sf_store[:, :, : segmented_dim[2]].view(torch.float8_e4m3fn)
+    assert not bad_sf.is_contiguous()
+    with pytest.raises(ValueError, match="packed blob"):
+        direct(_vp_bs(direct, token, weight, [q_direct, bad_sf], sfa, sfb, fto=offsets))
+    with pytest.raises(ValueError, match=r"SFA\[0\].*kernel reads"):
+        direct(_vp_bs(direct, token, weight, [q_direct, sf_direct], sfa_live.view(1, -1, 1), sfb, fto=offsets))
+
+    # A compiled plan admits runtime N from the weight/output shapes. The
+    # grouped-row scale blob remains graph-shaped, so a larger runtime N must
+    # be rejected before the epilogue can address past its last scale column.
+    runtime_n = N * 2
+    runtime_weight = torch.randint(0, 256, (E, runtime_n, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
+    runtime_sfb_log = torch.randint(1, 4, (E, runtime_n, K // bs), device=dev).to(torch.float8_e4m3fn)
+    runtime_sfb = torch.cat([_to_blocked(runtime_sfb_log[e]) for e in range(E)]).view(E, K // bs, runtime_n)
+    runtime_q = torch.full((1, S, runtime_n // 2), 0xC3, dtype=torch.uint8, device=dev)
+    sf_before = sf_direct.view(torch.uint8).clone()
+    with pytest.raises(ValueError, match=r"grouped row quant scale output\[0\].*kernel reads"):
+        direct(_vp_bs(direct, token, runtime_weight, [runtime_q, sf_direct], sfa, runtime_sfb, fto=offsets))
+    assert torch.all(runtime_q == 0xC3)
+    assert torch.equal(sf_direct.view(torch.uint8), sf_before)
+    global_up(_vp_bs(global_up, token, weight, [q_global, sf_global], sfa, sfb, fto=offsets))
+    direct(_vp_bs(direct, token, weight, [q_direct, sf_direct], sfa, sfb, fto=offsets))
+    torch.cuda.synchronize()
+
+    global_logical = sf_global.view(-1)[_f8_row_scale_addr(S, N, bs)]
+    bridged = torch.zeros_like(sf_direct)
+    valid_mask = torch.zeros(segmented_dim, dtype=torch.uint8, device=dev)
+    source_row = destination_byte = 0
+    for count in counts:
+        segment_bytes = _ceil_div(count, 128) * 128 * segmented_dim[2]
+        if count:
+            bridged.view(-1)[destination_byte : destination_byte + segment_bytes].copy_(_to_blocked(global_logical[source_row : source_row + count]))
+            live = torch.ones((count, scale_cols), dtype=torch.uint8, device=dev)
+            valid_mask.view(-1)[destination_byte : destination_byte + segment_bytes].copy_(_to_blocked(live))
+        source_row += count
+        destination_byte += segment_bytes
+    assert source_row == S
+    assert destination_byte == live_segmented_rows * segmented_dim[2]
+    valid = valid_mask.bool()
+    torch.testing.assert_close(q_direct, q_global, atol=0, rtol=0)
+    torch.testing.assert_close(sf_direct.view(torch.uint8)[valid], bridged.view(torch.uint8)[valid], atol=0, rtol=0)
+    assert torch.all(sf_direct.view(torch.uint8)[~valid] == 0x55)
+    assert torch.all(bridged.view(torch.uint8)[~valid] == 0)
+
+    recovered, cursor = [], 0
+    for count in counts:
+        segment_bytes = _ceil_div(count, 128) * 128 * segmented_dim[2]
+        if count:
+            recovered.append(sf_direct.view(-1)[cursor : cursor + segment_bytes][_f8_row_scale_addr(count, N, bs)])
+        cursor += segment_bytes
+    torch.testing.assert_close(torch.cat(recovered), global_logical, atol=0, rtol=0)
+
+    # Both handoffs feed the same down plan. Poisoned padding differs, so exact
+    # output equality proves no semantic output dependence on padded rows.
+    H = 128
+    down = _plan(_build_graph(E, S, H, N, len(offsets_list), combo="nvfp4"), config=by_name(config_name), cta_group=cta_group)
+    down_weight = torch.randint(0, 256, (E, H, N // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
+    down_sfb_log = torch.randint(1, 4, (E, H, N // bs), device=dev).to(torch.float8_e4m3fn)
+    down_sfb = torch.cat([_to_blocked(down_sfb_log[e]) for e in range(E)]).view(E, N // bs, H)
+    out_direct = torch.full((1, S, H), float("nan"), dtype=torch.bfloat16, device=dev)
+    out_bridged = torch.full((1, S, H), float("nan"), dtype=torch.bfloat16, device=dev)
+    down(_vp_bs(down, q_global.view(torch.float4_e2m1fn_x2), down_weight, out_bridged, bridged, down_sfb, fto=offsets))
+    down(_vp_bs(down, q_direct.view(torch.float4_e2m1fn_x2), down_weight, out_direct, sf_direct, down_sfb, fto=offsets))
+    torch.cuda.synchronize()
+    assert torch.isfinite(out_direct).all() and torch.isfinite(out_bridged).all()
+    torch.testing.assert_close(out_direct.view(torch.uint16), out_bridged.view(torch.uint16), atol=0, rtol=0)
+
+    # Reuse the exact same up/down plans and buffers with a second group
+    # partition. This exercises the runtime S/G envelope independently of the
+    # graph's original offsets and catches stale scheduler-prefix state.
+    balanced_offsets_list = [0, 128, 256, 384]
+    balanced_counts = [128, 128, 128, 128]
+    balanced_sfa_live = torch.cat([_to_blocked(sfa_log[begin : begin + count]) for begin, count in zip(balanced_offsets_list, balanced_counts)]).reshape(-1)
+    sfa.view(torch.uint8).fill_(0x44)
+    sfa.view(-1)[: balanced_sfa_live.numel()].copy_(balanced_sfa_live)
+    offsets.copy_(torch.tensor(balanced_offsets_list, dtype=torch.int32, device=dev))
+    q_direct.fill_(0xA5)
+    q_global.fill_(0x5A)
+    sf_direct.view(torch.uint8).fill_(0x55)
+    sf_global.view(torch.uint8).fill_(0x2A)
+    out_direct.fill_(float("nan"))
+    out_bridged.fill_(float("nan"))
+
+    global_up(_vp_bs(global_up, token, weight, [q_global, sf_global], sfa, sfb, fto=offsets))
+    direct(_vp_bs(direct, token, weight, [q_direct, sf_direct], sfa, sfb, fto=offsets))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_direct, q_global, atol=0, rtol=0)
+
+    balanced_global_logical = sf_global.view(-1)[_f8_row_scale_addr(S, N, bs)]
+    balanced_bridged = torch.zeros_like(sf_direct)
+    balanced_valid_mask = torch.zeros(segmented_dim, dtype=torch.uint8, device=dev)
+    source_row = destination_byte = 0
+    for count in balanced_counts:
+        segment_bytes = _ceil_div(count, 128) * 128 * segmented_dim[2]
+        balanced_bridged.view(-1)[destination_byte : destination_byte + segment_bytes].copy_(
+            _to_blocked(balanced_global_logical[source_row : source_row + count])
+        )
+        balanced_live = torch.ones((count, scale_cols), dtype=torch.uint8, device=dev)
+        balanced_valid_mask.view(-1)[destination_byte : destination_byte + segment_bytes].copy_(_to_blocked(balanced_live))
+        source_row += count
+        destination_byte += segment_bytes
+    balanced_valid = balanced_valid_mask.bool()
+    torch.testing.assert_close(
+        sf_direct.view(torch.uint8)[balanced_valid],
+        balanced_bridged.view(torch.uint8)[balanced_valid],
+        atol=0,
+        rtol=0,
+    )
+    assert torch.all(sf_direct.view(torch.uint8)[~balanced_valid] == 0x55)
+
+    down(_vp_bs(down, q_global.view(torch.float4_e2m1fn_x2), down_weight, out_bridged, balanced_bridged, down_sfb, fto=offsets))
+    down(_vp_bs(down, q_direct.view(torch.float4_e2m1fn_x2), down_weight, out_direct, sf_direct, down_sfb, fto=offsets))
+    torch.cuda.synchronize()
+    assert torch.isfinite(out_direct).all() and torch.isfinite(out_bridged).all()
+    torch.testing.assert_close(out_direct.view(torch.uint16), out_bridged.view(torch.uint16), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "config_name,cta_group,use_non_default_stream",
+    [
+        (_SEGMENTED_ROW_CFG, 1, False),
+        (_SEGMENTED_ROW_CFG_2CTA, 2, True),
+    ],
+    ids=("1cta-default-stream", "2cta-non-default-stream"),
+)
+def test_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name, cta_group, use_non_default_stream) -> None:
+    if not use_non_default_stream:
+        _run_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name, cta_group)
+        return
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _run_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name, cta_group)
+    stream.synchronize()
 
 
 @requires_sm100
