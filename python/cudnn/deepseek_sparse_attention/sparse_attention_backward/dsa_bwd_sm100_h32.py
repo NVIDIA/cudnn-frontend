@@ -28,6 +28,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         block_tile: int,
         max_topk: int = 0,
     ):
+        """Configure H32/D576 M64 tiling, TMEM offsets, and register budgets."""
         # Initialize the shared H16 machinery with its native K128 shape;
         # every shape-dependent tensor below is then rebuilt for this class.
         super().__init__(
@@ -713,6 +714,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         rTopkIdx: cute.Tensor,
         sub_tile_idx: int,
     ):
+        """Atomically accumulate one M128xN64 register fragment into global dKV."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp

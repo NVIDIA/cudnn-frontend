@@ -1101,6 +1101,7 @@ class FlashAttentionDSABackwardSm100H16:
         sSum_OdO: cute.Tensor,
         pipelines,
     ):
+        """Load the CTA's Q/dO tiles and per-head LSE/O·dO scalars into SMEM."""
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
