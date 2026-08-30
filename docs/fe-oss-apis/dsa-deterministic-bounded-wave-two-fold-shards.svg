@@ -1,0 +1,368 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1370" viewBox="0 0 1600 1370" role="img" aria-labelledby="title desc">
+  <title id="title">DSA Backward Determinism — Bounded Waves and Two-Fold Shards</title>
+  <desc id="desc">An English source-audited diagram explaining the 128 CTA bounded-wave schedule, one-writer-per-shard mapping, deterministic 128 to 16 to 1 reduction, and how removing in-grid semaphore waits avoids a potential scheduling deadlock.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.55" stop-color="#f5f7fa"/>
+      <stop offset="1" stop-color="#f1f5f8"/>
+    </linearGradient>
+    <linearGradient id="cyanPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fbfdfe"/>
+    </linearGradient>
+    <linearGradient id="greenPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fbfdfc"/>
+    </linearGradient>
+    <linearGradient id="redPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fffafa"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0" flood-color="#ffffff" flood-opacity="0"/>
+    </filter>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#62d9ff"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#56e39f"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ff6b7a"/>
+    </marker>
+    <style>
+      .sans { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+      .h1 { font-size: 38px; font-weight: 430; letter-spacing: -0.35px; fill: #18212b; }
+      .sub { font-size: 17px; font-weight: 400; fill: #657383; }
+      .tag { font-size: 13px; font-weight: 520; letter-spacing: 0.45px; fill: #426174; }
+      .section { font-size: 23px; font-weight: 480; fill: #1d2935; }
+      .cardTitle { font-size: 18px; font-weight: 480; fill: #273442; }
+      .body { font-size: 15px; font-weight: 400; fill: #465768; }
+      .small { font-size: 13px; font-weight: 400; fill: #607182; }
+      .tiny { font-size: 11px; font-weight: 430; fill: #6c7d8d; }
+      .number { font-size: 21px; font-weight: 560; fill: #ffffff; }
+
+      /* Minimal light-theme overrides. Presentation attributes retain semantic grouping. */
+      *[filter] { filter: none; }
+      rect[fill="#0b1b2a"], rect[fill="#112437"], rect[fill="#0a1c2b"],
+      rect[fill="#121d2d"], rect[fill="#121a27"] { fill: #ffffff; }
+      rect[fill="#194662"], rect[fill="#173a52"], rect[fill="#102c40"],
+      rect[fill="#102c3c"], rect[fill="#0d2638"], rect[fill="#19283a"] { fill: #eff7fb; }
+      rect[fill="#153d38"], rect[fill="#153f34"], rect[fill="#143c37"],
+      rect[fill="#143f39"], rect[fill="#173f34"], rect[fill="#174c3b"],
+      rect[fill="#163b35"], rect[fill="#102c29"], rect[fill="#205949"] { fill: #edf8f3; }
+      g[fill="#143c37"], g[fill="#205949"] { fill: #edf8f3; }
+      rect[fill="#30222e"], rect[fill="#482431"], rect[fill="#2a2029"],
+      rect[fill="#542633"] { fill: #fcf0f2; }
+      rect[fill="#312538"] { fill: #f5eff7; }
+      rect[fill="#77efb7"] { fill: #caefdf; }
+      [stroke="#21445e"], [stroke="#2a627e"], [stroke="#31536c"],
+      [stroke="#367394"], [stroke="#415a73"] { stroke: #cbdbe5; }
+      [stroke="#23564a"], [stroke="#277457"], [stroke="#2a8b68"],
+      [stroke="#42b987"], [stroke="#4dd7a0"], [stroke="#64e3ac"] { stroke: #8ac8ad; }
+      [stroke="#4b4051"], [stroke="#674d70"], [stroke="#805264"],
+      [stroke="#834052"], [stroke="#9d6570"] { stroke: #dfc5cc; }
+      [stroke="#26394d"] { stroke: #cbd4dc; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1370" fill="url(#bg)"/>
+  <circle cx="1450" cy="40" r="310" fill="#eaf4f8" opacity="0.7"/>
+  <circle cx="80" cy="1110" r="250" fill="#eaf6f1" opacity="0.7"/>
+
+  <!-- Header -->
+  <text x="72" y="72" class="sans h1">DSA Backward Determinism</text>
+  <text x="72" y="108" class="sans sub">Bounded Q waves + private FP32 shards + a fixed two-fold reduction</text>
+  <g transform="translate(1120,45)">
+    <rect x="0" y="0" width="112" height="32" rx="16" fill="#173a52" stroke="#3a789d"/>
+    <text x="56" y="21" text-anchor="middle" class="sans tag" fill="#8fe7ff">SM100 · H64</text>
+    <rect x="122" y="0" width="120" height="32" rx="16" fill="#153f34" stroke="#328b6c"/>
+    <text x="182" y="21" text-anchor="middle" class="sans tag" fill="#79edb4">128 SHARDS</text>
+    <rect x="252" y="0" width="154" height="32" rx="16" fill="#312538" stroke="#74527f"/>
+    <text x="329" y="21" text-anchor="middle" class="sans tag" fill="#e7b9f4">NO SEMAPHORE</text>
+  </g>
+
+  <!-- Section 1: bounded wave -->
+  <rect x="55" y="145" width="1490" height="575" rx="24" fill="url(#cyanPanel)" stroke="#21445e" stroke-width="1.5" filter="url(#shadow)"/>
+  <circle cx="91" cy="185" r="17" fill="#62d9ff"/>
+  <text x="91" y="192" text-anchor="middle" class="sans number">1</text>
+  <text x="120" y="193" class="sans section">Bound the dependency domain: one launch = at most 128 Q CTAs</text>
+
+  <!-- Wave 0 card -->
+  <g transform="translate(85,225)">
+    <rect width="405" height="235" rx="18" fill="#0b1b2a" stroke="#2a627e"/>
+    <text x="22" y="34" class="sans cardTitle">Wave w</text>
+    <text x="380" y="33" text-anchor="end" class="mono small" fill="#72dfff">Q = 128w ... 128w+127</text>
+    <g transform="translate(22,58)">
+      <rect x="0" y="0" width="78" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="39" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 0</text>
+      <text x="39" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[128w]</text>
+      <rect x="96" y="0" width="78" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="135" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 1</text>
+      <text x="135" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[+1]</text>
+      <text x="196" y="29" text-anchor="middle" class="sans body">···</text>
+      <rect x="220" y="0" width="116" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="278" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 127</text>
+      <text x="278" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[+127]</text>
+      <path d="M39 51 V76 M135 51 V76 M278 51 V76" stroke="#62d9ff" stroke-width="2" marker-end="url(#arrowCyan)"/>
+      <rect x="0" y="82" width="78" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="39" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 0</text>
+      <rect x="96" y="82" width="78" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="135" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 1</text>
+      <text x="196" y="108" text-anchor="middle" class="sans body">···</text>
+      <rect x="220" y="82" width="116" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="278" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 127</text>
+    </g>
+    <rect x="22" y="199" width="361" height="24" rx="12" fill="#102c3c"/>
+    <text x="202" y="216" text-anchor="middle" class="sans small" fill="#a9e8ff">CTA completion order may vary — writes never collide</text>
+  </g>
+
+  <!-- Stream boundary -->
+  <g transform="translate(505,252)">
+    <path d="M0 82 H125" stroke="#62d9ff" stroke-width="4" marker-end="url(#arrowCyan)" filter="url(#glow)"/>
+    <rect x="2" y="20" width="121" height="47" rx="11" fill="#102c40" stroke="#3c87ad"/>
+    <text x="62" y="39" text-anchor="middle" class="sans tiny" fill="#83e0ff">SAME STREAM</text>
+    <text x="62" y="56" text-anchor="middle" class="sans tiny" fill="#caeefa">kernel completes</text>
+    <text x="62" y="112" text-anchor="middle" class="sans small" fill="#78dffc">happens-before</text>
+    <text x="62" y="130" text-anchor="middle" class="mono tiny" fill="#9fb8cb">no spin / no ticket</text>
+  </g>
+
+  <!-- Wave 1 card -->
+  <g transform="translate(645,225)">
+    <rect width="405" height="235" rx="18" fill="#0b1b2a" stroke="#2a627e"/>
+    <text x="22" y="34" class="sans cardTitle">Wave w + 1</text>
+    <text x="380" y="33" text-anchor="end" class="mono small" fill="#72dfff">Q += 128</text>
+    <g transform="translate(22,58)">
+      <rect x="0" y="0" width="78" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="39" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 0</text>
+      <text x="39" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[+128]</text>
+      <rect x="96" y="0" width="78" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="135" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 1</text>
+      <text x="135" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[+129]</text>
+      <text x="196" y="29" text-anchor="middle" class="sans body">···</text>
+      <rect x="220" y="0" width="116" height="46" rx="9" fill="#194662" stroke="#51c8f2"/>
+      <text x="278" y="20" text-anchor="middle" class="mono tiny" fill="#b9edff">CTA 127</text>
+      <text x="278" y="37" text-anchor="middle" class="mono tiny" fill="#71d8ff">Q[+255]</text>
+      <path d="M39 51 V76 M135 51 V76 M278 51 V76" stroke="#62d9ff" stroke-width="2" marker-end="url(#arrowCyan)"/>
+      <rect x="0" y="82" width="78" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="39" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 0</text>
+      <rect x="96" y="82" width="78" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="135" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 1</text>
+      <text x="196" y="108" text-anchor="middle" class="sans body">···</text>
+      <rect x="220" y="82" width="116" height="43" rx="8" fill="#153d38" stroke="#4dd7a0"/>
+      <text x="278" y="108" text-anchor="middle" class="mono small" fill="#84f0bf">Shard 127</text>
+    </g>
+    <rect x="22" y="199" width="361" height="24" rx="12" fill="#102c3c"/>
+    <text x="202" y="216" text-anchor="middle" class="sans small" fill="#a9e8ff">Per-shard order: Q[i] → Q[i+128] → Q[i+256] ...</text>
+  </g>
+
+  <!-- invariant card -->
+  <g transform="translate(1080,225)">
+    <rect width="430" height="235" rx="18" fill="#112437" stroke="#31536c"/>
+    <text x="24" y="35" class="sans cardTitle">Why no semaphore is needed</text>
+    <g transform="translate(25,57)">
+      <circle cx="11" cy="11" r="11" fill="#56e39f"/><path d="M6 11 l4 4 7-9" fill="none" stroke="#092118" stroke-width="2.6"/>
+      <text x="35" y="16" class="sans body">Same wave: CTA i is the sole writer of shard i</text>
+      <circle cx="11" cy="51" r="11" fill="#56e39f"/><path d="M6 51 l4 4 7-9" fill="none" stroke="#092118" stroke-width="2.6"/>
+      <text x="35" y="56" class="sans body">Across waves: stream completion orders reuse</text>
+      <circle cx="11" cy="91" r="11" fill="#56e39f"/><path d="M6 91 l4 4 7-9" fill="none" stroke="#092118" stroke-width="2.6"/>
+      <text x="35" y="96" class="sans body">After BWD: folds start only when all waves finish</text>
+      <circle cx="11" cy="131" r="11" fill="#56e39f"/><path d="M6 131 l4 4 7-9" fill="none" stroke="#092118" stroke-width="2.6"/>
+      <text x="35" y="136" class="sans body">Therefore no concurrent writers need arbitration</text>
+    </g>
+    <rect x="24" y="205" width="382" height="18" rx="9" fill="#153f34"/>
+    <text x="215" y="218" text-anchor="middle" class="mono tiny" fill="#8aefbd">no conflict → no ticket, lock, or spin loop</text>
+  </g>
+
+  <!-- Mathematical proof of disjoint shard ownership -->
+  <g transform="translate(85,482)">
+    <rect width="620" height="210" rx="16" fill="#0a1c2b" stroke="#367394"/>
+    <text x="22" y="31" class="sans cardTitle">Proof: every CTA in a wave writes a different shard</text>
+    <text x="22" y="58" class="mono small" fill="#9fdff5">N = 128,   wave w,   CTA lane i ∈ {0, ..., N−1}</text>
+    <text x="22" y="87" class="mono body" fill="#d8f5ff">q(w,i) = q_offset + i = N·w + i</text>
+    <text x="22" y="116" class="mono body" fill="#d8f5ff">shard(w,i) = q(w,i) mod N = (N·w + i) mod N = i</text>
+    <rect x="20" y="131" width="580" height="34" rx="10" fill="#143f39" stroke="#42b987"/>
+    <text x="310" y="154" text-anchor="middle" class="mono body" fill="#8ff1be">i ≠ j  ⇒  shard(w,i) ≠ shard(w,j)   (injective)</text>
+    <text x="22" y="187" class="sans small" fill="#a9c3d7">Tail wave: i &lt; r ≤ 128, so the same injective mapping still holds.</text>
+    <text x="598" y="201" text-anchor="end" class="mono tiny" fill="#62859d">base L562–618, L827–836 · deter L100–101</text>
+  </g>
+
+  <!-- Why FA4-style ticket semaphores are a poor fit for DSA dKV -->
+  <g transform="translate(725,482)">
+    <rect width="785" height="210" rx="16" fill="#121d2d" stroke="#674d70"/>
+    <text x="22" y="31" class="sans cardTitle">Why not an FA4-style semaphore for DSA dKV?</text>
+    <text x="22" y="55" class="sans small" fill="#aebfd2">FA4’s protocol is valid; the mismatch is DSA’s irregular sparse fan-out.</text>
+
+    <g transform="translate(20,70)">
+      <rect width="232" height="88" rx="11" fill="#19283a" stroke="#415a73"/>
+      <text x="14" y="23" class="sans tag" fill="#8fddff">1 · MANY TARGETS</text>
+      <text x="14" y="44" class="sans tiny">One Q CTA scatters into</text>
+      <text x="14" y="60" class="sans tiny">up to Top-K KV rows and</text>
+      <text x="14" y="76" class="sans tiny">multiple dKV fragments.</text>
+    </g>
+    <g transform="translate(267,70)">
+      <rect width="238" height="88" rx="11" fill="#30222e" stroke="#805264"/>
+      <text x="14" y="23" class="sans tag" fill="#ff9daa">2 · STRICT TICKET CHAINS</text>
+      <text x="14" y="44" class="sans tiny">Irregular runtimes create</text>
+      <text x="14" y="60" class="sans tiny">head-of-line blocking and</text>
+      <text x="14" y="76" class="sans tiny">long semaphore tails.</text>
+    </g>
+    <g transform="translate(520,70)">
+      <rect width="245" height="88" rx="11" fill="#30222e" stroke="#805264"/>
+      <text x="14" y="23" class="sans tag" fill="#ff9daa">3 · COST / SCHEDULING RISK</text>
+      <text x="14" y="44" class="sans tiny">Fine: atomics + polls + metadata.</text>
+      <text x="14" y="60" class="sans tiny">Coarse: serialize independent work.</text>
+      <text x="14" y="76" class="sans tiny">Spin: scheduler / deadlock risk.</text>
+    </g>
+    <rect x="20" y="171" width="745" height="25" rx="9" fill="#173f34"/>
+    <text x="392" y="189" text-anchor="middle" class="sans small" fill="#9af0c4">Sharding replaces temporal arbitration with spatial separation; one fixed fold pays the ordering cost once.</text>
+  </g>
+
+  <!-- Section 2: two fold -->
+  <g transform="translate(0,170)">
+  <rect x="55" y="575" width="965" height="500" rx="24" fill="url(#greenPanel)" stroke="#23564a" stroke-width="1.5" filter="url(#shadow)"/>
+  <circle cx="91" cy="615" r="17" fill="#56e39f"/>
+  <text x="91" y="622" text-anchor="middle" class="sans number">2</text>
+  <text x="120" y="623" class="sans section">Two-fold shard reduction: 128 → 16 → 1</text>
+  <text x="85" y="654" class="sans small">All BWD waves finish before reduction. Both folds use a fixed FP32 addition order.</text>
+
+  <!-- 128 shards represented as 16 group capsules -->
+  <text x="85" y="693" class="sans tag" fill="#78ebb4">128 PRIVATE FP32 SHARDS</text>
+  <g transform="translate(85,712)">
+    <g fill="#143c37" stroke="#42b987">
+      <rect x="0" y="0" width="92" height="54" rx="10"/>
+      <rect x="102" y="0" width="92" height="54" rx="10"/>
+      <rect x="204" y="0" width="92" height="54" rx="10"/>
+      <rect x="306" y="0" width="92" height="54" rx="10"/>
+      <rect x="408" y="0" width="92" height="54" rx="10"/>
+      <rect x="510" y="0" width="92" height="54" rx="10"/>
+      <rect x="612" y="0" width="92" height="54" rx="10"/>
+      <rect x="714" y="0" width="92" height="54" rx="10"/>
+    </g>
+    <g class="mono tiny" fill="#a6f2cf" text-anchor="middle">
+      <text x="46" y="22">G0</text><text x="46" y="39">S0–S7</text>
+      <text x="148" y="22">G1</text><text x="148" y="39">S8–S15</text>
+      <text x="250" y="22">G2</text><text x="250" y="39">S16–S23</text>
+      <text x="352" y="22">G3</text><text x="352" y="39">S24–S31</text>
+      <text x="454" y="22">G4</text><text x="454" y="39">S32–S39</text>
+      <text x="556" y="22">G5</text><text x="556" y="39">S40–S47</text>
+      <text x="658" y="22">G6</text><text x="658" y="39">S48–S55</text>
+      <text x="760" y="22">G7</text><text x="760" y="39">S56–S63</text>
+    </g>
+    <g transform="translate(0,64)">
+      <g fill="#143c37" stroke="#42b987">
+        <rect x="0" y="0" width="92" height="54" rx="10"/><rect x="102" y="0" width="92" height="54" rx="10"/>
+        <rect x="204" y="0" width="92" height="54" rx="10"/><rect x="306" y="0" width="92" height="54" rx="10"/>
+        <rect x="408" y="0" width="92" height="54" rx="10"/><rect x="510" y="0" width="92" height="54" rx="10"/>
+        <rect x="612" y="0" width="92" height="54" rx="10"/><rect x="714" y="0" width="92" height="54" rx="10"/>
+      </g>
+      <g class="mono tiny" fill="#a6f2cf" text-anchor="middle">
+        <text x="46" y="22">G8</text><text x="46" y="39">S64–S71</text>
+        <text x="148" y="22">G9</text><text x="148" y="39">S72–S79</text>
+        <text x="250" y="22">G10</text><text x="250" y="39">S80–S87</text>
+        <text x="352" y="22">G11</text><text x="352" y="39">S88–S95</text>
+        <text x="454" y="22">G12</text><text x="454" y="39">S96–S103</text>
+        <text x="556" y="22">G13</text><text x="556" y="39">S104–S111</text>
+        <text x="658" y="22">G14</text><text x="658" y="39">S112–S119</text>
+        <text x="760" y="22">G15</text><text x="760" y="39">S120–S127</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- fold arrows -->
+  <path d="M485 845 V887" stroke="#56e39f" stroke-width="4" marker-end="url(#arrowGreen)"/>
+  <rect x="275" y="845" width="420" height="28" rx="14" fill="#153f34" stroke="#2a8b68"/>
+  <text x="485" y="864" text-anchor="middle" class="sans small" fill="#a5f1ce">FOLD 1 · sum each 8-shard group in index order</text>
+
+  <text x="85" y="910" class="sans tag" fill="#78ebb4">16 IN-PLACE GROUP SUMS</text>
+  <g transform="translate(85,927)">
+    <g fill="#205949" stroke="#64e3ac">
+      <rect x="0" y="0" width="44" height="44" rx="8"/><rect x="50" y="0" width="44" height="44" rx="8"/>
+      <rect x="100" y="0" width="44" height="44" rx="8"/><rect x="150" y="0" width="44" height="44" rx="8"/>
+      <rect x="200" y="0" width="44" height="44" rx="8"/><rect x="250" y="0" width="44" height="44" rx="8"/>
+      <rect x="300" y="0" width="44" height="44" rx="8"/><rect x="350" y="0" width="44" height="44" rx="8"/>
+      <rect x="400" y="0" width="44" height="44" rx="8"/><rect x="450" y="0" width="44" height="44" rx="8"/>
+      <rect x="500" y="0" width="44" height="44" rx="8"/><rect x="550" y="0" width="44" height="44" rx="8"/>
+      <rect x="600" y="0" width="44" height="44" rx="8"/><rect x="650" y="0" width="44" height="44" rx="8"/>
+      <rect x="700" y="0" width="44" height="44" rx="8"/><rect x="750" y="0" width="44" height="44" rx="8"/>
+    </g>
+    <g class="mono tiny" fill="#d0ffe9" text-anchor="middle">
+      <text x="22" y="27">G0</text><text x="72" y="27">G1</text><text x="122" y="27">G2</text><text x="172" y="27">G3</text>
+      <text x="222" y="27">G4</text><text x="272" y="27">G5</text><text x="322" y="27">G6</text><text x="372" y="27">G7</text>
+      <text x="422" y="27">G8</text><text x="472" y="27">G9</text><text x="522" y="27">10</text><text x="572" y="27">11</text>
+      <text x="622" y="27">12</text><text x="672" y="27">13</text><text x="722" y="27">14</text><text x="772" y="27">15</text>
+    </g>
+  </g>
+  <text x="85" y="992" class="mono small" fill="#9fcbbd">stored at shard starts: 0, 8, 16, ... 120</text>
+
+  <path d="M730 982 H845" stroke="#56e39f" stroke-width="4" marker-end="url(#arrowGreen)"/>
+  <g transform="translate(855,922)">
+    <rect width="130" height="75" rx="15" fill="#77efb7"/>
+    <text x="65" y="24" text-anchor="middle" class="sans tag" fill="#092319">FOLD 2</text>
+    <text x="65" y="45" text-anchor="middle" class="mono tiny" style="fill:#113829">G0 → G15</text>
+    <text x="65" y="63" text-anchor="middle" class="sans tiny" style="fill:#113829">+ output cast</text>
+  </g>
+  <rect x="85" y="1021" width="900" height="35" rx="11" fill="#102c29"/>
+  <text x="535" y="1044" text-anchor="middle" class="sans body" fill="#bbf5da">Same inputs + same FP32 addition tree = bitwise-stable dKV output</text>
+
+  <!-- Section 3: deadlock comparison -->
+  <rect x="1045" y="575" width="500" height="500" rx="24" fill="#121a27" stroke="#4b4051" stroke-width="1.5" filter="url(#shadow)"/>
+  <circle cx="1081" cy="615" r="17" fill="#f0b35b"/>
+  <text x="1081" y="622" text-anchor="middle" class="sans number">3</text>
+  <text x="1110" y="623" class="sans section">Why bounded waves matter</text>
+
+  <!-- bad path -->
+  <g transform="translate(1075,657)">
+    <rect width="440" height="180" rx="16" fill="url(#redPanel)" stroke="#834052"/>
+    <text x="20" y="31" class="sans cardTitle" fill="#ffd3d8">Potential deadlock: blocking semaphore grid</text>
+    <rect x="20" y="48" width="185" height="44" rx="9" fill="#482431" stroke="#ff6b7a"/>
+    <text x="112" y="66" text-anchor="middle" class="mono tiny" fill="#ffd4d8">later-ticket CTAs</text>
+    <text x="112" y="82" text-anchor="middle" class="mono tiny" fill="#ff8995">resident + spinning</text>
+    <rect x="255" y="48" width="165" height="44" rx="9" fill="#2a2029" stroke="#9d6570" stroke-dasharray="5 4"/>
+    <text x="337" y="66" text-anchor="middle" class="mono tiny" fill="#e1bac0">predecessor CTA</text>
+    <text x="337" y="82" text-anchor="middle" class="mono tiny" fill="#c78f99">not resident yet</text>
+    <path d="M205 70 H247" stroke="#ff6b7a" stroke-width="3" marker-end="url(#arrowRed)"/>
+    <text x="220" y="116" text-anchor="middle" class="mono small" fill="#ff9da7">while (ticket != expected) { spin; }</text>
+    <rect x="20" y="133" width="400" height="29" rx="9" fill="#542633"/>
+    <text x="220" y="153" text-anchor="middle" class="sans small" fill="#ffd0d5">If waiters occupy all slots, the predecessor cannot run</text>
+  </g>
+
+  <!-- good path -->
+  <g transform="translate(1075,855)">
+    <rect width="440" height="185" rx="16" fill="url(#greenPanel)" stroke="#277457"/>
+    <text x="20" y="31" class="sans cardTitle" fill="#caffdf">Bounded wave: no in-grid wait edge</text>
+    <rect x="20" y="49" width="116" height="45" rx="9" fill="#174c3b" stroke="#56e39f"/>
+    <text x="78" y="68" text-anchor="middle" class="mono tiny" fill="#caffdf">Wave w</text>
+    <text x="78" y="84" text-anchor="middle" class="mono tiny" fill="#8ff1be">runs to finish</text>
+    <path d="M144 71 H201" stroke="#56e39f" stroke-width="3" marker-end="url(#arrowGreen)"/>
+    <rect x="207" y="49" width="90" height="45" rx="9" fill="#163b35" stroke="#3fb784"/>
+    <text x="252" y="68" text-anchor="middle" class="mono tiny" fill="#caffdf">stream</text>
+    <text x="252" y="84" text-anchor="middle" class="mono tiny" fill="#8ff1be">boundary</text>
+    <path d="M305 71 H328" stroke="#56e39f" stroke-width="3" marker-end="url(#arrowGreen)"/>
+    <rect x="335" y="49" width="85" height="45" rx="9" fill="#174c3b" stroke="#56e39f"/>
+    <text x="377" y="68" text-anchor="middle" class="mono tiny" fill="#caffdf">Wave</text>
+    <text x="377" y="84" text-anchor="middle" class="mono tiny" fill="#8ff1be">w + 1</text>
+    <g transform="translate(20,113)">
+      <circle cx="9" cy="9" r="9" fill="#56e39f"/><path d="M5 9 l3 3 6-7" fill="none" stroke="#092118" stroke-width="2"/>
+      <text x="28" y="14" class="sans small" fill="#bff7d9">No spin loop; any scheduled CTA can progress</text>
+      <circle cx="9" cy="39" r="9" fill="#56e39f"/><path d="M5 39 l3 3 6-7" fill="none" stroke="#092118" stroke-width="2"/>
+      <text x="28" y="44" class="sans small" fill="#bff7d9">A successor is never resident before its wave</text>
+    </g>
+  </g>
+
+  <!-- Footer -->
+  <line x1="70" y1="1111" x2="1530" y2="1111" stroke="#26394d"/>
+  <text x="72" y="1142" class="sans small" fill="#9cb1c5">Workspace</text>
+  <text x="155" y="1142" class="mono small" fill="#d2dfeb">B × 128 × round_up(S_KV, 8) × round_up(D, 8) × 4 bytes</text>
+  <text x="650" y="1142" class="sans small" fill="#9cb1c5">Other deterministic paths</text>
+  <text x="835" y="1142" class="sans small" fill="#d2dfeb">dQ: single writer · dSink: one CTA/head with fixed traversal</text>
+  <text x="72" y="1171" class="sans tiny" fill="#71879c">Source anchors: deterministic subclass L18–22, L45–57, L92–108, L111–177 · inherited host wave loop in dsa_bwd_sm100.py L562–625</text>
+  <text x="1528" y="1171" text-anchor="end" class="mono tiny" fill="#71879c">source-audited manifest · 2026-08-28</text>
+  </g>
+</svg>
