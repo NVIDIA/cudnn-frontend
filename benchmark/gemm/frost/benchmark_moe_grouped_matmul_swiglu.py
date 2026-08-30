@@ -23,7 +23,19 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
-from benchmark_utils import add_sweep_args, group_offsets, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms
+from benchmark_utils import (
+    add_fto_alignment_arg,
+    add_sweep_args,
+    fto_alignment,
+    group_offsets,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_configs,
+    set_bytes,
+    spec_for,
+    time_ms,
+)
 
 
 def _build_plan(g, cfg, cta_group):
@@ -53,7 +65,7 @@ def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
 # Graph + data
 
 
-def _graph_swiglu(S: int, N: int, K: int, E: int):
+def _graph_swiglu(S: int, N: int, K: int, E: int, alignment: int = 1):
     """Dual MoE grouped-matmul SwiGLU: silu(moe(tok, w0)) * moe(tok, w1) * scale.
     token is shared by both grouped matmuls (loaded once → two accumulators)."""
     g = cudnn.pygraph(
@@ -91,6 +103,7 @@ def _graph_swiglu(S: int, N: int, K: int, E: int):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     c0 = g.moe_grouped_matmul(
         tok,
@@ -189,6 +202,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (even split)")
     add_sweep_args(p, nsys=False)
+    add_fto_alignment_arg(p)
     p.add_argument("--rtol", type=float, default=5e-2)
     p.add_argument("--atol", type=float, default=2e-1)
     args = p.parse_args()
@@ -217,6 +231,7 @@ def main() -> int:
     pool = _mkdata_pool(S, N, K, E, nbuf)
 
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(args.fto_alignment, offsets)
     ref = _reference(tok, w0, w1, scale, S, N, K, E)
 
     # baseline: unfused 2×cuBLAS batched GEMM + pointwise
@@ -244,7 +259,7 @@ def main() -> int:
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
-            g, h = _graph_swiglu(S, N, K, E)
+            g, h = _graph_swiglu(S, N, K, E, alignment)
             plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue

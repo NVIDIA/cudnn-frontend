@@ -22,7 +22,9 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    add_fto_alignment_arg,
     add_sweep_args,
+    fto_alignment,
     group_offsets,
     rand_e8m0,
     report_pool,
@@ -72,7 +74,7 @@ _COMBOS = {
 }
 
 
-def _graph_swiglu(S, N, K, E, combo):
+def _graph_swiglu(S, N, K, E, combo, alignment=1):
     block_size, a_dt, sf_dt = _COMBOS[combo]
     sf_k = K // block_size
     g = cudnn.pygraph(
@@ -109,6 +111,7 @@ def _graph_swiglu(S, N, K, E, combo):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     sf = g.tensor(
         name="scaleFactor",
@@ -249,6 +252,7 @@ def main() -> int:
     p.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (even split)")
     p.add_argument("--combo", choices=tuple(_COMBOS), default="nvfp4")
     add_sweep_args(p, nsys=False)
+    add_fto_alignment_arg(p)
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -273,6 +277,7 @@ def main() -> int:
     print()
 
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(args.fto_alignment, offsets)
 
     # --- baseline: unfused 2×cuBLAS batched BF16 GEMM + pointwise ---
     wbf = _mkdata_bf16(S, N, K, E)
@@ -305,7 +310,7 @@ def main() -> int:
         if args.stream:
             print(f"  ▶ running {label} ...", flush=True)
         try:
-            g, h = _graph_swiglu(S, N, K, E, combo)
+            g, h = _graph_swiglu(S, N, K, E, combo, alignment)
             plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue

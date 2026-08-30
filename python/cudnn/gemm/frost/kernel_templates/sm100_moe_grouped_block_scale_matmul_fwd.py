@@ -91,10 +91,17 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     return cutlass.Int32(w)
 
 
+def _a_collector_op(g):
+    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+        return None
+    if cutlass.const_expr(g == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(g == num_gemms - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
+
+
 def _b_collector_op(mi):
-    """B is identical across the M sub-blocks (only A's address advances), so the
-    first MMA fills the B collector and the rest read it back instead of
-    re-fetching the same operand from SMEM."""
     if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
         return None
     if cutlass.const_expr(mi == 0):
@@ -718,7 +725,13 @@ def _kernel(
         ]
         sfa_block_bytes = 512 * (((k // block_size) + 3) // 4)
         previous_group_begin = cutlass.Int32(-1)
-        if elect_one:
+        if cutlass.const_expr(moe_aligned_offsets):
+            a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
+            sfa_desc_load_list = [tma_sfa_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
+        else:
+            a_desc_load_list = a_desc_tma_ptr_list
+            sfa_desc_load_list = sfa_desc_tma_ptr_list
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
             for _ai in cutlass.range_constexpr(num_a_operands):
@@ -754,13 +767,17 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
                     coord_n_pair = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n
-                sfa_m_block = coord_m_group // 128
+                if cutlass.const_expr(moe_aligned_offsets):
+                    coord_m_desc = group_begin + coord_m_group
+                else:
+                    coord_m_desc = coord_m_group
+                sfa_m_block = coord_m_desc // 128
                 if cutlass.const_expr(cta_group == 1):
                     sfb_n_block = coord_n_per_cta // 128
                 else:
                     sfb_n_block = coord_n_pair // 128
 
-                if group_begin != previous_group_begin:
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
@@ -832,7 +849,7 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
-                                    sfa_desc_tma_ptr_list[_ai],
+                                    sfa_desc_load_list[_ai],
                                     (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
                                     sf_full_mbar_ptr.subview(stage),
                                     [],
@@ -857,8 +874,8 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_a_list[_ai].subview(sA_elems * stage + _a_off * ab_packed_per_row),
-                                    a_desc_tma_ptr_list[_ai],
-                                    (coord_k, coord_m_group + _a_off, cutlass.Int32(0)),
+                                    a_desc_load_list[_ai],
+                                    (coord_k, coord_m_desc + _a_off, cutlass.Int32(0)),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
@@ -1165,6 +1182,7 @@ def _kernel(
                                                 scale_a=sfa_dst_ptrs[_ai][mma_m][0],
                                                 scale_b=sfb_scale_ptrs[_bj],
                                                 scale_vec_size=scale_vec_size,
+                                                collector_op=_a_collector_op(gemm_i),
                                                 b_collector_op=_b_collector_op(mma_m),
                                             )
                                 # Every accumulator sees scale_d=False on exactly the first
@@ -1444,6 +1462,7 @@ def _kernel(
                                                     scale_a=sfa_dst_ptrs[_ai][mma_m][0],
                                                     scale_b=sfb_scale_ptrs[_bj],
                                                     scale_vec_size=scale_vec_size,
+                                                    collector_op=_a_collector_op(gemm_i),
                                                     b_collector_op=_b_collector_op(mma_m),
                                                 )
                                     # Every accumulator sees scale_d=False on exactly the first
@@ -1568,7 +1587,7 @@ def _kernel(
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
         previous_group_end = cutlass.Int32(-1)
-        if warp_idx == 0:
+        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
             for _di in cutlass.range_constexpr(n_tma_outputs):
                 if elect_one:
                     _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
@@ -1610,7 +1629,10 @@ def _kernel(
                 # @@TMA_STORE_ONLY:BEGIN@@
                 # Re-dimension D to this group's last row so the hardware clips the
                 # ragged tail; the base stays put, so the store coords are global.
-                if warp_idx == 0:
+                # Under `moe_aligned_offsets` no tile crosses `group_end` in the
+                # first place -- `cgrp_tile_m` divides every group -- so the clip
+                # has nothing to clip and the original descriptor serves.
+                if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
                     if group_end != previous_group_end:
                         previous_group_end = group_end
                         # One drain retires the in-flight stores of EVERY descriptor,

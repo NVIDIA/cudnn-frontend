@@ -80,6 +80,11 @@ class Tensor:
         uid_assigned: True if UID was explicitly assigned
         reordering_type: Memory layout transformation type
         ragged_offset: Tensor for variable-length tensor offsets
+        alignment_value: caller's promise that every VALUE this tensor holds is a
+            multiple of it (1 = no promise). Unlike every other attribute here it
+            constrains the CONTENTS, not the layout, and it is not validated --
+            violating it is undefined behaviour. Today only the MoE
+            first_token_offset tensor reads it.
     """
 
     name: str = ""
@@ -101,6 +106,7 @@ class Tensor:
     reordering_type: Any = None
     ragged_offset: Optional["Tensor"] = None
     ragged_offset_multiplier: int = 1
+    alignment_value: int = 1
     scalar_type: Any = None  # cudnn.scalar_type for tensor_scalar-created scalars
     # weakref to the owning graph (set at registration): identity mutations
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
@@ -121,6 +127,14 @@ class Tensor:
         """Set the data type."""
         self._guard()
         self.data_type = dtype
+        return self
+
+    def set_alignment_value(self, value: int) -> "Tensor":
+        """Promise every value this tensor holds is a multiple of `value`."""
+        self._guard()
+        if value < 1:
+            raise ValueError(f"alignment_value must be >= 1, got {value}")
+        self.alignment_value = value
         return self
 
     def set_name(self, name: str) -> "Tensor":

@@ -141,6 +141,7 @@ class _TensorMeta:
     is_input: bool = False
     # SF reorder layout name (e.g. "F8_128x4") or None for the default (NONE).
     reordering: str | None = None
+    alignment_value: int = 1
     # Strong ref to the cuDNN tensor object, used to bind each role for the
     # variant-pack dict (uid / name / object) instead of positional args.
     tensor: Any = None
@@ -468,6 +469,7 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
             dtype=_map_dtype(t.get_data_type()),
             is_input=id(t) not in produced,
             reordering=reordering,
+            alignment_value=max(1, int(getattr(t, "alignment_value", 1) or 1)),
             tensor=t,
         )
         if getattr(t, "data_type", None) is not None:
@@ -748,6 +750,34 @@ def _collect_quants(
     return quants, recs, data_dtypes, scale_objs
 
 
+def _dedup_operand(pid: int, cap: dict, ids: list[int], caps: dict[int, dict], side: str, meta: "dict[int, _TensorMeta]") -> int:
+    """Index of this operand among the distinct ones, registering it on first sight.
+
+    Dedup is by the packed-DATA tensor and the scale factor travels with it, so a
+    second capture of the same data must describe the SAME dequantize. Two
+    dequantizes over one packed tensor -- different SF, block size, or declared
+    output dtype -- would otherwise collapse onto the first capture and run every
+    GEMM with it, which is a wrong answer the variant pack cannot even express
+    (the dropped SF is not a graph input)."""
+    prev = caps.get(pid)
+    if prev is None:
+        ids.append(pid)
+        caps[pid] = cap
+        return len(ids) - 1
+    if prev != cap:
+
+        def _show(key, val):
+            return repr(meta[val].name) if key.endswith("_id") and val in meta else repr(val)
+
+        differing = ", ".join(f"{k} {_show(k, prev[k])} vs {_show(k, cap[k])}" for k in sorted(cap) if prev[k] != cap[k])
+        raise ValueError(
+            f"{side} operand {meta[pid].name!r} is dequantized more than once with different "
+            f"parameters ({differing}); one packed tensor carries one scale factor. Give each "
+            f"dequantize its own data tensor so they become distinct operands."
+        )
+    return ids.index(pid)
+
+
 def _build_multi_moe_chain(
     moe_ops: list[_RecordedOp],
     ops: list[_RecordedOp],
@@ -785,6 +815,7 @@ def _build_multi_moe_chain(
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
     num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
+    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
 
     # Resolve each moe operand through any dequant, then dedup by PACKED data
     # tensor id (shared dequant → one distinct operand; SF travels with its data).
@@ -826,14 +857,12 @@ def _build_multi_moe_chain(
     for moe in moe_ops:
         a_cap = _capture_side(moe.inputs[0])
         b_cap = _capture_side(moe.inputs[1])
-        a_pid, b_pid = a_cap["data_id"], b_cap["data_id"]
-        if a_pid not in a_ids:
-            a_ids.append(a_pid)
-            a_caps[a_pid] = a_cap
-        if b_pid not in b_ids:
-            b_ids.append(b_pid)
-            b_caps[b_pid] = b_cap
-        gemm_operands.append((a_ids.index(a_pid), b_ids.index(b_pid)))
+        gemm_operands.append(
+            (
+                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
+                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
+            )
+        )
 
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 
@@ -1243,7 +1272,13 @@ def _build_multi_moe_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
-        moe=MoeSpec(num_experts=int(E), mode=moe_ops[0].moe_mode, offset_dtype=offset_dtype, num_groups=num_groups),
+        moe=MoeSpec(
+            num_experts=int(E),
+            mode=moe_ops[0].moe_mode,
+            offset_dtype=offset_dtype,
+            num_groups=num_groups,
+            offset_multiple=offset_multiple,
+        ),
         block_scale=block_scale_spec,
         reductions=reductions,
         quants=quants,
@@ -1446,14 +1481,12 @@ def _build_multi_gemm_chain(
         mm_a_id, mm_b_id = operand_ids_by_mm[mm.output]
         a_cap = _capture_side(mm_a_id)
         b_cap = _capture_side(mm_b_id)
-        a_pid, b_pid = a_cap["data_id"], b_cap["data_id"]
-        if a_pid not in a_ids:
-            a_ids.append(a_pid)
-            a_caps[a_pid] = a_cap
-        if b_pid not in b_ids:
-            b_ids.append(b_pid)
-            b_caps[b_pid] = b_cap
-        gemm_operands.append((a_ids.index(a_pid), b_ids.index(b_pid)))
+        gemm_operands.append(
+            (
+                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
+                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
+            )
+        )
 
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 

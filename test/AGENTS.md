@@ -26,7 +26,6 @@ Requirements: `pip install -e ".[cutedsl]"` plus `pytest pytest-xdist looseversi
 
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
-- `torch.cuda.synchronize` is monkeypatched to a guard that prints a filtered traceback and hard-exits (`os._exit`) on async CUDA errors; the original is kept as `torch.cuda.synchronize_unsafe`.
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated torch stream; use it instead of creating handles per-test.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
