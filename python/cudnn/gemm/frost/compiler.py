@@ -301,6 +301,17 @@ def _tma_store_issue(chain, cfg, j: int, coord: str, ptr: str) -> "list[str]":
     ]
 
 
+def _tma_store_coord(chain, dim0: str, dim1: str) -> str:
+    """Coordinate tuple matching the output TMA descriptor rank.
+
+    Routed MoE outputs are one flat ``(S, N)`` surface: their logical batch is
+    fixed to one and every store used to carry a redundant third coordinate.
+    Keep ordinary GEMM descriptors rank-3, but let MoE issue the cheaper 2-D
+    TMA-store form.
+    """
+    return f"({dim0}, {dim1})" if chain.has_moe else f"({dim0}, {dim1}, tile_l)"
+
+
 def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list[str]":
     """One TMA-stored output's store stage: stage this lane's fragment into the
     shared ring slot, then issue from it.
@@ -340,10 +351,22 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
         for mb in range(m_rows // atom_m):
-            lines += _tma_store_issue(chain, cfg, j, f"(coord_m + {mb * atom_m}, col, tile_l)", f"{v}.data_ptr({mb * atom_m * epi_n})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, f"coord_m + {mb * atom_m}", "col"),
+                f"{v}.data_ptr({mb * atom_m * epi_n})",
+            )
         if _epi_dp22(cfg):
             # the other COLUMN half, not another M block: same rows, further along N
-            lines += _tma_store_issue(chain, cfg, j, "(coord_m, col + epi_cols_per_mma_m, tile_l)", f"{v}.data_ptr({atom_m * epi_n})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, "coord_m", "col + epi_cols_per_mma_m"),
+                f"{v}.data_ptr({atom_m * epi_n})",
+            )
     else:
         row_bytes = _epi_row_bytes(dt, epi_n)
         row_elems = _epi_row_elems(dt, epi_n)
@@ -357,11 +380,17 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "cute.arch.fence_view_async_shared()",
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
-        lines += _tma_store_issue(chain, cfg, j, f"({col_c}, coord_m, tile_l)", f"{v}.data_ptr()")
+        lines += _tma_store_issue(chain, cfg, j, _tma_store_coord(chain, col_c, "coord_m"), f"{v}.data_ptr()")
         if _epi_dp22(cfg):
             # warps 2/3's column half, staged behind the first tile
             half = "(col + epi_cols_per_mma_m) // 2" if DTYPE_BITS[dt] < 8 else "col + epi_cols_per_mma_m"
-            lines += _tma_store_issue(chain, cfg, j, f"({half}, coord_m, tile_l)", f"{v}.data_ptr({m_rows * row_elems})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, half, "coord_m"),
+                f"{v}.data_ptr({m_rows * row_elems})",
+            )
     lines += [
         "    if elect_one:",
         "        nvvm.cp_async_bulk_commit_group()",
@@ -389,20 +418,23 @@ def _host_tma_c_descs(chain, tma_slots: "frozenset[int]", epi_n: int) -> str:
     strides, box and swizzle, so outputs of different dtypes and different
     layouts can share one epilogue."""
     outs = _tma_out_dtypes(chain, tma_slots)
-    batch = "1" if chain.has_moe else "batch"
     lines: list[str] = []
     for j, (slot, dt) in enumerate(outs):
         width = _cd_view_bits(dt)
         if chain.output_specs[slot].major == "m":
-            dims = f"[m, n, {batch}]"
+            dims = "[m, n]" if chain.has_moe else "[m, n, batch]"
             outer = f"out_stride_n_{slot}"
-            box = f"[{_mmajor_atom_m(dt)}, {epi_n}, 1]"
+            box = f"[{_mmajor_atom_m(dt)}, {epi_n}]" if chain.has_moe else f"[{_mmajor_atom_m(dt)}, {epi_n}, 1]"
             sw = "s128b"
         else:
-            dims = f"[{'n // 2' if DTYPE_BITS[dt] < 8 else 'n'}, m, {batch}]"
+            n_dim = "n // 2" if DTYPE_BITS[dt] < 8 else "n"
+            dims = f"[{n_dim}, m]" if chain.has_moe else f"[{n_dim}, m, batch]"
             outer = f"out_stride_m_{slot}"
-            box = f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0], 1]"
+            box = f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0]]" if chain.has_moe else f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0], 1]"
             sw = _EPI_SWIZZLE_BY_ROW_BYTES[_epi_row_bytes(dt, epi_n)][1]
+        strides = [f"        {outer} * {width} // 128,"]
+        if not chain.has_moe:
+            strides.append(f"        out_stride_l_{slot} * {width} // 128,")
         lines += [
             f"_c{j} = _tma_c_outputs[{j}]",
             f"tma_c_desc_{j} = _tma.create_tensor_map_tiled(",
@@ -410,8 +442,7 @@ def _host_tma_c_descs(chain, tma_slots: "frozenset[int]", epi_n: int) -> str:
             f"    dtype={_cd_cutlass(dt)},",
             f"    global_dims={dims},",
             "    global_strides=[",
-            f"        {outer} * {width} // 128,",
-            f"        out_stride_l_{slot} * {width} // 128,",
+            *strides,
             "    ],",
             f"    box_dims={box},",
             f"    swizzle=_tma.TensorMapSwizzle.{sw},",

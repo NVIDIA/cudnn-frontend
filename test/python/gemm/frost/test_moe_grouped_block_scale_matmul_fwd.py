@@ -256,6 +256,24 @@ def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd() -> None:
 def test_analyzer_offset_dtype_int64() -> None:
     chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4, offset_dt=cudnn.data_type.INT64))
     assert chain.moe.offset_dtype == "int64"
+
+
+def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
+    """The block-scale MoE template shares the flat (S, N) TMA output surface
+    with plain MoE; neither descriptor nor store coordinates carry batch=1."""
+    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_store_sequence
+
+    chain = analyze(_build_graph(E=4, S=512, N=256, K=512, num_groups=4))
+    cfg = by_name(_CFG)
+    epi_n = _epi_n(cfg, chain.output_dtype)
+    host = _host_tma_c_descs(chain, frozenset({0}), epi_n)
+    sequence = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
+
+    assert "global_dims=[n, m]" in host
+    assert f"box_dims=[{epi_n}, epi_tile_mn[0]]" in host
+    assert "out_stride_l_0" not in host
+    assert "(col, coord_m)" in sequence
+    assert "tile_l" not in sequence
     assert chain.has_moe and chain.has_block_scale
 
 
