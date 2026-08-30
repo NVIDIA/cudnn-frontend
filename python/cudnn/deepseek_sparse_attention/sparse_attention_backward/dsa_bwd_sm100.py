@@ -16,6 +16,8 @@ from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 
 
 class FlashAttentionDSABackwardSm100:
+    """SM100 M64 DSA backward pipeline with overridable reduction policy."""
+
     arch = 100
     num_dkv_shards = 1
     q_wave_ctas = 0
@@ -211,6 +213,7 @@ class FlashAttentionDSABackwardSm100:
         total_seqlen_KV: Int32,
         acc_dtype: Type[cutlass.Numeric],
     ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
+        """Map caller scratch to the LSE, OdO, and dKV accumulator views."""
         H = cute.size(problem_shape[3][0])
         D = cute.round_up(problem_shape[2], 8)
         total_seqlen_Q = cute.round_up(total_seqlen_Q, 8)
@@ -239,6 +242,7 @@ class FlashAttentionDSABackwardSm100:
 
     @cute.jit
     def make_dKV_accumulator(self, workspace_dKV: cute.Tensor, total_seqlen_KV: Int32, head_dim: Int32):
+        """View ordinary-mode scratch as one contiguous FP32 accumulator."""
         dkv_iter = cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype)
         return cute.make_tensor(
             dkv_iter,
@@ -855,6 +859,7 @@ class FlashAttentionDSABackwardSm100:
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
     ):
+        """Execute one fused query-CTA backward pipeline."""
         wave_idx, launch_head_block_idx, batch_idx = cute.arch.block_idx()
         head_block_idx = launch_head_block_idx + head_block_offset
         token_idx = wave_idx + q_offset
@@ -1213,6 +1218,7 @@ class FlashAttentionDSABackwardSm100:
         head_block_idx: Int32,
         pipelines,
     ):
+        """Stage one query's Q, dO, LSE, and OdO values for computation."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
@@ -1441,6 +1447,7 @@ class FlashAttentionDSABackwardSm100:
         load_mma_K_pipeline,
         mTopkLength: Optional[cute.Tensor],
     ):
+        """Gather one query's sparse KV rows into the staged K buffer."""
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
@@ -1894,6 +1901,7 @@ class FlashAttentionDSABackwardSm100:
         head_block_idx: Int32,
         pipelines,
     ):
+        """Consume staged tiles to form softmax gradients and dQ fragments."""
         (
             mma_compute_S_pipeline,
             mma_compute_dP_pipeline,
@@ -2176,6 +2184,7 @@ class FlashAttentionDSABackwardSm100:
         token_idx: Int32,
         mma_reduce_dKV_pipeline,
     ):
+        """Reduce dKV MMA fragments into the selected global accumulator."""
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
 
         tidx, _, _ = cute.arch.thread_idx()

@@ -22,6 +22,8 @@ from . import _interface_sm100 as _iface_sm100
 
 
 class SparseAttentionBackward(APIBase):
+    """Validated architecture-dispatch wrapper for DSA backward."""
+
     def __init__(
         self,
         sample_q: torch.Tensor,  # (total_S_q, H, D) FP16/BF16
@@ -38,6 +40,7 @@ class SparseAttentionBackward(APIBase):
         block_tile: int = 64,
         deterministic: bool = False,
     ):
+        """Capture the sample tensor contract and execution policy."""
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
         self.kv_desc = self._make_tensor_desc(sample_kv, name="sample_kv")
@@ -52,6 +55,7 @@ class SparseAttentionBackward(APIBase):
         self.deterministic = bool(deterministic)
 
     def check_support(self) -> bool:
+        """Validate the device, dtype, shape, and deterministic contracts."""
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major < 9,
@@ -194,6 +198,7 @@ class SparseAttentionBackward(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch one validated execution to the active GPU architecture."""
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:

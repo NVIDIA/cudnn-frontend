@@ -78,6 +78,7 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
+    """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
         from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic import (
@@ -96,6 +97,7 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
 
 
 def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, check_short_workspace=False):
+    """Run one deterministic case against bitwise and numerical contracts."""
     from cudnn import DSA
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import flash_attn_bwd_sm100_workspace_size
 
@@ -141,6 +143,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 
     def run():
+        """Execute after dirtying caller scratch to verify in-kernel reset."""
         # The compiled kernel, not execute-side Torch code, must initialize
         # caller-owned scratch on every reuse.
         workspace.fill_(0xA5)
@@ -942,6 +945,7 @@ def test_DSA_sparse_attention_backward_noncontiguous_aux_inputs():
     )
 
     def run(attn_sink_, topk_idxs_, topk_length_):
+        """Execute once and clone outputs before the shared buffers are reused."""
         dq, dkv, d_sink = _interface_sm100.flash_attn_bwd_sm100(
             q,
             kv,
@@ -1042,6 +1046,7 @@ def test_DSA_sparse_attention_backward_cross_shape_validation():
     )
 
     def call(args):
+        """Invoke the interface with one mutated tensor-contract case."""
         _interface_sm100.flash_attn_bwd_sm100(
             args["q"],
             args["kv"],

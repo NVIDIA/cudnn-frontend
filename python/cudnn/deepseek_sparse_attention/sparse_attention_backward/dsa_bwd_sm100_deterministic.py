@@ -35,6 +35,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         b: int,
         acc_dtype: Type[cutlass.Numeric],
     ):
+        """Return byte-shaped storage for all 128 padded FP32 shards."""
         d = (d + 7) // 8 * 8
         k = (k + 7) // 8 * 8
         workspace_bytes = d * acc_dtype.width // 8
@@ -47,6 +48,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         total_seqlen_KV: Int32,
         head_dim: Int32,
     ) -> cute.Tensor:
+        """View deterministic scratch as 128 contiguous FP32 shards."""
         dkv_iter = cute.recast_ptr(workspace_dKV.iterator, dtype=self.acc_dtype)
         return cute.make_tensor(
             dkv_iter,
@@ -97,6 +99,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         seqlen: Int32,
         stream: cuda.CUstream,
     ):
+        """Launch the fixed first fold followed by ordered conversion."""
         self.fold_dKV_shards(mdKV_acc, seqlen).launch(
             grid=[seqlen, self.num_dkv_fold_groups, 1],
             block=[256, 1, 1],
@@ -116,6 +119,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         mdKV: cute.Tensor,
         seqlen: Int32,
     ):
+        """Fold the 16 group results in order and store the output dtype."""
         tidx, tidy, _ = cute.arch.thread_idx()
         seq_block_idx, _, batch_idx = cute.arch.block_idx()
         seq_id = self.block_seq * seq_block_idx + tidy
@@ -145,6 +149,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
                     cur_mdKV_row[dim_idx] = self.element_dtype(acc)
 
     def dSink_grid_q(self, problem_shape):
+        """Use one query-reduction block so each head has one dSink writer."""
         return 1
 
     @cute.kernel
@@ -156,6 +161,7 @@ class FlashAttentionDSABackwardSm100Deterministic(FlashAttentionDSABackwardSm100
         dSink: cute.Tensor,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
     ):
+        """Reduce each head's dSink across queries in a fixed thread order."""
         _, head_idx, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         q_idx = tidx
