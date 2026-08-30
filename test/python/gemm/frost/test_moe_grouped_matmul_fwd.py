@@ -13,6 +13,9 @@ import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
+from cudnn.gemm.frost import compiler
+from cudnn.gemm.frost.compiler import _render_template
+from cudnn.gemm.frost.epilogue_codegen import generate
 from gemm_test_utils import (
     requires_sm100,
     Plan as _plan,
@@ -44,6 +47,9 @@ def _vp_moe(compiled, token, weight, fto, output):
 
 
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
+_SCHED_CFG_1CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+_SCHED_CFG_1CTA_MULTI = "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma"
+_SCHED_CFG_2CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
 # (config name, cta_group): 2-CTA cluster2x1 (reference) + 1-CTA cluster1x1.
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
@@ -200,6 +206,47 @@ def _build_graph(
         return g
     out.set_data_type(output_dt).set_output(True)
     return g
+
+
+@pytest.mark.parametrize(
+    "cfg_name,expected_cta_group,expected_cluster_size",
+    [
+        (_SCHED_CFG_1CTA, 1, 1),
+        (_SCHED_CFG_1CTA_MULTI, 1, 2),
+        (_SCHED_CFG_2CTA, 2, 2),
+    ],
+)
+def test_moe_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group, expected_cluster_size) -> None:
+    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
+    cfg = by_name(cfg_name)
+    assert cfg.cta_group == expected_cta_group
+    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
+    monkeypatch.setattr(compiler, "_grid_num_clusters", lambda _cfg, device=None: 1)
+    modes = compiler._store_modes(chain, cfg)
+    tma_slots = frozenset(i for i, mode in enumerate(modes) if mode == "tma")
+    snippets = generate(
+        chain,
+        vec_bytes_epi=compiler._epi_chunk_bytes(chain, cfg, bool(tma_slots)),
+        output_elem_bytes=compiler.DTYPE_BYTES[chain.output_dtype],
+        tma_slots=tma_slots,
+        packed_lanes=compiler._epi_packed_lanes(cfg),
+    )
+    rendered = _render_template(chain, snippets, cfg)
+    assert cfg.cluster_shape[0] * cfg.cluster_shape[1] * cfg.cluster_shape[2] == expected_cluster_size
+    assert f"cluster_shape_mnk = {cfg.cluster_shape}" in rendered
+    acknowledge = rendered.index("nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))")
+    snapshot = rendered.index("last_bcast_stage = bcast_stage")
+    snapshot_guard = rendered.rfind("if cutlass.const_expr(cluster_size > 1):", 0, snapshot)
+    advance = rendered.index("bcast_stage += 1")
+    drain_guard = rendered.rfind("if cutlass.const_expr(cluster_size > 1):", 0, rendered.rindex("sched_bcast_empty_mbar_ptr.subview(last_bcast_stage)"))
+    leader_guard = rendered.rindex("if cta_rank_in_cluster == 0:")
+    drain = rendered.rindex("sched_bcast_empty_mbar_ptr.subview(last_bcast_stage)")
+    assert acknowledge < snapshot_guard < snapshot < advance < drain_guard < leader_guard < drain
+    assert "last_bcast_empty_done_phase = bcast_empty_phase ^ 1" in rendered
+    assert "last_bcast_empty_done_phase," in rendered[drain : drain + 240]
+    # The rendered cluster tuple makes both guards compile-time false for 1x1,
+    # so Cute emits no snapshot or drain instructions for singleton clusters.
+    assert (expected_cluster_size > 1) == (cfg.cluster_shape != (1, 1, 1))
 
 
 # --------------------------------------------------------------------------- #
