@@ -124,7 +124,10 @@ The bridge imports `flash_mla` only when called and invokes the external
 commit `15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor
 vLLM implementation source is present in this repository. A missing or
 incompatible optional dependency raises `FlashMLAUnavailableError`
-instead of falling back to a different forward.
+instead of falling back to a different forward. Compatibility is determined
+from the callable's actual signature, not a package version string: the entry
+point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`,
+`d_v`, `attn_sink`, and `topk_length` by keyword.
 
 The initial functional contract is exact SM100 (validated on ComputeLab B200),
 BF16, one flat MQA KV stream,

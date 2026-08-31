@@ -114,6 +114,66 @@ def test_flashmla_dependency_without_sparse_entrypoint_fails_closed(monkeypatch)
         bridge._resolve_flashmla_sparse_fwd()
 
 
+def test_flashmla_dependency_uses_call_capability_not_version_string(monkeypatch):
+    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
+        pytest.fail("signature probing must not execute the external callable")
+
+    dependency = types.SimpleNamespace(__version__="not-a-supported-version", flash_mla_sparse_fwd=compatible)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+
+    assert bridge._resolve_flashmla_sparse_fwd() is compatible
+
+
+def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch):
+    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
+        pytest.fail("signature probing must not execute the external callable")
+
+    probes = []
+    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
+    monkeypatch.setattr(bridge, "_probe_flashmla_sparse_fwd_signature", lambda candidate: probes.append(candidate))
+
+    assert bridge._resolve_flashmla_sparse_fwd() is compatible
+    assert bridge._resolve_flashmla_sparse_fwd() is compatible
+    assert probes == [compatible]
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        pytest.param(
+            lambda q, kv, indices, sm_scale, d_v=512, attn_sink=None: None,
+            id="missing-topk-length",
+        ),
+        pytest.param(
+            lambda q, kv, indices, workspace, sm_scale, d_v=512, attn_sink=None, topk_length=None: None,
+            id="new-required-parameter",
+        ),
+    ],
+)
+def test_flashmla_dependency_with_incompatible_call_signature_fails_closed(monkeypatch, incompatible):
+    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=incompatible)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+
+    with pytest.raises(bridge.FlashMLAUnavailableError, match=r"incompatible signature.*topk_length"):
+        bridge._resolve_flashmla_sparse_fwd()
+
+
+def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch):
+    class OpaqueCallable:
+        __signature__ = "not-an-inspect-signature"
+
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=OpaqueCallable())
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+
+    with pytest.raises(bridge.FlashMLAUnavailableError, match=r"no inspectable Python signature"):
+        bridge._resolve_flashmla_sparse_fwd()
+
+
 def test_flashmla_training_bridge_requires_sink_before_dependency_resolution(
     monkeypatch,
 ):

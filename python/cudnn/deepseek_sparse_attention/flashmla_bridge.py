@@ -27,9 +27,10 @@ with an explicitly trusted compact producer may bypass that metadata work.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from importlib import import_module
-import math
+from inspect import signature
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -43,6 +44,8 @@ _SUPPORTED_HEAD_DIMS = (512, 576)
 _VALUE_DIM = 512
 _MAX_C_STRIDE = (1 << 31) - 1
 _SCORE_TOPK_TILE = 128
+_FLASHMLA_SPARSE_FWD_CALL = "(q, kv, indices, *, sm_scale, d_v, attn_sink, topk_length)"
+_validated_flashmla_sparse_fwd: Optional[Callable[..., Any]] = None
 
 
 class FlashMLAUnavailableError(RuntimeError):
@@ -127,8 +130,40 @@ def _plan_flashmla_sparse_forward(
     )
 
 
+def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None:
+    """Fail closed unless ``sparse_fwd`` accepts the bridge's complete call."""
+
+    try:
+        sparse_fwd_signature = signature(sparse_fwd)
+    except Exception as exc:
+        raise FlashMLAUnavailableError(
+            "The installed 'flash_mla.flash_mla_sparse_fwd' callable has no inspectable "
+            f"Python signature; expected {_FLASHMLA_SPARSE_FWD_CALL}. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+    sentinel = object()
+    try:
+        sparse_fwd_signature.bind(
+            sentinel,
+            sentinel,
+            sentinel,
+            sm_scale=1.0,
+            d_v=_VALUE_DIM,
+            attn_sink=None,
+            topk_length=None,
+        )
+    except TypeError as exc:
+        raise FlashMLAUnavailableError(
+            "The installed 'flash_mla.flash_mla_sparse_fwd' has incompatible signature "
+            f"{sparse_fwd_signature}; expected support for {_FLASHMLA_SPARSE_FWD_CALL}. "
+            f"{_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+
 def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Resolve the official external entry point without caching failures."""
+    """Resolve and capability-probe the entry point without caching failures."""
+
+    global _validated_flashmla_sparse_fwd
 
     try:
         flash_mla = import_module("flash_mla")
@@ -138,6 +173,9 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
     sparse_fwd = getattr(flash_mla, "flash_mla_sparse_fwd", None)
     if not callable(sparse_fwd):
         raise FlashMLAUnavailableError("The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}")
+    if sparse_fwd is not _validated_flashmla_sparse_fwd:
+        _probe_flashmla_sparse_fwd_signature(sparse_fwd)
+        _validated_flashmla_sparse_fwd = sparse_fwd
     return sparse_fwd
 
 
