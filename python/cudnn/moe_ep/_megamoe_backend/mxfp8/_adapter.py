@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..._contracts import ValidatedForwardRequest
+from ..._contracts import Fc1WeightLayout, ValidatedForwardRequest
 from ..._types import BlockScaledTensor, MoeFormat
 from .._plan import PreparedResources
 from .._workspace import padded_mxfp8_scale_columns
@@ -369,7 +369,9 @@ class Mxfp8InputAdapter:
         fc1_weight, fc1_weight_sf = _prepare_fc1(
             fc1_source,
             config.intermediate,
-            already_interleaved=config.weight_interleave_size == 32,
+            already_interleaved=(
+                config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
+            ),
         )
         fc2_weight, fc2_weight_sf = _prepare_fc2(fc2_source)
         weights = Mxfp8Weights(

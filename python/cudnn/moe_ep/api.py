@@ -20,7 +20,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
-from ._contracts import ForwardConfig
+from ._contracts import ForwardConfig, normalize_fc1_weight_layout
 from ._tuning import MoeEpTuningConfig
 from ._types import (
     BlockScaledTensor,
@@ -140,8 +140,7 @@ class MoeEp:
             raise ValueError("drop_on_overflow must be a bool")
         if not isinstance(apply_topk_in_fc1, bool):
             raise ValueError("apply_topk_in_fc1 must be a bool")
-        if weight_interleave_size not in (None, 32):
-            raise ValueError("weight_interleave_size must be None or 32")
+        fc1_weight_layout = normalize_fc1_weight_layout(weight_interleave_size)
         for name, value in (
             ("token_padding_size", token_padding_size),
             ("sf_padding_size", sf_padding_size),
@@ -181,6 +180,7 @@ class MoeEp:
         self.combine_format = _parse_format(combine_format)
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.weight_interleave_size = weight_interleave_size
+        self._fc1_weight_layout = fc1_weight_layout
         self.gate_up_clamp = None if gate_up_clamp is None else abs(gate_up_clamp)
         self.token_padding_size = token_padding_size
         self.sf_padding_size = sf_padding_size
@@ -214,7 +214,7 @@ class MoeEp:
             output_format=self.output_format.value,
             combine_format=self.combine_format.value,
             apply_topk_in_fc1=self.apply_topk_in_fc1,
-            weight_interleave_size=self.weight_interleave_size,
+            fc1_weight_layout=self._fc1_weight_layout,
             gate_up_clamp=self.gate_up_clamp,
             generate_c=False,
             token_padding_size=self.token_padding_size,

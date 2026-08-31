@@ -26,6 +26,7 @@ from cudnn.moe_ep import (
     MoeEpTrainingSlot,
     MoeEpTrainingWgradOperands,
 )
+from cudnn.moe_ep._contracts import Fc1WeightLayout
 from cudnn.moe_ep._validation import validate_training_weights
 from cudnn.moe_ep._megamoe_backend.mxfp8._adapter import (
     _typed_k_major_view,
@@ -233,9 +234,26 @@ def test_training_abi_fingerprint_is_stable_and_structural():
         lane_count=2,
         source_tree_digest="source",
     )
+    changed_layout = _build_training_abi_facts(
+        _training_config(
+            ep_size=2,
+            ep_global_ranks=(0, 1),
+            weight_interleave_size=32,
+        ),
+        forward,
+        backward,
+        weights,
+        requirements,
+        slot_count=2,
+        lane_count=1,
+        source_tree_digest="source",
+    )
 
+    assert first["policy"]["fc1_weight_layout"] == "gate_then_up"
+    assert changed_layout["policy"]["fc1_weight_layout"] == "gate_up_interleaved_32"
     assert canonical_json_sha256(first) == canonical_json_sha256(second)
     assert canonical_json_sha256(first) != canonical_json_sha256(changed)
+    assert canonical_json_sha256(first) != canonical_json_sha256(changed_layout)
 
 
 @pytest.mark.L0
@@ -510,7 +528,7 @@ def test_training_wgrad_data_operands_alias_backward_outputs():
         experts=1,
         hidden=hidden,
         intermediate=intermediate,
-        weight_interleave_size=32,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
     )
     exporter._expand_scales = Mock()
 
@@ -522,6 +540,76 @@ def test_training_wgrad_data_operands_alias_backward_outputs():
     assert operands.fc2_a.data_ptr() == slot.fc1_recompute.data_ptr()
     assert operands.fc2_a.shape == (intermediate, pool_rows)
     assert operands.fc2_a.stride() == slot.fc1_recompute.transpose(0, 1).stride()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "layout",
+    [
+        Fc1WeightLayout.GATE_THEN_UP,
+        Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    ],
+)
+def test_training_wgrad_fc1_layout_matches_reference(layout):
+    pool_rows, hidden, intermediate = 3, 4, 64
+    semantic_dc = (
+        torch.arange(pool_rows * 2 * intermediate, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .reshape(pool_rows, 2 * intermediate)
+    )
+    interleaved_dc = (
+        semantic_dc.view(pool_rows, 2, intermediate // 32, 32)
+        .transpose(1, 2)
+        .reshape_as(semantic_dc)
+    )
+    x = torch.arange(pool_rows * hidden, dtype=torch.uint8).reshape(pool_rows, hidden)
+    slot = SimpleNamespace(
+        col_quant_data=x,
+        col_quant_sf=torch.empty(1, dtype=torch.uint8),
+        valid_route_counts=torch.zeros(1, dtype=torch.int32),
+        expert_offsets=torch.zeros(1, dtype=torch.int32),
+        fc1_recompute=torch.empty((pool_rows, intermediate), dtype=torch.uint8),
+        fc1_recompute_sf=torch.empty(1, dtype=torch.uint8),
+        fc1_col_output=interleaved_dc,
+        fc1_col_output_sf=torch.empty(1, dtype=torch.uint8),
+        grad_y2=torch.empty((pool_rows, hidden), dtype=torch.uint8),
+        grad_y2_sf=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_b=torch.empty_like(interleaved_dc),
+        wgrad_fc1_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_sfb=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfb=torch.empty(1, dtype=torch.uint8),
+    )
+    exporter = Mxfp8TrainingWgradExporter(
+        experts=1,
+        hidden=hidden,
+        intermediate=intermediate,
+        fc1_weight_layout=layout,
+    )
+    exporter._expand_scales = Mock()
+
+    operands = exporter.export(slot)
+    expected_dc = (
+        semantic_dc
+        if layout is Fc1WeightLayout.GATE_THEN_UP
+        else interleaved_dc
+    )
+    expected_wgrad = x.transpose(0, 1).float() @ expected_dc.float()
+    actual_wgrad = operands.fc1_a.float() @ operands.fc1_b.float()
+
+    torch.testing.assert_close(actual_wgrad, expected_wgrad, atol=0, rtol=0)
+    if layout is Fc1WeightLayout.GATE_THEN_UP:
+        assert operands.fc1_b is slot.wgrad_fc1_b
+        assert operands.fc1_b.data_ptr() != slot.fc1_col_output.data_ptr()
+        assert exporter._expand_scales.call_args_list[1].kwargs[
+            "deinterleave_gate_up"
+        ] == intermediate
+    else:
+        assert operands.fc1_b is slot.fc1_col_output
+        assert exporter._expand_scales.call_args_list[1].kwargs[
+            "deinterleave_gate_up"
+        ] is None
 
 
 @pytest.mark.L0
@@ -626,7 +714,7 @@ def test_training_weight_bindings_alias_data_and_stage_only_scales():
 
     bindings = Mxfp8TrainingWeightBindings(
         weights,
-        weight_interleave_size=32,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
     )
     bindings.refresh()
     data_pairs = (

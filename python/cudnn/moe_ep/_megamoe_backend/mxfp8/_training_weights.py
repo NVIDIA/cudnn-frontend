@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
+from ..._contracts import Fc1WeightLayout
 from ..._types import BlockScaledTensor, MoeEpTrainingWeights
 from ._adapter import Mxfp8Weights
 
@@ -186,22 +187,25 @@ class Mxfp8TrainingWeightBindings:
         self,
         weights: MoeEpTrainingWeights,
         *,
-        weight_interleave_size: int | None = None,
+        fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP,
     ) -> None:
         self.weights = weights
-        self.weight_interleave_size = weight_interleave_size
+        self.fc1_weight_layout = fc1_weight_layout
         fwd_fc1 = weights.forward_fc1
         fwd_fc2 = weights.forward_fc2
         bwd_w2t = weights.backward_w2_transpose
         bwd_w1t = weights.backward_w1_transpose
         self._uses_direct_weight_bindings = (
-            weight_interleave_size == 32
+            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
             and fwd_fc1.data.stride(1) == 1
             and fwd_fc2.data.stride(1) == 1
             and bwd_w2t.data.is_contiguous()
             and bwd_w1t.data.is_contiguous()
         )
-        if weight_interleave_size == 32 and not self._uses_direct_weight_bindings:
+        if (
+            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
+            and not self._uses_direct_weight_bindings
+        ):
             raise ValueError(
                 "weight_interleave_size=32 requires compact K-major forward "
                 "weights and contiguous backward transpose weights"

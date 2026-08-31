@@ -433,6 +433,27 @@ def test_moe_ep_rejects_unsupported_weight_interleave_size():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("weight_interleave_size", "expected_layout"),
+    [
+        (None, "gate_then_up"),
+        (32, "gate_up_interleaved_32"),
+    ],
+)
+def test_moe_ep_normalizes_fc1_weight_layout(
+    weight_interleave_size,
+    expected_layout,
+):
+    from cudnn import MoeEp
+
+    with MoeEp(
+        **_forward_config(),
+        weight_interleave_size=weight_interleave_size,
+    ) as op:
+        assert op._forward_config.fc1_weight_layout.value == expected_layout
+
+
+@pytest.mark.L0
 def test_moe_ep_rejects_interleaved_plain_fc1_weight():
     from cudnn import MoeEp
 

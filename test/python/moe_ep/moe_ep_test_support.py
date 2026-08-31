@@ -260,9 +260,10 @@ def quantize_mxfp8(tensor: torch.Tensor, *, axis: int = -1):
 
 
 def _training_config(**overrides):
-    from cudnn.moe_ep._contracts import ForwardConfig
+    from cudnn.moe_ep._contracts import ForwardConfig, normalize_fc1_weight_layout
     from cudnn.moe_ep._tuning import MoeEpTuningConfig
 
+    weight_interleave_size = overrides.pop("weight_interleave_size", None)
     values = {
         "num_experts": 2,
         "hidden_size": 128,
@@ -285,6 +286,7 @@ def _training_config(**overrides):
         "sf_padding_size": 128,
         "tuning": MoeEpTuningConfig(),
         "backward_wgrad_mode": "operands",
+        "fc1_weight_layout": normalize_fc1_weight_layout(weight_interleave_size),
     }
     values.update(overrides)
     return ForwardConfig(**values)
@@ -1255,6 +1257,7 @@ def _assert_wgrads_match_reference(
     expected,
     *,
     expected_dense=None,
+    weight_interleave_size=None,
 ) -> None:
     """Compare fixed-capacity production operands with standalone dense dW."""
 
@@ -1268,20 +1271,20 @@ def _assert_wgrads_match_reference(
     actual_dense = _dense_wgrads_from_operands(actual)
     if expected_dense is None:
         expected_dense = expected.dense_wgrads()
-    expected_fc1, expected_fc2 = expected_dense
-    interleave_size = 32
-    fc1_out_features = expected_fc1.shape[-1]
-    expected_fc1 = (
-        expected_fc1.view(
-            *expected_fc1.shape[:-1],
-            2,
-            fc1_out_features // (2 * interleave_size),
-            interleave_size,
+    if weight_interleave_size is not None:
+        expected_fc1, expected_fc2 = expected_dense
+        fc1_out_features = expected_fc1.shape[-1]
+        expected_fc1 = (
+            expected_fc1.view(
+                *expected_fc1.shape[:-1],
+                2,
+                fc1_out_features // (2 * weight_interleave_size),
+                weight_interleave_size,
+            )
+            .transpose(-3, -2)
+            .reshape(expected_fc1.shape)
         )
-        .transpose(-3, -2)
-        .reshape(expected_fc1.shape)
-    )
-    expected_dense = (expected_fc1, expected_fc2)
+        expected_dense = (expected_fc1, expected_fc2)
     for name, actual_dw, expected_dw in zip(
         ("grad_fc1_weight", "grad_fc2_weight"),
         actual_dense,

@@ -16,7 +16,7 @@ from typing import Any, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from ..._contracts import ForwardConfig
+from ..._contracts import Fc1WeightLayout, ForwardConfig
 from ..._types import MoeEpTrainingWeights
 from .._comm import SymmetricMemoryProvider
 from .._plan import PreparedResources
@@ -260,7 +260,7 @@ def build_training_workspace_requirements(
             scale_columns,
         ),
     }
-    if config.weight_interleave_size is None:
+    if config.fc1_weight_layout is Fc1WeightLayout.GATE_THEN_UP:
         wgrad_shapes["wgrad_fc1_b"] = (
             forward.pool_token_capacity,
             2 * config.intermediate_size,
@@ -547,6 +547,7 @@ def _build_training_abi_facts(
             "combine_format": config.combine_format,
             "output_format": config.output_format,
             "apply_topk_in_fc1": bool(config.apply_topk_in_fc1),
+            "fc1_weight_layout": config.fc1_weight_layout.value,
             "gate_up_clamp": config.gate_up_clamp,
         },
         "resources": {
@@ -649,7 +650,7 @@ class Mxfp8TrainingResourceOwner:
         self.backward_prepared = backward
         self.weight_bindings = Mxfp8TrainingWeightBindings(
             weights,
-            weight_interleave_size=config.weight_interleave_size,
+            fc1_weight_layout=config.fc1_weight_layout,
         )
         self.stager = Mxfp8TrainingStager(config.hidden_size, config.top_k)
         self.wgrad_exporter = Mxfp8TrainingWgradExporter(
@@ -657,7 +658,7 @@ class Mxfp8TrainingResourceOwner:
             hidden=config.hidden_size,
             intermediate=config.intermediate_size,
             sf_padding=backward.config.sf_padding_block,
-            weight_interleave_size=config.weight_interleave_size,
+            fc1_weight_layout=config.fc1_weight_layout,
         )
         self.beta = torch.ones(
             (config.experts_per_rank,),
@@ -1018,7 +1019,7 @@ class Mxfp8TrainingResourceOwner:
             ),
             wgrad_fc1_b=(
                 None
-                if config.weight_interleave_size == 32
+                if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
                 else _typed_k_major_view(
                     local_bytes("wgrad_fc1_b"),
                     _DATA_DTYPE,

@@ -63,6 +63,9 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 - An execution lane owns mutable router, barrier, and kernel scratch.
 - Every symmetric region is built in deterministic order and its size is
   normalized by name across EP ranks before allocation.
+- The training ABI fingerprint includes the normalized FC1 layout policy
+  (`gate_then_up` or `gate_up_interleaved_32`), so ranks with different
+  gate/up semantics fail the collective handshake before allocation.
 - Multiple streams require distinct lanes. Distributed MegaMoE kernels must be
   ordered consistently on every rank with captured CUDA events; independent
   lane storage does not permit unordered communication overlap.

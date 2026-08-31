@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..._contracts import Fc1WeightLayout
 from ..._types import MoeEpTrainingWgradOperands
 from ._launch import _to_cute
 
@@ -27,13 +28,13 @@ class Mxfp8TrainingWgradExporter:
         hidden: int,
         intermediate: int,
         sf_padding: int = 128,
-        weight_interleave_size: int | None = None,
+        fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP,
     ) -> None:
         self.experts = int(experts)
         self.hidden = int(hidden)
         self.intermediate = int(intermediate)
         self.sf_padding = int(sf_padding)
-        self.weight_interleave_size = weight_interleave_size
+        self.fc1_weight_layout = fc1_weight_layout
         self._compiled: dict[tuple[int, int, int | None], object] = {}
         self._lock = threading.RLock()
 
@@ -119,7 +120,7 @@ class Mxfp8TrainingWgradExporter:
             raise RuntimeError("forward/backward WGrad pool capacities differ")
 
         fc1_b = slot.fc1_col_output
-        if self.weight_interleave_size is None:
+        if self.fc1_weight_layout is Fc1WeightLayout.GATE_THEN_UP:
             if slot.wgrad_fc1_b is None:
                 raise RuntimeError("conventional W1 requires FC1 WGrad staging")
             self._copy_gate_up_data(
@@ -143,7 +144,9 @@ class Mxfp8TrainingWgradExporter:
             slot.wgrad_fc1_sfb,
             non_k_size=2 * self.intermediate,
             deinterleave_gate_up=(
-                self.intermediate if self.weight_interleave_size is None else None
+                self.intermediate
+                if self.fc1_weight_layout is Fc1WeightLayout.GATE_THEN_UP
+                else None
             ),
         )
         self._expand_scales(

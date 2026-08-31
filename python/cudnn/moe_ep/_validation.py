@@ -9,7 +9,7 @@ from typing import Tuple
 
 import torch
 
-from ._contracts import ForwardConfig, ValidatedForwardRequest
+from ._contracts import Fc1WeightLayout, ForwardConfig, ValidatedForwardRequest
 from ._types import (
     BlockScaledTensor,
     MoeEpTrainingWeights,
@@ -185,7 +185,7 @@ def validate_forward(
             config.hidden_size,
         ),
     )
-    if config.weight_interleave_size is not None and (
+    if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32 and (
         not isinstance(fc1_weight, BlockScaledTensor)
         or fc1_weight.format is not MoeFormat.MXFP8
     ):
@@ -300,7 +300,7 @@ def validate_training_weights(
                 f"{name} data and scale must be contiguous or compact K-major "
                 "for fixed training weight binding"
             )
-    if config.weight_interleave_size == 32 and not (
+    if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32 and not (
         is_compact_k_major(weights.forward_fc1.data)
         and is_compact_k_major(weights.forward_fc2.data)
         and weights.backward_w2_transpose.data.is_contiguous()
