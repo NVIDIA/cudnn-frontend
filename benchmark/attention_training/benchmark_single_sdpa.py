@@ -1766,7 +1766,10 @@ else:
                 or item.key.startswith("fmha_")
             ]
             if len(matched_kernels) >= 1:
-                fwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                fwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
             elif not prof.key_averages():
@@ -1823,7 +1826,10 @@ else:
                 or item.key.startswith("fmha_")
             ]
             if len(matched_kernels) >= 1:
-                bwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                bwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
             elif not prof.key_averages():
