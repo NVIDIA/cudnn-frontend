@@ -108,6 +108,13 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
 _REUSE_BMM2_ELECT = not CFG.THD_VARLEN or CFG.DTYPE_QKV == 1
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
+MERGE_SOFTMAX_WGS = (
+    not CFG.THD_VARLEN
+    and CFG.MASK_FLAGS == MASK_CAUSAL
+    and CFG.WINDOW_RIGHT == 0
+    and not CFG.BOTTOM_RIGHT
+    and not CFG.HAS_SINK
+)
 
 
 @cute.jit
@@ -160,7 +167,8 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
         elif CFG.DTYPE_QKV == 1 and i < 32:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         elif CFG.DTYPE_QKV == 0 and i < 32 and i % 10 < 4:
-            x, y = ex2_emulation_2(vec[i], vec[i + 1])
+            degree = 2 if MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 else 3
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=degree)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
@@ -169,9 +177,10 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
 
 
 def _exp2_mixed_late(vec):
+    tail_start = 40 if MERGE_SOFTMAX_WGS and CFG.DTYPE_QKV == 0 and CFG.SPLIT_KV == 1 else 56
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if i >= 56:
+        if i >= tail_start:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -295,6 +304,7 @@ _sdpa_h = make_sdpa_helpers(
     grouped_lpt=True,
     lpt_head_group=PARAMS.lpt_head_group,
     lpt_q_tiles=PARAMS.lpt_q_tiles,
+    lpt_l2_size_mib=PARAMS.lpt_l2_size_mib,
 )
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
@@ -365,6 +375,7 @@ _sdpa_h_mma_runtime = make_sdpa_helpers(
     lpt_q_tiles_in_cga_units=True,
     grouped_lpt=True,
     lpt_head_group=PARAMS.lpt_head_group,
+    lpt_l2_size_mib=PARAMS.lpt_l2_size_mib,
 )
 _dispatch_decode_initial_mma = _sdpa_h_mma_runtime.dispatch_decode_initial
 _dispatch_decode_payload_mma = _sdpa_h_mma_runtime.dispatch_decode_payload
@@ -648,9 +659,6 @@ def _kernel(
     amax_o_tensor: cute.Tensor,
 ) -> None:
 
-    cute.arch.inline_ptx('.pragma "global knob SchedLDSLatency=50";')
-    cute.arch.inline_ptx('.pragma "global knob MaxCumuWaitSinceEndGroup=0";')
-
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
 
@@ -832,7 +840,8 @@ def _kernel(
         scale_softmax_log2 = scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k
         o_scale_fused = o_scale_fused * _pre_dsc_v * _pre_scl_o
 
-    if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
+    softmax_first_end = CFG.CORR_WARP_BASE if cutlass.const_expr(MERGE_SOFTMAX_WGS) else CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS
+    if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < softmax_first_end:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg0_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
@@ -840,8 +849,12 @@ def _kernel(
             scale_log2 = scale_softmax_log2 * _wg0_dsc_q * _wg0_dsc_k
         else:
             scale_log2 = scale_softmax_log2
+        if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+            sub_tile_id = (warp_idx - cutlass.Int32(CFG.SOFTMAX_WG0_BASE)) // cutlass.Int32(CFG.SOFTMAX_WG_WARPS)
+        else:
+            sub_tile_id = 0
         _softmax_warp_group(
-            sub_tile_id=0,
+            sub_tile_id=sub_tile_id,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_log2,
@@ -860,7 +873,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
         )
 
-    elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
+    elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.CORR_WARP_BASE:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg1_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
@@ -1766,7 +1779,7 @@ def _softmax_kv_body(
     apply_mask: cutlass.Constexpr[bool],
     may_need_padding: cutlass.Constexpr[bool],
     body_mask_flags: cutlass.Constexpr[int],
-    sub_tile_id: cutlass.Constexpr[int],
+    sub_tile_id,
     kv_loop,
     is_first_real_kv,
     tmem_base,
@@ -1794,8 +1807,12 @@ def _softmax_kv_body(
     so ptxas places phases in URs (lowers to USYNCS.PHASECHK.TRANS64 instead
     of per-thread SYNCS+NANOSLEEP).
     """
-    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
-    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        tmem_S_off = cutlass.Int32(LAYOUT.S0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.S1_OFF - LAYOUT.S0_OFF)
+        tmem_P_off = cutlass.Int32(LAYOUT.P0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.P1_OFF - LAYOUT.P0_OFF)
+    else:
+        tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+        tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
     CHUNK = 64
     P_COLS_PER_CHUNK = CHUNK // 4
     N_CHUNKS = CFG.N_BMM2_CHUNKS
@@ -1940,7 +1957,6 @@ def _softmax_kv_body(
     deferred_sum_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        cute.arch.inline_ptx('.pragma "set knob SchedResBusyXU64=1";')
         deferred_P_1 = _exp2_mixed_late(chunk_S_1)
         deferred_sum_1 = row_reduction_pair(deferred_P_1)
         chunk_P_1_fp8 = _pack_fp8_vec(deferred_P_1)
@@ -1954,7 +1970,6 @@ def _softmax_kv_body(
         )
         if sub_tile_id == 0:
             nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
-        cute.arch.inline_ptx('.pragma "reset knob SchedResBusyXU64=1";')
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
@@ -2022,7 +2037,7 @@ def _softmax_kv_range(
 
 @cute.jit
 def _softmax_warp_group(
-    sub_tile_id: cutlass.Constexpr[int],
+    sub_tile_id,
     seqlen_q,
     seqlen_kv,
     scale_log2: cutlass.Float32,
@@ -2085,8 +2100,12 @@ def _softmax_warp_group(
     else:
         bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
 
-    softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
-    tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        softmax_wg_base = cutlass.Int32(CFG.SOFTMAX_WG0_BASE) + sub_tile_id * cutlass.Int32(CFG.SOFTMAX_WG1_BASE - CFG.SOFTMAX_WG0_BASE)
+        tid_in_wg = cute.arch.thread_idx()[0] - softmax_wg_base * cutlass.Int32(32)
+    else:
+        softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
+        tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
     if cutlass.const_expr(CFG.HAS_SINK):
         sinks_arr = cutlass.make_array_view(sinks_tensor)
 
@@ -2130,7 +2149,7 @@ def _softmax_warp_group(
         # α publish + stat_full fire back-to-back.
         _wait_mbarrier(bars.mb_stat_empty[sub_tile_id], stat_empty_phase)
         stat_empty_phase = stat_empty_phase ^ 1
-        if cutlass.const_expr(sub_tile_id == 1):
+        if sub_tile_id == 1:
             # Discard S0[first] so P1[j] consumes the S0[j+1] ownership event.
             _wait_mbarrier(score_bars.mb_s_consumed[0], inplace_phase)
             inplace_phase = inplace_phase ^ cutlass.Int32(1)
@@ -2340,7 +2359,7 @@ def _softmax_warp_group(
                     leader_cta_id,
                 )
 
-        if cutlass.const_expr(sub_tile_id == 0):
+        if sub_tile_id == 0:
             # No S0[last+1] exists; release P1[last] with one synthetic event.
             score_bars.mb_s_consumed[0].arrive()
 
@@ -2622,9 +2641,7 @@ def _correction_warp_group(
                         cutlass.Float32,
                     )
 
-                    for _i in cutlass.range_constexpr(O_CHUNK):
-                        _e = o_scaled[_i]
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                    _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
 
                     # Plain range (not range_constexpr) — extraction at Python trace time.
                     o_packed_v = fp32_to_fp8_pack(
@@ -3080,5 +3097,5 @@ def compile(  # noqa: A001
         fake_thd_kv_lens,
         fake_thd_lens_form,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi --ptxas-options -uumn",
+        options="--enable-tvm-ffi",
     )

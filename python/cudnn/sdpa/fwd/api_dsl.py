@@ -1237,6 +1237,30 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         lpt_q_tiles = 0
         if self._fp8 and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
+        lpt_l2_size_mib = 0
+        d192_lpt_groups = self.batch_size * self.h_q // _pack_g
+        d192_lpt_l2_8k = (
+            self.flavor == (192, 128)
+            and sched_policy == SCHED_LPT_L2
+            and not self.thd
+            and self.split_kv == 1
+            and self.s_q_max == 8192
+            and self.s_k_max == 8192
+        )
+        if (
+            d192_lpt_l2_8k
+            and self._pertensor
+            and self.dtype == torch.float8_e4m3fn
+            and d192_lpt_groups % 24 != 0
+            and d192_lpt_groups % 16 == 0
+        ):
+            # At 8K, the default 60 MiB budget groups 24 K/V heads. A 40 MiB
+            # group holds 16 and avoids a short final group for these grids.
+            lpt_l2_size_mib = 40
+        elif d192_lpt_l2_8k and not self._fp8 and d192_lpt_groups % 12 != 0 and d192_lpt_groups % 8 == 0:
+            # Half inputs double the per-head K/V footprint: 60 MiB groups 12
+            # heads, while 40 MiB groups 8 and avoids the same short tail.
+            lpt_l2_size_mib = 40
         template_window_right = self.window_right
         if (
             self._fp8
@@ -1322,6 +1346,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             sched_policy=sched_policy,
             lpt_head_group=lpt_head_group,
             lpt_q_tiles=lpt_q_tiles,
+            lpt_l2_size_mib=lpt_l2_size_mib,
             thd_varlen=self.thd,
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
@@ -1957,7 +1982,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         never from ``sf.shape[0]``, and only the total size is validated.
         """
         b = self.batch_size
-        flat = sf.contiguous()
+        # F8_128x4 is an opaque physical byte layout.  A full-storage tensor
+        # may carry the producer's logical permutation strides, but copying it
+        # in logical order both defeats that contract and launches a device
+        # reorder on every execute.  Bind its physical bytes directly; retain
+        # the packing fallback for views into a larger storage.
+        full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
+        flat = sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         if flat.numel() != b * h * n_tiles * sf_smem_size:
@@ -1982,7 +2013,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
         every tile is empty there, so no SF byte is ever loaded."""
-        flat = sf.contiguous()
+        full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
+        flat = sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         flat = flat.reshape(-1)

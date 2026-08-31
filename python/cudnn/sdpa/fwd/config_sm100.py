@@ -93,6 +93,8 @@ class TemplateParams:
     # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
+    # Optional LPT-L2 residency budget override. Zero uses the flavor default.
+    lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
@@ -194,6 +196,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
     if k.lpt_head_group not in (1, 8, 16):
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
+    if k.lpt_l2_size_mib < 0:
+        raise ValueError(f"{flavor}: lpt_l2_size_mib must be nonnegative; got {k.lpt_l2_size_mib}")
+    if k.lpt_l2_size_mib and flavor != "d192":
+        raise ValueError(f"{flavor}: lpt_l2_size_mib is only implemented by the D192 kernels")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:

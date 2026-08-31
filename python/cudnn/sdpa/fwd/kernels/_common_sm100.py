@@ -538,6 +538,7 @@ def make_sdpa_helpers(
     grouped_lpt: bool = False,
     lpt_head_group: int = 1,
     lpt_q_tiles: int = 0,
+    lpt_l2_size_mib: int = 0,
 ) -> SdpaHelpers:
     cga_tile_m = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
@@ -585,7 +586,7 @@ def make_sdpa_helpers(
 
     elif CFG.SCHEDULER_POLICY == SCHED_LPT_L2:
         _kv_bytes_per_row = (CFG.TILE_K + CFG.TILE_O) * CFG.BPE
-        _l2_bytes = CFG.L2_SIZE_MIB * 1024 * 1024
+        _l2_bytes = (lpt_l2_size_mib or CFG.L2_SIZE_MIB) * 1024 * 1024
 
         @cute.jit
         def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):

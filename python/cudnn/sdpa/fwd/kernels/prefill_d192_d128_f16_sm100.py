@@ -12,19 +12,14 @@ SM100 resource layout:
   1. **cga2-only, STAGES_KV=2**: per-CTA K/V halved by the collective MMA →
      SMEM 192 KiB (sQ 64 + sK 32 + sV 32 + sO 64), under the Blackwell
      ~228 KiB cap.
-  2. **TMEM stats** (512-col Blackwell cap): S_acc 0/128 + O 256..511 fill
-     all 512 cols, so stats ride the FREE HEAD of each sub-tile's S_acc
-     slot — sub-tile 0 → col 0, sub-tile 1 → col 128 (P only aliases the
-     tails at 64 / 192).  This matches the C++ SM100 reference layout
-     (tmem_Stats = base + softmax_gid*128).  Safe under the existing
-     mb_stat_full / mb_stat_empty handshake: correction reads alpha before
-     releasing MMA to overwrite that S_acc head next iter.
+  2. **SMEM stats**: alpha and final (max,sum) use a dedicated 2 KiB mailbox.
+     This leaves all 512 TMEM cols to S_acc 0/128 + O 256..511 and removes
+     the cross-tile dependency that otherwise delays the next BMM1 until
+     correction has consumed final stats from an aliased S_acc head.
   3. **Manual row-max** on the MASK_NONE fast path — ``tcgen05_ld`` +
      ``row_max_reduction`` (the masked path's pattern) instead of
      ``tmem_load_max_reduction_tile`` (LDTM.STAT).
-  4. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``; compile retains
-     ``--ptxas-options -uumn`` so the ``sched_res_busy_xu64`` region around
-     the P exp2/store sequence is honored by the backend.
+  4. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``.
 
 Supported: FP16 / BF16 (``DTYPE_QKV in {2, 3}``); masks none / causal / SWA /
 padded and all pairwise combos (causal+swa, causal+padded, swa+padded);
@@ -109,8 +104,28 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_SWA,
 )
+from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
+_DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
+    not CFG.THD_VARLEN
+    and CFG.MASK_FLAGS == MASK_CAUSAL
+    and CFG.WINDOW_RIGHT == 0
+    and not CFG.BOTTOM_RIGHT
+    and not CFG.HAS_SINK
+)
+
+
+def _exp2_mixed_late(vec):
+    values = []
+    for i in range(0, int(vec.shape[0]), 2):
+        if i >= 30:
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
+        else:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
+        values.extend((x, y))
+    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
 @cute.jit
@@ -205,7 +220,7 @@ THD_PERSISTENT = True
 
 # This flavor is cga2-only (CTA_MMA=2), so its LPT q-tile accounting in the
 # shared helper stays in CGA-tile units.
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, lpt_l2_size_mib=PARAMS.lpt_l2_size_mib)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 
@@ -598,15 +613,9 @@ _P1_OFF = 128 if IS_TF32 else 192
 class KernelTmemLayout:
     """Column offsets for the classic 2-sub-tile SDPA pipeline.
 
-    SM100 512-col TMEM cap.  S_acc[0]=0..127,
-    S_acc[1]=128..255, O=256..511 fill all 512 cols, so stats cannot live
-    at a dedicated col 544 (off the Blackwell cap).  Instead each sub-tile's
-    stats ride the FREE HEAD of its own S_acc slot (col 0 / 128) — P only
-    aliases the tails at 64 / 192, and softmax has already read S into
-    registers before writing stats.  Matches the C++ SM100 reference layout
-    (tmem_Stats = base + softmax_gid*128).  Safe under the existing
-    mb_stat_full / mb_stat_empty handshake: correction reads that iter's
-    alpha before releasing MMA to overwrite the S_acc head next iter.
+    SM100 512-col TMEM cap. S_acc[0]=0..127, S_acc[1]=128..255, and
+    O=256..511 fill all 512 cols. P aliases the tails at 64 / 192 after
+    softmax has loaded S; row stats use a dedicated SMEM mailbox.
     """
 
     # Blackwell SM10.0 cap; requires is_exclusive=True on tcgen05_alloc.
@@ -620,12 +629,6 @@ class KernelTmemLayout:
 
     P0_OFF: int = _P0_OFF
     P1_OFF: int = _P1_OFF
-
-    # SM100: stats ride the head of sub-tile qs's S_acc slot (== S{qs}_OFF):
-    # sub-tile 0 → col 0, sub-tile 1 → col 128.  Use STATS_OFF + qs*STATS_STRIDE.
-    STATS_OFF: int = 0
-    STATS_STRIDE: int = 128
-
 
 LAYOUT = KernelTmemLayout()
 
@@ -681,6 +684,12 @@ def _kernel(
     # K/V placement for the BMM2 handoff without changing occupancy.
     _kv_smem_pad = cutlass.Array(cutlass.Int8, 8192, alignment=1024, space=cutlass.AddressSpace.smem)
     sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sStats_raw = cutlass.Array(
+        cutlass.Float32,
+        CFG.TILES_Q * 2 * CFG.TILE_M,
+        alignment=128,
+        space=cutlass.AddressSpace.smem,
+    )
 
     sQ = SmemTile(
         base=sQ_raw,
@@ -771,7 +780,6 @@ def _kernel(
                 bars.mb_bmm2_done[qs].init()
                 bars.mb_stat_full[qs].init()
                 bars.mb_stat_empty[qs].init()
-                bars.mb_stats_read[qs].init()
                 bars.mb_o_full[qs].init()
                 bars.mb_o_empty[qs].init()
                 if cutlass.const_expr(IS_QO_ALIAS):
@@ -821,6 +829,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sStats_raw=sStats_raw,
             bars=bars,
             sched=sched,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
@@ -842,6 +851,7 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
+            sStats_raw=sStats_raw,
             bars=bars,
             sched=sched,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
@@ -860,6 +870,7 @@ def _kernel(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             sO=sO,
+            sStats_raw=sStats_raw,
             tmem_ptr_i32=tmem_ptr_i32,
             tidx=tidx,
             bars=bars,
@@ -1572,16 +1583,6 @@ def _mma_warp_group(
     bmm2_ready_phase = cutlass.Int32(0)
     # Only specializations that retain the legacy empty handshake use this.
     empty_mainloop_phase = cutlass.Int32(0)
-    # Stats-consumed gate (one flip per tile per sub-tile): the prologue BMM1
-    # overwrites the S_acc HEAD where the PREVIOUS tile's final
-    # (total_max, total_sum) stats live until the correction epilogue has read
-    # them.  q_full/k_full alone do NOT order that read before the BMM1 (Q/K
-    # can be resident well before correction finishes its epilogue — the
-    # window widens by ~a gmem latency under HAS_SINK, corrupting the second
-    # sub-tile's LSE/O on causal multi-wave shapes).  Bootstrap phase 1: the
-    # first tile has no prior stats to protect, so the wait passes immediately.
-    stats_read_phase = cutlass.Int32(1)
-
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
@@ -1592,26 +1593,19 @@ def _mma_warp_group(
             if cutlass.const_expr(not CAN_HAVE_EMPTY_KV):
                 _wait_mbarrier(bars.mb_empty_mainloop, empty_mainloop_phase)
                 empty_mainloop_phase = empty_mainloop_phase ^ cutlass.Int32(1)
-                _wait_mbarrier(bars.mb_stats_read[0], stats_read_phase)
-                _wait_mbarrier(bars.mb_stats_read[1], stats_read_phase)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
         else:
             # Prologue: BMM1[sub0], BMM1[sub1] for kv=kv_left.
-            # mb_stats_read[qs] gates each BMM1 on the correction epilogue
-            # having READ the previous tile's final stats from the S_acc head
-            # this BMM1 is about to overwrite (q_full/k_full don't order that).
             _wait_mbarrier(bars.mb_q_full[0], q_full_phase)
             _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
-            _wait_mbarrier(bars.mb_stats_read[0], stats_read_phase)
             desc_K = sK[kv_state.idx].desc()
             mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
             _wait_mbarrier(bars.mb_q_full[1], q_full_phase)
-            _wait_mbarrier(bars.mb_stats_read[1], stats_read_phase)
             mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1656,7 +1650,6 @@ def _mma_warp_group(
                             issue_mma=bmm2_issue,
                         )
                 elect_p = nvvm.elect_sync()
-                cute.arch.inline_ptx('.pragma "next knob FenceCode";')
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                 # BMM1 sub 0 for next kv
@@ -1694,7 +1687,6 @@ def _mma_warp_group(
                             issue_mma=bmm2_issue,
                         )
                 elect_p = nvvm.elect_sync()
-                cute.arch.inline_ptx('.pragma "next knob FenceCode";')
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -1780,9 +1772,6 @@ def _mma_warp_group(
             bmm2_ready_phase = bmm2_ready_phase ^ 1
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
-        if cutlass.const_expr(not CAN_HAVE_EMPTY_KV) or (kv_right > kv_left):
-            stats_read_phase = stats_read_phase ^ 1
-
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
         _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
@@ -1831,7 +1820,8 @@ def _softmax_kv_body(
     kv_loop,
     s_addr_base,
     p_addr_base,
-    stats_addr,
+    sStats_raw,
+    tid_in_wg,
     bars,
     q_abs,
     eff_seqlen_kv,
@@ -1989,8 +1979,6 @@ def _softmax_kv_body(
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
 
-    cute.arch.inline_ptx('.pragma "set knob SchedResBusyXU64=1";')
-
     # Online softmax with RESCALE_THRESHOLD skip.  total_max starts at -inf,
     # so the first live iteration always clears the threshold
     # (real - (-inf) = +inf) while a fully-masked one never does
@@ -2016,11 +2004,10 @@ def _softmax_kv_body(
     )
     total_max_safe = new_total_max_safe
 
-    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
     _wait_mbarrier(bars.mb_stat_empty[sub_tile_id], stat_empty_phase)
     stat_empty_phase = stat_empty_phase ^ 1
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    stats_base = cutlass.Int32(sub_tile_id * 2 * CFG.TILE_M)
+    sStats_raw.subview(stats_base + tid_in_wg).store(alpha)
     bars.mb_stat_full[sub_tile_id].arrive()
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
@@ -2039,7 +2026,6 @@ def _softmax_kv_body(
         chunk_P_0_fp16,
     )
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-    cute.arch.inline_ptx('.pragma "next knob FenceInterference";')
     bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
     # Chunk 1 folds out at TILE_N=64 (N_CHUNKS=1).
@@ -2047,8 +2033,12 @@ def _softmax_kv_body(
     p1_sum_pair = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
-        p1_sum_pair = row_reduction_pair(deferred_P_1)
+        if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+            deferred_P_1 = _exp2_mixed_late(chunk_S_1)
+        else:
+            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        if cutlass.const_expr(not _DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+            p1_sum_pair = row_reduction_pair(deferred_P_1)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
@@ -2059,10 +2049,9 @@ def _softmax_kv_body(
             chunk_P_1_fp16,
         )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-        cute.arch.inline_ptx('.pragma "next knob FenceCode";')
         bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-    cute.arch.inline_ptx('.pragma "reset knob SchedResBusyXU64=1";')
+        if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+            p1_sum_pair = row_reduction_pair(deferred_P_1)
 
     new_p_sum_pair = hoisted_sum
     if cutlass.const_expr(N_CHUNKS == 2):
@@ -2087,7 +2076,8 @@ def _softmax_masked_kv_loops(
     swa_right_start,
     s_addr_base,
     p_addr_base,
-    stats_addr,
+    sStats_raw,
+    tid_in_wg,
     bars,
     q_abs,
     eff_seqlen_kv,
@@ -2110,7 +2100,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2132,7 +2123,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2154,7 +2146,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2176,7 +2169,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2199,7 +2193,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2221,7 +2216,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2243,7 +2239,8 @@ def _softmax_masked_kv_loops(
                 kv_loop,
                 s_addr_base,
                 p_addr_base,
-                stats_addr,
+                sStats_raw,
+                tid_in_wg,
                 bars,
                 q_abs,
                 eff_seqlen_kv,
@@ -2268,6 +2265,7 @@ def _softmax_warp_group(
     scale_log2: cutlass.Float32,
     tmem_ptr_i32,
     sQ,
+    sStats_raw,
     bars,
     sched,
     seq_kv_lens_tensor,
@@ -2297,7 +2295,6 @@ def _softmax_warp_group(
 
     CHUNK = 64
     P_COLS_PER_CHUNK = CHUNK // 2
-    stats_off = LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE
 
     # Phase trackers persist across tile boundaries (barriers don't reset).
     bmm1_phase = cutlass.Int32(0)
@@ -2350,7 +2347,7 @@ def _softmax_warp_group(
     tmem_base_softmax = tmem_ptr_i32.load()
     s_addr_base_softmax = tmem_base_softmax + cutlass.Int32(tmem_S_off)
     p_addr_base_softmax = tmem_base_softmax + cutlass.Int32(tmem_P_off)
-    stats_addr_softmax = tmem_base_softmax + cutlass.Int32(stats_off)
+    stats_base = cutlass.Int32(sub_tile_id * 2 * CFG.TILE_M)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -2378,7 +2375,8 @@ def _softmax_warp_group(
                     kv_loop,
                     s_addr_base_softmax,
                     p_addr_base_softmax,
-                    stats_addr_softmax,
+                    sStats_raw,
+                    tid_in_wg,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -2403,7 +2401,8 @@ def _softmax_warp_group(
                         swa_right_start,
                         s_addr_base_softmax,
                         p_addr_base_softmax,
-                        stats_addr_softmax,
+                        sStats_raw,
+                        tid_in_wg,
                         bars,
                         q_abs,
                         eff_seqlen_kv,
@@ -2456,7 +2455,8 @@ def _softmax_warp_group(
                         right_start,
                         s_addr_base_softmax,
                         p_addr_base_softmax,
-                        stats_addr_softmax,
+                        sStats_raw,
+                        tid_in_wg,
                         bars,
                         q_abs,
                         eff_seqlen_kv,
@@ -2479,7 +2479,8 @@ def _softmax_warp_group(
                     bounds.unmasked_hi,
                     s_addr_base_softmax,
                     p_addr_base_softmax,
-                    stats_addr_softmax,
+                    sStats_raw,
+                    tid_in_wg,
                     bars,
                     q_abs,
                     eff_seqlen_kv,
@@ -2497,11 +2498,10 @@ def _softmax_warp_group(
             # Only real mainloops own a stats transaction. Empty tiles bypass
             # this phase entirely and are materialized by the correction warp.
             total_sum_scalar = total_sum[0] + total_sum[1]
-            stats_vec_epi = cutlass.Vector.from_elements((total_max_safe, total_sum_scalar), cutlass.Float32)
             _wait_mbarrier(bars.mb_stat_empty[sub_tile_id], stat_empty_phase)
             stat_empty_phase = stat_empty_phase ^ 1
-            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_softmax, cutlass.Float32), stats_vec_epi)
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+            sStats_raw.subview(stats_base + tid_in_wg).store(total_max_safe)
+            sStats_raw.subview(stats_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(total_sum_scalar)
             bars.mb_stat_full[sub_tile_id].arrive()
 
         (
@@ -2537,6 +2537,7 @@ def _correction_warp_group(
     seqlen_q,
     seqlen_kv,
     sO,
+    sStats_raw,
     tmem_ptr_i32,
     tidx,
     bars,
@@ -2621,22 +2622,15 @@ def _correction_warp_group(
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
             tmem_base_iter = tmem_ptr_i32.load()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                stats_off = LAYOUT.STATS_OFF + qs * LAYOUT.STATS_STRIDE
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
-                stats_addr = tmem_base_iter + cutlass.Int32(stats_off)
 
                 if cutlass.const_expr(CFG.THD_VARLEN and (CFG.MASK_FLAGS & MASK_SWA)):
                     _wait_mbarrier_inline(bars.mb_stat_full[qs], stat_full_phase)
                 else:
                     _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
 
-                stats_vec = nvvm.tcgen05_ld(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
-                    num=2,
-                )
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                alpha = stats_vec[0]
+                stats_base = cutlass.Int32(qs * 2 * CFG.TILE_M)
+                alpha = sStats_raw.subview(stats_base + tid_in_wg).load()
 
                 # all_alpha_one ballot: when every lane has alpha==1.0 the entire rescale loop skips.
                 alpha_is_one = alpha == cutlass.Float32(1.0)
@@ -2669,9 +2663,7 @@ def _correction_warp_group(
         # === End-of-kv epilogue ===
         tmem_base_epi = tmem_ptr_i32.load()
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
-            stats_off = LAYOUT.STATS_OFF + qs * LAYOUT.STATS_STRIDE
             tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
-            stats_addr = tmem_base_epi + cutlass.Int32(stats_off)
 
             total_max_scaled = cutlass.Float32(float("-inf"))
             total_sum = cutlass.Float32(0.0)
@@ -2679,22 +2671,11 @@ def _correction_warp_group(
                 # Wait the (total_max, total_sum_final) publish from softmax's epilogue.
                 _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
 
-                stats_vec = nvvm.tcgen05_ld(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
-                    num=2,
-                )
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                total_max_scaled = stats_vec[0]  # log2-units (softmax stores it scaled)
-                total_sum = stats_vec[1]
+                stats_base = cutlass.Int32(qs * 2 * CFG.TILE_M)
+                total_max_scaled = sStats_raw.subview(stats_base + tid_in_wg).load()
+                total_sum = sStats_raw.subview(stats_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
 
-                # Fire stat_empty so softmax's NEXT-tile iter 0 wait can pass.
                 bars.mb_stat_empty[qs].arrive()
-                # Release MMA's NEXT-tile prologue BMM1 into this S_acc slot: the
-                # final stats ride the slot HEAD and are now safely in registers
-                # (tcgen05_wait LOAD above).  Cross-CTA arrive on the leader under
-                # cga2 — the collective BMM1 writes both peers' TMEM.
-                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)
@@ -3203,7 +3184,5 @@ def compile(  # noqa: A001
         fake_thd_kv_lens,
         fake_thd_lens_form,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        # Keep -uumn so the P exp2/store sched_res_busy_xu64 region affects
-        # backend scheduling.
-        options="--enable-tvm-ffi --ptxas-options -uumn",
+        options="--enable-tvm-ffi",
     )
