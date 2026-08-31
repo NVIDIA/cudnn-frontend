@@ -727,8 +727,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             raise ValueError("two-CTA DSA backward requires head_dim=head_dim_v=512")
         if block_tile != 64:
             raise ValueError(f"two-CTA DSA backward requires block_tile=64, got {block_tile}")
-        if max_topk not in (128, 512, 1024, 2048):
-            raise ValueError("two-CTA DSA backward requires max_topk in " f"{{128, 512, 1024, 2048}}, got {max_topk}")
+        if max_topk not in (128, 512, 1024, 1152, 2048):
+            raise ValueError("two-CTA DSA backward requires max_topk in " f"{{128, 512, 1024, 1152, 2048}}, got {max_topk}")
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
         self.head_dim = head_dim

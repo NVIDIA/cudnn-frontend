@@ -90,7 +90,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
         "max_topk": 512,
         "device_capability": (10, 0),
     }
-    for max_topk in (128, 512, 1024, 2048):
+    for max_topk in (128, 512, 1024, 1152, 2048):
         assert _select_sm100_backend(128, 512, **{**supported, "max_topk": max_topk}) == ("h128_2cta_m64", 64)
 
     assert _select_sm100_backend(128, 512) == ("generic_m64", 64)
@@ -103,6 +103,8 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
         {**supported, "max_topk": 0},
         {**supported, "max_topk": 64},
         {**supported, "max_topk": 513},
+        {**supported, "max_topk": 1151},
+        {**supported, "max_topk": 1153},
         {**supported, "max_topk": 2112},
         {**supported, "device_capability": (10, 3)},
     ]
@@ -113,7 +115,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
-@pytest.mark.parametrize("topk", [128, 512, 1024, 2048])
+@pytest.mark.parametrize("topk", [128, 512, 1024, 1152, 2048])
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=20260829)
 def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_oob_indices(has_topk_length, topk):

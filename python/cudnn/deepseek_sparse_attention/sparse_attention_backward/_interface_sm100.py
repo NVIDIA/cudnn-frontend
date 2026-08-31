@@ -42,7 +42,7 @@ def _select_sm100_backend(
         and num_heads == 128
         and head_dim == 512
         and head_dim_v == 512
-        and max_topk in (128, 512, 1024, 2048)
+        and max_topk in (128, 512, 1024, 1152, 2048)
     ):
         return "h128_2cta_m64", 64
     if num_heads == 16 and head_dim == 576:

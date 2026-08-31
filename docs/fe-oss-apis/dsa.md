@@ -127,7 +127,7 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
 On SM100, the public backward entry point automatically selects the tuned
 kernel from the device, dtype, and tensor shape. On SM100 (10, 0) devices,
 BF16 H128 with `head_dim = head_dim_v = 512` and
-`topk_max ∈ {128, 512, 1024, 2048}` uses the two-CTA specialization. H16 with
+`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization. H16 with
 `head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
 counts and dimensions, and every other `topk_max` retain the existing
 generic/H16 selection. SM103+ devices do not select the two-CTA path. No
