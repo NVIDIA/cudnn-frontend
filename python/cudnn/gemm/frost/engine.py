@@ -53,12 +53,7 @@ class _FrostGemmPlan(CompiledPlan):
         # which carry the shape this execute runs, override_shapes included.
         operands = variant_pack.operands(indices)
         required = self.get_workspace_size()
-        if required:
-            # Scratch is carved from the CALLER's workspace: stable pointers, so
-            # a plan stays safe to capture in a CUDA graph. Only the MoE
-            # launchers need it, and they take the variant-pack dict.
-            self._compiled(dict(zip(self._tensors, operands)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
-            return
+        workspace = Workspace.over(variant_pack, required, "frost_gemm") if required else None
         launch = self._launch
         if launch is not None:
             # Which bound tensor holds which operand was settled at build, so
@@ -71,7 +66,9 @@ class _FrostGemmPlan(CompiledPlan):
             if borrowed:
                 flags = tuple(i in borrowed for i in indices)
                 graph_order = flags if any(flags) else None
-            launch(operands, graph_order, stream=ctx.stream)
+            launch(operands, graph_order, stream=ctx.stream, workspace=workspace)
+        elif workspace is not None:
+            self._compiled(dict(zip(self._tensors, operands)), workspace, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 

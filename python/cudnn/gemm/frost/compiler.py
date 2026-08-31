@@ -2401,6 +2401,8 @@ class CompiledFusedGemm:
     # clamped); drives the runtime output/aux alignment requirements. None →
     # fall back to the chain-derived width.
     vec_bytes_epi: "int | None" = None
+    # workspace for split-K
+    workspace_bytes: int = 0
 
     @property
     def tma_slots(self) -> "frozenset[int]":
@@ -2432,7 +2434,7 @@ class CompiledFusedGemm:
             self.recipe = build_recipe(self)
             self.lowered = self._lower()
 
-    def __call__(self, variant_pack, stream=None):
+    def __call__(self, variant_pack, stream=None, workspace=None):
         # The runtime call is a variant-pack dict keyed by cuDNN tensor object
         # (or uid / name) -> buffer; (M, N, K) is inferred from the buffer shapes.
         if not isinstance(variant_pack, dict):
@@ -2441,9 +2443,9 @@ class CompiledFusedGemm:
             )
         if self.binding is None:
             raise NotImplementedError("variant-pack call is not wired up for this graph type")
-        return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream)
+        return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream, workspace=workspace)
 
-    def run_resolved(self, resolved, stream=None):
+    def run_resolved(self, resolved, stream=None, workspace=None):
         """Launch over ``{id(bound_tensor): buffer}``, already resolved."""
         operands = []
         for i, t in enumerate(self.bound):
@@ -2453,7 +2455,7 @@ class CompiledFusedGemm:
             operands.append(buf)
         if self.lowered is None:
             raise NotImplementedError(f"cudnn.frost gemm: this kernel has no launch path -- {self.declined}")
-        return self.lowered(operands, stream=stream)
+        return self.lowered(operands, stream=stream, workspace=workspace)
 
     def _lower(self):
         """The recipe as one loop over flat tuples: this kernel's only call path.
@@ -2503,8 +2505,6 @@ class CompiledFusedGemm:
             _check_executable(self.chain)
         except NotImplementedError as exc:
             return decline(str(exc))
-        if r.workspace_bytes:
-            return decline("needs workspace")
         # Scale factors come with a block size to size their blob against.
         if bool(r.sf) != bool(r.block_size):
             return decline("scale factors without a block size")
@@ -2541,11 +2541,14 @@ class CompiledFusedGemm:
         device, launchable, refuse = r.device, self._launchable, self.explain
         fill_word, fill_plan, apply_fill = buffers.fill_word_async, buffers.strided_fill_plan, buffers.apply_fill_plan
         is_contiguous = buffers.is_contiguous
+        # split-K slices for the kernel
+        needs_workspace = bool(r.workspace_bytes)
+        split_k_slices = self.config.split_k_slices
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
 
-        def lowered(operands, graph_order=None, stream=None):
+        def lowered(operands, graph_order=None, stream=None, workspace=None):
             _check_plan_device(device)
             # Which axis order each input arrived in, by the backend's own rule:
             # the descriptor defines the tensor and the pack supplies a pointer,
@@ -2661,10 +2664,19 @@ class CompiledFusedGemm:
                         fill_word(ptr, count, word, stream)
                     else:
                         apply_fill(ptr, plan, word, stream)
+            extra = ()
+            if needs_workspace:
+                if workspace is None:
+                    raise ValueError(
+                        "cudnn.frost gemm: this plan needs a workspace; allocate "
+                        "graph.get_workspace_size() bytes and pass the buffer to execute()"
+                    )
+                extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
                 *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
+                *extra,
                 stream=_as_custream(stream),
             )
 
