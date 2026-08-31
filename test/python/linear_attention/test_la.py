@@ -1409,12 +1409,13 @@ def test_safe_gate_backward(backend, variant, gate_dtype):
         assert leaf.grad is not None and bool(torch.isfinite(leaf.grad).all()), name
 
 
-def test_beta_sigmoid_in_kernel(backend):
-    """KDA: io-dtype Beta logits with the in-kernel sigmoid match the
-    post-activation fp32 path."""
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=DTYPE_IDS.get)
+def test_beta_sigmoid_in_kernel(backend, beta_dtype):
+    """KDA: float32/io-dtype Beta logits with the in-kernel sigmoid match
+    the post-activation fp32 path."""
     case = make_case("kda", torch.bfloat16, T=256)
     set_seed(SEED + 11)
-    braw = torch.randn(1, case.T, case.HO, device="cuda").to(case.dtype)
+    braw = torch.randn(1, case.T, case.HO, device="cuda").to(beta_dtype)
     raw_case = case.clone(gates=dict(case.gates, beta=braw))
     eff_case = case.clone(gates=dict(case.gates, beta=braw.float().sigmoid()))
     o_raw, fs_raw = run_fwd(backend, raw_case, output_final_state=True, use_beta_sigmoid_in_kernel=True)
@@ -1423,14 +1424,18 @@ def test_beta_sigmoid_in_kernel(backend):
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_beta_sigmoid_backward(backend, variant):
+@pytest.mark.parametrize(
+    "variant,beta_dtype",
+    [(variant, torch.bfloat16) for variant in VARIANTS] + [("kda", torch.float32)],
+    ids=[*(f"{variant}-bf16" for variant in VARIANTS), "kda-fp32"],
+)
+def test_beta_sigmoid_backward(backend, variant, beta_dtype):
     """The in-kernel Beta sigmoid returns the gradient wrt the raw logit, so
     dbeta must equal the post-activation path's dbeta times s * (1 - s) at the
     io-rounded s the forward stores."""
     case = make_case(variant, torch.bfloat16, T=256)
     set_seed(SEED + 13)
-    braw = torch.randn_like(case.gates["beta"].float()).to(case.dtype)
+    braw = torch.randn_like(case.gates["beta"].float()).to(beta_dtype)
     s_io = torch.sigmoid(braw.float()).to(case.dtype)
 
     def dbeta(beta, **kw):
@@ -1441,6 +1446,7 @@ def test_beta_sigmoid_backward(backend, variant):
         with waive_unsupported(backend, variant):
             o, _ = pinned_op(backend, variant)(*args, case.cu, **kw)
             o.sum().backward()
+        assert leaf.grad.dtype == beta.dtype
         return leaf.grad.double()
 
     got = dbeta(braw, use_beta_sigmoid_in_kernel=True)

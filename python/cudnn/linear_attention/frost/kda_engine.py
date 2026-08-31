@@ -59,7 +59,7 @@ class KdaFrostEngine(BaseEngine):
         if not facts.gates_at_ho:
             raise NotImplementedError(f"KdaFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
         fp32 = cudnn.data_type.FLOAT
-        beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (fp32, facts.io_dtype)
+        beta_wants = (fp32, facts.io_dtype)
         if facts.beta_dtype not in beta_wants + (None,):
             raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
         state_dtypes = (fp32, cudnn.data_type.BFLOAT16)

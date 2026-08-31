@@ -359,7 +359,7 @@ def kda_fwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
-    check_dtype("beta", beta, q.dtype if use_beta_sigmoid_in_kernel else (torch.float32, q.dtype))
+    check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
         if a_log is None or dt_bias is None:
             raise ValueError("kimi_delta_attention: safe_gate requires a_log and dt_bias")
@@ -658,7 +658,7 @@ def kda_bwd(
         raise ValueError(f"kimi_delta_attention: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
-    check_dtype("beta", beta, q.dtype if use_beta_sigmoid_in_kernel else (torch.float32, q.dtype))
+    check_dtype("beta", beta, (torch.float32, q.dtype))
     if safe_gate:
         if a_log is None or dt_bias is None:
             raise ValueError("kimi_delta_attention: safe_gate requires a_log and dt_bias")
@@ -985,7 +985,7 @@ def kimi_delta_attention(
 
     Dtypes are kernel-native and strict (callers convert).  ``g`` is float32,
     bfloat16 or float16 and ``dG`` comes back in the same dtype.  ``beta`` and
-    ``dBeta`` are float32 or the io dtype (io-dtype logits under
+    ``dBeta`` are float32 or the io dtype (raw logits of either dtype under
     ``use_beta_sigmoid_in_kernel``).  ``initial_state`` is float32 or bfloat16
     and ``final_state`` and the state gradients (``d_final_state``,
     ``d_initial_state``) follow it.
@@ -994,7 +994,8 @@ def kimi_delta_attention(
         g: per-key-channel log-space decay (``alpha = exp(g) in (0, 1]^K``),
             or raw pre-activation logits when ``safe_gate=True``.
         beta: per-token scalar write strength (float32 or the io dtype,
-            post-sigmoid), or io-dtype logits when ``use_beta_sigmoid_in_kernel=True``.
+            post-sigmoid), or float32/io-dtype logits when
+            ``use_beta_sigmoid_in_kernel=True``.
         cu_seqlens: ``[N+1]`` int32/int64 sequence boundaries over the packed tokens.
         scale: attention scale applied to ``q``. Defaults to ``1 / sqrt(K)``.
         initial_state: optional recurrent state (otherwise zero); float32 or
