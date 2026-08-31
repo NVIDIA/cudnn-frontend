@@ -265,10 +265,13 @@ def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True):
     fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens)))
     out = sdpa_bwd_wrapper_sm80(q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu)
     if check_grads:
-        for i, s_len in enumerate(lens):
+        for i in range(len(lens)):
             lo, hi = int(cu[i]), int(cu[i + 1])
+
             # packed [T, H, D] slice -> BHSD [1, H, S, D]
-            _bhsd = lambda x: x[0, lo:hi].permute(1, 0, 2).unsqueeze(0)
+            def _bhsd(x, _lo=lo, _hi=hi):
+                return x[0, _lo:_hi].permute(1, 0, 2).unsqueeze(0)
+
             _, dq_ref, dk_ref, dv_ref = _ref_grads(_bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=-1, scale=1.0 / math.sqrt(d_qk))
             torch.testing.assert_close(_bhsd(out["dq_tensor"]).to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(_bhsd(out["dk_tensor"]).to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
@@ -342,7 +345,13 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
     # length is plan-time); different TOKEN TOTALS at the same batch count
     # must not — and the re-bound artifact must still be CORRECT, so this
     # call's gradients are validated against the dense per-sequence reference.
+    # The counter window brackets THIS call alone: a pure cache hit, zero
+    # misses (netting against the n_seqs=3 call could mask a leak).
+    misses_pre_rebind, hits_pre_rebind = cache_totals()
     _thd_run_and_check([64, 256], h=H, d_qk=D, d_v=D)  # same n_seqs as call 1, different totals
+    misses_post_rebind, hits_post_rebind = cache_totals()
+    assert misses_post_rebind == misses_pre_rebind, "the same-batch-count re-bind minted a compile (token totals leaked into the key)"
+    assert hits_post_rebind > hits_pre_rebind, "expected the same-batch-count re-bind to cache-hit"
     assert len(template_loader._MODULES) == n_modules_before, "a new template specialization was minted by runtime data"
     misses_1, hits_1 = cache_totals()
     # Call 2 (n_seqs=3) may legitimately re-specialize once; call 3 shares
