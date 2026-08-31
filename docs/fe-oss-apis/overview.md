@@ -35,6 +35,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [CSA Fused Compressor](csa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
+- [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 
 ## Installation and setup
@@ -43,6 +44,9 @@ All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. H
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
+
+The Triton NVFP4 attention QAT backward API additionally requires the
+`triton` extra. Its API page documents the framework and GPU requirements.
 
 The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash

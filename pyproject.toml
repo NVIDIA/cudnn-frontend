@@ -78,6 +78,11 @@ cutile = [
     # engines and nothing else.
     "cuda-tile>=1.4; python_version >= '3.10'",
 ]
+triton = [
+    # Framework-specific Triton FE OSS kernels. Torch remains in the explicit
+    # torch dependency group so callers can choose the matching CUDA wheel.
+    "triton>=3.7.0; sys_platform == 'linux' and python_version >= '3.10'",
+]
 
 [dependency-groups]
 dev = [
