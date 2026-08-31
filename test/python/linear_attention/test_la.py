@@ -179,6 +179,16 @@ def waive_unsupported(backend, variant):
         pytest.skip(f"{backend.name} {variant} declined: {exc}")
 
 
+@contextlib.contextmanager
+def waive_declined(what):
+    """Same waiver for the tests that pin no backend: default routing picks the
+    engine, so a config no engine serves is a skip, not a failure."""
+    try:
+        yield
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        pytest.skip(f"{what} declined: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Case generation and dispatch
 # ---------------------------------------------------------------------------
@@ -880,9 +890,10 @@ def test_bwd_meta_dtypes_match_eager(variant, gate_dtype):
     state0 = (torch.randn(case.N, case.HO, case.V, case.K, device="cuda") * 0.05).to(torch.bfloat16)
     kw = dict(initial_state=state0, d_final_state=state0.clone())
     bwd = getattr(torch.ops.cudnn, name + "_bwd")
-    eager = bwd(*args, **kw)
-    with FakeTensorMode(allow_non_fake_inputs=True):
-        meta = bwd(*args, **kw)
+    with waive_declined(f"{variant} with a bf16 state"):
+        eager = bwd(*args, **kw)
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            meta = bwd(*args, **kw)
     got = [(i, e.dtype, m.dtype) for i, (e, m) in enumerate(zip(eager, meta)) if e.dtype != m.dtype]
     assert not got, f"meta/eager dtype mismatch at output indices {got}"
 
@@ -1672,7 +1683,8 @@ def test_invalid_gate_dtype_raises(variant):
     with pytest.raises((TypeError, KeyError)):
         call(torch.float64)
     for gate_dtype in (torch.float32, torch.bfloat16, torch.float16):
-        assert call(gate_dtype)[0].dtype == case.dtype
+        with waive_declined(f"{variant} with a {gate_dtype} gate"):
+            assert call(gate_dtype)[0].dtype == case.dtype
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

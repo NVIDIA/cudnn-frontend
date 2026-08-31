@@ -2930,18 +2930,20 @@ def compute2_warp_group(
             bars.mb_dgate_tmastg_done[dgate_stage].wait(((gc // cfg.smem_dgate_stages) + 1) % 2)
             db_stage = gc % cfg.smem_db_stages
             bars.mb_db_tmastg_done[db_stage].wait(((gc // cfg.smem_db_stages) + 1) % 2)
+            dgate_base = dgate_stage * (cfg.b_t * cfg.d_k)
+            db_base = db_stage * (cfg.b_t * cfg.d_k)
             if cutlass.const_expr(cfg.gate_dtype != cutlass.Float32):
                 dgate_seg = channel // 64
                 dgate_dim = channel - dgate_seg * 64
             for t in cutlass.range_constexpr(cfg.b_t):
                 if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
                     dgate_idx = f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)
-                    (sDgate_raw.data_ptr() + dgate_idx).store(dgate_regs[t])
+                    (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t])
                 else:
                     dgate_idx = dgate_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, dgate_dim, elem_bytes=2)
-                    (sDgate_raw.data_ptr() + dgate_idx).store(dgate_regs[t].to(cfg.gate_dtype))
+                    (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t].to(cfg.gate_dtype))
                 db_idx = f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)
-                (sDb_raw.data_ptr() + db_idx).store(db_regs[t].to(cfg.io_dtype))
+                (sDb_raw.data_ptr() + db_base + db_idx).store(db_regs[t].to(cfg.io_dtype))
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dgate_tmastg_ready[dgate_stage].arrive()
             bars.mb_db_tmastg_ready[db_stage].arrive()

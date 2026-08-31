@@ -447,7 +447,6 @@ else:
     else:
         run_fwd = True
         run_bwd = False
-    # One canonical width per variant, for every backend.
     dtype_by_name = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     gate_dtype = target_dtype if args.variant == "kda" else torch.float32
     beta_dtype = torch.float32 if args.variant == "gdn" else target_dtype
@@ -456,14 +455,13 @@ else:
         gate_dtype = dtype_by_name[args.gate_data_type]
     if args.state_data_type != "auto":
         state_dtype = dtype_by_name[args.state_data_type]
-    # Reject up front what a library rejects inside a kernel launch.
     if args.la_backend == "flash_kda" and gate_dtype is not target_dtype:
         raise ValueError(f"flash_kda takes g and beta at the io dtype ({args.data_type}) only")
     if args.la_backend == "flash_kda" and state_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("flash_kda takes a bfloat16 or float32 state only")
     if args.la_backend == "flash_qla" and gate_dtype is not torch.float32 and run_bwd:
         raise ValueError("flash_qla's backward asserts an fp32 dg")
-    if args.la_backend == "fla" and state_dtype is not torch.float32:
+    if args.la_backend == "fla" and (args.initial_state or args.store_on) and state_dtype is not torch.float32:
         raise ValueError(f"fla's chunk_{args.variant} asserts an fp32 initial_state")
 
     # Parse input arguments
