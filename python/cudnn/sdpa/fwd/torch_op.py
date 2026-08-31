@@ -378,7 +378,7 @@ def _sdpa_fwd_impl(
         o_stride = _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
         stats_stride = (H_q * S_q, S_q, 1, 1)
 
-    _check_same_device(q, sinks=sinks, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv)
+    _check_same_device(q, k=k, v=v, sinks=sinks, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv)
     has_sinks = sinks is not None
     has_seq_lens = seq_len_q is not None or seq_len_kv is not None
     if has_seq_lens and (seq_len_q is None or seq_len_kv is None):
@@ -680,7 +680,7 @@ def _sdpa_bwd_impl(
     if o.shape != (T_q, H_q, D_v) or grad_out.shape != o.shape:
         raise ValueError(f"o {tuple(o.shape)} / grad_out {tuple(grad_out.shape)} must be (T_q={T_q}, H_q={H_q}, D_v={D_v})")
     S_q, S_kv = max_seqlen_q, max_seqlen_kv
-    _check_same_device(q, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, lse=lse, grad_out=grad_out)
+    _check_same_device(q, k=k, v=v, o=o, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, lse=lse, grad_out=grad_out)
 
     # lse arrives PADDED (B, H, max_seqlen_q) or (B, H, max_seqlen_q, 1) fp32
     # — a backend restriction (bprop THD rejects ragged LSE on SM8X/SM12X).
