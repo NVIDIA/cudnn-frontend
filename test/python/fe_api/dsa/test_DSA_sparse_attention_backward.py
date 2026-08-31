@@ -858,8 +858,9 @@ def test_DSA_sparse_attention_backward_staged_store():
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("num_heads,topk", [(64, 64), (128, 128)], ids=["generic", "h128-two-cta"])
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "supplied-length"])
 @torch_fork_set_rng(seed=7)
-def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_heads, topk):
+def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_heads, topk, has_topk_length):
     """The SM100 interface must establish zero state on the launch stream.
 
     The generic path uses torch zero-fills, while the H128 two-CTA path launches
@@ -890,6 +891,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device) if has_topk_length else None
 
     out, lse = ref_sparse_attention_forward(
         q,
@@ -910,6 +912,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
             attn_sink,
             topk_idxs,
             softmax_scale=softmax_scale,
+            topk_length=topk_length,
             stream=stream,
         )
         torch.cuda.synchronize()
@@ -927,6 +930,10 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
     # queued behind the sleep on the default stream.
     side_stream = torch.cuda.Stream()
     torch.cuda._sleep(2_000_000_000)
+    if topk_length is not None:
+        with torch.cuda.stream(side_stream):
+            topk_length.fill_(0)
+            topk_length.fill_(topk)
     dq, dkv, d_sink = run(cuda.CUstream(side_stream.cuda_stream))
 
     assert (dkv != 0).any(), "dkv accumulation was wiped by a zero-init racing on another stream"

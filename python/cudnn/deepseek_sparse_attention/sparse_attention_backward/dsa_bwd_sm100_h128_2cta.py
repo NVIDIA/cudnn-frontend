@@ -2642,6 +2642,13 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         ds_fragments = (dkv_tiled_mma.make_fragment_B(ds_blocks[0]), dkv_tiled_mma.make_fragment_B(ds_blocks[1]))
         kv_copy_atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL), self.element_dtype, num_bits_per_copy=128)
         kv_thread_copy = cute.make_tiled_copy_tv(kv_copy_atom, cute.make_layout((1,)), cute.make_layout((8,))).get_slice(0)
+        # Start the supplied-length load before barrier initialization, the
+        # cluster rendezvous, and two-CTA TMEM allocation.  Only the load is
+        # hoisted; its clamp and every dependent use remain below.
+        if cutlass.const_expr(mTopkLength is not None):
+            raw_topk = mTopkLength[token_idx]
+        else:
+            raw_topk = Int32(mTopkIdxs.shape[0])
         atom_thr_size = cute.size(score_tiled_mma.thr_id.shape)
         leader_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         math_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, atom_thr_size * self.MATH_THREADS)
@@ -2812,10 +2819,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         t_dp_pp = cute.make_tensor(tmem_ptr + self.TMEM_DP1_OFFSET, score_c_layout)
         t_dq = (cute.make_tensor(tmem_ptr + self.TMEM_DQ0_OFFSET, dq_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DQ1_OFFSET, dq_c_layout))
         t_dkv = (cute.make_tensor(tmem_ptr + self.TMEM_DKV0_OFFSET, dkv_c_layout), cute.make_tensor(tmem_ptr + self.TMEM_DKV1_OFFSET, dkv_c_layout))
-        if cutlass.const_expr(mTopkLength is not None):
-            topk = mTopkLength[token_idx]
-        else:
-            topk = Int32(mTopkIdxs.shape[0])
+        topk = raw_topk
         if topk > Int32(mTopkIdxs.shape[0]):
             topk = Int32(mTopkIdxs.shape[0])
         if topk < Int32(0):
