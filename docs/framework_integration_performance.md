@@ -107,21 +107,22 @@ input projections with
 keeps the down projection as a second kernel. The current FROST backward is
 SwiGLU-specific, so SiTU uses an exact cuDNN pointwise derivative graph.
 
-On B200, same-process interleaved CUDA-graph replay measured the complete
-three-GEMM inference call against the exact PyTorch composition below. These
-fixed-width rows are operation proxies, not an assembled MoE dispatch:
+On B200, same-process interleaved CUDA-graph replay device intervals measured
+the complete three-GEMM inference call against the exact PyTorch composition.
+Graph construction and autotuning happened before replay; each value is the
+median of 9 samples with 40 iterations per sample:
 
-| Kimi K3 role | M | H | I | PyTorch / cuDNN |
-|---|---:|---:|---:|---:|
-| dense | 512 | 7,168 | 33,792 | 1.69-1.70x |
-| shared expert | 2,048 | 7,168 | 6,144 | 1.69-1.71x |
-| routed-expert proxy | 128 | 3,584 | 3,072 | 1.92x |
+| Kimi K3 role | M | H | I | cuDNN replay (ms) | PyTorch replay (ms) | PyTorch / cuDNN |
+|---|---:|---:|---:|---:|---:|---:|
+| dense | 512 | 7,168 | 33,792 | 0.5527 | 0.8871 | 1.605x |
+| shared expert | 2,048 | 7,168 | 6,144 | 0.3704 | 0.6274 | 1.694x |
+| routed-expert proxy | 128 | 3,584 | 3,072 | 0.02058 | 0.04314 | 2.096x |
 
-Across two repeated runs, the corresponding cuDNN graph-replay medians were
-0.552-0.554, 0.369-0.371, and 0.02260 ms. Relative L2 error versus the official
-FP32-activation/BF16-boundary formula was below 0.00075 for all three. This is
-inference-only operator timing; it does not imply full-model or training-step
-speedup.
+Times are rounded to the displayed precision. Relative L2 error versus the
+official FP32-activation/BF16-boundary formula was below 0.00075 for all three.
+These fixed-width rows are inference-only operation proxies, not an assembled
+MoE dispatch, and the timings cover the full operator rather than one kernel;
+they do not imply full-model, training-step, or non-B200 speedup.
 
 ### 7. Mixing libraries in a hot eager loop
 Interleaving cuDNN `execute` with cuBLAS/`torch.mm`/other-library calls, op by op, is the
