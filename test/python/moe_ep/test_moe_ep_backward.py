@@ -510,6 +510,7 @@ def test_training_wgrad_data_operands_alias_backward_outputs():
         experts=1,
         hidden=hidden,
         intermediate=intermediate,
+        weight_interleave_size=32,
     )
     exporter._expand_scales = Mock()
 

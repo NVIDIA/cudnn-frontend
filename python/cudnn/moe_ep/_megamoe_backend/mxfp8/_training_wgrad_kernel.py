@@ -25,16 +25,25 @@ class Mxfp8TrainingScaleExpandKernel:
         non_k_size: int,
         expert_count: int,
         source_sf_padding: int,
+        deinterleave_gate_up: int | None = None,
     ) -> None:
         self.non_k_size = int(non_k_size)
         self.expert_count = int(expert_count)
         self.source_sf_padding = int(source_sf_padding)
+        self.deinterleave_gate_up = (
+            None if deinterleave_gate_up is None else int(deinterleave_gate_up)
+        )
         if self.non_k_size <= 0 or self.non_k_size % 128:
             raise ValueError("WGrad scale non-K size must be divisible by 128")
         if self.expert_count <= 0:
             raise ValueError("WGrad scale expansion requires experts")
         if self.source_sf_padding <= 0 or self.source_sf_padding % 128:
             raise ValueError("WGrad source SF padding must be a positive multiple of 128")
+        if (
+            self.deinterleave_gate_up is not None
+            and self.non_k_size != 2 * self.deinterleave_gate_up
+        ):
+            raise ValueError("gate/up scale deinterleave size mismatch")
 
     @cute.jit
     def __call__(
@@ -94,8 +103,38 @@ class Mxfp8TrainingScaleExpandKernel:
                 hidden_atom = relative_atom // target_token_atoms
                 token_atom = relative_atom % target_token_atoms
                 if token_atom < source_token_atoms:
-                    source_atom = source_atom_base + hidden_atom * source_token_atoms + token_atom
-                    value = source[source_atom * Int32(atom_bytes) + byte_in_atom]
+                    source_hidden_atom = hidden_atom
+                    source_byte = byte_in_atom
+                    if cutlass.const_expr(self.deinterleave_gate_up is not None):
+                        lane = byte_in_atom // Int32(16)
+                        byte_tail = byte_in_atom % Int32(16)
+                        group = byte_tail // Int32(4)
+                        column_lane = byte_tail % Int32(4)
+                        feature = hidden_atom * Int32(128) + group * Int32(32) + lane
+                        intermediate = Int32(self.deinterleave_gate_up)
+                        source_feature = Int32(0)
+                        if feature < intermediate:
+                            source_feature = (
+                                feature // Int32(32)
+                            ) * Int32(64) + feature % Int32(32)
+                        else:
+                            up_feature = feature - intermediate
+                            source_feature = (
+                                up_feature // Int32(32)
+                            ) * Int32(64) + Int32(32) + up_feature % Int32(32)
+                        source_hidden_atom = source_feature // Int32(128)
+                        source_feature_in_atom = source_feature % Int32(128)
+                        source_byte = (
+                            (source_feature_in_atom % Int32(32)) * Int32(16)
+                            + (source_feature_in_atom // Int32(32)) * Int32(4)
+                            + column_lane
+                        )
+                    source_atom = (
+                        source_atom_base
+                        + source_hidden_atom * source_token_atoms
+                        + token_atom
+                    )
+                    value = source[source_atom * Int32(atom_bytes) + source_byte]
             target_atom_base += target_atom_count
             source_atom_base += Int32(non_k_atoms) * source_token_atoms
             previous_end = end

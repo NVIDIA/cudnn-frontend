@@ -260,6 +260,11 @@ def build_training_workspace_requirements(
             scale_columns,
         ),
     }
+    if config.weight_interleave_size is None:
+        wgrad_shapes["wgrad_fc1_b"] = (
+            forward.pool_token_capacity,
+            2 * config.intermediate_size,
+        )
 
     for slot in range(slot_count):
         for name in sorted(_FORWARD_SLOT_SYMMETRIC):
@@ -604,6 +609,7 @@ class Mxfp8TrainingSlotViews:
     fc1_col_output_sf: torch.Tensor
     grad_y2: torch.Tensor
     grad_y2_sf: torch.Tensor
+    wgrad_fc1_b: torch.Tensor | None
     wgrad_fc1_sfa: torch.Tensor
     wgrad_fc1_sfb: torch.Tensor
     wgrad_fc2_sfa: torch.Tensor
@@ -651,6 +657,7 @@ class Mxfp8TrainingResourceOwner:
             hidden=config.hidden_size,
             intermediate=config.intermediate_size,
             sf_padding=backward.config.sf_padding_block,
+            weight_interleave_size=config.weight_interleave_size,
         )
         self.beta = torch.ones(
             (config.experts_per_rank,),
@@ -1008,6 +1015,18 @@ class Mxfp8TrainingResourceOwner:
                 local_bytes("grad_y2_sf"),
                 torch.uint8,
                 bwd_shapes["grad_y2_sf"],
+            ),
+            wgrad_fc1_b=(
+                None
+                if config.weight_interleave_size == 32
+                else _typed_k_major_view(
+                    local_bytes("wgrad_fc1_b"),
+                    _DATA_DTYPE,
+                    (
+                        self.forward_prepared.pool_token_capacity,
+                        2 * config.intermediate_size,
+                    ),
+                )
             ),
             wgrad_fc1_sfa=_typed_view(
                 local_bytes("wgrad_fc1_sfa"),

@@ -94,12 +94,13 @@ contract and relaxed atomic accumulation order.
 `MoeEpTrainingWgradOperands` is a fixed-capacity producer ABI. Device
 `expert_offsets` and `valid_route_counts` describe the current valid K extent;
 padding is zeroed. Its data operands alias persistent forward or backward
-outputs, using transpose views where required; exporting them performs no
-full-tensor data copies. Scale operands are expanded into persistent
-grouped-WGrad layouts. FC1 dY data and scales preserve the same 32-element
-gate/up-interleaved row order as W1, so a downstream grouped-WGrad consumer
-writes gradients in parameter storage order. No specific downstream
-grouped-WGrad consumer is guaranteed by this milestone.
+outputs, using transpose views where required. With
+`weight_interleave_size=32`, exporting them performs no full-tensor data
+copies, and FC1 dY data and scales preserve the same 32-element gate/up order
+as W1. With `None`, FC1 dY is copied and deinterleaved to match conventional
+gate-then-up W1 storage. Scale operands are expanded into persistent
+grouped-WGrad layouts. No specific downstream grouped-WGrad consumer is
+guaranteed by this milestone.
 
 ## Overflow policy
 
