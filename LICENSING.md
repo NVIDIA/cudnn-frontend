@@ -27,7 +27,8 @@ owned by NVIDIA. Files are kept under MIT in two cases:
    (yet) been obtained. Determined by `git blame` on `develop`: a file stays
    MIT if any external contributor's lines survive in it.
 2. **Third-party-derived code** — the file is derived from external open
-   source (FlashAttention, QuACK) and carries the original author's copyright.
+   source (FlashAttention, QuACK, or CUTLASS) and carries the original author's
+   copyright.
 
 If/when a listed external contributor grants consent, the files attributed to
 them below can be moved to Apache 2.0 by flipping their SPDX tag.
@@ -103,12 +104,12 @@ surviving external line(s) in each file (blame on `origin/develop`).
 > Note: `dlpack_version.txt` is a plain version-string file that cannot carry
 > a header comment; it is listed here and governed by MIT via this manifest.
 
-## Category 2 — MIT, third-party-derived (29 files)
+## Category 2 — MIT, third-party-derived (36 files)
 
-Derived from FlashAttention (BSD-3-Clause) and/or QuACK (Apache-2.0); they
-retain their original authors' copyright notices. See THIRD_PARTY_LICENSES.txt.
-The commit link(s) are the NVIDIA import commits that introduced the surviving
-derived lines.
+Derived from FlashAttention or CUTLASS (both BSD-3-Clause) and/or QuACK
+(Apache-2.0); they retain their original authors' copyright notices. See
+THIRD_PARTY_LICENSES.txt. The commit link(s) are the NVIDIA import commits that
+introduced the surviving derived lines.
 
 | File | Import commit(s) |
 |------|------------------|
@@ -141,4 +142,10 @@ derived lines.
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/bwd_tile_scheduler.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/mma.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`74efc0d`](https://github.com/NVIDIA/cudnn-frontend/commit/74efc0d44a11005326e797201b58adb1399b4733) (#321) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/primitives.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`7016b04`](https://github.com/NVIDIA/cudnn-frontend/commit/7016b04077c4c53ee00ba39a86ab1067a7542e8c) (#316) |
-
+| `python/cudnn/hstu_attention/_kernels/blackwell_helpers.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/block_info.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/fast_math.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/mask.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/mma_sm100_desc.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/tile_scheduler.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/utils.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |

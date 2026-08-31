@@ -706,7 +706,7 @@ def test_moe_grouped_block_scale_matmul_fwd_reduction_rejects_int32() -> None:
         NotImplementedError,
         match="MoE block-scale reduction supports only fp32 compute/output",
     ):
-        jit_from_cudnn_graph(g, config=cfg, cta_group=1)
+        jit_from_cudnn_graph(g, config=cfg)
 
 
 # Group boundaries NOT multiples of 128: SFA is padded to 128 rows PER GROUP, so
@@ -776,7 +776,7 @@ def test_auto_config_is_accepted_by_the_registry(S, N):
 
     chain = analyze(_build_graph(8, S, N, 512, 8))
     assert chain.has_block_scale and chain.has_moe
-    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
     cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
@@ -787,8 +787,8 @@ def test_auto_config_is_accepted_by_the_registry(S, N):
 # sm107 pipeline (the sm100 grouped pipeline on the 64-byte-K block-scale MMA)
 # ---------------------------------------------------------------------------
 
-_SM107_CFG = "CONFIG_sm107_128x256x128_128x256x64_cluster2x1"
-_SM107_CFG_1CTA = "CONFIG_sm107_128x256x128_128x256x64_cluster1x1"
+_SM107_CFG = "CONFIG_sm100_128x256x128_128x256x64_cluster2x1"
+_SM107_CFG_1CTA = "CONFIG_sm100_128x256x128_128x256x64_cluster1x1"
 
 
 def test_sm107_template_selection_and_arch_gate(monkeypatch) -> None:
@@ -798,18 +798,18 @@ def test_sm107_template_selection_and_arch_gate(monkeypatch) -> None:
     monkeypatch.setattr(C, "_current_arch", lambda: 107)
     chain = analyze(_build_graph(2, 512, 256, 512, num_groups=2))
     for cta_group, cfg_name, want in (
-        (1, _SM107_CFG_1CTA, "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py"),
-        (2, _SM107_CFG, "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py"),
+        (1, _SM107_CFG_1CTA, "sm100_moe_grouped_block_scale_matmul_fwd.py"),
+        (2, _SM107_CFG, "sm100_moe_grouped_block_scale_matmul_fwd.py"),
     ):
         cfg = by_name(cfg_name)
-        tmpl = select_template(chain, cfg, cta_group=cta_group)
+        tmpl = select_template(chain, cfg)
         assert tmpl.file == want
         assert tmpl.accepts(chain, cfg) is None
     # An sm100 config still pairs with the sm100 grouped templates on the same GPU.
-    assert select_template(chain, by_name(_CFG), cta_group=2).file == "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    assert select_template(chain, by_name(_CFG)).file == "sm100_moe_grouped_block_scale_matmul_fwd.py"
     # ... and the sm107 templates are gated off older Blackwell.
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    tmpl = next(t for t in TEMPLATES if t.file == "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py")
+    tmpl = next(t for t in TEMPLATES if t.file == "sm100_moe_grouped_block_scale_matmul_fwd.py")
     assert "107 <= SM < 110" in tmpl.accepts(chain, by_name(_SM107_CFG_1CTA))
 
 
@@ -839,7 +839,7 @@ def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
     # M block and SFB is walked across N blocks (they only differ once a block
     # count exceeds one, i.e. at cta_m/cta_n = 256).
     cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
-    name = f"CONFIG_sm107_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
+    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
     _run_e2e(E=4, S=512, N=256, K=256, offsets_list=[0, 128, 256, 384], combo=combo, config_name=name, cta_group=cta_group)
 
 

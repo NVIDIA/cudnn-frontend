@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import torch
 import cudnn
 
@@ -105,12 +106,14 @@ def compute_ref(q, k, v, attn_scale,
 
         NEG_INF = float('-inf')
         is_first = (m_old == NEG_INF)
-        exceeds_threshold = (m_block - m_old > rescale_threshold)
+        # The kernel's online softmax runs in the log2 domain, so the rescale
+        # threshold is in log2 units.
+        exceeds_threshold = (m_block - m_old > rescale_threshold * math.log(2))
         should_update = is_first | exceeds_threshold
         m_new = torch.where(should_update, m_block, m_old)
 
         exp_input = m_old - m_new
-        needs_correction = (exp_input < -rescale_threshold)
+        needs_correction = (exp_input < -rescale_threshold * math.log(2))
         correction = torch.where(needs_correction, torch.exp(exp_input), torch.ones_like(exp_input))
         correction = correction.nan_to_num()
 
@@ -147,7 +150,8 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          o_descale, dO_descale,
                          torch_otype,
                          padding=None, bias=None,
-                         left_bound=None, right_bound=None, diag_align=None, sink_token=None):
+                         left_bound=None, right_bound=None, diag_align=None, sink_token=None,
+                         stats=None):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax)."""
     b, s_q, h_q, d_qk = q.shape
@@ -208,9 +212,14 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
             swa_mask.tril_(diagonal=-1 * left_bound + (s_kv - s_q))
         s = s.masked_fill(swa_mask, float('-inf'))
 
-    # If sink_token is present, prepend it as a virtual attention score
+    # The backward kernel does not renormalize: it recomputes P = exp(S - stats)
+    # from the forward's log-sum-exp, which already accounts for the sink.
     p_sink = None
-    if sink_token is not None:
+    if stats is not None:
+        p = torch.exp(s - stats).nan_to_num()
+        if sink_token is not None:
+            p_sink = torch.exp(sink_token.float().expand(b, h_q, s_q, 1) - stats).nan_to_num()
+    elif sink_token is not None:
         sink_expanded = sink_token.float().expand(b, h_q, s_q, 1)
         s_extended = torch.cat([sink_expanded, s], dim=-1)
         p_extended = s_extended.softmax(dim=-1).nan_to_num()

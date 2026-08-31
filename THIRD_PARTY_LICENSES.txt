@@ -44,8 +44,9 @@ SOFTWARE.
 
 Portions of the CuTe DSL attention kernels under
 python/cudnn/block_sparse_attention/ and
-python/cudnn/deepseek_sparse_attention/ are derived from FlashAttention.
-Those files retain their original author copyright notices
+python/cudnn/deepseek_sparse_attention/, along with selected low-level
+utilities under python/cudnn/hstu_attention/_kernels/, are derived from
+FlashAttention. Those files retain their original author copyright notices
 (Tri Dao; Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
 Pradeep Ramani, Tri Dao; Wentao Guo, Ted Zadouri, Tri Dao; and external
 contributor Jerry Chen) in their file headers.
@@ -89,9 +90,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Portions of the CuTe DSL GEMM kernels under python/cudnn/ (gemm/cutedsl/*
 covering the dense, grouped, and discrete_grouped families,
 native_sparse_attention, and related utilities) are derived from CUTLASS
-CuTe DSL examples. CUTLASS
-is also consumed at runtime as the nvidia-cutlass-dsl PyPI package
-(optional dependency).
+CuTe DSL examples. The descriptor definitions in
+python/cudnn/hstu_attention/_kernels/mma_sm100_desc.py are ported from CUTLASS
+C++ headers. CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
+package (optional dependency).
 
 License: BSD 3-Clause License
 

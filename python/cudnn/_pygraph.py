@@ -291,9 +291,13 @@ class pygraph:
         name: str = "",
         uid: Optional[int] = None,
         ragged_offset_multiplier: int = 1,
+        alignment_value: int = 1,
         **kwargs,
     ) -> Tensor:
-        """Create a tensor."""
+        """Create a tensor.
+
+        `alignment_value` promises every VALUE the tensor holds is a multiple of
+        it; it constrains the contents, not the layout, and is not validated."""
         if not name:
             name = f"tensor_{len(self._tensors)}"
         if data_type is not None and getattr(data_type, "name", None) == "NOT_SET":
@@ -330,6 +334,7 @@ class pygraph:
             ragged_offset=ragged_offset,
             reordering_type=reordering_type,
             ragged_offset_multiplier=ragged_offset_multiplier,
+            alignment_value=alignment_value,
             uid=uid if uid is not None else self._alloc_uid(),
             uid_assigned=uid is not None,
             dim_assigned=True,  # graph inputs: the user specified the layout

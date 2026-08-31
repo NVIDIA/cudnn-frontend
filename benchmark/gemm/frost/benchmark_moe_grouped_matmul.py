@@ -28,8 +28,10 @@ from cudnn.gemm.frost.fusion_ir import (
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    add_fto_alignment_arg,
     add_sweep_args,
     find_cublas_time,
+    fto_alignment,
     group_offsets,
     kernel_match_token,
     nsys_run_and_parse,
@@ -52,7 +54,7 @@ def _vp_moe(handles, token, weight, fto, output):
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
     _, cta_group = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 def _build_spec_map():
@@ -74,8 +76,8 @@ def _build_spec_map():
     )
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -86,7 +88,7 @@ _SPEC_MAP = _build_spec_map()
 # ---------------------------------------------------------------------------
 
 
-def _graph_moe(S: int, N: int, K: int, E: int):
+def _graph_moe(S: int, N: int, K: int, E: int, alignment: int = 1):
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -109,6 +111,7 @@ def _graph_moe(S: int, N: int, K: int, E: int):
         dim=[E, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
+        alignment_value=alignment,
     )
     out = g.moe_grouped_matmul(
         tok,
@@ -170,12 +173,13 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
+def _nsys_worker(shape, configs, warmup, iters, nbuf, fto_align_spec) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
     S, E = G * M, G
     wtok, ww, wout = _mkdata(S, N, K, E)  # dedicated warmup buffer
     pool = _mkdata_pool(S, N, K, E, nbuf)  # rotation pool for timed iters
     offsets = group_offsets(S, E)
+    alignment = fto_alignment(fto_align_spec, offsets)
     print(f"[worker] shape G={G} M={M} N={N} K={K} (S={S}), configs={len(configs)}, " f"warmup={warmup}, iters={iters}, rotate_buffers={nbuf}")
 
     # 1. cuBLAS baseline — batched GEMM.
@@ -193,7 +197,7 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
         if cfg is None:
             continue
         try:
-            g, h = _graph_moe(S, N, K, E)
+            g, h = _graph_moe(S, N, K, E, alignment)
             plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
                 plan(_vp_moe(h, wtok, ww, offsets, wout))
@@ -219,6 +223,7 @@ def main() -> int:
         help="G,M,N,K (groups × per-group-M × N × K; default " "8,512,4096,4096 → S=G*M=4096 tokens)",
     )
     add_sweep_args(parser)
+    add_fto_alignment_arg(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -235,7 +240,7 @@ def main() -> int:
 
     if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, args.fto_alignment)
         return 0
 
     flops = 2 * S * N * K
@@ -256,7 +261,18 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        inner_args = ["--shape", args.shape, "--warmup", str(args.warmup), "--iters", str(args.iters), "--rotate-buffers", str(nbuf)]
+        inner_args = [
+            "--shape",
+            args.shape,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+            "--fto-alignment",
+            str(args.fto_alignment),
+        ]
         if config_names:
             inner_args += ["--configs", ",".join(config_names)]
         kern_times = nsys_run_and_parse(__file__, inner_args, tag="bench_moe")
@@ -290,6 +306,7 @@ def main() -> int:
         wtok, ww, wout = _mkdata(S, N, K, E)
         pool = _mkdata_pool(S, N, K, E, nbuf)
         offsets = group_offsets(S, E)
+        alignment = fto_alignment(args.fto_alignment, offsets)
         if args.stream:
             print("  ▶ running cuBLAS reference ...", flush=True)
         cublas_ms = timer(
@@ -317,7 +334,7 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g, h = _graph_moe(S, N, K, E)
+                    g, h = _graph_moe(S, N, K, E, alignment)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
                         rotating(

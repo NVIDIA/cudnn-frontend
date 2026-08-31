@@ -30,10 +30,10 @@ def test_analytic_selection_is_always_runnable(block_scale):
     for M in MS:
         for N in NS:
             for K in KS:
-                cfg, cta_group = select_config(M, N, 1, K=K, block_scale=block_scale)
+                cfg = select_config(M, N, 1, K=K, block_scale=block_scale)
                 assert by_name(cfg.name) is cfg, f"{cfg.name} not in CATALOG"
-                if cta_group == 2:
-                    assert cfg.cgrp_size_m % 2 == 0, f"2-CTA needs even cluster M: {cfg.name}"
+                if cfg.cta_group == 2:
+                    assert cfg.cga_size_m % 2 == 0, f"2-CTA needs even cluster M: {cfg.name}"
                 if block_scale:
                     assert cfg.cta_tile_m % 128 == 0 and cfg.cta_tile_n % 128 == 0
 
@@ -44,10 +44,10 @@ def test_omitting_k_is_accepted():
     for M in MS:
         for N in NS:
             for num_gemms in (1, 2, 4):
-                cfg, cta_group = select_config(M, N, num_gemms)
+                cfg = select_config(M, N, num_gemms)
                 assert by_name(cfg.name) is cfg
-                if cta_group == 2:
-                    assert cfg.cgrp_size_m % 2 == 0
+                if cfg.cta_group == 2:
+                    assert cfg.cga_size_m % 2 == 0
 
 
 def test_multi_gemm_budget_and_constraints():
@@ -57,9 +57,9 @@ def test_multi_gemm_budget_and_constraints():
     for ng in (2, 4, 8):
         cap = max(32, min(256, 256 // ng))
         for M in (64, 512, 4096):
-            cfg, cta_group = select_config(M, 8192, ng, K=4096)
+            cfg = select_config(M, 8192, ng, K=4096)
             assert cfg.cta_tile_n <= cap
-            assert cta_group == 1, "multi-GEMM is 1ctamma-only"
+            assert cfg.cta_group == 1, "multi-GEMM is 1ctamma-only"
 
 
 def test_n_major_b_lifts_the_n_tile():
@@ -68,8 +68,8 @@ def test_n_major_b_lifts_the_n_tile():
     for eb in (1, 2):
         group_elems = 128 // eb
         for M in (64, 512):
-            cfg, cta_group = select_config(M, 8192, 1, K=4096, b_n_major=True, b_elem_bytes=eb)
-            assert cfg.cta_tile_n % (group_elems * cta_group) == 0
+            cfg = select_config(M, 8192, 1, K=4096, b_n_major=True, b_elem_bytes=eb)
+            assert cfg.cta_tile_n % (group_elems * cfg.cta_group) == 0
 
 
 def test_a_new_pipeline_must_register_its_hardware_facts():

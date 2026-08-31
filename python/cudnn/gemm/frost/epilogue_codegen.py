@@ -240,17 +240,17 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
 
     if op.op in _CMP_OPS:
         if op.op == "cmp_le":
-            l, v = _step01(f"{b} - {a}", f"_{idx}")
-            return lines + l + [f"{new} = {v}"], new
+            step, v = _step01(f"{b} - {a}", f"_{idx}")
+            return lines + step + [f"{new} = {v}"], new
         if op.op == "cmp_ge":
-            l, v = _step01(f"{a} - {b}", f"_{idx}")
-            return lines + l + [f"{new} = {v}"], new
+            step, v = _step01(f"{a} - {b}", f"_{idx}")
+            return lines + step + [f"{new} = {v}"], new
         if op.op == "cmp_lt":
-            l, v = _step01(f"{a} - {b}", f"_{idx}")
-            return lines + l + [f"{new} = {_fl(a, 1.0)} - {v}"], new
+            step, v = _step01(f"{a} - {b}", f"_{idx}")
+            return lines + step + [f"{new} = {_fl(a, 1.0)} - {v}"], new
         if op.op == "cmp_gt":
-            l, v = _step01(f"{b} - {a}", f"_{idx}")
-            return lines + l + [f"{new} = {_fl(a, 1.0)} - {v}"], new
+            step, v = _step01(f"{b} - {a}", f"_{idx}")
+            return lines + step + [f"{new} = {_fl(a, 1.0)} - {v}"], new
         l1, v1 = _step01(f"{a} - {b}", f"_{idx}e1")
         l2, v2 = _step01(f"{b} - {a}", f"_{idx}e2")
         if op.op == "cmp_eq":
@@ -645,7 +645,6 @@ def _emit_tap_store(
     stride,
     vsize: int,
     offset_expr: str = "linear_idx",
-    spec_idx: int = 0,
     *,
     row_pred: str | None = None,
 ) -> list[str]:
@@ -677,12 +676,12 @@ def _reduction_output_offset_expr(red_idx: int, red: ReductionSpec, value_idx: s
     internal `(M, N, B)` order; the runtime wrapper passes matching strides."""
     b_extent, m_extent, n_extent = red.dim
     if red.grouped_by_moe:
-        l = "cutlass.Int64(group_idx)"
+        batch = "cutlass.Int64(group_idx)"
     else:
-        l = "cutlass.Int64(0)" if b_extent == 1 else "tile_l"
+        batch = "cutlass.Int64(0)" if b_extent == 1 else "tile_l"
     m = "cutlass.Int64(0)" if m_extent == 1 else "row"
     n = "cutlass.Int64(0)" if n_extent == 1 else f"(col_j + {value_idx})"
-    return f"(({m}) * red_stride_m_{red_idx} + " f"({n}) * red_stride_n_{red_idx} + " f"({l}) * red_stride_l_{red_idx})"
+    return f"(({m}) * red_stride_m_{red_idx} + " f"({n}) * red_stride_n_{red_idx} + " f"({batch}) * red_stride_l_{red_idx})"
 
 
 def _emit_reduction_local_combine(
@@ -952,6 +951,35 @@ def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: s
     ]
 
 
+def _emit_scale_quantize_pair(p: str, a: tuple[str, str, str, str], b: tuple[str, str, str, str], quant: BlockQuantizeSpec) -> list[str]:
+    """:func:`_emit_scale_quantize` for two scales at once. Each tuple is
+    ``(suffix, src, scale_var, back_var)``. The cvt unit is x2, so a scale
+    dtype that reaches it through the generated helpers converts both columns
+    in one instruction; e4m3 goes through the DSL cast and falls back to two."""
+    scale_dtype = _scale_store_dtype(quant.scale_dtype)
+    if quant.scale_dtype not in ("fp8_e8m0", "fp8_e5m3"):
+        return _emit_scale_quantize(p, *a, quant) + _emit_scale_quantize(p, *b, quant)
+    (sa, srca, scalea, backa), (sb, srcb, scaleb, backb) = a, b
+    fn = "_frost_cvt_f32_to_e8m0_bits" if quant.scale_dtype == "fp8_e8m0" else "_frost_cvt_f32_to_e5m3_bits"
+    lines = [
+        f"{p}_qw{sa} = {fn}_x2({srca}, {srcb})",
+        f"{p}_qb{sa} = {p}_qw{sa} & 0xFF",
+        f"{p}_qb{sb} = ({p}_qw{sa} >> 8) & 0xFF",
+    ]
+    if quant.scale_dtype == "fp8_e8m0":
+        return lines + [
+            f"{scalea} = (({p}_qb{sa}).to(cutlass.Int8)).bitcast({scale_dtype})",
+            f"{backa} = ({p}_qb{sa} << 23).bitcast(cutlass.Float32)",
+            f"{scaleb} = (({p}_qb{sb}).to(cutlass.Int8)).bitcast({scale_dtype})",
+            f"{backb} = ({p}_qb{sb} << 23).bitcast(cutlass.Float32)",
+        ]
+    return lines + [
+        f"{scalea} = ({p}_qb{sa}).to({scale_dtype})",
+        f"{scaleb} = ({p}_qb{sb}).to({scale_dtype})",
+        f"{backa}, {backb} = _frost_e5m3_bits_to_f32_x2({p}_qb{sa}, {p}_qb{sb})",
+    ]
+
+
 def _emit_block_quant_col(
     quant: BlockQuantizeSpec,
     quant_idx: int,
@@ -988,8 +1016,8 @@ def _emit_block_quant_col(
     for k in range(n_groups):
         lines.append(f"{p}_scale_mine_{k} = (cutlass.Float32(0.0)).to({scale_dtype})")
     # Columns are processed in batches of 4 warp reductions issued
-    # back-to-back so their latencies overlap; the per-column scale chains
-    # stay scalar to keep register liveness bounded.
+    # back-to-back so their latencies overlap; only adjacent PAIRS share an
+    # instruction, so register liveness stays bounded by the batch.
     for b0 in range(0, vsize, 4):
         nb = min(4, vsize - b0)
         cols = range(b0, b0 + nb)
@@ -1008,15 +1036,26 @@ def _emit_block_quant_col(
                 )
             else:
                 lines.append(f'{p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", abs=True)')
-        for i in cols:
-            lines.append(f"{p}_s{i} = {p}_a{i} * {p}_rl")
-            lines.extend(_emit_scale_quantize(p, str(i), f"{p}_s{i}", f"{p}_q{i}", f"{p}_u{i}", quant))
+        for i in range(b0, b0 + nb, 2):
+            j = i + 1
+            lines.append(f'{p}_s{i}, {p}_s{j} = cute.arch.mul_packed_f32x2(({p}_a{i}, {p}_a{j}), ({p}_rl, {p}_rl), rnd="rn", ftz=False)')
+            lines.extend(
+                _emit_scale_quantize_pair(
+                    p,
+                    (str(i), f"{p}_s{i}", f"{p}_q{i}", f"{p}_u{i}"),
+                    (str(j), f"{p}_s{j}", f"{p}_q{j}", f"{p}_u{j}"),
+                    quant,
+                )
+            )
             lines.extend(
                 [
                     f"{p}_i{i} = cute.math.min(cute.arch.rcp_approx({p}_u{i}), cutlass.Float32(3.402823466e38))",
-                    f"{p}_out[{i}] = {p}_src[{i}] * {p}_i{i}",
+                    f"{p}_i{j} = cute.math.min(cute.arch.rcp_approx({p}_u{j}), cutlass.Float32(3.402823466e38))",
+                    f'{p}_out[{i}], {p}_out[{j}] = cute.arch.mul_packed_f32x2(({p}_src[{i}], {p}_src[{j}]), ({p}_i{i}, {p}_i{j}), rnd="rn", ftz=False)',
                     f"if ({p}_lane % {G}) == {i % G}:",
                     f"    {p}_scale_mine_{i // G} = {p}_q{i}",
+                    f"if ({p}_lane % {G}) == {j % G}:",
+                    f"    {p}_scale_mine_{j // G} = {p}_q{j}",
                 ]
             )
     lines.extend(
@@ -1122,8 +1161,11 @@ def _emit_block_quant(
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
         lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
         lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
-        for e in range(bs):
-            lines.append(f"{p}_out[{base + e}] = {p}_src[{base + e}] * {p}_inv{k}")
+        for e in range(0, bs, 2):
+            lines.append(
+                f"{p}_out[{base + e}], {p}_out[{base + e + 1}] = cute.arch.mul_packed_f32x2("
+                f'({p}_src[{base + e}], {p}_src[{base + e + 1}]), ({p}_inv{k}, {p}_inv{k}), rnd="rn", ftz=False)'
+            )
     lines.extend(
         [
             f"{p}_vec = {p}_out.load().to_vector()",
@@ -1434,7 +1476,7 @@ def generate(
                 body_lines.append(f"if ({store_row_pred}) & (col_j + {vsize} <= N):")
                 body_lines.append(f"    {_st}")
         else:
-            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, si, row_pred=store_row_pred))
+            body_lines.extend(_emit_tap_store(tap_idx, src, spec.dtype, chain, spec.dim, spec.stride, vsize, offset_expr, row_pred=store_row_pred))
 
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)

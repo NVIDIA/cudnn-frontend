@@ -338,7 +338,12 @@ def _frost_dswiglu(dout2, Wd, gate, up):
             tn = 256 if interm >= 256 else 128
             cta_group = 2 if M > 128 else 1
             cluster_m = 2 if cta_group == 2 else 1
-            cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, cluster_m, 1))
+            cfg = next(
+                c
+                for c in CATALOG
+                if (c.pipeline, c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cga_size_m, c.cga_size_n, c.cta_group)
+                == ("sm100", 128, tn, 128, cluster_m, 1, cta_group)
+            )
             g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
             DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
             # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
@@ -349,7 +354,7 @@ def _frost_dswiglu(dout2, Wd, gate, up):
             dh = g.matmul(A=DY, B=WD, name="dgrad")
             g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
             g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+            compiled = jit_from_cudnn_graph(g, config=cfg)
             bd = compiled.binding
             out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
             aux_by = {a.get_name(): a for a in bd.aux}
