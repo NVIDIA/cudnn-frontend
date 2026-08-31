@@ -678,10 +678,10 @@ def _geom_sm120(
     )
 
 
-
 _SM120_SMEM_CAP_BYTES = 99 * 1024
 _SM120_SMEM_FIXED_RESERVE = 2048  # kernel_registry's default smem_fixed_reserve
 _SM120_STG_STAGE_ELEMS = 528  # f32 staging elems per compute warp (template _STG_EPI_WARP_ELEMS)
+
 
 def _sm120_smem_feasible(cta_m: int, cta_n: int, kb: int, num_compute_warps: int) -> bool:
     per_stage = (cta_m + cta_n) * kb + 16
