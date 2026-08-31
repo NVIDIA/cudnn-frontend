@@ -2015,7 +2015,7 @@ def test_execute_from_a_thread_with_no_cuda_context(backend, variant):
             # batch_invariant skips the split-K table launch that would bind a context first
             o, _ = pinned_op(backend, variant)(*args, case.cu, batch_invariant=True)
             seen["o"] = o.detach().clone()
-            seen["dq"] = torch.autograd.grad([o], leaves, [dO])[0]
+            seen["grads"] = torch.autograd.grad([o], leaves, [dO])
         except BaseException as exc:  # noqa: BLE001
             seen["exc"] = exc
         seen["after"] = int(drv.cuCtxGetCurrent()[1])
@@ -2031,9 +2031,10 @@ def test_execute_from_a_thread_with_no_cuda_context(backend, variant):
     # the cold thread must not just survive, it must compute what the warm one does
     with waive_unsupported(backend, variant):
         o_warm, _ = pinned_op(backend, variant)(*args, case.cu, batch_invariant=True)
-        (dq_warm,) = torch.autograd.grad([o_warm], leaves, [dO])
+        grads_warm = torch.autograd.grad([o_warm], leaves, [dO])
     assert_bitwise("o", seen["o"], o_warm)
-    assert_bitwise("dQ", seen["dq"], dq_warm)
+    for name, cold, warm in zip(("dQ", "dK"), seen["grads"], grads_warm):
+        assert_bitwise(name, cold, warm)
 
 
 # ---------------------------------------------------------------------------

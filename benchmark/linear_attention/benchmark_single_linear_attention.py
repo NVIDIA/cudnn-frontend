@@ -448,8 +448,9 @@ else:
         run_fwd = True
         run_bwd = False
     dtype_by_name = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
-    gate_dtype = target_dtype if args.variant == "kda" else torch.float32
-    beta_dtype = torch.float32 if args.variant == "gdn" else target_dtype
+    narrow_kda_gates = args.variant == "kda" and args.la_backend != "fla"
+    gate_dtype = target_dtype if narrow_kda_gates else torch.float32
+    beta_dtype = target_dtype if (narrow_kda_gates or args.variant == "gdn2") else torch.float32
     state_dtype = torch.float32
     if args.gate_data_type != "auto":
         gate_dtype = dtype_by_name[args.gate_data_type]
@@ -462,7 +463,10 @@ else:
     if args.la_backend == "flash_qla" and gate_dtype is not torch.float32 and run_bwd:
         raise ValueError("flash_qla's backward asserts an fp32 dg")
     if args.la_backend == "fla" and (args.initial_state or args.store_on) and state_dtype is not torch.float32:
-        raise ValueError(f"fla's chunk_{args.variant} asserts an fp32 initial_state")
+        if args.variant != "gdn":
+            raise ValueError(f"fla's chunk_{args.variant} asserts an fp32 initial_state")
+        if run_bwd:
+            raise ValueError("fla's chunk_gated_delta_rule hands back an fp32 d_initial_state")
 
     # Parse input arguments
     num_iters = args.num_iterations
