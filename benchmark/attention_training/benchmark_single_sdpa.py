@@ -1809,14 +1809,21 @@ else:
                 or "(anonymous namespace)::" in item.key
                 or item.key.startswith("fmha_")
             ]
+            # "No events at all" is the wrong test for a dead CUPTI: even a
+            # healthy profiler reports runtime-API entries (cudaMalloc,
+            # cudaLaunchKernel, ...) that carry device_time == 0 alongside the
+            # real kernel activity. Distinguish on DEVICE time, so that a run
+            # which recorded kernels but matched no name filter still raises
+            # below instead of being silently re-timed as a wider region.
+            device_events = [item for item in prof.key_averages() if item.device_time > 0]
             if len(matched_kernels) >= 1:
                 fwd_time = sum(item.device_time for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
-            elif not prof.key_averages():
-                # A silently-empty profiler must never ship as a 0.000 ms
-                # row. CUPTI could not attach here, so switch the whole run to
-                # CUDA-event timing and say so loudly.
+            elif not device_events:
+                # No device time was recorded at all -> CUPTI could not attach.
+                # Switch the whole run to CUDA-event timing and say so loudly;
+                # a silently-empty profiler must never ship as a 0.000 ms row.
                 _EVENT_TIMING = True
                 print(
                     "WARNING: CUPTI unavailable on this device - falling back to CUDA-event timing. "
