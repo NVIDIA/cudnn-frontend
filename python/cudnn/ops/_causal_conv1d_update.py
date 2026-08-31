@@ -17,6 +17,24 @@ def _normalize_activation(activation: Optional[str]) -> str:
     raise ValueError("activation must be None, 'identity', 'silu', or 'swish', " f"got {activation!r}")
 
 
+def _validate_x_stride(x: Tensor) -> None:
+    """Validate the native BF16 ``[N, D]`` row-strided input contract.
+
+    Compact rows retain the legacy behavior for every channel count.  Padded
+    rows are admitted only when every row begins at a 16-byte boundary; BF16
+    therefore requires an eight-element-aligned leading dimension.
+    """
+
+    n_channels = x.shape[1]
+    row_stride, channel_stride = x.stride()
+    if channel_stride != 1:
+        raise ValueError(f"x must have row-major strides (ld, 1), got {tuple(x.stride())}")
+    if row_stride < n_channels:
+        raise ValueError(f"x row stride ld must be at least D={n_channels}, got ld={row_stride}")
+    if row_stride > n_channels and row_stride % 8 != 0:
+        raise ValueError("padded x rows must start at 16-byte-aligned BF16 addresses " f"(ld % 8 == 0), got D={n_channels}, ld={row_stride}")
+
+
 def _validate_semantic_contract(
     x: Tensor,
     conv_state: Tensor,
@@ -66,7 +84,9 @@ def _validate_semantic_contract(
             continue
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must have dtype torch.bfloat16, got {tensor.dtype}")
-        if not tensor.is_contiguous():
+        if name == "x":
+            _validate_x_stride(tensor)
+        elif not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
         if tensor.device != x.device:
             raise ValueError(f"{name} must be on {x.device}, got {tensor.device}")
@@ -223,7 +243,10 @@ def causal_conv1d_update(
     select the same compile-time SiLU specialization.
 
     Args:
-        x: Contiguous CUDA BF16 tensor with shape ``[N, D]``.
+        x: CUDA BF16 tensor with shape ``[N, D]`` and strides ``(ld, 1)``.
+            Compact ``ld == D`` is supported for every ``D``. Padded
+            ``ld > D`` must be divisible by eight so each BF16 row starts at a
+            16-byte-aligned address.
         conv_state: Contiguous CUDA BF16 tensor with shape ``[S, D, L]``, where
             ``L >= W - 1``.
         weight: Contiguous CUDA BF16 tensor with shape ``[D, W]``.

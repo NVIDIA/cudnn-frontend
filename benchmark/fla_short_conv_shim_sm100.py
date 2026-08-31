@@ -24,7 +24,9 @@ arms pass full-output FP32-reference, bitwise-state, cache-identity, and cross
 implementation gates.  The timed Qwen decode layout is ``[N, 1, D]`` for
 ``N={1,8,32,128}``, ``D={6144,8192,10240,12288,20480}``, and ``W=4``.  These
 are the fused-QKV channel counts used by published Qwen3.5/Qwen3.8 models;
-Q, K, and V are split only after the convolution.  The other admitted input
+Q, K, and V are split only after the convolution.  Optional ``D:ld`` leading
+dimensions reproduce zero-copy slices from a wider fused projection and feed
+the exact same row-strided view to FLA and the shim.  The other admitted input
 layouts, ``[N,D]`` and ``[1,N,D]``, receive additional correctness/route smoke
 coverage at ``D=8192``.
 """
@@ -56,6 +58,16 @@ import fla.modules.conv.triton.ops as fla_ops
 DEFAULT_SHAPES = _base.DEFAULT_SHAPES
 SMOKE_N = 8
 SMOKE_D = 8192
+
+
+def _parse_leading_dimension(value: str) -> tuple[int, int]:
+    try:
+        n_channels, leading_dimension = (int(piece) for piece in value.split(":", maxsplit=1))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("leading dimension must be D:ld, for example 5120:8240") from exc
+    if n_channels <= 0 or leading_dimension < n_channels:
+        raise argparse.ArgumentTypeError(f"leading dimension must satisfy D > 0 and ld >= D, got D={n_channels}, ld={leading_dimension}")
+    return n_channels, leading_dimension
 
 
 class EagerArm(NamedTuple):
@@ -125,18 +137,48 @@ def _make_inputs(
     *,
     layout: str,
     seed: int,
+    leading_dimension: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
-    flat_x = torch.randn((n_rows, n_channels), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
-    if layout == "N1D":
-        x = flat_x.view(n_rows, 1, n_channels)
-    elif layout == "ND":
-        x = flat_x
-    elif layout == "1ND":
-        x = flat_x.view(1, n_rows, n_channels)
+    leading_dimension = n_channels if leading_dimension is None else leading_dimension
+    if leading_dimension < n_channels:
+        raise ValueError(f"leading dimension must be at least D={n_channels}, got ld={leading_dimension}")
+    if leading_dimension != n_channels and layout != "N1D":
+        raise ValueError("row-strided timed inputs currently require the N1D layout")
+
+    if layout == "N1D" and leading_dimension != n_channels:
+        # Mirror a prefix slice from Megatron's wider [1,N,ld] fused
+        # projection.  Transpose produces [N,1,ld]; slicing the logical D
+        # channels then normalizes to the exact FE stride (ld,1) with no copy.
+        storage = (
+            torch.randn(
+                (1, n_rows, leading_dimension),
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.25
+        )
+        x = storage.transpose(0, 1)[..., :n_channels]
     else:
-        raise ValueError(f"unknown layout {layout!r}")
+        flat_x = (
+            torch.randn(
+                (n_rows, n_channels),
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.25
+        )
+        if layout == "N1D":
+            x = flat_x.view(n_rows, 1, n_channels)
+        elif layout == "ND":
+            x = flat_x
+        elif layout == "1ND":
+            x = flat_x.view(1, n_rows, n_channels)
+        else:
+            raise ValueError(f"unknown layout {layout!r}")
     weight = torch.randn((n_channels, 4), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
     initial_state = torch.randn((n_rows, n_channels, 4), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.25
     return x, weight, initial_state
@@ -251,8 +293,15 @@ def _benchmark_shape(
     samples: int,
     warmup: int,
     seed: int,
+    leading_dimension: int,
 ) -> dict:
-    x, weight, initial_state = _make_inputs(n_rows, n_channels, layout="N1D", seed=seed)
+    x, weight, initial_state = _make_inputs(
+        n_rows,
+        n_channels,
+        layout="N1D",
+        seed=seed,
+        leading_dimension=leading_dimension,
+    )
     reference_output, reference_state = _reference_for_layout(x, weight, initial_state)
 
     shim_graph_state = initial_state.clone()
@@ -352,7 +401,17 @@ def _benchmark_shape(
     eager_paired = [fla_us / shim_us for shim_us, fla_us in zip(shim_eager_samples, fla_eager_samples, strict=True)]
 
     return {
-        "shape": {"layout": "N1D", "x": list(x.shape), "N": n_rows, "D": n_channels, "W": 4},
+        "shape": {
+            "layout": "N1D",
+            "x": list(x.shape),
+            "x_stride": list(x.stride()),
+            "normalized_x_stride": list(x.view(n_rows, n_channels).stride()),
+            "leading_dimension": leading_dimension,
+            "data_pointer_mod_16": x.data_ptr() % 16,
+            "N": n_rows,
+            "D": n_channels,
+            "W": 4,
+        },
         "correctness": {"graph": graph_correctness, "eager": eager_correctness},
         "graph_replay_us": {
             "shim": {**shim_graph_summary, "samples_us": shim_graph_samples},
@@ -543,6 +602,14 @@ def main() -> None:
         type=_base._parse_shape,
         help="N x D; repeat for multiple timed N1D shapes (default: Qwen decode matrix)",
     )
+    parser.add_argument(
+        "--leading-dimension",
+        action="append",
+        type=_parse_leading_dimension,
+        default=[],
+        metavar="D:LD",
+        help=("use row stride LD for every timed shape with logical width D; " "repeat for multiple widths (default: compact LD=D)"),
+    )
     parser.add_argument("--samples", type=int, default=51, help="timed samples per arm, metric, and shape")
     parser.add_argument("--warmup", type=int, default=10, help="warm calls/replays before measurement")
     parser.add_argument("--seed", type=int, default=20260828)
@@ -553,6 +620,16 @@ def main() -> None:
     if args.warmup < 1:
         parser.error("--warmup must be positive")
     shapes = tuple(args.shape) if args.shape else DEFAULT_SHAPES
+    leading_dimensions = {}
+    for n_channels, leading_dimension in args.leading_dimension:
+        if n_channels in leading_dimensions:
+            parser.error(f"duplicate --leading-dimension for D={n_channels}")
+        if leading_dimension > n_channels and leading_dimension % 8 != 0:
+            parser.error(f"padded leading dimension must be divisible by 8 BF16 elements, got D={n_channels}, ld={leading_dimension}")
+        leading_dimensions[n_channels] = leading_dimension
+    unused_leading_dimensions = set(leading_dimensions) - {n_channels for _, n_channels in shapes}
+    if unused_leading_dimensions:
+        parser.error("--leading-dimension provided for widths absent from --shape: " + ", ".join(str(value) for value in sorted(unused_leading_dimensions)))
 
     _validate_environment()
     repo = Path(__file__).resolve().parents[1]
@@ -571,6 +648,7 @@ def main() -> None:
             "seed": args.seed,
             "timed_layout": "N1D",
             "shapes": [list(shape) for shape in shapes],
+            "leading_dimensions": {str(n_channels): leading_dimensions.get(n_channels, n_channels) for n_channels in sorted({shape[1] for shape in shapes})},
             "smoke": {"layouts": ["ND", "1ND"], "N": SMOKE_N, "D": SMOKE_D, "W": 4},
         }
         result["layout_smoke"] = [
@@ -587,6 +665,7 @@ def main() -> None:
                 samples=args.samples,
                 warmup=args.warmup,
                 seed=args.seed + shape_index,
+                leading_dimension=leading_dimensions.get(n_channels, n_channels),
             )
             result["results"].append(row)
     finally:
@@ -602,8 +681,9 @@ def main() -> None:
     # was restored, so a partial/failed run cannot be mistaken for a result.
     for row in result["results"]:
         n_rows, n_channels = row["shape"]["N"], row["shape"]["D"]
+        leading_dimension = row["shape"]["leading_dimension"]
         print(
-            f"N={n_rows:3d} D={n_channels:4d}: "
+            f"N={n_rows:3d} D={n_channels:5d} ld={leading_dimension:5d}: "
             f"graph shim={row['graph_replay_us']['shim']['median_us']:.3f} us, "
             f"FLA={row['graph_replay_us']['fla']['median_us']:.3f} us, "
             f"paired={row['graph_replay_us']['paired_fla_over_shim']['median']:.3f}x; "

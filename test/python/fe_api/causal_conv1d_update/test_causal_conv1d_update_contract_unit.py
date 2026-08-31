@@ -49,6 +49,14 @@ def _inputs(*, n_rows=2, n_channels=8, n_slots=3, state_len=4, indexed=True):
     return x, weight, state, output, indices
 
 
+def _row_strided_x(n_rows, n_channels, row_stride):
+    return torch.empty_strided(
+        (n_rows, n_channels),
+        (row_stride, 1),
+        dtype=torch.bfloat16,
+    ).zero_()
+
+
 def _metadata_desc(tensor):
     if tensor is None:
         return None
@@ -197,6 +205,41 @@ def test_semantic_shape_contract_is_not_hard_coded_to_width_four():
     )
 
 
+@pytest.mark.parametrize(
+    "n_channels,row_stride",
+    [(7, 7), (10, 10), (10, 16)],
+    ids=["compact-unaligned-row", "compact-nonmultiple-eight", "padded-aligned"],
+)
+def test_semantic_contract_accepts_supported_x_row_strides(n_channels, row_stride):
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    n_rows = 2
+    x = _row_strided_x(n_rows, n_channels, row_stride)
+    state = torch.zeros(n_rows, n_channels, 4, dtype=torch.bfloat16)
+    weight = torch.zeros(n_channels, 4, dtype=torch.bfloat16)
+
+    ops_module._validate_semantic_contract(x, state, weight, None, None, None)
+
+
+@pytest.mark.parametrize(
+    "n_channels,stride,match",
+    [
+        (8, (16, 2), r"row-major strides \(ld, 1\)"),
+        (8, (7, 1), "row stride ld must be at least D=8"),
+        (10, (12, 1), "padded x rows must start at 16-byte-aligned"),
+    ],
+    ids=["channel-stride", "overlapping-rows", "misaligned-padded-rows"],
+)
+def test_semantic_contract_rejects_unsupported_x_row_strides(n_channels, stride, match):
+    ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
+    n_rows = 2
+    x = torch.empty_strided((n_rows, n_channels), stride, dtype=torch.bfloat16)
+    state = torch.zeros(n_rows, n_channels, 4, dtype=torch.bfloat16)
+    weight = torch.zeros(n_channels, 4, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=match):
+        ops_module._validate_semantic_contract(x, state, weight, None, None, None)
+
+
 def test_semantic_shape_contract_rejects_state_shorter_than_history():
     ops_module = importlib.import_module("cudnn.ops._causal_conv1d_update")
     x = torch.zeros(2, 8, dtype=torch.bfloat16)
@@ -302,6 +345,10 @@ def test_activation_aliases_and_cache_keys_are_canonical():
     silu_key = api_module._cache_key(x, state, weight, indices, None, "silu")
     assert identity_key != silu_key
 
+    padded_x = _row_strided_x(x.shape[0], x.shape[1], 16)
+    padded_key = api_module._cache_key(padded_x, state, weight, indices, None, "identity")
+    assert padded_key != identity_key
+
 
 def test_valid_descriptor_contract_without_kernel(monkeypatch):
     cls = _api_class()
@@ -311,6 +358,42 @@ def test_valid_descriptor_contract_without_kernel(monkeypatch):
 
     assert api.check_support()
     assert (api.n_rows, api.n_channels, api.n_slots) == (2, 8, 3)
+
+
+@pytest.mark.parametrize(
+    "n_channels,row_stride",
+    [(10, 10), (10, 16)],
+    ids=["compact-any-d", "padded-aligned"],
+)
+def test_plan_accepts_supported_x_row_strides_without_kernel(monkeypatch, n_channels, row_stride):
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs(n_channels=n_channels)
+    x = _row_strided_x(x.shape[0], n_channels, row_stride)
+    api = cls(x, weight, state, output, indices)
+    _mock_cuda_contract(monkeypatch, api)
+
+    assert api.check_support()
+    assert api.x_desc.stride == (row_stride, 1)
+
+
+@pytest.mark.parametrize(
+    "n_channels,stride,match",
+    [
+        (8, (16, 2), r"X must have row-major strides \(ld, 1\)"),
+        (8, (7, 1), "X row stride ld must be at least D=8"),
+        (10, (12, 1), "Padded X rows must start at 16-byte-aligned"),
+    ],
+    ids=["channel-stride", "overlapping-rows", "misaligned-padded-rows"],
+)
+def test_plan_rejects_unsupported_x_row_strides_without_kernel(monkeypatch, n_channels, stride, match):
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs(n_channels=n_channels)
+    x = torch.empty_strided(x.shape, stride, dtype=x.dtype)
+    api = cls(x, weight, state, output, indices)
+    _mock_cuda_contract(monkeypatch, api)
+
+    with pytest.raises(ValueError, match=match):
+        api.check_support()
 
 
 def test_width_four_minimum_state_descriptor_contract_without_kernel(monkeypatch):
@@ -362,7 +445,7 @@ def test_metadata_only_descriptors_skip_sample_pointer_alignment(monkeypatch):
                 o,
                 i,
             ),
-            "X tensor stride mismatch",
+            r"X must have row-major strides \(ld, 1\)",
         ),
         (lambda x, w, s, o, i: (x.float(), w, s, o.float(), i), "X dtype mismatch"),
         (lambda x, w, s, o, i: (x, w, s[:1], o, None), "State needs at least N slots"),
@@ -491,14 +574,37 @@ def test_execute_revalidates_presence_and_aliases(monkeypatch):
         )
 
 
-def test_overlap_uses_exact_contiguous_byte_spans():
+def test_execute_requires_the_exact_compiled_x_stride(monkeypatch):
+    cls = _api_class()
+    x, weight, state, output, indices = _inputs(n_channels=10)
+    x = _row_strided_x(x.shape[0], x.shape[1], 16)
+    api = cls(x, weight, state, output, indices)
+    _mock_cuda_contract(monkeypatch, api)
+    assert api.check_support()
+    api._compiled_kernel = lambda *args: None
+
+    different_valid_stride = _row_strided_x(x.shape[0], x.shape[1], 24)
+    with pytest.raises(ValueError, match=r"X stride mismatch: expected \(16, 1\), got \(24, 1\)"):
+        api.execute(
+            different_valid_stride,
+            weight,
+            state,
+            output,
+            indices,
+            current_stream=cuda.CUstream(7),
+        )
+
+
+def test_overlap_uses_positive_stride_byte_spans():
     api_module = importlib.import_module("cudnn.causal_conv1d_update_sm100.api")
 
     class Span:
-        def __init__(self, address, numel, element_size):
+        def __init__(self, address, numel, element_size, *, shape=None, stride=None):
             self.address = address
             self.length = numel
             self.itemsize = element_size
+            self.shape = shape if shape is not None else (numel,)
+            self.strides = stride if stride is not None else (1,)
 
         def data_ptr(self):
             return self.address
@@ -509,11 +615,20 @@ def test_overlap_uses_exact_contiguous_byte_spans():
         def element_size(self):
             return self.itemsize
 
+        def stride(self):
+            return self.strides
+
     left = Span(0x1000, 4, 2)
 
     assert api_module._tensors_overlap(left, Span(0x1006, 2, 2))
     assert api_module._tensors_overlap(Span(0x0FFE, 2, 2), left)
     assert not api_module._tensors_overlap(left, Span(0x1008, 2, 2))
+
+    # A 2x4 BF16 view with ld=8 occupies a 24-byte bounding span, not the
+    # 16 bytes implied by numel().  Alias checks must include the second row.
+    padded = Span(0x2000, 8, 2, shape=(2, 4), stride=(8, 1))
+    assert api_module._tensors_overlap(padded, Span(0x2014, 2, 2))
+    assert not api_module._tensors_overlap(padded, Span(0x2018, 2, 2))
 
 
 def test_record_streams_covers_every_present_raw_pointer_operand():

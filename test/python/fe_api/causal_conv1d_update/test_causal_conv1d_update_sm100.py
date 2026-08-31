@@ -67,6 +67,18 @@ def _assert_state_bits_equal(actual, expected):
     torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
 
 
+def _padded_x(values, row_stride):
+    storage = torch.empty(
+        values.shape[0],
+        row_stride,
+        device=values.device,
+        dtype=values.dtype,
+    )
+    result = storage[:, : values.shape[1]]
+    result.copy_(values)
+    return result
+
+
 @torch.no_grad()
 def test_nonzero_state_across_consecutive_steps():
     plan_cls, _ = _load_api()
@@ -92,6 +104,27 @@ def test_nonzero_state_across_consecutive_steps():
         api.execute(x, weight, state, output)
         torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
         _assert_state_bits_equal(state, expected_state)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
+def test_padded_x_rows_match_reference_and_preserve_compact_output(state_len):
+    _, causal_conv1d_update = _load_api()
+    torch.manual_seed(53 + state_len)
+    n_rows, n_channels, row_stride = 4, 257, 264
+    dense_x = torch.randn(n_rows, n_channels, device="cuda", dtype=torch.bfloat16)
+    x = _padded_x(dense_x, row_stride)
+    weight = torch.randn(n_channels, 4, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(n_rows, n_channels, state_len, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n_channels, device="cuda", dtype=torch.bfloat16)
+    expected_output, expected_state = _reference_step(dense_x, weight, state, bias=bias, activation="silu")
+
+    assert x.stride() == (row_stride, 1)
+    output = causal_conv1d_update(x, state, weight, bias, activation="silu")
+
+    assert output.is_contiguous()
+    torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+    _assert_state_bits_equal(state, expected_state)
 
 
 @torch.no_grad()
@@ -603,7 +636,7 @@ def test_invalid_state_indices_fail_closed_in_fresh_process(case):
                 s,
                 i,
             ),
-            "X tensor stride mismatch",
+            r"X must have row-major strides \(ld, 1\)",
         ),
         (lambda x, w, s, i: (x.float(), w, s, i), "X dtype mismatch"),
         (lambda x, w, s, i: (x, w, s[:1], None), "State needs at least N slots"),

@@ -85,19 +85,48 @@ def _require_storage_alignment(tensor: torch.Tensor, alignment: int, name: str) 
         raise ValueError(f"{name} data pointer must be {alignment}-byte aligned, " f"got address modulo {alignment} = {remainder}")
 
 
+def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return the conservative byte span of one positive-stride tensor."""
+
+    begin = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return begin, begin
+
+    # Every operand except row-strided X is contiguous.  Keep that hot path
+    # constant-time; execute() reuses the resulting span across all alias
+    # pairs instead of rebuilding it for each comparison.
+    is_contiguous = getattr(tensor, "is_contiguous", None)
+    if is_contiguous is not None and is_contiguous():
+        return begin, begin + tensor.numel() * tensor.element_size()
+
+    shape = tuple(tensor.shape)
+    stride = tuple(tensor.stride())
+    last_element = 0
+    for dim, axis_stride in zip(shape, stride):
+        if dim > 1 and axis_stride <= 0:
+            raise ValueError("alias validation requires positive strides, " f"got shape {shape}, strides {stride}")
+        last_element += (dim - 1) * axis_stride
+    return begin, begin + (last_element + 1) * tensor.element_size()
+
+
+def _byte_spans_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
+    lhs_begin, lhs_end = lhs
+    rhs_begin, rhs_end = rhs
+    if lhs_begin == lhs_end or rhs_begin == rhs_end:
+        return False
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+
 def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    """Return whether two exact-contiguous tensors share any device bytes.
+    """Return whether two positive-stride tensor spans share device bytes.
 
     ``torch._C._overlaps`` only compares PyTorch Storage identity. DLPack can
-    wrap the same device address in a distinct Storage, so use the byte spans
-    guaranteed by this API's exact-contiguous tensor contract instead.
+    wrap the same device address in a distinct Storage, so compare byte spans
+    derived from shape and stride.  The span conservatively includes padding
+    between rows of a strided tensor.
     """
 
-    lhs_begin = lhs.data_ptr()
-    rhs_begin = rhs.data_ptr()
-    lhs_end = lhs_begin + lhs.numel() * lhs.element_size()
-    rhs_end = rhs_begin + rhs.numel() * rhs.element_size()
-    return lhs_begin < rhs_end and rhs_begin < lhs_end
+    return _byte_spans_overlap(_tensor_byte_span(lhs), _tensor_byte_span(rhs))
 
 
 class _CausalConv1dUpdatePlan(APIBase):
@@ -109,7 +138,9 @@ class _CausalConv1dUpdatePlan(APIBase):
     This inference-only API advances ``state`` in place and writes ``output``.
     It deliberately supports one narrow contract:
 
-    * ``x`` and ``output``: contiguous ``[N, D]`` BF16
+    * ``x``: BF16 ``[N, D]`` with strides ``(ld, 1)``; compact rows admit any
+      ``D``, while padded rows require ``ld > D`` and ``ld % 8 == 0``
+    * ``output``: contiguous ``[N, D]`` BF16
     * ``weight``: contiguous ``[D, 4]`` BF16
     * ``state``: contiguous ``[S, D, L]`` BF16 with ``L`` in ``{3, 4}``,
       mutated in place
@@ -220,11 +251,18 @@ class _CausalConv1dUpdatePlan(APIBase):
         else:
             self._check_tensor_shape(self.state_indices_desc, (n_rows,), "State indices")
 
-        self._check_tensor_stride(
-            self.x_desc,
-            stride=(n_channels, 1),
-            name="X",
-            extra_error_msg="X must be row-major contiguous",
+        x_row_stride, x_channel_stride = self.x_desc.stride
+        self._value_error_if(
+            x_channel_stride != 1,
+            f"X must have row-major strides (ld, 1), got {self.x_desc.stride}",
+        )
+        self._value_error_if(
+            x_row_stride < n_channels,
+            f"X row stride ld must be at least D={n_channels}, got ld={x_row_stride}",
+        )
+        self._value_error_if(
+            x_row_stride > n_channels and x_row_stride % 8 != 0,
+            "Padded X rows must start at 16-byte-aligned BF16 addresses " f"(ld % 8 == 0), got D={n_channels}, ld={x_row_stride}",
         )
         self._check_tensor_stride(
             self.weight_desc,
@@ -387,17 +425,19 @@ class _CausalConv1dUpdatePlan(APIBase):
                 "State indices",
             )
 
-        for name, tensor in (
-            ("X", x_tensor),
-            ("Weight", weight_tensor),
-            ("State", state_tensor),
-            ("Output", output_tensor),
-            ("Bias", bias_tensor),
-        ):
+        operands = (
+            ("X", x_tensor, 16),
+            ("Weight", weight_tensor, 16),
+            ("State", state_tensor, 16),
+            ("Output", output_tensor, 16),
+            ("Bias", bias_tensor, 16),
+            ("State indices", state_indices_tensor, 4),
+        )
+        spans = {}
+        for name, tensor, alignment in operands:
             if tensor is not None:
-                _require_storage_alignment(tensor, 16, name)
-        if state_indices_tensor is not None:
-            _require_storage_alignment(state_indices_tensor, 4, "State indices")
+                _require_storage_alignment(tensor, alignment, name)
+                spans[name] = _tensor_byte_span(tensor)
 
         grad_tensors = (
             x_tensor,
@@ -408,25 +448,19 @@ class _CausalConv1dUpdatePlan(APIBase):
         )
         if torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in grad_tensors):
             raise RuntimeError("causal_conv1d_update is inference-only; call it under torch.no_grad()")
-        for name, tensor in (
-            ("X", x_tensor),
-            ("Weight", weight_tensor),
-            ("Output", output_tensor),
-            ("Bias", bias_tensor),
+        for owner, other in (
+            ("State", "X"),
+            ("State", "Weight"),
+            ("State", "Output"),
+            ("State", "Bias"),
+            ("State", "State indices"),
+            ("Output", "X"),
+            ("Output", "Weight"),
+            ("Output", "Bias"),
+            ("Output", "State indices"),
         ):
-            if tensor is not None and _tensors_overlap(state_tensor, tensor):
-                raise ValueError(f"State must not overlap {name}")
-        if state_indices_tensor is not None and _tensors_overlap(state_tensor, state_indices_tensor):
-            raise ValueError("State must not overlap State indices")
-        for name, tensor in (
-            ("X", x_tensor),
-            ("Weight", weight_tensor),
-            ("Bias", bias_tensor),
-        ):
-            if tensor is not None and _tensors_overlap(output_tensor, tensor):
-                raise ValueError(f"Output must not overlap {name}")
-        if state_indices_tensor is not None and _tensors_overlap(output_tensor, state_indices_tensor):
-            raise ValueError("Output must not overlap State indices")
+            if other in spans and _byte_spans_overlap(spans[owner], spans[other]):
+                raise ValueError(f"{owner} must not overlap {other}")
 
         if current_stream is None:
             consumer_stream = torch.cuda.current_stream(x_tensor.device)
@@ -472,6 +506,7 @@ def _cache_key(
         x_tensor.device.type,
         x_tensor.device.index,
         tuple(x_tensor.shape),
+        tuple(x_tensor.stride()),
         tuple(weight_tensor.shape),
         tuple(state_tensor.shape),
         state_indices_tensor is not None,

@@ -49,6 +49,18 @@ def _inputs(shape=(3, 8)):
     return x, weight, cache
 
 
+def _fused_projection_view(layout, *, n_rows=3, n_channels=8):
+    projection = torch.randn(n_rows, 3 * n_channels, dtype=torch.bfloat16)
+    x = projection[:, n_channels : 2 * n_channels]
+    if layout == "ND":
+        return x
+    if layout == "N1D":
+        return x.unsqueeze(1)
+    if layout == "1ND":
+        return x.unsqueeze(0)
+    raise AssertionError(layout)
+
+
 def _original_spy(calls):
     def original(x, cache, residual=None, weight=None, bias=None, activation=None):
         calls.append((x, cache, residual, weight, bias, activation))
@@ -99,6 +111,70 @@ def test_native_layouts_are_zero_copy_and_preserve_fla_shape_and_cache_identity(
     assert native_calls[0][2] is weight
     assert fallback_calls == []
     assert short_conv.last_path() == "native"
+
+
+@pytest.mark.parametrize("layout", ["ND", "N1D", "1ND"])
+def test_fused_projection_row_strides_are_zero_copy_and_route_native(mock_supported_arch, monkeypatch, layout):
+    x = _fused_projection_view(layout)
+    n_rows, n_channels = 3, 8
+    weight = torch.randn(n_channels, 4, dtype=torch.bfloat16)
+    cache = torch.randn(n_rows, n_channels, 4, dtype=torch.bfloat16)
+    fallback_calls = []
+    native_calls = []
+
+    def native(native_x, native_cache, native_weight):
+        native_calls.append((native_x, native_cache, native_weight))
+        assert native_x.data_ptr() == x.data_ptr()
+        assert native_x.stride() == (3 * n_channels, 1)
+        return native_x.clone()
+
+    monkeypatch.setattr(short_conv, "_call_native", native)
+    wrapped = short_conv.make_causal_conv1d_update(_original_spy(fallback_calls))
+
+    output, returned_cache = wrapped(x, cache, weight=weight, activation="silu")
+
+    assert output.shape == x.shape
+    assert returned_cache is cache
+    assert len(native_calls) == 1
+    assert native_calls[0][1] is cache
+    assert native_calls[0][2] is weight
+    assert fallback_calls == []
+    assert short_conv.last_path() == "native"
+
+
+@pytest.mark.parametrize("n_channels", [7, 10], ids=["d7", "d10"])
+def test_compact_rows_accept_channel_counts_not_divisible_by_eight(mock_supported_arch, n_channels):
+    x, weight, cache = _inputs((3, n_channels))
+
+    native_x = short_conv._native_input_view(x, weight, cache)
+
+    assert native_x.data_ptr() == x.data_ptr()
+    assert native_x.stride() == (n_channels, 1)
+
+
+@pytest.mark.parametrize(
+    "x,reason",
+    [
+        (torch.empty_strided((3, 8), (7, 1), dtype=torch.bfloat16), "noncontiguous"),
+        (torch.empty_strided((3, 10), (12, 1), dtype=torch.bfloat16), "alignment"),
+    ],
+    ids=["overlapping-rows", "misaligned-padded-rows"],
+)
+def test_unsupported_row_strides_fall_back_unchanged(mock_supported_arch, monkeypatch, x, reason):
+    n_rows, n_channels = x.shape
+    weight = torch.randn(n_channels, 4, dtype=torch.bfloat16)
+    cache = torch.randn(n_rows, n_channels, 4, dtype=torch.bfloat16)
+    fallback_calls = []
+    monkeypatch.setattr(short_conv, "_call_native", lambda *unused: pytest.fail("native path should have declined"))
+    wrapped = short_conv.make_causal_conv1d_update(_original_spy(fallback_calls))
+
+    output, returned_cache = wrapped(x, cache, weight=weight, activation="silu")
+
+    assert output.shape == x.shape
+    assert returned_cache is cache
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0][0] is x
+    assert short_conv.last_path() == f"fallback:{reason}"
 
 
 @pytest.mark.parametrize("capability", _SUPPORTED_COMPUTE_CAPABILITIES)

@@ -69,7 +69,7 @@ def _call_native(x: torch.Tensor, cache: torch.Tensor, weight: torch.Tensor) -> 
 
 
 def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
-    """Validate the narrow native contract and return a zero-copy ``[N, D]`` view."""
+    """Validate the native contract and return a zero-copy row-strided ``[N, D]`` view."""
 
     if type(x) is not torch.Tensor or type(weight) is not torch.Tensor or type(cache) is not torch.Tensor:
         raise ValueError("tensor-subclass")
@@ -83,7 +83,7 @@ def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tenso
         raise ValueError("device")
     if not is_supported_causal_conv1d_update_compute_capability(_device_capability(x.device)):
         raise ValueError("unsupported-arch")
-    if not (x.is_contiguous() and weight.is_contiguous() and cache.is_contiguous()):
+    if not (weight.is_contiguous() and cache.is_contiguous()):
         raise ValueError("noncontiguous")
 
     if x.ndim == 2:
@@ -96,6 +96,21 @@ def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tenso
         raise ValueError("shape")
     if n_rows <= 0 or n_channels <= 0:
         raise ValueError("shape")
+
+    # Each admitted 3D layout only adds a singleton dimension, so view() is a
+    # zero-copy normalization.  Preserve X's leading dimension: fused QKV
+    # projections commonly expose each slice as (3 * D, 1), which the native
+    # kernel addresses directly without an adapter-side copy.
+    try:
+        native_x = x.view(n_rows, n_channels)
+    except RuntimeError as error:
+        raise ValueError("noncontiguous") from error
+    row_stride, channel_stride = native_x.stride()
+    if channel_stride != 1 or row_stride < n_channels:
+        raise ValueError("noncontiguous")
+    if row_stride > n_channels and row_stride % 8 != 0:
+        raise ValueError("alignment")
+
     if tuple(weight.shape) != (n_channels, 4) or tuple(cache.shape) != (n_rows, n_channels, 4):
         raise ValueError("shape")
     if x.data_ptr() % 16 or weight.data_ptr() % 16 or cache.data_ptr() % 16:
@@ -103,9 +118,9 @@ def _native_input_view(x: torch.Tensor, weight: torch.Tensor, cache: torch.Tenso
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x, weight, cache)):
         raise ValueError("autograd")
 
-    # Contiguity and the singleton layout checks above make this a true view;
-    # no adapter-side allocation, gather, or copy is permitted here.
-    return x.view(n_rows, n_channels)
+    # The singleton layout and explicit stride checks above make this a true
+    # view; no adapter-side allocation, gather, or copy is permitted here.
+    return native_x
 
 
 def make_causal_conv1d_update(real_fn):

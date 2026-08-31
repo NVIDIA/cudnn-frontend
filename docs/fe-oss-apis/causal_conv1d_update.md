@@ -84,7 +84,9 @@ Warm the exact signature before latency measurement or CUDA Graph capture.
 
 ## Semantic tensor contract
 
-- `x`: `[N, D]` for one decode token
+- `x`: BF16 `[N, D]` for one decode token, with strides `(ld, 1)`; compact
+  `ld == D` accepts every `D`, while padded `ld > D` requires `ld % 8 == 0`
+  so every row starts at a 16-byte-aligned address
 - `weight`: `[D, W]`
 - `conv_state`: `[S, D, L]`, updated in place, with `L >= W - 1`
 - `bias`: optional `[D]`
@@ -102,7 +104,8 @@ the state or weight meanings. The current public implementation rejects 3D
   12.0, and 12.1; the portable one-row schedule is used on every admitted
   target
 - performance-characterized GPU: B200 SM100
-- `x`: contiguous BF16 `[N, D]`
+- `x`: BF16 `[N, D]` with strides `(ld, 1)`; compact `ld == D` accepts every
+  channel count, and padded `ld > D` requires `ld % 8 == 0`
 - `weight`: contiguous BF16 `[D, 4]`
 - `conv_state`: contiguous BF16 `[S, D, L]` with `L` equal to 3 or 4,
   updated in place

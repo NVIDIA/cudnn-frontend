@@ -21,6 +21,9 @@ Only the four-wide, BF16, optional-bias inference specialization lives here.
 State length four keeps the original vectorized path. State length three, the
 standard ``W - 1`` prefill handoff, uses a separate scalar state specialization.
 Identity and SiLU are separate compile-time specializations.
+The input is addressed through its compiled ``(ld, 1)`` strides, including a
+16-byte-row-aligned padded leading dimension; output and mutable state remain
+compact.
 One decode row is assigned to each CTA on every admitted architecture. This is
 an independent FE-native implementation using the original inline-PTX data
 path.

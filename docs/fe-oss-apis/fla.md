@@ -56,9 +56,10 @@ The native route is deliberately restricted to inference on compute
 capabilities 8.0, 8.6, 8.7, 8.9, 9.0, 10.0, 10.3, 11.0, 12.0, and 12.1 with BF16, a
 contiguous `[N, D, 4]` cache, contiguous `[D, 4]` weights, no residual or bias,
 and `silu`/`swish`. Every admitted architecture uses the same one-row
-functional schedule. Contiguous
-input layouts `[N, D]`, `[N, 1, D]`, and `[1, N, D]` are normalized with
-zero-copy views; output shape and cache object identity are preserved.
+functional schedule. Input layouts `[N, D]`, `[N, 1, D]`, and `[1, N, D]` are
+normalized to `[N, D]` with zero-copy views. Compact X rows accept every D;
+padded `(ld, 1)` rows, including slices of wider fused projections, require `ld > D`
+and `ld % 8 == 0`. Output shape and cache object identity are preserved.
 Everything else executes the saved original FLA callable. Typed
 unsupported-kernel declines fall back, while unexpected native binding,
 allocation, and launch failures propagate.
@@ -76,12 +77,11 @@ They use FLA's documented interface and observable depthwise causal-convolution
 semantics for compatibility; no FLA Triton kernel source is incorporated or
 translated.
 
-Use `benchmark/fla_short_conv_shim_sm100.py` on a ComputeLab B200 for the exact
-patched-callable comparison. It reports CUDA-graph replay separately from
-steady-state eager host enqueue time and refuses to emit timings until route,
+Use `benchmark/fla_short_conv_shim_sm100.py` for an exact patched-callable
+comparison. It runs on every functionally admitted target, records the actual
+hardware and software metadata, reports CUDA-graph replay separately from
+steady-state eager host enqueue time, and refuses to emit timings until route,
 output, mutable-state, cache-identity, and restore gates pass.
-The benchmark remains intentionally restricted to exact SM100 even though the
-adapter has wider functional support.
 
 ## Inspect and restore
 
