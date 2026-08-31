@@ -8,6 +8,8 @@ MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
 ``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
 Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>``.
+A warp-scoped family (sm120) additionally ALWAYS names its compute-warp grid
+via a ``_warpsMxN`` suffix — no grid is implied by an unsuffixed spelling.
 See ``kernel_registry`` for the template registry and the support funnel.
 """
 
@@ -468,15 +470,6 @@ class ConfigSm103(CtaPairTileConfig):
         super().__post_init__()
 
 
-# sm120's tensor core is WARP-scoped, so the warp tile is a real level: the CTA
-# tile is split over a fixed grid of compute warps. Both are pinned to the one
-# geometry the template is validated at; widening them is the next step.
-_SM120_WARP_GRID_MN = (4, 2)
-_SM120_WARPS_PER_CTA = 12  # 8 compute + TMA + CLC scheduler + 2 donors
-_SM120_CTA_TILE_MNK_BYTES = (128, 128, 128)
-_SM120_MMA_TILE_MNK_BYTES = (16, 16, 32)
-
-
 @dataclass(frozen=True)
 class ConfigSm120(TileConfig):
     """sm120 geometry — warp-scoped MMA on consumer Blackwell (CC 12.x).
@@ -487,35 +480,50 @@ class ConfigSm120(TileConfig):
     12-warp block is 8 compute + TMA + CLC scheduler + 2 donors."""
 
     MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32,)
+    # Family facts live HERE (one home, per the TileConfig docstring),
+    # consulted by `_geom_sm120`, `__post_init__` and `as_pipeline`. The warp
+    # grid has NO default: every sm120 name spells it (`_warpsMxN`); the
+    # CROSSING grid below is only what `as_pipeline` builds when a config
+    # crosses in from a family that has no warp-grid axis at all.
+    FIXED_MMA_TILE_MN: ClassVar[tuple[int, int]] = (16, 16)
+    FIXED_CGA_MN: ClassVar[tuple[int, int]] = (1, 1)
+    CROSSING_WARP_GRID_MN: ClassVar[tuple[int, int]] = (4, 2)
+    DEFAULT_WARPS_PER_CTA: ClassVar[int] = 12  # 8 compute + TMA + CLC scheduler + 2 donors
 
     def __post_init__(self) -> None:
-        # PINNED, not validated: every axis below is fixed for now, so a config
-        # crossing in from another family (`as_pipeline`) needs no sm120
-        # knowledge -- it is rewritten to the one geometry the template is
-        # validated at. Widening them is the next step.
-        cta_m, cta_n, cta_kb = _SM120_CTA_TILE_MNK_BYTES
-        warps_m, warps_n = _SM120_WARP_GRID_MN
-        mma_m, mma_n, mma_kb = _SM120_MMA_TILE_MNK_BYTES
-        for field, value in (
-            ("cta_tile_m", cta_m),
-            ("cta_tile_n", cta_n),
-            ("cta_tile_k_bytes", cta_kb),
-            ("warp_tile_m", cta_m // warps_m),
-            ("warp_tile_n", cta_n // warps_n),
-            ("warp_tile_k_bytes", cta_kb),
-            ("mma_tile_m", mma_m),
-            ("mma_tile_n", mma_n),
-            ("mma_tile_k_bytes", mma_kb),
-            ("mma_size_m", cta_m // warps_m // mma_m),
-            ("mma_size_n", cta_n // warps_n // mma_n),
-            ("mma_size_k", cta_kb // mma_kb),
-            # CC 12.x has no CGA.
-            ("cga_size_m", 1),
-            ("cga_size_n", 1),
-            ("warps_per_cta", _SM120_WARPS_PER_CTA),
-        ):
-            object.__setattr__(self, field, value)
+        # VALIDATED, not pinned: the geometry axes (CTA tile, warp grid, K
+        # width) are real choices here; only the facts of the family are
+        # enforced -- the 16x16x32B warp-MMA pair, no CGA, no warp-level K
+        # split, and a block wide enough for the compute grid + TMA producer
+        # + CLC scheduler.
         super().__post_init__()
+        name = self.name
+        mma = (self.mma_tile_m, self.mma_tile_n, self.mma_tile_k_bytes)
+        fixed_mma = (*self.FIXED_MMA_TILE_MN, self.MMA_TILE_K_BYTES[0])
+        if mma != fixed_mma:
+            raise NotImplementedError(f"ConfigSm120 {name!r}: the warp MMA pair is fixed at " f"{fixed_mma}; got mma_tile={mma}")
+        if (self.cga_size_m, self.cga_size_n) != (1, 1):
+            raise NotImplementedError(f"ConfigSm120 {name!r}: CC 12.x has no CGA; cluster must be 1x1, " f"got {self.cga_size_m}x{self.cga_size_n}")
+        if self.warp_tile_k_bytes != self.cta_tile_k_bytes:
+            raise NotImplementedError(
+                f"ConfigSm120 {name!r}: no warp-level K split; warp_tile_k_bytes="
+                f"{self.warp_tile_k_bytes} must equal cta_tile_k_bytes={self.cta_tile_k_bytes}"
+            )
+        compute_warps = (self.cta_tile_m // self.warp_tile_m) * (self.cta_tile_n // self.warp_tile_n)
+        if compute_warps + 2 > self.warps_per_cta:
+            raise NotImplementedError(
+                f"ConfigSm120 {name!r}: {compute_warps} compute warps + the TMA producer " f"+ the CLC scheduler exceed warps_per_cta={self.warps_per_cta}"
+            )
+
+    @property
+    def geometry_name(self) -> str:
+        """The warp grid is an AXIS here (unlike the CTA-scoped families), so it
+        is ALWAYS named via a ``_warpsMxN`` suffix -- no grid is implied by an
+        unsuffixed spelling."""
+        base = super().geometry_name
+        if self.warp_tile_m and self.warp_tile_n:
+            base += f"_warps{self.cta_tile_m // self.warp_tile_m}x{self.cta_tile_n // self.warp_tile_n}"
+        return base
 
     @property
     def epi_tile_m(self) -> int:
@@ -646,7 +654,8 @@ def _geom_sm120(
 ) -> ConfigSm120:
     """One sm120 geometry. The CTA tile is split over a ``warps_size_m`` x
     ``warps_size_n`` grid of compute warps; the MMA tile is the family's."""
-    mma_tile_m, mma_tile_n, mma_tile_k_bytes = _SM120_MMA_TILE_MNK_BYTES
+    mma_tile_m, mma_tile_n = ConfigSm120.FIXED_MMA_TILE_MN
+    mma_tile_k_bytes = ConfigSm120.MMA_TILE_K_BYTES[0]
     return ConfigSm120(
         pipeline="sm120",
         cta_tile_m=cta_tile_m,
@@ -664,9 +673,26 @@ def _geom_sm120(
         cga_size_m=cga_size_m,
         cga_size_n=cga_size_n,
         cga_size_k=1,
-        warps_per_cta=_SM120_WARPS_PER_CTA,
+        warps_per_cta=ConfigSm120.DEFAULT_WARPS_PER_CTA,
         split_k_slices=1,
     )
+
+
+# CC 12.x per-CTA opt-in SMEM cap. The sm120 catalog filter is STATIC (the
+# catalog builds with no GPU visible), so the family-wide cap is spelled here;
+# the render-time budget still comes from the device.
+_SM120_SMEM_CAP_BYTES = 99 * 1024
+_SM120_SMEM_FIXED_RESERVE = 2048  # kernel_registry's default smem_fixed_reserve
+_SM120_STG_STAGE_ELEMS = 528  # f32 staging elems per compute warp (template _STG_EPI_WARP_ELEMS)
+
+
+def _sm120_smem_feasible(cta_m: int, cta_n: int, kb: int, num_compute_warps: int) -> bool:
+    """Mirror of the sm120 template's stage arithmetic: after the transposed-STG
+    staging is funded from the AB pipeline, at least one stage must survive."""
+    per_stage = (cta_m + cta_n) * kb + 16
+    staging = 4 * _SM120_STG_STAGE_ELEMS * num_compute_warps
+    stages = min((_SM120_SMEM_CAP_BYTES - _SM120_SMEM_FIXED_RESERVE) // per_stage, 16)
+    return stages - -(-staging // per_stage) >= 1
 
 
 def _build_catalog() -> tuple[TileConfig, ...]:
@@ -687,8 +713,26 @@ def _build_catalog() -> tuple[TileConfig, ...]:
         for cga_m, cga_n in _CLUSTERS:
             for cta_group in (1, 2):
                 cfgs.append(_geom_sm103(128, cta_n, cga_m, cga_n, cta_group))
-    # sm120 is pinned to the one geometry its template is validated at.
-    cfgs.append(_geom_sm120(*_SM120_CTA_TILE_MNK_BYTES, *_SM120_WARP_GRID_MN, 1, 1))
+
+    # sm120: sweep the warp-MMA geometries over CTA tile x K width x warp grid.
+    # Only combos the template can render are cataloged: the warp grid must cut
+    # the CTA tile into whole 16x16 warp-MMA pairs, and SMEM must fit at least
+    # one AB stage on top of the transposed-STG staging.
+    _SM120_WARP_SIZE_CONFIGS: tuple[tuple[int, int], ...] = (
+        (2, 4),
+        (4, 2),
+        (1, 8),
+        (8, 1),
+    )
+    for cta_tile_m in (512, 256, 128, 64, 32):
+        for cta_tile_n in range(512, 0, -16):
+            for cta_tile_k_bytes in (128, 64, 32):
+                for warps_size_m, warps_size_n in _SM120_WARP_SIZE_CONFIGS:
+                    if cta_tile_m % (warps_size_m * 16) or cta_tile_n % (warps_size_n * 16):
+                        continue
+                    if not _sm120_smem_feasible(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m * warps_size_n):
+                        continue
+                    cfgs.append(_geom_sm120(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m, warps_size_n, 1, 1))
     return tuple(cfgs)
 
 
@@ -708,7 +752,8 @@ _CONFIG_NAME_RE = re.compile(
     r"^CONFIG_(?P<pipeline>sm\d+)_"
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
-    r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?$"
+    r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
+    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?$"
 )
 
 
@@ -723,28 +768,32 @@ def _synthesize_config(name: str) -> TileConfig:
     cls = config_class_for_pipeline(pipeline)  # KeyError for unknown pipelines
     cta_m = int(m.group("cta_m"))
     mma_m = int(m.group("mma_m"))
+    # The warp tile: the CTA tile split over the `_warpsMxN` token when the
+    # name spells one (the warp-scoped families' axis); without a token the
+    # grid is 1x1, i.e. the CTA tile itself. Non-canonical spellings -- an
+    # sm120 name missing its token, or a token on a CTA-scoped family -- die
+    # in the round-trip check below either way.
+    warp_m = cta_m // int(m.group("warps_m") or 1)
+    warp_n = int(m.group("cta_n")) // int(m.group("warps_n") or 1)
     cfg = cls(
         pipeline=pipeline,
         cta_tile_m=cta_m,
         cta_tile_n=int(m.group("cta_n")),
         cta_tile_k_bytes=int(m.group("k_bytes")),
-        # The warp tile is family-derived, not named: a CTA-scoped MMA pins it
-        # to the CTA tile, a warp-scoped one to its own warp grid. Passing the
-        # CTA tile lets each family's __post_init__ overwrite or reject it.
-        warp_tile_m=cta_m,
-        warp_tile_n=int(m.group("cta_n")),
+        warp_tile_m=warp_m,
+        warp_tile_n=warp_n,
         warp_tile_k_bytes=int(m.group("k_bytes")),
         mma_tile_m=mma_m,
         mma_tile_n=int(m.group("mma_n")),
         mma_tile_k_bytes=int(m.group("mma_k_bytes")),
-        mma_size_m=cta_m // mma_m,
-        mma_size_n=int(m.group("cta_n")) // int(m.group("mma_n")),
+        mma_size_m=warp_m // mma_m,
+        mma_size_n=warp_n // int(m.group("mma_n")),
         mma_size_k=int(m.group("k_bytes")) // int(m.group("mma_k_bytes")),
         cga_size_m=int(m.group("cga_m")),
         cga_size_n=int(m.group("cga_n")),
         cga_size_k=1,
-        # Not spelled by the name; a family that fixes its own block pins it.
-        warps_per_cta=_TCGEN05_WARPS_PER_CTA,
+        # Not spelled by the name; a family with its own block size declares it.
+        warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
         split_k_slices=1,
         # Only where the family HAS the axis; a name for one that does not
         # carries no such token either.
@@ -961,33 +1010,40 @@ def as_mma_tile_k(cfg: TileConfig, k_bytes: int) -> TileConfig:
 
 
 def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
-    """The same geometry as a ``pipeline``-family config — only the family-fixed
-    MMA-inst K width moves (a family that fixes MORE axes pins them in its own
-    ``__post_init__``, e.g. ConfigSm120's cluster and block size). A family
-    whose K axes this geometry cannot satisfy (sm103 fixes a 384-byte K-tile)
-    raises from the config's ``__post_init__``, so the invariant stays in one
-    place."""
+    """The same geometry as a ``pipeline``-family config: the CTA tile is
+    carried over, family-fixed axes snap to the target's ClassVar facts
+    (``FIXED_MMA_TILE_MN`` / ``FIXED_CGA_MN`` / ``CROSSING_WARP_GRID_MN`` /
+    ``DEFAULT_WARPS_PER_CTA``; a CTA-scoped family declares none and keeps the
+    source values). A geometry the target family cannot hold raises from its
+    ``__post_init__``, so the invariant stays in one place -- the only caller
+    is the auto path, whose ``select_config`` picks are all crossable."""
     if cfg.pipeline == pipeline:
         return cfg
     cls = config_class_for_pipeline(pipeline)
+    mma_kb = as_mma_tile_k_bytes(cfg.mma_tile_k_bytes, pipeline)
+    mma_m, mma_n = getattr(cls, "FIXED_MMA_TILE_MN", (cfg.mma_tile_m, cfg.mma_tile_n))
+    cga_m, cga_n = getattr(cls, "FIXED_CGA_MN", (cfg.cga_size_m, cfg.cga_size_n))
+    warps_m, warps_n = getattr(cls, "CROSSING_WARP_GRID_MN", (1, 1))
+    warp_m = cfg.cta_tile_m // warps_m
+    warp_n = cfg.cta_tile_n // warps_n
     return cls(
         pipeline=pipeline,
         cta_tile_m=cfg.cta_tile_m,
         cta_tile_n=cfg.cta_tile_n,
         cta_tile_k_bytes=cfg.cta_tile_k_bytes,
-        warp_tile_m=cfg.cta_tile_m,
-        warp_tile_n=cfg.cta_tile_n,
+        warp_tile_m=warp_m,
+        warp_tile_n=warp_n,
         warp_tile_k_bytes=cfg.cta_tile_k_bytes,
-        mma_tile_m=cfg.mma_tile_m,
-        mma_tile_n=cfg.mma_tile_n,
-        mma_tile_k_bytes=as_mma_tile_k_bytes(cfg.mma_tile_k_bytes, pipeline),
-        mma_size_m=cfg.cta_tile_m // cfg.mma_tile_m,
-        mma_size_n=cfg.cta_tile_n // cfg.mma_tile_n,
-        mma_size_k=cfg.cta_tile_k_bytes // as_mma_tile_k_bytes(cfg.mma_tile_k_bytes, pipeline),
-        cga_size_m=cfg.cga_size_m,
-        cga_size_n=cfg.cga_size_n,
+        mma_tile_m=mma_m,
+        mma_tile_n=mma_n,
+        mma_tile_k_bytes=mma_kb,
+        mma_size_m=warp_m // mma_m,
+        mma_size_n=warp_n // mma_n,
+        mma_size_k=cfg.cta_tile_k_bytes // mma_kb,
+        cga_size_m=cga_m,
+        cga_size_n=cga_n,
         cga_size_k=cfg.cga_size_k,
-        warps_per_cta=cfg.warps_per_cta,
+        warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", cfg.warps_per_cta),
         split_k_slices=cfg.split_k_slices,
         **({"cta_group": getattr(cfg, "cta_group", 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
