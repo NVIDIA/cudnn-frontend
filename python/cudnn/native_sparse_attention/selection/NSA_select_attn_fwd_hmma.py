@@ -922,15 +922,23 @@ class HopperSelectAttentionFwd:
                         if is_not_first_n_block:
                             row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
 
+                        # Keep the true max at -inf for an all-masked prefix, but
+                        # center exponentiation at zero so -inf - -inf cannot
+                        # turn a future-only selected block into NaN probability.
+                        row_max_cur_row_safe = row_max_cur_row
+                        if cutlass.const_expr(self.causal_within_selected_blocks):
+                            if row_max_cur_row_safe == -cutlass.Float32.inf:
+                                row_max_cur_row_safe = cutlass.Float32(0.0)
+
                         acc_QK_row_exp = cute.TensorSSA(  # e^{Sn-mn}
-                            self._exp2f((acc_QK_row - row_max_cur_row) * self.log2_e),
+                            self._exp2f((acc_QK_row - row_max_cur_row_safe) * self.log2_e),
                             tuple(acc_QK_row.shape),
                             cutlass.Float32,
                         )
                         acc_QK_row_sum = acc_QK_row_exp.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
                         acc_QK_row_sum = self._threadquad_reduce_sum(acc_QK_row_sum, mask=(1 << self.GQA_group_size) - 1)  # rowsum(e^{Sn-mn})
                         if is_not_first_n_block:
-                            prev_minus_cur_exp = self._exp2f((row_max_prev_row - row_max_cur_row) * self.log2_e)  # e^{M^{(n-1)} - M^{(n)}}
+                            prev_minus_cur_exp = self._exp2f((row_max_prev_row - row_max_cur_row_safe) * self.log2_e)  # e^{M^{(n-1)} - M^{(n)}}
                             # L^{(n)} = rowsum(e^{Sn-mn}) + L^{(n-1)} * e^{M^{(n-1)} - M^{(n)}}
                             acc_QK_row_sum = acc_QK_row_sum + row_sum[r] * prev_minus_cur_exp
                             # O^{(n-1)}' = O^{(n-1)} * e^{M^{(n-1)} - M^{(n)}}

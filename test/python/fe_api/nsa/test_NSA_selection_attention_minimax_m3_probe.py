@@ -26,6 +26,13 @@ _BLOCK_SIZE = 128
 _TOPK_BLOCKS = 16
 _REFERENCE_QUERY_CHUNK = 128
 
+_TARGETED_SEQLEN = 128
+_TARGETED_Q_HEADS = 4
+_TARGETED_KV_HEADS = 1
+_TARGETED_HEAD_DIM = 128
+_TARGETED_BLOCK_SIZE = 64
+_TARGETED_TOPK_BLOCKS = 2
+
 
 def _minimax_metadata(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     indices = torch.zeros((_SEQLEN, _KV_HEADS, _TOPK_BLOCKS), dtype=torch.int32)
@@ -100,6 +107,99 @@ def _causal_sparse_reference(
     return out.view_as(q), row_sum.view(_SEQLEN, _Q_HEADS, 1), row_max.view(_SEQLEN, _Q_HEADS, 1)
 
 
+def _run_targeted_causal_case(*, future_first: bool):
+    """Run one small causal case and check its analytically exact uniform-score result."""
+    if not torch.cuda.is_available():
+        pytest.skip("Selection-attention causal regression requires CUDA")
+    major, minor = torch.cuda.get_device_capability()
+    if major != 10:
+        pytest.skip(f"Selection-attention causal regression targets SM10x, found SM{major}{minor}")
+
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn import NSA
+    except ImportError:
+        pytest.skip("cuDNN Frontend CuTe DSL dependencies are not installed")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    q = torch.zeros((_TARGETED_SEQLEN, _TARGETED_Q_HEADS, _TARGETED_HEAD_DIM), device=device, dtype=dtype)
+    k = torch.zeros((_TARGETED_SEQLEN, _TARGETED_KV_HEADS, _TARGETED_HEAD_DIM), device=device, dtype=dtype)
+    values = (torch.arange(_TARGETED_SEQLEN, device=device, dtype=torch.float32) / _TARGETED_SEQLEN).to(dtype)
+    v = values[:, None, None].expand(-1, _TARGETED_KV_HEADS, _TARGETED_HEAD_DIM).contiguous()
+    o = torch.empty_like(q)
+    row_sum = torch.empty((_TARGETED_SEQLEN, _TARGETED_Q_HEADS, 1), device=device, dtype=torch.float32)
+    row_max = torch.empty_like(row_sum)
+    block_indices = torch.zeros((_TARGETED_SEQLEN, _TARGETED_KV_HEADS, _TARGETED_TOPK_BLOCKS), device=device, dtype=torch.int32)
+    block_counts = torch.ones((_TARGETED_SEQLEN, _TARGETED_KV_HEADS), device=device, dtype=torch.int32)
+    query_positions = torch.arange(_TARGETED_SEQLEN, device=device)
+
+    if future_first:
+        # The kernel traverses metadata in reverse, so block 1 is processed
+        # first. For queries 0..63 it is entirely causal-masked; block 0,
+        # processed next, contains valid keys and must recover cleanly.
+        block_indices[:, :, 0] = 0
+        block_indices[:, :, 1] = 1
+        block_counts.fill_(2)
+        first_selected = torch.zeros_like(query_positions)
+    else:
+        # Exercise is_causal on the established block-64/GQA-4 geometry,
+        # independently of the MiniMax block-128/GQA-16 admission changes.
+        current_block = query_positions // _TARGETED_BLOCK_SIZE
+        block_indices[:, :, 0] = current_block[:, None]
+        first_selected = current_block * _TARGETED_BLOCK_SIZE
+
+    cu_seqlens = torch.tensor([0, _TARGETED_SEQLEN], device=device, dtype=torch.int32)
+    operation = NSA.SelectionAttention(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_l=row_sum,
+        sample_m=row_max,
+        sample_block_indices=block_indices,
+        sample_block_counts=block_counts,
+        sample_cum_seqlen_q=cu_seqlens,
+        sample_cum_seqlen_k=cu_seqlens,
+        max_s_q=_TARGETED_SEQLEN,
+        max_s_k=_TARGETED_SEQLEN,
+        block_size=_TARGETED_BLOCK_SIZE,
+        is_causal=True,
+        scale_softmax=1.0 / math.sqrt(_TARGETED_HEAD_DIM),
+    )
+    assert operation.check_support()
+    operation.compile()
+    operation.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=o,
+        l_tensor=row_sum,
+        m_tensor=row_max,
+        block_indices_tensor=block_indices,
+        block_counts_tensor=block_counts,
+        cum_seqlen_q_tensor=cu_seqlens,
+        cum_seqlen_k_tensor=cu_seqlens,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+    selected_count = query_positions - first_selected + 1
+    value_prefix = values.float().cumsum(0)
+    prefix_before_selection = torch.zeros_like(value_prefix)
+    has_preceding_values = first_selected > 0
+    prefix_before_selection[has_preceding_values] = value_prefix[first_selected[has_preceding_values] - 1]
+    expected_value = (value_prefix - prefix_before_selection) / selected_count
+    expected_o = expected_value[:, None, None].expand_as(o)
+    expected_row_sum = selected_count[:, None, None].expand_as(row_sum).float()
+
+    assert torch.isfinite(o).all()
+    assert torch.isfinite(row_sum).all()
+    assert torch.isfinite(row_max).all()
+    torch.testing.assert_close(o.float(), expected_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(row_sum, expected_row_sum, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(row_max, torch.zeros_like(row_max), atol=0.0, rtol=0.0)
+
+
 @pytest.mark.L4
 @torch_fork_set_rng(seed=2029)
 def test_minimax_m3_selection_attention_block128_causal_probe():
@@ -164,3 +264,15 @@ def test_minimax_m3_selection_attention_block128_causal_probe():
     torch.testing.assert_close(o.float(), o_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(row_sum, row_sum_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(row_max, row_max_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L4
+def test_selection_attention_is_causal_on_existing_geometry():
+    """Causal masking works without relying on the new block-128/GQA-16 geometry."""
+    _run_targeted_causal_case(future_first=False)
+
+
+@pytest.mark.L4
+def test_selection_attention_causal_future_first_block_recovers_without_nan():
+    """A future-only first tile contributes zero and a later valid tile recovers."""
+    _run_targeted_causal_case(future_first=True)
