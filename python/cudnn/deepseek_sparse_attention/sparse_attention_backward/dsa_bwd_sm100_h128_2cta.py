@@ -655,7 +655,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     DSINK_THREADS = 128
     DSINK_UNROLL = 4
     ZERO_THREADS = 128
-    ZERO_ROWS_PER_BLOCK = 8
+    ZERO_ROWS_PER_BLOCK = 2
 
     THREADS_PER_CTA = 640
     GATHER_WARPS = 4
@@ -673,9 +673,18 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     REDUCE_THREADS = REDUCE_WARPS * 32
 
     DKV_MMA_TILER = (256, 64, 64)
-    ROUND_TILER = (256, 64, 32)
-    ROUND_STAGE_ELEMENTS = 4096
-    ROUND_STAGE_BYTES = 8192
+    # Round A-operand granularity.  The ring always occupies exactly 32 KiB
+    # (ROUND_BUF_ELEMENTS); ROUND_K_HEADS trades TMA/mbarrier round trips per
+    # KV tile against ring depth (in-flight TMA generations):
+    #   K=16 -> 32 gens/tile, depth 8   K=32 -> 16 gens/tile, depth 4
+    #   K=64 ->  8 gens/tile, depth 2
+    # Short rows never reach steady state, so they want the cheap issue side;
+    # long rows want the deep ring.  Selected per max_topk in __init__.
+    ROUND_BUF_ELEMENTS = 16384
+    ROUND_K_HEADS = 64
+    ROUND_TILER = (256, 64, 64)
+    ROUND_STAGE_ELEMENTS = 8192
+    ROUND_STAGE_BYTES = 16384
     PDS_BLOCK_ELEMENTS = 2048
     PDS_BLOCK_BYTES = 4096
     TMEM_S_OFFSET = 0
@@ -687,9 +696,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     TMEM_DKV0_OFFSET = 384
     TMEM_DKV1_OFFSET = 448
     SCORE_DONE_STAGES = 2
-    ROUND_PANELS_PER_TILE = 8
-    ROUND_GENS_PER_TILE = 16
-    ROUND_STAGES = 4
+    ROUND_GENS_PER_TILE = 8
+    ROUND_STAGES = 2
     MMA_DONE_STAGES = 2
     REDUCE_PACE_NS = 0
     REDUCE_DEPHASE_NS = 0
@@ -698,7 +706,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     DQ_WIDE_STORE_VALUES = 8
     DQ_CONVERSION_PAIR_VALUES = 2
 
-    DIRECT_DQ_LOAN_SYNC = True
+    DIRECT_DQ_LOAN_SYNC = False
     DEFER_KSCORE_TAIL_UNTIL_DQ0_STORED = True
     GATHER_SETMAXREG = 88
     UTILITY_SETMAXREG = 96
@@ -713,6 +721,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
     MATH_EPI_SETMAXREG = 200
     REDUCER_EPI_SETMAXREG = 24
     EARLY_DQ0_OVERLAP = True
+    # With the compatible long-row K-dQ retile, each score-B generation is
+    # already the rank-owned N32 half of both K-dQ D128 panels. Only the
+    # peer-owned N32 half then needs to be gathered before dQ.
+    KDQ_REFETCH_HALF = False
     DUAL_DQ_DRAIN = False
     W17_RUNTIME_TMA_LOOP = False
     STATIONARY_DO_FIRST = False
@@ -741,9 +753,24 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         self.same_hdim_kv = True
         self.block_tile = block_tile
         self.max_topk = max_topk
+        # Preserve the existing layout and full gather on short rows; the
+        # half-refetch layout pays off in the long steady-state pipeline.
+        self.KDQ_REFETCH_HALF = max_topk >= 512
+        # Two-tile / eight-tile rows spend most of the round ring's life in
+        # fill, so the cheap K64 issue side wins; sixteen-tile and longer rows
+        # are steady-state and want the deeper K32 ring instead.
+        self.ROUND_K_HEADS = 64 if max_topk <= 512 else 32
+        assert self.H_TILE_CLUSTER % self.ROUND_K_HEADS == 0
+        self.ROUND_TILER = (self.D_TILE_CLUSTER, self.N_TILE, self.ROUND_K_HEADS)
+        self.ROUND_STAGE_ELEMENTS = self.D_TILE_CTA * self.ROUND_K_HEADS
+        self.ROUND_STAGE_BYTES = 2 * self.ROUND_STAGE_ELEMENTS
+        self.ROUND_STAGES = self.ROUND_BUF_ELEMENTS // self.ROUND_STAGE_ELEMENTS
+        self.ROUND_GENS_PER_TILE = 4 * (self.H_TILE_CLUSTER // self.ROUND_K_HEADS)
+        assert self.ROUND_STAGES in (2, 4, 8)
+        assert self.ROUND_GENS_PER_TILE % (2 * self.ROUND_STAGES) == 0
         # Two-tile TOPK128 rows spend proportionally more time in the reducer
         # statistics path.  Move one 2K-register slice from four math warps to
-        # eight reducer warps; longer rows retain the measured 120/88 split.
+        # eight reducer warps; longer rows retain the tuned 120/88 split.
         if self.max_topk == 128:
             self.MATH_SETMAXREG = 104
             self.REDUCER_SETMAXREG = 96
@@ -751,9 +778,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         # of shared memory forces one CTA per SM, so ptxas is pinned to 96
         # registers per thread and the 640-thread CTA has exactly 61440
         # registers to divide between the four roles -- every extra register
-        # for one role is taken from another.  The split below is measured,
-        # not inherited: the utility warps (tcgen05 MMA issue, TMA load,
-        # relay) are by far the most sensitive role and need the larger share.
+        # for one role is taken from another.  The utility warps (tcgen05 MMA
+        # issue, TMA load, and relay) are the most register-sensitive role and
+        # therefore retain the larger share.
         assert (
             self.GATHER_SETMAXREG * self.GATHER_THREADS
             + self.MATH_SETMAXREG * self.MATH_THREADS
@@ -893,7 +920,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         kv_index_2: Int32,
         kv_index_3: Int32,
     ) -> None:
-        """Fill both sparse K-dQ panels from preloaded KV indices."""
+        """Fill the missing half (or all) of both sparse K-dQ panels."""
         seqlen_kv = cute.size(mKV, mode=[0])
         index_in_group = role_tidx % self.KV_GROUP_SIZE
         group_index = role_tidx // self.KV_GROUP_SIZE
@@ -901,19 +928,20 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         d_offset_0 = rank * Int32(self.D_TILE_CTA)
         d_offset_1 = Int32(self.D_TILE_CLUSTER) + rank * Int32(self.D_TILE_CTA)
         assert self.N_TILE % groups_total == 0
-        rows_per_group = self.N_TILE // groups_total
-        assert rows_per_group == 4
-        kdq_local_n = [row_iteration * groups_total + group_index for row_iteration in range(rows_per_group)]
+        assert self.N_TILE // groups_total == 4
+        half_base = (Int32(1) - rank) * Int32(self.N_TILE_CTA * int(self.KDQ_REFETCH_HALF))
+        rows = 2 if self.KDQ_REFETCH_HALF else 4
+        kdq_local_n = [half_base + Int32(row_iteration * groups_total) + group_index for row_iteration in range(rows)]
         kdq_kv_index = [kv_index_0, kv_index_1, kv_index_2, kv_index_3]
-        for row_iteration in cutlass.range_constexpr(rows_per_group):
+        for row_iteration in cutlass.range_constexpr(rows):
             local_n = kdq_local_n[row_iteration]
             kv_index = kdq_kv_index[row_iteration]
             if kv_index >= Int32(0) and kv_index < seqlen_kv:
-                self._copy_sparse_k_d128_row(mKV, kd_rows_0, Int32(local_n), kv_index, batch_idx, d_offset_0, index_in_group, copy_atom, thread_copy)
-                self._copy_sparse_k_d128_row(mKV, kd_rows_1, Int32(local_n), kv_index, batch_idx, d_offset_1, index_in_group, copy_atom, thread_copy)
+                self._copy_sparse_k_d128_row(mKV, kd_rows_0, local_n, kv_index, batch_idx, d_offset_0, index_in_group, copy_atom, thread_copy)
+                self._copy_sparse_k_d128_row(mKV, kd_rows_1, local_n, kv_index, batch_idx, d_offset_1, index_in_group, copy_atom, thread_copy)
             else:
-                self._zero_sparse_k_d128_row(kd_rows_0, Int32(local_n), index_in_group)
-                self._zero_sparse_k_d128_row(kd_rows_1, Int32(local_n), index_in_group)
+                self._zero_sparse_k_d128_row(kd_rows_0, local_n, index_in_group)
+                self._zero_sparse_k_d128_row(kd_rows_1, local_n, index_in_group)
 
     @cute.jit
     def _issue_dq_rounds(
@@ -954,6 +982,53 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         return kscore_consumer_state
 
     @cute.jit
+    def _issue_dkv_sweep(
+        self,
+        dkv_tiled_mma: cute.TiledMma,
+        t_dkv: cute.Tensor,
+        round_fragment_0: cute.Tensor,
+        round_fragment_1: cute.Tensor,
+        round_fragment_2: cute.Tensor,
+        round_fragment_3: cute.Tensor,
+        round_fragment_4: cute.Tensor,
+        round_fragment_5: cute.Tensor,
+        round_fragment_6: cute.Tensor,
+        round_fragment_7: cute.Tensor,
+        b_fragment_0: cute.Tensor,
+        b_fragment_1: cute.Tensor,
+        first_accumulate: cutlass.Constexpr[bool],
+        round_pipeline,
+        round_consumer_state: pipeline.PipelineState,
+    ):
+        """Consume one full 128-head A sweep against its two 64-head B halves.
+
+        The ring always holds ``ROUND_STAGES == H_TILE_CLUSTER //
+        ROUND_K_HEADS`` generations, so the sweep index doubles as the ring
+        slot and the k-block order is identical for every ROUND_K_HEADS.
+        """
+
+        round_slot_fragments = (
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+        )
+        for chunk in cutlass.range_constexpr(self.ROUND_STAGES):
+            head_base = chunk * self.ROUND_K_HEADS
+            b_fragment = b_fragment_0 if head_base < self.H_TILE_CTA else b_fragment_1
+            b_k_half = (head_base % self.H_TILE_CTA) // self.ROUND_K_HEADS
+            accumulate = True if chunk > 0 else first_accumulate
+            round_pipeline.consumer_wait(round_consumer_state)
+            self._issue_dkv_pass(dkv_tiled_mma, t_dkv, round_slot_fragments[chunk], b_fragment, b_k_half, accumulate)
+            round_pipeline.consumer_release(round_consumer_state)
+            round_consumer_state.advance()
+        return round_consumer_state
+
+    @cute.jit
     def _issue_dkv_pass(
         self,
         dkv_tiled_mma: cute.TiledMma,
@@ -963,10 +1038,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         b_k_half: cutlass.Constexpr[int],
         accumulate: cutlass.Constexpr[bool],
     ) -> None:
-        """Issue one self-contained K32 stage against its original B half."""
+        """Issue one self-contained A stage against its original B half."""
         k_blocks = cute.size(a_fragment, mode=[2])
-        assert k_blocks == 2
-        assert cute.size(b_fragment, mode=[2]) == 2 * k_blocks
+        assert k_blocks == self.ROUND_K_HEADS // 16
+        assert cute.size(b_fragment, mode=[2]) == self.H_TILE_CTA // 16
         b_k_block_offset = b_k_half * k_blocks
         mma = dkv_tiled_mma.with_()
         mma.set(tcgen05.Field.ACCUMULATE, accumulate)
@@ -1038,6 +1113,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         round_fragment_1: cute.Tensor,
         round_fragment_2: cute.Tensor,
         round_fragment_3: cute.Tensor,
+        round_fragment_4: cute.Tensor,
+        round_fragment_5: cute.Tensor,
+        round_fragment_6: cute.Tensor,
+        round_fragment_7: cute.Tensor,
         p_fragment_0: cute.Tensor,
         p_fragment_1: cute.Tensor,
         ds_fragment_0: cute.Tensor,
@@ -1060,81 +1139,85 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_0, p_fragment_0, 0, False)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_1, p_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_2, p_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_3, p_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_0,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            p_fragment_0,
+            p_fragment_1,
+            False,
+            round_pipeline,
+            round_consumer_state,
+        )
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_0, p_fragment_0, 0, False)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_1, p_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_2, p_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_3, p_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_1,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            p_fragment_0,
+            p_fragment_1,
+            False,
+            round_pipeline,
+            round_consumer_state,
+        )
         pds_pipeline.consumer_wait(pds_consumer_state)
         _mbarrier_wait_acquire_cluster(ds_local_ready_mbar, relay_phase)
         kscore_consumer_state = self._issue_dq_rounds(
             dq_tiled_mma, t_dq_0, t_dq_1, dq_kd_fragment_a, dq_kd_fragment_b, dq_ds_fragment, dq_accumulate, kscore_pipeline, kscore_consumer_state
         )
         _mbarrier_wait_acquire_cluster(relay_mbars + 1, relay_phase)
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_0, ds_fragment_0, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_1, ds_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_2, ds_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_3, ds_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_0,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            ds_fragment_0,
+            ds_fragment_1,
+            True,
+            round_pipeline,
+            round_consumer_state,
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_0, ds_fragment_0, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_1, ds_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_2, ds_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_3, ds_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_1,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            ds_fragment_0,
+            ds_fragment_1,
+            True,
+            round_pipeline,
+            round_consumer_state,
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
@@ -1187,15 +1270,16 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         """
         group_index = role_tidx // self.KV_GROUP_SIZE
         groups_total = self.GATHER_THREADS // self.KV_GROUP_SIZE
-        rows_per_group = self.N_TILE // groups_total
-        assert rows_per_group == 4
-        kdq_local_n = [row_iteration * groups_total + group_index for row_iteration in range(rows_per_group)]
+        assert self.N_TILE // groups_total == 4
+        half_base = (Int32(1) - rank) * Int32(self.N_TILE_CTA * int(self.KDQ_REFETCH_HALF))
+        rows = 2 if self.KDQ_REFETCH_HALF else 4
+        kdq_local_n = [half_base + Int32(row_iteration * groups_total) + group_index for row_iteration in range(rows)]
         kdq_kv_index = []
         for local_n in kdq_local_n:
-            global_n = tile_index * Int32(self.N_TILE) + Int32(local_n)
+            global_n = tile_index * Int32(self.N_TILE) + local_n
             kv_index = Int32(-1)
             if global_n < topk:
-                kv_index = tile_indices[Int32(local_n)]
+                kv_index = tile_indices[local_n]
             kdq_kv_index.append(kv_index)
         self._fill_kdq_pair(
             mKV,
@@ -1209,8 +1293,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             thread_copy,
             kdq_kv_index[0],
             kdq_kv_index[1],
-            kdq_kv_index[2],
-            kdq_kv_index[3],
+            kdq_kv_index[-2],
+            kdq_kv_index[-1],
         )
 
     @cute.jit
@@ -1370,7 +1454,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         assert cute.cosize(dkv_a_layout_staged) <= 16384
         round_stage_elements = cute.cosize(round_a_layout_staged)
         assert round_stage_elements == self.ROUND_STAGE_ELEMENTS
-        assert cute.cosize(dkv_a_layout_staged) == 2 * round_stage_elements
+        assert cute.cosize(dkv_a_layout_staged) == 8192
         assert round_a_layout_staged.inner == dkv_a_layout_staged.inner
         assert cute.cosize(dkv_b_layout_staged) <= 4096
         assert cute.cosize(dq_a_layout_staged) <= 8192
@@ -1395,7 +1479,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         assert round_stage_bytes == self.ROUND_STAGE_BYTES
         local_bulk_stage_offset = cute.cosize(round_a_layout_staged)
         assert local_bulk_stage_offset == self.ROUND_STAGE_ELEMENTS
-        assert cute.cosize(score_a_layout_staged) == 8 * local_bulk_stage_offset
+        assert cute.cosize(score_a_layout_staged) * self.ROUND_K_HEADS == 256 * local_bulk_stage_offset
         assert score_a_layout_staged.inner == round_a_layout_staged.inner
         SharedStorage = self._make_shared_storage(
             score_a_layout_staged, score_b_layout_staged, dkv_a_layout_staged, dkv_b_layout_staged, dq_a_layout_staged, dq_b_layout_staged
@@ -1733,7 +1817,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
 
     @cute.jit
     def _load_o_bf16x16(self, source: cute.Pointer):
-        """Load immutable O through the vectorized read path."""
+        """Load immutable O through the policy-neutral path."""
 
         return _load_o_bf16x16(source)
 
@@ -2020,8 +2104,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         row = row_base + lane // Int32(4)
         group_lane = lane % Int32(4)
         head = rank * Int32(self.H_TILE_CTA) + row
-        for chunk in cutlass.range_constexpr(8):
-            dim = (group_lane + Int32(4 * chunk)) * Int32(16)
+        # Each O row is 512 BF16 = 1024 B = eight aligned 128-byte lines.
+        # Four lanes own one row, so two requests per lane cover the row with
+        # exactly one prefetch per line instead of four per line.
+        for chunk in cutlass.range_constexpr(2):
+            dim = (group_lane + Int32(4 * chunk)) * Int32(64)
             source = mOut.iterator + mOut.layout((head, dim, (token_idx, batch_idx)))
             _prefetch_o_row_l2(source)
 
@@ -2384,11 +2471,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         pds_ready_mbars = storage.pds_ready_mbars.data_ptr()
         p_ready_mbars = storage.p_ready_mbars.data_ptr()
         ds_local_ready_mbar = storage.ds_local_ready_mbar.data_ptr()
-        round_tma_mbars = storage.round_tma_mbars.data_ptr()
         loan_epi_safe_mbar = storage.loan_epi_safe_mbar.ptr
         stationary_q_raw = storage.stationary_q.data_ptr()
         stationary_do_raw = storage.stationary_do.data_ptr()
-        round_slot_raw = (storage.round_buf_a0.data_ptr(), storage.round_buf_a1.data_ptr(), storage.round_buf_b0.data_ptr(), storage.round_buf_b1.data_ptr())
+        round_buf_raw = storage.round_buf.data_ptr()
+        round_slot_raw = tuple(round_buf_raw + slot * self.ROUND_STAGE_ELEMENTS for slot in range(self.ROUND_STAGES))
         score_kv_raw = storage.score_kv.data_ptr()
         stationary_q = storage.stationary_q.get_tensor(score_a_layout_staged.outer, swizzle=score_a_layout_staged.inner)
         stationary_do = storage.stationary_do.get_tensor(score_a_layout_staged.outer, swizzle=score_a_layout_staged.inner)
@@ -2413,15 +2500,48 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         ]
         kdq_loan_ptr_0 = cute.make_ptr(self.element_dtype, score_kv_raw.toint(), score_kv_raw.memspace, assumed_align=1024)
         kdq_loan_ptr_1 = cute.make_ptr(self.element_dtype, score_kv_raw.toint() + Int32(16384), score_kv_raw.memspace, assumed_align=1024)
+        # Retile each K-dQ panel as two stacked copies of the score-B stage:
+        # panel(kv,d) = 4096*(kv//32) + scoreB_stage(kv%32,d).
+        # This remains a canonical SMEM A descriptor within every K16 block
+        # and makes the preceding rank-owned score-B bytes reusable verbatim.
+        if cutlass.const_expr(self.KDQ_REFETCH_HALF):
+            atom_mn = 64
+            atom_k = 8
+            m_tiles = self.D_TILE_CTA // atom_mn
+            stage_elements = self.N_TILE_CTA * self.D_TILE_CTA
+            n_tile_stride = atom_mn * atom_k
+            d_tile_stride = n_tile_stride * (self.N_TILE_CTA // atom_k)
+            kdq_outer = cute.make_layout(
+                (((atom_mn, m_tiles), (atom_k, 2)), 1, (2, 2), 1),
+                stride=(
+                    ((1, d_tile_stride), (atom_mn, n_tile_stride)),
+                    0,
+                    (n_tile_stride * 2, stage_elements),
+                    self.D_TILE_CTA * self.N_TILE,
+                ),
+            )
+            assert cute.cosize(kdq_outer) == self.D_TILE_CTA * self.N_TILE
+        else:
+            kdq_outer = dq_a_layout_staged.outer
         kdq_loan = (
-            cute.make_tensor(cute.recast_ptr(kdq_loan_ptr_0, dq_a_layout_staged.inner, dtype=self.element_dtype), dq_a_layout_staged.outer),
-            cute.make_tensor(cute.recast_ptr(kdq_loan_ptr_1, dq_a_layout_staged.inner, dtype=self.element_dtype), dq_a_layout_staged.outer),
+            cute.make_tensor(cute.recast_ptr(kdq_loan_ptr_0, dq_a_layout_staged.inner, dtype=self.element_dtype), kdq_outer),
+            cute.make_tensor(cute.recast_ptr(kdq_loan_ptr_1, dq_a_layout_staged.inner, dtype=self.element_dtype), kdq_outer),
         )
-        round_slots = (
-            storage.round_buf_a0.get_tensor(round_a_layout_staged.outer, swizzle=round_a_layout_staged.inner),
-            storage.round_buf_a1.get_tensor(round_a_layout_staged.outer, swizzle=round_a_layout_staged.inner),
-            storage.round_buf_b0.get_tensor(round_a_layout_staged.outer, swizzle=round_a_layout_staged.inner),
-            storage.round_buf_b1.get_tensor(round_a_layout_staged.outer, swizzle=round_a_layout_staged.inner),
+        round_slots = tuple(
+            cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(
+                        self.element_dtype,
+                        round_buf_raw.toint() + slot * self.ROUND_STAGE_BYTES,
+                        round_buf_raw.memspace,
+                        assumed_align=1024,
+                    ),
+                    round_a_layout_staged.inner,
+                    dtype=self.element_dtype,
+                ),
+                round_a_layout_staged.outer,
+            )
+            for slot in range(self.ROUND_STAGES)
         )
         p_blocks_raw = storage.p_blocks.data_ptr()
         ds_blocks_raw = storage.ds_blocks.data_ptr()
@@ -2456,7 +2576,6 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         ds_block_raw_ptrs = (ds_blocks_raw, ds_blocks_raw + self.PDS_BLOCK_ELEMENTS)
         flat_pds_block_layout = cute.make_layout((self.PDS_BLOCK_ELEMENTS,), stride=(1,))
         p_xchg_raw = storage.p_xchg.get_tensor(flat_pds_block_layout)
-        ds_xchg_raw = storage.ds_xchg.get_tensor(flat_pds_block_layout)
         softmax_stats = storage.stats.get_tensor(cute.make_layout((self.H_TILE_CTA, 2), stride=(1, self.H_TILE_CTA)))
         staged_indices = storage.tile_indices.get_tensor(cute.make_layout((self.N_TILE, 2), stride=(1, self.N_TILE)))
         if cutlass.const_expr(not self.W17_RUNTIME_TMA_LOOP):
@@ -2482,32 +2601,21 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             g_dot_round = cute.local_tile(round_tma_tensor_dot, cute.select(self.ROUND_TILER, mode=[0, 2]), (None, None, (token_idx, batch_idx)))
             rank_g_qt_round = rank_dkv_mma.partition_A(g_qt_round)
             rank_g_dot_round = rank_dkv_mma.partition_A(g_dot_round)
-            t_qt_round_smem_0, t_qt_round_gmem = cpasync.tma_partition(
-                round_tma_atom_qt, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[0], 0, 3), cute.group_modes(rank_g_qt_round, 0, 3)
-            )
-            t_qt_round_smem_1, _ = cpasync.tma_partition(
-                round_tma_atom_qt, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[1], 0, 3), cute.group_modes(rank_g_qt_round, 0, 3)
-            )
-            t_qt_round_smem_2, _ = cpasync.tma_partition(
-                round_tma_atom_qt, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[2], 0, 3), cute.group_modes(rank_g_qt_round, 0, 3)
-            )
-            t_qt_round_smem_3, _ = cpasync.tma_partition(
-                round_tma_atom_qt, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[3], 0, 3), cute.group_modes(rank_g_qt_round, 0, 3)
-            )
-            t_dot_round_smem_0, t_dot_round_gmem = cpasync.tma_partition(
-                round_tma_atom_dot, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[0], 0, 3), cute.group_modes(rank_g_dot_round, 0, 3)
-            )
-            t_dot_round_smem_1, _ = cpasync.tma_partition(
-                round_tma_atom_dot, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[1], 0, 3), cute.group_modes(rank_g_dot_round, 0, 3)
-            )
-            t_dot_round_smem_2, _ = cpasync.tma_partition(
-                round_tma_atom_dot, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[2], 0, 3), cute.group_modes(rank_g_dot_round, 0, 3)
-            )
-            t_dot_round_smem_3, _ = cpasync.tma_partition(
-                round_tma_atom_dot, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[3], 0, 3), cute.group_modes(rank_g_dot_round, 0, 3)
-            )
-            t_qt_round_smem = (t_qt_round_smem_0, t_qt_round_smem_1, t_qt_round_smem_2, t_qt_round_smem_3)
-            t_dot_round_smem = (t_dot_round_smem_0, t_dot_round_smem_1, t_dot_round_smem_2, t_dot_round_smem_3)
+            qt_round_smem_slots = []
+            dot_round_smem_slots = []
+            for slot in cutlass.range_constexpr(self.ROUND_STAGES):
+                qt_slot, qt_round_gmem = cpasync.tma_partition(
+                    round_tma_atom_qt, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[slot], 0, 3), cute.group_modes(rank_g_qt_round, 0, 3)
+                )
+                dot_slot, dot_round_gmem = cpasync.tma_partition(
+                    round_tma_atom_dot, block_coord_vmnk[2], a_cta_layout, cute.group_modes(round_slots[slot], 0, 3), cute.group_modes(rank_g_dot_round, 0, 3)
+                )
+                qt_round_smem_slots.append(qt_slot)
+                dot_round_smem_slots.append(dot_slot)
+                t_qt_round_gmem = qt_round_gmem
+                t_dot_round_gmem = dot_round_gmem
+            t_qt_round_smem = tuple(qt_round_smem_slots)
+            t_dot_round_smem = tuple(dot_round_smem_slots)
         score_q_fragment = score_tiled_mma.make_fragment_A(stationary_q)
         score_do_fragment = dp_tiled_mma.make_fragment_A(stationary_do)
         score_k_fragment = score_tiled_mma.make_fragment_B(k_n)
@@ -2516,19 +2624,15 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dq_kd_fragment_b = dq_tiled_mma.make_fragment_A(kdq_loan[1])
         dq_ds_fragment = dq_tiled_mma.make_fragment_B(ds_image)
         assert cute.cosize(round_a_layout_staged) == self.ROUND_STAGE_ELEMENTS
-        round_fragments = (
-            dkv_tiled_mma.make_fragment_A(round_slots[0]),
-            dkv_tiled_mma.make_fragment_A(round_slots[1]),
-            dkv_tiled_mma.make_fragment_A(round_slots[2]),
-            dkv_tiled_mma.make_fragment_A(round_slots[3]),
-        )
+        round_fragments = tuple(dkv_tiled_mma.make_fragment_A(round_slots[slot]) for slot in range(self.ROUND_STAGES))
+        round_a_k_blocks = self.ROUND_K_HEADS // 16
         for round_slot in cutlass.range_constexpr(self.ROUND_STAGES):
             round_slot_tensor = round_slots[round_slot]
             round_fragment = round_fragments[round_slot]
             assert cute.cosize(round_slot_tensor.layout) == self.ROUND_STAGE_ELEMENTS
-            assert cute.size(round_slot_tensor, mode=[2]) == 2
-            assert cute.size(round_fragment, mode=[2]) == 2
-            for k_block in cutlass.range_constexpr(2):
+            assert cute.size(round_slot_tensor, mode=[2]) == round_a_k_blocks
+            assert cute.size(round_fragment, mode=[2]) == round_a_k_blocks
+            for k_block in cutlass.range_constexpr(round_a_k_blocks):
                 k_block_slice = round_slot_tensor[None, None, k_block, 0]
                 k_block_offset = round_slot_tensor.layout((0, 0, k_block, 0))
                 k_block_cosize = cute.cosize(k_block_slice.layout)
@@ -2684,8 +2788,6 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             cute.arch.mbarrier_init(pds_ready_mbars, self.MATH_WARPS)
             cute.arch.mbarrier_init(p_ready_mbars, self.MATH_WARPS)
             cute.arch.mbarrier_init(ds_local_ready_mbar, 2)
-            for round_slot in cutlass.range_constexpr(self.ROUND_STAGES):
-                cute.arch.mbarrier_init(round_tma_mbars + round_slot, 1)
             if cutlass.const_expr(self.DIRECT_DQ_LOAN_SYNC):
                 cute.arch.mbarrier_init(loan_epi_safe_mbar, 1)
         cute.arch.fence_view_async_shared()
@@ -2848,8 +2950,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                             cute.arch.mbarrier_arrive(loan_epi_safe_mbar)
                 if cutlass.const_expr(self.EARLY_DQ0_OVERLAP):
                     pipe_dq0_done.consumer_wait(dq0_done_gather_state)
-                    # The now-idle gather warpgroup drains panel 0 with the
-                    # BF16x8 streaming store while DQ1 and dK continue.
+                    # Use the split epilogue: the now-idle
+                    # gather warpgroup drains panel 0 with the existing
+                    # BF16x8 streaming store while DQ1/dK continue.
                     self._store_dq_epi_scalar_direct(
                         t_dq[0],
                         dq_tmem_load,
@@ -2891,8 +2994,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         elif warp_idx < Int32(self.REDUCE_WARP_BEGIN):
             mtx = tidx - Int32(self.MATH_THREAD_BEGIN)
             if tile_count > Int32(0):
+                # stats_lse_barrier spans MATH+REDUCE, so it already aligns the
+                # four math warps; math_barrier is only needed on the empty row.
                 self.stats_lse_barrier.arrive_and_wait()
-            self.math_barrier.arrive_and_wait()
+            else:
+                self.math_barrier.arrive_and_wait()
             s_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.SCORE_DONE_STAGES)
             dp_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.SCORE_DONE_STAGES)
             pds_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
@@ -2926,26 +3032,16 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                 p_xchg_raw.memspace,
                 assumed_align=16,
             )
-            aligned_ds_xchg_ptr = cute.make_ptr(
-                self.element_dtype,
-                ds_xchg_raw.iterator.toint() - mtx // Int32(self.H_TILE_CTA) * Int32(self.PDS_BLOCK_BYTES),
-                ds_xchg_raw.memspace,
-                assumed_align=16,
-            )
             p_xchg_store = cute.make_tensor(cute.recast_ptr(aligned_p_xchg_ptr, score_store_layout.inner, dtype=self.element_dtype), score_store_domain)
-            ds_xchg_store = cute.make_tensor(cute.recast_ptr(aligned_ds_xchg_ptr, score_store_layout.inner, dtype=self.element_dtype), score_store_domain)
             t_rs_p_local = thread_copy_r2s.partition_D(p_local_store)
             t_rs_ds_local = thread_copy_r2s.partition_D(ds_local_store)
             t_rs_p_xchg = thread_copy_r2s.partition_D(p_xchg_store)
-            t_rs_ds_xchg = thread_copy_r2s.partition_D(ds_xchg_store)
             assert cute.size(t_rs_p_local, mode=[4]) == 1
             assert cute.size(t_rs_ds_local, mode=[4]) == 1
             assert cute.size(t_rs_p_xchg, mode=[4]) == 1
-            assert cute.size(t_rs_ds_xchg, mode=[4]) == 1
             t_rs_p_local_tile = t_rs_p_local[None, None, None, None, 0]
             t_rs_ds_local_tile = t_rs_ds_local[None, None, None, None, 0]
             t_rs_p_xchg_tile = t_rs_p_xchg[None, None, None, None, 0]
-            t_rs_ds_xchg_tile = t_rs_ds_xchg[None, None, None, None, 0]
             r_score = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_dp = cute.make_rmem_tensor(score_coordinates.shape, self.acc_dtype)
             r_p = cute.make_rmem_tensor(score_coordinates.shape, self.element_dtype)
@@ -3032,7 +3128,6 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         r_ds[i1] = self.element_dtype(d1)
                 r_ds_store = thread_copy_r2s.retile(r_ds)
                 assert t_rs_ds_local_tile.shape == r_ds_store.shape
-                assert t_rs_ds_xchg_tile.shape == r_ds_store.shape
                 if math_owns_local_half:
                     cute.copy(tiled_copy_r2s, r_ds_store, t_rs_ds_local_tile)
                 assert t_rs_ds_tile.shape == r_ds_store.shape
@@ -3171,10 +3266,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                             dq_kd_fragment_a,
                             dq_kd_fragment_b,
                             dq_ds_fragment,
-                            round_fragments[0],
-                            round_fragments[1],
-                            round_fragments[2],
-                            round_fragments[3],
+                            round_fragments[0 % len(round_fragments)],
+                            round_fragments[1 % len(round_fragments)],
+                            round_fragments[2 % len(round_fragments)],
+                            round_fragments[3 % len(round_fragments)],
+                            round_fragments[4 % len(round_fragments)],
+                            round_fragments[5 % len(round_fragments)],
+                            round_fragments[6 % len(round_fragments)],
+                            round_fragments[7 % len(round_fragments)],
                             p_fragments[0],
                             p_fragments[1],
                             ds_fragments[0],
@@ -3215,10 +3314,14 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                             dq_kd_fragment_a,
                             dq_kd_fragment_b,
                             dq_ds_fragment,
-                            round_fragments[0],
-                            round_fragments[1],
-                            round_fragments[2],
-                            round_fragments[3],
+                            round_fragments[0 % len(round_fragments)],
+                            round_fragments[1 % len(round_fragments)],
+                            round_fragments[2 % len(round_fragments)],
+                            round_fragments[3 % len(round_fragments)],
+                            round_fragments[4 % len(round_fragments)],
+                            round_fragments[5 % len(round_fragments)],
+                            round_fragments[6 % len(round_fragments)],
+                            round_fragments[7 % len(round_fragments)],
                             p_fragments[0],
                             p_fragments[1],
                             ds_fragments[0],
@@ -3313,8 +3416,9 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                     w17_t_q_smem, w17_t_q_gmem = t_q_smem, t_q_gmem
                     w17_t_do_smem, w17_t_do_gmem = t_do_smem, t_do_gmem
                 if cutlass.const_expr(self.STATIONARY_DO_FIRST):
-                    # Load dO first because the reducer O.dO sweep consumes it
-                    # immediately; hide Q behind the first sparse-K gather.
+                    # Preserve the critical-panel order.  The
+                    # reducer O.dO sweep consumes dO immediately, while Q is
+                    # additionally hidden behind the first sparse-K gather.
                     # Each panel retains its original transaction count and
                     # independent completion/readiness barriers.
                     with cute.arch.elect_one():
@@ -3378,47 +3482,38 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         )
                 else:
                     for loop_iter in cutlass.range(tile_count):
-                        tile_index = tile_count - Int32(1) - loop_iter
-                        for flat_gen in cutlass.range_constexpr(self.ROUND_PANELS_PER_TILE):
-                            if cutlass.const_expr(flat_gen < 2):
-                                grad_round = 0
-                                tensor_kind = 0
-                            elif cutlass.const_expr(flat_gen < 4):
-                                grad_round = 1
-                                tensor_kind = 0
-                            elif cutlass.const_expr(flat_gen < 6):
-                                grad_round = 0
-                                tensor_kind = 1
-                            else:
-                                grad_round = 1
-                                tensor_kind = 1
-                            h_half = flat_gen % 2
-                            for k_half in cutlass.range_constexpr(2):
-                                micro_gen = 2 * flat_gen + k_half
-                                round_slot = micro_gen % self.ROUND_STAGES
-                                source_h32 = 2 * h_half + k_half
-                                round_acq = pipeline.PipelineState(
-                                    self.ROUND_STAGES,
-                                    loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
-                                    Int32(round_slot),
-                                    Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
+                        # ROUND_GENS_PER_TILE generations per KV tile, in the
+                        # exact order the UMMA warp consumes them: dO^T rounds
+                        # 0/1 then Q^T rounds 0/1, each split into
+                        # H_TILE_CLUSTER / ROUND_K_HEADS head chunks.
+                        gens_per_group = self.H_TILE_CLUSTER // self.ROUND_K_HEADS
+                        for micro_gen in cutlass.range_constexpr(self.ROUND_GENS_PER_TILE):
+                            tensor_kind = micro_gen // (2 * gens_per_group)
+                            grad_round = (micro_gen // gens_per_group) % 2
+                            h_half = micro_gen % gens_per_group
+                            round_slot = micro_gen % self.ROUND_STAGES
+                            round_acq = pipeline.PipelineState(
+                                self.ROUND_STAGES,
+                                loop_iter * Int32(self.ROUND_GENS_PER_TILE) + Int32(micro_gen),
+                                Int32(round_slot),
+                                Int32(1 ^ micro_gen // self.ROUND_STAGES & 1),
+                            )
+                            pipe_round.producer_acquire(round_acq)
+                            round_completion_mbar = pipe_round.producer_get_barrier(round_acq)
+                            if cutlass.const_expr(tensor_kind == 0):
+                                cute.copy(
+                                    round_tma_atom_dot,
+                                    t_dot_round_gmem[None, grad_round, h_half],
+                                    t_dot_round_smem[round_slot][None, 0],
+                                    tma_bar_ptr=round_completion_mbar,
                                 )
-                                pipe_round.producer_acquire(round_acq)
-                                round_completion_mbar = pipe_round.producer_get_barrier(round_acq)
-                                if cutlass.const_expr(tensor_kind == 0):
-                                    cute.copy(
-                                        round_tma_atom_dot,
-                                        t_dot_round_gmem[None, grad_round, source_h32],
-                                        t_dot_round_smem[round_slot][None, 0],
-                                        tma_bar_ptr=round_completion_mbar,
-                                    )
-                                else:
-                                    cute.copy(
-                                        round_tma_atom_qt,
-                                        t_qt_round_gmem[None, grad_round, source_h32],
-                                        t_qt_round_smem[round_slot][None, 0],
-                                        tma_bar_ptr=round_completion_mbar,
-                                    )
+                            else:
+                                cute.copy(
+                                    round_tma_atom_qt,
+                                    t_qt_round_gmem[None, grad_round, h_half],
+                                    t_qt_round_smem[round_slot][None, 0],
+                                    tma_bar_ptr=round_completion_mbar,
+                                )
                 round_tail = pipeline.PipelineState(self.ROUND_STAGES, tile_count * Int32(self.ROUND_GENS_PER_TILE), Int32(0), Int32(1))
                 pipe_round.producer_tail(round_tail)
         elif warp_idx == Int32(self.RELAY_WARP):
@@ -3480,7 +3575,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             s_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dp_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             kscore_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            round_mbars: cute.struct.MemRange[cutlass.Int64, 8]
+            round_mbars: cute.struct.MemRange[cutlass.Int64, 16]
             pds_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             dkv_done_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             dq_done_mbars: cute.struct.MemRange[cutlass.Int64, 2]
@@ -3489,7 +3584,6 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             stationary_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             landing_mbars: cute.struct.MemRange[cutlass.Int64, 2]
             relay_mbars: cute.struct.MemRange[cutlass.Int64, 2]
-            round_tma_mbars: cute.struct.MemRange[cutlass.Int64, 4]
             loan_epi_safe_mbar: cutlass.Int64
             pds_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
             p_ready_mbars: cute.struct.MemRange[cutlass.Int64, 1]
@@ -3499,15 +3593,11 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             stationary_q: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
             stationary_do: cute.struct.Align[cute.struct.MemRange[element_dtype, 32768], 1024]
             score_kv: cute.struct.Align[cute.struct.MemRange[element_dtype, 16384], 1024]
-            round_buf_a0: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
-            round_buf_a1: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
-            round_buf_b0: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
-            round_buf_b1: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
+            round_buf: cute.struct.Align[cute.struct.MemRange[element_dtype, 16384], 1024]
             p_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             p_xchg: cute.struct.Align[cute.struct.MemRange[element_dtype, 2048], 1024]
             ds_image: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
             ds_blocks: cute.struct.Align[cute.struct.MemRange[element_dtype, 4096], 1024]
-            ds_xchg: cute.struct.Align[cute.struct.MemRange[element_dtype, 2048], 1024]
             stats: cute.struct.Align[cute.struct.MemRange[Float32, 128], 1024]
             tile_indices: cute.struct.Align[cute.struct.MemRange[Int32, 128], 16]
 
@@ -3586,6 +3676,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         round_fragment_1: cute.Tensor,
         round_fragment_2: cute.Tensor,
         round_fragment_3: cute.Tensor,
+        round_fragment_4: cute.Tensor,
+        round_fragment_5: cute.Tensor,
+        round_fragment_6: cute.Tensor,
+        round_fragment_7: cute.Tensor,
         p_fragment_0: cute.Tensor,
         p_fragment_1: cute.Tensor,
         ds_fragment_0: cute.Tensor,
@@ -3614,41 +3708,43 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         _mbarrier_wait_acquire_cluster(relay_mbars, relay_phase)
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_0, p_fragment_0, 0, False)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_1, p_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_2, p_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_3, p_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_0,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            p_fragment_0,
+            p_fragment_1,
+            False,
+            round_pipeline,
+            round_consumer_state,
+        )
 
         dkv_done_pipeline.producer_acquire(dkv_acquire_state)
         dkv_acquire_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_0, p_fragment_0, 0, False)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_1, p_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_2, p_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_3, p_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_1,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            p_fragment_0,
+            p_fragment_1,
+            False,
+            round_pipeline,
+            round_consumer_state,
+        )
 
         pds_pipeline.consumer_wait(pds_consumer_state)
         _mbarrier_wait_acquire_cluster(ds_local_ready_mbar, relay_phase)
@@ -3670,42 +3766,44 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         )
 
         _mbarrier_wait_acquire_cluster(relay_mbars + 1, relay_phase)
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_0, ds_fragment_0, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_1, ds_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_2, ds_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_0, round_fragment_3, ds_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_0,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            ds_fragment_0,
+            ds_fragment_1,
+            True,
+            round_pipeline,
+            round_consumer_state,
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
 
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_0, ds_fragment_0, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_1, ds_fragment_0, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_2, ds_fragment_1, 0, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
-        round_pipeline.consumer_wait(round_consumer_state)
-        self._issue_dkv_pass(dkv_tiled_mma, t_dkv_1, round_fragment_3, ds_fragment_1, 1, True)
-        round_pipeline.consumer_release(round_consumer_state)
-        round_consumer_state.advance()
+        round_consumer_state = self._issue_dkv_sweep(
+            dkv_tiled_mma,
+            t_dkv_1,
+            round_fragment_0,
+            round_fragment_1,
+            round_fragment_2,
+            round_fragment_3,
+            round_fragment_4,
+            round_fragment_5,
+            round_fragment_6,
+            round_fragment_7,
+            ds_fragment_0,
+            ds_fragment_1,
+            True,
+            round_pipeline,
+            round_consumer_state,
+        )
         cute.arch.fence_view_async_tmem_store()
         dkv_done_pipeline.producer_commit(dkv_commit_state)
         dkv_commit_state.advance()
