@@ -343,10 +343,8 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
     )
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=0)
-@with_dsa_sparse_attention_backward_params
-def test_DSA_sparse_attention_backward_wrapper(
+def _run_DSA_sparse_attention_backward_wrapper(
+    *,
     dtype,
     acc_dtype,
     head_dim,
@@ -429,6 +427,49 @@ def test_DSA_sparse_attention_backward_wrapper(
             atol=5e-2,
             rtol=5e-2,
         )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_dsa_sparse_attention_backward_params
+def test_DSA_sparse_attention_backward_wrapper(
+    dtype,
+    acc_dtype,
+    head_dim,
+    head_dim_v,
+    num_heads,
+    topk,
+    has_topk_length,
+    request,
+):
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=dtype,
+        acc_dtype=acc_dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        num_heads=num_heads,
+        topk=topk,
+        has_topk_length=has_topk_length,
+        request=request,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=0)
+def test_DSA_sparse_attention_backward_wrapper_h128(has_topk_length, request):
+    _run_DSA_sparse_attention_backward_wrapper(
+        dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        head_dim=512,
+        head_dim_v=512,
+        num_heads=128,
+        topk=512,
+        has_topk_length=has_topk_length,
+        request=request,
+    )
 
 
 @pytest.mark.L0
