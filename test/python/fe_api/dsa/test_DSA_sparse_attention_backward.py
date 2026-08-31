@@ -16,6 +16,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import (
+    _require_exact_sm100,
     _require_sm90,
     _require_sm100,
     dsa_init,
@@ -123,8 +124,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    _require_exact_sm100()
 
     s_q, s_kv, num_heads, head_dim = 4, topk + 64, 128, 512
     device = "cuda"
@@ -209,8 +209,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
 @torch_fork_set_rng(seed=20260830)
 def test_DSA_sparse_attention_backward_sm100_h128_dsink_reduction_covers_tail():
     """Every query block, including a one-row tail, contributes to dSink."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    _require_exact_sm100()
     try:
         from cudnn import DSA
     except ImportError:
@@ -274,8 +273,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    _require_exact_sm100()
 
     s_q, s_kv, num_heads, head_dim, topk = 4, 192, 128, 512, 128
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda") / 10
@@ -525,8 +523,8 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
     major, minor = torch.cuda.get_device_capability()
     if major * 10 + minor < 100:
         pytest.skip("zero top-k length regression test targets the SM100 kernel")
-    if num_heads == 128 and (major, minor) != (10, 0):
-        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    if num_heads == 128:
+        _require_exact_sm100()
 
     try:
         from cudnn import DSA
@@ -858,7 +856,7 @@ def test_DSA_sparse_attention_backward_staged_store():
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize("num_heads,topk", [(64, 64), (128, 128)], ids=["generic", "h128-two-cta"])
-@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "supplied-length"])
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
 @torch_fork_set_rng(seed=7)
 def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_heads, topk, has_topk_length):
     """The SM100 interface must establish zero state on the launch stream.
@@ -880,8 +878,8 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
-    if num_heads == 128 and torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("B200/SM100 required for the H128 two-CTA specialization")
+    if num_heads == 128:
+        _require_exact_sm100()
     device = torch.device("cuda")
     s_q, s_kv = 256, 1024
     head_dim = 512

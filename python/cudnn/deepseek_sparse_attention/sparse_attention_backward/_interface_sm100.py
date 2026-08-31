@@ -32,8 +32,9 @@ def _select_sm100_backend(
     """Return the tuned SM100 kernel variant and its sparse-row tile size.
 
     The two-CTA specialization is deliberately fail-closed.  It is selected
-    only for the exact B200/BF16/H128/D512 envelope validated by its kernel;
-    every other supported configuration retains the established backend.
+    only for the exact SM100 (10, 0) BF16 H128/D512 envelope validated by its
+    kernel; every other supported configuration retains the established
+    backend.
     """
     if (
         device_capability == (10, 0)
@@ -45,12 +46,19 @@ def _select_sm100_backend(
     ):
         return "h128_2cta_m64", 64
     if num_heads == 16 and head_dim == 576:
+        # The H16 KV-major specialization can use the full M128 UMMA tile,
+        # halving the top-k loop count while keeping one CTA per query token.
         return "h16_m128", 128
     return "generic_m64", 64
 
 
 def _get_sm100_kernel_class(backend: str):
-    """Load the selected implementation without perturbing other variants."""
+    """Load the selected implementation without perturbing other variants.
+
+    Each variant lives in its own CuTe DSL class: embedding variant
+    conditionals in a shared class measurably perturbs the code generation
+    of the tuned paths.
+    """
     if backend == "h128_2cta_m64":
         from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA
 
@@ -203,16 +211,14 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
-        if uses_h128_two_cta:
-            # The main kernel uniquely publishes both FP32 statistics planes;
-            # the dSink helper never reads padded query rows.
-            workspace_LSE_OdO = torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
-        else:
-            workspace_LSE_OdO = torch.zeros(
-                *ws_lse_odo_shape,
-                dtype=torch.uint8,
-                device=device,
-            )
+        # The two-CTA main kernel uniquely publishes both FP32 statistics
+        # planes and its dSink helper never reads padded query rows, so that
+        # path can skip zeroing.
+        workspace_LSE_OdO = (
+            torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
+            if uses_h128_two_cta
+            else torch.zeros(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
+        )
 
         ws_dkv_shape = kernel_cls._get_workspace_size_dKV(
             total_S_kv,
@@ -220,16 +226,11 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
-        if uses_h128_two_cta:
-            # The specialization establishes its own call-local FP32 zero
-            # state in a stream-ordered device kernel.
-            workspace_dKV = torch.empty(*ws_dkv_shape, dtype=torch.uint8, device=device)
-        else:
-            workspace_dKV = torch.zeros(
-                *ws_dkv_shape,
-                dtype=torch.uint8,
-                device=device,
-            )
+        # The two-CTA specialization establishes its own call-local FP32 zero
+        # state in a stream-ordered device kernel.
+        workspace_dKV = (
+            torch.empty(*ws_dkv_shape, dtype=torch.uint8, device=device) if uses_h128_two_cta else torch.zeros(*ws_dkv_shape, dtype=torch.uint8, device=device)
+        )
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
