@@ -57,7 +57,7 @@ from .dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
 from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
 from .recipe import (
     CONST,
@@ -411,6 +411,25 @@ def _tma_store_sequence(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> 
     for j, (slot, dt) in enumerate(_tma_out_dtypes(chain, tma_slots)):
         lines += _tma_store_one(chain, cfg, epi_n, j, dt, chain.output_specs[slot].major)
     return "\n".join(lines) if lines else "pass"
+
+
+def _place_tma_stores(epilogue: str, chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> tuple[str, str]:
+    """Inline each multi-output TMA store at its fragment's last use.
+
+    Single-output graphs retain the aggregate trailing sequence, preserving
+    their existing instruction scheduling.
+    """
+    outputs = _tma_out_dtypes(chain, tma_slots)
+    stream = len(outputs) > 1
+    for j, (slot, dt) in enumerate(outputs):
+        marker = tma_out_ready_marker(j)
+        if epilogue.count(marker) != 1:
+            raise RuntimeError(f"epilogue missing unique TMA-output marker {marker}")
+        replacement = ""
+        if stream:
+            replacement = "\n".join(_tma_store_one(chain, cfg, epi_n, j, dt, chain.output_specs[slot].major))
+        epilogue = epilogue.replace(marker, replacement)
+    return epilogue, "pass" if stream else _tma_store_sequence(chain, cfg, tma_slots, epi_n)
 
 
 def _host_tma_c_descs(chain, tma_slots: "frozenset[int]", epi_n: int) -> str:
@@ -1963,7 +1982,7 @@ def _render_template(
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n(config, chain.output_dtype)
-        replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
+        replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
     # Per-GEMM STG vector bindings — on every STG-epilogue template (mainloop
     # included; single-GEMM → `pass`).
@@ -2173,7 +2192,7 @@ def _render_block_scale_template(
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n(config, chain.output_dtype)
-        replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
+        replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
     # MoE block-scale raw-A-tensor plumbing (per-routed-group descriptor patch).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:

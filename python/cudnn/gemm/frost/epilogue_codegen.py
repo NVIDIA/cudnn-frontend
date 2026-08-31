@@ -110,6 +110,11 @@ def tma_out_value(j: int) -> str:
     return "vec_out" if j == 0 else f"_tma_out_{j}"
 
 
+def tma_out_ready_marker(j: int) -> str:
+    """Codegen marker immediately after TMA output ``j`` is ready."""
+    return f"# @@FROST_TMA_OUT_{j}_READY@@"
+
+
 def _aux_reads_row(aux: TensorRef) -> bool:
     return len(aux.dim) >= 2 and aux.dim[-2] != 1
 
@@ -1044,13 +1049,26 @@ def _emit_block_quant_col(
                 quant,
             )
         )
+    # The deterministic FP32->scale converter is a hardware x2 operation (the
+    # native x4 form is stochastic-only), but the four rounded scale values can
+    # still share one vector reciprocal/min pipeline.  Keeping that pipeline as
+    # TensorSSA gives the backend the same four-wide scheduling opportunity as
+    # the specialized Rubin epilogue without changing RP/SATFINITE semantics.
+    lines.extend(
+        [
+            f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+            *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
+            f"    {p}_upv = {p}_up4.load()",
+            f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
+        ]
+    )
+    for lane_in_batch in range(0, 4, 2):
+        other = lane_in_batch + 1
         lines.extend(
             [
-                f"    {p}_i{lane_in_batch} = cute.math.min(cute.arch.rcp_approx({p}_u{lane_in_batch}), cutlass.Float32(3.402823466e38))",
-                f"    {p}_i{other} = cute.math.min(cute.arch.rcp_approx({p}_u{other}), cutlass.Float32(3.402823466e38))",
                 f"    {p}_out[{p}_vi + {lane_in_batch}], {p}_out[{p}_vi + {other}] = cute.arch.mul_packed_f32x2("
                 f"({p}_src[{p}_vi + {lane_in_batch}], {p}_src[{p}_vi + {other}]), "
-                f'({p}_i{lane_in_batch}, {p}_i{other}), rnd="rn", ftz=False)',
+                f'({p}_iv[{lane_in_batch}], {p}_iv[{other}]), rnd="rn", ftz=False)',
                 f"    if ({p}_lane % {G}) == (({p}_vi + {lane_in_batch}) % {G}):",
                 f"        {p}_scale_mine[({p}_vi + {lane_in_batch}) // {G}] = {p}_q{lane_in_batch}",
                 f"    if ({p}_lane % {G}) == (({p}_vi + {other}) % {G}):",
@@ -1147,26 +1165,15 @@ def _emit_block_quant(
     n_sub = vsize // bs
     lines: list[str] = [
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
-        f"{p}_abs = cute.math.abs({p}_src)",
+        f"{p}_frg = cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)",
+        f"{p}_abs_ir = cutlass._mlir.dialects.math.absf({p}_frg.ir_value())",
+        f"{p}_abs = type({p}_frg)({p}_abs_ir, {p}_frg.shape, {p}_frg.dtype)",
         f"{p}_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)",
         f"{p}_rl = cute.arch.rcp_approx({_quant_output_max(output_dtype)})",
     ]
     for k in range(n_sub):
         base = k * bs
-        reduction = [f"{p}_abs[{base + e}]" for e in range(bs)]
-        level = 0
-        while len(reduction) > 1:
-            next_level: list[str] = []
-            for pair in range(0, len(reduction), 2):
-                if pair + 1 == len(reduction):
-                    next_level.append(reduction[pair])
-                    continue
-                var = f"{p}_r{k}_{level}_{pair // 2}"
-                lines.append(f"{var} = cute.math.max({reduction[pair]}, {reduction[pair + 1]})")
-                next_level.append(var)
-            reduction = next_level
-            level += 1
-        lines.append(f"{p}_amax{k} = {reduction[0]}")
+        lines.append(f"{p}_amax{k} = {p}_abs[None, {k}].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
         lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
         lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
@@ -1427,10 +1434,23 @@ def generate(
     def _scale_tap_idx(qi: int) -> int:
         return _tap_of[len(specs) + len(chain.reductions) + qi]
 
-    for si, spec in enumerate(specs):
+    output_order = list(range(len(specs)))
+    if on_tma_arm and len(tma_slots) > 1:
+        # The compiler stores each output at its ready marker.  Retire outputs
+        # backed by an exclusive source first, while register-heavy quantizers
+        # stay last.  Python's stable sort preserves slot order among ties.
+        source_uses: dict[int, int] = {}
+        for output_spec in specs:
+            source_uses[output_spec.source_ref] = source_uses.get(output_spec.source_ref, 0) + 1
+        for reduction in chain.reductions:
+            source_uses[reduction.source_ref] = source_uses.get(reduction.source_ref, 0) + 1
+        output_order.sort(key=lambda oi: (specs[oi].quant_idx is not None, source_uses[specs[oi].source_ref]))
+    for si in output_order:
+        spec = specs[si]
         src = _parent_value(spec.source_ref)
         if si in tma_slots:
-            _ov = tma_out_value(sorted(tma_slots).index(si))
+            _tma_j = sorted(tma_slots).index(si)
+            _ov = tma_out_value(_tma_j)
             if spec.quant_idx is not None:
                 body_lines.extend(
                     _emit_block_quant(
@@ -1448,6 +1468,7 @@ def generate(
                 )
             else:
                 body_lines.append(f"{_ov} = {_store_cast_expr(src, spec.dtype)}")
+            body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
         if spec.major == "m":
