@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 
-from cudnn.flex_attention.dispatch import _flex_attn_bwd, _flex_attn_fwd
+from cudnn.flex_attention.execution import _flex_attention_backward, _flex_attention_forward
 from cudnn.flex_attention.plan.mask_plan import MaskPlan
 
 
@@ -21,28 +21,15 @@ class FlexAttnFunc(torch.autograd.Function):
         deterministic: bool,
         return_lse: bool,
     ):
-        packed_plan, cu_seqlens_q, cu_seqlens_k = mask_plan._runtime_args
-        metadata = mask_plan.metadata
-        sequence_args = (
-            {
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": metadata.max_seqlen_q,
-                "max_seqlen_k": metadata.max_seqlen_k,
-            }
-            if mask_plan._is_varlen
-            else {}
-        )
-        out, lse = _flex_attn_fwd(
+        result = _flex_attention_forward(
             q,
             k,
             v,
+            mask_plan=mask_plan,
             softmax_scale=softmax_scale,
-            pack_gqa=mask_plan.metadata.pack_gqa,
-            block_sparse_tensors=packed_plan,
             return_lse=return_lse,
-            **sequence_args,
         )
+        out, lse = result
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.mask_plan = mask_plan
         ctx.softmax_scale = softmax_scale
@@ -56,31 +43,19 @@ class FlexAttnFunc(torch.autograd.Function):
         q, k, v, out, lse = ctx.saved_tensors
         if dout is None:
             dout = torch.zeros_like(out)
-        packed_plan, cu_seqlens_q, cu_seqlens_k = ctx.mask_plan._runtime_args
-        metadata = ctx.mask_plan.metadata
-        sequence_args = (
-            {
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": metadata.max_seqlen_q,
-                "max_seqlen_k": metadata.max_seqlen_k,
-            }
-            if ctx.mask_plan._is_varlen
-            else {}
-        )
-        dq, dk, dv = _flex_attn_bwd(
+        result = _flex_attention_backward(
             q,
             k,
             v,
             out,
             dout,
             lse,
+            mask_plan=ctx.mask_plan,
             softmax_scale=ctx.softmax_scale,
             deterministic=ctx.deterministic,
-            block_sparse_tensors=packed_plan,
-            dlse=dlse if ctx.return_lse else None,
-            **sequence_args,
+            dlse_tensor=dlse if ctx.return_lse else None,
         )
+        dq, dk, dv = result
         return dq, dk, dv, None, None, None, None
 
 

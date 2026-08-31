@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 
 from cudnn.flex_attention.autograd import FlexAttnFunc
+from cudnn.flex_attention.execution import FlexAttentionBwd, FlexAttentionFwd
 from cudnn.flex_attention.plan.builder import create_mask_plan
 from cudnn.flex_attention.plan.mask_plan import MaskPlan
 from cudnn.flex_attention.plan.validation import validate_call_options
@@ -67,4 +68,10 @@ def flex_attn_func(
     return result if return_lse else result[0]
 
 
-__all__ = ["MaskPlan", "create_mask_plan", "flex_attn_func"]
+__all__ = [
+    "FlexAttentionBwd",
+    "FlexAttentionFwd",
+    "MaskPlan",
+    "create_mask_plan",
+    "flex_attn_func",
+]

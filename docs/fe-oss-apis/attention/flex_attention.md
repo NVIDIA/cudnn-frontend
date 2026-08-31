@@ -30,8 +30,11 @@ be reused with new Q/K/V values that have the same geometry, dtype, and CUDA
 device. A single `flex_attn_func` entry point handles both layouts: supplying
 `cu_seqlens_q` and `cu_seqlens_k` when the plan is created selects the THD
 variable-length path; omitting both selects fixed-length BSHD. Execution uses
-PyTorch custom autograd, so no separate `APIBase.compile()` / `execute()`
-lifecycle is needed.
+the `FlexAttentionFwd` and `FlexAttentionBwd` `APIBase` adapters. Their
+`check_support()`, `compile()`, and `execute()` lifecycle supports precompiled,
+allocation-free launches with caller-provided outputs and workspace;
+`flex_attn_func` composes the allocating wrappers behind PyTorch custom
+autograd.
 
 ## Requirements
 
@@ -150,6 +153,64 @@ The execution function accepts `softmax_scale` (default
 `1 / sqrt(Dqk)`), `deterministic`, and `return_lse`. Plan reuse requires the
 same fixed/variable mode, sequence and head geometry, dtype, and device used
 at construction.
+
+Keep `MaskPlan` outside the execution loop. Q/K/V values and tensor addresses
+may change between calls, while the mask and plan geometry stay fixed:
+
+```python
+plan = create_mask_plan(mask_func, q_sample, k_sample, v_sample, build_backward=True)
+
+for q, k, v in inputs_with_the_same_geometry:
+    out = flex_attn_func(q, k, v, mask_plan=plan)
+    out.backward(torch.randn_like(out))
+```
+
+The plan owns immutable forward metadata and, with `build_backward=True`, the
+backward metadata. Mutable scheduler counters, semaphores, and accumulation
+buffers are per-execution workspace rather than plan state, so one plan can be
+used by independent calls.
+
+## Explicit compile and execute APIs
+
+Most PyTorch users should use `flex_attn_func`. Framework integrations can use
+`FlexAttentionFwd` and `FlexAttentionBwd` directly. Constructors capture sample
+tensor descriptors and a sample plan; `execute()` accepts new tensors and any
+compatible plan. Outputs and the `workspace_size`-byte CUDA `uint8` workspace
+must be allocated before `execute()`:
+
+```python
+import torch
+from cudnn import FlexAttentionBwd, FlexAttentionFwd
+
+plan = create_mask_plan(mask_func, q, k, v, build_backward=True)
+out = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
+lse = torch.empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device)
+fwd = FlexAttentionFwd(q, k, v, out, plan, lse)
+fwd.check_support()
+fwd.compile()
+
+fwd_workspace = torch.empty(fwd.workspace_size, device=q.device, dtype=torch.uint8)
+fwd.execute(q, k, v, out, plan, lse, workspace=fwd_workspace)
+
+do = torch.randn_like(out)
+dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+bwd = FlexAttentionBwd(q, k, v, out, do, lse, dq, dk, dv, plan)
+bwd.check_support()
+bwd.compile()
+
+bwd_workspace = torch.empty(bwd.workspace_size, device=q.device, dtype=torch.uint8)
+bwd.execute(q, k, v, out, do, lse, dq, dk, dv, plan, workspace=bwd_workspace)
+```
+
+The same `plan`, compiled API objects, output buffers, and workspaces can be
+reused for sequential calls with new tensor values that keep the compiled
+shape, stride, dtype, and device. Concurrent calls may share the immutable
+plan and compiled API objects, but each in-flight call needs separate outputs
+and workspace.
+
+`flex_attn_func` uses internal allocating helpers to manage outputs, workspaces,
+compiled-object caches, and autograd state. Explicit backward requires the LSE
+produced by forward and a plan built with backward metadata.
 
 ## Supported configurations and current limits
 

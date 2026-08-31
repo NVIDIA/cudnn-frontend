@@ -8,13 +8,70 @@ import math
 import pytest
 import torch
 
-from cudnn.flex_attention import create_mask_plan, flex_attn_func
+from cudnn.flex_attention import FlexAttentionBwd, FlexAttentionFwd, create_mask_plan, flex_attn_func
 from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
 
 
 def _current_arch() -> int:
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.L1
+def test_explicit_forward_backward_reuses_plan_executors_and_workspaces():
+    if _current_arch() not in SUPPORTED_ARCHES:
+        pytest.skip("Flex Attention requires SM90, SM100, or SM103")
+
+    torch.manual_seed(2028)
+    batch, seqlen, heads, head_dim = 1, 64, 2, 64
+    shape = (batch, seqlen, heads, head_dim)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    endpoints = torch.arange(1, seqlen + 1, device="cuda", dtype=torch.int32).view(1, 1, seqlen)
+    plan = create_mask_plan(endpoints, q, k, v, build_backward=True)
+
+    out = torch.empty_like(q)
+    lse = torch.empty((batch, heads, seqlen), dtype=torch.float32, device="cuda")
+    api = FlexAttentionFwd(q, k, v, out, plan, lse)
+    assert api.check_support()
+    api.compile()
+    workspace = torch.empty((api.workspace_size,), dtype=torch.uint8, device="cuda")
+    api.execute(q, k, v, out, plan, lse, workspace=workspace)
+
+    q_next = torch.randn_like(q)
+    out_next = torch.empty_like(out)
+    lse_next = torch.empty_like(lse)
+    api.execute(q_next, k, v, out_next, plan, lse_next, workspace=workspace)
+
+    q_ref = q_next.float().requires_grad_()
+    k_ref = k.float().requires_grad_()
+    v_ref = v.float().requires_grad_()
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) / math.sqrt(head_dim)
+    causal = torch.ones((seqlen, seqlen), dtype=torch.bool, device="cuda").tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    out_ref = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v_ref)
+    torch.testing.assert_close(out_next.float(), out_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse_next, torch.logsumexp(scores, dim=-1), atol=3e-2, rtol=3e-2)
+
+    do = torch.randn_like(out_next)
+    dq, dk, dv = torch.empty_like(q_next), torch.empty_like(k), torch.empty_like(v)
+    bwd = FlexAttentionBwd(q_next, k, v, out_next, do, lse_next, dq, dk, dv, plan)
+    assert bwd.check_support()
+    bwd.compile()
+    bwd_workspace = torch.empty((bwd.workspace_size,), dtype=torch.uint8, device="cuda")
+    bwd.execute(q_next, k, v, out_next, do, lse_next, dq, dk, dv, plan, workspace=bwd_workspace)
+    first_grads = tuple(grad.clone() for grad in (dq, dk, dv))
+
+    for grad in (dq, dk, dv):
+        grad.fill_(float("nan"))
+    bwd.execute(q_next, k, v, out_next, do, lse_next, dq, dk, dv, plan, workspace=bwd_workspace)
+    out_ref.backward(do.float())
+    for actual, first, reference in zip((dq, dk, dv), first_grads, (q_ref.grad, k_ref.grad, v_ref.grad)):
+        torch.testing.assert_close(actual, first, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual.float(), reference, atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.gpu_exclusive

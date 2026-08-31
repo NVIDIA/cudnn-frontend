@@ -6,6 +6,7 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -357,7 +358,36 @@ def _resolve_forward_config(
     )
 
 
-def _flex_attn_fwd(
+@dataclass(frozen=True)
+class _FwdDispatch:
+    arch: int
+    is_varlen: bool
+    batch_size: int
+    seqlen_q: int
+    seqlen_k: int
+    total_q: int
+    total_k: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    head_dim_v: int
+    resolved_max_q: int
+    resolved_max_k: int
+    qhead_per_kvhead: int
+    pack_gqa: bool
+    config: object
+    normalized_plan: BlockSparseTensorsTorch
+    output_shape: tuple[int, ...]
+    lse_shape: tuple[int, ...]
+    use_hd256: bool
+    use_qstage1_1cta: bool
+    use_qstage1_2cta: bool
+    use_smem_mask_pipeline: bool
+    num_sms: int
+    compile_key: tuple
+
+
+def _prepare_flex_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -365,18 +395,16 @@ def _flex_attn_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    softmax_scale: Optional[float] = None,
     pack_gqa: Optional[bool] = None,
     block_sparse_tensors: BlockSparseTensorsTorch = None,
-    return_lse: bool = False,
+    has_lse: bool = False,
     sm90_use_smem_mask_pipeline: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run packed arbitrary-mask forward."""
+) -> _FwdDispatch:
+    """Resolve and validate one forward launch without compiling or allocating."""
 
     if type(sm90_use_smem_mask_pipeline) is not bool:
         raise TypeError("sm90_use_smem_mask_pipeline must be a bool")
 
-    q, k, v = [maybe_contiguous(tensor) for tensor in (q, k, v)]
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("Q/K/V must be FP16 or BF16")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -412,8 +440,6 @@ def _flex_attn_fwd(
     resolved_max_q = max_seqlen_q if is_varlen else seqlen_q
     resolved_max_k = max_seqlen_k if is_varlen else seqlen_k
     qhead_per_kvhead = num_q_heads // num_kv_heads
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
 
     plan_signature = _validate_plan_binding(
         block_sparse_tensors,
@@ -474,20 +500,8 @@ def _flex_attn_fwd(
 
     output_shape = (total_q, num_q_heads, head_dim_v) if is_varlen else (batch_size, seqlen_q, num_q_heads, head_dim_v)
     lse_shape = (num_q_heads, total_q) if is_varlen else (batch_size, num_q_heads, seqlen_q)
-    out = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-    needs_lse = q.requires_grad or k.requires_grad or v.requires_grad or return_lse
-    lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device) if needs_lse else None
-    if total_q == 0 or total_k == 0:
-        out.zero_()
-        if lse is not None:
-            lse.fill_(float("-inf"))
-        return out, lse
-
     use_hd256 = head_dim == 256 and head_dim_v == 256 and arch in (100, 103)
-    scheduler_tile_counter = None
     num_sms = 132 if is_fake_mode() else torch.cuda.get_device_properties(q.device).multi_processor_count
-    if arch == 90:
-        scheduler_tile_counter = torch.zeros((1,), dtype=torch.int32, device=q.device)
 
     compile_key = (
         arch,
@@ -497,7 +511,7 @@ def _flex_attn_fwd(
         qhead_per_kvhead,
         pack_gqa,
         is_varlen,
-        lse is None,
+        not has_lse,
         plan_signature.compile_key,
         get_broadcast_dims(q),
         get_broadcast_dims(k),
@@ -508,114 +522,185 @@ def _flex_attn_fwd(
         qstage1_overlap_pv_with_k_wait,
         use_smem_mask_pipeline,
     )
-    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    if compile_key not in _flex_attn_fwd.compile_cache:
-        q_tensor, k_tensor, v_tensor, o_tensor = [to_cute_tensor(tensor) for tensor in (q, k, v, out)]
-        lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
-        cu_q_tensor, cu_k_tensor = [
-            to_cute_tensor(tensor, assumed_align=4, leading_dim=0) if tensor is not None else None for tensor in (cu_seqlens_q, cu_seqlens_k)
-        ]
-        sparse_tensor = to_cute_block_sparse_tensors(normalized_plan)
 
-        if arch == 90:
-            assert isinstance(config, _ResolvedSm90FwdConsumerConfig)
-            kernel = FlexAttentionForwardSm90(
-                torch2cute_dtype_map[q.dtype],
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
-                pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                mma_pv_is_rs=config.mma_pv_is_rs,
-                use_smem_mask_pipeline=use_smem_mask_pipeline,
-                num_mask_payload_groups=config.num_mask_payload_groups,
-            )
-            scheduler_counter_tensor = (
-                to_cute_tensor(
-                    scheduler_tile_counter,
-                    assumed_align=4,
-                    leading_dim=0,
-                )
-                if scheduler_tile_counter is not None
-                else None
-            )
-            compile_args = [
-                kernel,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_q_tensor,
-                cu_k_tensor,
-                sparse_tensor,
-                scheduler_counter_tensor,
-                Int32(0),
-                current_stream,
-            ]
-            compile_options = "--enable-tvm-ffi " "--ptxas-options='--register-usage-level=0'"
-        elif use_hd256:
-            assert isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
-            kernel = BlackwellFusedMultiHeadAttentionForward(
-                use_2cta_instrs=config.cta_group_size == 2,
-            )
-            compile_args = [
-                kernel,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_q_tensor,
-                cu_k_tensor,
-                sparse_tensor,
-                current_stream,
-            ]
-            compile_options = "--enable-tvm-ffi"
-        else:
-            assert isinstance(config, _ResolvedSm100FwdConsumerConfig)
-            kernel_cls = FlexAttentionForwardQStage1Sm100 if use_qstage1_1cta or use_qstage1_2cta else FlexAttentionForwardSm100
-            kernel_kwargs = (
-                {
-                    "use_2cta_instrs": use_qstage1_2cta,
-                    "overlap_pv_with_k_wait": qstage1_overlap_pv_with_k_wait,
-                }
-                if use_qstage1_1cta or use_qstage1_2cta
-                else {}
-            )
-            kernel = kernel_cls(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                pack_gqa=pack_gqa,
-                is_varlen_q=is_varlen,
-                **kernel_kwargs,
-            )
-            compile_args = [
-                kernel,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_q_tensor,
-                cu_k_tensor,
-                sparse_tensor,
-                current_stream,
-            ]
-            compile_options = "--enable-tvm-ffi"
-        _flex_attn_fwd.compile_cache[compile_key] = _compile_with_timing(
-            *compile_args,
-            options=compile_options,
+    return _FwdDispatch(
+        arch=arch,
+        is_varlen=is_varlen,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        total_q=total_q,
+        total_k=total_k,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        resolved_max_q=resolved_max_q,
+        resolved_max_k=resolved_max_k,
+        qhead_per_kvhead=qhead_per_kvhead,
+        pack_gqa=pack_gqa,
+        config=config,
+        normalized_plan=normalized_plan,
+        output_shape=output_shape,
+        lse_shape=lse_shape,
+        use_hd256=use_hd256,
+        use_qstage1_1cta=use_qstage1_1cta,
+        use_qstage1_2cta=use_qstage1_2cta,
+        use_smem_mask_pipeline=use_smem_mask_pipeline,
+        num_sms=num_sms,
+        compile_key=compile_key,
+    )
+
+
+def _compile_flex_attn_fwd(
+    dispatch: _FwdDispatch,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    softmax_scale: float,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    scheduler_tile_counter: Optional[torch.Tensor],
+):
+    """Compile or reuse the forward callable for a resolved launch."""
+
+    kernel_compile_key = dispatch.compile_key + (
+        get_broadcast_dims(out),
+        get_broadcast_dims(lse) if lse is not None else None,
+    )
+    if kernel_compile_key in _flex_attn_fwd.compile_cache:
+        return _flex_attn_fwd.compile_cache[kernel_compile_key]
+
+    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    q_tensor, k_tensor, v_tensor, o_tensor = [to_cute_tensor(tensor) for tensor in (q, k, v, out)]
+    lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+    cu_q_tensor, cu_k_tensor = [
+        to_cute_tensor(tensor, assumed_align=4, leading_dim=0) if tensor is not None else None for tensor in (cu_seqlens_q, cu_seqlens_k)
+    ]
+    sparse_tensor = to_cute_block_sparse_tensors(dispatch.normalized_plan)
+    config = dispatch.config
+
+    if dispatch.arch == 90:
+        assert isinstance(config, _ResolvedSm90FwdConsumerConfig)
+        kernel = FlexAttentionForwardSm90(
+            torch2cute_dtype_map[q.dtype],
+            dispatch.head_dim,
+            dispatch.head_dim_v,
+            dispatch.qhead_per_kvhead,
+            pack_gqa=dispatch.pack_gqa,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            mma_pv_is_rs=config.mma_pv_is_rs,
+            use_smem_mask_pipeline=dispatch.use_smem_mask_pipeline,
+            num_mask_payload_groups=config.num_mask_payload_groups,
         )
+        scheduler_counter_tensor = (
+            to_cute_tensor(
+                scheduler_tile_counter,
+                assumed_align=4,
+                leading_dim=0,
+            )
+            if scheduler_tile_counter is not None
+            else None
+        )
+        compile_args = [
+            kernel,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            cu_q_tensor,
+            cu_k_tensor,
+            sparse_tensor,
+            scheduler_counter_tensor,
+            Int32(0),
+            current_stream,
+        ]
+        compile_options = "--enable-tvm-ffi " "--ptxas-options='--register-usage-level=0'"
+    elif dispatch.use_hd256:
+        assert isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
+        kernel = BlackwellFusedMultiHeadAttentionForward(
+            use_2cta_instrs=config.cta_group_size == 2,
+        )
+        compile_args = [
+            kernel,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            cu_q_tensor,
+            cu_k_tensor,
+            sparse_tensor,
+            current_stream,
+        ]
+        compile_options = "--enable-tvm-ffi"
+    else:
+        assert isinstance(config, _ResolvedSm100FwdConsumerConfig)
+        kernel_cls = FlexAttentionForwardQStage1Sm100 if dispatch.use_qstage1_1cta or dispatch.use_qstage1_2cta else FlexAttentionForwardSm100
+        kernel_kwargs = (
+            {
+                "use_2cta_instrs": dispatch.use_qstage1_2cta,
+                "overlap_pv_with_k_wait": dispatch.use_qstage1_1cta and not dispatch.normalized_plan.narrow_workset,
+            }
+            if dispatch.use_qstage1_1cta or dispatch.use_qstage1_2cta
+            else {}
+        )
+        kernel = kernel_cls(
+            dispatch.head_dim,
+            dispatch.head_dim_v,
+            qhead_per_kvhead=dispatch.qhead_per_kvhead,
+            pack_gqa=dispatch.pack_gqa,
+            is_varlen_q=dispatch.is_varlen,
+            **kernel_kwargs,
+        )
+        compile_args = [
+            kernel,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            cu_q_tensor,
+            cu_k_tensor,
+            sparse_tensor,
+            current_stream,
+        ]
+        compile_options = "--enable-tvm-ffi"
+    compiled_kernel = _compile_with_timing(
+        *compile_args,
+        options=compile_options,
+    )
+    _flex_attn_fwd.compile_cache[kernel_compile_key] = compiled_kernel
+    return compiled_kernel
+
+
+def _launch_flex_attn_fwd(
+    dispatch: _FwdDispatch,
+    compiled_kernel,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    softmax_scale: float,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    scheduler_tile_counter: Optional[torch.Tensor],
+) -> None:
+    """Launch a previously compiled forward callable."""
 
     if not is_fake_mode():
-        sparse_args = _block_sparse_runtime_tuple(normalized_plan)
-        if arch == 90:
+        if scheduler_tile_counter is not None:
+            scheduler_tile_counter.zero_()
+        sparse_args = _block_sparse_runtime_tuple(dispatch.normalized_plan)
+        if dispatch.arch == 90:
             call_args = [
                 q.detach(),
                 k.detach(),
@@ -627,9 +712,9 @@ def _flex_attn_fwd(
                 cu_seqlens_k,
                 sparse_args,
                 scheduler_tile_counter,
-                num_sms,
+                dispatch.num_sms,
             ]
-        elif use_hd256:
+        elif dispatch.use_hd256:
             call_args = [
                 q.detach(),
                 k.detach(),
@@ -653,7 +738,75 @@ def _flex_attn_fwd(
                 cu_seqlens_k,
                 sparse_args,
             ]
-        _flex_attn_fwd.compile_cache[compile_key](*call_args)
+        compiled_kernel(*call_args)
+
+
+def _flex_attn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    pack_gqa: Optional[bool] = None,
+    block_sparse_tensors: BlockSparseTensorsTorch = None,
+    return_lse: bool = False,
+    sm90_use_smem_mask_pipeline: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Allocating convenience path for packed arbitrary-mask forward."""
+
+    q, k, v = [maybe_contiguous(tensor) for tensor in (q, k, v)]
+    needs_lse = q.requires_grad or k.requires_grad or v.requires_grad or return_lse
+    dispatch = _prepare_flex_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        pack_gqa=pack_gqa,
+        block_sparse_tensors=block_sparse_tensors,
+        has_lse=needs_lse,
+        sm90_use_smem_mask_pipeline=sm90_use_smem_mask_pipeline,
+    )
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(dispatch.head_dim)
+    out = torch.empty(dispatch.output_shape, dtype=q.dtype, device=q.device)
+    lse = torch.empty(dispatch.lse_shape, dtype=torch.float32, device=q.device) if needs_lse else None
+    if dispatch.total_q == 0 or dispatch.total_k == 0:
+        out.zero_()
+        if lse is not None:
+            lse.fill_(float("-inf"))
+        return out, lse
+    scheduler_tile_counter = torch.zeros((1,), dtype=torch.int32, device=q.device) if dispatch.arch == 90 else None
+    compiled_kernel = _compile_flex_attn_fwd(
+        dispatch,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        scheduler_tile_counter,
+    )
+    _launch_flex_attn_fwd(
+        dispatch,
+        compiled_kernel,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        scheduler_tile_counter,
+    )
     return out, lse
 
 
@@ -765,7 +918,7 @@ def _bwd_preprocess(
     max_seqlen_q,
     use_padded_offsets,
 ):
-    compile_key = (
+    compiled_kernel = _get_bwd_preprocess_kernel(
         dtype,
         head_dim,
         head_dim_v,
@@ -775,10 +928,8 @@ def _bwd_preprocess(
         dq_accum is not None,
         use_padded_offsets,
     )
-    if compile_key not in _bwd_preprocess.compile_cache:
-        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
-        _bwd_preprocess.compile_cache[compile_key](
+        compiled_kernel(
             out,
             dout,
             dpsum,
@@ -789,6 +940,31 @@ def _bwd_preprocess(
             dlse,
             max_seqlen_q,
         )
+
+
+def _get_bwd_preprocess_kernel(
+    dtype,
+    head_dim,
+    head_dim_v,
+    tile_m,
+    is_varlen,
+    has_dlse,
+    has_dq_accum,
+    use_padded_offsets,
+):
+    compile_key = (
+        dtype,
+        head_dim,
+        head_dim_v,
+        tile_m,
+        is_varlen,
+        has_dlse,
+        has_dq_accum,
+        use_padded_offsets,
+    )
+    if compile_key not in _bwd_preprocess.compile_cache:
+        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+    return _bwd_preprocess.compile_cache[compile_key]
 
 
 _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
@@ -851,7 +1027,7 @@ def _bwd_postprocess_convert(
     use_2cta_instrs=False,
     cluster_size=1,
 ):
-    compile_key = (
+    compiled_kernel = _get_bwd_postprocess_kernel(
         dtype,
         head_dim,
         tile_m,
@@ -864,16 +1040,45 @@ def _bwd_postprocess_convert(
         cluster_size,
         arch,
     )
-    if compile_key not in _bwd_postprocess_convert.compile_cache:
-        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
-        _bwd_postprocess_convert.compile_cache[compile_key](
+        compiled_kernel(
             accum,
             output,
             scale,
             cu_seqlens,
             max_seqlen,
         )
+
+
+def _get_bwd_postprocess_kernel(
+    dtype,
+    head_dim,
+    tile_m,
+    num_threads,
+    atom_layout,
+    swap_ab,
+    accum_row_major,
+    is_varlen,
+    use_2cta_instrs,
+    cluster_size,
+    arch,
+):
+    compile_key = (
+        dtype,
+        head_dim,
+        tile_m,
+        num_threads,
+        atom_layout,
+        swap_ab,
+        accum_row_major,
+        is_varlen,
+        use_2cta_instrs,
+        cluster_size,
+        arch,
+    )
+    if compile_key not in _bwd_postprocess_convert.compile_cache:
+        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
+    return _bwd_postprocess_convert.compile_cache[compile_key]
 
 
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
@@ -891,6 +1096,43 @@ def _resolve_bwd_compile_options(
     return options
 
 
+@dataclass
+class _BwdPreallocated:
+    dq: torch.Tensor
+    dk: torch.Tensor
+    dv: torch.Tensor
+    dq_accum: Optional[torch.Tensor]
+    dpsum: torch.Tensor
+    lse_log2: torch.Tensor
+    dk_accum: Optional[torch.Tensor]
+    dv_accum: Optional[torch.Tensor]
+    dq_semaphore: Optional[torch.Tensor]
+    dk_semaphore: Optional[torch.Tensor]
+    dv_semaphore: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class _CompiledBwd:
+    compile_key: tuple
+    preprocess: object
+    main: object
+    post_dq: Optional[object]
+    post_dk: Optional[object]
+    post_dv: Optional[object]
+    workspace_specs: tuple
+
+
+def _checked_preallocated(tensor, name: str, shape, dtype, device):
+    if shape is None:
+        if tensor is not None:
+            raise ValueError(f"{name} must be None for this compiled configuration")
+        return None
+    if tensor is None:
+        raise ValueError(f"{name} is required for this compiled configuration")
+    _validate_tensor(tensor, name, shape, dtype, device)
+    return tensor
+
+
 def _flex_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -906,13 +1148,20 @@ def _flex_attn_bwd(
     deterministic: bool = False,
     block_sparse_tensors: BlockSparseTensorsTorch = None,
     dlse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _preallocated: Optional[_BwdPreallocated] = None,
+    _compiled: Optional[_CompiledBwd] = None,
+    _compile_only: bool = False,
+    _native_inputs: bool = False,
+    _validate_only: bool = False,
+    _compile_outputs: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _CompiledBwd]:
     """Run packed arbitrary-mask backward."""
 
     use_hd256_input_abi = q.shape[-1] == 256 and v.shape[-1] == 256
     input_align_bytes = 128 if use_hd256_input_abi else 16
-    q, k, v, out, dout = [maybe_contiguous(tensor, align_bytes=input_align_bytes) for tensor in (q, k, v, out, dout)]
-    lse, dlse = [maybe_contiguous(tensor) for tensor in (lse, dlse)]
+    if not _native_inputs:
+        q, k, v, out, dout = [maybe_contiguous(tensor, align_bytes=input_align_bytes) for tensor in (q, k, v, out, dout)]
+        lse, dlse = [maybe_contiguous(tensor) for tensor in (lse, dlse)]
     (
         is_varlen,
         batch_size,
@@ -955,6 +1204,8 @@ def _flex_attn_bwd(
     _validate_tensor(out, "out", expected_out_shape, q.dtype, q.device)
     _validate_tensor(dout, "dout", expected_out_shape, q.dtype, q.device)
     _validate_tensor(lse, "lse", expected_lse_shape, torch.float32, q.device)
+    if dlse is not None:
+        _validate_tensor(dlse, "dlse", expected_lse_shape, torch.float32, q.device)
 
     outer_signature = _validate_plan_binding(
         block_sparse_tensors,
@@ -1135,10 +1386,27 @@ def _flex_attn_bwd(
         atom_layout_m_dq = 1
         dq_single_wg = False
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    if _validate_only:
+        return None
+
+    if _preallocated is not None and _compile_outputs is not None:
+        raise ValueError("_preallocated and _compile_outputs are mutually exclusive")
+    if _preallocated is None:
+        if _compile_outputs is None:
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+        else:
+            dq = _checked_preallocated(_compile_outputs[0], "dq", tuple(q.shape), q.dtype, q.device)
+            dk = _checked_preallocated(_compile_outputs[1], "dk", tuple(k.shape), k.dtype, k.device)
+            dv = _checked_preallocated(_compile_outputs[2], "dv", tuple(v.shape), v.dtype, v.device)
+    else:
+        dq = _checked_preallocated(_preallocated.dq, "dq", tuple(q.shape), q.dtype, q.device)
+        dk = _checked_preallocated(_preallocated.dk, "dk", tuple(k.shape), k.dtype, k.device)
+        dv = _checked_preallocated(_preallocated.dv, "dv", tuple(v.shape), v.dtype, v.device)
     if total_q == 0 or total_k == 0:
+        if _compile_only:
+            raise ValueError("cannot compile Flex Attention backward from zero-token sample tensors")
         dq.zero_()
         dk.zero_()
         dv.zero_()
@@ -1155,99 +1423,58 @@ def _flex_attn_bwd(
     head_dim_v_rounded = math.ceil(head_dim_v / 16) * 16
     if is_varlen:
         total_q_padded = (total_q + cu_seqlens_q.shape[0] * tile_m - 1) // tile_m * tile_m
-        dq_accum = (
-            None
-            if use_hd256
-            else torch.empty(
-                num_q_heads,
-                total_q_padded * head_dim_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
-        dpsum = torch.empty(
-            num_q_heads,
-            total_q_padded,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        dq_accum_shape = None if use_hd256 else (num_q_heads, total_q_padded * head_dim_rounded)
+        dpsum_shape = (num_q_heads, total_q_padded)
+    else:
+        dq_accum_shape = None if use_hd256 else (batch_size, num_q_heads, seqlen_q_rounded * head_dim_rounded)
+        dpsum_shape = (batch_size, num_q_heads, seqlen_q_rounded)
+
+    if _preallocated is None:
+        dq_accum = torch.empty(dq_accum_shape, dtype=torch.float32, device=q.device) if dq_accum_shape is not None else None
+        dpsum = torch.empty(dpsum_shape, dtype=torch.float32, device=q.device)
         lse_log2 = torch.empty_like(dpsum)
     else:
-        dq_accum = (
-            None
-            if use_hd256
-            else torch.empty(
-                batch_size,
-                num_q_heads,
-                seqlen_q_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
-        )
-        dpsum = torch.empty(
-            batch_size,
-            num_q_heads,
-            seqlen_q_rounded,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        lse_log2 = torch.empty_like(dpsum)
+        dq_accum = _checked_preallocated(_preallocated.dq_accum, "dq_accum", dq_accum_shape, torch.float32, q.device)
+        dpsum = _checked_preallocated(_preallocated.dpsum, "dpsum", dpsum_shape, torch.float32, q.device)
+        lse_log2 = _checked_preallocated(_preallocated.lse_log2, "lse_log2", dpsum_shape, torch.float32, q.device)
 
     # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
     # padded MHA dimensions through the FP32 workspace as well, so the shared
     # postprocess owns the final head-dimension predicate.
     dkv_postprocess = not use_hd256 and (qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v)))
-    dk_accum = dv_accum = None
+    dk_accum_shape = dv_accum_shape = None
     if dkv_postprocess:
         if is_varlen:
             cluster_tile_n = cluster_size * tile_n
             total_k_padded = (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
-            dk_accum = torch.zeros(
-                num_kv_heads,
-                total_k_padded * head_dim_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
-            dv_accum = torch.zeros(
-                num_kv_heads,
-                total_k_padded * head_dim_v_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
+            dk_accum_shape = (num_kv_heads, total_k_padded * head_dim_rounded)
+            dv_accum_shape = (num_kv_heads, total_k_padded * head_dim_v_rounded)
         else:
-            dk_accum = torch.zeros(
-                batch_size,
-                num_kv_heads,
-                seqlen_k_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
-            dv_accum = torch.zeros(
-                batch_size,
-                num_kv_heads,
-                seqlen_k_rounded * head_dim_v_rounded,
-                dtype=torch.float32,
-                device=q.device,
-            )
+            dk_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_rounded)
+            dv_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_v_rounded)
+
+    if _preallocated is None:
+        dk_accum = torch.zeros(dk_accum_shape, dtype=torch.float32, device=q.device) if dk_accum_shape is not None else None
+        dv_accum = torch.zeros(dv_accum_shape, dtype=torch.float32, device=q.device) if dv_accum_shape is not None else None
+    else:
+        dk_accum = _checked_preallocated(_preallocated.dk_accum, "dk_accum", dk_accum_shape, torch.float32, q.device)
+        dv_accum = _checked_preallocated(_preallocated.dv_accum, "dv_accum", dv_accum_shape, torch.float32, q.device)
 
     dtype = torch2cute_dtype_map[q.dtype]
-    _bwd_preprocess(
-        out,
-        dout,
-        dpsum,
-        lse,
-        lse_log2,
-        dq_accum,
-        cu_seqlens_q,
-        dlse,
-        dtype,
-        head_dim,
-        head_dim_v,
-        tile_m,
-        resolved_max_q,
-        use_hd256,
+    preprocess_kernel = (
+        _compiled.preprocess
+        if _compiled is not None
+        else _get_bwd_preprocess_kernel(
+            dtype,
+            head_dim,
+            head_dim_v,
+            tile_m,
+            cu_seqlens_q is not None,
+            dlse is not None,
+            dq_accum is not None,
+            use_hd256,
+        )
     )
-
     normalized_bwd = normalize_arbitrary_block_sparse_config_bwd(
         nested_plan,
         device=q.device,
@@ -1280,31 +1507,16 @@ def _flex_attn_bwd(
             expected_fixed_total_m_blocks=(None if is_varlen else batch_size * math.ceil(seqlen_q / dq_config.block_size[0])),
         )
     spt = deterministic and not use_hd256
-    dQ_semaphore = (
-        torch.zeros(
-            batch_size,
-            num_q_heads,
-            seqlen_q_rounded // tile_m,
-            cluster_size,
-            dtype=torch.int32,
-            device=q.device,
-        )
-        if deterministic and not use_hd256
-        else None
-    )
-    dK_semaphore = (
-        torch.zeros(
-            batch_size,
-            num_kv_heads,
-            seqlen_k_rounded // tile_n,
-            2,
-            dtype=torch.int32,
-            device=q.device,
-        )
-        if deterministic and qhead_per_kvhead > 1 and not use_hd256
-        else None
-    )
-    dV_semaphore = torch.zeros_like(dK_semaphore) if dK_semaphore is not None else None
+    dq_semaphore_shape = (batch_size, num_q_heads, seqlen_q_rounded // tile_m, cluster_size) if deterministic and not use_hd256 else None
+    dk_semaphore_shape = (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2) if deterministic and qhead_per_kvhead > 1 and not use_hd256 else None
+    if _preallocated is None:
+        dQ_semaphore = torch.zeros(dq_semaphore_shape, dtype=torch.int32, device=q.device) if dq_semaphore_shape is not None else None
+        dK_semaphore = torch.zeros(dk_semaphore_shape, dtype=torch.int32, device=q.device) if dk_semaphore_shape is not None else None
+        dV_semaphore = torch.zeros_like(dK_semaphore) if dK_semaphore is not None else None
+    else:
+        dQ_semaphore = _checked_preallocated(_preallocated.dq_semaphore, "dq_semaphore", dq_semaphore_shape, torch.int32, q.device)
+        dK_semaphore = _checked_preallocated(_preallocated.dk_semaphore, "dk_semaphore", dk_semaphore_shape, torch.int32, q.device)
+        dV_semaphore = _checked_preallocated(_preallocated.dv_semaphore, "dv_semaphore", dk_semaphore_shape, torch.int32, q.device)
 
     compile_key = (
         arch,
@@ -1333,10 +1545,16 @@ def _flex_attn_bwd(
         get_broadcast_dims(k),
         get_broadcast_dims(v),
         get_broadcast_dims(dout),
+        get_broadcast_dims(dq),
+        get_broadcast_dims(dk),
+        get_broadcast_dims(dv),
         use_hd256,
     )
-    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    if compile_key not in _flex_attn_bwd.compile_cache:
+    api_compile_key = compile_key + (dlse is not None,)
+    if _compiled is not None and _compiled.compile_key != api_compile_key:
+        raise ValueError("runtime tensors, plan, or options do not match the compiled Flex Attention backward configuration")
+    if _compiled is None and compile_key not in _flex_attn_bwd.compile_cache:
+        current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [to_cute_tensor(tensor) for tensor in (q, k, v, dout, dq, dk, dv)]
         lse_log2_tensor = to_cute_tensor(lse_log2)
         dpsum_tensor = to_cute_tensor(dpsum)
@@ -1479,7 +1697,24 @@ def _flex_attn_bwd(
             ),
         )
 
-    if not is_fake_mode():
+    main_kernel = _compiled.main if _compiled is not None else _flex_attn_bwd.compile_cache[compile_key]
+
+    if not _compile_only and not is_fake_mode():
+        if _preallocated is not None:
+            for tensor in (dk_accum, dv_accum, dQ_semaphore, dK_semaphore, dV_semaphore):
+                if tensor is not None:
+                    tensor.zero_()
+        preprocess_kernel(
+            out,
+            dout,
+            dpsum,
+            lse,
+            lse_log2,
+            dq_accum,
+            cu_seqlens_q,
+            dlse,
+            resolved_max_q,
+        )
         dq_accum_arg = dq if use_hd256 else dq_accum
         dk_arg = dk_accum if dkv_postprocess else dk
         dv_arg = dv_accum if dkv_postprocess else dv
@@ -1542,60 +1777,91 @@ def _flex_attn_bwd(
                 dV_semaphore,
                 _block_sparse_runtime_tuple(normalized_bwd),
             ]
-        _flex_attn_bwd.compile_cache[compile_key](*call_args)
+        main_kernel(*call_args)
 
+    post_dq_kernel = post_dk_kernel = post_dv_kernel = None
     if not use_hd256:
         num_threads_post_q = 128 if arch == 90 and dq_single_wg else 256 if arch == 90 else 128
         num_threads_post_kv = 256 if arch == 90 else 128
-        _bwd_postprocess_convert(
-            dq_accum,
-            dq,
-            softmax_scale,
-            cu_seqlens_q,
-            resolved_max_q,
-            arch,
-            dtype,
-            head_dim,
-            tile_m,
-            num_threads_post_q,
-            atom_layout_m_dq,
-            False,
-            use_2cta_instrs=use_2cta,
-            cluster_size=1,
-        )
-        if dkv_postprocess:
-            _bwd_postprocess_convert(
-                dk_accum,
-                dk,
-                softmax_scale,
-                cu_seqlens_k,
-                resolved_max_k,
-                arch,
+        post_dq_kernel = (
+            _compiled.post_dq
+            if _compiled is not None
+            else _get_bwd_postprocess_kernel(
                 dtype,
                 head_dim,
-                tile_n,
-                num_threads_post_kv,
-                atom_layout_n_dkv,
-                dkv_swap_ab,
-                accum_row_major=(arch == 90 and atom_layout_n_dkv == 1),
-                cluster_size=cluster_size,
-            )
-            _bwd_postprocess_convert(
-                dv_accum,
-                dv,
-                1.0,
-                cu_seqlens_k,
-                resolved_max_k,
+                tile_m,
+                num_threads_post_q,
+                atom_layout_m_dq,
+                False,
+                False,
+                is_varlen,
+                use_2cta,
+                1,
                 arch,
-                dtype,
-                head_dim_v,
-                tile_n,
-                num_threads_post_kv,
-                atom_layout_n_dkv,
-                dkv_swap_ab,
-                accum_row_major=(arch == 90 and atom_layout_n_dkv == 1),
-                cluster_size=cluster_size,
             )
+        )
+        if not _compile_only and not is_fake_mode():
+            post_dq_kernel(dq_accum, dq, softmax_scale, cu_seqlens_q, resolved_max_q)
+        if dkv_postprocess:
+            accum_row_major = arch == 90 and atom_layout_n_dkv == 1
+            post_dk_kernel = (
+                _compiled.post_dk
+                if _compiled is not None
+                else _get_bwd_postprocess_kernel(
+                    dtype,
+                    head_dim,
+                    tile_n,
+                    num_threads_post_kv,
+                    atom_layout_n_dkv,
+                    dkv_swap_ab,
+                    accum_row_major,
+                    is_varlen,
+                    False,
+                    cluster_size,
+                    arch,
+                )
+            )
+            post_dv_kernel = (
+                _compiled.post_dv
+                if _compiled is not None
+                else _get_bwd_postprocess_kernel(
+                    dtype,
+                    head_dim_v,
+                    tile_n,
+                    num_threads_post_kv,
+                    atom_layout_n_dkv,
+                    dkv_swap_ab,
+                    accum_row_major,
+                    is_varlen,
+                    False,
+                    cluster_size,
+                    arch,
+                )
+            )
+            if not _compile_only and not is_fake_mode():
+                post_dk_kernel(dk_accum, dk, softmax_scale, cu_seqlens_k, resolved_max_k)
+                post_dv_kernel(dv_accum, dv, 1.0, cu_seqlens_k, resolved_max_k)
+
+    compiled_bundle = _CompiledBwd(
+        compile_key=api_compile_key,
+        preprocess=preprocess_kernel,
+        main=main_kernel,
+        post_dq=post_dq_kernel,
+        post_dk=post_dk_kernel,
+        post_dv=post_dv_kernel,
+        workspace_specs=(
+            ("dq_accum", dq_accum_shape, torch.float32),
+            ("dpsum", dpsum_shape, torch.float32),
+            ("lse_log2", dpsum_shape, torch.float32),
+            ("dk_accum", dk_accum_shape, torch.float32),
+            ("dv_accum", dv_accum_shape, torch.float32),
+            ("dq_semaphore", dq_semaphore_shape, torch.int32),
+            ("dk_semaphore", dk_semaphore_shape, torch.int32),
+            ("dv_semaphore", dk_semaphore_shape, torch.int32),
+        ),
+    )
+    if _compile_only:
+        return dq, dk, dv, compiled_bundle
     return dq, dk, dv
 
 

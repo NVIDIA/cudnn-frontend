@@ -16,8 +16,10 @@ from cutlass import Boolean
 import cudnn
 import cudnn.flex_attention as flex_attention
 import cudnn.flex_attention.api as flex_attention_api
+from cudnn.api_base import APIBase
 from cudnn.flex_attention._compat import sm90_utils
 from cudnn.flex_attention.autograd import FlexAttnFunc
+from cudnn.flex_attention.execution import FlexAttentionBwd, FlexAttentionFwd
 from cudnn.flex_attention.plan.mask_plan import ArbitraryPlanRuntimeBinding, MaskPlan, validate_arbitrary_plan_runtime_binding
 from cudnn.flex_attention.plan.validation import is_supported_head_dims, validate_call_options
 from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
@@ -43,11 +45,22 @@ def test_bulk_copy_internal_election_version_window(version, expected):
 
 def test_public_exports_are_lazy_top_level_aliases():
     assert cudnn.flex_attention is flex_attention
-    for name in ("create_mask_plan", "flex_attn_func"):
+    for name in (
+        "FlexAttentionBwd",
+        "FlexAttentionFwd",
+        "create_mask_plan",
+        "flex_attn_func",
+    ):
         assert getattr(cudnn, name) is getattr(flex_attention, name)
         assert getattr(flex_attention, name) is getattr(flex_attention_api, name)
     assert flex_attention.MaskPlan is flex_attention_api.MaskPlan
     assert not hasattr(cudnn, "MaskPlan")
+    assert issubclass(FlexAttentionFwd, APIBase)
+    assert issubclass(FlexAttentionBwd, APIBase)
+    for internal_name in ("flex_attention_forward", "flex_attention_backward"):
+        assert not hasattr(cudnn, internal_name)
+        assert not hasattr(flex_attention, internal_name)
+        assert not hasattr(flex_attention_api, internal_name)
 
 
 def test_clean_top_level_import_stays_optional_and_quack_free():
@@ -62,11 +75,22 @@ import sys
 import cudnn
 assert "torch" not in sys.modules
 assert "cutlass" not in sys.modules
-from cudnn import create_mask_plan, flex_attn_func
+from cudnn import (
+    FlexAttentionBwd,
+    FlexAttentionFwd,
+    create_mask_plan,
+    flex_attn_func,
+)
 module = cudnn.flex_attention
 assert create_mask_plan is module.create_mask_plan
 assert module.flex_attn_func is cudnn.flex_attn_func
 assert flex_attn_func is module.flex_attn_func
+assert FlexAttentionFwd is module.FlexAttentionFwd
+assert FlexAttentionBwd is module.FlexAttentionBwd
+assert not hasattr(cudnn, "flex_attention_forward")
+assert not hasattr(cudnn, "flex_attention_backward")
+assert not hasattr(module, "flex_attention_forward")
+assert not hasattr(module, "flex_attention_backward")
 assert not hasattr(cudnn, "MaskPlan")
 assert not any(name == "quack" or name.startswith("quack.") for name in sys.modules)
 """
@@ -168,3 +192,12 @@ def test_functional_return_contract(monkeypatch):
     assert flex_attention.flex_attn_func(q, k, v, mask_plan=plan, return_lse=True) == ("out", "lse")
     assert runtime_calls == [(plan, q, k, v), (plan, q, k, v)]
     assert [call[-1] for call in apply_calls] == [False, True]
+
+
+def test_allocating_wrappers_stay_internal():
+    from cudnn.flex_attention import execution
+
+    assert callable(execution._flex_attention_forward)
+    assert callable(execution._flex_attention_backward)
+    assert "_flex_attention_forward" not in execution.__all__
+    assert "_flex_attention_backward" not in execution.__all__
