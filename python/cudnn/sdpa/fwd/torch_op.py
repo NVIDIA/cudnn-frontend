@@ -443,8 +443,8 @@ def _sdpa_fwd_impl(
     # The no-LSE placeholder is a 0-elem CUDA fp32 tensor (a CUDA op must not
     # hand back a CPU tensor; the fake kernel mirrors this).
     if is_thd:
-        o = torch.empty(q.shape[0], H_q, D_v, dtype=q.dtype, device=q.device)
-        stats = torch.empty(q.shape[0], H_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
+        o = torch.empty(T_q, H_q, D_v, dtype=q.dtype, device=q.device)
+        stats = torch.empty(T_q, H_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
     else:
         o = torch.empty_strided((B, H_q, S_q, D_v), o_stride, dtype=q.dtype, device=q.device)
         stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)

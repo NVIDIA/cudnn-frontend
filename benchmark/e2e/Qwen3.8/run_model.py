@@ -120,11 +120,14 @@ def _wire_sdpa_attention():
             raise NotImplementedError("cudnn::sdpa_fwd does not serve dropout")
         if window_size[1] not in (-1, 0):
             raise NotImplementedError(f"cudnn::sdpa_fwd has no right window bound; got {window_size[1]}")
+        # torch's SDPA APIs treat scale=None as "use the default"; the op's
+        # schema takes a required float, so resolve it here.
+        attn_scale = softmax_scale if softmax_scale is not None else qt.shape[-1] ** -0.5
         o, _ = torch.ops.cudnn.sdpa_fwd(
             qt,
             kt,
             vt,
-            softmax_scale,
+            attn_scale,
             is_causal=causal,
             window_left=window_size[0],
             return_lse=False,

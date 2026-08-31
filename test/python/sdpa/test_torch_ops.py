@@ -29,6 +29,11 @@ if cudnn.backend_version() < 90600:
 
 from cudnn.sdpa.fwd import torch_op  # noqa: E402  (registers torch.ops.cudnn.sdpa_fwd / sdpa_bwd)
 
+# SDPA rejects sink_token below 9.13 (scaled_dot_product_flash_attention.h:
+# "SDPA with sink_token is not supported before 9.13."), while the module
+# gate above only needs 9.6 for token-major THD stats.
+_SINKS_UNSUPPORTED = pytest.mark.skipif(cudnn.backend_version() < 91300, reason="sink_token requires cuDNN >= 9.13")
+
 TOL = 2.5e-2  # bf16 rounding at these magnitudes
 
 
@@ -74,6 +79,7 @@ def bshd(B, H, S, D, dtype=torch.bfloat16, requires_grad=False):
 
 class TestSdpaFwdDense:
     @pytest.mark.L0
+    @_SINKS_UNSUPPORTED
     @pytest.mark.parametrize("is_causal", [False, True])
     def test_sinks(self, is_causal):
         torch.manual_seed(0)
@@ -160,6 +166,7 @@ class TestSdpaFwdDense:
         assert (o.float() - ref).abs().max().item() < TOL
 
     @pytest.mark.L0
+    @_SINKS_UNSUPPORTED
     def test_sinks_with_window(self):
         torch.manual_seed(0)
         B, H, S, D = 2, 8, 512, 128

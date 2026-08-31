@@ -759,9 +759,10 @@ o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True,
                                   return_lse=True)
 o.backward(grad)  # routes through cudnn::sdpa_bwd via register_autograd
 
-# Or through the python wrapper (same op underneath):
-o = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                     max_seqlen_q=mx, max_seqlen_kv=mx)
+# Or through the python wrapper (same op underneath). It defaults to
+# return_lse=False; autograd needs the stats, so ask for them explicitly:
+o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                          max_seqlen_q=mx, max_seqlen_kv=mx, return_lse=True)
 ```
 
 #### Contracts and limits

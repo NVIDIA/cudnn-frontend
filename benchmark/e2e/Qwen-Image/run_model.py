@@ -241,11 +241,14 @@ def install_joint_attention_dispatch(qwen_module, *, text_tokens, counters=None,
         qt, kt, vt = (tensor.transpose(1, 2) for tensor in (q, k, v))
         if dropout_p:
             raise NotImplementedError("cudnn::sdpa_fwd does not serve dropout")
+        # torch's SDPA APIs treat scale=None as "use the default"; the op's
+        # schema takes a required float, so resolve it here.
+        attn_scale = scale if scale is not None else qt.shape[-1] ** -0.5
         out, _ = torch.ops.cudnn.sdpa_fwd(
             qt,
             kt,
             vt,
-            scale,
+            attn_scale,
             is_causal=is_causal,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
