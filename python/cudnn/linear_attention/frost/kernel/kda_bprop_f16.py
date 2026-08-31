@@ -17,6 +17,8 @@ from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_
 from .kda_bprop_config import CFG
 
 from cudnn.frost.tile_dsl.barrier import (
+    launch_dependent_grids,
+    wait_on_dependent_grids,
     advance,
     MBarrier,
     PipelineState,
@@ -39,6 +41,8 @@ from cudnn.frost.tile_dsl.pointwise import (
     pack_u16x2,
     sub_f16x2,
 )
+
+USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
@@ -334,6 +338,7 @@ def epilogue_warp(
         tma_granu_elems=64,
         tma_subtile_stride_elems=cfg.b_t * 64,
     )
+    dgate_granu = cutlass.const_expr(128 // (cfg.gate_dtype.width // 8))
     sDgate_tma = SmemTile(
         base=sDgate_raw,
         elems_per_stage=(cfg.b_t * cfg.d_k),
@@ -341,9 +346,9 @@ def epilogue_warp(
         leading_byte_offset=0,
         stride_byte_offset=0,
         layout=0,
-        tma_loads_per_tile=(cfg.d_k // 32),
-        tma_granu_elems=32,
-        tma_subtile_stride_elems=cfg.b_t * 32,
+        tma_loads_per_tile=(cfg.d_k // dgate_granu),
+        tma_granu_elems=dgate_granu,
+        tma_subtile_stride_elems=cfg.b_t * dgate_granu,
     )
     dq_index = PipelineState.start(phase=0)
     dk_index = PipelineState.start(phase=0)
@@ -1511,6 +1516,7 @@ def tmaldg_warp(
         tma_granu_elems=64,
         tma_subtile_stride_elems=(cfg.b_t * 64),
     )
+    gate_granu = cutlass.const_expr(128 // (cfg.gate_dtype.width // 8))
     sGate_tma = SmemTile(
         base=sGate_raw,
         elems_per_stage=(cfg.d_k * cfg.b_t),
@@ -1518,8 +1524,8 @@ def tmaldg_warp(
         leading_byte_offset=0,
         stride_byte_offset=0,
         layout=0,
-        tma_loads_per_tile=(cfg.d_k // 32),
-        tma_granu_elems=32,
+        tma_loads_per_tile=(cfg.d_k // gate_granu),
+        tma_granu_elems=gate_granu,
         tma_subtile_stride_elems=(cfg.b_t * 32),
     )
     sDo_tma = SmemTile(
@@ -1623,6 +1629,8 @@ def tmaldg_warp(
                 tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx = next_tile
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.jit
@@ -1654,6 +1662,7 @@ def compute0_warp_group(
     sBeta_raw,
     sK_inv_raw,
     sGate_raw,
+    sGate_load_ptr,
     sK_raw,
     sQ_raw,
     sState_raw,
@@ -1704,7 +1713,8 @@ def compute0_warp_group(
             raw_stage = chunk_serial % cfg.smem_raw_stages
             sQ_ptr = sQ_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
             sK_ptr = sK_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
-            sGate_ptr = sGate_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
+            sGate_ptr = sGate_load_ptr + raw_stage * cfg.gate_stage_elems
+            sGate_exchange_ptr = sGate_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
             sK_inv_ptr = sK_inv_raw.data_ptr() + decay_stage * (cfg.b_t * cfg.d_k)
             sK_decay_ptr = sK_decay_raw.data_ptr() + decay_stage * (cfg.d_k * cfg.b_t)
             sQ_decay_ptr = sQ_decay_raw.data_ptr() + decay_stage * (cfg.d_k * cfg.b_t)
@@ -1734,54 +1744,111 @@ def compute0_warp_group(
             lane_in_row_group = lane_idx - lane_row_group * 8
             decay_row = row_group_start + lane_row_group
 
-            g_prefix_ptr = sGate_ptr
             channel_dim = cg0_warp * cfg.threads_per_warp + lane_idx
             # ---- gate prefix scan: cumulative log-gate per key channel ---------------
             f32_segment = channel_dim // 32
             f32_segment_dim = channel_dim - f32_segment * 32
+            if cutlass.const_expr(cfg.gate_dtype != cutlass.Float32):
+                raw_segment = channel_dim // 64
+                raw_seg_base = raw_segment * (cfg.b_t * 64)
+                raw_col = channel_dim - raw_segment * 64
             prefix_acc = cutlass.Float32(0.0)
             exp_g_last = cutlass.Float32(0.0)
-            for row_pair in cutlass.range(cfg.b_t // 2, unroll=1):
-                row0 = row_pair * 2
-                row1 = row0 + 1
-                prefix_idx0 = f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0, f32_segment_dim, elem_bytes=4)
-                prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1, f32_segment_dim, elem_bytes=4)
-                gate0 = (sGate_ptr + prefix_idx0).load()
-                gate1 = (sGate_ptr + prefix_idx1).load()
-                token_idx0 = chunk_idx * cutlass.Int32(cfg.b_t) + row0
-                token_idx1 = chunk_idx * cutlass.Int32(cfg.b_t) + row1
-                if cutlass.const_expr(cfg.safe_gate):
-                    if token_idx0 < batch_seqlen:
-                        gate0 = gate_scale(cfg, cg0_a_log_exp * (gate0 + cg0_dt_bias_value))
+            if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+                for row_pair in cutlass.range(cfg.b_t // 2, unroll=1):
+                    row0 = row_pair * 2
+                    row1 = row0 + 1
+                    prefix_idx0 = f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0, f32_segment_dim, elem_bytes=4)
+                    prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1, f32_segment_dim, elem_bytes=4)
+                    gate0 = (sGate_ptr + prefix_idx0).load()
+                    gate1 = (sGate_ptr + prefix_idx1).load()
+                    token_idx0 = chunk_idx * cutlass.Int32(cfg.b_t) + row0
+                    token_idx1 = chunk_idx * cutlass.Int32(cfg.b_t) + row1
+                    if cutlass.const_expr(cfg.safe_gate):
+                        if token_idx0 < batch_seqlen:
+                            gate0 = gate_scale(cfg, cg0_a_log_exp * (gate0 + cg0_dt_bias_value))
+                        else:
+                            gate0 = cutlass.Float32(0.0)
+                        if token_idx1 < batch_seqlen:
+                            gate1 = gate_scale(cfg, cg0_a_log_exp * (gate1 + cg0_dt_bias_value))
+                        else:
+                            gate1 = cutlass.Float32(0.0)
                     else:
-                        gate0 = cutlass.Float32(0.0)
-                    if token_idx1 < batch_seqlen:
-                        gate1 = gate_scale(cfg, cg0_a_log_exp * (gate1 + cg0_dt_bias_value))
+                        if token_idx0 < batch_seqlen:
+                            gate0 = gate_scale(cfg, gate0)
+                        else:
+                            gate0 = cutlass.Float32(0.0)
+                        if token_idx1 < batch_seqlen:
+                            gate1 = gate_scale(cfg, gate1)
+                        else:
+                            gate1 = cutlass.Float32(0.0)
+                    pair_vec = nvvm.add_packed_f32x2(
+                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
+                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
+                        ftz=False,
+                        rnd="rn",
+                    )
+                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix1 = prefix_acc + row_pair_sum
+                    exp_g0 = cute.math.exp2(prefix0, fastmath=True)
+                    exp_g1 = cute.math.exp2(prefix1, fastmath=True)
+                    (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
+                    (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
+                    prefix_acc = prefix1
+                    exp_g_last = exp_g1
+            else:
+                gate_raw = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
+                    row0 = row_pair * 2
+                    row1 = row0 + 1
+                    raw_idx0 = raw_seg_base + swizzle_xor_128b(row0, row0 * 64 + raw_col, elem_bytes=2)
+                    raw_idx1 = raw_seg_base + swizzle_xor_128b(row1, row1 * 64 + raw_col, elem_bytes=2)
+                    gate0 = (sGate_ptr + raw_idx0).load().to(cutlass.Float32)
+                    gate1 = (sGate_ptr + raw_idx1).load().to(cutlass.Float32)
+                    token_idx0 = chunk_idx * cutlass.Int32(cfg.b_t) + row0
+                    token_idx1 = chunk_idx * cutlass.Int32(cfg.b_t) + row1
+                    if cutlass.const_expr(cfg.safe_gate):
+                        if token_idx0 < batch_seqlen:
+                            gate0 = gate_scale(cfg, cg0_a_log_exp * (gate0 + cg0_dt_bias_value))
+                        else:
+                            gate0 = cutlass.Float32(0.0)
+                        if token_idx1 < batch_seqlen:
+                            gate1 = gate_scale(cfg, cg0_a_log_exp * (gate1 + cg0_dt_bias_value))
+                        else:
+                            gate1 = cutlass.Float32(0.0)
                     else:
-                        gate1 = cutlass.Float32(0.0)
-                else:
-                    if token_idx0 < batch_seqlen:
-                        gate0 = gate_scale(cfg, gate0)
-                    else:
-                        gate0 = cutlass.Float32(0.0)
-                    if token_idx1 < batch_seqlen:
-                        gate1 = gate_scale(cfg, gate1)
-                    else:
-                        gate1 = cutlass.Float32(0.0)
-                pair_vec = nvvm.add_packed_f32x2(
-                    cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
-                    cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
-                    ftz=False,
-                    rnd="rn",
-                )
-                prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
-                prefix1 = prefix_acc + row_pair_sum
-                exp_g0 = cute.math.exp2(prefix0, fastmath=True)
-                exp_g1 = cute.math.exp2(prefix1, fastmath=True)
-                (sGate_ptr + prefix_idx0).store(exp_g0)
-                (sGate_ptr + prefix_idx1).store(exp_g1)
-                prefix_acc = prefix1
-                exp_g_last = exp_g1
+                        if token_idx0 < batch_seqlen:
+                            gate0 = gate_scale(cfg, gate0)
+                        else:
+                            gate0 = cutlass.Float32(0.0)
+                        if token_idx1 < batch_seqlen:
+                            gate1 = gate_scale(cfg, gate1)
+                        else:
+                            gate1 = cutlass.Float32(0.0)
+                    gate_raw[row0] = gate0
+                    gate_raw[row1] = gate1
+                nvvm.barrier_cta_sync(cfg.cg0_sync_barrier_id, thread_count=cfg.cg0_threads)
+                for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
+                    row0 = row_pair * 2
+                    row1 = row0 + 1
+                    prefix_idx0 = f32_segment * (cfg.b_t * 32) + row0 * 32 + swizzle_xor_128b(row0, f32_segment_dim, elem_bytes=4)
+                    prefix_idx1 = f32_segment * (cfg.b_t * 32) + row1 * 32 + swizzle_xor_128b(row1, f32_segment_dim, elem_bytes=4)
+                    gate0 = gate_raw[row0]
+                    gate1 = gate_raw[row1]
+                    pair_vec = nvvm.add_packed_f32x2(
+                        cutlass.Vector.from_elements((prefix_acc, gate0), cutlass.Float32),
+                        cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32),
+                        ftz=False,
+                        rnd="rn",
+                    )
+                    prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
+                    prefix1 = prefix_acc + row_pair_sum
+                    exp_g0 = cute.math.exp2(prefix0, fastmath=True)
+                    exp_g1 = cute.math.exp2(prefix1, fastmath=True)
+                    (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
+                    (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
+                    prefix_acc = prefix1
+                    exp_g_last = exp_g1
             # ---- decay-slot guard ----------------------------------------------------
             operand_done_phase = ((chunk_serial // cfg.smem_decay_stages) + 1) % 2
             bars.mb_decay_done[decay_stage].wait(operand_done_phase)
@@ -1889,9 +1956,9 @@ def compute0_warp_group(
                     f32_segment = f32_dim_base // 32
                     f32_segment_dim = f32_dim_base - f32_segment * 32
                     g_prefix_idx = f32_segment * (cfg.b_t * 32) + decay_row * 32 + swizzle_xor_128b(decay_row, f32_segment_dim, elem_bytes=4)
-                    exp_g_frag = (g_prefix_ptr + g_prefix_idx).load(count=4, alignment=16)
+                    exp_g_frag = (sGate_exchange_ptr + g_prefix_idx).load(count=4, alignment=16)
                     exp_g_last_idx = f32_segment * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b((cfg.b_t - 1), f32_segment_dim, elem_bytes=4)
-                    exp_g_last_frag = (g_prefix_ptr + exp_g_last_idx).load(count=4, alignment=16)
+                    exp_g_last_frag = (sGate_exchange_ptr + exp_g_last_idx).load(count=4, alignment=16)
                     f32_reg_base = reg_base + f32_group * 4
                     exp_g_regs[f32_reg_base] = exp_g_frag[0]
                     exp_g_regs[f32_reg_base + 1] = exp_g_frag[1]
@@ -2082,14 +2149,15 @@ def compute1_warp_group(
                 bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
                 row_lo_addr = tmem_row << 16
+                seed_vw = 16 // (mDstate_in.element_type.width // 8)
                 dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(cfg.d_k // 16):
                     seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
-                    for g in cutlass.range_constexpr(4):
-                        seed_chunk = (dstate_src + i * 16 + g * 4).load(count=4, alignment=16)
-                        for t in cutlass.range_constexpr(4):
+                    for g in cutlass.range_constexpr(16 // seed_vw):
+                        seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                        for t in cutlass.range_constexpr(seed_vw):
                             dval = seed_chunk[t].to(cutlass.Float32)
-                            seed_block[g * 4 + t] = dval if seed_true else cutlass.Float32(0.0)
+                            seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 16), cutlass.Float32),
@@ -2419,14 +2487,18 @@ def compute1_warp_group(
             if num_compute_chunks > 0:
                 if write_start == 0:
                     row_lo_addr = tmem_row << 16
+                    dstate0_vw = 16 // (mDstate0.element_type.width // 8)
                     dstate0_dst = (mDstate0.iterator + mDstate0.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
                     for i in cutlass.range_constexpr(cfg.d_k // 32):
                         dstate0_vec = nvvm.tcgen05_ld(
                             "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 32), cutlass.Float32), num=32
                         )
-                        for g in cutlass.range_constexpr(8):
-                            (dstate0_dst + i * 32 + g * 4).store(
-                                cutlass.Vector.from_elements(tuple(dstate0_vec[g * 4 + t] for t in range(4)), cutlass.Float32),
+                        for g in cutlass.range_constexpr(32 // dstate0_vw):
+                            (dstate0_dst + i * 32 + g * dstate0_vw).store(
+                                cutlass.Vector.from_elements(
+                                    tuple(dstate0_vec[g * dstate0_vw + t].to(mDstate0.element_type) for t in range(dstate0_vw)),
+                                    mDstate0.element_type,
+                                ),
                                 alignment=16,
                             )
             else:
@@ -2436,7 +2508,7 @@ def compute1_warp_group(
                         if cutlass.const_expr(cfg.use_dstate_in):
                             mDstate0[batch_idx, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd]
                         else:
-                            mDstate0[batch_idx, head_idx, value_dim, kd] = cutlass.Float32(0.0)
+                            mDstate0[batch_idx, head_idx, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
         if num_compute_chunks > 0:
             bars.mb_dstate0_acc_stored.arrive()
         chunk_serial_base += num_compute_chunks
@@ -2511,7 +2583,7 @@ def compute2_warp_group(
             has_dstate = cutlass.Boolean(rev_idx > 0)
             if cutlass.const_expr(cfg.use_dstate_in):
                 has_dstate = cutlass.Boolean(True)
-            sGate_ptr = sGate_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
+            sGate_exchange_ptr = sGate_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
             writes = chunk_idx < write_end
 
             bars.mb_k_decay_inv_ready[decay_stage].wait((chunk_serial // cfg.smem_decay_stages) % 2)
@@ -2523,7 +2595,7 @@ def compute2_warp_group(
             f16_dim = channel - f16_seg * 64
             eg = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
             for t in cutlass.range_constexpr(cfg.b_t):
-                eg[t] = (sGate_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)).load()
+                eg[t] = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)).load()
             egl = eg[cfg.b_t - 1]
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_gate_done[raw_stage].arrive()
@@ -2735,9 +2807,16 @@ def compute2_warp_group(
             # ---- stage dGate for the epilogue TMA store ------------------------------
             dgate_stage = chunk_serial % cfg.smem_dgate_stages
             bars.mb_dgate_tmastg_done[dgate_stage].wait(((chunk_serial // cfg.smem_dgate_stages) + 1) % 2)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                dgate_idx = f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)
-                (sDgate_raw.data_ptr() + dgate_idx).store(dgate_regs[t])
+            if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    dgate_idx = f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)
+                    (sDgate_raw.data_ptr() + dgate_idx).store(dgate_regs[t])
+            else:
+                dgate_seg = channel // 64
+                dgate_dim = channel - dgate_seg * 64
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    dgate_idx = dgate_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, dgate_dim, elem_bytes=2)
+                    (sDgate_raw.data_ptr() + dgate_idx).store(dgate_regs[t].to(cfg.gate_dtype))
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dgate_tmastg_ready[dgate_stage].arrive()
             raw_index = advance(raw_index, cfg.smem_raw_stages)
@@ -2897,6 +2976,9 @@ def frost_kda_bprop_prologue(
     consumers' scheduler rings via :func:`order_body`; it then builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
     per array (the extra warps only take part in the order phase)."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
+        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -3016,12 +3098,15 @@ def prologue(
     base_q = cuda.create_tensor_map_tiled_from_view(q_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_k = cuda.create_tensor_map_tiled_from_view(k_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_v = cuda.create_tensor_map_tiled_from_view(v_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
-    base_gate = cuda.create_tensor_map_tiled_from_view(gate_headed, box_dims=(32, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
+    gate_granu_elems = 128 // (gate.element_type.width // 8)
+    base_gate = cuda.create_tensor_map_tiled_from_view(gate_headed, box_dims=(gate_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_do = cuda.create_tensor_map_tiled_from_view(do_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_dq = cuda.create_tensor_map_tiled_from_view(dq_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_dk = cuda.create_tensor_map_tiled_from_view(dk_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
     base_dv = cuda.create_tensor_map_tiled_from_view(dv_headed, box_dims=(tma_granu_elems, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
-    base_dgate = cuda.create_tensor_map_tiled_from_view(dgate_headed, box_dims=(32, 1, b_t), stride_order=(0, 1, 2), swizzle=swz)
+    base_dgate = cuda.create_tensor_map_tiled_from_view(
+        dgate_headed, box_dims=(128 // (dgate.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swz
+    )
 
     checkpoint_view = cute.make_tensor(
         state_checkpoints.iterator,
@@ -3075,7 +3160,7 @@ def prologue(
         cutlass.Int32(dgate.stride[0]),
         cutlass.Int32(state_checkpoints.stride[0]),
         cutlass.Int32(b_t),
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
+    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit
@@ -3122,6 +3207,7 @@ def host(
         grid=grid_shape,
         block=(cfg.threads_per_cta, 1, 1),
         stream=stream,
+        use_pdl=USE_PDL,
         min_blocks_per_mp=1,
     )
 
@@ -3145,6 +3231,8 @@ def frost_kda_bprop(
     scale: cutlass.Float32,
 ) -> None:
     """BT=16 KDA backward kernel (persistent, 16 warps)."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
     num_ctas = cute.arch.grid_dim()[0]
@@ -3152,10 +3240,9 @@ def frost_kda_bprop(
     lane_idx = tidx % cfg.threads_per_warp
 
     total_tiles = mCount[0]
-    beta_expected = cfg.io_dtype if cutlass.const_expr(cfg.beta_sigmoid) else cutlass.Float32
-    assert mBeta.element_type == beta_expected
+    assert mBeta.element_type in (cutlass.Float32, cfg.io_dtype)
     assert cu_seqlens.element_type in (cutlass.Int32, cutlass.Int64)
-    assert mDgate.element_type == cutlass.Float32 and mDbeta.element_type == beta_expected
+    assert mDgate.element_type == cfg.gate_dtype and mDbeta.element_type == mBeta.element_type
 
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     arr_words = n_desc * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -3201,11 +3288,15 @@ def frost_kda_bprop(
     sK_raw = cutlass.Array(cfg.io_dtype, cfg.raw_qk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sV_raw = cutlass.Array(cfg.io_dtype, cfg.raw_v_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sGate_raw = cutlass.Array(cutlass.Float32, cfg.raw_gate_cosize, space=SMEM, alignment=1024)
+    if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+        sGate_load_ptr = sGate_raw.data_ptr()
+    else:
+        sGate_load_ptr = cute.make_ptr(cfg.gate_dtype, sGate_raw.data_ptr().toint(), mem_space=SMEM, assumed_align=1024)
     sDy_raw = cutlass.Array(cfg.io_dtype, cfg.b_t * cfg.d_v, space=SMEM, alignment=cfg.buffer_align_bytes)
     sU_raw = cutlass.Array(cfg.io_dtype, cfg.b_t * cfg.d_v, space=SMEM, alignment=cfg.buffer_align_bytes)
     sDq_raw = cutlass.Array(cfg.io_dtype, cfg.dq_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sDk_raw = cutlass.Array(cfg.io_dtype, cfg.dk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
-    sDgate_raw = cutlass.Array(cutlass.Float32, cfg.dgate_cosize, space=SMEM, alignment=1024)
+    sDgate_raw = cutlass.Array(cfg.gate_dtype, cfg.dgate_cosize, space=SMEM, alignment=1024)
 
     sState_trans = SmemTile(
         base=sState_raw.data_ptr().toint(),
@@ -3537,6 +3628,7 @@ def frost_kda_bprop(
             sBeta_raw,
             sK_inv_raw,
             sGate_raw,
+            sGate_load_ptr,
             sK_raw,
             sQ_raw,
             sState_raw,
@@ -3605,6 +3697,7 @@ class KdaBwdCfg:
     and SMEM buffer cosizes are stamped by ``build_cfg``)."""
 
     io_dtype: Type[cutlass.Numeric]
+    gate_dtype: Type[cutlass.Numeric]
     use_dstate_in: bool
     use_dstate0: bool
     l2norm: bool
@@ -3683,6 +3776,7 @@ class KdaBwdCfg:
     raw_qk_cosize: int = 0
     raw_v_cosize: int = 0
     raw_gate_cosize: int = 0
+    gate_stage_elems: int = 0
     operand_cosize: int = 0
     diag_cosize: int = 0
     intermediate_cosize: int = 0
@@ -3703,6 +3797,7 @@ class KdaBwdCfg:
 
 def build_cfg(
     io_dtype: Type[cutlass.Numeric],
+    gate_dtype: Type[cutlass.Numeric],
     *,
     use_dstate_in: bool,
     use_dstate0: bool,
@@ -3722,6 +3817,7 @@ def build_cfg(
         raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
     cfg = KdaBwdCfg(
         io_dtype=io_dtype,
+        gate_dtype=gate_dtype,
         use_dstate_in=use_dstate_in,
         use_dstate0=use_dstate0,
         l2norm=l2norm,
@@ -3765,6 +3861,7 @@ def build_cfg(
     cfg.raw_qk_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
     cfg.raw_v_cosize = cfg.smem_raw_stages * cfg.d_v * cfg.b_t
     cfg.raw_gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
+    cfg.gate_stage_elems = (cfg.d_k * cfg.b_t) * (4 // (cfg.gate_dtype.width // 8))
     cfg.operand_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
     cfg.diag_cosize = cfg.smem_decay_stages * (cfg.d_k // 16) * 256
     cfg.intermediate_cosize = cfg.smem_intermediate_stages * cfg.intermediate_tiles * cfg.b_t * cfg.b_t
@@ -3776,7 +3873,7 @@ def build_cfg(
     cfg.tma_state_bytes = cfg.d_k * cfg.d_v * (io_dtype.width // 8)
     cfg.tma_q_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
     cfg.tma_k_bytes = cfg.d_k * cfg.b_t * (cfg.io_dtype.width // 8)
-    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * 4
+    cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * (cfg.gate_dtype.width // 8)
     cfg.tma_do_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
     cfg.tma_v_bytes = cfg.d_v * cfg.b_t * (cfg.io_dtype.width // 8)
     return cfg
@@ -3792,7 +3889,11 @@ TENSORMAP_STATIC_SLOTS = 0
 @lru_cache(maxsize=None)
 def get_compiled_cache(
     io_dtype_str: str,
+    dstate_in_dtype_str: str,
+    dstate0_dtype_str: str,
+    gate_dtype_str: str,
     cu_dtype_str: str,
+    beta_dtype_str: str,
     HQ: int,
     HK: int,
     HV: int,
@@ -3852,7 +3953,8 @@ def chunk_kda_bwd_sm100(
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
         v: ``(total_tokens, HV, DV)`` float16/bfloat16
-        gate: ``(total_tokens, HO, DK)`` fp32.  Natural-log per-channel decay
+        gate: ``(total_tokens, HO, DK)`` float32/bfloat16/float16 (16-bit is widened to fp32 on the SMEM read).
+              Natural-log per-channel decay
               unless ``safe_gate``, which applies the safe-gate transform
               ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``.
         beta: ``(total_tokens, HO)``.  Post-sigmoid float32, or io-dtype
@@ -3874,8 +3976,9 @@ def chunk_kda_bwd_sm100(
         scale: attention scale factor
         use_initial_state: the forward ran with an initial state, so chunk 0
             has an entering state to load from ``state_checkpoints`` row 0
-        d_initial_state: fp32 ``(num_seqs, HO, DV, DK)`` OUT (dL/d initial state), or None
-        d_final_state: fp32 ``(num_seqs, HO, DV, DK)`` IN (dL/d final state)
+        d_initial_state: ``(num_seqs, HO, DV, DK)`` float32/bfloat16 OUT (dL/d initial state), or None
+        d_final_state: ``(num_seqs, HO, DV, DK)`` float32/bfloat16 IN (dL/d final state); both state
+            gradients carry the same dtype
         use_qk_l2norm_in_kernel: q/k arrive raw; the kernel normalizes for the
             recompute math and chains the L2-norm backward into dq/dk
         safe_gate: interpret ``gate`` through the safe-gate transform
@@ -3924,7 +4027,11 @@ def chunk_kda_bwd_sm100(
     cu_stream = cuda_driver.CUstream(int(stream))
     cache = get_compiled_cache(
         str(q.dtype),
+        str(d_final_state.dtype) if d_final_state is not None else "none",
+        str(d_initial_state.dtype) if d_initial_state is not None else "none",
+        str(gate.dtype),
         str(cu_seqlens.dtype),
+        str(beta.dtype),
         HQ,
         HK,
         HV,
@@ -3942,8 +4049,10 @@ def chunk_kda_bwd_sm100(
 
     if "compiled" not in cache:
         io_dtype = get_dtype(q.dtype)
+        gate_dtype = get_dtype(gate.dtype)
         cfg = build_cfg(
             io_dtype,
+            gate_dtype,
             use_dstate_in=use_dstate_in,
             use_dstate0=use_dstate0,
             l2norm=use_qk_l2norm_in_kernel,

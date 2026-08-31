@@ -24,6 +24,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from .host import get_dtype
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+
+USE_PDL = True
 
 BLOCK = 256
 
@@ -40,6 +43,8 @@ def frost_head_reduce(
     inner_words: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
 ) -> None:
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
     gw = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
@@ -66,6 +71,8 @@ def frost_head_reduce(
                 acc_lo = acc_lo + lo
                 acc_hi = acc_hi + hi
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.jit
@@ -86,6 +93,7 @@ def launch(
         grid=(grid_x, 1, 1),
         block=(BLOCK, 1, 1),
         stream=stream,
+        use_pdl=USE_PDL,
     )
 
 

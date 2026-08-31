@@ -297,10 +297,10 @@ are close.
   recompute when the series is absent); the op is
   `cudnn.linear_attention.ops.gated_delta_net_v2`.
 - The FROST engines are pure pass-through: `check_support` requires the
-  kernel-native dtypes (fp32 gates — io-dtype `beta`/`w` for GDN-2 — int32
-  or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
-  initial/final dtypes, fp32 state gradients for GDN/KDA and io-dtype
-  `dBeta`/`dW` for GDN-2) and execute hands the caller's buffers straight to
+  kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
+  — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
+  initial/final dtypes, state gradients at the state's own dtype, and
+  io-dtype `dBeta`/`dW` for GDN-2) and execute hands the caller's buffers straight to
   the kernels, carving any scratch it needs out of the explicit workspace as
   DLPack views. The cuTile engines follow the same buffer contract: outputs
   are written in place (the caller's output buffers, required in the
