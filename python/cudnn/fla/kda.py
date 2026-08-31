@@ -97,9 +97,11 @@ def _to_native(
         b = dt_bias.float().reshape(H, K)
         g = -a.exp() * F.softplus(g + b)
 
-    # beta is io-dtype logits when the kernel applies the sigmoid; post-activation beta rides as given.
-    if use_beta_sigmoid_in_kernel:
-        beta = beta.to(q.dtype)
+    # Preserve raw-logit precision for the fused sigmoid.  The current native
+    # kernels accept either the io dtype or float32 and return dBeta in the
+    # corresponding dtype; official Kimi passes float32 logits here.
+    if use_beta_sigmoid_in_kernel and beta.dtype not in (q.dtype, torch.float32):
+        raise _Decline(f"beta logits must be {q.dtype} or float32, got {beta.dtype}")
 
     def thd(t):
         return t.reshape(-1, *t.shape[2:])

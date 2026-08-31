@@ -254,7 +254,9 @@ def _kda_leaves(B, T, H, K, V, dtype, seed):
         "k": io(B, T, H, K),
         "v": io(B, T, H, V),
         "g": io(B, T, H, K),  # raw f_proj output (channel-wise), io dtype
-        "beta": io(B, T, H),
+        # Official Kimi preserves raw beta logits in FP32 until the fused
+        # sigmoid; exercise that exact adapter contract here.
+        "beta": torch.randn(B, T, H, generator=gen, device=dev).requires_grad_(True),
         "A_log": torch.log(torch.empty(H, device=dev).uniform_(1, 16)).requires_grad_(True),
         "dt_bias": (dt + torch.log(-torch.expm1(-dt))).detach().requires_grad_(True),
     }
@@ -291,7 +293,7 @@ def test_kda_parity_fused():
     def clone(src, dt):
         lv = {}
         for name, t in src.items():
-            fp32 = name in ("A_log", "dt_bias")
+            fp32 = name in ("beta", "A_log", "dt_bias")
             lv[name] = t.detach().clone().to(torch.float32 if fp32 else dt).requires_grad_(True)
         return lv
 
@@ -327,6 +329,7 @@ def test_kda_parity_fused():
     check("o", o_fla, o_cud, o_ref, KDA_SLACK)
     for n in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad, KDA_GATE_SLACK if n in GATE_PARAMS else KDA_SLACK)
+    assert lv_cud["beta"].grad.dtype == torch.float32
 
 
 def test_fallback_is_transparent():
