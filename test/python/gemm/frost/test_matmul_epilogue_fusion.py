@@ -2803,12 +2803,15 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
-    assert sites == 4, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+    assert sites == 5, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 5. A new one either "
         f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
         f"then update this test."
     )
     assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
+    # Col quant's `_scale_mine` is the fifth rmem tensor. It is a one-byte-per-
+    # block side-store carrier, not a dense value entering the TMA staging ring.
+    assert src.count("_scale_mine = cute.make_rmem_tensor(") == 1
     # The two block-quantize emitters were the last holdouts: their result now
     # reaches a TMA-stored dense output, so they must convert like the rest.
     assert src.count("_out = cute.make_rmem_tensor(") == 2
