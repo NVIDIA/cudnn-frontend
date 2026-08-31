@@ -1221,6 +1221,9 @@ class SparseAttentionForwardSm100Head64:
             # waits this handoff before issuing the current PV.
             if warp_idx < Int32(4):
                 if tile_idx > Int32(0):
+                    # Warps 0 and 1 publish the rescale metadata. Synchronize
+                    # all four WG0 warps before any of them consume it.
+                    self.softmax_sync_barrier.arrive_and_wait()
                     self._rescale_o_tmem(sScale, sGroupRescale, tidx)
                 cute.arch.fence_view_async_shared()
                 cute.arch.mbarrier_arrive(so_ready_mbar_ptr)
