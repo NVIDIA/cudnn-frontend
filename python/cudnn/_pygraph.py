@@ -826,10 +826,37 @@ class pygraph:
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
         # the caller registered its own engine — the pre-existing exemption.
+        #
+        # SDPA-family graphs with a python engine candidate validate natively in
+        # python instead (issue #704): the eager C++ round-trip couples a graph
+        # a FROST engine fully serves to the installed backend's version (an
+        # attribute the backend is too old to *validate* but will never
+        # execute). Semantic validity is checked here by _sdpa_validate with
+        # classic error types; the backend's own verdict is deferred to
+        # planning, where a decline is recorded (backend_plan_entries) and
+        # surfaced by plan() only if no python engine proposes a plan either.
         if self._backend_lowerable() and self._lowered_graph is None:
-            self._lowered_graph = self._lower_to_cpp()
-            self._lowered_graph.validate()
-            self._verify_uid_ownership()
+            if self._python_native_validation():
+                from . import _sdpa_validate
+
+                for node in self._nodes:
+                    _sdpa_validate.validate_node(node)
+            else:
+                self._lowered_graph = self._lower_to_cpp()
+                self._lowered_graph.validate()
+                self._verify_uid_ownership()
+
+    def _python_native_validation(self) -> bool:
+        """Whether validate() may skip the eager C++ lowering: every node has a
+        python-native validator AND the manifest offers a python engine for this
+        graph (frost engines available and enabled). Without a candidate the
+        backend is the only possible server, so classic timing — raise its
+        rejection from validate() — must hold."""
+        from . import _sdpa_validate
+
+        if not self._nodes or any(n.node_type not in _sdpa_validate.COVERED_NODE_TYPES for n in self._nodes):
+            return False
+        return bool(self._candidate_engines())
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
