@@ -1240,20 +1240,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         lpt_l2_size_mib = 0
         d192_lpt_groups = self.batch_size * self.h_q // _pack_g
         d192_lpt_l2_8k = (
-            self.flavor == (192, 128)
-            and sched_policy == SCHED_LPT_L2
-            and not self.thd
-            and self.split_kv == 1
-            and self.s_q_max == 8192
-            and self.s_k_max == 8192
+            self.flavor == (192, 128) and sched_policy == SCHED_LPT_L2 and not self.thd and self.split_kv == 1 and self.s_q_max == 8192 and self.s_k_max == 8192
         )
-        if (
-            d192_lpt_l2_8k
-            and self._pertensor
-            and self.dtype == torch.float8_e4m3fn
-            and d192_lpt_groups % 24 != 0
-            and d192_lpt_groups % 16 == 0
-        ):
+        if d192_lpt_l2_8k and self._pertensor and self.dtype == torch.float8_e4m3fn and d192_lpt_groups % 24 != 0 and d192_lpt_groups % 16 == 0:
             # At 8K, the default 60 MiB budget groups 24 K/V heads. A 40 MiB
             # group holds 16 and avoids a short final group for these grids.
             lpt_l2_size_mib = 40

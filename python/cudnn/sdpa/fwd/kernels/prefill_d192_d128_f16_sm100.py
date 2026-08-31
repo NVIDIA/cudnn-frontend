@@ -107,13 +107,7 @@ from cudnn.frost.tile_dsl.mask import (
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
-_DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
-    not CFG.THD_VARLEN
-    and CFG.MASK_FLAGS == MASK_CAUSAL
-    and CFG.WINDOW_RIGHT == 0
-    and not CFG.BOTTOM_RIGHT
-    and not CFG.HAS_SINK
-)
+_DENSE_CAUSAL_PUBLIC_EXP2_MIX = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 
 
 def _exp2_mixed_late(vec):
@@ -272,9 +266,7 @@ TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 # assigns a partial KV-tail tile to the lower side when those ranges meet.
 _MASK_TOKENS_PER_CGA = CFG.TILES_Q * TOKENS_PER_TILE * CFG.CTA_MMA
 _SWA_ONE_SIDED_GEOMETRY = bool(
-    (CFG.MASK_FLAGS & MASK_SWA)
-    and (CFG.MASK_FLAGS & MASK_CAUSAL)
-    and CFG.WINDOW_LEFT + CFG.WINDOW_RIGHT >= _MASK_TOKENS_PER_CGA + CFG.TILE_N - 2
+    (CFG.MASK_FLAGS & MASK_SWA) and (CFG.MASK_FLAGS & MASK_CAUSAL) and CFG.WINDOW_LEFT + CFG.WINDOW_RIGHT >= _MASK_TOKENS_PER_CGA + CFG.TILE_N - 2
 )
 
 # === KV split ===
@@ -308,9 +300,7 @@ _partial_batch = _split_h.partial_batch
 # const-folded to False is what desynchronises the warp groups.
 CAN_HAVE_EMPTY_KV = CAN_HAVE_EMPTY_KV or SPLIT_KV > 1
 
-_PREDECODE_THD_SWA_SEGMENTS = bool(
-    CFG.THD_VARLEN and SPLIT_KV == 1 and not CFG.BOTTOM_RIGHT and _SWA_ONE_SIDED_GEOMETRY
-)
+_PREDECODE_THD_SWA_SEGMENTS = bool(CFG.THD_VARLEN and SPLIT_KV == 1 and not CFG.BOTTOM_RIGHT and _SWA_ONE_SIDED_GEOMETRY)
 
 
 @cute.jit
@@ -337,11 +327,7 @@ def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, s
         )
     )
     swa_left_end = cute.math.min(cute.math.max(lower_end_raw, bounds.left), bounds.right)
-    pad_start = (
-        eff_seqlen_kv // cutlass.Int32(CFG.TILE_N)
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED)
-        else bounds.right
-    )
+    pad_start = eff_seqlen_kv // cutlass.Int32(CFG.TILE_N) if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED) else bounds.right
     swa_left_pad_start = cute.math.min(cute.math.max(pad_start, bounds.left), swa_left_end)
     causal_start = (cga_q_row_coord + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)) // cutlass.Int32(CFG.TILE_N)
     right_start_raw = cute.math.min(causal_start, pad_start)
@@ -474,10 +460,7 @@ def _softmax_next_payload(
     if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
         wait(sched.mb_decoded.subview(sched_state.idx), sched_state.phase)
         base = sched_state.idx * cutlass.Int32(11)
-        payload = tuple(
-            cute.arch.make_warp_uniform(sched.decoded_smem.subview(base + cutlass.Int32(i)).load())
-            for i in range(11)
-        )
+        payload = tuple(cute.arch.make_warp_uniform(sched.decoded_smem.subview(base + cutlass.Int32(i)).load()) for i in range(11))
         bounds = KvLoopBounds(
             left=payload[6],
             unmasked_lo=payload[8],
@@ -629,6 +612,7 @@ class KernelTmemLayout:
 
     P0_OFF: int = _P0_OFF
     P1_OFF: int = _P1_OFF
+
 
 LAYOUT = KernelTmemLayout()
 
@@ -1251,9 +1235,7 @@ def _tmaldg_warp_group(
             q_super_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base).load())
             head_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(1)).load())
             batch_idx = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(2)).load())
-            is_valid_tile = cute.arch.make_warp_uniform(
-                sched.decoded_smem.subview(decoded_base + cutlass.Int32(3)).load()
-            )
+            is_valid_tile = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(3)).load())
             split_idx = cutlass.Int32(0)
             kv_left = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(6)).load())
             kv_right = cute.arch.make_warp_uniform(sched.decoded_smem.subview(decoded_base + cutlass.Int32(10)).load())
@@ -2418,11 +2400,7 @@ def _softmax_warp_group(
                 else:
                     cga_q_row_coord = (q_super_idx - cta_in_pair) * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
                     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
-                    lower_anchor = (
-                        cga_q_row_coord
-                        + causal_diag
-                        + cutlass.Int32(_MASK_TOKENS_PER_CGA - 1 - CFG.WINDOW_LEFT)
-                    )
+                    lower_anchor = cga_q_row_coord + causal_diag + cutlass.Int32(_MASK_TOKENS_PER_CGA - 1 - CFG.WINDOW_LEFT)
                     lower_end_if_positive = (lower_anchor + cutlass.Int32(CFG.TILE_N - 1)) // cutlass.Int32(CFG.TILE_N)
                     lower_end_raw = cutlass.Int32(
                         arith.select(
@@ -2432,15 +2410,9 @@ def _softmax_warp_group(
                         )
                     )
                     left_end = cute.math.min(cute.math.max(lower_end_raw, bounds.left), bounds.right)
-                    pad_start = (
-                        eff_seqlen_kv // cutlass.Int32(CFG.TILE_N)
-                        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED)
-                        else bounds.right
-                    )
+                    pad_start = eff_seqlen_kv // cutlass.Int32(CFG.TILE_N) if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED) else bounds.right
                     left_pad_start = cute.math.min(cute.math.max(pad_start, bounds.left), left_end)
-                    causal_start = (
-                        cga_q_row_coord + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)
-                    ) // cutlass.Int32(CFG.TILE_N)
+                    causal_start = (cga_q_row_coord + causal_diag + cutlass.Int32(CFG.WINDOW_RIGHT)) // cutlass.Int32(CFG.TILE_N)
                     right_start_raw = cute.math.min(causal_start, pad_start)
                     right_start = cute.math.min(
                         cute.math.max(cute.math.max(right_start_raw, left_end), bounds.left),

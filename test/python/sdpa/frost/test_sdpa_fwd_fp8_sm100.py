@@ -910,15 +910,19 @@ def _run_thd(
         ob = _ref(qb, kb, vb, scale=scale, **ref_kw)
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
         if stats:
-            lse_ref[cu_q[b] : cu_q[b + 1]] = _ref_lse(
-                qb,
-                kb,
-                scale=scale,
-                causal=bottom_right or causal or swa_window is not None,
-                bottom_right=bottom_right,
-                swa_window=swa_window,
-                sinks=(sink.flatten() if sink is not None else None),
-            ).squeeze(0).T
+            lse_ref[cu_q[b] : cu_q[b + 1]] = (
+                _ref_lse(
+                    qb,
+                    kb,
+                    scale=scale,
+                    causal=bottom_right or causal or swa_window is not None,
+                    bottom_right=bottom_right,
+                    swa_window=swa_window,
+                    sinks=(sink.flatten() if sink is not None else None),
+                )
+                .squeeze(0)
+                .T
+            )
 
     o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None

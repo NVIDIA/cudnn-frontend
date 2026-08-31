@@ -108,13 +108,8 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
 _REUSE_BMM2_ELECT = not CFG.THD_VARLEN or CFG.DTYPE_QKV == 1
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
-MERGE_SOFTMAX_WGS = (
-    not CFG.THD_VARLEN
-    and CFG.MASK_FLAGS == MASK_CAUSAL
-    and CFG.WINDOW_RIGHT == 0
-    and not CFG.BOTTOM_RIGHT
-    and not CFG.HAS_SINK
-)
+MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
+_FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
 
 
 @cute.jit
@@ -167,7 +162,7 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
         elif CFG.DTYPE_QKV == 1 and i < 32:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         elif CFG.DTYPE_QKV == 0 and i < 32 and i % 10 < 4:
-            degree = 2 if MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 else 3
+            degree = 2 if _FAST_E4_DENSE_MHA else 3
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=degree)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -177,7 +172,7 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
 
 
 def _exp2_mixed_late(vec):
-    tail_start = 40 if MERGE_SOFTMAX_WGS and CFG.DTYPE_QKV == 0 and CFG.SPLIT_KV == 1 else 56
+    tail_start = 40 if _FAST_E4_DENSE_MHA else 56
     values = []
     for i in range(0, int(vec.shape[0]), 2):
         if i >= tail_start:
@@ -340,16 +335,16 @@ TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 
 _MASK_TOKENS_PER_CGA = CFG.TILES_Q * TOKENS_PER_TILE * CFG.CTA_MMA
 _SWA_ONE_SIDED_GEOMETRY = bool(
-    (CFG.MASK_FLAGS & MASK_SWA)
+    CFG.THD_VARLEN
+    and (CFG.MASK_FLAGS & MASK_SWA)
     and (CFG.MASK_FLAGS & MASK_CAUSAL)
     and CFG.WINDOW_LEFT + CFG.WINDOW_RIGHT >= _MASK_TOKENS_PER_CGA + CFG.TILE_N - 2
 )
 _DENSE_ORDINARY_STORE_P_BEFORE_REDUCE = bool(
-    not CFG.THD_VARLEN
-    and not CFG.BOTTOM_RIGHT
-    and not (CFG.MASK_FLAGS & MASK_SWA)
-    and (CFG.DTYPE_QKV == 1 or CFG.WINDOW_RIGHT == 0)
+    not CFG.THD_VARLEN and not CFG.BOTTOM_RIGHT and not (CFG.MASK_FLAGS & MASK_SWA) and (CFG.DTYPE_QKV == 1 or CFG.WINDOW_RIGHT == 0)
 )
+
+
 @cute.jit
 def _bounds_for_tile_uniform(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, qh_per_kh: int = 1):
     """Uniform bounds signature for the shared KV-split helper."""
@@ -393,13 +388,7 @@ _decode_payload_split_mma = _split_h_mma_runtime.decode_payload_split
 # decoded coordinates beside it. THD also predecodes effective sequence lengths
 # once per work unit so every pipeline role does not repeat the same GMEM loads.
 _PREDECODE_THD_LENGTHS = bool(CFG.THD_VARLEN and CFG.MASK_FLAGS != MASK_NONE)
-_PREDECODE_THD_SWA_SEGMENTS = bool(
-    CFG.DTYPE_QKV == 0
-    and CFG.THD_VARLEN
-    and SPLIT_KV == 1
-    and not CFG.BOTTOM_RIGHT
-    and _SWA_ONE_SIDED_GEOMETRY
-)
+_PREDECODE_THD_SWA_SEGMENTS = bool(CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN and SPLIT_KV == 1 and not CFG.BOTTOM_RIGHT and _SWA_ONE_SIDED_GEOMETRY)
 SCHED_PAYLOAD_WORDS = 16 if _PREDECODE_THD_SWA_SEGMENTS else 12 if SPLIT_KV > 1 or _PREDECODE_THD_LENGTHS else 8
 INITIAL_DECODED_WORDS = 12 if _PREDECODE_THD_SWA_SEGMENTS else 8 if _PREDECODE_THD_LENGTHS else 4
 
@@ -458,11 +447,7 @@ def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair):
         )
     )
     swa_left_end = cute.math.min(cute.math.max(lower_end_raw, bounds.left), bounds.right)
-    pad_start = (
-        eff_seqlen_kv // cutlass.Int32(CFG.TILE_N)
-        if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED)
-        else bounds.right
-    )
+    pad_start = eff_seqlen_kv // cutlass.Int32(CFG.TILE_N) if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED) else bounds.right
     swa_left_pad_start = cute.math.min(cute.math.max(pad_start, bounds.left), swa_left_end)
     causal_start = (cga_mask_row_coord + cutlass.Int32(CFG.WINDOW_RIGHT)) // cutlass.Int32(CFG.TILE_N)
     right_start_raw = cute.math.min(causal_start, pad_start)
@@ -477,9 +462,11 @@ def _swa_segment_bounds(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair):
 def _load_swa_segment_bounds(initial: cutlass.Constexpr[bool], sched, decoded_base):
     segment_base = cutlass.Int32(6) if cutlass.const_expr(initial) else decoded_base + cutlass.Int32(7)
     return tuple(
-        cute.arch.make_warp_uniform(sched.initial_decoded_smem.subview(segment_base + cutlass.Int32(i)).load())
-        if cutlass.const_expr(initial)
-        else cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base + cutlass.Int32(i)).load())
+        (
+            cute.arch.make_warp_uniform(sched.initial_decoded_smem.subview(segment_base + cutlass.Int32(i)).load())
+            if cutlass.const_expr(initial)
+            else cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base + cutlass.Int32(i)).load())
+        )
         for i in range(5)
     )
 
@@ -1108,9 +1095,7 @@ def _tmaldg_warp_group(
     elif cutlass.const_expr(CFG.MASK_FLAGS == 0):
         kv_left, kv_right = _nomask_range_split(seqlen_kv, split_idx)
     else:
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-            True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-        )
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
         bounds_init = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
@@ -1263,13 +1248,9 @@ def _tmaldg_warp_group(
             if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
                 segment_base = decoded_base + cutlass.Int32(7)
                 kv_left = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base).load())
-                kv_right = cute.arch.make_warp_uniform(
-                    sched.tile_id_smem.subview(segment_base + cutlass.Int32(4)).load()
-                )
+                kv_right = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(segment_base + cutlass.Int32(4)).load())
             else:
-                eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-                    False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-                )
+                eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
                 bounds_next = _bounds_for_tile_split(
                     q_super_idx,
                     eff_seqlen_q,
@@ -2090,9 +2071,7 @@ def _softmax_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
-    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-        True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-    )
+    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
     if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
         decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
             True, sched, cutlass.Int32(0)
@@ -2380,9 +2359,7 @@ def _softmax_warp_group(
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(decoded_base + cutlass.Int32(4)).load())
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-            False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-        )
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
         if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
             decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
                 False, sched, decoded_base
@@ -2451,9 +2428,7 @@ def _correction_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
-    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-        True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-    )
+    eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(True, sched, cutlass.Int32(0), batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
     bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
 
     while is_valid_tile > cutlass.Int32(0):
@@ -2757,9 +2732,7 @@ def _correction_warp_group(
         if cutlass.const_expr(SPLIT_KV > 1):
             split_idx = sched.tile_id_smem.subview(decoded_base + cutlass.Int32(4)).load()
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
-        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(
-            False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch
-        )
+        eff_seqlen_q, eff_seqlen_kv = _load_effective_lengths(False, sched, decoded_base, batch_idx, seq_kv_lens_tensor, seqlen_q, seqlen_kv, n_batch)
         bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
 
     # tmem_dealloc fan-out: fire one arrive per lane; cga2 also DSMEM-arrives
