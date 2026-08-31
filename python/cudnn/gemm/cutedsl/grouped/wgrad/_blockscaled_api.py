@@ -537,7 +537,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
+        self._workspace_arg = from_dlpack(
+            self._workspace,
+            assumed_align=128,
+            enable_tvm_ffi=True,
+        )
         single_expert_placeholder = torch.empty_strided(
             self.single_expert_wgrad_desc.shape,
             self.single_expert_wgrad_desc.stride,
@@ -557,6 +561,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor: torch.Tensor,
             wgrad_ptrs: torch.Tensor,
             offsets_tensor: torch.Tensor,
+            workspace,
             stream: cuda.CUstream,
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
@@ -568,7 +573,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 sfb_tensor,
                 wgrad_ptrs.data_ptr(),
                 offsets_tensor,
-                cached_workspace,
+                workspace,
                 stream,
                 global_scale_a,
                 global_scale_b,
@@ -648,6 +653,31 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 ptrs = [wgrad_tensor.data_ptr() + i * expert_stride_bytes for i in range(wgrad_tensor.shape[0])]
                 wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
         _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
+        if descriptor_workspace is None:
+            workspace_arg = self._workspace_arg
+        else:
+            self._value_error_if(
+                descriptor_workspace.dtype != torch.uint8,
+                f"descriptor_workspace must have dtype uint8, got {descriptor_workspace.dtype}",
+            )
+            self._value_error_if(
+                descriptor_workspace.device != a_tensor.device,
+                "descriptor_workspace and WGrad operands must be on the same device",
+            )
+            self._value_error_if(
+                not descriptor_workspace.is_contiguous(),
+                "descriptor_workspace must be contiguous",
+            )
+            self._value_error_if(
+                descriptor_workspace.numel() < self._workspace_bytes,
+                f"descriptor_workspace requires at least {self._workspace_bytes} bytes, "
+                f"got {descriptor_workspace.numel()}",
+            )
+            workspace_arg = from_dlpack(
+                descriptor_workspace,
+                assumed_align=128,
+                enable_tvm_ffi=True,
+            )
         self._compiled_kernel(
             a_tensor,
             b_tensor,
@@ -655,6 +685,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             sfb_tensor,
             wgrad_ptrs,
             offsets_tensor,
+            workspace_arg,
             current_stream,
             global_scale_a,
             global_scale_b,

@@ -336,10 +336,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
     if descriptor_workspace is not None and (
         backend is not GroupedGemmBackend.BLOCK_SCALED
         or framework != "torch"
-        or output_mode != "dense"
     ):
         raise ValueError(
-            "descriptor_workspace is supported only for dense torch block-scaled WGrad"
+            "descriptor_workspace is supported only for torch block-scaled WGrad"
         )
     explicit_dense_output_identity = None
     if (
