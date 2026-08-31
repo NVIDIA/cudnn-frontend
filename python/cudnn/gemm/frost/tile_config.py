@@ -678,21 +678,20 @@ def _geom_sm120(
     )
 
 
-# CC 12.x per-CTA opt-in SMEM cap. The sm120 catalog filter is STATIC (the
-# catalog builds with no GPU visible), so the family-wide cap is spelled here;
-# the render-time budget still comes from the device.
+
 _SM120_SMEM_CAP_BYTES = 99 * 1024
 _SM120_SMEM_FIXED_RESERVE = 2048  # kernel_registry's default smem_fixed_reserve
 _SM120_STG_STAGE_ELEMS = 528  # f32 staging elems per compute warp (template _STG_EPI_WARP_ELEMS)
 
-
 def _sm120_smem_feasible(cta_m: int, cta_n: int, kb: int, num_compute_warps: int) -> bool:
-    """Mirror of the sm120 template's stage arithmetic: after the transposed-STG
-    staging is funded from the AB pipeline, at least one stage must survive."""
     per_stage = (cta_m + cta_n) * kb + 16
     staging = 4 * _SM120_STG_STAGE_ELEMS * num_compute_warps
     stages = min((_SM120_SMEM_CAP_BYTES - _SM120_SMEM_FIXED_RESERVE) // per_stage, 16)
     return stages - -(-staging // per_stage) >= 1
+
+
+def _sm120_reg_feasible(cta_m: int, cta_n: int, num_compute_warps: int) -> bool:
+    return cta_m * cta_n // (num_compute_warps * 32) <= 128
 
 
 def _build_catalog() -> tuple[TileConfig, ...]:
@@ -731,6 +730,8 @@ def _build_catalog() -> tuple[TileConfig, ...]:
                     if cta_tile_m % (warps_size_m * 16) or cta_tile_n % (warps_size_n * 16):
                         continue
                     if not _sm120_smem_feasible(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m * warps_size_n):
+                        continue
+                    if not _sm120_reg_feasible(cta_tile_m, cta_tile_n, warps_size_m * warps_size_n):
                         continue
                     cfgs.append(_geom_sm120(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m, warps_size_n, 1, 1))
     return tuple(cfgs)
