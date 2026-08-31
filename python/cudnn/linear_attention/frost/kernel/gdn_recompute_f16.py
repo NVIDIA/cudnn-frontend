@@ -96,6 +96,8 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
+    launch_dependent_grids,
+    wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_step_k8, mma_ts_step, mma_step
@@ -109,6 +111,8 @@ from cudnn.frost.tile_dsl.tma import (
     tma_tensormap_acquire,
 )
 from .gdn_recompute_config import CFG
+
+USE_PDL = True
 
 
 class GdnBars(NamedTuple):
@@ -498,7 +502,7 @@ def gate_beta_warp(
                 oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
                 toks = [chunk_offset + lane_idx + col * cfg.threads_per_warp for col in range(n_cols)]
                 pos_valid = [tok < batch_end for tok in toks]
-                gate_vals = [gGateSeq[min(tok, batch_end - 1)] if valid else oob_neutral for tok, valid in zip(toks, pos_valid)]
+                gate_vals = [gGateSeq[min(tok, batch_end - 1)].to(cutlass.Float32) if valid else oob_neutral for tok, valid in zip(toks, pos_valid)]
 
                 if cutlass.const_expr(cfg.safe_gate):
                     for col in cutlass.range_constexpr(0, n_cols, 2):
@@ -544,13 +548,14 @@ def gate_beta_warp(
                 beta_idx = beta_index.idx
                 bars.mb_beta_done[beta_idx].wait(beta_index.phase)
                 beta_index = advance(beta_index, cfg.smem_beta_stages)
-                if cutlass.const_expr(cfg.beta_sigmoid):
+                if cutlass.const_expr(cfg.beta_sigmoid or mBeta.element_type != cutlass.Float32):
                     for col in cutlass.range_constexpr(n_cols):
                         pos = lane_idx + col * cfg.threads_per_warp
                         beta_value = cutlass.Float32(0.0)
                         if pos_valid[col]:
                             beta_value = gBeta[pos].to(cutlass.Float32)
-                            beta_value = sigmoid(beta_value).to(mBeta.element_type).to(cutlass.Float32)
+                            if cutlass.const_expr(cfg.beta_sigmoid):
+                                beta_value = sigmoid(beta_value).to(mBeta.element_type).to(cutlass.Float32)
                         sBeta[pos, 0, beta_idx] = beta_value
                     bars.mb_beta_ready[beta_idx].arrive()
                 else:
@@ -971,6 +976,8 @@ def tmaldg_warp(
     for _ in range(cfg.smem_v_stages):
         bars.mb_v_done[v_index.idx].wait(v_index.phase)
         v_index = advance(v_index, cfg.smem_v_stages)
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.jit
@@ -1639,6 +1646,9 @@ def frost_gdn_recompute_prologue(
     consumers' scheduler rings via :func:`order_body`; it then builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
     per array (the extra warps only take part in the order phase)."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
+        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -1763,7 +1773,7 @@ def prologue(
         cutlass.Int32(v_row_stride),
         cutlass.Int32(state_checkpoints_out.stride[0] if state_checkpoints_out is not None else 0),
         checkpoint_every_n,
-    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
+    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit
@@ -1915,6 +1925,7 @@ def host(
         block=(cfg.threads_per_cta, 1, 1),
         cluster=cfg.cluster_shape_mnk,
         stream=stream,
+        use_pdl=USE_PDL,
         min_blocks_per_mp=1,
     )
 
@@ -1942,6 +1953,8 @@ def frost_gdn_recompute(
 ):
     """Main GDN chunked kernel: warp-specialized dispatch over (batch, head)
     tiles."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     bidx = cute.arch.block_idx()[0]
@@ -2345,6 +2358,8 @@ def get_compiled_cache(
     io_dtype_str: str,
     state_dtype_str: str,
     cu_dtype_str: str,
+    gate_dtype_str: str,
+    beta_dtype_str: str,
     HK: int,
     HV: int,
     HO: int,
@@ -2543,6 +2558,8 @@ def chunk_gdn_recompute_sm100(
         str(k.dtype),
         str(state_dtype_src),
         str(cu_seqlens.dtype),
+        str(gate.dtype),
+        str(beta.dtype),
         HK,
         HV,
         HO,
