@@ -288,6 +288,10 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::O, attributes.outputs);
 
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
+
         if (attributes.generate_stats.value_or(false) == true) {
             CUDNN_FE_VALIDATE_OUTPUT_TENSOR(output_names::Stats);
         }
@@ -1240,6 +1244,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
+
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
 
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
