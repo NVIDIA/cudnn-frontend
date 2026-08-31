@@ -1022,9 +1022,16 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
     right_bound = int(wr) if (is_causal and wr is not None and wr > 0) else 0
     from cudnn.sdpa.bwd.config_sm80 import bwd_params_for_flavor
 
+    # NOTE: llama-swept tiles always (matching the dense adapter — the gptoss
+    # wide-Q-tile row stays unwired pending a perf gate); the flavor picks
+    # only the ENVELOPE dims, which must reach the compiled kernel (a flavor
+    # name alone would leave the template at its 128/128 defaults while the
+    # buffers pad to the envelope — OOB at d=64, wrong grads at 192/256).
     params = bwd_params_for_flavor(
-        flavor,
+        "llama",
         io_bf16=(q.dtype == torch.bfloat16),
+        d_qk=fdqk,
+        d_v=fdv,
         is_causal=bool(is_causal),
         has_swa=has_swa,
         causal_bottom_right=bool(causal_bottom_right) and (bool(is_causal) or has_swa),

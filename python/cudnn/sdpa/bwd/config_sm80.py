@@ -148,7 +148,10 @@ def bwd_params_for_flavor(flavor: str, **overrides) -> TemplateParams:
     qo_stages / drop-sDQ from d_qk).
     """
     cfg = {"llama": LLAMA_CFG, "gptoss": GPTOSS_CFG}.get(flavor, LLAMA_CFG)
-    base = dict(tile_kv=cfg.TILE_KV, tile_q=cfg.TILE_Q, warps_per_sg=cfg.WARPS_PER_SG)
+    # Seed the envelope dims too, so a flavor name alone cannot yield tiles
+    # from one flavor and head dims from another (callers with a different
+    # envelope — dsv3/qwen on the llama pipeline — override d_qk/d_v).
+    base = dict(d_qk=cfg.D_QK, d_v=cfg.D_V, tile_kv=cfg.TILE_KV, tile_q=cfg.TILE_Q, warps_per_sg=cfg.WARPS_PER_SG)
     base.update(overrides)
     p = TemplateParams(**base)
     validate_bwd_params(p)

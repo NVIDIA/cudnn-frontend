@@ -247,6 +247,49 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     torch.testing.assert_close(dv_d.float(), dv_g.float(), rtol=2e-2, atol=2e-2)
 
 
+def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True):
+    """Run the THD fwd+bwd wrappers on packed random inputs; when
+    ``check_grads``, compare each sequence's dQ/dK/dV slice against the dense
+    fp32 autograd reference (the existing ``_ref_grads`` pattern)."""
+    import itertools
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_sm80
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+
+    t = int(sum(lens))
+    cu = torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device="cuda")
+    q = torch.randn(1, t, h, d_qk, dtype=torch.float16, device="cuda")
+    k = torch.randn(1, t, h, d_qk, dtype=torch.float16, device="cuda")
+    v = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
+    do = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
+    fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens)))
+    out = sdpa_bwd_wrapper_sm80(q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu)
+    if check_grads:
+        for i, s_len in enumerate(lens):
+            lo, hi = int(cu[i]), int(cu[i + 1])
+            # packed [T, H, D] slice -> BHSD [1, H, S, D]
+            _bhsd = lambda x: x[0, lo:hi].permute(1, 0, 2).unsqueeze(0)
+            _, dq_ref, dk_ref, dv_ref = _ref_grads(_bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=-1, scale=1.0 / math.sqrt(d_qk))
+            torch.testing.assert_close(_bhsd(out["dq_tensor"]).to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+            torch.testing.assert_close(_bhsd(out["dk_tensor"]).to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
+            torch.testing.assert_close(_bhsd(out["dv_tensor"]).to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+    return out
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (192, 128)], ids=["gptoss_env", "dsv3_env"])
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_flavor_envelope_dims(d_qk, d_v):
+    """Regression: THD must compile the kernel at the FLAVOR ENVELOPE dims,
+    not the template's 128/128 defaults — a flavor-name-only params build
+    wrote dQ/dK/dV out of bounds at d=64 and returned wrong gradients at
+    192/128 (CodeRabbit critical on the TemplateParams port)."""
+    try:
+        _thd_run_and_check([96, 160], h=4, d_qk=d_qk, d_v=d_v)
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_sm80_bwd_thd_compile_key_plan_time_only():
@@ -297,8 +340,9 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
     varlen([128, 64, 320])  # different totals AND batch count
     # Different logical batch counts legitimately re-specialize (the cu fake
     # length is plan-time); different TOKEN TOTALS at the same batch count
-    # must not.
-    varlen([64, 192])  # same n_seqs as call 1, different totals
+    # must not — and the re-bound artifact must still be CORRECT, so this
+    # call's gradients are validated against the dense per-sequence reference.
+    _thd_run_and_check([64, 256], h=H, d_qk=D, d_v=D)  # same n_seqs as call 1, different totals
     assert len(template_loader._MODULES) == n_modules_before, "a new template specialization was minted by runtime data"
     misses_1, hits_1 = cache_totals()
     # Call 2 (n_seqs=3) may legitimately re-specialize once; call 3 shares
