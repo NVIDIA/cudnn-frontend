@@ -1299,7 +1299,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.flavor == (192, 128)
             and self.split_kv == 1
             and not self.thd
-            and (self.window_left is not None or (dtype_qkv_code == DTYPE_E5M2 and self.window_right is None))
+            and (
+                self.window_left is not None
+                or (dtype_qkv_code == DTYPE_E5M2 and self.window_right is None)
+                or (
+                    dtype_qkv_code == DTYPE_E4M3
+                    and self.dtype_o in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    and self.window_left is None
+                    and self.window_right == 0
+                    and not template_bottom_right
+                )
+            )
         )
         d192_mx_cga1 = False
         # D192 MX cga1 trades two-CTA cooperation for twice as many independent

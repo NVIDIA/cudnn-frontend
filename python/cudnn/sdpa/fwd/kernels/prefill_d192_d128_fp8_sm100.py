@@ -172,7 +172,7 @@ def _exp2_chunk0_mask_aware(vec, apply_mask):
 
 
 def _exp2_mixed_late(vec):
-    tail_start = 40 if _FAST_E4_DENSE_MHA else 56
+    tail_start = 36 if _FAST_E4_DENSE_MHA else 56
     values = []
     for i in range(0, int(vec.shape[0]), 2):
         if i >= tail_start:
