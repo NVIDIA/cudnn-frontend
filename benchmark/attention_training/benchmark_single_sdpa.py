@@ -31,6 +31,11 @@ from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
+if __package__:
+    from .flops import count_causal_nonmasked_elems
+else:
+    from flops import count_causal_nonmasked_elems
+
 # torch.profiler measures through CUPTI. If CUPTI cannot attach -- for any
 # reason: a device it does not recognise, a driver mismatch, missing profiling
 # permissions, or simply not being present -- it records no events at all, and
@@ -1477,21 +1482,7 @@ else:
         if attn_mask == "no_mask":
             num_nonmasked_elems = q_seqlen * kv_seqlen
         elif attn_mask in ("top_left", "bottom_right"):
-            if sliding_window_size is not None:
-                # With sliding window: each query attends to at most W keys
-                # (left_bound is exclusive, right_bound is inclusive)
-                # For positions 0 to W-1: 1, 2, ..., W keys (partial window)
-                # For positions W to S-1: W keys each (full window)
-                W = sliding_window_size
-                S = min(q_seqlen, kv_seqlen)
-                if S <= W:
-                    # Sequence shorter than window, use full causal
-                    num_nonmasked_elems = S * (S + 1) // 2
-                else:
-                    # Partial window (first W positions) + full window (remaining positions)
-                    num_nonmasked_elems = W * (W + 1) // 2 + (S - W) * W
-            else:
-                num_nonmasked_elems = torch.tril(torch.ones((q_seqlen, kv_seqlen), dtype=torch.bool)).sum()
+            num_nonmasked_elems = count_causal_nonmasked_elems(q_seqlen, kv_seqlen, attn_mask, sliding_window_size)
         else:
             raise ValueError(f"Unknown attn_mask: {attn_mask}")
         # BMM FLOPs: 2 * M * N * K.
