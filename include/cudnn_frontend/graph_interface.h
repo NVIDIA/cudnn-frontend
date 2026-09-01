@@ -1683,14 +1683,14 @@ class Graph : public ICudnn, public INode {
             serialize(j);
         }
 
-        // OSS-sentinel candidates (-2, -3) are NVRTC kernels that bypass the cuDNN backend; they
-        // have no cudnnBackendExecutionPlan and nothing to write — reject with a specific message.
-        if (plans.candidate == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
-            plans.candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+        auto const candidate = plans.candidate;
+
+        // OSS-sentinel candidates bypass the cuDNN backend and have no cudnnBackendExecutionPlan to write
+        if (candidate == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
+            candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             return {error_code_t::GRAPH_NOT_SUPPORTED, "OSS engine graphs are not serializable"};
         }
 
-        auto const candidate = plans.candidate;
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             candidate < 0 || candidate >= static_cast<int64_t>(plans.execution_plans.size()) ||
                 plans.execution_plans[candidate] == nullptr,
@@ -1698,7 +1698,7 @@ class Graph : public ICudnn, public INode {
             "Graph::serialize: no built execution plan (candidate = " + std::to_string(candidate) + ")");
 
         auto serialized_plan    = plans.execution_plans[candidate]->getJsonRepresentation();
-        j["cudnn_backend_data"] = serialized_plan;
+        j["cudnn_backend_data"] = std::move(serialized_plan);
         j["variant_pack_uids"]  = variant_pack_uids;
 
         std::vector<BehaviorNote_t> selected_behavior_notes;

@@ -170,7 +170,6 @@ class KernelCache : public detail::backend_descriptor {
    private:
     bool finalized = false;
     // Protects finalized, and the desc/status members inherited from backend_descriptor.
-    // Precedent: cudnn_frontend_ExecutionPlanCache.h uses the same plain mutable mutex pattern.
     // KernelCache is always heap-allocated via shared_ptr and never moved after construction.
     mutable std::mutex mutex_;
 

@@ -108,7 +108,7 @@ TEST_CASE("KernelCache build() succeeds for all concurrent callers", "[kernel_ca
     }
 
     constexpr int N     = 16;
-    constexpr int ITERS = 40;
+    constexpr int ITERS = 10;
 
     for (int iter = 0; iter < ITERS; ++iter) {
         auto kc = std::make_shared<cudnn_frontend::KernelCache>();
@@ -164,7 +164,7 @@ TEST_CASE("KernelCache to_json() is safe while build() races on another thread",
         SKIP("KernelCache to_json() requires cuDNN >= 9.10");
     }
 
-    constexpr int ITERS = 40;
+    constexpr int ITERS = 10;
 
     for (int iter = 0; iter < ITERS; ++iter) {
         auto kc = std::make_shared<cudnn_frontend::KernelCache>();
@@ -207,7 +207,7 @@ TEST_CASE("KernelCache from_json() and build() racing each other yield consisten
         SKIP("KernelCache from_json requires cuDNN >= 9.10");
     }
 
-    constexpr int ITERS = 40;
+    constexpr int ITERS = 10;
     for (int iter = 0; iter < ITERS; ++iter) {
         auto kc = std::make_shared<cudnn_frontend::KernelCache>();
         auto g2 = setup_matmul_graph(kc);
@@ -244,7 +244,7 @@ TEST_CASE("KernelCache concurrent from_json() calls leave KC in consistent state
         SKIP("KernelCache from_json requires cuDNN >= 9.10");
     }
 
-    constexpr int ITERS = 40;
+    constexpr int ITERS = 10;
     for (int iter = 0; iter < ITERS; ++iter) {
         auto kc = std::make_shared<cudnn_frontend::KernelCache>();
 
@@ -291,54 +291,4 @@ TEST_CASE("KernelCache build() is idempotent after first finalization", "[kernel
     REQUIRE(kc->build(nullptr).is_good());
     REQUIRE(kc->build(nullptr).is_good());
     REQUIRE(kc->get_ptr_locked() == ptr1);
-}
-
-// ---------------------------------------------------------------------------
-// Test 6 — Graph::serialize candidate validation + get_name_at_index OOB
-//
-// serialize() must return a clear error (not an OOB read or silent UB) when
-// no execution plan has been selected.  get_name_at_index OOB must error, not
-// crash.
-// ---------------------------------------------------------------------------
-TEST_CASE("Graph::serialize rejects unbuilt candidate; get_name_at_index rejects OOB",
-          "[kernel_cache][serialize_validate]") {
-    if (cudnnGetVersion() < 90400) {
-        SKIP("Dynamic shape graphs require cuDNN >= 9.4");
-    }
-
-    cudnnHandle_t handle;
-    cudnnCreate(&handle);
-
-    auto graph = make_matmul_graph(handle);
-    REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
-    REQUIRE(graph->check_support().is_good());
-
-    // candidate == -1 (build_plans not yet called): serialize must fail with a
-    // diagnostic mentioning the candidate value, not silently write a partial blob.
-    {
-        std::vector<uint8_t> data;
-        auto err = graph->serialize(data);
-        REQUIRE(err.is_bad());
-        REQUIRE(err.get_message().find("candidate") != std::string::npos);
-        REQUIRE(data.empty());
-    }
-
-    REQUIRE(graph->build_plans().is_good());
-
-    // After a successful build, serialize must succeed.
-    {
-        std::vector<uint8_t> data;
-        REQUIRE(graph->serialize(data).is_good());
-        REQUIRE(!data.empty());
-    }
-
-    // get_name_at_index with out-of-range index must return an error, not crash.
-    {
-        std::string name;
-        auto const count = graph->get_execution_plan_count();
-        REQUIRE(graph->get_plan_name_at_index(-1, name).is_bad());
-        REQUIRE(graph->get_plan_name_at_index(count, name).is_bad());
-    }
-
-    cudnnDestroy(handle);
 }

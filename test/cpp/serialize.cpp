@@ -1162,3 +1162,63 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
     }
 #endif  // CUDNN_VERSION >= 90800
 }
+
+// serialize() must return a clear error (not an OOB read or silent UB) when
+// no execution plan has been selected.  get_name_at_index OOB must error, not
+// crash.
+TEST_CASE("Graph::serialize rejects unbuilt candidate; get_name_at_index rejects OOB",
+          "[serialize][serialize_validate]") {
+    if (cudnnGetVersion() < 90400) {
+        SKIP("Dynamic shape graphs require cuDNN >= 9.4");
+    }
+
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_dynamic_shape_enabled(true);
+    auto A = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("A").set_dim({4, 16, 64}).set_stride({16 * 64, 64, 1}));
+    auto B = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("B").set_dim({4, 64, 32}).set_stride({64 * 32, 32, 1}));
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true);
+    REQUIRE(graph.validate().is_good());
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support().is_good());
+
+    // candidate == -1 (build_plans not yet called): serialize must fail with a
+    // diagnostic mentioning the candidate value, not silently write a partial blob.
+    {
+        std::vector<uint8_t> data;
+        auto err = graph.serialize(data);
+        REQUIRE(err.is_bad());
+        REQUIRE(err.get_message().find("candidate") != std::string::npos);
+        REQUIRE(data.empty());
+    }
+
+    REQUIRE(graph.build_plans().is_good());
+
+    // After a successful build, serialize must succeed.
+    {
+        std::vector<uint8_t> data;
+        REQUIRE(graph.serialize(data).is_good());
+        REQUIRE(!data.empty());
+    }
+
+    // get_name_at_index with out-of-range index must return an error, not crash.
+    {
+        std::string name;
+        auto const count = graph.get_execution_plan_count();
+        REQUIRE(graph.get_plan_name_at_index(-1, name).is_bad());
+        REQUIRE(graph.get_plan_name_at_index(count, name).is_bad());
+    }
+
+    cudnnDestroy(handle);
+}
