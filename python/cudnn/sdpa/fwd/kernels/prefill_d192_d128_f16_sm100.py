@@ -94,7 +94,8 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
-from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.frost.tile_dsl.mma import mma_ss as _mma_ss_generic
+from cudnn.frost.tile_dsl.mma import mma_ts_step as _mma_ts_step_generic
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -110,6 +111,88 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
+
+
+@cute.jit
+def _mma_ss(
+    desc,
+    desc_a_base,
+    desc_b_base,
+    tmem_c,
+    tmem_sf_a=None,
+    tmem_sf_b=None,
+    accumulate: bool = False,
+    k_start: int = 0,
+    k_count=None,
+    elect_once: bool = False,
+):
+    """Issue D192 half BMM1 from one elected lane on THD paths."""
+    if cutlass.const_expr(not elect_once):
+        _mma_ss_generic(
+            desc,
+            desc_a_base,
+            desc_b_base,
+            tmem_c,
+            tmem_sf_a=tmem_sf_a,
+            tmem_sf_b=tmem_sf_b,
+            accumulate=accumulate,
+            k_start=k_start,
+            k_count=k_count,
+        )
+    else:
+        if cutlass.const_expr(desc.cta_group == 1):
+            cta_group_kind = nvvm.CTAGroup.CTA_1
+        else:
+            cta_group_kind = nvvm.CTAGroup.CTA_2
+        k_count = desc.num_k_steps if cutlass.const_expr(k_count is None) else k_count
+        enable_input_d = accumulate
+        issue_mma = nvvm.elect_sync()
+        for kk in cutlass.range_constexpr(k_count):
+            k = k_start + kk
+            ki_a = k % desc.sps_A
+            s_a = k // desc.sps_A
+            ki_b = k % desc.sps_B
+            s_b = k // desc.sps_B
+            da = desc_a_base + ((desc.smem_advance_A_intra * ki_a + desc.smem_subtile_A * s_a) >> 4)
+            db = desc_b_base + ((desc.smem_advance_B_intra * ki_b + desc.smem_subtile_B * s_b) >> 4)
+            if issue_mma:
+                nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, da, db, desc.idesc, enable_input_d)
+            enable_input_d = True
+
+
+@cute.jit
+def _mma_ts_step(
+    desc,
+    tmem_a_base,
+    desc_b_base,
+    tmem_c,
+    k_idx: int,
+    accumulate,
+    tmem_sf_a=None,
+    tmem_sf_b=None,
+    issue_mma=None,
+):
+    """Reuse a D192 half BMM2 issuing lane when the caller provides one."""
+    if cutlass.const_expr(issue_mma is None):
+        _mma_ts_step_generic(
+            desc,
+            tmem_a_base,
+            desc_b_base,
+            tmem_c,
+            k_idx,
+            accumulate,
+            tmem_sf_a=tmem_sf_a,
+            tmem_sf_b=tmem_sf_b,
+        )
+    else:
+        if cutlass.const_expr(desc.cta_group == 1):
+            cta_group_kind = nvvm.CTAGroup.CTA_1
+        else:
+            cta_group_kind = nvvm.CTAGroup.CTA_2
+        dp = tmem_a_base.subview(k_idx * desc.tmem_advance_A)
+        db = desc_b_base + ((desc.smem_advance_B_intra * k_idx) >> 4)
+        if issue_mma:
+            nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, dp, db, desc.idesc, accumulate)
 
 
 def _exp2_mixed_late(vec):
@@ -1585,12 +1668,12 @@ def _mma_warp_group(
             _wait_mbarrier(bars.mb_q_full[0], q_full_phase)
             _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
             desc_K = sK[kv_state.idx].desc()
-            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
+            _mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
             _wait_mbarrier(bars.mb_q_full[1], q_full_phase)
-            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
+            _mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1611,7 +1694,7 @@ def _mma_warp_group(
                 _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(
+                    _mma_ts_step(
                         bmm2_desc,
                         (tmem_raw.subview(LAYOUT.P0_OFF)),
                         desc_V,
@@ -1624,7 +1707,7 @@ def _mma_warp_group(
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                     _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
                     for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                        mma_ts_step(
+                        _mma_ts_step(
                             bmm2_desc,
                             (tmem_raw.subview(LAYOUT.P0_OFF)),
                             desc_V,
@@ -1639,7 +1722,7 @@ def _mma_warp_group(
                 # BMM1 sub 0 for next kv
                 _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
                 desc_K = sK[kv_state.idx].desc()
-                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
+                _mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -1648,7 +1731,7 @@ def _mma_warp_group(
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(
+                    _mma_ts_step(
                         bmm2_desc,
                         (tmem_raw.subview(LAYOUT.P1_OFF)),
                         desc_V,
@@ -1661,7 +1744,7 @@ def _mma_warp_group(
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                     _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
                     for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                        mma_ts_step(
+                        _mma_ts_step(
                             bmm2_desc,
                             (tmem_raw.subview(LAYOUT.P1_OFF)),
                             desc_V,
@@ -1675,7 +1758,7 @@ def _mma_warp_group(
                 bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                 # BMM1 sub 1 for next kv
-                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
+                _mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), elect_once=CFG.THD_VARLEN)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1698,7 +1781,7 @@ def _mma_warp_group(
             _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(
+                _mma_ts_step(
                     bmm2_desc,
                     (tmem_raw.subview(LAYOUT.P0_OFF)),
                     desc_V,
@@ -1711,7 +1794,7 @@ def _mma_warp_group(
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                 _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(
+                    _mma_ts_step(
                         bmm2_desc,
                         (tmem_raw.subview(LAYOUT.P0_OFF)),
                         desc_V,
@@ -1727,7 +1810,7 @@ def _mma_warp_group(
             _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                mma_ts_step(
+                _mma_ts_step(
                     bmm2_desc,
                     (tmem_raw.subview(LAYOUT.P1_OFF)),
                     desc_V,
@@ -1740,7 +1823,7 @@ def _mma_warp_group(
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1], bmm2_ready_phase)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
-                    mma_ts_step(
+                    _mma_ts_step(
                         bmm2_desc,
                         (tmem_raw.subview(LAYOUT.P1_OFF)),
                         desc_V,

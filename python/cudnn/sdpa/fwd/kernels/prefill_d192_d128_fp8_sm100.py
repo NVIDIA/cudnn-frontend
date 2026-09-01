@@ -107,7 +107,6 @@ from cudnn.frost.tile_dsl.mask import (
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
-_REUSE_BMM2_ELECT = not CFG.THD_VARLEN or CFG.DTYPE_QKV == 1
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
 MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
@@ -1591,7 +1590,6 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O0_OFF)),
                         local_k,
                         accum_b2,
-                        issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                     )
                     accum_b2 = cutlass.Boolean(True)
                 # Chunk 1 folds out at N_BMM2_CHUNKS=1 (full NUM_KPHASES_PV in chunk 0).
@@ -1605,7 +1603,6 @@ def _mma_warp_group(
                             (tmem_raw.subview(LAYOUT.O0_OFF)),
                             NUM_KPHASES_PV_PER_CHUNK + local_k,
                             cutlass.Boolean(True),
-                            issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                         )
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -1626,7 +1623,6 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O1_OFF)),
                         local_k,
                         accum_b2,
-                        issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                     )
                     accum_b2 = cutlass.Boolean(True)
                 if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
@@ -1639,7 +1635,6 @@ def _mma_warp_group(
                             (tmem_raw.subview(LAYOUT.O1_OFF)),
                             NUM_KPHASES_PV_PER_CHUNK + local_k,
                             cutlass.Boolean(True),
-                            issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                         )
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1666,7 +1661,6 @@ def _mma_warp_group(
                     (tmem_raw.subview(LAYOUT.O0_OFF)),
                     local_k,
                     accum_b2,
-                    issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                 )
                 accum_b2 = cutlass.Boolean(True)
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
@@ -1679,7 +1673,6 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O0_OFF)),
                         NUM_KPHASES_PV_PER_CHUNK + local_k,
                         cutlass.Boolean(True),
-                        issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                     )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1694,7 +1687,6 @@ def _mma_warp_group(
                     (tmem_raw.subview(LAYOUT.O1_OFF)),
                     local_k,
                     accum_b2,
-                    issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                 )
                 accum_b2 = cutlass.Boolean(True)
             if cutlass.const_expr(CFG.N_BMM2_CHUNKS == 2):
@@ -1707,7 +1699,6 @@ def _mma_warp_group(
                         (tmem_raw.subview(LAYOUT.O1_OFF)),
                         NUM_KPHASES_PV_PER_CHUNK + local_k,
                         cutlass.Boolean(True),
-                        issue_mma=elect_p if cutlass.const_expr(_REUSE_BMM2_ELECT) else None,
                     )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
