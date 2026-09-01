@@ -94,7 +94,7 @@ The `kda` and `gdn2` variants fuse q/k L2 normalization in-kernel on every backe
 | `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 | `flash_kda` | FlashKDA (`kda` forward variant only) |
 
-The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-class devices, the cuTile engines elsewhere.
+The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2` is FROST-only.
 
 ## Results
 

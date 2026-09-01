@@ -41,8 +41,8 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: k heads ({facts.h_k}) must match q's ({facts.h_q}) or v's ({facts.h_v}; canonical GQA shares grouped k/v heads)")
     if facts.h_v != facts.h_q and max(facts.h_q, facts.h_v) % min(facts.h_q, facts.h_v) != 0:
         raise NotImplementedError(f"{engine}: q heads ({facts.h_q}) and v heads ({facts.h_v}) must be equal or one a multiple of the other")
-    if facts.g_dtype not in (cudnn.data_type.FLOAT, None):
-        raise NotImplementedError(f"{engine}: 'g' must be fp32, got {facts.g_dtype}")
+    if facts.g_dtype not in (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF, None):
+        raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
 

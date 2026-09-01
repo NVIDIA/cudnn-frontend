@@ -60,9 +60,9 @@ class GdnFrostEngine(BaseEngine):
         fp32 = cudnn.data_type.FLOAT
         io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
-        beta_want = facts.io_dtype if facts.use_beta_sigmoid else fp32
-        if beta_want is not None and facts.beta_dtype not in (beta_want, None):
-            raise NotImplementedError(f"GdnFrostEngine: 'beta' must be {beta_want} (io-dtype logits under use_beta_sigmoid), got {facts.beta_dtype}")
+        beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (fp32, facts.io_dtype)
+        if facts.beta_dtype not in beta_wants + (None,):
+            raise NotImplementedError(f"GdnFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
             if got not in (fp32, None):
                 raise NotImplementedError(f"GdnFrostEngine: '{port}' must be fp32, got {got}")
@@ -72,22 +72,23 @@ class GdnFrostEngine(BaseEngine):
         if not facts.state_pair_match:
             raise NotImplementedError("GdnFrostEngine: initial_state and final_state dtypes must match")
         if facts.is_bwd:
-            for port, got in (
-                ("d_a_log", facts.d_a_log_dtype),
-                ("d_dt_bias", facts.d_dt_bias_dtype),
-                ("d_final_state", facts.d_final_state_dtype),
-                ("d_initial_state", facts.d_initial_state_dtype),
-                ("dG", facts.dg_dtype),
-            ):
+            for port, got in (("d_a_log", facts.d_a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype)):
                 if got not in (fp32, None):
                     raise NotImplementedError(f"GdnFrostEngine: '{port}' must be fp32, got {got}")
+            state_grad_want = facts.state_dtype if facts.state_dtype is not None else fp32
+            for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
+                if got not in (state_grad_want, None):
+                    raise NotImplementedError(f"GdnFrostEngine: '{port}' must match the state dtype ({state_grad_want}), got {got}")
+            if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
+                raise NotImplementedError(f"GdnFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
+            if facts.dg_dtype not in (facts.g_dtype, None):
+                raise NotImplementedError(f"GdnFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
             if facts.do_dtype not in io + (None,):
                 raise NotImplementedError(f"GdnFrostEngine: 'dO' must be fp16/bf16, got {facts.do_dtype}")
             if facts.io_dtype is not None and facts.state_checkpoints_dtype not in (facts.io_dtype, None):
                 raise NotImplementedError("GdnFrostEngine: 'state_checkpoints' must match the io dtype")
-            dbeta_want = facts.io_dtype if facts.use_beta_sigmoid and facts.io_dtype is not None else fp32
-            if facts.dbeta_dtype not in (dbeta_want, None):
-                raise NotImplementedError(f"GdnFrostEngine: 'dBeta' must be {dbeta_want}, got {facts.dbeta_dtype}")
+            if facts.dbeta_dtype not in (facts.beta_dtype, None):
+                raise NotImplementedError(f"GdnFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
         elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
             raise NotImplementedError("GdnFrostEngine: 'state_checkpoints' must match the io dtype")
 
@@ -353,7 +354,6 @@ class CompiledGdnBwd:
         self.num_sm = multiprocessor_count(current_device())
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # cuts never in batch-invariant mode
         self.split = not self.batch_invariant
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(16)

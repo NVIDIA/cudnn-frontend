@@ -18,6 +18,7 @@ Can be used as CLI or imported as a module:
 """
 
 import argparse
+import sys
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import os
@@ -29,6 +30,44 @@ import time
 from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
+
+# torch.profiler measures through CUPTI. If CUPTI cannot attach -- for any
+# reason: a device it does not recognise, a driver mismatch, missing profiling
+# permissions, or simply not being present -- it records no events at all, and
+# refusing to measure would leave the harness unusable on that machine. Fall
+# back to CUDA-event timing of the same region instead.
+#
+# These are NOT the same measurement. CUPTI reports the summed DEVICE time of
+# the matched kernels; events report WALL time of the region (kernel + launch
+# overhead + any gap). They agree closely when one kernel dominates, but do not
+# mix the two in a single comparison table -- every fallback run is tagged
+# [cuda-events] on the result line.
+_EVENT_TIMING = False
+
+
+def _time_region_ms(fn):
+    """Wall-clock milliseconds for one call of fn(), via CUDA events."""
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+    fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end)
+
+
+def _run_forward_once():
+    """One forward execution, used by both the profiled and the event-timed path.
+
+    Assigns the module-level ``output`` so the non-cuDNN backends do not have to
+    be run a second time just to retrieve it for the backward pass.
+    """
+    global output
+    if is_cudnn_fe:
+        graph_fwd.execute(variant_pack_fwd, workspace)
+    else:
+        output = sdpa_function(query, key, value)
+
 
 # Exit code the benchmark subprocess uses to signal "this backend cannot serve
 # this configuration" (vs. a real failure). The `cudnn_oss` backend emits it for
@@ -1743,7 +1782,12 @@ else:
         l2_flush_buffer.zero_()
 
         # Run kernel with profiler for forward if requested, else run unprofiled to prep for backward
-        if run_fwd:
+        if run_fwd and _EVENT_TIMING:
+            # CUPTI already known unavailable -> ONE execution, timed with events.
+            fwd_time = _time_region_ms(_run_forward_once)
+            if i >= dry_run_iters:
+                forward_times.append(fwd_time)
+        elif run_fwd:
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("sdpa.forward"):  # Custom marker
                     if is_cudnn_fe:
@@ -1765,15 +1809,34 @@ else:
                 or "(anonymous namespace)::" in item.key
                 or item.key.startswith("fmha_")
             ]
+            # "No events at all" is the wrong test for a dead CUPTI: even a
+            # healthy profiler reports runtime-API entries (cudaMalloc,
+            # cudaLaunchKernel, ...) that carry device_time == 0 alongside the
+            # real kernel activity. Distinguish on DEVICE time, so that a run
+            # which recorded kernels but matched no name filter still raises
+            # below instead of being silently re-timed as a wider region.
+            device_events = [item for item in prof.key_averages() if item.device_time > 0]
             if len(matched_kernels) >= 1:
-                fwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                fwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
-            elif not prof.key_averages():
-                # A silently-empty profiler (typically CUPTI failing to init
-                # against this driver) would make every case read 0.000 ms and
-                # ship as valid data — fail loudly instead.
-                raise RuntimeError("torch.profiler recorded no CUDA events for the forward pass (CUPTI init failure?); refusing to emit unusable timings")
+            elif not device_events:
+                # No device time was recorded at all -> CUPTI could not attach.
+                # Switch the whole run to CUDA-event timing and say so loudly;
+                # a silently-empty profiler must never ship as a 0.000 ms row.
+                _EVENT_TIMING = True
+                print(
+                    "WARNING: CUPTI unavailable on this device - falling back to CUDA-event timing. "
+                    "These are WALL times for the region, not summed kernel device times; "
+                    "do not compare them against CUPTI-timed rows.",
+                    file=sys.stderr,
+                )
+                fwd_time = _time_region_ms(_run_forward_once)
+                if i >= dry_run_iters:
+                    forward_times.append(fwd_time)
             else:
                 raise RuntimeError(
                     "torch.profiler recorded CUDA events for the forward pass but none matched the known kernel-name filters; "
@@ -1823,7 +1886,10 @@ else:
                 or item.key.startswith("fmha_")
             ]
             if len(matched_kernels) >= 1:
-                bwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                bwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
             elif not prof.key_averages():
@@ -1932,11 +1998,12 @@ else:
             f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''}"
         )
     else:
+        _tt = " [cuda-events]" if _EVENT_TIMING else ""
         if run_fwd and run_bwd:
             print(
-                f"{args.sdpa_backend}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
+                f"{args.sdpa_backend}{_tt}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
             )
         elif run_fwd:
-            print(f"{args.sdpa_backend}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
+            print(f"{args.sdpa_backend}{_tt}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
         elif run_bwd:
-            print(f"{args.sdpa_backend}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")
+            print(f"{args.sdpa_backend}{_tt}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")
