@@ -1437,13 +1437,21 @@ def generate(
     if on_tma_arm and len(tma_slots) > 1:
         # The compiler stores each output at its ready marker.  Retire outputs
         # backed by an exclusive source first, while register-heavy quantizers
-        # stay last.  Python's stable sort preserves slot order among ties.
+        # stay last.  Among quantizers retire M-axis/column reduction state
+        # before the cheaper row path; on a shared 64-column drain this avoids
+        # carrying the heavier path across the row output's TMA store.
         source_uses: dict[int, int] = {}
         for output_spec in specs:
             source_uses[output_spec.source_ref] = source_uses.get(output_spec.source_ref, 0) + 1
         for reduction in chain.reductions:
             source_uses[reduction.source_ref] = source_uses.get(reduction.source_ref, 0) + 1
-        output_order.sort(key=lambda oi: (specs[oi].quant_idx is not None, source_uses[specs[oi].source_ref]))
+        output_order.sort(
+            key=lambda oi: (
+                specs[oi].quant_idx is not None,
+                0 if specs[oi].quant_idx is not None and chain.quants[specs[oi].quant_idx].axis == 1 else 1,
+                source_uses[specs[oi].source_ref],
+            )
+        )
     for si in output_order:
         spec = specs[si]
         src = _parent_value(spec.source_ref)
