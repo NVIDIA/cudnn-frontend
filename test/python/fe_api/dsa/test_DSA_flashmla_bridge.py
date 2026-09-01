@@ -338,7 +338,7 @@ def test_flashmla_score_recompute_deepseek_v4_h128_d512_launch_envelope(monkeypa
     )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.parametrize(
     "heads,head_dim,topk",
     [
@@ -376,7 +376,7 @@ def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk):
     torch.testing.assert_close(actual["lse"], lse_ref, atol=2e-4, rtol=2e-4)
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 def test_flashmla_cudnn_training_and_score_recompute_match_references():
     _require_b200_flashmla()
     torch.manual_seed(411)
