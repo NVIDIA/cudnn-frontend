@@ -218,6 +218,30 @@ python/cudnn/gemm/
 
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
+## CuTeDSL kernel bodies
+
+**Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
+The DSL AST-transforms only the decorated function's own source: `for` becomes
+an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
+not transformed, so the ops it emits can land outside the enclosing region.
+
+Hoisting an 11-line block that ran correctly inline into a
+`write_clamped_kv_descs(...)` helper — called from inside
+`if nvvm.elect_sync() and tidx < 32:` — turned 212 passing forward tests into
+31 failures (`Error building ...`, traceback through `ir_loop` →
+`scf_execute_dynamic`). Unrolling the helper's own loop did not help; the
+helper *call* was the problem. Duplicating the block across flavors is the
+correct trade here. Factor only host-side code, or code you can mark
+`@cute.jit`.
+
+Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
+rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
+(e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.
+
+**Detector.** These break at `compile()`, not at import — `python -c "import ..."`
+and `pytest --collect-only` both stay green. After any refactor of a kernel
+body, run that flavor's own tests.
+
 ## The APIBase contract (`api_base.py`)
 
 Every OSS kernel API extends `APIBase` and implements:
