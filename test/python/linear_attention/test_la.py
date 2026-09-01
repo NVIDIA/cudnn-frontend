@@ -671,6 +671,7 @@ def test_bwd_varlen(backend, variant, seq_lens):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=seq_lens))
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 def test_gdn_bwd_partial_final_chunk(backend):
     """The final GDN chunk has four live lanes and sixty invalid lanes."""
