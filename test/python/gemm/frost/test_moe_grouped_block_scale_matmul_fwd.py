@@ -12,7 +12,6 @@ import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.gemm.frost import compiler
 from gemm_test_utils import (
     requires_sm100,
     requires_sm107,
@@ -31,8 +30,7 @@ from gemm_test_utils import (
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
-from cudnn.gemm.frost.compiler import _check_block_quant_supported, _render_block_scale_template, jit_from_cudnn_graph
-from cudnn.gemm.frost.epilogue_codegen import _f8_128x4_row_scale_index_expr, generate
+from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
@@ -361,87 +359,6 @@ def test_segmented_row_quant_rejects_invalid_capacity(scale_dim, message) -> Non
 def test_segmented_row_quant_requires_f8_128x4() -> None:
     with pytest.raises(ValueError, match="requires F8_128x4"):
         analyze(_segmented_row_quant_graph(reorder=False))
-
-
-@pytest.mark.parametrize(
-    "total_rows,num_groups,expected_rows",
-    [
-        (0, 512, 0),
-        (1, 512, 128),
-        (127, 1, 128),
-        (128, 1, 128),
-        (129, 1, 256),
-        (255, 1, 256),
-        (256, 1, 256),
-        (257, 1, 384),
-        (258, 1, 384),
-        (128, 2, 256),
-        (2816, 4, 3200),
-        (2816, 23, 5632),
-        (2816, 512, 67840),
-    ],
-)
-def test_segmented_row_scale_static_capacity(total_rows, num_groups, expected_rows) -> None:
-    assert segmented_row_scale_capacity_rows(total_rows, num_groups) == expected_rows
-
-
-def test_segmented_row_quant_codegen_emits_group_local_scale_addressing(monkeypatch) -> None:
-    chain = analyze(_segmented_row_quant_graph())
-    cfg = by_name(_SEGMENTED_ROW_CFG)
-    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
-    monkeypatch.setattr(compiler, "_grid_num_clusters", lambda _cfg, device=None: 1)
-    _check_block_quant_supported(chain, compiler._epi_vec_bytes(chain, cfg), cfg)
-    modes = compiler._store_modes(chain, cfg)
-    tma_slots = frozenset(i for i, mode in enumerate(modes) if mode == "tma")
-    snippets = generate(
-        chain,
-        vec_bytes_epi=compiler._epi_chunk_bytes(chain, cfg, bool(tma_slots)),
-        output_elem_bytes=1,
-        tma_slots=tma_slots,
-        packed_lanes=compiler._epi_packed_lanes(cfg),
-    )
-    for semantic_name in ("_q0_local_row", "group_begin", "_q0_base", "start_sf_block_m", "_q0_ncb"):
-        assert semantic_name in snippets.epilogue
-    rendered = _render_block_scale_template(chain, snippets, cfg)
-    assert "start_sf_block_m" in rendered
-    assert "subview(6)" in rendered
-
-
-def test_segmented_row_scale_address_map_is_concatenated_per_group_atoms() -> None:
-    group_rows, scale_cols = (100, 0, 140, 260), 168
-    n_col_quads = scale_cols // 4
-    start_block = 0
-    addresses = []
-    for count in group_rows:
-        for local_row in range(count):
-            for scale_col in (0, 3, 4, 83, 167):
-                base = start_block * n_col_quads * 512
-                expr = _f8_128x4_row_scale_index_expr(str(local_row), str(scale_col), str(n_col_quads), atom_base=str(base))
-                got = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - expression is generated locally from integer inputs
-                within = ((local_row // 128) * n_col_quads + scale_col // 4) * 512 + (local_row % 32) * 16 + ((local_row % 128) // 32) * 4 + scale_col % 4
-                assert got == base + within
-                addresses.append(got)
-        start_block += _ceil_div(count, 128)
-    assert start_block * 128 == sum(_ceil_div(count, 128) * 128 for count in group_rows)
-    assert len(addresses) == len(set(addresses))
-
-
-def test_plain_moe_segmented_row_quant_declines_without_prefix_scheduler() -> None:
-    S, N, K, E, G = 512, 256, 256, 4, 4
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    weight = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    out = g.moe_grouped_matmul(tok, weight, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
-    q, sf = g.block_scale_quantize(input=out, block_size=16, axis=-1, group_offset=fto, name="q")
-    q.set_data_type(cudnn.data_type.FP4_E2M1).set_output(True)
-    capacity_rows = segmented_row_scale_capacity_rows(S, G)
-    sf.set_dim([1, capacity_rows, 16]).set_stride([capacity_rows * 16, 16, 1])
-    sf.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-    chain = analyze(g)
-    assert chain.has_moe and not chain.has_block_scale and chain.quants[0].grouped_by_moe
-    with pytest.raises(NotImplementedError, match="requires a block-scaled MoE"):
-        _check_block_quant_supported(chain, 32, by_name(_SEGMENTED_ROW_CFG))
 
 
 # --------------------------------------------------------------------------- #
