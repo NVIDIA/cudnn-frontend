@@ -698,7 +698,10 @@ def gate_beta_warp(
 
                 # ---- Gate load: GMEM -> SMEM (OOB neutral: 1.0 -> log2 = 0.0) --------
                 oob_neutral = cutlass.Float32(0.0) if cutlass.const_expr(cfg.log_gate) else cutlass.Float32(1.0)
-                gate_vals = [gGate[lane_idx + col * cfg.threads_per_warp].to(cutlass.Float32) if pos_valid[col] else oob_neutral for col in range(n_cols)]
+                gate_vals = [
+                    gGate[min(lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1)].to(cutlass.Float32) if pos_valid[col] else oob_neutral
+                    for col in range(n_cols)
+                ]
 
                 if cutlass.const_expr(cfg.safe_gate):
                     for col in cutlass.range_constexpr(0, n_cols, 2):
