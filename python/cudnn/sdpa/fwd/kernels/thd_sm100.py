@@ -252,7 +252,7 @@ def build_thd_meta_o_kv_descs_kernel(
     (``0 · NaN == NaN`` wipes every valid row of the tile), and on cc10.3 the
     fused-LDTM row-max reduces S BEFORE the mask. So the setup thread also
     copies the K and V base descriptors into ``o_desc_words`` slots
-    ``n_batch+1`` / ``n_batch+2`` with their seq extent (GLOBAL_DIM ord=2)
+    ``n_batch+1`` / ``n_batch+2`` with each descriptor's sequence extent
     patched to the packed total ``cu_k[B]`` — tile-tail loads past it become
     TMA-OOB and land as EXACT ZEROS in SMEM (zero V nulls the masked P·V
     terms; zero K keeps the pre-mask row-max finite). Slot ``n_batch`` stays

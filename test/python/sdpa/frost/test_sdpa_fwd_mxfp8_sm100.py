@@ -48,6 +48,21 @@ _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_
 _BLOCK = 32
 
 
+@pytest.mark.L0
+def test_f8_128x4_flatten_preserves_physical_storage_order():
+    from cudnn.sdpa.fwd.api_dsl import _flatten_f8_128x4_storage
+
+    storage = torch.arange(24, dtype=torch.int8)
+    full_storage = storage.reshape(2, 3, 4).permute(1, 0, 2)
+    assert not full_storage.is_contiguous()
+    torch.testing.assert_close(_flatten_f8_128x4_storage(full_storage), storage)
+
+    larger_storage = torch.arange(30, dtype=torch.int8)
+    storage_view = larger_storage[3:27].reshape(2, 3, 4).permute(1, 0, 2)
+    expected = storage_view.contiguous().reshape(-1)
+    torch.testing.assert_close(_flatten_f8_128x4_storage(storage_view), expected)
+
+
 class _ReferenceWithStats(NamedTuple):
     output: torch.Tensor
     stats: torch.Tensor

@@ -31,7 +31,7 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     pack_gqa_supported,
-    resolve_template_params,
+    resolve_d192_template_params,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
@@ -55,6 +55,13 @@ def dtype_name(buffer) -> str:
     slot print ``float32``.
     """
     return str(buffer.dtype).rsplit(".", 1)[-1]
+
+
+def _flatten_f8_128x4_storage(sf: torch.Tensor) -> torch.Tensor:
+    """Flatten an opaque F8_128x4 tensor in physical byte order."""
+
+    full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
+    return sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
 
 
 _SM100_FLAVORS = (
@@ -1234,11 +1241,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
-        dtype_qkv_code = _SM100_DTYPE_QKV_CODE[self.dtype]
         from cudnn import data_type as _cudnn_dtype
 
         params = Sm100TemplateParams(
-            dtype_qkv=dtype_qkv_code,
+            dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
             window_right=self.window_right,
@@ -1254,16 +1260,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
-        params = resolve_template_params(
-            params,
-            flavor=self.flavor,
-            pertensor=self._pertensor,
-            batch_size=self.batch_size,
-            h_q=self.h_q,
-            pack_gqa_ratio=(self.h_q // self.h_kv) if self.pack_gqa else 1,
-            s_q=self.s_q_max,
-            s_kv=self.s_k_max,
-        )
+        if self.flavor == (192, 128):
+            params = resolve_d192_template_params(
+                params,
+                pertensor=self._pertensor,
+                batch_size=self.batch_size,
+                h_q=self.h_q,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -1891,13 +1896,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         never from ``sf.shape[0]``, and only the total size is validated.
         """
         b = self.batch_size
-        # F8_128x4 is an opaque physical byte layout.  A full-storage tensor
-        # may carry the producer's logical permutation strides, but copying it
-        # in logical order both defeats that contract and launches a device
-        # reorder on every execute.  Bind its physical bytes directly; retain
-        # the packing fallback for views into a larger storage.
-        full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
-        flat = sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
+        # Bind full-storage tensors in physical byte order; pack storage views.
+        flat = _flatten_f8_128x4_storage(sf)
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         if flat.numel() != b * h * n_tiles * sf_smem_size:
@@ -1922,8 +1922,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
         every tile is empty there, so no SF byte is ever loaded."""
-        full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
-        flat = sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
+        flat = _flatten_f8_128x4_storage(sf)
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         flat = flat.reshape(-1)

@@ -129,125 +129,6 @@ class TemplateParams:
     softmax_f16: bool = False
 
 
-def resolve_template_params(
-    params: TemplateParams,
-    *,
-    flavor: tuple[int, int],
-    pertensor: bool,
-    batch_size: int,
-    h_q: int,
-    pack_gqa_ratio: int,
-    s_q: int,
-    s_kv: int,
-) -> TemplateParams:
-    """Resolve shape-dependent codegen choices before template loading."""
-
-    if flavor != (192, 128):
-        return params
-
-    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    mxfp8 = fp8 and not pertensor
-    thd = params.thd_varlen
-    window_left = params.window_left
-    window_right = params.window_right
-    groups = batch_size * h_q // pack_gqa_ratio
-
-    lpt_head_group = 8 if fp8 and not thd and groups % 8 == 0 else 1
-    lpt_q_tiles = (s_q * pack_gqa_ratio + 511) // 512 if fp8 and not thd else 0
-
-    lpt_l2_size_mib = 0
-    lpt_l2_8k = params.sched_policy == SCHED_LPT_L2 and not thd and params.split_kv == 1 and s_q == 8192 and s_kv == 8192
-    if lpt_l2_8k and pertensor and params.dtype_qkv == DTYPE_E4M3 and groups % 24 != 0 and groups % 16 == 0:
-        # At 8K, 60 MiB groups 24 one-byte K/V heads; 40 MiB groups 16 and
-        # avoids a short final group for these grids.
-        lpt_l2_size_mib = 40
-    elif lpt_l2_8k and not fp8 and groups % 12 != 0 and groups % 8 == 0:
-        # Half inputs double the per-head K/V footprint: 60 MiB groups 12
-        # heads, while 40 MiB groups 8 and avoids the same short tail.
-        lpt_l2_size_mib = 40
-
-    template_window_right = window_right
-    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
-        # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-        # MASK_NONE x32 path. This bound removes no valid K and selects the
-        # equivalent masked-interior lowering.
-        template_window_right = s_kv
-
-    square_br_as_tl = (
-        params.split_kv == 1
-        and not thd
-        and not params.seq_q_lens_present
-        and not params.seq_kv_lens_present
-        and window_left is None
-        and window_right == 0
-        and params.bottom_right
-        and s_q == s_kv
-        and 4096 < s_kv <= 8192
-    )
-    template_bottom_right = False if square_br_as_tl else params.bottom_right
-
-    mx_dense_mid_causal_cga1 = (
-        mxfp8
-        and params.split_kv == 1
-        and not thd
-        and window_left is None
-        and window_right == 0
-        and not template_bottom_right
-        and 4096 < s_kv <= 8192
-        and (params.dtype_qkv == DTYPE_E5M2 or s_q >= 4096)
-    )
-    sched_policy = SCHED_NATURAL if mx_dense_mid_causal_cga1 else params.sched_policy
-
-    # Per-tensor D192 favors independent CTAs for dense sliding windows and
-    # E5M2 no-mask. Keep cga2's KV reuse for causal, THD, and split-KV.
-    pt_cga1 = (
-        pertensor
-        and params.split_kv == 1
-        and not thd
-        and (
-            window_left is not None
-            or (params.dtype_qkv == DTYPE_E5M2 and window_right is None)
-            or (
-                params.dtype_qkv == DTYPE_E4M3
-                and params.dtype_o in (DTYPE_E4M3, DTYPE_E5M2)
-                and window_left is None
-                and window_right == 0
-                and not template_bottom_right
-            )
-        )
-    )
-
-    # D192 MX cga1 trades two-CTA cooperation for twice as many independent
-    # assignments and half the KV stage depth. Small packed SWA tiles retain
-    # cga2's reuse; masked dense and sufficiently long packed tiles use cga1.
-    mx_cga1 = False
-    if mxfp8 and params.split_kv == 1:
-        masked = window_right is not None
-        sliding = window_left is not None
-        if thd:
-            if params.dtype_qkv == DTYPE_E5M2 and not masked:
-                mx_cga1 = True
-            elif masked and sliding:
-                min_s_kv = 4096 if params.dtype_qkv == DTYPE_E4M3 else 2048
-                mx_cga1 = s_kv >= min_s_kv
-            elif masked:
-                mx_cga1 = s_kv >= 2048
-        elif masked:
-            mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
-    mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
-
-    return replace(
-        params,
-        window_right=template_window_right,
-        bottom_right=template_bottom_right,
-        sched_policy=sched_policy,
-        lpt_head_group=lpt_head_group,
-        lpt_q_tiles=lpt_q_tiles,
-        lpt_l2_size_mib=lpt_l2_size_mib,
-        cta_mma=1 if pt_cga1 or mx_cga1 else 2,
-    )
-
-
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
 # kernel reads them.  Accepting them elsewhere would silently ignore them — and
@@ -291,11 +172,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
-    # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor,
-    # but a kernel must explicitly read them. Accepting them elsewhere would
-    # silently ignore them — and for
-    # split_kv that is not merely surprising but WRONG: the caller sizes an
-    # (S*B)-batch partial workspace and runs the combine, while the kernel keeps
+    # A flavor must explicitly consume split_kv / cta_mma. Accepting either
+    # elsewhere would silently ignore it; for split_kv that is also WRONG: the
+    # caller sizes an (S*B)-batch partial workspace and runs the combine, while the kernel keeps
     # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
     # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
     # corrupt the result instead of dropping out.  Reject at the door.
@@ -1055,6 +934,121 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             raise ValueError(msg)
 
 
+def resolve_d192_template_params(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    batch_size: int,
+    h_q: int,
+    s_q: int,
+    s_kv: int,
+) -> TemplateParams:
+    """Resolve D192 shape-dependent codegen choices before template loading."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    mxfp8 = fp8 and not pertensor
+    thd = params.thd_varlen
+    window_left = params.window_left
+    window_right = params.window_right
+    pack_gqa_ratio = params.qh_per_kh if params.pack_gqa else 1
+    groups = batch_size * h_q // pack_gqa_ratio
+
+    lpt_head_group = 8 if fp8 and not thd and groups % 8 == 0 else 1
+    lpt_q_tiles = (s_q * pack_gqa_ratio + 511) // 512 if fp8 and not thd else 0
+
+    lpt_l2_size_mib = 0
+    lpt_l2_8k = params.sched_policy == SCHED_LPT_L2 and not thd and params.split_kv == 1 and s_q == 8192 and s_kv == 8192
+    if lpt_l2_8k and pertensor and params.dtype_qkv == DTYPE_E4M3 and groups % 24 != 0 and groups % 16 == 0:
+        # At 8K, 60 MiB groups 24 one-byte K/V heads; 40 MiB groups 16 and
+        # avoids a short final group for these grids.
+        lpt_l2_size_mib = 40
+    elif lpt_l2_8k and not fp8 and groups % 12 != 0 and groups % 8 == 0:
+        # Half inputs double the per-head K/V footprint: 60 MiB groups 12
+        # heads, while 40 MiB groups 8 and avoids the same short tail.
+        lpt_l2_size_mib = 40
+
+    template_window_right = window_right
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+        # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
+        # MASK_NONE x32 path. This bound removes no valid K and selects the
+        # equivalent masked-interior lowering.
+        template_window_right = s_kv
+
+    square_br_as_tl = (
+        params.split_kv == 1
+        and not thd
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and window_left is None
+        and window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+        and 4096 < s_kv <= 8192
+    )
+    template_bottom_right = False if square_br_as_tl else params.bottom_right
+
+    mx_dense_mid_causal_cga1 = (
+        mxfp8
+        and params.split_kv == 1
+        and not thd
+        and window_left is None
+        and window_right == 0
+        and not template_bottom_right
+        and 4096 < s_kv <= 8192
+        and (params.dtype_qkv == DTYPE_E5M2 or s_q >= 4096)
+    )
+    sched_policy = SCHED_NATURAL if mx_dense_mid_causal_cga1 else params.sched_policy
+
+    # Per-tensor D192 favors independent CTAs for dense sliding windows and
+    # E5M2 no-mask. Keep cga2's KV reuse for causal, THD, and split-KV.
+    pt_cga1 = (
+        pertensor
+        and params.split_kv == 1
+        and not thd
+        and (
+            window_left is not None
+            or (params.dtype_qkv == DTYPE_E5M2 and window_right is None)
+            or (
+                params.dtype_qkv == DTYPE_E4M3
+                and params.dtype_o in (DTYPE_E4M3, DTYPE_E5M2)
+                and window_left is None
+                and window_right == 0
+                and not template_bottom_right
+            )
+        )
+    )
+
+    # D192 MX cga1 trades two-CTA cooperation for twice as many independent
+    # assignments and half the KV stage depth. Small packed SWA tiles retain
+    # cga2's reuse; masked dense and sufficiently long packed tiles use cga1.
+    mx_cga1 = False
+    if mxfp8 and params.split_kv == 1:
+        masked = window_right is not None
+        sliding = window_left is not None
+        if thd:
+            if params.dtype_qkv == DTYPE_E5M2 and not masked:
+                mx_cga1 = True
+            elif masked and sliding:
+                min_s_kv = 4096 if params.dtype_qkv == DTYPE_E4M3 else 2048
+                mx_cga1 = s_kv >= min_s_kv
+            elif masked:
+                mx_cga1 = s_kv >= 2048
+        elif masked:
+            mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
+    mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
+
+    return replace(
+        params,
+        window_right=template_window_right,
+        bottom_right=template_bottom_right,
+        sched_policy=sched_policy,
+        lpt_head_group=lpt_head_group,
+        lpt_q_tiles=lpt_q_tiles,
+        lpt_l2_size_mib=lpt_l2_size_mib,
+        cta_mma=1 if pt_cga1 or mx_cga1 else 2,
+    )
+
+
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     _validate_params("d192", params)
     b = bpe(params.dtype_qkv)
@@ -1062,8 +1056,8 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
     mask_flags = _mask_flags_from(params)
-    e4_thd_swa = fp8 and params.dtype_qkv == DTYPE_E4M3 and params.thd_varlen and bool(mask_flags & MASK_SWA)
-    e5_thd_swa = fp8 and params.dtype_qkv == DTYPE_E5M2 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    thd_swa = fp8 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    e4_thd_swa = thd_swa and params.dtype_qkv == DTYPE_E4M3
     e5_dense_causal_regs = (
         params.dtype_qkv == DTYPE_E5M2
         and not params.thd_varlen
@@ -1072,6 +1066,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         and mask_flags == MASK_CAUSAL
         and (params.window_right or 0) == 0
     )
+    wide_role_regs = thd_swa or e5_dense_causal_regs
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -1097,8 +1092,8 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         BOTTOM_RIGHT=int(params.bottom_right),
         L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SCHEDULER_POLICY=params.sched_policy,
-        SOFTMAX_REGS=192 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
-        CORRECTION_REGS=88 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,
+        SOFTMAX_REGS=192 if wide_role_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
+        CORRECTION_REGS=88 if wide_role_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),

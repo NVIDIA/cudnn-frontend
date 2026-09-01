@@ -571,8 +571,8 @@ def _sm100_spec() -> EngineSpec:
 def _sm100_mxfp8_spec() -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen on both native shapes rides the
-    shared packed lowering (write_thd_meta envelope design, issue #552; packed
+    THD/varlen on both native shapes rides the shared packed lowering
+    (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
     in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
@@ -659,9 +659,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
-    fully-masked row can poison the global amax. THD/varlen rides the shared packed
-    lowering (write_thd_meta envelope design, issue #552; packed Q/K/V/O
-    contract only). Rubin keeps the d128-only SM107 sibling.
+    fully-masked row can poison the global amax. THD/varlen rides the shared
+    packed lowering on all SM100 native shapes (write_thd_meta envelope
+    design, issue #552; packed Q/K/V/O contract only). Rubin keeps the
+    d128-only SM107 sibling.
     """
 
     rubin_row = arch == "sm107"
