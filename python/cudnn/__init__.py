@@ -268,6 +268,11 @@ from .nodes import Node
 
 from .graph import graph, jit, graph_cache
 
+# AOT kernel export/import. Imported eagerly (it pulls in nothing heavy; the
+# cutlass / tvm-ffi imports live inside the engine that needs them).
+from . import aot
+from .aot import export_to_disk, import_from_disk, KernelLibrary, register_global, get_global, unregister_global
+
 from typing import Any
 
 _EAGER_PUBLIC_NAMES = (

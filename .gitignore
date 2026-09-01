@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AOT sample build output
+samples/aot*/flow2_import_execute
+samples/aot*/bench_cpu_costs
+samples/aot*/*.so
+samples/aot*/*.o
+samples/aot*/*.cubin
+samples/aot*/*.cudnn
+samples/aot*/*.cudnn.*
+samples/aot/bench_sdpa_cpu_costs
