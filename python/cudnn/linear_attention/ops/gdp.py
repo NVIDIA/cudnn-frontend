@@ -448,7 +448,8 @@ def gdp_fwd_fake(
     if initial_state is not None and initial_state.shape[0] != N:
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
-    final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=torch.float32)
+    state_dtype = initial_state.dtype if initial_state is not None else torch.float32
+    final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + N, 1)
         state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)

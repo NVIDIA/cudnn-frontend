@@ -2667,6 +2667,10 @@ def chunk_gdn_recompute_sm100(
     gen_intervals = seed_checkpoints
     if seed_checkpoints and scheduler_all is None:
         raise ValueError("seed_state_checkpoints requires scheduler_all (the prologue zeroes both consumers' scheduler rings)")
+    if seed_checkpoints and not enable_checkpoints:
+        raise ValueError("seed_state_checkpoints requires checkpoint staging (checkpoint_every_n_tokens > 0)")
+    if seed_checkpoints and (seed_every_n_tokens < CFG.B_T or (seed_span_tokens or seed_every_n_tokens) < CFG.B_T):
+        raise ValueError("seed_state_checkpoints requires seed_every_n_tokens (and any seed_span_tokens) of at least one chunk (B_T tokens)")
     dynamic_scheduling = scheduler_counter is not None
     run_order = bool(order_in_prologue)
     order_gen = work_item_scratch is None
