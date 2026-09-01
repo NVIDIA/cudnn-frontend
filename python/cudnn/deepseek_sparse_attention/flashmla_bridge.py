@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Optional FlashMLA forward bridge for cuDNN DSA training.
+"""Current FlashMLA provider for semantic cuDNN DSA training APIs.
 
 This module does not contain or vendor a sparse-attention forward kernel.  It
 dynamically calls ``flash_mla.flash_mla_sparse_fwd`` from the external,
@@ -48,8 +48,8 @@ _FLASHMLA_SPARSE_FWD_CALL = "(q, kv, indices, *, sm_scale, d_v, attn_sink, topk_
 _validated_flashmla_sparse_fwd: Optional[Callable[..., Any]] = None
 
 
-class FlashMLAUnavailableError(RuntimeError):
-    """The external FlashMLA sparse-forward dependency is unavailable."""
+class SparseAttentionBackendUnavailableError(RuntimeError):
+    """No compatible sparse-attention forward backend is available."""
 
 
 @dataclass(frozen=True)
@@ -136,7 +136,7 @@ def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None
     try:
         sparse_fwd_signature = signature(sparse_fwd)
     except Exception as exc:
-        raise FlashMLAUnavailableError(
+        raise SparseAttentionBackendUnavailableError(
             "The installed 'flash_mla.flash_mla_sparse_fwd' callable has no inspectable "
             f"Python signature; expected {_FLASHMLA_SPARSE_FWD_CALL}. {_FLASHMLA_INSTALL_HINT}"
         ) from exc
@@ -153,7 +153,7 @@ def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None
             topk_length=None,
         )
     except TypeError as exc:
-        raise FlashMLAUnavailableError(
+        raise SparseAttentionBackendUnavailableError(
             "The installed 'flash_mla.flash_mla_sparse_fwd' has incompatible signature "
             f"{sparse_fwd_signature}; expected support for {_FLASHMLA_SPARSE_FWD_CALL}. "
             f"{_FLASHMLA_INSTALL_HINT}"
@@ -168,11 +168,13 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
     try:
         flash_mla = import_module("flash_mla")
     except Exception as exc:
-        raise FlashMLAUnavailableError(f"Cannot import optional dependency 'flash_mla'. {_FLASHMLA_INSTALL_HINT}") from exc
+        raise SparseAttentionBackendUnavailableError(f"Cannot import optional dependency 'flash_mla'. {_FLASHMLA_INSTALL_HINT}") from exc
 
     sparse_fwd = getattr(flash_mla, "flash_mla_sparse_fwd", None)
     if not callable(sparse_fwd):
-        raise FlashMLAUnavailableError("The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}")
+        raise SparseAttentionBackendUnavailableError(
+            "The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}"
+        )
     if sparse_fwd is not _validated_flashmla_sparse_fwd:
         _probe_flashmla_sparse_fwd_signature(sparse_fwd)
         _validated_flashmla_sparse_fwd = sparse_fwd
@@ -465,7 +467,7 @@ def _run_flashmla_sparse_forward(
     return result, scale
 
 
-def flashmla_sparse_forward(
+def sparse_attention_forward(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -473,7 +475,11 @@ def flashmla_sparse_forward(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
 ) -> TupleDict:
-    """Call the external FlashMLA sparse forward without autograd wiring.
+    """Run token-indexed sparse-attention forward without autograd wiring.
+
+    This provider-neutral semantic entry point currently dispatches to the
+    separately installed official FlashMLA implementation.  Backend selection
+    is private and may change without changing this API.
 
     ``q`` is ``(S_q, H, D)``, ``kv`` is ``(S_kv, D)``, and ``indices`` is
     ``(S_q, topk)`` with global positions into the flat KV stream.  Invalid
@@ -481,7 +487,7 @@ def flashmla_sparse_forward(
     must contain values in ``[0, topk]``.  The returned ``lse`` excludes the
     attention sink, matching cuDNN DSA backward.
 
-    Use :func:`flashmla_sparse_attention` for an autograd-enabled call.
+    Use :func:`sparse_attention` for an autograd-enabled call.
     """
 
     result, _ = _run_flashmla_sparse_forward(q, kv, indices, attn_sink, topk_length, softmax_scale)
@@ -559,7 +565,7 @@ class _FlashMLACudnnSparseAttention(torch.autograd.Function):
         )
 
 
-def flashmla_sparse_attention(
+def sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -568,7 +574,11 @@ def flashmla_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
     trusted_compact_metadata: bool = False,
 ) -> TupleDict:
-    """Training bridge: external FlashMLA forward plus cuDNN DSA backward.
+    """Run token-indexed sparse attention with cuDNN DSA autograd.
+
+    The current forward provider is the separately installed official
+    FlashMLA implementation.  cuDNN Frontend owns metadata normalization,
+    backward, and score recompute; the provider is an implementation detail.
 
     Gradients are provided for ``q``, ``kv``, and ``attn_sink``.  Top-K
     indices/lengths and ``softmax_scale`` are non-differentiable.  FlashMLA's
@@ -604,7 +614,7 @@ def flashmla_sparse_attention(
     return TupleDict(output=output, max_logits=max_logits, lse=lse)
 
 
-def flashmla_sparse_score_recompute(
+def sparse_attention_score_recompute(
     q: torch.Tensor,
     kv: torch.Tensor,
     lse: torch.Tensor,
@@ -613,14 +623,15 @@ def flashmla_sparse_score_recompute(
     topk_length: Optional[torch.Tensor] = None,
     stream: Optional[Any] = None,
 ) -> TupleDict:
-    """Run cuDNN attention-score recompute from a FlashMLA forward tuple.
+    """Run cuDNN attention-score recompute from a sparse-forward tuple.
 
     This is a single-flat-sequence adapter over
     :func:`DSA.sparse_attn_score_recompute_wrapper`.  It safety-normalizes the
-    wider FlashMLA invalid-index contract in place, masks the inactive suffix,
-    and uses the non-compact recompute path so every returned target slot stays
-    aligned with the caller's original ``indices`` position.  The launch-only
-    tail is padded to a conservative 128-slot tile and sliced away afterward.
+    wider invalid-index contract accepted by the current FlashMLA provider,
+    masks the inactive suffix, and uses the non-compact recompute path so every
+    returned target slot stays aligned with the caller's original ``indices``
+    position.  The launch-only tail is padded to a conservative 128-slot tile
+    and sliced away afterward.
     """
 
     if stream is not None:
@@ -662,8 +673,8 @@ def flashmla_sparse_score_recompute(
 
 
 __all__ = [
-    "FlashMLAUnavailableError",
-    "flashmla_sparse_attention",
-    "flashmla_sparse_forward",
-    "flashmla_sparse_score_recompute",
+    "SparseAttentionBackendUnavailableError",
+    "sparse_attention",
+    "sparse_attention_forward",
+    "sparse_attention_score_recompute",
 ]

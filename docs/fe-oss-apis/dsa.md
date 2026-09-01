@@ -14,16 +14,18 @@ cuDNN Frontend operations.
 
 **Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
 scores/top-K, sparse/dense score recompute, and sparse/dense indexer
-backward. The production sparse-attention forward kernel remains the external
-C++ implementation from `deepseek-ai/FlashMLA`; it is not copied or vendored.
-An optional B200 bridge dynamically calls that package's
-`flash_mla_sparse_fwd` and connects its outputs to cuDNN backward and score
-recompute. The pure-PyTorch test reference remains available at
+backward. The current sparse-attention forward provider is the external C++
+implementation from `deepseek-ai/FlashMLA`; it is not copied or vendored. The
+public API is provider-neutral: its initial B200 implementation dynamically
+calls that package's `flash_mla_sparse_fwd` and connects its outputs to cuDNN
+backward and score recompute. A future cuDNN-owned forward can replace the
+provider without changing model call sites. The pure-PyTorch test reference
+remains available at
 `test/python/fe_api/dsa/dsa_reference.py::ref_sparse_attention_forward`.
 
 The module packages the following operations:
 
-0. **Optional FlashMLA Training Bridge** – external forward plus cuDNN DSA backward and score recompute (B200 prototype).
+0. **Token-Indexed Sparse Attention Training** – semantic forward/autograd API whose current B200 provider is FlashMLA.
 1. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
@@ -83,9 +85,9 @@ from cudnn import DSA
 DSA.SparseAttentionBackward
 DSA.sparse_attention_backward_wrapper
 
-DSA.flashmla_sparse_forward
-DSA.flashmla_sparse_attention
-DSA.flashmla_sparse_score_recompute
+DSA.sparse_attention_forward
+DSA.sparse_attention
+DSA.sparse_attention_score_recompute
 
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
@@ -119,17 +121,22 @@ DSA.dense_indexer_backward_wrapper
 
 ## Components
 
-### 0. Optional FlashMLA Training Bridge (B200 prototype)
+### 0. Token-Indexed Sparse Attention Training (B200 prototype)
 
-The bridge imports `flash_mla` only when called and invokes the external
-`flash_mla_sparse_fwd` symbol. It was developed against official FlashMLA
-commit `15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor
-vLLM implementation source is present in this repository. A missing or
-incompatible optional dependency raises `FlashMLAUnavailableError`
-instead of falling back to a different forward. Compatibility is determined
-from the callable's actual signature, not a package version string: the entry
-point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`,
-`d_v`, `attn_sink`, and `topk_length` by keyword.
+`DSA.sparse_attention_forward`, `DSA.sparse_attention`, and
+`DSA.sparse_attention_score_recompute` describe the model operation rather
+than a particular provider. The current implementation imports `flash_mla`
+only when forward is called and invokes the external `flash_mla_sparse_fwd`
+symbol. It was developed against official FlashMLA commit
+`15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor vLLM
+implementation source is present in this repository. A missing or incompatible
+optional dependency raises `SparseAttentionBackendUnavailableError` instead
+of silently selecting a different forward. Compatibility is determined from
+the callable's actual signature, not a package version string: the current
+entry point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`,
+`d_v`, `attn_sink`, and `topk_length` by keyword. Provider selection and launch
+planning remain private, so a future cuDNN forward can replace this bridge
+without renaming the semantic API.
 
 The initial functional contract is exact SM100 (validated on ComputeLab B200),
 BF16, one flat MQA KV stream,
@@ -154,7 +161,7 @@ positions to `-1`, and returns those effective `indices` beside the aligned
 tails are padded with `-1` and removed from returned results.
 
 ```python
-result = DSA.flashmla_sparse_attention(
+result = DSA.sparse_attention(
     q, kv, topk_idxs, attn_sink,
     softmax_scale=1.0 / math.sqrt(q.shape[-1]),
     topk_length=topk_length,
@@ -163,7 +170,7 @@ result = DSA.flashmla_sparse_attention(
 loss = result["output"].float().square().mean()
 loss.backward()  # cuDNN DSA backward: q.grad, kv.grad, attn_sink.grad
 
-score = DSA.flashmla_sparse_score_recompute(
+score = DSA.sparse_attention_score_recompute(
     q.detach(), kv.detach(), result["lse"], topk_idxs,
     softmax_scale=1.0 / math.sqrt(q.shape[-1]),
     topk_length=topk_length,

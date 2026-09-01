@@ -34,7 +34,7 @@ def main():
     # returned tensors and all cuDNN gradients retain the original H32/K65 ABI.
     # This sample constructs a bounded active prefix, so it can explicitly
     # skip the safe-default metadata scan and compactification.
-    result = DSA.flashmla_sparse_attention(
+    result = DSA.sparse_attention(
         q,
         kv,
         indices,
@@ -45,7 +45,7 @@ def main():
     )
     result["output"].float().square().mean().backward()
 
-    score = DSA.flashmla_sparse_score_recompute(
+    score = DSA.sparse_attention_score_recompute(
         q.detach(),
         kv.detach(),
         result["lse"],

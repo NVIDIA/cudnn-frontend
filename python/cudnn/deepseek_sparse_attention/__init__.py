@@ -4,10 +4,10 @@
 from importlib import import_module
 
 _SYMBOLS = {
-    "FlashMLAUnavailableError": (".flashmla_bridge", "FlashMLAUnavailableError"),
-    "flashmla_sparse_forward": (".flashmla_bridge", "flashmla_sparse_forward"),
-    "flashmla_sparse_attention": (".flashmla_bridge", "flashmla_sparse_attention"),
-    "flashmla_sparse_score_recompute": (".flashmla_bridge", "flashmla_sparse_score_recompute"),
+    "SparseAttentionBackendUnavailableError": (".flashmla_bridge", "SparseAttentionBackendUnavailableError"),
+    "sparse_attention_forward": (".flashmla_bridge", "sparse_attention_forward"),
+    "sparse_attention": (".flashmla_bridge", "sparse_attention"),
+    "sparse_attention_score_recompute": (".flashmla_bridge", "sparse_attention_score_recompute"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
