@@ -92,6 +92,28 @@ neither names the thing that breaks it most directly: a device-to-host read.
   hand you — or assert in-kernel. Reading lengths back to decide whether to
   raise buys nothing: the Router had to choose an engine before any buffer
   existed.
+- **Prove it; do not grep for it.** The list above is a reminder, not a
+  detector — the spellings are many (`int(cu[i])` on a CUDA tensor is a
+  blocking copy that a search for `.item()` will not find) and a reviewer who
+  greps a subset concludes "clean". Assert the property instead:
+
+  ```python
+  torch.cuda.set_sync_debug_mode("error")   # any blocking D2H now raises
+  try:
+      out.backward(grad)                    # or graph.execute(...)
+  finally:
+      torch.cuda.set_sync_debug_mode("default")
+  ```
+
+  Put that in a test (see `test_varlen_backward_does_not_sync`), and check the
+  test is RED against the old code before trusting it — a sync test that was
+  never seen to fail is asserting nothing.
+- **Suspect duplicated logic first.** Every violation found so far has been a
+  *second* copy of a conversion that was already device-side somewhere else:
+  the packed-to-padded LSE repad existed in both `sdpa/fwd/torch_op.py` (with
+  `searchsorted`, device-side) and `torch/sdpa_provider.py` (a `for i in
+  range(B): int(cu[i])` loop). Extract the correct one and call it from both
+  rather than writing the obvious loop again.
 
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:

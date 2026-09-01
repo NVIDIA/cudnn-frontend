@@ -21,8 +21,9 @@ The ops build cuDNN pygraph ``sdpa`` / ``sdpa_backward`` nodes; the engine
 Router then picks the best serving plan (FROST OSS kernels or cuDNN-backend
 engines) per config.
 
-Backward contract: ``sdpa_bwd`` serves the THD/varlen path (dense backward and
-sink backward are follow-ups and raise ``NotImplementedError``). It consumes a
+Backward contract: ``sdpa_bwd`` serves the THD/varlen path and the unpadded
+dense BHSD path (sink backward, and dense backward with per-batch lengths,
+are follow-ups and raise ``NotImplementedError``). On THD it consumes a
 PADDED ``(B, H, max_seqlen_q, 1)`` fp32 LSE — a backend restriction (bprop THD
 rejects ragged LSE on SM8X/SM12X). ``sdpa_fwd`` is differentiable on the
 varlen path via ``torch.library.register_autograd`` when called with
@@ -159,14 +160,19 @@ def _thd_desc_stride(t: torch.Tensor, s_max: int) -> Tuple[int, int, int, int]:
     return (s_max * s_t, s_h, s_t, s_d)
 
 
-def _normalize_thd(t: torch.Tensor, name: str) -> torch.Tensor:
+def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torch.Tensor:
     """Innermost dim must be dense and the base pointer 16B-aligned for the
     cuDNN descriptors (an odd-element storage offset has equal strides but
     faults the kernels with a misaligned address). clone(), NOT contiguous():
     contiguous() returns ``self`` unchanged for an already-contiguous tensor,
-    whatever its storage offset, so it cannot repair a misaligned base."""
+    whatever its storage offset, so it cannot repair a misaligned base.
+
+    Applies to BOTH layouts. The descriptor requirement is a property of the
+    operand, not of THD packing: a dense BHSD tensor whose last dim is strided
+    (say a ``[..., ::2]`` slice), or whose base is misaligned, breaks the same
+    way."""
     if t.stride(-1) != 1 or t.data_ptr() % 16:
-        _logger.warning("sdpa_fwd: copying %s to normalize layout/alignment (slow path)", name)
+        _logger.warning("%s: copying %s to normalize layout/alignment (slow path)", op, name)
         t = t.clone(memory_format=torch.contiguous_format)
     return t
 
@@ -343,9 +349,9 @@ def _sdpa_fwd_impl(
         if seq_len_q is not None or seq_len_kv is not None:
             raise ValueError("varlen path derives seq lens from cu_seqlens; do not pass seq_len_q/kv")
         B = cu_seqlens_q.numel() - 1
-        q = _normalize_thd(q, "q")
-        k = _normalize_thd(k, "k")
-        v = _normalize_thd(v, "v")
+        q = _normalize_operand(q, "q")
+        k = _normalize_operand(k, "k")
+        v = _normalize_operand(v, "v")
         T_q, H_q, D_qk = q.shape
         T_kv, H_v, D_v = v.shape
         H_k = k.shape[1]
@@ -374,6 +380,12 @@ def _sdpa_fwd_impl(
             raise ValueError(f"k shape {tuple(k.shape)} must be (B={B}, H_k, S_kv={S_kv}, D_qk={D_qk}) to match q and v")
         if H_q % H_k or H_q % H_v:
             raise ValueError(f"GQA head counts must divide H_q={H_q}; got H_k={H_k}, H_v={H_v}")
+        # Same descriptor contract as THD: dense strides are declared as-is,
+        # but a strided innermost dim or a misaligned base still has to be
+        # repaired before the descriptors are built.
+        q = _normalize_operand(q, "q")
+        k = _normalize_operand(k, "k")
+        v = _normalize_operand(v, "v")
         q_stride, k_stride, v_stride = q.stride(), k.stride(), v.stride()
         o_stride = _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
         stats_stride = (H_q * S_q, S_q, 1, 1)
@@ -545,8 +557,19 @@ def _build_bwd_graph(
     o_stride,
     stats_stride,
     is_deterministic: bool,
+    is_thd: bool,
+    dq_stride=None,
+    dk_stride=None,
+    dv_stride=None,
 ):
-    """THD/varlen backward graph (the only path the bwd op serves today)."""
+    """Backward graph for the packed THD/varlen path or the dense BHSD one.
+
+    Dense differs from THD in three ways: no ragged-offset tensors, no
+    per-batch length operands (an unpadded dense batch has every sequence at
+    its declared S), and no ``max_total_seq_len_*`` — those size the ragged dq
+    accumulator and the node rejects them on a non-ragged layout. dQ/dK/dV
+    adopt the caller's Q/K/V layouts on the dense path (autograd hands these
+    straight back as ``.grad``), where THD always returns them packed."""
     io_dtype = _TORCH_DTYPE_TO_CUDNN[dtype]
     g = cudnn.pygraph(
         handle=handle,
@@ -564,20 +587,23 @@ def _build_bwd_graph(
     # bprop THD on SM8X/SM12X ("Packed/ragged LSE is not supported").
     stats_t = g.tensor(name="stats", dim=[B, H_q, S_q, 1], stride=list(stats_stride), data_type=cudnn.data_type.FLOAT, uid=_UIDs.STATS)
 
-    seq_q_t = g.tensor(name="seq_len_q", dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, uid=_UIDs.SEQ_LEN_Q)
-    seq_kv_t = g.tensor(name="seq_len_kv", dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, uid=_UIDs.SEQ_LEN_KV)
-    rq = g.tensor(name="ragged_q", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_Q)
-    rk = g.tensor(name="ragged_k", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_KV)
-    rv = g.tensor(name="ragged_v", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_V)
-    ro = g.tensor(name="ragged_o", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_O)
-    rdq = g.tensor(name="ragged_dq", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DQ)
-    rdk = g.tensor(name="ragged_dk", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DK)
-    rdv = g.tensor(name="ragged_dv", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DV)
-    q_t.set_ragged_offset(rq)
-    k_t.set_ragged_offset(rk)
-    v_t.set_ragged_offset(rv)
-    o_t.set_ragged_offset(ro)
-    do_t.set_ragged_offset(ro)
+    seq_q_t = seq_kv_t = None
+    rdq = rdk = rdv = None
+    if is_thd:
+        seq_q_t = g.tensor(name="seq_len_q", dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, uid=_UIDs.SEQ_LEN_Q)
+        seq_kv_t = g.tensor(name="seq_len_kv", dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, uid=_UIDs.SEQ_LEN_KV)
+        rq = g.tensor(name="ragged_q", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_Q)
+        rk = g.tensor(name="ragged_k", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_KV)
+        rv = g.tensor(name="ragged_v", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_V)
+        ro = g.tensor(name="ragged_o", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_O)
+        rdq = g.tensor(name="ragged_dq", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DQ)
+        rdk = g.tensor(name="ragged_dk", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DK)
+        rdv = g.tensor(name="ragged_dv", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_DV)
+        q_t.set_ragged_offset(rq)
+        k_t.set_ragged_offset(rk)
+        v_t.set_ragged_offset(rv)
+        o_t.set_ragged_offset(ro)
+        do_t.set_ragged_offset(ro)
 
     rb = 0 if is_causal else None
     lb = window_left if window_left >= 0 else None
@@ -592,29 +618,33 @@ def _build_bwd_graph(
         dO=do_t,
         stats=stats_t,
         attn_scale=attn_scale,
-        use_padding_mask=True,
+        # Padding/lengths and the ragged dq-accumulator sizing are THD-only:
+        # max_total_seq_len_* is rejected on a non-ragged layout, and an
+        # unpadded dense batch has every sequence at its declared S.
+        use_padding_mask=is_thd,
         seq_len_q=seq_q_t,
         seq_len_kv=seq_kv_t,
-        # Actual packed token totals (rounded up to the backend's 64-token
-        # accumulator granularity) — sizes the dq accumulator.
-        max_total_seq_len_q=_round64(total_q),
-        max_total_seq_len_kv=_round64(total_kv),
+        **({"max_total_seq_len_q": _round64(total_q), "max_total_seq_len_kv": _round64(total_kv)} if is_thd else {}),
         diagonal_alignment=alignment,
         diagonal_band_left_bound=lb,
         diagonal_band_right_bound=rb,
         use_deterministic_algorithm=is_deterministic,
     )
 
-    # Gradients are OURS: always packed-contiguous, independent of the input views.
-    dq_stride = _packed_bhsd_stride(B, H_q, S_q, D_qk)
-    dk_stride = _packed_bhsd_stride(B, H_k, S_kv, D_qk)
-    dv_stride = _packed_bhsd_stride(B, H_v, S_kv, D_v)
+    # THD gradients are OURS: always packed-contiguous, independent of the
+    # input views. Dense gradients adopt the caller's Q/K/V layouts — autograd
+    # hands them straight back as .grad, which should match the parameter.
+    if is_thd:
+        dq_stride = _packed_bhsd_stride(B, H_q, S_q, D_qk)
+        dk_stride = _packed_bhsd_stride(B, H_k, S_kv, D_qk)
+        dv_stride = _packed_bhsd_stride(B, H_v, S_kv, D_v)
     dq_t.set_uid(_UIDs.DQ).set_output(True).set_dim([B, H_q, S_q, D_qk]).set_stride(list(dq_stride)).set_data_type(io_dtype)
     dk_t.set_uid(_UIDs.DK).set_output(True).set_dim([B, H_k, S_kv, D_qk]).set_stride(list(dk_stride)).set_data_type(io_dtype)
     dv_t.set_uid(_UIDs.DV).set_output(True).set_dim([B, H_v, S_kv, D_v]).set_stride(list(dv_stride)).set_data_type(io_dtype)
-    dq_t.set_ragged_offset(rdq)
-    dk_t.set_ragged_offset(rdk)
-    dv_t.set_ragged_offset(rdv)
+    if is_thd:
+        dq_t.set_ragged_offset(rdq)
+        dk_t.set_ragged_offset(rdk)
+        dv_t.set_ragged_offset(rdv)
 
     g.validate()
     g.build_operation_graph()
@@ -632,6 +662,144 @@ _lib.define(
     "int max_seqlen_q=0, int max_seqlen_kv=0, "
     "bool is_deterministic=False) -> (Tensor, Tensor, Tensor)"
 )
+
+
+def _sdpa_bwd_dense(
+    grad_out,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    attn_scale,
+    *,
+    is_causal,
+    causal_bottom_right,
+    window_left,
+    is_deterministic,
+):
+    """Dense BHSD backward.
+
+    The unpadded dense contract: every sequence is its declared S, so no
+    length operands and no ragged offsets. Stats arrive as ``(B, H, S)`` or
+    ``(B, H, S, 1)`` fp32 — which is exactly aten's logsumexp layout for
+    ``_scaled_dot_product_cudnn_attention``, so the provider hands ours
+    straight through. dQ/dK/dV adopt Q/K/V's layouts, since autograd returns
+    them as ``.grad`` on the caller's parameters.
+    """
+    B, H_q, S_q, D_qk = q.shape
+    _, H_v, S_kv, D_v = v.shape
+    H_k = k.shape[1]
+    if k.shape != (B, H_k, S_kv, D_qk):
+        raise ValueError(f"k shape {tuple(k.shape)} must be (B={B}, H_k, S_kv={S_kv}, D_qk={D_qk}) to match q and v")
+    if H_q % H_k or H_q % H_v:
+        raise ValueError(f"GQA head counts must divide H_q={H_q}; got H_k={H_k}, H_v={H_v}")
+    if o.shape != (B, H_q, S_q, D_v) or grad_out.shape != o.shape:
+        raise ValueError(f"o {tuple(o.shape)} / grad_out {tuple(grad_out.shape)} must be (B={B}, H_q={H_q}, S_q={S_q}, D_v={D_v})")
+    _check_same_device(q, k=k, v=v, o=o, lse=lse, grad_out=grad_out)
+
+    # Descriptor contract (innermost dense, 16B-aligned base) — before the
+    # strides are read and before dO is matched to O, so a repaired O does not
+    # leave dO on the old layout.
+    q = _normalize_operand(q, "q", "sdpa_bwd")
+    k = _normalize_operand(k, "k", "sdpa_bwd")
+    v = _normalize_operand(v, "v", "sdpa_bwd")
+    o = _normalize_operand(o, "o", "sdpa_bwd")
+
+    if lse.dtype != torch.float32:
+        raise ValueError(f"lse must be float32, got {lse.dtype}")
+    if not lse.is_contiguous() or lse.data_ptr() % 16:
+        lse = lse.clone(memory_format=torch.contiguous_format)
+    lse = lse.reshape(B, H_q, S_q, 1)
+    # dO must match O's layout (and be 16B-aligned) — equal strides with an
+    # odd storage offset would fault the kernels.
+    if grad_out.stride() != o.stride() or grad_out.data_ptr() % 16:
+        grad_out = torch.empty_strided(o.shape, o.stride(), dtype=grad_out.dtype, device=grad_out.device).copy_(grad_out)
+
+    # Gradients adopt the corresponding input's layout; a broadcast/overlapping
+    # input has no usable gradient layout, so fall back to packed there.
+    dq_stride = _like_layout_stride((B, H_q, S_q, D_qk), q)
+    dk_stride = _like_layout_stride((B, H_k, S_kv, D_qk), k)
+    dv_stride = _like_layout_stride((B, H_v, S_kv, D_v), v)
+    stats_stride = (H_q * S_q, S_q, 1, 1)
+
+    key = (
+        "sdpa_bwd_dense",
+        q.dtype,
+        B,
+        H_q,
+        H_k,
+        H_v,
+        S_q,
+        S_kv,
+        D_qk,
+        D_v,
+        tuple(q.stride()),
+        tuple(k.stride()),
+        tuple(v.stride()),
+        tuple(o.stride()),
+        dq_stride,
+        dk_stride,
+        dv_stride,
+        attn_scale,
+        is_causal,
+        causal_bottom_right,
+        window_left,
+        is_deterministic,
+        q.device,
+    )
+
+    handle = _get_handle(q.device)
+    g, ws = _cached_graph(
+        key,
+        lambda: _build_bwd_graph(
+            handle,
+            dtype=q.dtype,
+            B=B,
+            H_q=H_q,
+            H_k=H_k,
+            H_v=H_v,
+            S_q=S_q,
+            S_kv=S_kv,
+            D_qk=D_qk,
+            D_v=D_v,
+            total_q=0,
+            total_kv=0,
+            attn_scale=attn_scale,
+            is_causal=is_causal,
+            causal_bottom_right=causal_bottom_right,
+            window_left=window_left,
+            q_stride=q.stride(),
+            k_stride=k.stride(),
+            v_stride=v.stride(),
+            o_stride=o.stride(),
+            stats_stride=stats_stride,
+            is_deterministic=is_deterministic,
+            is_thd=False,
+            dq_stride=dq_stride,
+            dk_stride=dk_stride,
+            dv_stride=dv_stride,
+        ),
+    )
+
+    dq = torch.empty_strided((B, H_q, S_q, D_qk), dq_stride, dtype=q.dtype, device=q.device)
+    dk = torch.empty_strided((B, H_k, S_kv, D_qk), dk_stride, dtype=q.dtype, device=q.device)
+    dv = torch.empty_strided((B, H_v, S_kv, D_v), dv_stride, dtype=q.dtype, device=q.device)
+    workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
+
+    variant = {
+        int(_UIDs.Q): q,
+        int(_UIDs.K): k,
+        int(_UIDs.V): v,
+        int(_UIDs.O): o,
+        int(_UIDs.DO): grad_out,
+        int(_UIDs.STATS): lse,
+        int(_UIDs.DQ): dq,
+        int(_UIDs.DK): dk,
+        int(_UIDs.DV): dv,
+    }
+    g.execute(variant, workspace, handle=handle)
+    return dq, dk, dv
 
 
 def _sdpa_bwd_impl(
@@ -657,19 +825,36 @@ def _sdpa_bwd_impl(
         # this backward has no dSink support yet, and silently ignoring the
         # sink term would produce numerically wrong dq/dk/dv.
         raise NotImplementedError("cudnn::sdpa_bwd does not support attention sinks yet (dSink is a follow-up); gradients would be wrong")
-    if cu_seqlens_q is None:
-        raise NotImplementedError("cudnn::sdpa_bwd currently serves the THD/varlen path; dense backward is a follow-up")
-    if cu_seqlens_kv is None or max_seqlen_q <= 0 or max_seqlen_kv <= 0:
-        raise ValueError("varlen path needs cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv")
-    if q.ndim != 3:
-        raise ValueError(f"varlen path expects packed (T, H, D) tensors, got q.ndim={q.ndim}")
+    is_thd = cu_seqlens_q is not None
+    if is_thd:
+        if cu_seqlens_kv is None or max_seqlen_q <= 0 or max_seqlen_kv <= 0:
+            raise ValueError("varlen path needs cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv")
+        if q.ndim != 3:
+            raise ValueError(f"varlen path expects packed (T, H, D) tensors, got q.ndim={q.ndim}")
+    elif q.ndim != 4:
+        raise ValueError(f"dense path expects BHSD tensors, got q.ndim={q.ndim}")
     _check_io_dtypes("sdpa_bwd", grad_out=grad_out, q=q, k=k, v=v, o=o)
 
+    if not is_thd:
+        return _sdpa_bwd_dense(
+            grad_out,
+            q,
+            k,
+            v,
+            o,
+            lse,
+            attn_scale,
+            is_causal=is_causal,
+            causal_bottom_right=causal_bottom_right,
+            window_left=window_left,
+            is_deterministic=is_deterministic,
+        )
+
     B = cu_seqlens_q.numel() - 1
-    q = _normalize_thd(q, "q")
-    k = _normalize_thd(k, "k")
-    v = _normalize_thd(v, "v")
-    o = _normalize_thd(o, "o")
+    q = _normalize_operand(q, "q")
+    k = _normalize_operand(k, "k")
+    v = _normalize_operand(v, "v")
+    o = _normalize_operand(o, "o", "sdpa_bwd")
     T_q, H_q, D_qk = q.shape
     T_kv, H_v, D_v = v.shape
     H_k = k.shape[1]
@@ -759,6 +944,7 @@ def _sdpa_bwd_impl(
             o_stride=o_stride,
             stats_stride=stats_stride,
             is_deterministic=is_deterministic,
+            is_thd=True,
         ),
     )
 
@@ -816,9 +1002,16 @@ def _sdpa_bwd_fake(
     max_seqlen_kv=0,
     is_deterministic=False,
 ):
-    # The real kernel returns FRESH packed-contiguous gradients in q.dtype —
-    # not views of the inputs (q/k/v may be non-contiguous kv-interleaved
-    # views), so empty_like would report strides that never materialize.
+    # The real kernel returns FRESH gradients in q.dtype, never views of the
+    # inputs, so empty_like would report strides that never materialize. THD
+    # gradients are packed-contiguous (q/k/v may be kv-interleaved views);
+    # dense gradients adopt each input's own dim-permutation, which the meta
+    # kernel must mirror exactly or opcheck's stride assertions fail.
+    if cu_seqlens_q is None:
+        dq = torch.empty_strided(q.shape, _like_layout_stride(tuple(q.shape), q), dtype=q.dtype, device=q.device)
+        dk = torch.empty_strided(k.shape, _like_layout_stride(tuple(k.shape), k), dtype=q.dtype, device=q.device)
+        dv = torch.empty_strided(v.shape, _like_layout_stride(tuple(v.shape), v), dtype=q.dtype, device=q.device)
+        return dq, dk, dv
     dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     dk = torch.empty(k.shape, dtype=q.dtype, device=q.device)
     dv = torch.empty(v.shape, dtype=q.dtype, device=q.device)
@@ -871,31 +1064,65 @@ def _sdpa_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[1])
 
 
+def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seqlen_q: int) -> torch.Tensor:
+    """Packed ``(T, H)`` log-sum-exp -> padded ``(B, H, max_seqlen_q, 1)``.
+
+    ``cudnn::sdpa_bwd`` takes the padded layout on the THD path (the backend
+    rejects ragged LSE for bprop THD on SM8X/SM12X). Rows past each sequence's
+    length stay zero and are ignored.
+
+    Entirely DEVICE-side, and deliberately so: the obvious
+    ``for i in range(B): int(cu[i])`` loop is ``2*B`` blocking D2H copies
+    before the backward kernel is even launched, which makes an async-launch
+    API synchronous and cannot be stream-captured (python/cudnn/AGENTS.md,
+    Rule 3). It also keeps the conversion traceable under dynamic-shape AOT
+    dispatch, where reading a cu value to host raises
+    GuardOnDataDependentSymNode.
+    """
+    B = cu_seqlens_q.numel() - 1
+    T, H = lse_th.shape
+    cu = cu_seqlens_q.long()
+    token = torch.arange(T, device=lse_th.device)
+    seq_of_token = torch.searchsorted(cu[1:], token, right=True)  # t in [cu[i], cu[i+1]) -> i
+    pos_in_seq = token - cu[seq_of_token]
+    padded = torch.zeros(B, H, max_seqlen_q, 1, dtype=torch.float32, device=lse_th.device)
+    padded[seq_of_token, :, pos_in_seq, 0] = lse_th
+    return padded
+
+
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
     q, k, v, o, stats, cu_q, cu_kv = ctx.saved_tensors
     if grad_o is None:  # o unused in the loss; stats is non-differentiable
         return (None,) * 15
-    if cu_q is None:
-        raise NotImplementedError("cudnn::sdpa_fwd autograd serves the THD/varlen path; dense backward is a follow-up")
     if ctx.has_sinks:
         raise NotImplementedError("cudnn::sdpa_fwd autograd does not support attention sinks yet (dSink is a follow-up)")
-    if ctx.has_seq_lens:
+    if ctx.has_seq_lens and cu_q is None:
         raise NotImplementedError("cudnn::sdpa_fwd autograd does not support the padded dense path yet")
     if not ctx.return_lse:
         raise RuntimeError("cudnn::sdpa_fwd autograd requires return_lse=True (the backward consumes the forward stats)")
+
+    if cu_q is None:
+        # Dense: stats already are (B, H, S, 1) fp32 — hand them straight on.
+        dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
+            grad_o,
+            q,
+            k,
+            v,
+            o,
+            stats,
+            ctx.attn_scale,
+            is_causal=ctx.is_causal,
+            causal_bottom_right=ctx.causal_bottom_right,
+            window_left=ctx.window_left,
+            is_deterministic=torch.are_deterministic_algorithms_enabled(),
+        )
+        return (dq, dk, dv) + (None,) * 12
 
     # Packed TH1 (T, H, 1) -> padded (B, H, max_seqlen_q, 1): the backend
     # rejects ragged LSE for bprop THD on SM8X/SM12X. Entirely device-side
     # (no host reads of cu values): traceable under dynamic-shape AOT
     # dispatch, and no D2H sync on the backward hot path.
-    B = cu_q.numel() - 1
-    H_q = q.shape[1]
-    T_q = stats.shape[0]
-    token = torch.arange(T_q, device=stats.device)
-    seq_of_token = torch.searchsorted(cu_q[1:].long(), token, right=True)  # token t in [cu[i], cu[i+1]) -> i
-    pos_in_seq = token - cu_q.long()[seq_of_token]
-    lse_padded = torch.zeros(B, H_q, ctx.max_seqlen_q, 1, dtype=torch.float32, device=stats.device)
-    lse_padded[seq_of_token, :, pos_in_seq, 0] = stats[:, :, 0]
+    lse_padded = thd_lse_to_padded(stats[:, :, 0], cu_q, ctx.max_seqlen_q)
 
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_o,

@@ -426,6 +426,17 @@ def __getattr__(name: str) -> Any:
         globals()["jax"] = _jax
         return _jax
 
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
+
     if name == "fla":
         # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.
         # Deferred so `import cudnn` never eagerly imports torch / the FLA shim.
