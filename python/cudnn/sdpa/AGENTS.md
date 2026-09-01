@@ -16,11 +16,17 @@ head-major, never dense-padded.**
   (per-sequence stride) mis-addresses under that packing — it must be
   rejected at validation time, not silently accepted and mis-read.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
-  `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1 and
-  stride_h >= H`; anything else raises. See `_checked_lse_view` in
-  `fwd/api_dsl.py` (duplicated at the two THD compile-key call sites —
-  extract rather than re-copy if you touch it, per Rule 3's "suspect
-  duplicated logic first").
+  `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
+  `stride_h` the declared head stride, which must cover the **packed token
+  count `T`** — `stride_h >= H` is not the bound; at `T > stride_h` the
+  per-head slices alias. `T` is a runtime total, so plan-time
+  classification can only check `stride_s == 1 and stride_h >= 1`; the
+  packed total fitting under the declared head stride is an execute-time
+  capacity check (the dense path's `_checked_lse_view` rejects via
+  `as_strided` when the backing storage is too small). See the THD
+  classification sites in `fwd/api_dsl.py` (duplicated at the two THD
+  compile-key call sites — extract rather than re-copy if you touch it,
+  per Rule 3's "suspect duplicated logic first").
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
