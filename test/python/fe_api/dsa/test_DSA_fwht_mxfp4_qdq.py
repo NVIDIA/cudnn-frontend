@@ -3,17 +3,29 @@
 
 """Tests for the DeepSeek-V4 normalized H128 plus MXFP4 QDQ operation."""
 
+from importlib import import_module
+
 import pytest
 import torch
-
-pytestmark = pytest.mark.L0
 
 
 def _require_supported_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("the current inline E2M1 conversion path requires Blackwell+")
+    if torch.cuda.get_device_capability()[0] not in (10, 11, 12):
+        pytest.skip("the current inline E2M1 conversion path requires an SM100-, SM110-, or SM120-family GPU")
+
+
+def _require_operation():
+    """Return the operation only when all lazy optional dependencies exist."""
+
+    _require_supported_device()
+    try:
+        import_module("cudnn.ops._fwht_mxfp4_qdq_cutedsl")
+        from cudnn.ops import fwht_mxfp4_qdq
+    except ImportError as error:
+        pytest.skip(f"CuTe DSL optional dependencies are unavailable: {error}")
+    return fwht_mxfp4_qdq
 
 
 def _pow2_ceil_positive(values: torch.Tensor) -> torch.Tensor:
@@ -112,6 +124,7 @@ def _legacy_combined_round_reference(input_tensor: torch.Tensor) -> torch.Tensor
     return output.reshape(input_tensor.shape).to(torch.bfloat16)
 
 
+@pytest.mark.L0
 def test_reference_e2m1_rne_ties_and_neighbors_on_host():
     boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32)
     below = torch.nextafter(boundaries, torch.zeros_like(boundaries))
@@ -127,6 +140,7 @@ def test_reference_e2m1_rne_ties_and_neighbors_on_host():
     assert torch.equal(quantized_zero.view(torch.int16), torch.tensor([-32768, 0], dtype=torch.int16))
 
 
+@pytest.mark.L0
 def test_reference_ue8m0_power_of_two_boundaries_on_host():
     exponents = torch.tensor([-125, -64, -1, 0, 1, 64, 125], dtype=torch.int32)
     exact = torch.ldexp(torch.ones(exponents.shape, dtype=torch.float32), exponents)
@@ -147,6 +161,7 @@ def test_reference_ue8m0_power_of_two_boundaries_on_host():
     assert torch.equal(_pow2_ceil_positive(maximum_bf16 * (1.0 / 6.0)), maximum_scale)
 
 
+@pytest.mark.L1
 def test_packed_bf16_qdq_matches_reference_for_every_finite_bf16_on_host():
     positive_bits = torch.arange(0x0000, 0x7F80, dtype=torch.int32)
     finite_bits = torch.cat((positive_bits, positive_bits | 0x8000))
@@ -163,6 +178,7 @@ def test_packed_bf16_qdq_matches_reference_for_every_finite_bf16_on_host():
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.L1
 def test_packed_scale_bytes_match_reference_for_every_positive_finite_bf16_on_host():
     positive_bits = torch.arange(0x0000, 0x7F80, dtype=torch.int32)
     clamped_bits = torch.maximum(positive_bits, torch.tensor(0x01C0, dtype=torch.int32))
@@ -183,6 +199,7 @@ def test_packed_scale_bytes_match_reference_for_every_positive_finite_bf16_on_ho
     assert torch.equal(actual_high, expected.flip(0))
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("rows", [15, 16, 17])
 def test_reference_is_row_local_at_current_cta_boundary_on_host(rows):
     torch.manual_seed(20260829 + rows)
@@ -206,6 +223,7 @@ def _subnormal_double_rounding_case():
     return input_tensor, expected, legacy
 
 
+@pytest.mark.L0
 def test_bf16_boundary_precedes_inverse_scale_on_host():
     """Lock down the double-rounding case fixed by the baseline implementation."""
 
@@ -216,9 +234,9 @@ def test_bf16_boundary_precedes_inverse_scale_on_host():
     assert torch.equal(legacy, torch.full((1, 128), 0x0040, dtype=torch.int16))
 
 
+@pytest.mark.L0
 def test_actual_kernel_observes_bf16_boundary_before_inverse_scale():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     input_tensor, expected, legacy = _subnormal_double_rounding_case()
     actual = fwht_mxfp4_qdq(input_tensor.cuda()).cpu().view(torch.int16)
@@ -227,13 +245,10 @@ def test_actual_kernel_observes_bf16_boundary_before_inverse_scale():
     assert not torch.equal(actual, legacy)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("shape", [(1, 128), (31, 128), (33, 128), (2, 3, 4, 128)])
 def test_fwht_mxfp4_qdq_matches_exact_recipe(shape):
-    _require_supported_device()
-    try:
-        from cudnn.ops import fwht_mxfp4_qdq
-    except ImportError as error:
-        pytest.skip(f"CuTe DSL optional dependencies are unavailable: {error}")
+    fwht_mxfp4_qdq = _require_operation()
 
     torch.manual_seed(20260829)
     input_tensor = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
@@ -246,10 +261,25 @@ def test_fwht_mxfp4_qdq_matches_exact_recipe(shape):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("compute_capability", [(9, 0), (13, 0)])
+def test_fwht_mxfp4_qdq_rejects_unsupported_arch_before_compile(monkeypatch, compute_capability):
+    _require_operation()
+    from cudnn.ops import _fwht_mxfp4_qdq_cutedsl as kernel_module
+
+    input_tensor = torch.zeros((1, 128), device="cuda", dtype=torch.bfloat16)
+    output_tensor = torch.empty_like(input_tensor)
+    monkeypatch.setattr(kernel_module.torch.cuda, "get_device_capability", lambda _device: compute_capability)
+    monkeypatch.setattr(kernel_module.cute, "compile", lambda *_args, **_kwargs: pytest.fail("unsupported targets must not compile"))
+
+    with pytest.raises(RuntimeError, match=r"SM100-, SM110-, or SM120-family.*compute capability"):
+        kernel_module.run_fwht_mxfp4_qdq(input_tensor, output_tensor)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("rows", [15, 16, 17, 63, 64, 65, 127, 128, 129])
 def test_fwht_mxfp4_qdq_cta_row_boundaries(rows):
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     torch.manual_seed(20260830 + rows)
     input_tensor = torch.randn((rows, 128), device="cuda", dtype=torch.bfloat16)
@@ -258,10 +288,10 @@ def test_fwht_mxfp4_qdq_cta_row_boundaries(rows):
     assert torch.equal(actual, _reference(input_tensor))
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_fwht_mxfp4_qdq_torch_library_contract():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     input_tensor = torch.randn((65, 128), device="cuda", dtype=torch.bfloat16)
     # Importing the public function performs the lazy registration.
@@ -282,10 +312,10 @@ def test_fwht_mxfp4_qdq_torch_library_contract():
     assert results == {test: "SUCCESS" for test in test_utils}
 
 
+@pytest.mark.L1
 @torch.no_grad()
 def test_fwht_mxfp4_qdq_torch_compile_fullgraph():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     torch.manual_seed(20260901)
     input_tensor = torch.randn((65, 128), device="cuda", dtype=torch.bfloat16)
@@ -296,10 +326,14 @@ def test_fwht_mxfp4_qdq_torch_compile_fullgraph():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
 @torch.no_grad()
 def test_fwht_mxfp4_qdq_respects_non_default_torch_stream():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is unavailable")
 
     torch.manual_seed(20260902)
     input_tensor = torch.zeros((65, 128), device="cuda", dtype=torch.bfloat16)
@@ -310,25 +344,24 @@ def test_fwht_mxfp4_qdq_respects_non_default_torch_stream():
     fwht_mxfp4_qdq(input_tensor)
     torch.cuda.synchronize()
 
+    # Park the side stream before the input update. A launch incorrectly sent
+    # to the default stream overtakes the update and reads the old zeros, while
+    # a launch on the current side stream is ordered after the replacement.
     side_stream = torch.cuda.Stream()
-    gate = torch.cuda.Event()
     with torch.cuda.stream(side_stream):
-        side_stream.wait_event(gate)
+        torch.cuda._sleep(500_000_000)
         input_tensor.copy_(replacement)
         actual = fwht_mxfp4_qdq(input_tensor)
 
-    # A launch incorrectly sent to the default stream would execute before the
-    # gated input update. A launch on the current side stream observes it.
-    gate.record()
-    side_stream.synchronize()
+    torch.cuda.synchronize()
 
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_fwht_mxfp4_qdq_warmed_cuda_graph_capture_and_replay():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     torch.manual_seed(20260903)
     static_input = torch.zeros((65, 128), device="cuda", dtype=torch.bfloat16)
@@ -354,9 +387,9 @@ def test_fwht_mxfp4_qdq_warmed_cuda_graph_capture_and_replay():
         assert torch.equal(captured_output, replay_expected)
 
 
+@pytest.mark.L0
 def test_fwht_mxfp4_qdq_empty_does_not_launch():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     input_tensor = torch.empty((0, 128), device="cuda", dtype=torch.bfloat16)
     output = fwht_mxfp4_qdq(input_tensor)
@@ -364,9 +397,9 @@ def test_fwht_mxfp4_qdq_empty_does_not_launch():
     assert output.numel() == 0
 
 
+@pytest.mark.L0
 def test_fwht_mxfp4_qdq_rejects_implicit_layout_conversion():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     input_tensor = torch.empty((128, 7), device="cuda", dtype=torch.bfloat16).transpose(0, 1)
     assert input_tensor.shape == (7, 128)
@@ -375,9 +408,9 @@ def test_fwht_mxfp4_qdq_rejects_implicit_layout_conversion():
         fwht_mxfp4_qdq(input_tensor)
 
 
+@pytest.mark.L0
 def test_fwht_mxfp4_qdq_rejects_misaligned_contiguous_view():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     storage = torch.empty((129,), device="cuda", dtype=torch.bfloat16)
     input_tensor = storage[1:].view(1, 128)
@@ -387,9 +420,9 @@ def test_fwht_mxfp4_qdq_rejects_misaligned_contiguous_view():
         fwht_mxfp4_qdq(input_tensor)
 
 
+@pytest.mark.L0
 def test_fwht_mxfp4_qdq_is_explicitly_inference_only():
-    _require_supported_device()
-    from cudnn.ops import fwht_mxfp4_qdq
+    fwht_mxfp4_qdq = _require_operation()
 
     input_tensor = torch.randn((1, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
     with pytest.raises(NotImplementedError, match="inference-only"):

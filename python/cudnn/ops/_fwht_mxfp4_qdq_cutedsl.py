@@ -35,6 +35,11 @@ WORDS_PER_GROUP_PER_LANE = WORDS_PER_LANE // GROUPS_PER_LANE
 
 NORM_BITS = 0x3DB504F3  # float32(128 ** -0.5)
 
+# The packed E2M1/BF16 conversion sequence is defined only for these PTX
+# architecture families.  Minor capabilities select family variants and are
+# intentionally accepted (for example SM103 and SM121).
+_SUPPORTED_ARCHITECTURE_MAJORS = frozenset((10, 11, 12))
+
 _WORD_INDICES = list(range(WORDS_PER_LANE))
 _VECTOR_INDICES = list(range(VECTORS_PER_LANE))
 _GROUP_INDICES = list(range(GROUPS_PER_LANE))
@@ -363,13 +368,23 @@ _COMPILED_KERNELS = {}
 def run_fwht_mxfp4_qdq(input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> None:
     """Launch the internal kernel on checked contiguous ``[M, 128]`` tensors."""
 
-    from cuda.bindings import driver as cuda_driver
-
     device = input_tensor.device
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     compute_capability = torch.cuda.get_device_capability(device)
+    if compute_capability[0] not in _SUPPORTED_ARCHITECTURE_MAJORS:
+        raise RuntimeError(
+            "fwht_mxfp4_qdq requires an SM100-, SM110-, or SM120-family GPU "
+            "for its packed E2M1/BF16 instructions; "
+            f"device {device} has compute capability {compute_capability[0]}.{compute_capability[1]}"
+        )
+
+    # Import and compile only after the architecture has been admitted so an
+    # unsupported target receives the semantic error above rather than an
+    # opaque optional-runtime or PTX-assembly failure.
+    from cuda.bindings import driver as cuda_driver
+
     cache_key = (device_index, compute_capability)
     with torch.cuda.device(device):
         stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
