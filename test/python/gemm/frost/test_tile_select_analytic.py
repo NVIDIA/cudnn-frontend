@@ -16,12 +16,8 @@ Selection is pure geometry, so every invariant is checkable on CPU:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from cudnn.gemm.frost.tile_config import by_name, select_config
-
-pytestmark = pytest.mark.L0
 
 MS = (1, 4, 16, 32, 64, 96, 128, 129, 256, 512, 1024, 4096)
 NS = (32, 64, 128, 256, 512, 1024, 4096, 8192, 10240)
@@ -65,43 +61,19 @@ def test_multi_gemm_budget_and_constraints():
             assert cfg.cta_group == 1, "multi-GEMM is 1ctamma-only"
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("M", [384, 768, 1408])
-def test_terminal_quant_strategy_forces_one_cta_and_rescores_cluster(M):
-    """Ultra-like terminal-quant up projections use 1-CTA; the matching down
-    geometry keeps the default 2-CTA policy.  The cluster remains a scorer result."""
-    from cudnn.gemm.frost import tile_config as tc
-
-    sm_count = 148
-    up = select_config(
-        M,
-        5120,
-        1,
-        K=2048,
-        block_scale=True,
-        sm_count=sm_count,
-        force_cta_group=1,
-    )
-    down = select_config(M, 2048, 1, K=5120, block_scale=True, sm_count=sm_count)
-    assert up.cta_group == 1
-    assert down.cta_group == 2
-
-    pool = [cluster for cluster in tc._CLUSTERS_1D + tc._CLUSTERS_2D if not tc._hang_prone(up.cta_tile_m, up.cta_tile_n, *cluster)]
-    expected = max(
-        pool,
-        key=lambda cluster: tc._cluster_score(
-            M,
-            5120,
-            up.cta_tile_m,
-            up.cta_tile_n,
-            1,
-            *cluster,
-            sm_count,
-        ),
-    )
-    assert (up.cga_size_m, up.cga_size_n) == expected
+def test_terminal_quant_strategy_can_select_one_cta(M):
+    """The strategy override selects a runnable 1-CTA config without pinning a
+    private tile or cluster identity."""
+    config = select_config(M, 5120, 1, K=2048, block_scale=True, sm_count=148, force_cta_group=1)
+    assert config.cta_group == 1
+    assert by_name(config.name) is config
 
 
+@pytest.mark.L0
 def test_force_cta_group_rejects_invalid_or_unsupported_values():
+    """Invalid overrides and a 2-CTA multi-GEMM request fail explicitly."""
     for value in (True, 0, 3):
         with pytest.raises(ValueError, match="force_cta_group"):
             select_config(384, 5120, 1, force_cta_group=value)
@@ -109,28 +81,91 @@ def test_force_cta_group_rejects_invalid_or_unsupported_values():
         select_config(384, 5120, 2, force_cta_group=2)
 
 
-@pytest.mark.parametrize("M", [384, 768, 1408])
-def test_planner_applies_one_cta_to_dense_and_grouped_terminal_quant_chain(monkeypatch, M):
+def _block_scaled_chain(*, M, N=5120, K=2048, batch=1, quantized=True, moe_groups=None):
+    """Build the semantic IR consumed by the planner, without GPU storage."""
+    from cudnn.gemm.frost.fusion_ir import (
+        BlockQuantizeSpec,
+        BlockScaleSpec,
+        FusionChain,
+        MatmulSpec,
+        MoeSpec,
+        OutputSpec,
+        gemm_source,
+    )
+
+    if moe_groups is not None and batch != 1:
+        raise ValueError("MoE analyzer IR always has batch=1")
+    matmul = MatmulSpec(
+        M=M,
+        N=N,
+        K=K,
+        batch=batch,
+        a_batch=1,
+        b_batch=batch,
+        a_dtype="fp4_e2m1",
+        b_dtype="fp4_e2m1",
+    )
+    block_scale = BlockScaleSpec(
+        a_dtype="fp4_e2m1",
+        b_dtype="fp4_e2m1",
+        block_size_a=(1, 16),
+        block_size_b=(16, 1),
+        sf_dtype_a="fp8_e4m3",
+        sf_dtype_b="fp8_e4m3",
+        sfa_reorder="F8_128x4",
+        sfb_reorder="F8_128x4",
+        dequant_compute_a="fp32",
+        dequant_compute_b="fp32",
+        dequant_out_a="fp32",
+        dequant_out_b="fp32",
+    )
+    source = gemm_source(0)
+    quants = [BlockQuantizeSpec(source_ref=source, block_size=16, scale_dtype="fp8_e4m3")] if quantized else []
+    output = OutputSpec(source_ref=source, dtype="fp4_e2m1", quant_idx=0) if quantized else OutputSpec(source_ref=source, dtype="bf16")
+    moe = None if moe_groups is None else MoeSpec(num_experts=moe_groups, num_groups=moe_groups)
+    return FusionChain(matmul=matmul, block_scale=block_scale, moe=moe, quants=quants, output_specs=[output])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("M,expected_cta_group", [(384, 1), (1408, 1), (1409, 2), (4096, 2)])
+def test_planner_bounds_terminal_quant_one_cta_to_measured_total_rows(monkeypatch, M, expected_cta_group):
+    """The terminal-quant override stops at the measured total-row boundary."""
     from cudnn.gemm.frost import compiler, kernel_registry
 
     monkeypatch.setattr(kernel_registry, "preferred_strategy", lambda _chain, config: config)
+    config = compiler.plan_config(_block_scaled_chain(M=M))
+    assert config.cta_group == expected_cta_group
 
-    def chain(*, N, K, quants, moe_groups=None):
-        return SimpleNamespace(
-            matmul=SimpleNamespace(M=M * (moe_groups or 1), N=N, K=K, b_major="k", b_dtype="fp4_e2m1"),
-            moe=None if moe_groups is None else SimpleNamespace(num_groups=moe_groups),
-            num_gemms=1,
-            has_block_scale=True,
-            has_moe=moe_groups is not None,
-            quants=quants,
-        )
 
-    up = compiler.plan_config(chain(N=5120, K=2048, quants=[object()]))
-    down = compiler.plan_config(chain(N=2048, K=5120, quants=[]))
-    moe_quant = compiler.plan_config(chain(N=5120, K=2048, quants=[object()], moe_groups=64))
-    assert up.cta_group == 1
-    assert down.cta_group == 2
-    assert moe_quant.cta_group == 1
+@pytest.mark.L0
+def test_planner_uses_total_m_not_unobservable_moe_row_distribution(monkeypatch):
+    """A low average cannot extend the override past total M; naturally M-starved
+    grouped problems may still select 1-CTA through the ordinary heuristic."""
+    from cudnn.gemm.frost import compiler, kernel_registry
+
+    monkeypatch.setattr(kernel_registry, "preferred_strategy", lambda _chain, config: config)
+    assert compiler.plan_config(_block_scaled_chain(M=2816, moe_groups=2)).cta_group == 2
+    assert compiler.plan_config(_block_scaled_chain(M=2816, moe_groups=23)).cta_group == 1
+
+
+@pytest.mark.L0
+def test_planner_counts_every_dense_batch_row(monkeypatch):
+    """A small per-batch M does not bypass the total declared-row boundary."""
+    from cudnn.gemm.frost import compiler, kernel_registry
+
+    monkeypatch.setattr(kernel_registry, "preferred_strategy", lambda _chain, config: config)
+    assert compiler.plan_config(_block_scaled_chain(M=384, batch=3)).cta_group == 1
+    assert compiler.plan_config(_block_scaled_chain(M=384, batch=4)).cta_group == 2
+
+
+@pytest.mark.L0
+def test_non_quantizing_graph_keeps_default_cta_policy(monkeypatch):
+    """A block-scaled graph without a materialized quantizer is unaffected."""
+    from cudnn.gemm.frost import compiler, kernel_registry
+
+    monkeypatch.setattr(kernel_registry, "preferred_strategy", lambda _chain, config: config)
+    config = compiler.plan_config(_block_scaled_chain(M=384, N=2048, K=5120, quantized=False))
+    assert config.cta_group == 2
 
 
 def test_n_major_b_lifts_the_n_tile():
