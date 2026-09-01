@@ -679,6 +679,8 @@ def _geom_sm120(
 
 
 _SM120_SMEM_CAP_FALLBACK_BYTES = 99 * 1024
+
+
 def _sm120_smem_cap_bytes() -> int:
     try:
         from cudnn.frost.device import compute_capability, is_available, resolve_device
@@ -692,6 +694,7 @@ def _sm120_smem_cap_bytes() -> int:
     except Exception:
         return _SM120_SMEM_CAP_FALLBACK_BYTES
 
+
 _SM120_SMEM_CAP_BYTES = _sm120_smem_cap_bytes()
 _SM120_SMEM_FIXED_RESERVE = 2048  # kernel_registry's default smem_fixed_reserve
 _SM120_STG_STAGE_ELEMS = 528  # f32 staging elems per compute warp (template _STG_EPI_WARP_ELEMS)
@@ -702,6 +705,7 @@ def _sm120_smem_feasible(cta_m: int, cta_n: int, kb: int, num_compute_warps: int
     staging = 4 * _SM120_STG_STAGE_ELEMS * num_compute_warps
     stages = min((_SM120_SMEM_CAP_BYTES - _SM120_SMEM_FIXED_RESERVE) // per_stage, 16)
     return stages - -(-staging // per_stage) >= 1
+
 
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
