@@ -108,6 +108,7 @@ from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
+_REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
 
 
 def _exp2_mixed_late(vec):
@@ -1605,7 +1606,7 @@ def _mma_warp_group(
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
 
                 # BMM2 sub-tile 0
-                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
+                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(_REUSE_BMM2_ISSUE_ELECTION) else None
                 _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
@@ -1642,7 +1643,7 @@ def _mma_warp_group(
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                 # BMM2 sub-tile 1
-                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
+                bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(_REUSE_BMM2_ISSUE_ELECTION) else None
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
@@ -1692,7 +1693,7 @@ def _mma_warp_group(
             desc_V = sV[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
 
-            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
+            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(_REUSE_BMM2_ISSUE_ELECTION) else None
             _wait_mbarrier(bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
@@ -1721,7 +1722,7 @@ def _mma_warp_group(
             elect_p = nvvm.elect_sync()
             bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
-            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(CFG.THD_VARLEN) else None
+            bmm2_issue = nvvm.elect_sync() if cutlass.const_expr(_REUSE_BMM2_ISSUE_ELECTION) else None
             _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
             accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
