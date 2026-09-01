@@ -18,9 +18,10 @@ The initial contract is deliberately narrow: exact SM100 (validated on B200),
 BF16, one flat MQA KV stream, QK dimension 512 or 576, V dimension 512, and
 16/32/64/128 query heads.  FlashMLA itself launches 64- or 128-head kernels, so smaller
 cuDNN backward head counts are zero-padded to 64 for forward and sliced back
-before returning.  KV and aligned raw-forward Top-K inputs use zero-copy
-singleton-head views.  Safe-default training and score-recompute calls
-materialize safety-normalized indices because FlashMLA's invalid-index
+before returning.  KV and aligned raw-forward Top-K inputs without lengths use
+zero-copy singleton-head views.  Length-bearing forward, safe-default training,
+and score-recompute calls materialize safety-normalized indices because the
+provider may speculatively read an inactive valid suffix and its invalid-index
 contract is wider than the current cuDNN backward contract.  Training callers
 with an explicitly trusted compact producer may bypass that metadata work.
 """
@@ -30,8 +31,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from importlib import import_module, metadata as importlib_metadata
-from inspect import signature
+from inspect import getsourcefile, signature
 from numbers import Real
+from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -167,21 +169,27 @@ def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None
         ) from exc
 
 
-def _probe_flashmla_provider_identity() -> None:
-    """Require the declared build version whose private launch policy we adapt.
+def _probe_flashmla_provider_identity(flash_mla: Any, sparse_fwd: Callable[..., Any]) -> None:
+    """Require one pinned wheel to own the imported provider implementation.
 
     FlashMLA's module-level ``__version__`` is the generic ``1.0.0``.  Its
     official build metadata is more specific: ``setup.py`` appends the Git
     short SHA to the ``flash_mla`` distribution version, and that identity is
     retained in a built wheel.  The pinned revision reports
-    ``1.0.0+15f13e5``.
+    ``1.0.0+15f13e5``.  Version metadata alone is insufficient because a
+    package earlier on ``sys.path`` could otherwise borrow an installed
+    wheel's identity.  Require the imported package, the Python callable, and
+    the compiled extension actually bound in that callable's globals to appear
+    in that same distribution's file manifest.
 
     This check runs only when resolving a new provider callable.  It performs
     no device work and is cached together with the signature probe.
     """
 
     try:
-        installed_version = importlib_metadata.version("flash_mla")
+        distribution = importlib_metadata.distribution("flash_mla")
+        installed_version = distribution.version
+        distribution_files = distribution.files
     except importlib_metadata.PackageNotFoundError as exc:
         raise SparseAttentionBackendUnavailableError(
             "The imported 'flash_mla' package has no installed distribution metadata, "
@@ -189,7 +197,7 @@ def _probe_flashmla_provider_identity() -> None:
         ) from exc
     except Exception as exc:
         raise SparseAttentionBackendUnavailableError(
-            "Cannot read the installed 'flash_mla' distribution version, so its " f"declared build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
+            "Cannot read the installed 'flash_mla' distribution metadata, so its " f"build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
         ) from exc
 
     if installed_version != _FLASHMLA_DISTRIBUTION_VERSION:
@@ -199,6 +207,39 @@ def _probe_flashmla_provider_identity() -> None:
             f"from revision {_FLASHMLA_REVISION}. The adapter's head and Top-K padding "
             "must not be used with an unverified provider launch policy."
         )
+
+    if not distribution_files:
+        raise SparseAttentionBackendUnavailableError(
+            "The installed 'flash_mla' distribution has no file manifest, so the "
+            f"imported provider cannot be tied to its pinned build. {_FLASHMLA_INSTALL_HINT}"
+        )
+
+    provider_globals = getattr(sparse_fwd, "__globals__", None)
+    flash_mla_cuda = provider_globals.get("flash_mla_cuda") if isinstance(provider_globals, dict) else None
+    if not callable(getattr(flash_mla_cuda, "sparse_prefill_fwd", None)):
+        raise SparseAttentionBackendUnavailableError(
+            "The imported FlashMLA sparse-forward callable does not bind a callable " f"'flash_mla_cuda.sparse_prefill_fwd'. {_FLASHMLA_INSTALL_HINT}"
+        )
+
+    try:
+        owned_paths = {Path(distribution.locate_file(relative_path)).resolve() for relative_path in distribution_files}
+        provider_paths = {
+            "package": Path(flash_mla.__file__).resolve(),
+            "sparse forward callable": Path(getsourcefile(sparse_fwd)).resolve(),
+            "compiled sparse-forward extension": Path(flash_mla_cuda.__file__).resolve(),
+        }
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "Cannot resolve the imported FlashMLA package, sparse-forward callable, "
+            f"and compiled extension to files owned by the pinned distribution. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+    for label, provider_path in provider_paths.items():
+        if provider_path not in owned_paths:
+            raise SparseAttentionBackendUnavailableError(
+                f"The imported FlashMLA {label} at {provider_path} is not owned by the "
+                f"pinned {_FLASHMLA_DISTRIBUTION_VERSION!r} distribution. Remove shadowed "
+                f"or editable source trees from the import path. {_FLASHMLA_INSTALL_HINT}"
+            )
 
 
 def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -217,7 +258,7 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
             "The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}"
         )
     if sparse_fwd is not _validated_flashmla_sparse_fwd:
-        _probe_flashmla_provider_identity()
+        _probe_flashmla_provider_identity(flash_mla, sparse_fwd)
         _probe_flashmla_sparse_fwd_signature(sparse_fwd)
         _validated_flashmla_sparse_fwd = sparse_fwd
     return sparse_fwd
@@ -366,20 +407,21 @@ def _prepare_flashmla_launch_inputs(
     )
 
 
-def _mask_invalid_sparse_indices(
+def _normalize_sparse_index_slots(
     indices: torch.Tensor,
     topk_length: Optional[torch.Tensor],
     s_kv: int,
-) -> torch.Tensor:
-    """Map every invalid/inactive slot to ``-1`` without changing positions."""
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Mask unsafe slots and bound lengths without changing slot positions."""
 
     topk = indices.shape[1]
     valid = (indices >= 0) & (indices < s_kv)
+    bounded_length = None
     if topk_length is not None:
         bounded_length = topk_length.clamp(min=0, max=topk)
         positions = torch.arange(topk, dtype=torch.int32, device=indices.device).unsqueeze(0)
         valid = valid & (positions < bounded_length.unsqueeze(1))
-    return torch.where(valid, indices, -1)
+    return torch.where(valid, indices, -1), bounded_length
 
 
 def _normalize_cudnn_sparse_metadata(
@@ -417,7 +459,7 @@ def _normalize_cudnn_sparse_metadata(
         # launch the same metadata kernels this fast path exists to avoid.
         return indices, topk_length
 
-    normalized = _mask_invalid_sparse_indices(indices, topk_length, s_kv)
+    normalized, _ = _normalize_sparse_index_slots(indices, topk_length, s_kv)
     if topk_length is None:
         return normalized, None
 
@@ -501,6 +543,14 @@ def _run_flashmla_sparse_forward(
     # device guard so a multi-GPU caller does not accidentally route by another
     # device or enqueue adapter work on another device's current stream.
     with torch.cuda.device(q.device):
+        # The pinned provider may speculatively read a valid suffix index even
+        # when topk_length excludes it; if that KV row contains NaN, the
+        # ignored slot can contaminate the output.  Make the semantic length
+        # contract explicit in the metadata presented to the provider.  Pass
+        # the same bounded length used by the mask so an out-of-contract value
+        # cannot make the provider address beyond the physical Top-K extent.
+        if topk_length is not None:
+            indices, topk_length = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
         result = _launch_flashmla_sparse_forward(
             q,
             kv,
@@ -531,8 +581,10 @@ def sparse_attention_forward(
     ``q`` is ``(S_q, H, D)``, ``kv`` is ``(S_kv, D)``, and ``indices`` is
     ``(S_q, topk)`` with global positions into the flat KV stream.  Invalid
     indices may be ``-1`` or at least ``S_kv``.  ``topk_length``, when given,
-    must contain values in ``[0, topk]``.  The returned ``lse`` excludes the
-    attention sink, matching cuDNN DSA backward.
+    is clamped to the physical ``[0, topk]`` range.  The returned ``lse``
+    excludes the attention sink, matching cuDNN DSA backward.  Invalid entries
+    and the inactive suffix are safety-masked before the current provider
+    launch.
 
     Use :func:`sparse_attention` for an autograd-enabled call.
     """
@@ -637,12 +689,13 @@ def sparse_attention(
 
     Set ``trusted_compact_metadata=True`` only when the producer guarantees
     that every active-prefix index is in ``[0, S_kv)`` and every length is in
-    ``[0, K]``.  Without lengths, every nonnegative index must be below
+    ``[0, K]``; every inactive-suffix index must be invalid (negative or at
+    least ``S_kv``).  Without lengths, every nonnegative index must be below
     ``S_kv``.  The explicit fast path skips the device scan, mask, and
     compactification.  FlashMLA Top-K alignment padding and a downstream
     kernel's required contiguous copy can still occur; violating the trusted
     contract can cause an illegal memory access in the tuned cuDNN backward
-    kernel.
+    kernel or let an ignored provider load contaminate the output.
     """
 
     if attn_sink is None:
@@ -697,7 +750,7 @@ def sparse_attention_score_recompute(
     from .score_recompute.api import sparse_attn_score_recompute_wrapper
 
     with torch.cuda.device(q.device):
-        safe_indices = _mask_invalid_sparse_indices(indices, topk_length, kv.shape[0])
+        safe_indices, _ = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
         launch_topk = _round_up(indices.shape[1], _SCORE_TOPK_TILE)
         if launch_topk == indices.shape[1]:
             launch_indices = safe_indices

@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import types
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 
 import pytest
 import torch
@@ -19,6 +20,20 @@ from fe_api.dsa.dsa_reference import (
     check_ref_sparse_score_recompute,
     ref_sparse_attention_forward,
 )
+
+
+def _fake_flashmla_distribution(root: Path, version: str = "1.0.0+15f13e5"):
+    files = [
+        Path("flash_mla/__init__.py"),
+        Path("flash_mla/flash_mla_interface.py"),
+        Path("flash_mla/cuda.cpython-312-x86_64-linux-gnu.so"),
+    ]
+    return types.SimpleNamespace(version=version, files=files, locate_file=lambda relative_path: root / relative_path)
+
+
+def _bind_fake_flashmla_extension(monkeypatch, sparse_fwd, path: Path):
+    extension = types.SimpleNamespace(__file__=str(path), sparse_prefill_fwd=lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(sparse_fwd.__globals__, "flash_mla_cuda", extension)
 
 
 @pytest.mark.L0
@@ -101,7 +116,7 @@ def test_sparse_attention_forward_preserves_semantic_output_contract(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
     monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
     monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace(flash_mla_sparse_fwd=provider))
-    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda *_args: None)
 
     device = torch.device("cuda")
     q = torch.zeros((2, heads, head_dim), dtype=torch.bfloat16, device=device)
@@ -118,6 +133,37 @@ def test_sparse_attention_forward_preserves_semantic_output_contract(monkeypatch
     assert result["max_logits"].shape == result["lse"].shape == (2, heads)
     assert result["output"].dtype == torch.bfloat16
     assert result["max_logits"].dtype == result["lse"].dtype == torch.float32
+
+
+@pytest.mark.L0
+def test_sparse_attention_forward_bounds_lengths_before_provider(monkeypatch):
+    observed_lengths = []
+
+    def provider(q, kv, indices, *, sm_scale, d_v, attn_sink, topk_length):
+        observed_lengths.append(topk_length)
+        aux_shape = q.shape[:2]
+        return (
+            q.new_zeros((*aux_shape, d_v)),
+            torch.zeros(aux_shape, dtype=torch.float32, device=q.device),
+            torch.zeros(aux_shape, dtype=torch.float32, device=q.device),
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
+    monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace(flash_mla_sparse_fwd=provider))
+    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda *_args: None)
+
+    device = torch.device("cuda")
+    topk = 64
+    q = torch.zeros((2, 64, 512), dtype=torch.bfloat16, device=device)
+    kv = torch.zeros((7, 512), dtype=torch.bfloat16, device=device)
+    indices = torch.zeros((2, topk), dtype=torch.int32, device=device)
+    lengths = torch.tensor([-5, topk + 7], dtype=torch.int32, device=device)
+
+    DSA.sparse_attention_forward(q, kv, indices, topk_length=lengths)
+
+    assert len(observed_lengths) == 1
+    torch.testing.assert_close(observed_lengths[0], torch.tensor([0, topk], dtype=torch.int32, device=device))
 
 
 @pytest.mark.L0
@@ -144,21 +190,50 @@ def test_flashmla_dependency_without_sparse_entrypoint_fails_closed(monkeypatch)
 
 
 @pytest.mark.L0
-def test_flashmla_dependency_accepts_pinned_distribution_identity(monkeypatch):
+def test_flashmla_dependency_accepts_pinned_distribution_identity(monkeypatch, tmp_path):
     def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
         pytest.fail("compatibility probing must not execute the external callable")
 
-    versions = []
-    dependency = types.SimpleNamespace(__version__="1.0.0", flash_mla_sparse_fwd=compatible)
+    package_path = tmp_path / "flash_mla/__init__.py"
+    callable_path = tmp_path / "flash_mla/flash_mla_interface.py"
+    distributions = []
+    dependency = types.SimpleNamespace(__version__="1.0.0", __file__=str(package_path), flash_mla_sparse_fwd=compatible)
+    _bind_fake_flashmla_extension(monkeypatch, compatible, tmp_path / "flash_mla/cuda.cpython-312-x86_64-linux-gnu.so")
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
     monkeypatch.setattr(
         importlib_metadata,
-        "version",
-        lambda distribution: versions.append(distribution) or "1.0.0+15f13e5",
+        "distribution",
+        lambda distribution: distributions.append(distribution) or _fake_flashmla_distribution(tmp_path),
     )
+    monkeypatch.setattr(bridge, "getsourcefile", lambda _callable: str(callable_path))
 
     assert bridge._resolve_flashmla_sparse_fwd() is compatible
-    assert versions == ["flash_mla"]
+    assert distributions == ["flash_mla"]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shadowed_path", ["package", "callable", "extension"])
+def test_flashmla_dependency_rejects_code_not_owned_by_pinned_distribution(monkeypatch, tmp_path, shadowed_path):
+    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
+        pytest.fail("a shadowed provider must not execute")
+
+    package_path = tmp_path / "flash_mla/__init__.py"
+    callable_path = tmp_path / "flash_mla/flash_mla_interface.py"
+    extension_path = tmp_path / "flash_mla/cuda.cpython-312-x86_64-linux-gnu.so"
+    if shadowed_path == "package":
+        package_path = tmp_path / "shadow/flash_mla/__init__.py"
+    elif shadowed_path == "callable":
+        callable_path = tmp_path / "shadow/flash_mla/flash_mla_interface.py"
+    else:
+        extension_path = tmp_path / "shadow/flash_mla/cuda.cpython-312-x86_64-linux-gnu.so"
+    dependency = types.SimpleNamespace(__file__=str(package_path), flash_mla_sparse_fwd=compatible)
+    _bind_fake_flashmla_extension(monkeypatch, compatible, extension_path)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(importlib_metadata, "distribution", lambda _name: _fake_flashmla_distribution(tmp_path))
+    monkeypatch.setattr(bridge, "getsourcefile", lambda _callable: str(callable_path))
+
+    with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"not owned by the pinned"):
+        bridge._resolve_flashmla_sparse_fwd()
 
 
 @pytest.mark.L0
@@ -169,7 +244,7 @@ def test_flashmla_dependency_rejects_unverified_distribution_identity(monkeypatc
 
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: installed_version)
+    monkeypatch.setattr(importlib_metadata, "distribution", lambda _distribution: _fake_flashmla_distribution(Path("/unused"), installed_version))
 
     with pytest.raises(
         bridge.SparseAttentionBackendUnavailableError,
@@ -189,29 +264,10 @@ def test_flashmla_dependency_without_distribution_metadata_fails_closed(monkeypa
     def missing_distribution(_distribution):
         raise importlib_metadata.PackageNotFoundError("flash_mla")
 
-    monkeypatch.setattr(importlib_metadata, "version", missing_distribution)
+    monkeypatch.setattr(importlib_metadata, "distribution", missing_distribution)
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no installed distribution metadata"):
         bridge._resolve_flashmla_sparse_fwd()
-
-
-@pytest.mark.L0
-def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch):
-    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
-        pytest.fail("signature probing must not execute the external callable")
-
-    identity_probes = []
-    signature_probes = []
-    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
-    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
-    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda: identity_probes.append(None))
-    monkeypatch.setattr(bridge, "_probe_flashmla_sparse_fwd_signature", lambda candidate: signature_probes.append(candidate))
-
-    assert bridge._resolve_flashmla_sparse_fwd() is compatible
-    assert bridge._resolve_flashmla_sparse_fwd() is compatible
-    assert identity_probes == [None]
-    assert signature_probes == [compatible]
 
 
 @pytest.mark.L0
@@ -231,7 +287,7 @@ def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch)
 def test_flashmla_dependency_with_incompatible_call_signature_fails_closed(monkeypatch, incompatible):
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=incompatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda *_args: None)
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"incompatible signature.*topk_length"):
         bridge._resolve_flashmla_sparse_fwd()
@@ -247,7 +303,7 @@ def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch
 
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=OpaqueCallable())
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda *_args: None)
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no inspectable Python signature"):
         bridge._resolve_flashmla_sparse_fwd()
@@ -387,17 +443,19 @@ def test_sparse_attention_score_recompute_deepseek_v4_topk_contract(monkeypatch,
 
 @pytest.mark.L1
 @pytest.mark.parametrize(
-    "heads,head_dim,topk",
+    "heads,head_dim,topk,s_kv",
     [
-        pytest.param(64, 512, 64, id="native-h64-d512"),
-        pytest.param(32, 576, 65, id="padded-h32-d576-k65"),
+        pytest.param(64, 512, 64, 96, id="native-h64-d512"),
+        pytest.param(32, 576, 65, 96, id="padded-h32-d576-k65"),
+        pytest.param(128, 512, 1152, 1280, id="h128-d512-small-topk"),
+        pytest.param(128, 512, 1281, 1408, id="h128-d512-regular-topk"),
     ],
 )
-def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk):
+def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk, s_kv):
     _require_b200_flashmla()
     torch.manual_seed(410)
     device = torch.device("cuda")
-    s_q, s_kv = 4, 96
+    s_q = 4
     scale = 1.0 / math.sqrt(head_dim)
     q = torch.randn(s_q, heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
@@ -421,6 +479,31 @@ def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk):
     assert actual["max_logits"].shape == actual["lse"].shape == (s_q, heads)
     torch.testing.assert_close(actual["output"], out_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(actual["lse"], lse_ref, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.L1
+def test_flashmla_bridge_masks_inactive_valid_index_before_provider():
+    """An ignored valid index must not pull a NaN KV row into the output."""
+
+    _require_b200_flashmla()
+    torch.manual_seed(413)
+    device = torch.device("cuda")
+    s_q, s_kv, heads, head_dim, topk = 1, 65, 64, 512, 64
+    q = torch.randn(s_q, heads, head_dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
+    kv_with_nan_suffix = kv.clone()
+    kv_with_nan_suffix[-1].fill_(float("nan"))
+    sink = torch.randn(heads, dtype=torch.float32, device=device)
+    indices = torch.zeros((s_q, topk), dtype=torch.int32, device=device)
+    indices[0, 1] = s_kv - 1
+    lengths = torch.ones((s_q,), dtype=torch.int32, device=device)
+
+    actual = DSA.sparse_attention_forward(q, kv_with_nan_suffix, indices, attn_sink=sink, topk_length=lengths)
+    expected = DSA.sparse_attention_forward(q, kv, indices, attn_sink=sink, topk_length=lengths)
+
+    assert bool(torch.isfinite(actual["output"]).all())
+    torch.testing.assert_close(actual["output"], expected["output"], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(actual["lse"], expected["lse"], atol=0.0, rtol=0.0)
 
 
 @pytest.mark.L1

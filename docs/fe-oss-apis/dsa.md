@@ -136,30 +136,38 @@ pinned provider's private H/Top-K launch tiling, it requires the official
 `flash_mla` distribution version `1.0.0+15f13e5`. FlashMLA's build appends the
 Git short SHA to this distribution version; its module-level `__version__`
 remains the generic `1.0.0` and is not used as proof of compatibility. The
-declared-version check is cached with a call-signature check: the current entry
-point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`, `d_v`,
-`attn_sink`, and `topk_length` by keyword. Both checks are host-only and run
-before the first provider launch. Provider selection and launch planning remain
-private, so a future cuDNN forward can replace this bridge without renaming the
-semantic API.
+imported package, Python callable, and compiled extension actually bound by
+that callable must all be owned by the same installed distribution whose
+version is pinned to `1.0.0+15f13e5`; shadowed or editable source trees are
+rejected. This ownership check is cached with a call-signature check:
+the current entry point must accept `q`, `kv`, and `indices` positionally, plus
+`sm_scale`, `d_v`, `attn_sink`, and `topk_length` by keyword. Both checks are
+host-only and run before the first provider launch. Provider selection and
+launch planning remain private, so a future cuDNN forward can replace this
+bridge without renaming the semantic API.
 
 The initial functional contract is exact SM100 (validated on ComputeLab B200),
 BF16, one flat MQA KV stream,
 `D_qk in {512, 576}`, `D_v = 512`, and `H in {16, 32, 64, 128}`. H16/H32 are
 zero-padded to the external H64 launch. KV uses a zero-copy singleton-head
-view. The raw forward also views aligned Top-K without copying; the training
-and score paths must first safety-normalize indices because FlashMLA accepts
+view. The raw forward views aligned Top-K without copying when no lengths are
+given; with `topk_length`, it safety-masks the inactive suffix because the
+current provider can speculatively read an ignored valid index. The training
+and score paths must also safety-normalize indices because FlashMLA accepts
 high invalid sentinels that current cuDNN backward cannot address safely.
-For training with lengths, valid active entries are compacted and a safe
-length is derived; without lengths, every invalid sentinel becomes `-1`.
+Safe-default calls clamp lengths to the physical `[0, K]` range. For training
+with lengths, valid active entries are compacted and a safe length is derived;
+without lengths, every invalid sentinel becomes `-1`.
 This safe default launches metadata work. Producers that already emit a
 compact, bounded active prefix can opt into `trusted_compact_metadata=True`:
 every active index must then satisfy `0 <= index < S_kv`, every length must be
-in `[0, K]`, and without lengths every nonnegative index must be below `S_kv`.
-That explicit contract skips the device scan, mask, and compactification.
+in `[0, K]`, every inactive-suffix index must be negative or at least `S_kv`,
+and without lengths every nonnegative index must be below `S_kv`. That explicit
+contract skips the device scan, mask, and compactification.
 FlashMLA Top-K alignment padding and a downstream kernel's required contiguous
 copy can still occur. The contract is not inferred from device values;
-violating it can cause an illegal memory access in the tuned backward kernel.
+violating it can cause an illegal memory access in the tuned backward kernel
+or let an ignored provider load contaminate the output.
 Score recompute instead preserves every original slot, masks invalid/inactive
 positions to `-1`, and returns those effective `indices` beside the aligned
 `target`. No D2H validation or synchronization is introduced. Launch-only
