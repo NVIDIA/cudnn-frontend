@@ -1578,7 +1578,7 @@ def _kernel(
 
         # @@TMA_STORE_ONLY:BEGIN@@
         epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
-        # The routed output is a single (1, S, N) tensor, so the batch coord is fixed.
+        # The routed output is one flat (S, N) TMA surface.
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
         d_desc_base_list = [

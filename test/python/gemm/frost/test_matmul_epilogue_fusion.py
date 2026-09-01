@@ -2803,16 +2803,41 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
-    assert sites == 4, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+    assert sites == 6, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 6. A new one either "
         f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
         f"then update this test."
     )
     assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
+    # Col quant's `_scale_mine` is the fifth rmem tensor. It is a one-byte-per-
+    # block side-store carrier, not a dense value entering the TMA staging ring.
+    assert src.count("_scale_mine = cute.make_rmem_tensor(") == 1
     # The two block-quantize emitters were the last holdouts: their result now
     # reaches a TMA-stored dense output, so they must convert like the rest.
     assert src.count("_out = cute.make_rmem_tensor(") == 2
     assert src.count("_vec = {p}_out.load().to_vector()") == 2, "the block-quantize emitters must hand on a Vector"
+
+
+def test_col_quant_uses_four_wide_inverse_scale_pipeline() -> None:
+    """The FP8 scale conversion itself is deterministic x2 in hardware, but
+    the four scales in one col-quant batch should share a TensorSSA reciprocal
+    and clamp instead of lowering to four scalar compare/select pairs."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    assert "{p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)" in src
+    assert "{p}_iv = cute.math.min(cute.math.rcp({p}_upv" in src
+    assert "cute.arch.rcp_approx({p}_u{lane_in_batch})" not in src
+
+
+def test_row_quant_amax_uses_vector_reduce() -> None:
+    """A scalar max tree lowers every pair to FSETP/FSEL.  Keep the row-block
+    amax in TensorSSA form so MLIR lowers it to the compact vector reduction
+    used by the specialized grouped-GLU epilogue."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    assert "cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)" in src
+    assert "{p}_abs = cute.math.absf({p}_frg)" in src
+    assert "cutlass._mlir.dialects.math.absf" not in src
+    assert "{p}_abs[None, {k}].reduce(cute.ReductionOp.MAX" in src
+    assert 'lines.append(f"{var} = cute.math.max(' not in src
 
 
 _PW_M, _PW_N, _PW_K = 128, 128, 128

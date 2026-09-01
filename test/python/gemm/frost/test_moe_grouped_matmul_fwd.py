@@ -561,6 +561,26 @@ def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
     torch.testing.assert_close(output[0], _ref_f32(token, weight_k, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+def test_moe_tma_store_uses_rank2_output_descriptor() -> None:
+    """MoE's output is one flat (S, N) surface, so its TMA store must not carry
+    the fixed-one batch dimension paid by ordinary batched GEMM. Besides being
+    redundant in the descriptor, that extra coordinate selects UTMASTG.3D
+    instead of UTMASTG.2D in SASS."""
+    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_store_sequence
+
+    chain = analyze(_build_graph(E=4, S=512, N=256, K=128))
+    cfg = by_name(_CFG)
+    epi_n = _epi_n(cfg, chain.output_dtype)
+    host = _host_tma_c_descs(chain, frozenset({0}), epi_n)
+    sequence = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
+
+    assert "global_dims=[n, m]" in host
+    assert f"box_dims=[{epi_n}, epi_tile_mn[0]]" in host
+    assert "out_stride_l_0" not in host
+    assert "(col, coord_m)" in sequence
+    assert "tile_l" not in sequence
+
+
 @pytest.mark.parametrize("cta_group", (1, 2))
 def test_moe_m_major_output(cta_group: int) -> None:
     """A routed MoE output may be M-major. It takes STG: TMA would clip D to

@@ -110,6 +110,11 @@ def tma_out_value(j: int) -> str:
     return "vec_out" if j == 0 else f"_tma_out_{j}"
 
 
+def tma_out_ready_marker(j: int) -> str:
+    """Codegen marker immediately after TMA output ``j`` is ready."""
+    return f"# @@FROST_TMA_OUT_{j}_READY@@"
+
+
 def _aux_reads_row(aux: TensorRef) -> bool:
     return len(aux.dim) >= 2 and aux.dim[-2] != 1
 
@@ -904,16 +909,6 @@ def _quant_output_max(dtype: Dtype) -> str:
     raise ValueError(f"block quantize output dtype {dtype!r} is not supported by codegen")
 
 
-def _quant_output_min(dtype: Dtype) -> str:
-    if dtype == "fp8_e4m3":
-        return "cutlass.Float32(-448.0)"
-    if dtype == "fp8_e5m2":
-        return "cutlass.Float32(-57344.0)"
-    if dtype == "fp4_e2m1":
-        return "cutlass.Float32(-6.0)"
-    raise ValueError(f"block quantize output dtype {dtype!r} is not supported by codegen")
-
-
 def _scale_store_dtype(scale_dtype: Dtype) -> str:
     """The DSL type a quantized scale is STORED as — one source of truth for the
     scale tap's element type, its zero-init, and the value written. E5M3 has no
@@ -1012,64 +1007,85 @@ def _emit_block_quant_col(
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
         f"{p}_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)",
         f"{p}_rl = cute.arch.rcp_approx({_quant_output_max(output_dtype)})",
+        f"{p}_scale_mine = cute.make_rmem_tensor({n_groups}, {scale_dtype})",
     ]
     for k in range(n_groups):
-        lines.append(f"{p}_scale_mine_{k} = (cutlass.Float32(0.0)).to({scale_dtype})")
-    # Columns are processed in batches of 4 warp reductions issued
-    # back-to-back so their latencies overlap; only adjacent PAIRS share an
-    # instruction, so register liveness stays bounded by the batch.
-    for b0 in range(0, vsize, 4):
-        nb = min(4, vsize - b0)
-        cols = range(b0, b0 + nb)
-        for i in cols:
-            if quant.block_size == 16:
-                # 16-row blocks: each half-warp reduces its own block (the
-                # cta_tile_m=64 1-CTA layout only ever runs the low half).
-                lines.extend(
-                    [
-                        f"{p}_a{i} = cutlass.Float32(0.0)",
-                        f"if {p}_lane < 16:",
-                        f'    {p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", mask_and_clamp=0x0000FFFF, abs=True)',
-                        f"else:",
-                        f'    {p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", mask_and_clamp=0xFFFF0000, abs=True)',
-                    ]
-                )
-            else:
-                lines.append(f'{p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", abs=True)')
-        for i in range(b0, b0 + nb, 2):
-            j = i + 1
-            lines.append(f'{p}_s{i}, {p}_s{j} = cute.arch.mul_packed_f32x2(({p}_a{i}, {p}_a{j}), ({p}_rl, {p}_rl), rnd="rn", ftz=False)')
-            lines.extend(
-                _emit_scale_quantize_pair(
-                    p,
-                    (str(i), f"{p}_s{i}", f"{p}_q{i}", f"{p}_u{i}"),
-                    (str(j), f"{p}_s{j}", f"{p}_q{j}", f"{p}_u{j}"),
-                    quant,
-                )
-            )
+        lines.append(f"{p}_scale_mine[{k}] = (cutlass.Float32(0.0)).to({scale_dtype})")
+
+    # Keep only four columns' reduction/scale temporaries live at once.  It is
+    # important that this is one generated constexpr loop with reused names,
+    # rather than Python-codegen unrolling into q0..q31 SSA values: the latter
+    # makes the backend retain most of the 32-column scale state concurrently.
+    lines.append(f"for {p}_vi in cutlass.range_constexpr(0, {vsize}, 4):")
+    for lane_in_batch in range(4):
+        if quant.block_size == 16:
+            # 16-row blocks: each half-warp reduces its own block (the
+            # cta_tile_m=64 1-CTA layout only ever runs the low half).
             lines.extend(
                 [
-                    f"{p}_i{i} = cute.math.min(cute.arch.rcp_approx({p}_u{i}), cutlass.Float32(3.402823466e38))",
-                    f"{p}_i{j} = cute.math.min(cute.arch.rcp_approx({p}_u{j}), cutlass.Float32(3.402823466e38))",
-                    f'{p}_out[{i}], {p}_out[{j}] = cute.arch.mul_packed_f32x2(({p}_src[{i}], {p}_src[{j}]), ({p}_i{i}, {p}_i{j}), rnd="rn", ftz=False)',
-                    f"if ({p}_lane % {G}) == {i % G}:",
-                    f"    {p}_scale_mine_{i // G} = {p}_q{i}",
-                    f"if ({p}_lane % {G}) == {j % G}:",
-                    f"    {p}_scale_mine_{j // G} = {p}_q{j}",
+                    f"    {p}_a{lane_in_batch} = cutlass.Float32(0.0)",
+                    f"    if {p}_lane < 16:",
+                    f'        {p}_a{lane_in_batch} = cute.arch.warp_redux_sync({p}_src[{p}_vi + {lane_in_batch}], "fmax", '
+                    "mask_and_clamp=0x0000FFFF, abs=True)",
+                    "    else:",
+                    f'        {p}_a{lane_in_batch} = cute.arch.warp_redux_sync({p}_src[{p}_vi + {lane_in_batch}], "fmax", '
+                    "mask_and_clamp=0xFFFF0000, abs=True)",
                 ]
             )
+        else:
+            lines.append(f'    {p}_a{lane_in_batch} = cute.arch.warp_redux_sync({p}_src[{p}_vi + {lane_in_batch}], "fmax", abs=True)')
+    for lane_in_batch in range(0, 4, 2):
+        other = lane_in_batch + 1
+        lines.append(
+            f"    {p}_s{lane_in_batch}, {p}_s{other} = cute.arch.mul_packed_f32x2("
+            f'({p}_a{lane_in_batch}, {p}_a{other}), ({p}_rl, {p}_rl), rnd="rn", ftz=False)'
+        )
+        lines.extend(
+            "    " + line
+            for line in _emit_scale_quantize_pair(
+                p,
+                (f"b{lane_in_batch}", f"{p}_s{lane_in_batch}", f"{p}_q{lane_in_batch}", f"{p}_u{lane_in_batch}"),
+                (f"b{other}", f"{p}_s{other}", f"{p}_q{other}", f"{p}_u{other}"),
+                quant,
+            )
+        )
+    # The deterministic FP32->scale converter is a hardware x2 operation (the
+    # native x4 form is stochastic-only), but the four rounded scale values can
+    # still share one vector reciprocal/min pipeline.  Keeping that pipeline as
+    # TensorSSA gives the backend the same four-wide scheduling opportunity as
+    # the specialized Rubin epilogue without changing RP/SATFINITE semantics.
+    lines.extend(
+        [
+            f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+            *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
+            f"    {p}_upv = {p}_up4.load()",
+            f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
+        ]
+    )
+    for lane_in_batch in range(0, 4, 2):
+        other = lane_in_batch + 1
+        lines.extend(
+            [
+                f"    {p}_out[{p}_vi + {lane_in_batch}], {p}_out[{p}_vi + {other}] = cute.arch.mul_packed_f32x2("
+                f"({p}_src[{p}_vi + {lane_in_batch}], {p}_src[{p}_vi + {other}]), "
+                f'({p}_iv[{lane_in_batch}], {p}_iv[{other}]), rnd="rn", ftz=False)',
+                f"    if ({p}_lane % {G}) == (({p}_vi + {lane_in_batch}) % {G}):",
+                f"        {p}_scale_mine[({p}_vi + {lane_in_batch}) // {G}] = {p}_q{lane_in_batch}",
+                f"    if ({p}_lane % {G}) == (({p}_vi + {other}) % {G}):",
+                f"        {p}_scale_mine[({p}_vi + {other}) // {G}] = {p}_q{other}",
+            ]
+        )
+    # The scale is rounded up and the reciprocal comes from that stored scale,
+    # so every data value is already inside the destination format's finite
+    # range.  An explicit elementwise min/max here is redundant and lowers to
+    # hundreds of FSETP/FMNMX instructions for a dual row/col quant epilogue.
     lines.extend(
         [
             f"{p}_vec = {p}_out.load().to_vector()",
             (
-                f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
-                f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
-                f"cutlass.full_like({p}_vec, {_quant_output_max(output_dtype)}))"
-            ),
-            (
-                f"{out_var} = ({p}_clamped).to(cutlass.Float4E2M1FN).bitcast(cutlass.Int8)"
+                f"{out_var} = ({p}_vec).to(cutlass.Float4E2M1FN).bitcast(cutlass.Int8)"
                 if output_dtype == "fp4_e2m1"
-                else f"{out_var} = ({p}_clamped).to({DTYPE_TO_CUTLASS[output_dtype]})"
+                else f"{out_var} = ({p}_vec).to({DTYPE_TO_CUTLASS[output_dtype]})"
             ),
         ]
     )
@@ -1100,7 +1116,7 @@ def _emit_block_quant_col(
             )
         # The scale byte is a SIDE STORE: the STG arm sits inside `row < M`,
         # the TMA arm has no row bound of its own.
-        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine_{k}, alignment=1)"
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"
         if row_pred is None:
             lines.append(_st)
         else:
@@ -1149,15 +1165,14 @@ def _emit_block_quant(
     n_sub = vsize // bs
     lines: list[str] = [
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
-        f"{p}_abs = cute.math.abs({p}_src)",
+        f"{p}_frg = cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)",
+        f"{p}_abs = cute.math.absf({p}_frg)",
         f"{p}_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)",
         f"{p}_rl = cute.arch.rcp_approx({_quant_output_max(output_dtype)})",
     ]
     for k in range(n_sub):
         base = k * bs
-        lines.append(f"{p}_amax{k} = {p}_abs[{base}]")
-        for e in range(1, bs):
-            lines.append(f"{p}_amax{k} = cute.math.max({p}_amax{k}, {p}_abs[{base + e}])")
+        lines.append(f"{p}_amax{k} = {p}_abs[None, {k}].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
         lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
         lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
@@ -1166,18 +1181,16 @@ def _emit_block_quant(
                 f"{p}_out[{base + e}], {p}_out[{base + e + 1}] = cute.arch.mul_packed_f32x2("
                 f'({p}_src[{base + e}], {p}_src[{base + e + 1}]), ({p}_inv{k}, {p}_inv{k}), rnd="rn", ftz=False)'
             )
+    # See the col-quant path above: scale-up rounding already bounds the data,
+    # and the direct narrowing is the same contract used by the specialized
+    # grouped-GEMM quant epilogues.
     lines.extend(
         [
             f"{p}_vec = {p}_out.load().to_vector()",
             (
-                f"{p}_clamped = cute.math.min(cute.math.max({p}_vec, "
-                f"cutlass.full_like({p}_vec, {_quant_output_min(output_dtype)})), "
-                f"cutlass.full_like({p}_vec, {_quant_output_max(output_dtype)}))"
-            ),
-            (
-                f"{out_var} = ({p}_clamped).to(cutlass.Float4E2M1FN).bitcast(cutlass.Int8)"
+                f"{out_var} = ({p}_vec).to(cutlass.Float4E2M1FN).bitcast(cutlass.Int8)"
                 if output_dtype == "fp4_e2m1"
-                else f"{out_var} = ({p}_clamped).to({DTYPE_TO_CUTLASS[output_dtype]})"
+                else f"{out_var} = ({p}_vec).to({DTYPE_TO_CUTLASS[output_dtype]})"
             ),
         ]
     )
@@ -1420,10 +1433,23 @@ def generate(
     def _scale_tap_idx(qi: int) -> int:
         return _tap_of[len(specs) + len(chain.reductions) + qi]
 
-    for si, spec in enumerate(specs):
+    output_order = list(range(len(specs)))
+    if on_tma_arm and len(tma_slots) > 1:
+        # The compiler stores each output at its ready marker.  Retire outputs
+        # backed by an exclusive source first, while register-heavy quantizers
+        # stay last.  Python's stable sort preserves slot order among ties.
+        source_uses: dict[int, int] = {}
+        for output_spec in specs:
+            source_uses[output_spec.source_ref] = source_uses.get(output_spec.source_ref, 0) + 1
+        for reduction in chain.reductions:
+            source_uses[reduction.source_ref] = source_uses.get(reduction.source_ref, 0) + 1
+        output_order.sort(key=lambda oi: (specs[oi].quant_idx is not None, source_uses[specs[oi].source_ref]))
+    for si in output_order:
+        spec = specs[si]
         src = _parent_value(spec.source_ref)
         if si in tma_slots:
-            _ov = tma_out_value(sorted(tma_slots).index(si))
+            _tma_j = sorted(tma_slots).index(si)
+            _ov = tma_out_value(_tma_j)
             if spec.quant_idx is not None:
                 body_lines.extend(
                     _emit_block_quant(
@@ -1441,6 +1467,7 @@ def generate(
                 )
             else:
                 body_lines.append(f"{_ov} = {_store_cast_expr(src, spec.dtype)}")
+            body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
         if spec.major == "m":
