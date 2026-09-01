@@ -20,13 +20,15 @@ head-major, never dense-padded.**
   `stride_h` the declared head stride, which must cover the **packed token
   count `T`** — `stride_h >= H` is not the bound; at `T > stride_h` the
   per-head slices alias. `T` is a runtime total, so plan-time
-  classification can only check `stride_s == 1 and stride_h >= 1`; the
-  packed total fitting under the declared head stride is an execute-time
-  capacity check (the dense path's `_checked_lse_view` rejects via
-  `as_strided` when the backing storage is too small). See the THD
-  classification sites in `fwd/api_dsl.py` (duplicated at the two THD
-  compile-key call sites — extract rather than re-copy if you touch it,
-  per Rule 3's "suspect duplicated logic first").
+  classification can only check `stride_s == 1 and stride_h >= 1`. In the
+  THD path the packed total is a *device* value — Rule 3 bans reading it
+  back, so `stride_h >= T` is **caller contract** (stated in
+  `_thd_lse_view`'s docstring), not something the adapter verifies:
+  `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
+  this with a host-side length read; an in-kernel assert is the only
+  legal detector. See the THD classification sites in `fwd/api_dsl.py`
+  (duplicated at the two THD compile-key call sites — extract rather than
+  re-copy if you touch it, per Rule 3's "suspect duplicated logic first").
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
