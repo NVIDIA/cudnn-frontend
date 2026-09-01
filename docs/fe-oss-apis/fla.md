@@ -118,4 +118,13 @@ pip install "nvidia-cudnn-frontend[cutedsl]"
 The `cutedsl` extra supplies the optional CUTLASS DSL and CUDA Python
 dependencies required by the native `gated_mlp` and `short_conv` targets. To
 require the native `short_conv` route instead of its typed fallback, also
-ensure `nvidia-cutlass-dsl[cu13]>=4.7` is installed.
+ensure CUTLASS DSL 4.7 or newer is installed using the package variant that
+matches the CUDA Toolkit:
+
+```bash
+# CUDA Toolkit 12.9
+pip install "nvidia-cutlass-dsl>=4.7"
+
+# CUDA Toolkit 13.3
+pip install "nvidia-cutlass-dsl[cu13]>=4.7"
+```

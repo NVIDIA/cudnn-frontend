@@ -72,7 +72,8 @@ def _state_identity(state: torch.Tensor) -> tuple[int, tuple[int, ...], int]:
 @torch.no_grad()
 def test_dense_default_and_caller_owned_states_feed_decode_without_repacking() -> None:
     _require_native_route()
-    from cudnn.ops import causal_conv1d, causal_conv1d_update
+    from cudnn.ops import causal_conv1d_update
+    from cudnn.ops.causal_conv1d import causal_conv1d
 
     torch.manual_seed(20260901)
     batch, tokens, channels = 2, 5, 257
@@ -121,7 +122,8 @@ def test_dense_default_and_caller_owned_states_feed_decode_without_repacking() -
 @torch.no_grad()
 def test_packed_default_state_feeds_indexed_decode_without_repacking() -> None:
     _require_native_route()
-    from cudnn.ops import causal_conv1d, causal_conv1d_update
+    from cudnn.ops import causal_conv1d_update
+    from cudnn.ops.causal_conv1d import causal_conv1d
 
     torch.manual_seed(20260902)
     tokens, channels = 8, 257

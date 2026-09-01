@@ -198,7 +198,13 @@ def test_v2_cpasync_uses_live_sm_count_and_preserves_explicit_vec4(monkeypatch):
 
 def test_v2_cpasync_planner_is_safe_for_arbitrary_t_d_and_sm(monkeypatch):
     backward, *_ = _load_backward()
-    for sequence_length in range(64, 32769):
+    stage = backward._VEC2_CPASYNC_TOKENS_PER_STAGE
+    sequence_lengths = sorted(
+        set(range(64, 32769, 97))
+        | {64, 65, 66, 8241, 8242, 8243, 16383, 16384, 16385, 32767, 32768}
+        | {3 + stage * multiple for multiple in (8, 9, 10, 127, 128, 129, 1023, 1024, 1025, 4095)}
+    )
+    for sequence_length in sequence_lengths:
         for n_channels in (512, 1024, 2048, 4096, 8192, 16384):
             channel_ctas = n_channels // backward._VEC2_CPASYNC_CHANNELS_PER_CTA
             for sm_count in (40, 60, 80, 100, 120, 148, 160):

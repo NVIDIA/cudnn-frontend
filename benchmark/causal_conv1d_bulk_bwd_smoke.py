@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ComputeLab compile and correctness smoke for dense causal-conv backward."""
+"""GPU compile and correctness smoke for dense causal-conv backward."""
 
 from pathlib import Path
 

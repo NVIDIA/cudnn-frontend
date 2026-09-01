@@ -20,13 +20,10 @@ def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and is_supported_causal_conv1d_update_compute_capability(torch.cuda.get_device_capability())
 
 
-pytestmark = [
-    pytest.mark.L0,
-    pytest.mark.skipif(
-        not _has_supported_gpu(),
-        reason="requires a functionally supported GPU architecture",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="requires a functionally supported GPU architecture",
+)
 
 
 def _load_api():
@@ -89,6 +86,7 @@ def _padded_x(values, row_stride):
     return result
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_nonzero_state_across_consecutive_steps():
     causal_conv1d_update = _load_api()
@@ -106,6 +104,7 @@ def test_nonzero_state_across_consecutive_steps():
         _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 @pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
 def test_padded_x_rows_match_reference(state_len):
@@ -128,6 +127,7 @@ def test_padded_x_rows_match_reference(state_len):
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 @pytest.mark.parametrize("channels", [2048, 4096])
 def test_n128_representative_shape_correctness(channels):
@@ -145,6 +145,7 @@ def test_n128_representative_shape_correctness(channels):
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_paged_state_slots_and_untouched_rows():
     causal_conv1d_update = _load_api()
@@ -162,6 +163,7 @@ def test_paged_state_slots_and_untouched_rows():
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 @pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
 def test_padding_state_indices_write_zero_and_do_not_mutate_state(state_len):
@@ -196,6 +198,7 @@ def test_padding_state_indices_write_zero_and_do_not_mutate_state(state_len):
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_channel_fast_wminus1_state_matches_next_causal_output():
     causal_conv1d_update = _load_api()
@@ -217,6 +220,7 @@ def test_channel_fast_wminus1_state_matches_next_causal_output():
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_public_api_returns_an_ordinary_tensor():
     causal_conv1d_update = _load_api()
@@ -233,6 +237,7 @@ def test_public_api_returns_an_ordinary_tensor():
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 @pytest.mark.parametrize("state_len", [3, 4], ids=["w-minus-one", "legacy-four"])
 def test_state_shift_and_append_are_bitwise(state_len):
@@ -263,6 +268,7 @@ def test_state_shift_and_append_are_bitwise(state_len):
     torch.testing.assert_close(state.view(torch.int16), expected_bits, rtol=0, atol=0)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_channel_fast_wminus1_state_shift_and_append_are_bitwise():
     causal_conv1d_update = _load_api()
@@ -293,6 +299,7 @@ def test_channel_fast_wminus1_state_shift_and_append_are_bitwise():
     torch.testing.assert_close(state.contiguous().view(torch.int16), expected_bits, rtol=0, atol=0)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_silu_special_values_and_channel_tail():
     causal_conv1d_update = _load_api()
@@ -332,6 +339,7 @@ def test_silu_special_values_and_channel_tail():
     assert torch.equal(torch.isnan(output), torch.isnan(expected))
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_silu_and_swish_aliases_are_observably_identical():
     causal_conv1d_update = _load_api()
@@ -350,6 +358,7 @@ def test_silu_and_swish_aliases_are_observably_identical():
     _assert_state_bits_equal(silu_state, swish_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_public_torch_compile_fullgraph_observes_state_mutation():
     causal_conv1d_update = _load_api()
@@ -367,6 +376,7 @@ def test_public_torch_compile_fullgraph_observes_state_mutation():
     _assert_state_bits_equal(state, expected_state)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_public_cuda_graph_capture_and_replay_observe_state_mutation():
     causal_conv1d_update = _load_api()
@@ -400,6 +410,7 @@ def test_public_cuda_graph_capture_and_replay_observe_state_mutation():
     _assert_state_bits_equal(state, expected_state_2)
 
 
+@pytest.mark.L0
 @torch.no_grad()
 def test_public_call_respects_current_torch_stream():
     causal_conv1d_update = _load_api()
@@ -487,6 +498,7 @@ def test_invalid_state_indices_fail_closed_in_fresh_process(case):
     assert f"EXPECTED_DEVICE_FAILURE:{case}:" in diagnostics, diagnostics
 
 
+@pytest.mark.L0
 @torch.no_grad()
 @pytest.mark.parametrize(
     "mutate,match",

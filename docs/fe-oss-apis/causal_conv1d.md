@@ -9,8 +9,8 @@ interface:
 - reserved `seq_idx[B, T]` compatibility keyword (currently only `None` is
   accepted)
 - optional packed `cu_seqlens[N + 1]` (mutually exclusive with `seq_idx`)
-- dense and `seq_idx` state: optional `initial_states[B, D, W - 1]` and
-  returned `final_states[B, D, W - 1]`
+- dense state: optional `initial_states[B, D, W - 1]` and returned
+  `final_states[B, D, W - 1]`
 - packed state: optional `initial_states[N, D, W - 1]` and returned
   `final_states[N, D, W - 1]`, where `N = len(cu_seqlens) - 1`
 

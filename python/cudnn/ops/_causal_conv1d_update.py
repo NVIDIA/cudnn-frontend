@@ -48,7 +48,7 @@ def _has_supported_conv_state_layout(conv_state: Tensor) -> bool:
         return True
     if conv_state.ndim != 3 or conv_state.shape[2] != 3:
         return False
-    n_slots, n_channels, state_len = conv_state.shape
+    _, n_channels, state_len = conv_state.shape
     return tuple(conv_state.stride()) == (n_channels * state_len, 1, n_channels)
 
 

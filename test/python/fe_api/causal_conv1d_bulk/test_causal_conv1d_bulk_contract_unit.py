@@ -287,8 +287,9 @@ def test_support_rejects_unlisted_arch(monkeypatch, capability):
         api.check_support()
 
 
-def test_constructor_rejects_metadata_only_tensor_descriptors():
+def test_support_accepts_metadata_only_tensor_descriptors(monkeypatch):
     _, api_class, _ = _load_private_backend()
+    import cudnn.causal_conv1d_bulk_sm100.api as api_module
     from cudnn.api_base import TensorDesc
 
     sample_x = TensorDesc(
@@ -298,11 +299,27 @@ def test_constructor_rejects_metadata_only_tensor_descriptors():
         stride_order=(2, 1, 0),
         device=torch.device("cuda"),
     )
-    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
-    output = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+    sample_weight = TensorDesc(
+        dtype=torch.bfloat16,
+        shape=(8, 4),
+        stride=(4, 1),
+        stride_order=(1, 0),
+        device=torch.device("cuda"),
+    )
+    sample_output = TensorDesc(
+        dtype=torch.bfloat16,
+        shape=(1, 2, 8),
+        stride=(16, 8, 1),
+        stride_order=(2, 1, 0),
+        device=torch.device("cuda"),
+    )
+    api = api_class(sample_x, sample_weight, sample_output)
+    monkeypatch.setattr(api_module, "cutedsl_state", lambda: (True, None))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
 
-    with pytest.raises(TypeError, match=r"sample_x must be a torch.Tensor, got TensorDesc"):
-        api_class(sample_x, weight, output)
+    assert api.check_support()
+    assert api._sample_alignment_remainders == {}
 
 
 @pytest.mark.parametrize("missing_name", ["sample_x", "sample_weight", "sample_output"])
@@ -315,7 +332,7 @@ def test_constructor_rejects_none_for_required_samples(missing_name):
     }
     samples[missing_name] = None
 
-    with pytest.raises(TypeError, match=rf"{missing_name} must be a torch.Tensor, got NoneType"):
+    with pytest.raises(TypeError, match=rf"{missing_name} must be a torch.Tensor or TensorDesc, got NoneType"):
         api_class(**samples)
 
 

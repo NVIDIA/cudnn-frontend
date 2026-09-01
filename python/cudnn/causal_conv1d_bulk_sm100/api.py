@@ -12,7 +12,7 @@ correctness-first scalar schedule. Model code should use
 
 from contextlib import contextmanager
 import threading
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Union
 
 from cuda.bindings import driver as cuda
 import cutlass
@@ -119,14 +119,14 @@ class CausalConv1dBulkFwdSm100(APIBase):
 
     def __init__(
         self,
-        sample_x: torch.Tensor,
-        sample_weight: torch.Tensor,
-        sample_output: torch.Tensor,
-        sample_cu_seqlens: Optional[torch.Tensor] = None,
-        sample_initial_state: Optional[torch.Tensor] = None,
-        sample_final_state: Optional[torch.Tensor] = None,
+        sample_x: Union[torch.Tensor, TensorDesc],
+        sample_weight: Union[torch.Tensor, TensorDesc],
+        sample_output: Union[torch.Tensor, TensorDesc],
+        sample_cu_seqlens: Optional[Union[torch.Tensor, TensorDesc]] = None,
+        sample_initial_state: Optional[Union[torch.Tensor, TensorDesc]] = None,
+        sample_final_state: Optional[Union[torch.Tensor, TensorDesc]] = None,
         *,
-        sample_bias: Optional[torch.Tensor] = None,
+        sample_bias: Optional[Union[torch.Tensor, TensorDesc]] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -136,16 +136,16 @@ class CausalConv1dBulkFwdSm100(APIBase):
             ("sample_weight", sample_weight),
             ("sample_output", sample_output),
         ):
-            if not isinstance(sample, torch.Tensor):
-                raise TypeError(f"{name} must be a torch.Tensor, got {type(sample).__name__}")
+            if not isinstance(sample, (torch.Tensor, TensorDesc)):
+                raise TypeError(f"{name} must be a torch.Tensor or TensorDesc, got {type(sample).__name__}")
         for name, sample in (
             ("sample_bias", sample_bias),
             ("sample_cu_seqlens", sample_cu_seqlens),
             ("sample_initial_state", sample_initial_state),
             ("sample_final_state", sample_final_state),
         ):
-            if sample is not None and not isinstance(sample, torch.Tensor):
-                raise TypeError(f"{name} must be a torch.Tensor, got {type(sample).__name__}")
+            if sample is not None and not isinstance(sample, (torch.Tensor, TensorDesc)):
+                raise TypeError(f"{name} must be a torch.Tensor or TensorDesc, got {type(sample).__name__}")
 
         self.x_desc = self._make_tensor_desc(sample_x, name="sample_x")
         self.weight_desc = self._make_tensor_desc(sample_weight, name="sample_weight")
@@ -158,19 +158,21 @@ class CausalConv1dBulkFwdSm100(APIBase):
         # TensorDesc intentionally does not retain sample storage.  Preserve
         # only the pointer remainders backing the alignment promises made to
         # CuTe during compilation.
-        self._sample_alignment_remainders = {
-            "X": sample_x.data_ptr() % 16,
-            "Weight": sample_weight.data_ptr() % 16,
-            "Output": sample_output.data_ptr() % 16,
-        }
-        if sample_cu_seqlens is not None:
-            self._sample_alignment_remainders["cu_seqlens"] = sample_cu_seqlens.data_ptr() % 4
-        if sample_bias is not None:
-            self._sample_alignment_remainders["Bias"] = sample_bias.data_ptr() % 16
-        if sample_initial_state is not None:
-            self._sample_alignment_remainders["Initial state"] = sample_initial_state.data_ptr() % 16
-        if sample_final_state is not None:
-            self._sample_alignment_remainders["Final state"] = sample_final_state.data_ptr() % 16
+        # Metadata-only samples have no pointer to validate. Defer their
+        # alignment check to the live tensors passed to execute().
+        self._sample_alignment_remainders = {}
+        for name, sample, alignment in (
+            ("X", sample_x, 16),
+            ("Weight", sample_weight, 16),
+            ("Output", sample_output, 16),
+            ("cu_seqlens", sample_cu_seqlens, 4),
+            ("Bias", sample_bias, 16),
+            ("Initial state", sample_initial_state, 16),
+            ("Final state", sample_final_state, 16),
+        ):
+            data_ptr = getattr(sample, "data_ptr", None)
+            if callable(data_ptr):
+                self._sample_alignment_remainders[name] = data_ptr() % alignment
 
         self.batch_size = None
         self.sample_sequence_length = None

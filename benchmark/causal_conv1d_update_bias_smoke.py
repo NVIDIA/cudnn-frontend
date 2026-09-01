@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ComputeLab correctness smoke for optional decode causal-conv bias."""
+"""GPU correctness smoke for optional decode causal-conv bias."""
 
 from pathlib import Path
 

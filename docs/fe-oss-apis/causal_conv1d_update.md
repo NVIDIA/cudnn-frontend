@@ -114,7 +114,7 @@ the state or weight meanings. The current public implementation rejects 3D
   compact storage is accepted for both lengths, and `L=3` additionally accepts
   the channel-last `(3 * D, 1, D)` stride returned by full-sequence prefill
 - `bias`: optional contiguous BF16 `[D]`
-- `cache_seqlens`: must be omitted
+- `cache_seqlens`: must be `None` or omitted
 - `conv_state_indices`: optional contiguous CUDA int32 `[N]`
 - output: contiguous BF16 `[N, D]`
 - activation: identity or SiLU
@@ -128,7 +128,7 @@ sufficient for this operation. The optional FLA 0.5.2 adapter treats the
 resulting `ImportError` as a typed decline and executes FLA's original path.
 
 Runtime correctness was validated on A100 SM80, L40S SM89, H200 SM90, B200
-SM100, a GB110 board reporting SM103, and RTX 5080 SM120. SM86, SM87, SM110,
+SM100, an SM103 board, and RTX 5080 SM120. SM86, SM87, SM110,
 and SM121 have compile-only validation. The SM110 path is functional support,
 not a training-performance claim.
 

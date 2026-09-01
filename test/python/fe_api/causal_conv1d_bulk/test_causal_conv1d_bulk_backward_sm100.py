@@ -47,7 +47,7 @@ def _reference(
     if offsets is None:
         return _dense_reference(x, weight, bias)
     return torch.cat(
-        [_dense_reference(x[:, start:end], weight, bias) for start, end in zip(offsets[:-1], offsets[1:], strict=True)],
+        [_dense_reference(x[:, start:end], weight, bias) for start, end in zip(offsets[:-1], offsets[1:])],
         dim=1,
     )
 
