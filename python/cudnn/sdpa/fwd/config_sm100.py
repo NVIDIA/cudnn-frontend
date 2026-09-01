@@ -20,7 +20,7 @@ those support checks have a gap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -93,6 +93,9 @@ class TemplateParams:
     # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
+    # Optional L2 working-set budget for SCHED_LPT_L2. Zero keeps the flavor's
+    # default budget.
+    lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
@@ -126,14 +129,7 @@ class TemplateParams:
     softmax_f16: bool = False
 
 
-@dataclass(frozen=True)
-class _D192TemplateParams(TemplateParams):
-    """D192-only additions to the SM100 template-module cache key."""
-
-    lpt_l2_size_mib: int = 0
-
-
-def specialize_template_params(
+def resolve_template_params(
     params: TemplateParams,
     *,
     flavor: tuple[int, int],
@@ -144,12 +140,10 @@ def specialize_template_params(
     s_q: int,
     s_kv: int,
 ) -> TemplateParams:
-    """Apply a flavor's module-level codegen policy before template loading."""
+    """Resolve shape-dependent codegen choices before template loading."""
 
     if flavor != (192, 128):
         return params
-
-    params = _D192TemplateParams(**{field.name: getattr(params, field.name) for field in fields(TemplateParams)})
 
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     mxfp8 = fp8 and not pertensor
@@ -1101,7 +1095,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        L2_SIZE_MIB=int(getattr(params, "lpt_l2_size_mib", 0)) or 60,
+        L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SCHEDULER_POLICY=params.sched_policy,
         SOFTMAX_REGS=192 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
         CORRECTION_REGS=88 if e4_thd_swa or e5_thd_swa or e5_dense_causal_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,

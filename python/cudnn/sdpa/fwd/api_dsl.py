@@ -31,7 +31,7 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     pack_gqa_supported,
-    specialize_template_params as specialize_sm100_template_params,
+    resolve_template_params,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
@@ -1254,7 +1254,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
-        params = specialize_sm100_template_params(
+        params = resolve_template_params(
             params,
             flavor=self.flavor,
             pertensor=self._pertensor,
