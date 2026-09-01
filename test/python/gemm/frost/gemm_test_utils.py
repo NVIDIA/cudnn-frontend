@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, jit_from_cudnn_graph
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.tile_config import by_name
 
 # --- GPU / arch gate -------------------------------------------------------
@@ -42,6 +43,15 @@ requires_sm100 = pytest.mark.skipif(
     _SM is None or not (100 <= _SM < 120),
     reason="needs a Blackwell-family GPU (100 <= SM < 120), have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
+    """Copy live scales into deterministic, analyzer-sized segmented storage."""
+    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
+    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
+    return result
+
 
 # test_matmul.py sweeps every matmul family (sm100 tcgen05 + sm120 warp-MMA), so
 # its module gate is the union of their arch ranges; a config whose own family

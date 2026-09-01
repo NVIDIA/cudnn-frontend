@@ -1608,6 +1608,7 @@ def _kernel(
                 is_valid = (_slot.subview(3)).load()
                 group_begin = (_slot.subview(4)).load()
                 group_end = (_slot.subview(5)).load()
+                start_sf_block_m = (_slot.subview(6)).load()
                 group_idx = (_slot.subview(7)).load()
             else:
                 slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
@@ -1616,6 +1617,7 @@ def _kernel(
                 is_valid = (slot.subview(3)).load()
                 group_begin = (slot.subview(4)).load()
                 group_end = (slot.subview(5)).load()
+                start_sf_block_m = (slot.subview(6)).load()
                 group_idx = (slot.subview(7)).load()
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))

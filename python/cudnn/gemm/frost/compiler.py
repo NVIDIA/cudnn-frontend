@@ -58,7 +58,12 @@ from .dtypes import (
     tensor_alignment,
 )
 from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
-from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
+from .fusion_ir import (
+    ZERO_PRESERVING_OPS,
+    FusionChain,
+    TensorRef,
+    segmented_row_scale_capacity_rows,
+)
 from .recipe import (
     CONST,
     FROM_M,
@@ -3007,6 +3012,34 @@ def _sf_blob_reject(named_blobs) -> "str | None":
     return None
 
 
+def _grouped_row_quant_scale_blob_reject(
+    chain: FusionChain,
+    outputs,
+    total_rows: int,
+    runtime_n: int,
+    num_groups: int,
+) -> str | None:
+    """Reject a strided view where grouped-row quant stores raw blob offsets.
+
+    The F8_128x4 epilogue deliberately addresses the physical atom stream and
+    does not apply the runtime tensor strides. Reuse the input-SF packed-blob
+    contract so every accepted destination is one dense byte run.
+    """
+    blobs = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        quant_idx = int(spec.source.rsplit("_", 1)[1])
+        quant = chain.quants[quant_idx]
+        if not quant.grouped_by_moe or quant.axis == 1:
+            continue
+        padded_n_blocks = ((runtime_n // quant.block_size + 3) // 4) * 4
+        required_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+        required = required_rows * padded_n_blocks * DTYPE_BYTES[quant.scale_dtype]
+        blobs.append((f"grouped row quant scale output[{quant_idx}]", buf, required))
+    return _sf_blob_reject(blobs) if blobs else None
+
+
 def _check_input_alignment(chain: FusionChain) -> None:
     """Graph-time TMA input-alignment gate (the runtime dims are re-checked in
     ``CompiledFusedGemm.__call__`` — the kernel is shape-agnostic, so the call
@@ -3282,6 +3315,14 @@ def _check_block_quant_supported(
                 f"cols_per_acc_stage={cols_per_acc_stage} and to {MAX_EPI_CHUNK_ELEMS} "
                 f"elements); got block_size={q.block_size}, vsize={vsize}"
             )
+        if q.grouped_by_moe and q.axis != 1:
+            if not chain.has_moe:
+                raise NotImplementedError("grouped row block_scale_quantize requires a MoE grouped matmul graph")
+            if not chain.has_block_scale:
+                raise NotImplementedError(
+                    "grouped row block_scale_quantize currently requires a block-scaled MoE "
+                    "matmul whose scheduler supplies the per-group 128-row scale prefix"
+                )
         if q.axis == 1:
             # Col quant: a warp (block 32) or half-warp (block 16) of rows is
             # one M block; the redux needs every row guard uniform across the
@@ -3323,13 +3364,26 @@ def _check_block_quant_supported(
                 f"config={config.name}"
             )
         if q.scale_reorder == "F8_128x4":
-            expected_scale_dim = (
-                chain.matmul.batch,
-                ((chain.matmul.M + 127) // 128) * 128,
-                (((chain.matmul.N // q.block_size) + 3) // 4) * 4,
-            )
-            if q.scale_dim != expected_scale_dim:
-                raise NotImplementedError("F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}")
+            padded_n_blocks = (((chain.matmul.N // q.block_size) + 3) // 4) * 4
+            if q.grouped_by_moe and q.axis != 1:
+                required_rows = segmented_row_scale_capacity_rows(chain.matmul.M, chain.moe.num_groups)
+                if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_n_blocks:
+                    raise NotImplementedError(
+                        "grouped F8_128x4 row block_scale_quantize requires "
+                        "scale_dim=(1, segmented_rows, padded_N_blocks), with "
+                        f"segmented_rows a multiple of 128 and >= the static worst-case {required_rows}, and "
+                        f"padded_N_blocks={padded_n_blocks}; got {q.scale_dim}"
+                    )
+            else:
+                expected_scale_dim = (
+                    chain.matmul.batch,
+                    ((chain.matmul.M + 127) // 128) * 128,
+                    padded_n_blocks,
+                )
+                if q.scale_dim != expected_scale_dim:
+                    raise NotImplementedError(
+                        "F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}"
+                    )
 
 
 _FORCE_STG_EPI = False
@@ -4209,6 +4263,15 @@ class CompiledMoeBlockScaleGemm:
                     f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
                     f"got {tuple(t.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            self.chain,
+            outputs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
         # num_experts = weight batch (E); num_groups = first_token_offset len
         # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
@@ -4278,8 +4341,9 @@ class CompiledMoeBlockScaleGemm:
         if sfa or sfb:
             _S, _N, _K = snk[0], snk[1], snk[2]
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
+            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
             _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 512 * _sf_k4 * ((_S + 127) // 128)) for i, x in enumerate(sfa or [])]
+                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(sfa or [])]
                 + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(b_bufs[j].shape[0])) for j, x in enumerate(sfb or [])]
             )
             if _r_sf is not None:
@@ -4346,6 +4410,15 @@ class CompiledMoeBlockScaleGemm:
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
                     f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            chain,
+            outs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = int(first_token_offset.shape[0])
