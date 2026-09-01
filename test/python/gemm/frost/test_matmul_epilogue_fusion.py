@@ -2834,6 +2834,8 @@ def test_row_quant_amax_uses_vector_reduce() -> None:
     used by the specialized grouped-GLU epilogue."""
     src = pathlib.Path(epilogue_codegen.__file__).read_text()
     assert "cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)" in src
+    assert "{p}_abs = cute.math.absf({p}_frg)" in src
+    assert "cutlass._mlir.dialects.math.absf" not in src
     assert "{p}_abs[None, {k}].reduce(cute.ReductionOp.MAX" in src
     assert 'lines.append(f"{var} = cute.math.max(' not in src
 

@@ -1166,8 +1166,7 @@ def _emit_block_quant(
     lines: list[str] = [
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
         f"{p}_frg = cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)",
-        f"{p}_abs_ir = cutlass._mlir.dialects.math.absf({p}_frg.ir_value())",
-        f"{p}_abs = type({p}_frg)({p}_abs_ir, {p}_frg.shape, {p}_frg.dtype)",
+        f"{p}_abs = cute.math.absf({p}_frg)",
         f"{p}_out = cute.make_rmem_tensor({vsize}, cutlass.Float32)",
         f"{p}_rl = cute.arch.rcp_approx({_quant_output_max(output_dtype)})",
     ]

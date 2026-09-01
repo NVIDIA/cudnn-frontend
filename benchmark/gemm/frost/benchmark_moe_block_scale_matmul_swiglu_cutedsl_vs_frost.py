@@ -61,8 +61,8 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def _permuted(l, mode0, mode1, dtype, *, mode0_major=False):
-    shape = (l, mode1, mode0) if mode0_major else (l, mode0, mode1)
+def _permuted(num_groups, mode0, mode1, dtype, *, mode0_major=False):
+    shape = (num_groups, mode1, mode0) if mode0_major else (num_groups, mode0, mode1)
     order = (2, 1, 0) if mode0_major else (1, 2, 0)
     if dtype is torch.float4_e2m1fn_x2:
         packed = torch.randint(0, 256, (*shape[:-1], shape[-1] // 2), dtype=torch.uint8, device=_DEV)
@@ -70,9 +70,9 @@ def _permuted(l, mode0, mode1, dtype, *, mode0_major=False):
     return torch.empty(shape, dtype=torch.float32, device=_DEV).uniform_(-2, 2).permute(order).to(dtype)
 
 
-def _make_sf(l, mn, k, sf_vec_size, dtype):
+def _make_sf(num_groups, mn, k, sf_vec_size, dtype):
     sf_k = _ceil_div(k, sf_vec_size)
-    shape = (l, _ceil_div(mn, 128), _ceil_div(sf_k, 4), 32, 4, 4)
+    shape = (num_groups, _ceil_div(mn, 128), _ceil_div(sf_k, 4), 32, 4, 4)
     buf = torch.empty(shape, dtype=torch.float32, device=_DEV).uniform_(1, 3).to(torch.int8).to(torch.float32)
     return buf.permute(3, 4, 1, 5, 2, 0).to(dtype)
 
@@ -278,7 +278,7 @@ def _frost_spec_map(combo, output_mode, alignment=1):
 
     chain = analyze(_frost_graph(1024, 256, 512, 2, combo, output_mode, alignment)[0])
     m = {}
-    for t, cfg in registry_candidates(chain):
+    for _template, cfg in registry_candidates(chain):
         if cfg.pipeline != "sm100" or cfg.mma_tile_m != 128:
             continue
         m[cfg.name] = (cfg, cfg.cta_group)
@@ -446,7 +446,7 @@ def main() -> int:
     if args.sides in ("both", "cutedsl"):
         per_set = _cutedsl_bytes(E, M, N, K, args.combo, args.output_mode)
         nbuf = bu.resolve_nbuf(args.rotate_buffers, per_set)
-        print(f"  -- cuteDSL GroupedGemmGluSm100 --")
+        print("  -- cuteDSL GroupedGemmGluSm100 --")
         bu.report_pool(nbuf, per_set)
         wset = _cutedsl_set(E, M, N, K, args.combo, args.output_mode)
         pool = _cutedsl_pool(E, M, N, K, args.combo, args.output_mode, nbuf)
@@ -497,14 +497,9 @@ def main() -> int:
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 
         store_modes = {"tma": ["tma"], "stg": ["stg"], "both": ["tma", "stg"]}[args.frost_store]
-        spec_map = _frost_spec_map(args.combo, args.output_mode, args.fto_alignment)
         offsets = bu.group_offsets(S, E)
-        bad = [int(o) for o in offsets.tolist() if int(o) % args.fto_alignment]
-        if bad:
-            sys.exit(
-                f"--fto-alignment {args.fto_alignment} is not true of the offsets this bench builds "
-                f"({bad[:4]}...): the promise is unchecked at runtime and would miscompute."
-            )
+        alignment = bu.fto_alignment(args.fto_alignment, offsets)
+        spec_map = _frost_spec_map(args.combo, args.output_mode, alignment)
         wset = _frost_set(S, N, K, E, args.combo, args.output_mode)
         pool = [wset] + [_frost_set(S, N, K, E, args.combo, args.output_mode) for _ in range(max(0, nbuf - 1))]
         for cname in bu.select_configs(args.configs, spec_map):
@@ -519,7 +514,7 @@ def main() -> int:
                     print(f"  > {label} ...", flush=True)
                 t0 = time.time()
                 try:
-                    g, h = _frost_graph(S, N, K, E, args.combo, args.output_mode, args.fto_alignment)
+                    g, h = _frost_graph(S, N, K, E, args.combo, args.output_mode, alignment)
                     with C.force_stg_epi(store == "stg"):
                         plan = jit_from_cudnn_graph(g, config=cfg)
                 except (NotImplementedError, ValueError) as e:
