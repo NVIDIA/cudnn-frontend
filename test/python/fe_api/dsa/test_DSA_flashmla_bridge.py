@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import types
+from importlib import metadata as importlib_metadata
 
 import pytest
 import torch
@@ -78,7 +79,7 @@ def test_sparse_attention_forward_preserves_semantic_output_contract(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
     monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
     monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace(flash_mla_sparse_fwd=provider))
-    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     device = torch.device("cuda")
     q = torch.zeros((2, heads, head_dim), dtype=torch.bfloat16, device=device)
@@ -129,7 +130,7 @@ def test_flashmla_dependency_accepts_pinned_distribution_identity(monkeypatch):
     dependency = types.SimpleNamespace(__version__="1.0.0", flash_mla_sparse_fwd=compatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
     monkeypatch.setattr(
-        bridge.importlib_metadata,
+        importlib_metadata,
         "version",
         lambda distribution: versions.append(distribution) or "1.0.0+15f13e5",
     )
@@ -146,7 +147,7 @@ def test_flashmla_dependency_rejects_unverified_distribution_identity(monkeypatc
 
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: installed_version)
+    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: installed_version)
 
     with pytest.raises(
         bridge.SparseAttentionBackendUnavailableError,
@@ -164,9 +165,9 @@ def test_flashmla_dependency_without_distribution_metadata_fails_closed(monkeypa
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
 
     def missing_distribution(_distribution):
-        raise bridge.importlib_metadata.PackageNotFoundError("flash_mla")
+        raise importlib_metadata.PackageNotFoundError("flash_mla")
 
-    monkeypatch.setattr(bridge.importlib_metadata, "version", missing_distribution)
+    monkeypatch.setattr(importlib_metadata, "version", missing_distribution)
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no installed distribution metadata"):
         bridge._resolve_flashmla_sparse_fwd()
@@ -208,7 +209,7 @@ def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch)
 def test_flashmla_dependency_with_incompatible_call_signature_fails_closed(monkeypatch, incompatible):
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=incompatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"incompatible signature.*topk_length"):
         bridge._resolve_flashmla_sparse_fwd()
@@ -224,7 +225,7 @@ def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch
 
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=OpaqueCallable())
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
-    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
+    monkeypatch.setattr(importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no inspectable Python signature"):
         bridge._resolve_flashmla_sparse_fwd()

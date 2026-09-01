@@ -167,7 +167,7 @@ def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None
 
 
 def _probe_flashmla_provider_identity() -> None:
-    """Require the provider revision whose private launch policy we adapt.
+    """Require the declared build version whose private launch policy we adapt.
 
     FlashMLA's module-level ``__version__`` is the generic ``1.0.0``.  Its
     official build metadata is more specific: ``setup.py`` appends the Git
@@ -183,11 +183,12 @@ def _probe_flashmla_provider_identity() -> None:
         installed_version = importlib_metadata.version("flash_mla")
     except importlib_metadata.PackageNotFoundError as exc:
         raise SparseAttentionBackendUnavailableError(
-            "The imported 'flash_mla' package has no installed distribution metadata, " f"so its kernel revision cannot be verified. {_FLASHMLA_INSTALL_HINT}"
+            "The imported 'flash_mla' package has no installed distribution metadata, "
+            f"so its declared build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
         ) from exc
     except Exception as exc:
         raise SparseAttentionBackendUnavailableError(
-            "Cannot read the installed 'flash_mla' distribution version, so its kernel " f"revision cannot be verified. {_FLASHMLA_INSTALL_HINT}"
+            "Cannot read the installed 'flash_mla' distribution version, so its " f"declared build identity cannot be checked. {_FLASHMLA_INSTALL_HINT}"
         ) from exc
 
     if installed_version != _FLASHMLA_DISTRIBUTION_VERSION:

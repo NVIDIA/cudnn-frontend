@@ -136,8 +136,8 @@ pinned provider's private H/Top-K launch tiling, it requires the official
 `flash_mla` distribution version `1.0.0+15f13e5`. FlashMLA's build appends the
 Git short SHA to this distribution version; its module-level `__version__`
 remains the generic `1.0.0` and is not used as proof of compatibility. The
-identity check is cached with a call-signature check: the current entry point
-must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`, `d_v`,
+declared-version check is cached with a call-signature check: the current entry
+point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`, `d_v`,
 `attn_sink`, and `topk_length` by keyword. Both checks are host-only and run
 before the first provider launch. Provider selection and launch planning remain
 private, so a future cuDNN forward can replace this bridge without renaming the
