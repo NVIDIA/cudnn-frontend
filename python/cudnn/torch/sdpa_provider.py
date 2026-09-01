@@ -25,8 +25,8 @@ Conveniently, aten's logsumexp convention for this op is (B, H, S, 1) float32
 the boundary with no reshape or copy.
 
 Hybrid fallback to the C++ worker ops (bit-exact with the shadowed native
-kernel): attn_bias, dropout_p > 0, and — until dense backward lands in
-cudnn::sdpa_bwd — every dense backward. The forward runs on the python API
+kernel): attn_bias, dropout_p > 0, and the padded dense backward (per-batch
+lengths). Dense and varlen backward both run on the python API. The forward runs on the python API
 either way, so training still exercises the python fwd path.
 """
 
@@ -99,15 +99,27 @@ def _bwd(
     *,
     scale: Optional[float] = None,
 ):
-    # Dense backward is not wired in cudnn::sdpa_bwd yet — route to the C++
-    # worker op (bit-exact with the shadowed native kernel). The forward
-    # already ran on the python API, whose (B,H,S,1) fp32 logsumexp is the
-    # exact layout this worker consumes.
-    calls["bwd_cpp"] += 1
-    return torch.ops.aten._cudnn_attention_backward(
-        grad_out, query, key, value, out, logsumexp,
-        philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k,
-        max_q, max_k, dropout_p, is_causal, scale=scale,
+    # Anything cudnn::sdpa_bwd does not serve goes to the C++ worker op
+    # (bit-exact with the shadowed native kernel): attention bias, dropout,
+    # and the padded dense path (per-batch lengths). Everything else runs on
+    # the python API, closing the last C++ hop in a dense training step.
+    if attn_bias is not None or dropout_p > 0.0 or cum_seq_q is not None:
+        calls["bwd_cpp"] += 1
+        return torch.ops.aten._cudnn_attention_backward(
+            grad_out, query, key, value, out, logsumexp,
+            philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k,
+            max_q, max_k, dropout_p, is_causal, scale=scale,
+        )  # fmt: skip
+
+    calls["bwd"] += 1
+    attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
+    # aten hands us logsumexp as (B, H, S) fp32 — exactly the layout the dense
+    # backward wants, modulo the trailing 1 the descriptor declares.
+    lse = logsumexp if logsumexp.dim() == 4 else logsumexp.unsqueeze(-1)
+    return torch.ops.cudnn.sdpa_bwd(
+        grad_out, query, key, value, out, lse, attn_scale,
+        is_causal=is_causal,
+        is_deterministic=torch.are_deterministic_algorithms_enabled(),
     )  # fmt: skip
 
 

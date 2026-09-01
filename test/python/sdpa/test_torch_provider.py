@@ -82,15 +82,18 @@ def test_sdpa_dense_parity(B, Hq, Hkv, Sq, Skv, D, dtype, is_causal, scale, enab
         k = torch.randn(B, Hkv, Skv, D, dtype=dtype, device="cuda", requires_grad=True)
         v = torch.randn(B, Hkv, Skv, D, dtype=dtype, device="cuda", requires_grad=True)
 
-    # Dense: fwd runs on the python API; bwd routes to the C++ worker op
-    # (bit-exact hybrid) until dense backward lands in cudnn::sdpa_bwd.
-    fwd_before, bwd_before = provider.calls["fwd"], provider.calls["bwd_cpp"]
+    # Dense: BOTH directions run on the python API now that cudnn::sdpa_bwd
+    # serves dense. The C++ worker keeps only what the op declines (bias,
+    # dropout, padded), so bwd_cpp must NOT move here.
+    fwd_before, bwd_before = provider.calls["fwd"], provider.calls["bwd"]
+    cpp_before = provider.calls["bwd_cpp"]
     with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
         o = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
     grad_o = torch.randn_like(o)
     o.backward(grad_o)
     assert provider.calls["fwd"] == fwd_before + 1, "provider fwd did not intercept"
-    assert provider.calls["bwd_cpp"] == bwd_before + 1, "provider bwd did not intercept"
+    assert provider.calls["bwd"] == bwd_before + 1, "provider bwd did not intercept"
+    assert provider.calls["bwd_cpp"] == cpp_before, "dense backward fell back to the C++ worker"
     assert o.grad_fn.__class__.__name__.startswith("ScaledDotProductCudnnAttention"), o.grad_fn
 
     o_ref, q_ref, k_ref, v_ref = math_ref(q, k, v, is_causal, scale, enable_gqa)
