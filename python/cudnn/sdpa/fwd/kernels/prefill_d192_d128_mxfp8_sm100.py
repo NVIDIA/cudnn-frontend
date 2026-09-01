@@ -129,6 +129,16 @@ _DENSE_NATURAL_HEAVY_ROWS_FIRST = (
     and CFG.WINDOW_RIGHT == 0
     and not CFG.BOTTOM_RIGHT
 )
+_DENSE_NATURAL_BALANCED_ROWS = (
+    not CFG.THD_VARLEN
+    and CFG.DTYPE_QKV == 0
+    and CFG.SCHEDULER_POLICY == SCHED_NATURAL
+    and CFG.CTA_MMA == 1
+    and CFG.SPLIT_KV == 1
+    and CFG.MASK_FLAGS == MASK_CAUSAL
+    and CFG.WINDOW_RIGHT == 0
+    and not CFG.BOTTOM_RIGHT
+)
 _THD_MASKED_CORRECTION_HEAVY = CFG.THD_VARLEN and CFG.MASK_FLAGS != MASK_NONE and (CFG.DTYPE_QKV == 1 or (CFG.DTYPE_QKV == 0 and CFG.BOTTOM_RIGHT))
 _THD_SWA_STORE_P_BEFORE_REDUCE = (
     CFG.THD_VARLEN
@@ -411,12 +421,23 @@ def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
 
 
 @cute.jit
+def _balance_dense_natural_q(q, n_q_supers):
+    q_half = q // cutlass.Int32(2)
+    balanced_q = q_half
+    if q % cutlass.Int32(2) == cutlass.Int32(0):
+        balanced_q = n_q_supers - cutlass.Int32(1) - q_half
+    return balanced_q
+
+
+@cute.jit
 def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
     if cutlass.const_expr(_THD_HEAVY_ROWS_FIRST):
         return _thd_decode_causal(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
     q, h, b = _sdpa_h.dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
     if cutlass.const_expr(_DENSE_NATURAL_HEAVY_ROWS_FIRST):
         q = n_q_supers - cutlass.Int32(1) - q
+    elif cutlass.const_expr(_DENSE_NATURAL_BALANCED_ROWS):
+        q = _balance_dense_natural_q(q, n_q_supers)
     return q, h, b
 
 
@@ -427,6 +448,8 @@ def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq
     q, h, b = _sdpa_h.dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
     if cutlass.const_expr(_DENSE_NATURAL_HEAVY_ROWS_FIRST):
         q = n_q_supers - cutlass.Int32(1) - q
+    elif cutlass.const_expr(_DENSE_NATURAL_BALANCED_ROWS):
+        q = _balance_dense_natural_q(q, n_q_supers)
     return q, h, b
 
 
