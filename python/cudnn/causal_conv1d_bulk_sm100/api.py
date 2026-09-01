@@ -5,7 +5,7 @@
 
 The internal class retains its historical ``Sm100`` suffix. SM100 uses the
 measured vector schedule, other listed targets at SM100 or newer use the same
-instruction-compatible path, and supported pre-Blackwell targets use the
+instruction-compatible path, and supported pre-SM100 targets use the
 correctness-first scalar schedule. Model code should use
 ``cudnn.ops.causal_conv1d`` rather than this lifecycle API.
 """

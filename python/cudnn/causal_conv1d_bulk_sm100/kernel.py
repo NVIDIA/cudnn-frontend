@@ -554,7 +554,7 @@ class CausalConv1dBulkForwardKernel:
 
     ``use_vec8`` is selected from the exact compilation target.  Its packed
     FP32 arithmetic requires SM100-or-newer instructions; the scalar schedule
-    is the functional fallback on supported pre-Blackwell architectures. Both
+    is the functional fallback on supported pre-SM100 architectures. Both
     BF16 and FP32 filter specializations accumulate in FP32.
     """
 

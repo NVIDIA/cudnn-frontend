@@ -56,7 +56,7 @@ def _stream_step_vec2_fast_tanh(
     produce_dx: cutlass.Constexpr,
     masked: cutlass.Constexpr,
 ) -> None:
-    """Advance one token using Blackwell packed-f32x2 arithmetic."""
+    """Advance one token using SM100+ packed-f32x2 arithmetic."""
 
     fma2 = cute.arch.fma_packed_f32x2
     mul2 = cute.arch.mul_packed_f32x2
