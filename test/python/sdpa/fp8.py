@@ -93,7 +93,7 @@ class GraphBwdUid(IntEnum):
     sink_token = 133
     dSink_token = 134
 
-def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO):
+def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None):
     graph_fwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     use_padding_mask = None
@@ -174,6 +174,8 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         left_bound=left_bound, right_bound=right_bound,
         sink_token=sink_token,
         implementation=implementation,
+        max_total_seq_len_q=max_total_seq_len_q,
+        max_total_seq_len_kv=max_total_seq_len_kv,
     )
     # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
     if diag_align is not None:
@@ -359,8 +361,10 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
-        max_t_q = max(64, ((seq_len_q_gpu.sum().item() + 63) // 64) * 64)
-        max_t_kv = max(64, ((seq_len_kv_gpu.sum().item() + 63) // 64) * 64)
+        # Honor first-class total_q/total_kv capacities when set; fall back to
+        # the minimal packed capacity.
+        max_t_q = getattr(cfg, "total_q", None) or max(64, ((seq_len_q_gpu.sum().item() + 63) // 64) * 64)
+        max_t_kv = getattr(cfg, "total_kv", None) or max(64, ((seq_len_kv_gpu.sum().item() + 63) // 64) * 64)
 
         # With the ragged offset multiplier, offsets are stored in coarser units
         # (divided by the per-tensor multiplier; always divides evenly) and the
@@ -380,7 +384,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     # Build forward graph (always needed)
     try:
-        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation)
+        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
+                                       max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
+                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])

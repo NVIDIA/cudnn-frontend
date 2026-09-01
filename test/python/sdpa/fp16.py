@@ -133,8 +133,10 @@ def validate_config(cfg):
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
-    max_t_q = packed_token_capacity(cfg.seq_len_q) if cfg.is_ragged else None
-    max_t_kv = packed_token_capacity(cfg.seq_len_kv) if cfg.is_ragged else None
+    # total_q/total_kv are first-class capacities: honor explicit (possibly
+    # slack-fuzzed) totals, falling back to the minimal packed capacity.
+    max_t_q = (cfg.total_q or packed_token_capacity(cfg.seq_len_q)) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or packed_token_capacity(cfg.seq_len_kv)) if cfg.is_ragged else None
 
     # When perf mode is enabled, use normal distribution instead of sparse small integers
     # to avoid artificially fast timings from GPU memory compression of sparse data.
@@ -383,6 +385,11 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         score_sum_exp=score_sum_exp,
         sink_token=sink_token,
         unfuse_fma=cfg.with_unfuse_fma,
+        # Declared packed token totals (first-class total_q/total_kv). The
+        # backward graph always declares them; forward declaration is opt-in
+        # so it can be fuzzed on/off.
+        max_total_seq_len_q=cfg.total_q if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
+        max_total_seq_len_kv=cfg.total_kv if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
@@ -733,8 +740,9 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.is_ragged and cfg.is_train:
         dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q)
 
-    max_t_q = max(64, ((seq_len_q_ref.sum().item() + 63) // 64) * 64) if cfg.is_ragged else None
-    max_t_kv = max(64, ((seq_len_kv_ref.sum().item() + 63) // 64) * 64) if cfg.is_ragged else None
+    # Must match the allocation capacity (honors first-class total_q/total_kv).
+    max_t_q = (cfg.total_q or max(64, ((seq_len_q_ref.sum().item() + 63) // 64) * 64)) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or max(64, ((seq_len_kv_ref.sum().item() + 63) // 64) * 64)) if cfg.is_ragged else None
 
     attn_scale = 0.125
 
