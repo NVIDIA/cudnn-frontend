@@ -13,7 +13,7 @@ from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 
 
-def frost_la_gate(engine: str, facts, op: str, *, d_qk_allowed=(128,), d_v_allowed=(128,)) -> None:
+def frost_la_gate(engine: str, facts, op: str) -> None:
     """The FROST LA engines' shared check_support core: the analyzer record,
     the device/DSL environment, and the gates common to all three kernels."""
     if facts is None or facts.op != op:
@@ -35,10 +35,6 @@ def frost_la_gate(engine: str, facts, op: str, *, d_qk_allowed=(128,), d_v_allow
         raise NotImplementedError(f"{engine}: q/k/v must be fp16/bf16, got {facts.io_dtype}")
     if not facts.thd_layout:
         raise NotImplementedError(f"{engine}: q/k/v must be THD [total_T, heads, dim]")
-    if facts.d_qk not in d_qk_allowed:
-        raise NotImplementedError(f"{engine}: q/k head dim must be in {d_qk_allowed}, got {facts.d_qk}")
-    if facts.d_v not in d_v_allowed:
-        raise NotImplementedError(f"{engine}: v head dim must be in {d_v_allowed}, got {facts.d_v}")
     if facts.h_k not in (facts.h_q, facts.h_v):
         raise NotImplementedError(f"{engine}: k heads ({facts.h_k}) must match q's ({facts.h_q}) or v's ({facts.h_v}; canonical GQA shares grouped k/v heads)")
     if facts.h_v != facts.h_q and max(facts.h_q, facts.h_v) % min(facts.h_q, facts.h_v) != 0:

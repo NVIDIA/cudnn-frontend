@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST GDP engine: GDP/GDP_BWD nodes on the unmodified GDN kernels via the
-``num_householder`` sub-token expansion (gate on sub-token 0, readout on
-sub-token ``n - 1``); compiled plans shared with ``gdn_engine.py``."""
+"""FROST GDP engine: GDP/GDP_BWD nodes on the ``num_householder`` sub-token
+expansion (gate on sub-token 0, readout on sub-token ``n - 1``).  Plans are
+built by ``gdn_engine.py``, which routes d_v = 64 to the fork kernels and
+everything else to the shared expanded-timeline kernels."""
 
 from __future__ import annotations
 
@@ -24,10 +25,12 @@ class GdpFrostEngine(BaseEngine):
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
-        frost_la_gate("GdpFrostEngine", facts, "GDP", d_v_allowed=(64, 128))
+        frost_la_gate("GdpFrostEngine", facts, "GDP")
+        if facts.d_qk not in (64, 128):
+            raise NotImplementedError(f"GdpFrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
+        if facts.d_v not in (64, 128):
+            raise NotImplementedError(f"GdpFrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
         gdn_support_gates("GdpFrostEngine", facts)
-        if facts.safe_gate:
-            raise NotImplementedError("GdpFrostEngine: safe_gate has no exact neutral fill on the expanded sub-token rows")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         handle = ctx.handle if ctx is not None else None

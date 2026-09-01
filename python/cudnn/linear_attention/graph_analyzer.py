@@ -60,21 +60,22 @@ class LaGraphFacts:
     is_bwd: bool = False
 
     # geometry (THD; zeros when the port ranks are not declared)
-    thd_layout: bool = True  # Q/K/V are rank-3 [total_T, heads, dim]
+    thd_layout: bool = True
     h_q: int = 0
     h_k: int = 0
     h_v: int = 0
     h_o: int = 0
     d_qk: int = 0
     d_v: int = 0
-    total_t: int = 0  # packed token count
+    total_t: int = 0
     n_seq: int = 0
     state_checkpoint_rows: int = 0  # rows declared on the checkpoint port (0 = absent or undeclared)
     gates_at_ho: bool = True  # Gate/Beta(/W) carry HO = max(h_q, h_v) heads
+    gate_channels: int = 0  # g's channel dim (0 = scalar per-head gate or undeclared)
 
     # dtypes (cudnn.data_type vocabulary; None = unset/inferred)
     io_dtype: Any = None  # Q's dtype
-    uniform_io: bool = True  # Q/K/V dtypes agree
+    uniform_io: bool = True
     g_dtype: Any = None
     beta_dtype: Any = None
     w_dtype: Any = None
@@ -83,7 +84,7 @@ class LaGraphFacts:
     dt_bias_dtype: Any = None
     do_dtype: Any = None
     state_checkpoints_dtype: Any = None
-    state_checkpoints_out_dtype: Any = None  # fwd checkpoint OUTPUT port dtype
+    state_checkpoints_out_dtype: Any = None
     d_final_state_dtype: Any = None
     state_dtype: Any = None
     final_state_dtype: Any = None
@@ -102,18 +103,18 @@ class LaGraphFacts:
     # ports present / requested
     has_initial_state: bool = False
     wants_d_initial_state: bool = False
-    wants_state_checkpoints: bool = False  # fwd checkpoint-series output
+    wants_state_checkpoints: bool = False
 
     # attributes
     scale: Optional[float] = None
     use_qk_l2norm: bool = False
     safe_gate: bool = False
     use_beta_sigmoid: bool = False
+    allow_neg_eigval: bool = False
     beta_guard: bool = False
     gate_lower_bound: Optional[float] = None
     checkpoint_every_n_tokens: int = 0
     batch_invariant: bool = False
-    # GDP: k/v/beta rows == q rows * num_householder (total_t stays q rows)
     num_householder: int = 1
 
 
@@ -170,6 +171,10 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "checkpoint_every_n_tokens > 0 requires the state_checkpoints output"
     elif not is_bwd and checkpoint == 0 and "state_checkpoints" in outs:
         invalid = "state_checkpoints output requires checkpoint_every_n_tokens > 0"
+    elif is_bwd and checkpoint > 0 and "state_checkpoints" not in ins:
+        invalid = "checkpoint_every_n_tokens > 0 on a bwd node requires the state_checkpoints input"
+    elif bool(params.get("allow_neg_eigval", False)) and not bool(params.get("use_beta_sigmoid", False)):
+        invalid = "allow_neg_eigval requires use_beta_sigmoid=True (the 2x rides on the fused sigmoid)"
     elif num_householder < 1:
         invalid = "num_householder must be a positive integer"
     elif op == "GDP" and ins["q"].dim and any(t.dim and int(t.dim[0]) != int(ins["q"].dim[0]) * num_householder for t in (ins["k"], ins["v"], ins["beta"])):
@@ -198,6 +203,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         checkpoint_port = outs.get("state_checkpoints")
     state_checkpoint_rows = int(checkpoint_port.dim[0]) if checkpoint_port is not None and checkpoint_port.dim else 0
     gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
+    gate_channels = int(ins["g"].dim[2]) if ins["g"].dim and len(ins["g"].dim) == 3 else 0
     io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
     state_dtypes = {in_dt.get("initial_state"), out_dt.get("final_state")} - {None}
     scale = params.get("scale")
@@ -216,6 +222,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         n_seq=n_seq,
         state_checkpoint_rows=state_checkpoint_rows,
         gates_at_ho=gates_at_ho,
+        gate_channels=gate_channels,
         io_dtype=in_dt["q"],
         uniform_io=len(io_dtypes) <= 1,
         g_dtype=in_dt["g"],
@@ -248,6 +255,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
         safe_gate=safe_gate,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
+        allow_neg_eigval=bool(params.get("allow_neg_eigval", False)),
         beta_guard=bool(params.get("beta_guard", False)),
         gate_lower_bound=float(params["gate_lower_bound"]) if params.get("gate_lower_bound") is not None else None,
         checkpoint_every_n_tokens=checkpoint,

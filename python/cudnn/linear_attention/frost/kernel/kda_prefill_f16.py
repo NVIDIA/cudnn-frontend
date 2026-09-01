@@ -311,7 +311,7 @@ def tmaldg_warp(
             if beta_token < batch_seqlen:
                 beta_carry = mBeta[batch_start + beta_token, head_o].to(cutlass.Float32)
                 if cutlass.const_expr(cfg.beta_sigmoid):
-                    beta_carry = sigmoid(beta_carry).to(mBeta.element_type).to(cutlass.Float32)
+                    beta_carry = (sigmoid(beta_carry) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(mBeta.element_type).to(cutlass.Float32)
 
         for chunk_idx in cutlass.range(compute_start, write_end, 1, unroll=1):
             chunk_start = chunk_idx * cfg.b_t
@@ -327,7 +327,7 @@ def tmaldg_warp(
                 if beta_token < batch_seqlen:
                     beta_carry = mBeta[batch_start + beta_token, head_o].to(cutlass.Float32)
                     if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_carry = sigmoid(beta_carry).to(mBeta.element_type).to(cutlass.Float32)
+                        beta_carry = (sigmoid(beta_carry) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(mBeta.element_type).to(cutlass.Float32)
 
             # ---- Q load --------------------------------------------------------------
             bars.mb_q_done[raw_index.idx].wait(raw_index.phase)
@@ -1091,9 +1091,18 @@ def compute0_warp_group(
 
     cg0_warp = warp_idx - cfg.compute_group_0_warp_ids[0]
     cg0_local_warp = cg0_warp % cfg.cg0_warps_per_group
+    dk_halves = cutlass.const_expr(cfg.d_k // 64)
+    channel_rows = cutlass.const_expr(cfg.d_k // cfg.cg0_warps_per_group)
+    channel_active = cutlass.Boolean(True)
+    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+        channel_active = lane_idx < cutlass.Int32(channel_rows)
+    store_rows = cutlass.const_expr(cfg.b_t * channel_rows // cfg.threads_per_warp)
+    store_row_base = (lane_idx // cutlass.Int32(channel_rows)) * cutlass.Int32(store_rows)
 
     cg0_group_id = cg0_warp // cfg.cg0_warps_per_group
     channel_dim = cg0_local_warp * cfg.threads_per_warp + lane_idx
+    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+        channel_dim = cg0_local_warp * channel_rows + lane_idx % channel_rows
     cg0_a_log_exp = cutlass.Float32(1.0)
     cg0_dt_bias_value = cutlass.Float32(0.0)
     cum_chunk_base = cutlass.Int32(0)
@@ -1138,8 +1147,6 @@ def compute0_warp_group(
             lane_row_group = lane_idx // 8
             lane_in_row_group = lane_idx - lane_row_group * 8
             decay_row = row_group_start + lane_row_group
-
-            channel_dim = cg0_local_warp * cfg.threads_per_warp + lane_idx
 
             # ---- Gate prefix scan ----------------------------------------------------
             f32_segment = channel_dim // 32
@@ -1202,25 +1209,32 @@ def compute0_warp_group(
             exp_g_last = g_prefix_regs[cfg.b_t - 1]
             if cutlass.const_expr(cfg.gate_dtype != cutlass.Float32):
                 nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
-            for row in cutlass.range_constexpr(cfg.b_t):
+            for row_off in cutlass.range_constexpr(store_rows):
+                if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+                    row = store_row_base + cutlass.Int32(row_off)
+                    value = g_prefix_regs[row_off + cfg.b_t // 2] if lane_idx >= cutlass.Int32(channel_rows) else g_prefix_regs[row_off]
+                else:
+                    row = row_off
+                    value = g_prefix_regs[row_off]
                 prefix_idx = prefix_seg_base + swizzle_xor_128b(row, row * 32 + prefix_col, elem_bytes=4)
-                (sGate_exchange_ptr + prefix_idx).store(g_prefix_regs[row])
+                (sGate_exchange_ptr + prefix_idx).store(value)
 
             # ---- state-scale diag: stage exp2(g last) decay blocks -------------------
             bars.mb_state_scale_diag_done[state_scale_diag_stage].wait(diag_ring_phase ^ cutlass.Int32(1))
             block = channel_dim // cutlass.Int32(16)
             coord = channel_dim - block * cutlass.Int32(16)
             diag_idx = block * cutlass.Int32(256) + coord * cutlass.Int32(16) + swizzle_xor_32b(channel_dim, coord)
-            sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
+            if channel_active:
+                sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
 
             nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
 
             bars.mb_q_ready[raw_bar_stage].wait((cum_chunk // cfg.smem_raw_bar_stages) % 2)
             bars.mb_k_ready[raw_bar_stage].wait((cum_chunk // cfg.smem_raw_bar_stages) % 2)
-            k_inv_pack = cutlass.Array(cutlass.Int32, 2 * 4, alignment=16)
-            k_restore_pack = cutlass.Array(cutlass.Int32, 2 * 4, alignment=16)
-            raw_q_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            raw_k_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
+            k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
+            k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
+            raw_q_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            raw_k_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
 
             # ---- optional Q/K L2-norm ------------------------------------------------
             if cutlass.const_expr(cfg.l2norm):
@@ -1228,8 +1242,8 @@ def compute0_warp_group(
                 k_sq_even = opaque_f32_zero()
                 q_sq_odd = opaque_f32_zero()
                 k_sq_odd = opaque_f32_zero()
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
@@ -1265,10 +1279,10 @@ def compute0_warp_group(
                 k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
-            exp_g_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            exp_g_last_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            exp_g_last_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 for f32_group in cutlass.range_constexpr(2):
                     f32_dim_base = dim_base + f32_group * 4
@@ -1283,8 +1297,8 @@ def compute0_warp_group(
                         exp_g_regs[f32_reg_base + j] = exp_g_frag[j]
                         exp_g_last_regs[f32_reg_base + j] = exp_g_last_frag[j]
 
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
 
                 # ---- K decay + K inv + K restore operands: K * exp2(+g), K * exp2(-g), K * exp2(g last - g) ----
@@ -1341,8 +1355,8 @@ def compute0_warp_group(
             bars.mb_gate_done[raw_stage].arrive()
 
             # ---- Q decay operand: Q * q inv norm -------------------------------------
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 q_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
                 for pair_idx in cutlass.range_constexpr(4):
@@ -1370,8 +1384,8 @@ def compute0_warp_group(
 
             # ---- K restore operand store ---------------------------------------------
             bars.mb_k_restore_done[decay_stage].wait(((cum_chunk // cfg.smem_decay_stages + 1) % 2))
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
                 k_restore_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
@@ -2017,22 +2031,6 @@ def frost_kda_prefill(
     lane_idx = tidx % cfg.threads_per_warp
 
     total_tiles = mCount[0]
-    if cutlass.const_expr(cfg.dynamic_scheduling):
-        assert mScheduler is not None and mScheduler.element_type == cutlass.Int32
-    assert mQ.element_type == cfg.io_dtype and mK.element_type == cfg.io_dtype and mV.element_type == cfg.io_dtype
-    assert mGate.element_type == cfg.gate_dtype
-    assert mBeta.element_type in (cutlass.Float32, cfg.io_dtype)
-    assert cu_seqlens.element_type in (cutlass.Int32, cutlass.Int64)
-    if cutlass.const_expr(cfg.use_initial_state):
-        assert mState_init is not None and mState_init.element_type in (cutlass.BFloat16, cutlass.Float32)
-    else:
-        assert mState_init is None, "mState_init must be None if use_initial_state is False"
-    if cutlass.const_expr(cfg.store_final_state):
-        assert mState_out is not None and mState_out.element_type in (cutlass.BFloat16, cutlass.Float32)
-    else:
-        assert mState_out is None, "mState_out must be None if store_final_state is False"
-    if cutlass.const_expr(mState_init is not None and mState_out is not None):
-        assert mState_init.element_type == mState_out.element_type
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     arr_words = n_desc * cutlass.Int32(TENSOR_MAP_QWORDS)
     desc_q_base = desc_base_words
@@ -2319,6 +2317,7 @@ class KdaCfg:
     safe_gate: bool
     gate_scale_log2: float
     beta_sigmoid: bool
+    allow_neg_eigval: bool
     q_ratio: int
     k_ratio: int
     v_ratio: int
@@ -2404,6 +2403,7 @@ def build_cfg(
     safe_gate: bool,
     gate_scale_log2: float,
     beta_sigmoid: bool,
+    allow_neg_eigval: bool,
     q_ratio: int,
     k_ratio: int,
     v_ratio: int,
@@ -2415,12 +2415,6 @@ def build_cfg(
 ) -> KdaCfg:
     """Build the per-compile ``KdaCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
-    if io_dtype not in (cutlass.Float16, cutlass.BFloat16):
-        raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
-    if d_k != 128:
-        raise ValueError(f"d_k={d_k} not supported; the q/k head dim must be 128")
-    if d_v not in (64, 128):
-        raise ValueError(f"d_v={d_v} not supported; the v head dim must be 64 or 128")
     cfg = KdaCfg(
         io_dtype=io_dtype,
         state_dtype=state_dtype,
@@ -2432,6 +2426,7 @@ def build_cfg(
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         beta_sigmoid=beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
         q_ratio=q_ratio,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
@@ -2750,6 +2745,8 @@ def get_compiled_cache(
     io_dtype_str: str,
     state_dtype_str: str,
     gate_dtype_str: str,
+    a_log_dtype_str: str,
+    dt_bias_dtype_str: str,
     cu_dtype_str: str,
     beta_dtype_str: str,
     HQ: int,
@@ -2764,6 +2761,7 @@ def get_compiled_cache(
     safe_gate: bool,
     gate_lower_bound: float,
     beta_sigmoid: bool,
+    allow_neg_eigval: bool,
     dynamic_scheduling: bool,
     order_gen: bool,
 ):
@@ -2782,6 +2780,7 @@ def compile(
     safe_gate: bool,
     gate_scale_log2: float,
     beta_sigmoid: bool,
+    allow_neg_eigval: bool,
     q_ratio: int,
     k_ratio: int,
     v_ratio: int,
@@ -2822,6 +2821,7 @@ def compile(
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         beta_sigmoid=beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
         q_ratio=q_ratio,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
@@ -2876,6 +2876,7 @@ def chunk_kda_sm100(
     a_log=None,
     dt_bias=None,
     use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
     work_items=None,
     work_count=None,
     scheduler_counter=None,
@@ -2939,17 +2940,6 @@ def chunk_kda_sm100(
     use_initial_state = initial_state is not None
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
-    if enable_checkpoints:
-        if output_state_checkpoints is None:
-            raise ValueError("checkpoint_every_n_tokens > 0 requires output_state_checkpoints")
-        if str(output_state_checkpoints.dtype).split(".")[-1] != str(q.dtype).split(".")[-1]:
-            raise ValueError(
-                f"output_state_checkpoints dtype must match the io dtype (fp32 state belongs to output_state): got {output_state_checkpoints.dtype} with io {q.dtype}"
-            )
-    if work_items is None or work_count is None:
-        raise ValueError(
-            "work_items/work_count are required (built by the split-table stage, or by an order-generating prologue when work_item_scratch is None)"
-        )
     dynamic_scheduling = scheduler_counter is not None
     order_gen = work_item_scratch is None
 
@@ -2960,16 +2950,11 @@ def chunk_kda_sm100(
     else:
         state_dtype_src = "float32"
 
-    for name, h in (("HQ", HQ), ("HK", HK), ("HV", HV)):
-        if HO % h != 0:
-            raise ValueError(f"{name}={h} must divide sab heads {HO}")
     q_ratio = HO // HQ
     k_ratio = HO // HK
     v_ratio = HO // HV
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
-    if safe_gate and (a_log is None or dt_bias is None):
-        raise ValueError("safe_gate requires a_log and dt_bias")
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -2979,6 +2964,8 @@ def chunk_kda_sm100(
         str(q.dtype),
         str(state_dtype_src),
         str(gate.dtype),
+        str(a_log.dtype) if a_log is not None else "none",
+        str(dt_bias.dtype) if dt_bias is not None else "none",
         str(cu_seqlens.dtype),
         str(beta.dtype),
         HQ,
@@ -2993,6 +2980,7 @@ def chunk_kda_sm100(
         safe_gate,
         gate_lower_bound,
         use_beta_sigmoid_in_kernel,
+        allow_neg_eigval,
         dynamic_scheduling,
         order_gen,
     )
@@ -3040,6 +3028,7 @@ def chunk_kda_sm100(
             safe_gate,
             gate_scale_log2,
             use_beta_sigmoid_in_kernel,
+            allow_neg_eigval,
             q_ratio,
             k_ratio,
             v_ratio,

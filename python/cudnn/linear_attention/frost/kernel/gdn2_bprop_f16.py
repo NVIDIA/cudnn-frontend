@@ -1764,14 +1764,20 @@ def compute0_warp_group(
     nvvm.setmaxregister(cfg.num_regs_compute_group_0, nvvm.SetMaxRegisterAction.INCREASE)
     elect_one = nvvm.elect_sync()
     cg0_warp = warp_idx - cfg.compute_group_0_warp_ids[0]
+    dk_halves = cutlass.const_expr(cfg.d_k // 64)
+    channel_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
+    channel_active = cutlass.Boolean(True)
+    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+        channel_active = lane_idx < cutlass.Int32(channel_rows)
     nvvm.barrier_cta_sync(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_hold.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
-    tmem_sp = warp_idx % (cfg.d_k // cfg.threads_per_warp)
     state_copy_addr = tmem_row << 16
     state_index = PipelineState.start(phase=0)
     cg0_channel_dim = cg0_warp * cfg.threads_per_warp + lane_idx
+    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
+        cg0_channel_dim = cg0_warp * channel_rows + lane_idx % channel_rows
     cg0_a_log_exp = cutlass.Float32(1.0)
     cg0_dt_bias_value = cutlass.Float32(0.0)
     gbase = cutlass.Int32(0)
@@ -1816,7 +1822,7 @@ def compute0_warp_group(
             decay_row = row_group_start + lane_row_group
 
             gate_prefix_ptr = sGate_exchange_ptr
-            channel_dim = cg0_warp * cfg.threads_per_warp + lane_idx
+            channel_dim = cg0_channel_dim
             # ---- gate prefix scan: cumulative log-gate per key channel ---------------
             f32_segment = channel_dim // 32
             f32_segment_dim = channel_dim - f32_segment * 32
@@ -1864,8 +1870,9 @@ def compute0_warp_group(
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
-                    (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
-                    (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
+                    if channel_active:
+                        (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
+                        (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
                     prefix_acc = prefix1
                     exp_g_last = exp_g1
             else:
@@ -1903,8 +1910,9 @@ def compute0_warp_group(
                     prefix1 = prefix_acc + row_pair_sum
                     exp_g0 = cute.math.exp2(prefix0, fastmath=True)
                     exp_g1 = cute.math.exp2(prefix1, fastmath=True)
-                    (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
-                    (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
+                    if channel_active:
+                        (sGate_exchange_ptr + prefix_idx0).store(exp_g0)
+                        (sGate_exchange_ptr + prefix_idx1).store(exp_g1)
                     prefix_acc = prefix1
                     exp_g_last = exp_g1
             # ---- decay-slot guard ----------------------------------------------------
@@ -1915,7 +1923,8 @@ def compute0_warp_group(
             block = channel_dim // cutlass.Int32(16)
             coord = channel_dim - block * cutlass.Int32(16)
             diag_idx = block * cutlass.Int32(256) + coord * cutlass.Int32(16) + swizzle_xor_32b(channel_dim, coord)
-            sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
+            if channel_active:
+                sState_scale_diag_ptr[diag_idx] = exp_g_last.to(cfg.io_dtype)
 
             # ---- raw Q/K: SMEM -> TMEM ring (channel-major) --------------------------
             qk_raw_stage = gc % cfg.tmem_qk_raw_stages
@@ -1949,19 +1958,19 @@ def compute0_warp_group(
 
             nvvm.barrier_cta_sync(cfg.cg0_sync_barrier_id, thread_count=cfg.cg0_threads)
 
-            k_inv_pack = cutlass.Array(cutlass.Int32, 2 * 4, alignment=16)
-            k_restore_pack = cutlass.Array(cutlass.Int32, 2 * 4, alignment=16)
-            raw_q_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            raw_k_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            raw_beta_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
+            k_inv_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
+            k_restore_pack = cutlass.Array(cutlass.Int32, dk_halves * 4, alignment=16)
+            raw_q_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            raw_k_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            raw_beta_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
             # ---- optional Q/K L2-norm ------------------------------------------------
             if cutlass.const_expr(cfg.l2norm):
                 qk0_lo = opaque_f32_zero()
                 qk0_hi = opaque_f32_zero()
                 qk1_lo = opaque_f32_zero()
                 qk1_hi = opaque_f32_zero()
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
@@ -1980,7 +1989,7 @@ def compute0_warp_group(
                     raw_k_regs[reg_base + dim_offset] = k_val
                     beta_val = raw_beta_frag_f32[dim_offset]
                     if cutlass.const_expr(cfg.beta_sigmoid):
-                        beta_val = sigmoid(beta_val).to(cfg.io_dtype).to(cutlass.Float32)
+                        beta_val = (sigmoid(beta_val) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
                     raw_beta_regs[reg_base + dim_offset] = beta_val
                     if cutlass.const_expr(cfg.l2norm):
                         if cutlass.const_expr(dim_offset % 2 == 0):
@@ -2017,8 +2026,8 @@ def compute0_warp_group(
             # ---- beta guard ----------------------------------------------------------
             if cutlass.const_expr(cfg.beta_guard):
                 beta_guard(cfg, raw_beta_regs, raw_k_regs, k_inv_norm, gate_prefix_ptr, decay_row, lane_in_row_group)
-                for dim_half in cutlass.range_constexpr(2):
-                    dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+                for dim_half in cutlass.range_constexpr(dk_halves):
+                    dim_base = dim_half * 64 + lane_in_row_group * 8
                     reg_base = dim_half * 8
                     beta_eff_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
                     for pair_idx in cutlass.range_constexpr(4):
@@ -2034,10 +2043,10 @@ def compute0_warp_group(
                     (sBetaP_ptr + raw_f16_idx).store(beta_eff_vec, alignment=16)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
-            exp_g_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            exp_g_last_regs = cutlass.Array(cutlass.Float32, 2 * 8, alignment=16)
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            exp_g_last_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 for f32_group in cutlass.range_constexpr(2):
                     f32_dim_base = dim_base + f32_group * 4
@@ -2061,8 +2070,8 @@ def compute0_warp_group(
             if cutlass.const_expr(cfg.beta_guard):
                 bars.mb_beta_done[raw_stage].arrive()
 
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 # ---- K decay + K inv + K restore operands: Beta * K * exp2(+g), K * exp2(-g), K * exp2(g last - g) ----
                 k_decay_pack = cutlass.Array(cutlass.Int32, 4, alignment=16)
@@ -2104,8 +2113,8 @@ def compute0_warp_group(
             bars.mb_k_decay_inv_ready[decay_stage].arrive()
 
             # ---- Q decay + K restore operands ----------------------------------------
-            for dim_half in cutlass.range_constexpr(2):
-                dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
+            for dim_half in cutlass.range_constexpr(dk_halves):
+                dim_base = dim_half * 64 + lane_in_row_group * 8
                 reg_base = dim_half * 8
                 if cutlass.const_expr(cfg.beta_guard):
                     f16_segment = dim_base // 64
@@ -2156,7 +2165,7 @@ def compute0_warp_group(
                 state_src = sState_raw.data_ptr() + state_index.idx * (cfg.d_k * cfg.d_v)
                 ldm_row_coord = (lane_idx // 16) * 8 + (lane_idx & 7)
                 ldm_col_offset = ((lane_idx // 8) & 1) * 8
-                k_base = tmem_sp * cfg.threads_per_warp
+                k_base = cg0_warp * channel_rows
                 k_seg_off = (k_base // 64) * (cfg.d_v * 64)
                 state_copy_hi_addr = state_copy_addr + (16 << 16)
                 state_col = tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)
@@ -2167,13 +2176,14 @@ def compute0_warp_group(
                         4,
                         nvvm.MMALayout.COL,
                     )
-                    frag_hi = nvvm.ldmatrix(
-                        state_src + k_seg_off + dv_row * 64 + swizzle_xor_128b(dv_row, (k_base + 16 + ldm_col_offset) % 64, elem_bytes=2),
-                        4,
-                        nvvm.MMALayout.COL,
-                    )
                     nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(state_copy_addr + (state_col + dv_blk * 8), cutlass.Int8), frag_lo)
-                    nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(state_copy_hi_addr + (state_col + dv_blk * 8), cutlass.Int8), frag_hi)
+                    if cutlass.const_expr(channel_rows == cfg.threads_per_warp):
+                        frag_hi = nvvm.ldmatrix(
+                            state_src + k_seg_off + dv_row * 64 + swizzle_xor_128b(dv_row, (k_base + 16 + ldm_col_offset) % 64, elem_bytes=2),
+                            4,
+                            nvvm.MMALayout.COL,
+                        )
+                        nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(state_copy_hi_addr + (state_col + dv_blk * 8), cutlass.Int8), frag_hi)
                 nvvm.tcgen05_wait("store")
                 bars.mb_state_cg0_done[state_index.idx].arrive()
                 state_index = advance(state_index, cfg.smem_state_stages)
@@ -2501,7 +2511,8 @@ def compute1_warp_group(
             sdv_stage_base = dv_stage * (cfg.b_t * cfg.d_v)
             sdwo_stage_base = dwo_stage * (cfg.b_t * cfg.d_v)
             dy_frag_lo = nvvm.ldmatrix(sDy_raw.data_ptr() + dy_addr_lo, 4, nvvm.MMALayout.COL)
-            dy_frag_hi = nvvm.ldmatrix(sDy_raw.data_ptr() + dy_addr_hi, 4, nvvm.MMALayout.COL)
+            if cutlass.const_expr(dv_halves == 2):
+                dy_frag_hi = nvvm.ldmatrix(sDy_raw.data_ptr() + dy_addr_hi, 4, nvvm.MMALayout.COL)
             dv_w_frag_lo = nvvm.ldmatrix(
                 sW_ptr
                 + (value_dim_base + ov_col_offset) // 64 * (cfg.b_t * 64)
@@ -2510,31 +2521,34 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            dv_w_frag_hi = nvvm.ldmatrix(
-                sW_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                dv_w_frag_hi = nvvm.ldmatrix(
+                    sW_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             dv_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             dv_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 dv_pack_lo[reg_idx] = mul_f16x2(dv_w_frag_lo[reg_idx], dy_frag_lo[reg_idx], cfg.io_dtype)
-                dv_pack_hi[reg_idx] = mul_f16x2(dv_w_frag_hi[reg_idx], dy_frag_hi[reg_idx], cfg.io_dtype)
+                if cutlass.const_expr(dv_halves == 2):
+                    dv_pack_hi[reg_idx] = mul_f16x2(dv_w_frag_hi[reg_idx], dy_frag_hi[reg_idx], cfg.io_dtype)
             nvvm.stmatrix(
                 sDv_raw.data_ptr() + sdv_stage_base + dy_addr_lo,
                 dv_pack_lo.data_ptr().load(count=4, alignment=4),
                 nvvm.MMALayout.COL,
                 shape=nvvm.StoreShape.M8N8,
             )
-            nvvm.stmatrix(
-                sDv_raw.data_ptr() + sdv_stage_base + dy_addr_hi,
-                dv_pack_hi.data_ptr().load(count=4, alignment=4),
-                nvvm.MMALayout.COL,
-                shape=nvvm.StoreShape.M8N8,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.stmatrix(
+                    sDv_raw.data_ptr() + sdv_stage_base + dy_addr_hi,
+                    dv_pack_hi.data_ptr().load(count=4, alignment=4),
+                    nvvm.MMALayout.COL,
+                    shape=nvvm.StoreShape.M8N8,
+                )
             dwo_v_frag_lo = nvvm.ldmatrix(
                 sV_ptr
                 + (value_dim_base + ov_col_offset) // 64 * (cfg.b_t * 64)
@@ -2543,31 +2557,34 @@ def compute1_warp_group(
                 4,
                 nvvm.MMALayout.COL,
             )
-            dwo_v_frag_hi = nvvm.ldmatrix(
-                sV_ptr
-                + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
-                + ov_row_coord * 64
-                + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
-                4,
-                nvvm.MMALayout.COL,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                dwo_v_frag_hi = nvvm.ldmatrix(
+                    sV_ptr
+                    + (value_dim_base + 16 + ov_col_offset) // 64 * (cfg.b_t * 64)
+                    + ov_row_coord * 64
+                    + swizzle_xor_128b(ov_row_coord, (value_dim_base + 16 + ov_col_offset) % 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.COL,
+                )
             dwo_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             dwo_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
                 dwo_pack_lo[reg_idx] = mul_f16x2(dwo_v_frag_lo[reg_idx], dy_frag_lo[reg_idx], cfg.io_dtype)
-                dwo_pack_hi[reg_idx] = mul_f16x2(dwo_v_frag_hi[reg_idx], dy_frag_hi[reg_idx], cfg.io_dtype)
+                if cutlass.const_expr(dv_halves == 2):
+                    dwo_pack_hi[reg_idx] = mul_f16x2(dwo_v_frag_hi[reg_idx], dy_frag_hi[reg_idx], cfg.io_dtype)
             nvvm.stmatrix(
                 sDwOut_raw.data_ptr() + sdwo_stage_base + dy_addr_lo,
                 dwo_pack_lo.data_ptr().load(count=4, alignment=4),
                 nvvm.MMALayout.COL,
                 shape=nvvm.StoreShape.M8N8,
             )
-            nvvm.stmatrix(
-                sDwOut_raw.data_ptr() + sdwo_stage_base + dy_addr_hi,
-                dwo_pack_hi.data_ptr().load(count=4, alignment=4),
-                nvvm.MMALayout.COL,
-                shape=nvvm.StoreShape.M8N8,
-            )
+            if cutlass.const_expr(dv_halves == 2):
+                nvvm.stmatrix(
+                    sDwOut_raw.data_ptr() + sdwo_stage_base + dy_addr_hi,
+                    dwo_pack_hi.data_ptr().load(count=4, alignment=4),
+                    nvvm.MMALayout.COL,
+                    shape=nvvm.StoreShape.M8N8,
+                )
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dv_tmastg_ready[dv_stage].arrive()
             bars.mb_dwo_tmastg_ready[dwo_stage].arrive()
@@ -2582,7 +2599,7 @@ def compute1_warp_group(
                 bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
                 row_lo_addr = tmem_row << 16
-                for i in cutlass.range(4, unroll=1):
+                for i in cutlass.range(cfg.d_k // 32, unroll=1):
                     dstate_vec = nvvm.tcgen05_ld(
                         "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 32), cutlass.Float32), num=32
                     )
@@ -2598,7 +2615,7 @@ def compute1_warp_group(
                 bars.mb_dstate_input_ready.arrive()
 
                 # ---- dstate input: TMEM -> sDstate -----------------------------------
-                for i in cutlass.range(4, unroll=1):
+                for i in cutlass.range(cfg.d_k // 32, unroll=1):
                     dstate_words = nvvm.tcgen05_ld(
                         "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_input_offset + i * 16), cutlass.Float32), num=16
                     )
@@ -2692,10 +2709,16 @@ def compute2_warp_group(
     tmem_base = tmem_hold.load()
     tmem_col = tmem_base & 0xFFFF
     tmem_row = tmem_base >> 16
-    wg1_sp = warp_idx % 4
-    channel = wg1_sp * cfg.threads_per_warp + lane_idx
+    cg2_warp = warp_idx - cfg.compute_group_2_warp_ids[0]
+    channel_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_2_warp_ids))
+    split_channels = cutlass.const_expr(channel_rows < cfg.threads_per_warp)
+    channel = cg2_warp * cfg.threads_per_warp + lane_idx
+    if cutlass.const_expr(split_channels):
+        fragment_quad = lane_idx % 4
+        quad_base = lane_idx - fragment_quad
+        channel_lo = cg2_warp * channel_rows + lane_idx // 4
+        channel_hi = channel_lo + cutlass.Int32(8)
     row_lo_addr = tmem_row << 16
-    cg2_tidx = channel
 
     raw_index = PipelineState.start(phase=0)
     dq_acc_index = PipelineState.start(phase=0)
@@ -2723,19 +2746,35 @@ def compute2_warp_group(
                 has_dstate = cutlass.Boolean(True)
             sBetaP_ptr = sBeta_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
             sGate_exchange_ptr = sGate_raw.data_ptr() + raw_stage * (cfg.d_k * cfg.b_t)
-            writes = chunk_idx < write_end
 
             bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
 
             # ---- per-channel gate factors --------------------------------------------
-            f32_seg = channel // 32
-            f32_dim = channel - f32_seg * 32
-            f16_seg = channel // 64
-            f16_dim = channel - f16_seg * 64
-            eg = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                eg[t] = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)).load()
-            egl = eg[cfg.b_t - 1]
+            if cutlass.const_expr(split_channels):
+                eg_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                eg_last = cutlass.Array(cutlass.Float32, 2, alignment=8)
+                for cs in cutlass.range_constexpr(2):
+                    channel_cs = channel_lo if cs == 0 else channel_hi
+                    seg_cs = channel_cs // 32
+                    dim_cs = channel_cs - seg_cs * 32
+                    for rep in cutlass.range_constexpr(2):
+                        for n in cutlass.range_constexpr(2):
+                            token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                            eg_frag[rep * 4 + cs * 2 + n] = (
+                                sGate_exchange_ptr + seg_cs * (cfg.b_t * 32) + token * 32 + swizzle_xor_128b(token, dim_cs, elem_bytes=4)
+                            ).load()
+                    eg_last[cs] = (
+                        sGate_exchange_ptr + seg_cs * (cfg.b_t * 32) + (cfg.b_t - 1) * 32 + swizzle_xor_128b(cfg.b_t - 1, dim_cs, elem_bytes=4)
+                    ).load()
+            else:
+                f32_seg = channel // 32
+                f32_dim = channel - f32_seg * 32
+                f16_seg = channel // 64
+                f16_dim = channel - f16_seg * 64
+                eg = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    eg[t] = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)).load()
+                egl = eg[cfg.b_t - 1]
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_gate_done[raw_stage].arrive()
 
@@ -2748,98 +2787,207 @@ def compute2_warp_group(
 
             # ---- dGate last dot: sum over v of dstate[v, c] * state[c, v] ------------
             dgate_last_val = cutlass.Float32(0.0)
+            if cutlass.const_expr(split_channels):
+                dgate_last_frag = cutlass.Array(cutlass.Float32, 2, alignment=8)
+                for cs in cutlass.range_constexpr(2):
+                    dgate_last_frag[cs] = cutlass.Float32(0.0)
             bars.mb_state_input_ready[gc % 2].wait((gc // 2) % 2)
             if has_dstate:
                 bars.mb_dstate_smem_ready.wait(dgate_last_dstate_smem_index.phase)
                 dgate_last_dstate_smem_index = advance(dgate_last_dstate_smem_index, 1)
-                for trip in cutlass.range(2 * (cfg.d_v // 64), unroll=1):
+                if cutlass.const_expr(split_channels):
                     state_vec = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2) + trip * 16), cutlass.Float32),
-                        num=16,
+                        "16x256b",
+                        nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2)), cutlass.Float32),
+                        num=cfg.d_v // 16,
                     )
                     hacc = cutlass.Array(cutlass.Float32, 8, alignment=16)
                     for i in cutlass.range_constexpr(8):
                         hacc[i] = opaque_f32_zero()
-                    for j in cutlass.range_constexpr(16):
-                        v0 = trip * 32 + 2 * j
-                        state_pair = cutlass.Vector.from_elements((state_vec[j],), cutlass.Float32).bitcast(cfg.io_dtype)
-                        dstate_addr0 = (channel // 64) * (cfg.d_v * 64) + v0 * 64 + swizzle_xor_128b(2 * j, channel % 64, elem_bytes=2)
-                        dstate_addr1 = (channel // 64) * (cfg.d_v * 64) + (v0 + 1) * 64 + swizzle_xor_128b(2 * j + 1, channel % 64, elem_bytes=2)
-                        hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
-                        hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
-                        hacc[(2 * j) % 8] = hacc[(2 * j) % 8] + hval0 * state_pair[0].to(cutlass.Float32)
-                        hacc[(2 * j + 1) % 8] = hacc[(2 * j + 1) % 8] + hval1 * state_pair[1].to(cutlass.Float32)
-                    pa0, pb0 = fadd2(hacc[0], hacc[2], hacc[4], hacc[6])
-                    pa1, pb1 = fadd2(hacc[1], hacc[3], hacc[5], hacc[7])
-                    part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
-                    dgate_last_val = dgate_last_val + (part_a + part_b)
+                    for cs in cutlass.range_constexpr(2):
+                        channel_cs = channel_lo if cs == 0 else channel_hi
+                        for rep in cutlass.range_constexpr(cfg.d_v // 16):
+                            for n in cutlass.range_constexpr(2):
+                                word_col = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                                v0 = word_col * 2
+                                state_pair = cutlass.Vector.from_elements((state_vec[rep * 4 + cs * 2 + n],), cutlass.Float32).bitcast(cfg.io_dtype)
+                                dstate_addr0 = v0 * 64 + swizzle_xor_128b(v0, channel_cs, elem_bytes=2)
+                                dstate_addr1 = (v0 + 1) * 64 + swizzle_xor_128b(v0 + 1, channel_cs, elem_bytes=2)
+                                hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
+                                hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
+                                bucket = cs * 4 + (rep % 2) * 2 + n
+                                hacc[bucket] = hacc[bucket] + hval0 * state_pair[0].to(cutlass.Float32)
+                                hacc[bucket] = hacc[bucket] + hval1 * state_pair[1].to(cutlass.Float32)
+                    for cs in cutlass.range_constexpr(2):
+                        part = (hacc[cs * 4 + 0] + hacc[cs * 4 + 1]) + (hacc[cs * 4 + 2] + hacc[cs * 4 + 3])
+                        part = part + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, part, 1, 31, kind=nvvm.Shfl.BFLY))
+                        part = part + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, part, 2, 31, kind=nvvm.Shfl.BFLY))
+                        dgate_last_frag[cs] = part
+                else:
+                    for trip in cutlass.range(2 * (cfg.d_v // 64), unroll=1):
+                        state_vec = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_state_input_offset + (gc % 2) * (cfg.d_v // 2) + trip * 16), cutlass.Float32),
+                            num=16,
+                        )
+                        hacc = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                        for i in cutlass.range_constexpr(8):
+                            hacc[i] = opaque_f32_zero()
+                        for j in cutlass.range_constexpr(16):
+                            v0 = trip * 32 + 2 * j
+                            state_pair = cutlass.Vector.from_elements((state_vec[j],), cutlass.Float32).bitcast(cfg.io_dtype)
+                            dstate_addr0 = (channel // 64) * (cfg.d_v * 64) + v0 * 64 + swizzle_xor_128b(2 * j, channel % 64, elem_bytes=2)
+                            dstate_addr1 = (channel // 64) * (cfg.d_v * 64) + (v0 + 1) * 64 + swizzle_xor_128b(2 * j + 1, channel % 64, elem_bytes=2)
+                            hval0 = (sDstate_raw.data_ptr() + dstate_addr0).load().to(cutlass.Float32)
+                            hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
+                            hacc[(2 * j) % 8] = hacc[(2 * j) % 8] + hval0 * state_pair[0].to(cutlass.Float32)
+                            hacc[(2 * j + 1) % 8] = hacc[(2 * j + 1) % 8] + hval1 * state_pair[1].to(cutlass.Float32)
+                        pa0, pb0 = fadd2(hacc[0], hacc[2], hacc[4], hacc[6])
+                        pa1, pb1 = fadd2(hacc[1], hacc[3], hacc[5], hacc[7])
+                        part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
+                        dgate_last_val = dgate_last_val + (part_a + part_b)
                 bars.mb_dstate_smem_cg2_done.arrive()
             bars.mb_state_input_cg2_done[gc % 2].arrive()
 
             # ---- part-store accumulators ---------------------------------------------
-            dq_n = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            dk_n = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            db_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            dgate_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            dgate_last_acc = cutlass.Array(cutlass.Float32, 4, alignment=16)
-            for i in cutlass.range_constexpr(4):
-                dgate_last_acc[i] = opaque_f32_zero()
-            for t in cutlass.range_constexpr(cfg.b_t):
-                dk_n[t] = cutlass.Float32(0.0)
+            if cutlass.const_expr(split_channels):
+                dq_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                dk_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                db_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                dgate_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
+                dgate_last_kdot = cutlass.Array(cutlass.Float32, 4, alignment=16)
+                for i in cutlass.range_constexpr(4):
+                    dgate_last_kdot[i] = opaque_f32_zero()
+                for i in cutlass.range_constexpr(8):
+                    dk_frag[i] = cutlass.Float32(0.0)
+            else:
+                dq_n = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                dk_n = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                db_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                dgate_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                dgate_last_acc = cutlass.Array(cutlass.Float32, 4, alignment=16)
+                for i in cutlass.range_constexpr(4):
+                    dgate_last_acc[i] = opaque_f32_zero()
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    dk_n[t] = cutlass.Float32(0.0)
 
             # ---- dK restore part store: (eGl/eG) scale + dGate last K-dot ------------
             if has_dstate:
                 bars.mb_dk_restore_part_acc_ready.wait(dk_restore_part_index.phase)
                 dk_restore_part_index = advance(dk_restore_part_index, 1)
-                dk_restore_part_vec = nvvm.tcgen05_ld(
-                    "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_restore_acc_offset), cutlass.Float32), num=cfg.b_t
-                )
-                kr_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
-                for t in cutlass.range_constexpr(cfg.b_t):
-                    dk_hat = egl * cute.math.rcp(eg[t], approx=True, ftz=True) * dk_restore_part_vec[t]
-                    dk_n[t] = dk_hat
-                    k_pair = cutlass.Vector.from_elements((kr_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                    k_v = k_pair[t % 2].to(cutlass.Float32)
-                    if cutlass.const_expr(cfg.l2norm):
-                        k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
-                    dgate_last_acc[t % 4] = dgate_last_acc[t % 4] + k_v * dk_hat
+                if cutlass.const_expr(split_channels):
+                    dk_restore_vec = nvvm.tcgen05_ld(
+                        "16x256b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_restore_acc_offset), cutlass.Float32), num=cfg.b_t // 8
+                    )
+                    kr_words = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 16)
+                    for cs in cutlass.range_constexpr(2):
+                        for rep in cutlass.range_constexpr(2):
+                            source_lane = quad_base + fragment_quad // 2 + cutlass.Int32(rep * 2)
+                            word_n0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kr_words[cs * 2], source_lane, 31, kind=nvvm.Shfl.IDX))
+                            word_n1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kr_words[cs * 2 + 1], source_lane, 31, kind=nvvm.Shfl.IDX))
+                            k_word = word_n1 if fragment_quad % 2 == 1 else word_n0
+                            k_pair = cutlass.Vector.from_elements((k_word,), cutlass.Float32).bitcast(cfg.io_dtype)
+                            for n in cutlass.range_constexpr(2):
+                                k = rep * 4 + cs * 2 + n
+                                token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                                dk_hat = eg_last[cs] * cute.math.rcp(eg_frag[k], approx=True, ftz=True) * dk_restore_vec[k]
+                                dk_frag[k] = dk_hat
+                                k_v = k_pair[n].to(cutlass.Float32)
+                                if cutlass.const_expr(cfg.l2norm):
+                                    k_v = k_v * sNorm_raw[norm_base + cfg.b_t + token]
+                                dgate_last_kdot[cs * 2 + n] = dgate_last_kdot[cs * 2 + n] + k_v * dk_hat
+                else:
+                    dk_restore_part_vec = nvvm.tcgen05_ld(
+                        "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_restore_acc_offset), cutlass.Float32), num=cfg.b_t
+                    )
+                    kr_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
+                    for t in cutlass.range_constexpr(cfg.b_t):
+                        dk_hat = egl * cute.math.rcp(eg[t], approx=True, ftz=True) * dk_restore_part_vec[t]
+                        dk_n[t] = dk_hat
+                        k_pair = cutlass.Vector.from_elements((kr_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                        k_v = k_pair[t % 2].to(cutlass.Float32)
+                        if cutlass.const_expr(cfg.l2norm):
+                            k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
+                        dgate_last_acc[t % 4] = dgate_last_acc[t % 4] + k_v * dk_hat
 
             # ---- dQ acc store: eG.scale ----------------------------------------------
             bars.mb_dq_acc_ready.wait(dq_acc_index.phase)
             dq_acc_index = advance(dq_acc_index, 1)
-            dq_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dq_acc_offset), cutlass.Float32), num=cfg.b_t)
-            for t2 in cutlass.range_constexpr(cfg.b_t // 2):
-                t = 2 * t2
-                lo, hi = fmul2(eg[t], eg[t + 1], scale, scale)
-                dq_n[t], dq_n[t + 1] = fmul2(lo, hi, dq_vec[t], dq_vec[t + 1])
+            if cutlass.const_expr(split_channels):
+                dq_vec = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dq_acc_offset), cutlass.Float32), num=cfg.b_t // 8)
+                for k2 in cutlass.range_constexpr(4):
+                    k = 2 * k2
+                    lo, hi = fmul2(eg_frag[k], eg_frag[k + 1], scale, scale)
+                    dq_frag[k], dq_frag[k + 1] = fmul2(lo, hi, dq_vec[k], dq_vec[k + 1])
+            else:
+                dq_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dq_acc_offset), cutlass.Float32), num=cfg.b_t)
+                for t2 in cutlass.range_constexpr(cfg.b_t // 2):
+                    t = 2 * t2
+                    lo, hi = fmul2(eg[t], eg[t + 1], scale, scale)
+                    dq_n[t], dq_n[t + 1] = fmul2(lo, hi, dq_vec[t], dq_vec[t + 1])
 
             # ---- dK inv part store: (dA - dM) term, 1/eG scale -----------------------
             bars.mb_dk_inv_part_acc_ready.wait(dk_inv_part_index.phase)
             dk_inv_part_index = advance(dk_inv_part_index, 1)
-            dk_inv_part_vec = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_inv_acc_offset), cutlass.Float32), num=cfg.b_t)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                dk_n[t] = dk_n[t] + dk_inv_part_vec[t] * cute.math.rcp(eg[t], approx=True, ftz=True)
+            if cutlass.const_expr(split_channels):
+                dk_inv_vec = nvvm.tcgen05_ld(
+                    "16x256b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_inv_acc_offset), cutlass.Float32), num=cfg.b_t // 8
+                )
+                for k in cutlass.range_constexpr(8):
+                    dk_frag[k] = dk_frag[k] + dk_inv_vec[k] * cute.math.rcp(eg_frag[k], approx=True, ftz=True)
+            else:
+                dk_inv_part_vec = nvvm.tcgen05_ld(
+                    "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_inv_acc_offset), cutlass.Float32), num=cfg.b_t
+                )
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    dk_n[t] = dk_n[t] + dk_inv_part_vec[t] * cute.math.rcp(eg[t], approx=True, ftz=True)
 
             # ---- dK decay part store: -eG scale --------------------------------------
             bars.mb_dk_decay_part_acc_ready.wait(dk_decay_part_index.phase)
             dk_decay_part_index = advance(dk_decay_part_index, 1)
-            dk_decay_part_vec = nvvm.tcgen05_ld(
-                "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_decay_acc_offset), cutlass.Float32), num=cfg.b_t
-            )
-            kd_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                dk_decay = -eg[t] * dk_decay_part_vec[t]
-                k_pair = cutlass.Vector.from_elements((kd_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                k_v = k_pair[t % 2].to(cutlass.Float32)
-                if cutlass.const_expr(cfg.l2norm):
-                    k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
-                db_regs[t] = k_v * dk_decay
-                beta_v = (sBetaP_ptr + f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)).load().to(cutlass.Float32)
-                if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
-                    beta_v = sigmoid(beta_v).to(cfg.io_dtype).to(cutlass.Float32)
-                dgate_regs[t] = beta_v * dk_decay
-                dk_n[t] = dk_n[t] + dgate_regs[t]
+            if cutlass.const_expr(split_channels):
+                dk_decay_vec = nvvm.tcgen05_ld(
+                    "16x256b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_decay_acc_offset), cutlass.Float32), num=cfg.b_t // 8
+                )
+                kd_words = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 16)
+                for cs in cutlass.range_constexpr(2):
+                    channel_cs = channel_lo if cs == 0 else channel_hi
+                    for rep in cutlass.range_constexpr(2):
+                        source_lane = quad_base + fragment_quad // 2 + cutlass.Int32(rep * 2)
+                        word_n0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kd_words[cs * 2], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        word_n1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kd_words[cs * 2 + 1], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        k_word = word_n1 if fragment_quad % 2 == 1 else word_n0
+                        k_pair = cutlass.Vector.from_elements((k_word,), cutlass.Float32).bitcast(cfg.io_dtype)
+                        for n in cutlass.range_constexpr(2):
+                            k = rep * 4 + cs * 2 + n
+                            token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                            dk_decay = -eg_frag[k] * dk_decay_vec[k]
+                            k_v = k_pair[n].to(cutlass.Float32)
+                            if cutlass.const_expr(cfg.l2norm):
+                                k_v = k_v * sNorm_raw[norm_base + cfg.b_t + token]
+                            db_frag[k] = k_v * dk_decay
+                            beta_v = (sBetaP_ptr + token * 64 + swizzle_xor_128b(token, channel_cs, elem_bytes=2)).load().to(cutlass.Float32)
+                            if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                                beta_v = (sigmoid(beta_v) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
+                            dgate_frag[k] = beta_v * dk_decay
+                            dk_frag[k] = dk_frag[k] + dgate_frag[k]
+            else:
+                dk_decay_part_vec = nvvm.tcgen05_ld(
+                    "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dk_decay_acc_offset), cutlass.Float32), num=cfg.b_t
+                )
+                kd_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    dk_decay = -eg[t] * dk_decay_part_vec[t]
+                    k_pair = cutlass.Vector.from_elements((kd_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                    k_v = k_pair[t % 2].to(cutlass.Float32)
+                    if cutlass.const_expr(cfg.l2norm):
+                        k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
+                    db_regs[t] = k_v * dk_decay
+                    beta_v = (sBetaP_ptr + f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)).load().to(cutlass.Float32)
+                    if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                        beta_v = (sigmoid(beta_v) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
+                    dgate_regs[t] = beta_v * dk_decay
+                    dk_n[t] = dk_n[t] + dgate_regs[t]
 
             nvvm.tcgen05_wait("load")
             bars.mb_dqk_acc_done.arrive()
@@ -2847,76 +2995,184 @@ def compute2_warp_group(
             # ---- dA diagonal: Gamma-free dQ/dK terms ---------------------------------
             da_diag_stage = gc % cfg.smem_da_diag_stages
             bars.mb_da_diag_ready[da_diag_stage].wait((gc // cfg.smem_da_diag_stages) % 2)
-            da_diag = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                da_diag[t] = sDaDiag_raw[da_diag_stage * cfg.b_t + t] * scale
+            if cutlass.const_expr(split_channels):
+                da_diag_frag = cutlass.Array(cutlass.Float32, 4, alignment=16)
+                for rep in cutlass.range_constexpr(2):
+                    for n in cutlass.range_constexpr(2):
+                        token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                        da_diag_frag[rep * 2 + n] = sDaDiag_raw[da_diag_stage * cfg.b_t + token] * scale
+            else:
+                da_diag = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    da_diag[t] = sDaDiag_raw[da_diag_stage * cfg.b_t + t] * scale
             bars.mb_da_diag_done[da_diag_stage].arrive()
 
             # ---- dGate finalize ------------------------------------------------------
-            qf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + qraw_col, cutlass.Float32), num=cfg.b_t // 2)
-            kf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                q_pair = cutlass.Vector.from_elements((qf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                k_pair = cutlass.Vector.from_elements((kf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                q_v = q_pair[t % 2].to(cutlass.Float32)
-                k_v = k_pair[t % 2].to(cutlass.Float32)
-                if cutlass.const_expr(cfg.l2norm):
-                    q_v = q_v * sNorm_raw[norm_base + t]
-                    k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
-                beta_v = (sBetaP_ptr + f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)).load().to(cutlass.Float32)
-                if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
-                    beta_v = sigmoid(beta_v).to(cfg.io_dtype).to(cutlass.Float32)
-                dq_n[t] = dq_n[t] + da_diag[t] * k_v
-                dk_n[t] = dk_n[t] + da_diag[t] * q_v
-                dgate_regs[t] = q_v * dq_n[t] + beta_v * db_regs[t] - k_v * (dk_n[t] - dgate_regs[t])
-                if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
-                    db_regs[t] = db_regs[t] * (beta_v - beta_v * beta_v)
-                if cutlass.const_expr(cfg.beta_sigmoid and cfg.beta_guard):
-                    token_idx = chunk_start + cutlass.Int32(t)
-                    sig_val = cutlass.Float32(0.0)
-                    if token_idx < batch_seqlen:
-                        sig_val = sigmoid(mBeta[batch_start + token_idx, head_idx, channel].to(cutlass.Float32)).to(cfg.io_dtype).to(cutlass.Float32)
-                    db_regs[t] = db_regs[t] * (sig_val - sig_val * sig_val)
-            dgate_regs[cfg.b_t - 1] = dgate_regs[cfg.b_t - 1] + ((dgate_last_acc[0] + dgate_last_acc[1]) + (dgate_last_acc[2] + dgate_last_acc[3]))
+            if cutlass.const_expr(split_channels):
+                qf_words = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + qraw_col, cutlass.Float32), num=cfg.b_t // 16)
+                kf_words = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 16)
+                for cs in cutlass.range_constexpr(2):
+                    channel_cs = channel_lo if cs == 0 else channel_hi
+                    for rep in cutlass.range_constexpr(2):
+                        source_lane = quad_base + fragment_quad // 2 + cutlass.Int32(rep * 2)
+                        q_word_n0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qf_words[cs * 2], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        q_word_n1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qf_words[cs * 2 + 1], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        k_word_n0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kf_words[cs * 2], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        k_word_n1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kf_words[cs * 2 + 1], source_lane, 31, kind=nvvm.Shfl.IDX))
+                        q_word = q_word_n1 if fragment_quad % 2 == 1 else q_word_n0
+                        k_word = k_word_n1 if fragment_quad % 2 == 1 else k_word_n0
+                        q_pair = cutlass.Vector.from_elements((q_word,), cutlass.Float32).bitcast(cfg.io_dtype)
+                        k_pair = cutlass.Vector.from_elements((k_word,), cutlass.Float32).bitcast(cfg.io_dtype)
+                        for n in cutlass.range_constexpr(2):
+                            k = rep * 4 + cs * 2 + n
+                            token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                            q_v = q_pair[n].to(cutlass.Float32)
+                            k_v = k_pair[n].to(cutlass.Float32)
+                            if cutlass.const_expr(cfg.l2norm):
+                                q_v = q_v * sNorm_raw[norm_base + token]
+                                k_v = k_v * sNorm_raw[norm_base + cfg.b_t + token]
+                            beta_v = (sBetaP_ptr + token * 64 + swizzle_xor_128b(token, channel_cs, elem_bytes=2)).load().to(cutlass.Float32)
+                            if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                                beta_v = (sigmoid(beta_v) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
+                            dq_frag[k] = dq_frag[k] + da_diag_frag[rep * 2 + n] * k_v
+                            dk_frag[k] = dk_frag[k] + da_diag_frag[rep * 2 + n] * q_v
+                            dgate_frag[k] = q_v * dq_frag[k] + beta_v * db_frag[k] - k_v * (dk_frag[k] - dgate_frag[k])
+                            if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                                db_frag[k] = db_frag[k] * (beta_v - beta_v * beta_v * (0.5 if cfg.allow_neg_eigval else 1.0))
+                            if cutlass.const_expr(cfg.beta_sigmoid and cfg.beta_guard):
+                                token_idx = chunk_start + token
+                                sig_val = cutlass.Float32(0.0)
+                                if token_idx < batch_seqlen:
+                                    sig_val = (
+                                        (
+                                            sigmoid(mBeta[batch_start + token_idx, head_idx, channel_cs].to(cutlass.Float32))
+                                            * (2.0 if cfg.allow_neg_eigval else 1.0)
+                                        )
+                                        .to(cfg.io_dtype)
+                                        .to(cutlass.Float32)
+                                    )
+                                db_frag[k] = db_frag[k] * (sig_val - sig_val * sig_val * (0.5 if cfg.allow_neg_eigval else 1.0))
+                for cs in cutlass.range_constexpr(2):
+                    kdot = dgate_last_kdot[cs * 2] + dgate_last_kdot[cs * 2 + 1]
+                    kdot = kdot + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kdot, 1, 31, kind=nvvm.Shfl.BFLY))
+                    kdot = kdot + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kdot, 2, 31, kind=nvvm.Shfl.BFLY))
+                    if fragment_quad == 3:
+                        dgate_frag[4 + cs * 2 + 1] = dgate_frag[4 + cs * 2 + 1] + kdot
+            else:
+                qf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + qraw_col, cutlass.Float32), num=cfg.b_t // 2)
+                kf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    q_pair = cutlass.Vector.from_elements((qf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                    k_pair = cutlass.Vector.from_elements((kf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                    q_v = q_pair[t % 2].to(cutlass.Float32)
+                    k_v = k_pair[t % 2].to(cutlass.Float32)
+                    if cutlass.const_expr(cfg.l2norm):
+                        q_v = q_v * sNorm_raw[norm_base + t]
+                        k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
+                    beta_v = (sBetaP_ptr + f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)).load().to(cutlass.Float32)
+                    if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                        beta_v = (sigmoid(beta_v) * (2.0 if cfg.allow_neg_eigval else 1.0)).to(cfg.io_dtype).to(cutlass.Float32)
+                    dq_n[t] = dq_n[t] + da_diag[t] * k_v
+                    dk_n[t] = dk_n[t] + da_diag[t] * q_v
+                    dgate_regs[t] = q_v * dq_n[t] + beta_v * db_regs[t] - k_v * (dk_n[t] - dgate_regs[t])
+                    if cutlass.const_expr(cfg.beta_sigmoid and not cfg.beta_guard):
+                        db_regs[t] = db_regs[t] * (beta_v - beta_v * beta_v * (0.5 if cfg.allow_neg_eigval else 1.0))
+                    if cutlass.const_expr(cfg.beta_sigmoid and cfg.beta_guard):
+                        token_idx = chunk_start + cutlass.Int32(t)
+                        sig_val = cutlass.Float32(0.0)
+                        if token_idx < batch_seqlen:
+                            sig_val = (
+                                (sigmoid(mBeta[batch_start + token_idx, head_idx, channel].to(cutlass.Float32)) * (2.0 if cfg.allow_neg_eigval else 1.0))
+                                .to(cfg.io_dtype)
+                                .to(cutlass.Float32)
+                            )
+                        db_regs[t] = db_regs[t] * (sig_val - sig_val * sig_val * (0.5 if cfg.allow_neg_eigval else 1.0))
+                dgate_regs[cfg.b_t - 1] = dgate_regs[cfg.b_t - 1] + ((dgate_last_acc[0] + dgate_last_acc[1]) + (dgate_last_acc[2] + dgate_last_acc[3]))
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_beta_done[raw_stage].arrive()
 
             # ---- L2-norm backward row projection -------------------------------------
             if cutlass.const_expr(cfg.l2norm):
-                for grad, qk_col, inv_off in ((dq_n, qraw_col, 0), (dk_n, kraw_col, cfg.b_t)):
-                    dots = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-                    for half in cutlass.range_constexpr(2):
-                        p_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4)
-                        for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
-                            tt = 2 * tt2
-                            t = half * (cfg.b_t // 2) + tt
-                            p_pair = cutlass.Vector.from_elements((p_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                            gp_lo, gp_hi = fmul2(grad[t], grad[t + 1], p_pair[0].to(cutlass.Float32), p_pair[1].to(cutlass.Float32))
-                            dots[t], dots[t + 1] = fmul2(gp_lo, gp_hi, sNorm_raw[norm_base + inv_off + t], sNorm_raw[norm_base + inv_off + t + 1])
-                    for off in cutlass.range(5, unroll=1):
-                        step = cutlass.Int32(1) << off
-                        for t2 in cutlass.range_constexpr(cfg.b_t // 2):
-                            t = 2 * t2
-                            bfly_lo = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
-                            bfly_hi = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t + 1], step, 31, kind=nvvm.Shfl.BFLY))
-                            dots[t], dots[t + 1] = fadd2(dots[t], dots[t + 1], bfly_lo, bfly_hi)
-                    if lane_idx == 0:
-                        for t in cutlass.range_constexpr(cfg.b_t):
-                            sRed1_raw[wg1_sp * cfg.b_t + t] = dots[t]
-                    nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
-                    for half in cutlass.range_constexpr(2):
-                        a_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4)
-                        for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
-                            t = half * (cfg.b_t // 2) + 2 * tt2
-                            a_pair = cutlass.Vector.from_elements((a_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                            dot_lo, dot_hi = fadd2(sRed1_raw[t], sRed1_raw[t + 1], sRed1_raw[cfg.b_t + t], sRed1_raw[cfg.b_t + t + 1])
-                            dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[2 * cfg.b_t + t], sRed1_raw[2 * cfg.b_t + t + 1])
-                            dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[3 * cfg.b_t + t], sRed1_raw[3 * cfg.b_t + t + 1])
-                            norm_lo = sNorm_raw[norm_base + inv_off + t]
-                            norm_hi = sNorm_raw[norm_base + inv_off + t + 1]
-                            grad[t] = (grad[t] - a_pair[0].to(cutlass.Float32) * norm_lo * dot_lo) * norm_lo
-                            grad[t + 1] = (grad[t + 1] - a_pair[1].to(cutlass.Float32) * norm_hi * dot_hi) * norm_hi
-                    nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
+                if cutlass.const_expr(split_channels):
+                    for grad, qk_col, inv_off in ((dq_frag, qraw_col, 0), (dk_frag, kraw_col, cfg.b_t)):
+                        p_words = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + qk_col, cutlass.Float32), num=cfg.b_t // 16)
+                        raw_aligned = cutlass.Array(cutlass.Float32, 4, alignment=16)
+                        for cs in cutlass.range_constexpr(2):
+                            for rep in cutlass.range_constexpr(2):
+                                source_lane = quad_base + fragment_quad // 2 + cutlass.Int32(rep * 2)
+                                word_n0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, p_words[cs * 2], source_lane, 31, kind=nvvm.Shfl.IDX))
+                                word_n1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, p_words[cs * 2 + 1], source_lane, 31, kind=nvvm.Shfl.IDX))
+                                raw_aligned[cs * 2 + rep] = word_n1 if fragment_quad % 2 == 1 else word_n0
+                        token_dot = cutlass.Array(cutlass.Float32, 4, alignment=16)
+                        for rep in cutlass.range_constexpr(2):
+                            for n in cutlass.range_constexpr(2):
+                                token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                                norm_v = sNorm_raw[norm_base + inv_off + token]
+                                contrib = cutlass.Float32(0.0)
+                                for cs in cutlass.range_constexpr(2):
+                                    p_pair = cutlass.Vector.from_elements((raw_aligned[cs * 2 + rep],), cutlass.Float32).bitcast(cfg.io_dtype)
+                                    contrib = contrib + grad[rep * 4 + cs * 2 + n] * p_pair[n].to(cutlass.Float32) * norm_v
+                                contrib = contrib + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, contrib, 4, 31, kind=nvvm.Shfl.BFLY))
+                                contrib = contrib + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, contrib, 8, 31, kind=nvvm.Shfl.BFLY))
+                                contrib = contrib + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, contrib, 16, 31, kind=nvvm.Shfl.BFLY))
+                                token_dot[rep * 2 + n] = contrib
+                        if lane_idx < 4:
+                            for rep in cutlass.range_constexpr(2):
+                                for n in cutlass.range_constexpr(2):
+                                    token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                                    sRed1_raw[cg2_warp * cfg.b_t + token] = token_dot[rep * 2 + n]
+                        nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
+                        for cs in cutlass.range_constexpr(2):
+                            for rep in cutlass.range_constexpr(2):
+                                a_pair = cutlass.Vector.from_elements((raw_aligned[cs * 2 + rep],), cutlass.Float32).bitcast(cfg.io_dtype)
+                                for n in cutlass.range_constexpr(2):
+                                    k = rep * 4 + cs * 2 + n
+                                    token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                                    dot_total = (sRed1_raw[token] + sRed1_raw[cfg.b_t + token]) + (
+                                        sRed1_raw[2 * cfg.b_t + token] + sRed1_raw[3 * cfg.b_t + token]
+                                    )
+                                    norm_v = sNorm_raw[norm_base + inv_off + token]
+                                    grad[k] = (grad[k] - a_pair[n].to(cutlass.Float32) * norm_v * dot_total) * norm_v
+                        nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
+                else:
+                    for grad, qk_col, inv_off in ((dq_n, qraw_col, 0), (dk_n, kraw_col, cfg.b_t)):
+                        dots = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
+                        for half in cutlass.range_constexpr(2):
+                            p_words = nvvm.tcgen05_ld(
+                                "32x32b", nvvm.make_tmem_ptr(row_lo_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4
+                            )
+                            for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
+                                tt = 2 * tt2
+                                t = half * (cfg.b_t // 2) + tt
+                                p_pair = cutlass.Vector.from_elements((p_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                                gp_lo, gp_hi = fmul2(grad[t], grad[t + 1], p_pair[0].to(cutlass.Float32), p_pair[1].to(cutlass.Float32))
+                                dots[t], dots[t + 1] = fmul2(gp_lo, gp_hi, sNorm_raw[norm_base + inv_off + t], sNorm_raw[norm_base + inv_off + t + 1])
+                        for off in cutlass.range(5, unroll=1):
+                            step = cutlass.Int32(1) << off
+                            for t2 in cutlass.range_constexpr(cfg.b_t // 2):
+                                t = 2 * t2
+                                bfly_lo = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
+                                bfly_hi = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t + 1], step, 31, kind=nvvm.Shfl.BFLY))
+                                dots[t], dots[t + 1] = fadd2(dots[t], dots[t + 1], bfly_lo, bfly_hi)
+                        if lane_idx == 0:
+                            for t in cutlass.range_constexpr(cfg.b_t):
+                                sRed1_raw[cg2_warp * cfg.b_t + t] = dots[t]
+                        nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
+                        for half in cutlass.range_constexpr(2):
+                            a_words = nvvm.tcgen05_ld(
+                                "32x32b", nvvm.make_tmem_ptr(row_lo_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4
+                            )
+                            for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
+                                t = half * (cfg.b_t // 2) + 2 * tt2
+                                a_pair = cutlass.Vector.from_elements((a_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                                dot_lo, dot_hi = fadd2(sRed1_raw[t], sRed1_raw[t + 1], sRed1_raw[cfg.b_t + t], sRed1_raw[cfg.b_t + t + 1])
+                                dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[2 * cfg.b_t + t], sRed1_raw[2 * cfg.b_t + t + 1])
+                                dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[3 * cfg.b_t + t], sRed1_raw[3 * cfg.b_t + t + 1])
+                                norm_lo = sNorm_raw[norm_base + inv_off + t]
+                                norm_hi = sNorm_raw[norm_base + inv_off + t + 1]
+                                grad[t] = (grad[t] - a_pair[0].to(cutlass.Float32) * norm_lo * dot_lo) * norm_lo
+                                grad[t + 1] = (grad[t + 1] - a_pair[1].to(cutlass.Float32) * norm_hi * dot_hi) * norm_hi
+                        nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
 
             nvvm.tcgen05_wait("load")
             bars.mb_qk_raw_done[qk_raw_stage].arrive()
@@ -2928,10 +3184,21 @@ def compute2_warp_group(
             bars.mb_dk_tmastg_done[dk_stage].wait(((gc // cfg.smem_dk_stages) + 1) % 2)
             dq_base = dq_stage * (cfg.b_t * cfg.d_k)
             dk_base = dk_stage * (cfg.b_t * cfg.d_k)
-            for t in cutlass.range_constexpr(cfg.b_t):
-                out_idx = f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)
-                (sDq_raw.data_ptr() + dq_base + out_idx).store(dq_n[t].to(cfg.io_dtype))
-                (sDk_raw.data_ptr() + dk_base + out_idx).store(dk_n[t].to(cfg.io_dtype))
+            if cutlass.const_expr(split_channels):
+                for cs in cutlass.range_constexpr(2):
+                    channel_cs = channel_lo if cs == 0 else channel_hi
+                    for rep in cutlass.range_constexpr(2):
+                        for n in cutlass.range_constexpr(2):
+                            k = rep * 4 + cs * 2 + n
+                            token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                            out_idx = token * 64 + swizzle_xor_128b(token, channel_cs, elem_bytes=2)
+                            (sDq_raw.data_ptr() + dq_base + out_idx).store(dq_frag[k].to(cfg.io_dtype))
+                            (sDk_raw.data_ptr() + dk_base + out_idx).store(dk_frag[k].to(cfg.io_dtype))
+            else:
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    out_idx = f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)
+                    (sDq_raw.data_ptr() + dq_base + out_idx).store(dq_n[t].to(cfg.io_dtype))
+                    (sDk_raw.data_ptr() + dk_base + out_idx).store(dk_n[t].to(cfg.io_dtype))
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dq_tmastg_ready[dq_stage].arrive()
             bars.mb_dk_tmastg_ready[dk_stage].arrive()
@@ -2939,14 +3206,43 @@ def compute2_warp_group(
             # ---- dGate last add ------------------------------------------------------
             if has_dstate:
                 if chunk_idx >= FIRST_STATE_CHUNK:
-                    dgate_regs[cfg.b_t - 1] = dgate_regs[cfg.b_t - 1] + egl * dgate_last_val
+                    if cutlass.const_expr(split_channels):
+                        if fragment_quad == 3:
+                            for cs in cutlass.range_constexpr(2):
+                                dgate_frag[4 + cs * 2 + 1] = dgate_frag[4 + cs * 2 + 1] + eg_last[cs] * dgate_last_frag[cs]
+                    else:
+                        dgate_regs[cfg.b_t - 1] = dgate_regs[cfg.b_t - 1] + egl * dgate_last_val
 
             # ---- dGate reverse cumsum ------------------------------------------------
-            suffix = cutlass.Float32(0.0)
-            for rt in cutlass.range_constexpr(cfg.b_t):
-                t = cfg.b_t - 1 - rt
-                suffix = suffix + dgate_regs[t]
-                dgate_regs[t] = suffix
+            if cutlass.const_expr(split_channels):
+                for cs in cutlass.range_constexpr(2):
+                    pair_sum = cutlass.Array(cutlass.Float32, 2, alignment=8)
+                    higher = cutlass.Array(cutlass.Float32, 2, alignment=8)
+                    block_total = cutlass.Array(cutlass.Float32, 2, alignment=8)
+                    for rep in cutlass.range_constexpr(2):
+                        pair_sum[rep] = dgate_frag[rep * 4 + cs * 2] + dgate_frag[rep * 4 + cs * 2 + 1]
+                        quad_1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, pair_sum[rep], quad_base + cutlass.Int32(1), 31, kind=nvvm.Shfl.IDX))
+                        quad_2 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, pair_sum[rep], quad_base + cutlass.Int32(2), 31, kind=nvvm.Shfl.IDX))
+                        quad_3 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, pair_sum[rep], quad_base + cutlass.Int32(3), 31, kind=nvvm.Shfl.IDX))
+                        after = quad_1 if fragment_quad < 1 else cutlass.Float32(0.0)
+                        after = after + (quad_2 if fragment_quad < 2 else cutlass.Float32(0.0))
+                        after = after + (quad_3 if fragment_quad < 3 else cutlass.Float32(0.0))
+                        higher[rep] = after
+                        total = pair_sum[rep] + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, pair_sum[rep], 1, 31, kind=nvvm.Shfl.BFLY))
+                        total = total + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, total, 2, 31, kind=nvvm.Shfl.BFLY))
+                        block_total[rep] = total
+                    tail = dgate_frag[4 + cs * 2 + 1] + higher[1]
+                    dgate_frag[4 + cs * 2 + 1] = tail
+                    dgate_frag[4 + cs * 2] = dgate_frag[4 + cs * 2] + tail
+                    head = dgate_frag[cs * 2 + 1] + higher[0]
+                    dgate_frag[cs * 2 + 1] = head + block_total[1]
+                    dgate_frag[cs * 2] = (dgate_frag[cs * 2] + head) + block_total[1]
+            else:
+                suffix = cutlass.Float32(0.0)
+                for rt in cutlass.range_constexpr(cfg.b_t):
+                    t = cfg.b_t - 1 - rt
+                    suffix = suffix + dgate_regs[t]
+                    dgate_regs[t] = suffix
 
             # ---- stage dGate + dBeta for the epilogue TMA stores ---------------------
             dgate_stage = gc % cfg.smem_dgate_stages
@@ -2955,18 +3251,36 @@ def compute2_warp_group(
             bars.mb_db_tmastg_done[db_stage].wait(((gc // cfg.smem_db_stages) + 1) % 2)
             dgate_base = dgate_stage * (cfg.b_t * cfg.d_k)
             db_base = db_stage * (cfg.b_t * cfg.d_k)
-            if cutlass.const_expr(cfg.gate_dtype != cutlass.Float32):
-                dgate_seg = channel // 64
-                dgate_dim = channel - dgate_seg * 64
-            for t in cutlass.range_constexpr(cfg.b_t):
-                if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
-                    dgate_idx = f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)
-                    (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t])
-                else:
-                    dgate_idx = dgate_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, dgate_dim, elem_bytes=2)
-                    (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t].to(cfg.gate_dtype))
-                db_idx = f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)
-                (sDb_raw.data_ptr() + db_base + db_idx).store(db_regs[t].to(cfg.io_dtype))
+            if cutlass.const_expr(split_channels):
+                for cs in cutlass.range_constexpr(2):
+                    channel_cs = channel_lo if cs == 0 else channel_hi
+                    for rep in cutlass.range_constexpr(2):
+                        for n in cutlass.range_constexpr(2):
+                            k = rep * 4 + cs * 2 + n
+                            token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
+                            if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+                                seg_cs = channel_cs // 32
+                                dim_cs = channel_cs - seg_cs * 32
+                                dgate_idx = seg_cs * (cfg.b_t * 32) + token * 32 + swizzle_xor_128b(token, dim_cs, elem_bytes=4)
+                                (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_frag[k])
+                            else:
+                                dgate_idx = token * 64 + swizzle_xor_128b(token, channel_cs, elem_bytes=2)
+                                (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_frag[k].to(cfg.gate_dtype))
+                            db_idx = token * 64 + swizzle_xor_128b(token, channel_cs, elem_bytes=2)
+                            (sDb_raw.data_ptr() + db_base + db_idx).store(db_frag[k].to(cfg.io_dtype))
+            else:
+                if cutlass.const_expr(cfg.gate_dtype != cutlass.Float32):
+                    dgate_seg = channel // 64
+                    dgate_dim = channel - dgate_seg * 64
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
+                        dgate_idx = f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t, f32_dim, elem_bytes=4)
+                        (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t])
+                    else:
+                        dgate_idx = dgate_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, dgate_dim, elem_bytes=2)
+                        (sDgate_raw.data_ptr() + dgate_base + dgate_idx).store(dgate_regs[t].to(cfg.gate_dtype))
+                    db_idx = f16_seg * (cfg.b_t * 64) + t * 64 + swizzle_xor_128b(t, f16_dim, elem_bytes=2)
+                    (sDb_raw.data_ptr() + db_base + db_idx).store(db_regs[t].to(cfg.io_dtype))
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dgate_tmastg_ready[dgate_stage].arrive()
             bars.mb_db_tmastg_ready[db_stage].arrive()
@@ -3473,10 +3787,6 @@ def frost_gdn2_bprop(
     lane_idx = tidx % cfg.threads_per_warp
 
     total_tiles = mCount[0]
-    assert cu_seqlens.element_type in (cutlass.Int32, cutlass.Int64)
-    assert mDgate.element_type == cfg.gate_dtype
-    assert mDb.element_type == cfg.io_dtype and mDw_out.element_type == cfg.io_dtype
-
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     arr_words = n_desc * cutlass.Int32(TENSOR_MAP_QWORDS)
     desc_q_base = desc_base_words
@@ -3963,6 +4273,7 @@ class Gdn2BwdCfg:
     safe_gate: bool
     gate_scale_log2: float
     beta_sigmoid: bool
+    allow_neg_eigval: bool
     beta_guard: bool
     use_initial_state: bool
     q_ratio: int
@@ -4061,6 +4372,7 @@ def build_cfg(
     safe_gate: bool,
     gate_scale_log2: float,
     beta_sigmoid: bool,
+    allow_neg_eigval: bool,
     beta_guard: bool = False,
     use_initial_state: bool,
     q_ratio: int,
@@ -4072,14 +4384,6 @@ def build_cfg(
     d_k: int = CFG.D_K,
     d_v: int = CFG.D_V,
 ) -> Gdn2BwdCfg:
-    if io_dtype not in (cutlass.Float16, cutlass.BFloat16):
-        raise ValueError(f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported")
-    if beta_guard and not l2norm:
-        raise ValueError("beta_guard requires l2norm (the sensor is defined on the normalized key)")
-    if d_k != 128:
-        raise ValueError(f"d_k={d_k} not supported; the q/k head dim must be 128")
-    if d_v not in (64, 128):
-        raise ValueError(f"d_v={d_v} not supported; the v head dim must be 64 or 128")
     cfg = Gdn2BwdCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -4089,6 +4393,7 @@ def build_cfg(
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
         beta_sigmoid=beta_sigmoid,
+        allow_neg_eigval=allow_neg_eigval,
         beta_guard=beta_guard,
         use_initial_state=use_initial_state,
         q_ratio=q_ratio,
@@ -4157,6 +4462,8 @@ def get_compiled_cache(
     dstate_in_dtype_str: str,
     dstate0_dtype_str: str,
     gate_dtype_str: str,
+    a_log_dtype_str: str,
+    dt_bias_dtype_str: str,
     cu_dtype_str: str,
     HQ: int,
     HK: int,
@@ -4169,6 +4476,7 @@ def get_compiled_cache(
     safe_gate: bool,
     gate_lower_bound: float,
     beta_sigmoid: bool,
+    allow_neg_eigval: bool,
     beta_guard: bool,
     use_initial_state: bool,
     dynamic_scheduling: bool,
@@ -4206,6 +4514,7 @@ def chunk_gdn2_bwd_sm100(
     a_log=None,
     dt_bias=None,
     use_beta_sigmoid: bool = False,
+    allow_neg_eigval: bool = False,
     beta_guard: bool = False,
     work_items=None,
     work_count=None,
@@ -4273,25 +4582,13 @@ def chunk_gdn2_bwd_sm100(
     DV = v.shape[2]
     use_dstate_in = d_final_state is not None
     use_dstate0 = d_initial_state is not None
-    if work_items is None or work_count is None:
-        raise ValueError(
-            "work_items/work_count are required (built by the split-table stage, or by an order-generating prologue when work_item_scratch is None)"
-        )
     dynamic_scheduling = scheduler_counter is not None
     order_gen = work_item_scratch is None
     if order_in_prologue and scheduler_all is None:
         raise ValueError("order_in_prologue requires scheduler_all (the prologue zeroes both consumers' scheduler rings)")
-    for name, t in (("state_checkpoints", state_checkpoints), ("beta", beta), ("w", w), ("dbeta", dbeta), ("dw", dw)):
-        if str(t.dtype).split(".")[-1] != str(q.dtype).split(".")[-1]:
-            raise ValueError(f"{name} dtype must match the io dtype: got {t.dtype} with io {q.dtype}")
-    for name, hh in (("HQ", HQ), ("HK", HK), ("HV", HV)):
-        if HO % hh != 0:
-            raise ValueError(f"{name}={hh} must divide {HO}")
     B = cu_seqlens.shape[0] - 1
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
-    if safe_gate and (a_log is None or dt_bias is None):
-        raise ValueError("safe_gate requires a_log and dt_bias")
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -4302,6 +4599,8 @@ def chunk_gdn2_bwd_sm100(
         str(d_final_state.dtype) if d_final_state is not None else "none",
         str(d_initial_state.dtype) if d_initial_state is not None else "none",
         str(gate.dtype),
+        str(a_log.dtype) if a_log is not None else "none",
+        str(dt_bias.dtype) if dt_bias is not None else "none",
         str(cu_seqlens.dtype),
         HQ,
         HK,
@@ -4314,6 +4613,7 @@ def chunk_gdn2_bwd_sm100(
         safe_gate,
         gate_lower_bound,
         use_beta_sigmoid,
+        allow_neg_eigval,
         beta_guard,
         use_initial_state,
         dynamic_scheduling,
@@ -4334,6 +4634,7 @@ def chunk_gdn2_bwd_sm100(
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
             beta_sigmoid=use_beta_sigmoid,
+            allow_neg_eigval=allow_neg_eigval,
             beta_guard=beta_guard,
             use_initial_state=use_initial_state,
             q_ratio=HO // HQ,
