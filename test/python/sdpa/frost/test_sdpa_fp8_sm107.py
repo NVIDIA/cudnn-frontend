@@ -61,7 +61,7 @@ def test_sm107_per_tensor_fp8_advertises_only_d128():
 def test_per_tensor_fp8_rows_split_per_arch_line():
     """The per-tensor FP8 rows are split at the Rubin boundary — each row
     declares exactly what its own lowering carries, with no knob x arch
-    notches: HALF softmax and the missing split/LPT paths are row DATA."""
+    notches: the HALF softmax arm and the d192 flavor are row DATA."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines
@@ -82,15 +82,58 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert sm107.softmax_precisions == frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
 
     # Both fp8 rows now wire the split path (the SM107 sibling carries the same
-    # make_split_helpers plumbing as its SM100 twin). The LPT remap is still
-    # un-ported on SM107 (issue #653), which the sched domain below pins.
+    # make_split_helpers plumbing as its SM100 twin) and the LPT/LPT_L2 remap
+    # (issue #653) — every SM107 decode call site threads qh_per_kh/seqlen_kv,
+    # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert sm107.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
     # Both d128 cells carry the write_thd_meta THD leg.
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
+
+
+def test_sm107_row_ranks_the_lpt_remap_for_causal():
+    """The LPT/LPT_L2 remap (issue #653) is live on the Rubin row: a causal
+    per-tensor FP8 graph at cc10.7 ranks LPT_L2 first, exactly as its SM100
+    twin does, and both remap specializations template-load. Pure — facts pin
+    the device, and nothing here compiles."""
+    import cudnn as _c
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    def facts(cc):
+        return ga.SdpaGraphFacts(
+            b=1,
+            h_q=8,
+            h_kv=8,
+            s_q=4096,
+            s_kv=4096,
+            d_qk=128,
+            d_v=128,
+            dtype=_c.data_type.FP8_E4M3,
+            dtype_o=_c.data_type.BFLOAT16,
+            is_fp8=True,
+            causal=True,
+            device_cc=cc,
+        )
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(fp8=True)]
+    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
+
+    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
+    # the remap groups against, so the L2 variant leads on BOTH rows. Before
+    # the port the Rubin row had a one-element domain and took _sched_points'
+    # sole-element shortcut, which is what pinned it to NATURAL.
+    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+
+    # Both remap specializations template-load on the Rubin sibling.
+    for policy in (SCHED_LPT, SCHED_LPT_L2):
+        assert _load(rubin=True, sched_policy=policy).CFG.SCHEDULER_POLICY == policy
 
 
 def test_softmax_half_declines_by_row_domain():
