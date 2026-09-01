@@ -767,6 +767,9 @@ def _kernel(
         nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     problem_size: tuple,

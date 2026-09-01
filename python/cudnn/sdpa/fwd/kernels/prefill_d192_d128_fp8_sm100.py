@@ -784,6 +784,9 @@ def _kernel(
         )
 
 
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # === TMA-LDG warp ===
 
 

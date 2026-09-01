@@ -1124,6 +1124,9 @@ def _bprop_kernel(
                 Pointer((dK_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_kb, alignment=4)
 
 
+_bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _atomic_add_f32(addr_i64, val):
     """``atom.global.add.f32`` on a 32-bit GMEM float element.  ``addr_i64`` is
@@ -1200,6 +1203,9 @@ def _do_dot_kernel(
             Pointer(cutlass.make_array_view(DELTA).data_ptr() + row, dtype=cutlass.Float32).store(acc)
 
 
+_do_dot_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ===========================================================================
 # Attention-sink gradient: dSink_h = -Σ_{b,q} exp(sink_h - lse[b,h,q]) *
 # do_dot[b,h,q].  Standalone (dQ/dK/dV are already sink-correct from the
@@ -1245,6 +1251,9 @@ def _dsink_kernel(
             _atomic_add_f32(cutlass.make_array_view(DSINK).data_ptr() + h, -acc)
 
 
+_dsink_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ===========================================================================
 # dQ_acc (fp32) → dQ (io_dtype) cast kernel.
 # ===========================================================================
@@ -1263,6 +1272,9 @@ def _cast_kernel(
         dst = cutlass.make_array_view(dQ_out).data_ptr()
         v = Pointer(src + gid * cutlass.Int32(2), dtype=cutlass.Float32).load(count=2)
         Pointer(dst + gid * cutlass.Int32(2), dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
+
+
+_cast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
@@ -1296,6 +1308,9 @@ def _dkv_reduce_kernel(
         for g in cutlass.range_constexpr(ratio):
             acc = acc + Pointer(src + in_base + cutlass.Int32(g * d), dtype=io_dtype).load().to(cutlass.Float32)
         Pointer(cutlass.make_array_view(OUT).data_ptr() + e, dtype=io_dtype).store(acc.to(io_dtype))
+
+
+_dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
