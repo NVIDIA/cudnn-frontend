@@ -1245,7 +1245,7 @@ class FlashAttentionDSABackwardSm90:
                     softmax_scale_log2,
                     softmax_scale,
                     dQ_accumulate=False,
-                    valid_rows=topk_tail_rows,
+                    num_valid_rows=topk_tail_rows,
                 )
                 n_block -= 1
 
@@ -1273,7 +1273,7 @@ class FlashAttentionDSABackwardSm90:
                         softmax_scale_log2,
                         softmax_scale,
                         dQ_accumulate=True,
-                        valid_rows=self.tile_n,
+                        num_valid_rows=self.tile_n,
                     )
                     n_block -= 1
 
@@ -1435,7 +1435,7 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
         dQ_accumulate: Boolean = False,
-        valid_rows: Int32 = 64,
+        num_valid_rows: Int32 = 64,
     ):
         """WG0 one n_block: load KV(cp.async) + GEMM1/2 + softmax/dsoftmax + R2S + GEMM4_WG0(x2)"""
         if dQ_accumulate:
@@ -1450,7 +1450,7 @@ class FlashAttentionDSABackwardSm90:
         for r in cutlass.range_constexpr(ROWS_PER_GROUP):
             row = r * NUM_GROUPS + group_idx
             global_topk_row = n_block * self.tile_n + row
-            if row < valid_rows or dQ_accumulate:
+            if row < num_valid_rows or dQ_accumulate:
                 if const_expr(self.have_topk_length):
                     self._copy_row(
                         mKV_cur,
@@ -1501,7 +1501,7 @@ class FlashAttentionDSABackwardSm90:
         #
         # Padded columns are zero-filled in sKV, so their score is 0 rather
         # than -inf. Force those lanes to probability zero.
-        # Compact: past valid_rows on the peeled tail n_block.
+        # Compact: past num_valid_rows on the peeled tail n_block.
         # Non-compact: a negative top-k index. Positive OOB indices and
         # compact entries in [0, topK) are trusted as valid KV rows.
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
@@ -1511,7 +1511,7 @@ class FlashAttentionDSABackwardSm90:
                 p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
                 col = tScS_mn[r, c][COL]
                 if not dQ_accumulate:
-                    p = Float32(0.0) if col >= valid_rows else p
+                    p = Float32(0.0) if col >= num_valid_rows else p
                 if const_expr(not self.have_topk_length):
                     # Peeled tile still spans tile_n columns; clamp so a
                     # partial non-compact row is not read past its end.
