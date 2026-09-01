@@ -778,6 +778,35 @@ def _dedup_operand(pid: int, cap: dict, ids: list[int], caps: dict[int, dict], s
     return ids.index(pid)
 
 
+def _require_materialized_block_scale_inputs(
+    data_id: int,
+    sf_id: int,
+    ops: list[_RecordedOp],
+    meta: dict[int, _TensorMeta],
+) -> None:
+    """Require dequantized operands to come from the caller's variant pack.
+
+    FROST folds ``block_scale_dequantize`` into the GEMM.  It does not execute
+    an upstream quantizer, so accepting virtual ``block_scale_quantize``
+    outputs here would produce a plan whose packed data and scales have no
+    runtime binding.  Standalone quantize callers materialize both tensors and
+    pass them as ordinary graph inputs instead.
+    """
+
+    data_meta = meta[data_id]
+    sf_meta = meta[sf_id]
+    if data_meta.is_input and sf_meta.is_input and not data_meta.tensor.get_is_virtual() and not sf_meta.tensor.get_is_virtual():
+        return
+
+    quant = next(
+        (op for op in ops if op.cudnn_name == "block_scale_quantize" and op.output == data_id and op.scale_output == sf_id),
+        None,
+    )
+    if quant is not None:
+        raise NotImplementedError("block-scale matmul requires materialized packed graph inputs; " "call cudnn.ops.nvfp4_block_scale_quantize explicitly")
+    raise NotImplementedError("block-scale matmul requires its packed data and scale-factor tensors " "to be non-virtual materialized graph inputs")
+
+
 def _build_multi_moe_chain(
     moe_ops: list[_RecordedOp],
     ops: list[_RecordedOp],
@@ -835,6 +864,7 @@ def _build_multi_moe_chain(
                 sf_id=None,
             )
         data_id, sf_id = deq.inputs
+        _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
         sf_meta = meta[sf_id]
         deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
         deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
@@ -1426,6 +1456,7 @@ def _build_multi_gemm_chain(
                 sf_id=None,
             )
         data_id, sf_id = deq.inputs
+        _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
         sf_meta = meta[sf_id]
         deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
         deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
