@@ -10,10 +10,7 @@ from typing import Any
 # specific operation is first accessed. Mirrors cudnn/gemm/__init__.py.
 _LAZY_EXPORTS = {
     "moe_grouped_matmul": ("cudnn.gemm.ops.moe_grouped_matmul", "moe_grouped_matmul"),
-    # Keep both semantic entry points in one implementation module. A public
-    # same-named ``situ_mlp`` submodule would let normal Python import machinery
-    # replace this package's callable export with the module object, depending
-    # on import order.
+    # Both semantic entry points share the existing implementation module.
     "situ_mlp": ("cudnn.gemm.ops.swiglu_mlp", "situ_mlp"),
     "swiglu_mlp": ("cudnn.gemm.ops.swiglu_mlp", "swiglu_mlp"),
 }

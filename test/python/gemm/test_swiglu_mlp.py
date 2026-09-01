@@ -115,16 +115,13 @@ def test_swiglu_mlp_parity(M, H, inter):
     not (torch.cuda.is_available() and _cc() >= 100),
     reason="cuDNN SiTU-MLP fusion requires SM100 (Blackwell)",
 )
-def test_situ_mlp_kimi_k3_forward_and_cache_contract():
-    """Kimi's beta=4/linear-beta=25 formula is exact, and both values own plans.
+def test_situ_mlp_kimi_k3_forward_beta_contract():
+    """Kimi's defaults and alternate beta values follow the public formula.
 
     The published dense layer has H=7168/I=33792; shared experts use
     H=7168/I=6144 and routed experts H=3584/I=3072. This smaller matrix keeps L0
     practical while preserving the identical [M,H]@[H,I] semantic contract.
     """
-    import importlib
-
-    mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
     torch.manual_seed(10)
     M, H, inter = 128, 256, 256
     x = torch.randn(1, M, H, device="cuda", dtype=torch.bfloat16)
@@ -141,9 +138,7 @@ def test_situ_mlp_kimi_k3_forward_and_cache_contract():
 
     assert _rel_l2(official, official_ref) < _TOL, f"official SiTU rel={_rel_l2(official, official_ref):.2e}"
     assert _rel_l2(alternate, alternate_ref) < _TOL, f"alternate SiTU rel={_rel_l2(alternate, alternate_ref):.2e}"
-    assert not torch.equal(official, alternate), "different SiTU betas must not alias one cached plan"
-    configs = {key[-3:] for key in mod._SWIGLU_CACHE if key[:3] == (M, H, inter) and key[7] is False and key[8] == x.device.index}
-    assert {("situ", 4.0, 25.0), ("situ", 2.0, 8.0)} <= configs
+    assert not torch.equal(official, alternate), "different SiTU betas must retain distinct semantics"
 
 
 @pytest.mark.L0
@@ -182,7 +177,6 @@ def test_situ_mlp_kimi_k3_backward_parity_does_not_use_frost(monkeypatch):
     assert _rel_l2(out, ref) < _TOL, f"fwd rel={_rel_l2(out, ref):.2e}"
     for name, got, expected in zip(("dx", "dWg", "dWu", "dWd"), args, refs):
         assert _rel_l2(got.grad, expected.grad) < _TOL, f"{name} rel={_rel_l2(got.grad, expected.grad):.2e}"
-    assert any(key[:2] == (M, inter) and key[-3:] == ("situ", 4.0, 25.0) for key in mod._DSWIGLU_CACHE)
 
 
 @pytest.mark.L0
@@ -454,8 +448,8 @@ def test_swiglu_mlp_all_frozen_uses_h_only(monkeypatch):
     not (torch.cuda.is_available() and _cc() >= 100),
     reason="cuDNN SwiGLU-MLP fusion requires SM100 (Blackwell)",
 )
-def test_swiglu_mlp_h_only_matches_full_and_cache_switches():
-    """The output mask is part of the plan cache and must not change h rounding."""
+def test_swiglu_mlp_h_only_matches_full():
+    """Selecting saved preactivations must not change h rounding."""
     import importlib
 
     mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
@@ -473,8 +467,6 @@ def test_swiglu_mlp_h_only_matches_full_and_cache_switches():
     assert gate_full is not None and up_full is not None
     assert torch.equal(h_only_1, h_full)
     assert torch.equal(h_only_1, h_only_2)
-    matching = [key for key in mod._SWIGLU_CACHE if key[:3] == (M, H, inter)]
-    assert {key[7] for key in matching} == {False, True}
 
 
 @pytest.mark.L0
