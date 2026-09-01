@@ -26,10 +26,8 @@ metadata and runtime TMA descriptors, and a plan-time envelope grid. Dense
 specializations fold the THD path out.
 """
 
-import os
-import sys
 from functools import lru_cache
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 
 from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DKG-bump
@@ -62,8 +60,6 @@ TMA_VO_GRANU_ELEMS = _TMA.VO_GRANU_ELEMS
 TMA_O_GRANU_ELEMS_HOST = CFG.O_SWZ_BYTES // CFG.BPE_O
 TMA_O_ITERS_HOST = (CFG.TILE_O * CFG.BPE_O) // CFG.O_SWZ_BYTES
 
-from typing import NamedTuple
-
 from cudnn.frost.tile_dsl.barrier import (
     MBarrier,
     PipelineState,
@@ -79,8 +75,6 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     read_tile_id_arrive,
     SCHED_NATURAL,
-    SCHED_LPT,
-    SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
     # SM100: no LDTM.STAT — the MASK_NONE fast path uses manual tcgen05_ld +
@@ -106,7 +100,7 @@ from cudnn.frost.tile_dsl.mask import (
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
-_REUSE_BMM2_ELECT = not CFG.THD_VARLEN or CFG.DTYPE_QKV == 1
+_REUSE_BMM2_ELECT = (not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_NONE) or (CFG.THD_VARLEN and CFG.DTYPE_QKV == 1)
 _ROLE_LOCAL_E4_SCALES = CFG.DTYPE_QKV == 0 and CFG.THD_VARLEN
 MERGE_SOFTMAX_WGS = not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 _FAST_E4_DENSE_MHA = MERGE_SOFTMAX_WGS and CFG.SPLIT_KV == 1 and CFG.QH_PER_KH == 1
@@ -266,10 +260,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     make_split_helpers,
-    Bars,
-    KvLoopBounds,
     make_classic_bars,
-    compute_kv_loop_bounds,
     make_sdpa_helpers,
 )
 
@@ -1961,57 +1952,79 @@ def _softmax_kv_body(
     return total_max, total_sum, inplace_phase
 
 
+class _SoftmaxKvContext(NamedTuple):
+    sub_tile_id: object
+    tmem_base: object
+    sStats_raw: object
+    bars: object
+    score_bars: object
+    tid_in_wg: object
+    q_abs: object
+    eff_seqlen_kv: object
+    scale_log2: object
+    leader_cta_id: object
+
+
 @cute.jit
-def _softmax_kv_range(
-    apply_mask: cutlass.Constexpr[bool],
-    may_need_padding: cutlass.Constexpr[bool],
-    body_mask_flags: cutlass.Constexpr[int],
-    kv_begin,
-    kv_end,
-    first_real_kv,
-    sub_tile_id,
-    tmem_base,
-    sStats_raw,
-    bars,
-    score_bars,
-    tid_in_wg,
-    q_abs,
-    eff_seqlen_kv,
-    scale_log2,
-    total_max,
-    total_sum,
-    inplace_phase,
-    bmm1_phase,
-    stat_empty_phase,
-    leader_cta_id,
-):
+def _softmax_kv_range(apply_mask: bool, may_need_padding: bool, body_mask_flags: int, kv_begin, kv_end, first_real_kv, context, state):
+    total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = state
     for kv_loop in cutlass.range(kv_begin, kv_end, 1, unroll=1):
-        _wait_mbarrier(bars.mb_bmm1_done[sub_tile_id], bmm1_phase)
+        _wait_mbarrier(context.bars.mb_bmm1_done[context.sub_tile_id], bmm1_phase)
         bmm1_phase = bmm1_phase ^ 1
         total_max, total_sum, inplace_phase = _softmax_kv_body(
             apply_mask,
             may_need_padding,
             body_mask_flags,
-            sub_tile_id,
+            context.sub_tile_id,
             kv_loop,
             kv_loop == first_real_kv,
-            tmem_base,
-            sStats_raw,
-            bars,
-            score_bars,
-            tid_in_wg,
-            q_abs,
-            eff_seqlen_kv,
-            scale_log2,
+            context.tmem_base,
+            context.sStats_raw,
+            context.bars,
+            context.score_bars,
+            context.tid_in_wg,
+            context.q_abs,
+            context.eff_seqlen_kv,
+            context.scale_log2,
             total_max,
             total_sum,
             inplace_phase,
-            leader_cta_id,
+            context.leader_cta_id,
         )
-        _wait_mbarrier(bars.mb_stat_empty[sub_tile_id], stat_empty_phase)
+        _wait_mbarrier(context.bars.mb_stat_empty[context.sub_tile_id], stat_empty_phase)
         stat_empty_phase = stat_empty_phase ^ 1
 
     return total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase
+
+
+@cute.jit
+def _softmax_masked_kv_loops(one_sided_swa: bool, bounds, segment_bounds, context, state):
+    if cutlass.const_expr(one_sided_swa):
+        segment_left, segment_left_pad_start, segment_left_end, segment_right_start, segment_right = segment_bounds
+        regions = (
+            (True, False, MASK_SWA, segment_left, segment_left_pad_start, segment_left),
+            (True, True, MASK_SWA, segment_left_pad_start, segment_left_end, segment_left),
+            (False, False, CFG.MASK_FLAGS, segment_left_end, segment_right_start, segment_left),
+            (True, True, MASK_CAUSAL, segment_right_start, segment_right, segment_left),
+        )
+    else:
+        regions = (
+            (True, False, CFG.MASK_FLAGS, bounds.left, bounds.unmasked_lo, bounds.left),
+            (False, False, CFG.MASK_FLAGS, bounds.unmasked_lo, bounds.unmasked_hi, bounds.left),
+            (True, True, CFG.MASK_FLAGS, bounds.unmasked_hi, bounds.right, bounds.left),
+        )
+    for apply_mask, may_need_padding, mask_flags, begin, end, first_real_kv in regions:
+        state = _softmax_kv_range(
+            apply_mask,
+            may_need_padding,
+            mask_flags,
+            begin,
+            end,
+            first_real_kv,
+            context,
+            state,
+        )
+    return state
 
 
 @cute.jit
@@ -2159,182 +2172,45 @@ def _softmax_warp_group(
                 _wait_mbarrier(bars.mb_stat_empty[sub_tile_id], stat_empty_phase)
                 stat_empty_phase = stat_empty_phase ^ 1
         else:
+            context = _SoftmaxKvContext(
+                sub_tile_id,
+                tmem_base,
+                sStats_raw,
+                bars,
+                score_bars,
+                tid_in_wg,
+                q_abs,
+                eff_seqlen_kv,
+                scale_log2,
+                leader_cta_id,
+            )
+            state = (total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase)
             if cutlass.const_expr(_SWA_ONE_SIDED_GEOMETRY):
                 if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
-                    segment_left = decoded_swa_left
-                    segment_left_pad_start = decoded_swa_left_pad_start
-                    segment_left_end = decoded_swa_left_end
-                    segment_right_start = decoded_swa_right_start
-                    segment_right = decoded_swa_right
+                    segment_bounds = (
+                        decoded_swa_left,
+                        decoded_swa_left_pad_start,
+                        decoded_swa_left_end,
+                        decoded_swa_right_start,
+                        decoded_swa_right,
+                    )
                 else:
-                    segment_left, segment_left_pad_start, segment_left_end, segment_right_start, segment_right = _swa_segment_bounds(
+                    segment_bounds = _swa_segment_bounds(
                         q_super_idx,
                         eff_seqlen_q,
                         eff_seqlen_kv,
                         cta_in_pair,
                     )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    True,
-                    False,
-                    MASK_SWA,
-                    segment_left,
-                    segment_left_pad_start,
-                    segment_left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    True,
-                    True,
-                    MASK_SWA,
-                    segment_left_pad_start,
-                    segment_left_end,
-                    segment_left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    False,
-                    False,
-                    CFG.MASK_FLAGS,
-                    segment_left_end,
-                    segment_right_start,
-                    segment_left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    True,
-                    True,
-                    MASK_CAUSAL,
-                    segment_right_start,
-                    segment_right,
-                    segment_left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
             else:
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    True,
-                    False,
-                    CFG.MASK_FLAGS,
-                    bounds.left,
-                    bounds.unmasked_lo,
-                    bounds.left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    False,
-                    False,
-                    CFG.MASK_FLAGS,
-                    bounds.unmasked_lo,
-                    bounds.unmasked_hi,
-                    bounds.left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
-                total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_kv_range(
-                    True,
-                    True,
-                    CFG.MASK_FLAGS,
-                    bounds.unmasked_hi,
-                    bounds.right,
-                    bounds.left,
-                    sub_tile_id,
-                    tmem_base,
-                    sStats_raw,
-                    bars,
-                    score_bars,
-                    tid_in_wg,
-                    q_abs,
-                    eff_seqlen_kv,
-                    scale_log2,
-                    total_max,
-                    total_sum,
-                    inplace_phase,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
+                segment_bounds = (bounds.left, bounds.unmasked_lo, bounds.unmasked_lo, bounds.unmasked_hi, bounds.right)
+
+            total_max, total_sum, inplace_phase, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
+                _SWA_ONE_SIDED_GEOMETRY,
+                bounds,
+                segment_bounds,
+                context,
+                state,
+            )
 
         if sub_tile_id == 0:
             # No S0[last+1] exists; release P1[last] with one synthetic event.
@@ -2403,14 +2279,11 @@ def _correction_warp_group(
     # O_CHUNK=16 keeps live range short — O_CHUNK=32 spilled correction-warp regs.
     O_CHUNK = 16
     N_CHUNKS_O = CFG.TILE_O // O_CHUNK
-    O_CHUNK_EPI = 64
-    N_CHUNKS_O_EPI = CFG.TILE_O // O_CHUNK_EPI
     # D_BLOCK_SIZE must use O_SWZ_B not V_SWZ_B (under cga2 V may drop swizzle).
     # Sized in BPE_O so it stays consistent with the BPE_O-derived O_SWZ_BYTES
     # (these feed the FP8 store branch only; the BF16/FP16 branch is self-contained).
     TMA_O_ITERS = (CFG.TILE_O * CFG.BPE_O) // CFG.O_SWZ_BYTES
     D_BLOCK_SIZE = CFG.TILE_O // TMA_O_ITERS
-    TMA_O_GRANU_ELEMS = CFG.TILE_M * D_BLOCK_SIZE
 
     stat_full_phase = cutlass.Int32(0)
     # bmm2_done starts at phase=0; iter 0 skipped — first wait at kv_loop=1.

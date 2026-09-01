@@ -41,7 +41,7 @@ from typing import Callable, NamedTuple, Optional, Tuple
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass.experimental.cuda import tensor_map as tmap
-from cutlass._mlir.dialects import arith, llvm
+from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 
 import cutlass
@@ -75,7 +75,6 @@ from cudnn.frost.tile_dsl.barrier import (
     cga_arrive,
     cga_wait,
     wait,
-    WAIT_TIMEOUT,
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
@@ -93,7 +92,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
-from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -133,28 +132,6 @@ def _wait_ptr(mb, phase):
 @cute.jit
 def _wait_mbarrier(mb, phase):
     _wait_ptr(mb.smem_ptr, phase)
-
-
-@cute.jit
-def _wait_mbarrier_inline(mb, phase):
-    mbar_addr = cutlass.Int32(cute.arch.make_warp_uniform(mb.smem_ptr.data_ptr().toint(cutlass.Int32)))
-    phase = cutlass.Int32(cute.arch.make_warp_uniform(phase))
-    llvm.inline_asm(
-        None,
-        [mbar_addr.ir_value(), phase.ir_value()],
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1;\n\t"
-        "@p bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
 
 
 # Storage dtype + MMA kind dispatch — folded at trace time on CFG.DTYPE_QKV.
@@ -1584,6 +1561,8 @@ def _mma_warp_group(
             _wait_mbarrier(bars.mb_q_full[0], q_full_phase)
             _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
             desc_K = sK[kv_state.idx].desc()
+            if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+                desc_K = desc_opaque(desc_K)
             mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1638,6 +1617,8 @@ def _mma_warp_group(
                 # BMM1 sub 0 for next kv
                 _wait_mbarrier(bars.mb_k_full[kv_state.idx], kv_state.phase)
                 desc_K = sK[kv_state.idx].desc()
+                if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
+                    desc_K = desc_opaque(desc_K)
                 mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), elect_once=CFG.THD_VARLEN)
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2049,195 +2030,83 @@ def _softmax_kv_body(
     return total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase
 
 
+class _SoftmaxKvContext(NamedTuple):
+    sub_tile_id: object
+    s_addr_base: object
+    p_addr_base: object
+    sStats_raw: object
+    tid_in_wg: object
+    bars: object
+    q_abs: object
+    eff_seqlen_kv: object
+    eff_seqlen_q: object
+    scale_log2: object
+    leader_cta_id: object
+
+
+@cute.jit
+def _softmax_kv_range(may_need_mask: bool, may_need_padding: bool, mask_flags: int, begin, end, context, state):
+    total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = state
+    for kv_loop in cutlass.range(begin, end, 1, unroll=1):
+        total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+            may_need_mask,
+            may_need_padding,
+            mask_flags,
+            context.sub_tile_id,
+            kv_loop,
+            context.s_addr_base,
+            context.p_addr_base,
+            context.sStats_raw,
+            context.tid_in_wg,
+            context.bars,
+            context.q_abs,
+            context.eff_seqlen_kv,
+            context.eff_seqlen_q,
+            context.scale_log2,
+            total_max,
+            total_max_safe,
+            total_sum,
+            bmm1_phase,
+            stat_empty_phase,
+            context.leader_cta_id,
+        )
+    return total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase
+
+
 @cute.jit
 def _softmax_masked_kv_loops(
     one_sided_swa: bool,
-    sub_tile_id,
     bounds,
-    swa_left_end,
     swa_left_pad_start,
+    swa_left_end,
     swa_right_start,
-    s_addr_base,
-    p_addr_base,
-    sStats_raw,
-    tid_in_wg,
-    bars,
-    q_abs,
-    eff_seqlen_kv,
-    eff_seqlen_q,
-    scale_log2,
-    total_max,
-    total_max_safe,
-    total_sum,
-    bmm1_phase,
-    stat_empty_phase,
-    leader_cta_id,
+    context,
+    state,
 ):
     if cutlass.const_expr(one_sided_swa):
-        for kv_loop in cutlass.range(bounds.left, swa_left_pad_start, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                True,
-                False,
-                MASK_SWA,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-        for kv_loop in cutlass.range(swa_left_pad_start, swa_left_end, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                True,
-                True,
-                MASK_SWA,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-        for kv_loop in cutlass.range(swa_left_end, swa_right_start, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                False,
-                False,
-                CFG.MASK_FLAGS,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-        for kv_loop in cutlass.range(swa_right_start, bounds.right, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                True,
-                True,
-                MASK_CAUSAL,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
+        regions = (
+            (True, False, MASK_SWA, bounds.left, swa_left_pad_start),
+            (True, True, MASK_SWA, swa_left_pad_start, swa_left_end),
+            (False, False, CFG.MASK_FLAGS, swa_left_end, swa_right_start),
+            (True, True, MASK_CAUSAL, swa_right_start, bounds.right),
+        )
     else:
-        for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                True,
-                False,
-                CFG.MASK_FLAGS,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-        for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                False,
-                False,
-                CFG.MASK_FLAGS,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-        for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
-                True,
-                True,
-                CFG.MASK_FLAGS,
-                sub_tile_id,
-                kv_loop,
-                s_addr_base,
-                p_addr_base,
-                sStats_raw,
-                tid_in_wg,
-                bars,
-                q_abs,
-                eff_seqlen_kv,
-                eff_seqlen_q,
-                scale_log2,
-                total_max,
-                total_max_safe,
-                total_sum,
-                bmm1_phase,
-                stat_empty_phase,
-                leader_cta_id,
-            )
-
-    return total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase
+        regions = (
+            (True, False, CFG.MASK_FLAGS, bounds.left, bounds.unmasked_lo),
+            (False, False, CFG.MASK_FLAGS, bounds.unmasked_lo, bounds.unmasked_hi),
+            (True, True, CFG.MASK_FLAGS, bounds.unmasked_hi, bounds.right),
+        )
+    for may_need_mask, may_need_padding, mask_flags, begin, end in regions:
+        state = _softmax_kv_range(
+            may_need_mask,
+            may_need_padding,
+            mask_flags,
+            begin,
+            end,
+            context,
+            state,
+        )
+    return state
 
 
 @cute.jit
@@ -2275,9 +2144,6 @@ def _softmax_warp_group(
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
 
     NEG_INF = cutlass.Float32(float("-inf"))
-
-    CHUNK = 64
-    P_COLS_PER_CHUNK = CHUNK // 2
 
     # Phase trackers persist across tile boundaries (barriers don't reset).
     bmm1_phase = cutlass.Int32(0)
@@ -2373,32 +2239,24 @@ def _softmax_warp_group(
                     leader_cta_id,
                 )
         else:
+            context = _SoftmaxKvContext(
+                sub_tile_id,
+                s_addr_base_softmax,
+                p_addr_base_softmax,
+                sStats_raw,
+                tid_in_wg,
+                bars,
+                q_abs,
+                eff_seqlen_kv,
+                eff_seqlen_q,
+                scale_log2,
+                leader_cta_id,
+            )
+            state = (total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase)
             if cutlass.const_expr(_SWA_ONE_SIDED_GEOMETRY):
-                if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
-                    total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
-                        True,
-                        sub_tile_id,
-                        bounds,
-                        swa_left_end,
-                        swa_left_pad_start,
-                        swa_right_start,
-                        s_addr_base_softmax,
-                        p_addr_base_softmax,
-                        sStats_raw,
-                        tid_in_wg,
-                        bars,
-                        q_abs,
-                        eff_seqlen_kv,
-                        eff_seqlen_q,
-                        scale_log2,
-                        total_max,
-                        total_max_safe,
-                        total_sum,
-                        bmm1_phase,
-                        stat_empty_phase,
-                        leader_cta_id,
-                    )
-                else:
+                if cutlass.const_expr(not _PREDECODE_THD_SWA_SEGMENTS):
+                    # Keep dense segment arithmetic in this warp: extracting it
+                    # changes CuTeDSL lowering on the hot dense path.
                     cga_q_row_coord = (q_super_idx - cta_in_pair) * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
                     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
                     lower_anchor = cga_q_row_coord + causal_diag + cutlass.Int32(_MASK_TOKENS_PER_CGA - 1 - CFG.WINDOW_LEFT)
@@ -2419,53 +2277,23 @@ def _softmax_warp_group(
                         cute.math.max(cute.math.max(right_start_raw, left_end), bounds.left),
                         bounds.right,
                     )
-                    total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
-                        True,
-                        sub_tile_id,
-                        bounds,
-                        left_end,
-                        left_pad_start,
-                        right_start,
-                        s_addr_base_softmax,
-                        p_addr_base_softmax,
-                        sStats_raw,
-                        tid_in_wg,
-                        bars,
-                        q_abs,
-                        eff_seqlen_kv,
-                        eff_seqlen_q,
-                        scale_log2,
-                        total_max,
-                        total_max_safe,
-                        total_sum,
-                        bmm1_phase,
-                        stat_empty_phase,
-                        leader_cta_id,
-                    )
+                    swa_left_pad_start = left_pad_start
+                    swa_left_end = left_end
+                    swa_right_start = right_start
             else:
-                total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
-                    False,
-                    sub_tile_id,
-                    bounds,
-                    bounds.unmasked_lo,
-                    bounds.unmasked_lo,
-                    bounds.unmasked_hi,
-                    s_addr_base_softmax,
-                    p_addr_base_softmax,
-                    sStats_raw,
-                    tid_in_wg,
-                    bars,
-                    q_abs,
-                    eff_seqlen_kv,
-                    eff_seqlen_q,
-                    scale_log2,
-                    total_max,
-                    total_max_safe,
-                    total_sum,
-                    bmm1_phase,
-                    stat_empty_phase,
-                    leader_cta_id,
-                )
+                swa_left_pad_start = bounds.unmasked_lo
+                swa_left_end = bounds.unmasked_lo
+                swa_right_start = bounds.unmasked_hi
+
+            total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_masked_kv_loops(
+                _SWA_ONE_SIDED_GEOMETRY,
+                bounds,
+                swa_left_pad_start,
+                swa_left_end,
+                swa_right_start,
+                context,
+                state,
+            )
 
         if cutlass.const_expr(not CAN_HAVE_EMPTY_KV) or (bounds.right > bounds.left):
             # Only real mainloops own a stats transaction. Empty tiles bypass
@@ -2597,10 +2425,7 @@ def _correction_warp_group(
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
 
-                if cutlass.const_expr(CFG.THD_VARLEN and (CFG.MASK_FLAGS & MASK_SWA)):
-                    _wait_mbarrier_inline(bars.mb_stat_full[qs], stat_full_phase)
-                else:
-                    _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
+                _wait_mbarrier(bars.mb_stat_full[qs], stat_full_phase)
 
                 stats_base = cutlass.Int32(qs * 2 * CFG.TILE_M)
                 alpha = sStats_raw.subview(stats_base + tid_in_wg).load()

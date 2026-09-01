@@ -962,10 +962,10 @@ def resolve_d192_template_params(
         # At 8K, 60 MiB groups 24 one-byte K/V heads; 40 MiB groups 16 and
         # avoids a short final group for these grids.
         lpt_l2_size_mib = 40
-    elif lpt_l2_8k and not fp8 and groups % 12 != 0 and groups % 8 == 0:
-        # Half inputs double the per-head K/V footprint: 60 MiB groups 12
-        # heads, while 40 MiB groups 8 and avoids the same short tail.
-        lpt_l2_size_mib = 40
+    elif lpt_l2_8k and not fp8 and not params.pack_gqa and groups % 16 == 0:
+        # At 8K, each half-precision K/V head occupies 5 MiB. Grouping exactly
+        # 16 heads avoids a short final LPT-L2 group on the model grids.
+        lpt_l2_size_mib = 80
 
     template_window_right = window_right
     if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
