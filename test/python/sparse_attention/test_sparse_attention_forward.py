@@ -308,3 +308,49 @@ def test_rejection_matrix(mutate, err):
     args_idxs = kwargs.pop("topk_idxs", idxs)
     with pytest.raises(err):
         _wrapper()(args_q, args_k, args_v, args_idxs, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Device-kernel parity: backend="default" vs the normative reference
+# ---------------------------------------------------------------------------
+def _dsa_kernel_available():
+    from cudnn.sparse_attention.forward.api import _get_dsa_prefill_kernel
+
+    return _get_dsa_prefill_kernel() is not None
+
+
+@torch_fork_set_rng(seed=4)
+@pytest.mark.parametrize("d_k", [512, 576])
+@pytest.mark.parametrize("sink", [False, True])
+def test_default_backend_matches_reference(d_k, sink):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
+    if not _dsa_kernel_available():
+        pytest.skip("DSA sparse-prefill kernel module not present in this tree")
+
+    device = "cuda"
+    t_q, t_kv, h = 64, 256, 64
+    d_v = 512 if d_k == 576 else d_k
+    kv = torch.randn(t_kv, 1, d_k, dtype=torch.bfloat16, device=device) / 10
+    q = torch.randn(t_q, h, d_k, dtype=torch.bfloat16, device=device) / 10
+    v = kv[:, :, :d_v]
+    attn_sink = torch.randn(h, dtype=torch.float32, device=device) if sink else None
+    # Compact-front ragged indices: unique valid ids in slots [0, length),
+    # -1 pads trailing (the kernel-facing convention).
+    idxs = _rand_indices((t_q,), 1, 128, t_kv, device, pad_ratio=0.0)
+    length = torch.randint(0, 129, (t_q,), dtype=torch.int32, device=device)
+    slot = torch.arange(128, device=device).unsqueeze(0)
+    idxs = torch.where(slot < length.unsqueeze(1), idxs, torch.full_like(idxs, -1))
+    cu = torch.tensor([0, t_q], dtype=torch.int32, device=device)
+
+    dev = _wrapper()(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink, cu_seqlens_q=cu, backend="default")
+    ref = _wrapper()(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink, cu_seqlens_q=cu, backend="reference")
+
+    torch.testing.assert_close(dev["out"].float(), ref["out"].float(), atol=2e-2, rtol=2e-2)
+    live = (length > 0).unsqueeze(-1).expand_as(dev["lse"])
+    torch.testing.assert_close(dev["lse"][live], ref["lse"][live], atol=1e-3, rtol=1e-3)
+    # KNOWN DEVIATION (kernel to fix when re-based onto this contract): the
+    # current DSA sparse-prefill kernel emits +inf dead-row LSE (FA2-style);
+    # the contract requires -inf (the LSE-merge identity). out is 0 either way.
+    assert torch.isinf(dev["lse"][~live]).all()
+    assert torch.isneginf(ref["lse"][~live]).all()

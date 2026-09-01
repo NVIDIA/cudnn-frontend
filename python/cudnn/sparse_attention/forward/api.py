@@ -33,10 +33,12 @@ Contract summary (normative — kernels must match the reference exactly):
   produce ``lse = -inf`` and ``out = 0``.
 * **Deterministic always**: same inputs produce bitwise-identical outputs.
 
-Backends: ``"default"`` dispatches to registered device kernels (none are
-registered yet — this is the contract bring-up); ``"reference"`` is an
-explicit opt-in PyTorch implementation used for validation. It is
-reference-speed by design and never selected implicitly.
+Backends: ``"default"`` dispatches to registered device kernels — currently
+the SM100 DSA sparse-prefill kernel for its envelope (THD, MQA latent with
+K aliased as V, ``D_k in (512, 576)``, shared token-granularity indices),
+when that module is present in the tree — and raises ``NotImplementedError``
+otherwise. ``"reference"`` is an explicit opt-in PyTorch implementation used
+for validation; reference-speed by design, never selected implicitly.
 """
 
 from __future__ import annotations
@@ -55,6 +57,22 @@ _BACKENDS = ("default", "reference")
 def _validate_backend(backend: str) -> None:
     if backend not in _BACKENDS:
         raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
+
+
+def _get_dsa_prefill_kernel():
+    """Probe for the SM100 DSA sparse-prefill kernel (ships on its own branch).
+
+    Returns the wrapper or ``None``. The generic op registers it as the
+    ``backend="default"`` implementation for its envelope when present, so
+    this module stays landable (and raising) on trees without the kernel.
+    """
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward import (
+            sparse_attention_forward_wrapper as dsa_fwd,
+        )
+    except ImportError:
+        return None
+    return dsa_fwd
 
 
 class SparseAttentionForward(APIBase):
@@ -106,6 +124,7 @@ class SparseAttentionForward(APIBase):
         # Derived in check_support().
         self.is_thd = None
         self.group_scope = None  # G: 1, H_kv, or H_q
+        self._dispatch = None  # device-kernel wrapper for backend="default"
 
     # ------------------------------------------------------------------
     # Validation
@@ -239,10 +258,29 @@ class SparseAttentionForward(APIBase):
         )
 
         # ---- backend envelope ----
-        self._not_implemented_error_if(
-            self.backend == "default",
-            "sparse_attention_forward has no device kernel registered yet; " 'pass backend="reference" for the (reference-speed) PyTorch path',
-        )
+        self._dispatch = None
+        if self.backend == "default":
+            # SM100 DSA sparse-prefill kernel envelope: THD, MQA latent
+            # (H_kv == 1, K aliased as V), shared indices, token granularity,
+            # D_k in {512, 576} (576 splits QK=576 / V=512).
+            in_dsa_envelope = (
+                self.is_thd
+                and self.group_scope == 1
+                and self.index_granularity == 1
+                and h_kv == 1
+                and d_k in (512, 576)
+                and d_v == (512 if d_k == 576 else d_k)
+                and major == 10
+            )
+            kernel = _get_dsa_prefill_kernel() if in_dsa_envelope else None
+            self._not_implemented_error_if(
+                kernel is None,
+                "sparse_attention_forward has no device kernel registered for this "
+                "configuration; the SM100 DSA sparse-prefill kernel serves THD MQA-latent "
+                "(H_kv=1, K aliased as V, D_k in (512, 576), G=1, granularity=1) when its "
+                'module is present. Pass backend="reference" for the PyTorch path.',
+            )
+            self._dispatch = kernel
 
         self._is_supported = True
         return True
@@ -269,6 +307,22 @@ class SparseAttentionForward(APIBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._compiled_kernel is None:
             self.compile()
+        if self.backend == "default":
+            # K is V aliasing is part of this kernel's envelope; the sample
+            # descriptors cannot see storage, so verify on the real tensors.
+            d_v = v.shape[-1]
+            if v.data_ptr() != k.data_ptr() or v.shape[0] != k.shape[0]:
+                raise ValueError("the registered DSA sparse-prefill kernel requires V to alias K's storage (MLA latent); pass v as a view of k")
+            result = self._dispatch(
+                q,
+                k[:, 0, :],
+                topk_idxs,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                softmax_scale=self.softmax_scale,
+                stream=current_stream,
+            )
+            return result["out"][:, :, :d_v], result["lse"]
         assert self.backend == "reference"
         # The reference path runs ordinary PyTorch ops on the caller's
         # current stream; `current_stream` is accepted for signature parity.
