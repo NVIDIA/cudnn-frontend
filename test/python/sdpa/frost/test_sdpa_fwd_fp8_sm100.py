@@ -709,7 +709,7 @@ def test_fp8_stats_less_zero_workspace(in_key):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False):
+def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False, d=128):
     """THD/varlen: packed [T,H,D] Q/K/V/O + per-operand ragged_offset + per-batch
     lengths (or their cu prefix-sum form).
 
@@ -721,7 +721,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     import cudnn
 
     dev = "cuda"
-    D = 128
+    D = d
     B = len(seq_lens_q)
     S_max_q, S_max_kv = max(seq_lens_q), max(seq_lens_kv)
     T_q, T_kv = sum(seq_lens_q), sum(seq_lens_kv)
@@ -1070,3 +1070,218 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sync_debug=True)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+# ===========================================================================
+# d512 flavor (d_qk = d_v = 512) — per-tensor FP8 only.
+#
+# Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
+# runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
+# Blackwell K=32 QMMA step.  There is no d512 MXFP8 kernel and no Rubin d512
+# kernel, so this whole section is sm100-only.
+# ===========================================================================
+
+_skip_d512_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d512 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+_D512 = 512
+_D512_SCALE = 1.0 / math.sqrt(_D512)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_masks(in_key, mask):
+    """Every causal-family mask on the d512 FP8 flavor."""
+    out, o_ref, a_o, a_o_ref = _run(2, 4, 4, 256, 256, in_key, torch.float16, scale=_D512_SCALE, sdpa_kwargs=_MASKS[mask], d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_output_dtypes(in_key, out_key):
+    """DTYPE_O is independent of DTYPE_QKV on d512 too.  The BF16/FP16 arms
+    also exercise the byte-sized Q u O SMEM alias: a BPE_O=2 output is twice
+    the FP8 input's width, and an element-sized alias would overflow into the
+    P-transfer ring."""
+    out_dt = _OUT[out_key]
+    out, o_ref, a_o, a_o_ref = _run(1, 4, 4, 256, 256, in_key, out_dt, scale=_D512_SCALE, sdpa_kwargs={}, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, out_dt, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_sink():
+    """Attention sink on d512: one extra softmax column with V = 0."""
+    sink = torch.randn(1, 8, 1, 1, device="cuda", dtype=torch.float32)
+    out, o_ref, a_o, a_o_ref = _run(1, 8, 8, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, sink=sink, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("h_q,h_kv", [(8, 2), (8, 1)], ids=["g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_gqa(h_q, h_kv):
+    """Grouped / multi-query attention on d512."""
+    out, o_ref, a_o, a_o_ref = _run(2, h_q, h_kv, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_padded_kv():
+    """Per-batch KV padding (seq_len_kv) on d512: KV columns past the batch's
+    valid length are masked, so every query row keeps a well-defined
+    normalization."""
+    out, o_ref, a_o, a_o_ref = _run(2, 4, 4, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, seq_lens_kv=[200, 137], d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_stats():
+    """generate_stats on d512: the dense LSE matches the natural-log reference."""
+    r = _run(1, 4, 4, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), d_qk=_D512, d_v=_D512, return_lse=True)
+    _check(r.output, r.reference, torch.float16, "e4m3", r.amax, r.reference_amax)
+    diff = (r.stats.float() - r.reference_stats).abs().max().item()
+    assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_multi_tile():
+    """A shape that spans several Q tiles and several persistent waves, so the
+    scheduler ring, the S_acc parity ring (XFER_STAGES=3 at FP8) and the KV
+    ring (STAGES_KV=3) all wrap."""
+    out, o_ref, a_o, a_o_ref = _run(
+        2, 4, 4, 1024, 1024, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), d_qk=_D512, d_v=_D512
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+# --- d512 THD / varlen -----------------------------------------------------
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd(in_key, causal):
+    """THD/varlen self-attention on d512: two packed sequences of unequal,
+    tile-ragged length."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, in_key, scale=_D512_SCALE, causal=causal, d=_D512)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_cross_gqa():
+    """THD cross-attention on d512: unequal per-sequence Q and KV lengths with
+    unequal packed totals, under GQA."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", scale=_D512_SCALE, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_sink_stats():
+    """THD + sink + ragged Stats on d512 (packed token-major TH1 layout)."""
+    sink = torch.randn(1, 8, 1, 1, device="cuda", dtype=torch.float32)
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=_D512_SCALE, causal=True, sink=sink, stats=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    diff = (lse.float() - lse_ref).abs().max().item()
+    assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_zero_len_kv():
+    """THD on d512 with a zero-length KV sequence: those Q rows are dead
+    (O := 0, LSE := -inf) and must not poison amax_o."""
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=_D512_SCALE, stats=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    assert torch.equal(lse[:126], torch.full_like(lse[:126], float("-inf"))), "dead rows must report LSE = -inf"
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_cu_seq_len():
+    """THD on d512 via the cu_seq_len prefix-sum length form."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", scale=_D512_SCALE, cu_lens=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize(
+    ("d_qk", "d_v"),
+    [(384, 448), (464, 368), (272, 272), (512, 496)],
+    ids=["d384_d448", "d464_d368", "d272", "d512_d496"],
+)
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
+    """The d512 flavor serves the (256, 512] head-dim band, d_qk != d_v included.
+
+    ENVELOPE semantics: the TMA descriptors carry the ACTUAL extents while the
+    tile box stays the compile-time 512 geometry, so Q/K loads past d_qk and V
+    loads past d_v hardware zero-fill (exact zero terms in QK^T and P.V, so S,
+    the softmax and O are bit-identical to the unpadded problem) and O stores
+    past d_v are OOB-clipped.  d % 16 at 1 byte/elem is the TMA 16-byte
+    global-stride rule.
+    """
+    out, o_ref, a_o, a_o_ref = _run(1, 4, 4, 256, 256, "e4m3", torch.float16, scale=1.0 / math.sqrt(d_qk), sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+def test_fp8_d512_envelope_floor_declines_below_256():
+    """Below the d512 floor the adapter declines instead of routing a much
+    smaller graph onto a kernel tuned for d = 512 (there is no d256 FP8
+    kernel, so d256 has no home -- that is the honest answer, not a 2x-padded
+    d512 launch).  Straddling the floor is declined too."""
+    from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
+
+    shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    for d_qk, d_v in [(384, 448), (464, 368), (272, 272), (512, 512)]:
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in [(256, 256), (160, 160), (384, 128), (512, 256)]:
+        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+
+
+@pytest.mark.L0
+def test_fp8_envelope_floor_matches_engine_row():
+    """The adapter's floor table and the engine row's must agree: the row
+    decides eligibility, the adapter picks the flavor, and a drift between them
+    is a plan that enters the ranked list only to die in the lowering."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import _SM100_FP8_ENVELOPE_FLOORS
+
+    row = {s.name: s.capabilities for s in engines.ENGINE_SPECS}[engines.engine_name(fp8=True)]
+    assert dict(row.d_envelope_floors) == _SM100_FP8_ENVELOPE_FLOORS
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+def test_fp8_d512_mxfp8_declines():
+    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
+    rejected up front, not fail late in the lowering."""
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
+    assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))

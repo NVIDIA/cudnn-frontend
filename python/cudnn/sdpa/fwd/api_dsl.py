@@ -84,13 +84,33 @@ _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
+    (512, 512): "prefill_d512_fp8_sm100.py",
 }
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
+    """NATIVE (exact) FP8 kernel-flavor shapes for the device line."""
     if device_cc == (10, 7):
         return frozenset({(128, 128)})
+    # d512 is per-tensor only: there is no d512 block-scale (MXFP8) kernel.
+    if pertensor:
+        return frozenset({(128, 128), (192, 128), (512, 512)})
     return frozenset({(128, 128), (192, 128)})
+
+
+# Per-native-shape ENVELOPE FLOOR (see engines.Capabilities.d_envelope_floors,
+# which MUST agree — test_fp8_envelope_floor_matches_engine_row pins it). The
+# d512 flavor serves the (256, 512] band on both head dims: the range no
+# smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
+# declined rather than routed onto a kernel whose cga4x1 role-split geometry is
+# tuned for d = 512.
+_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+
+
+def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
+    """Does some native FP8 shape cover ``(d_qk, d_v)`` as an envelope bound,
+    respecting that shape's floor?"""
+    return any(d_qk <= sq and d_v <= sv and min(d_qk, d_v) > _SM100_FP8_ENVELOPE_FLOORS.get((sq, sv), 0) for sq, sv in shapes)
 
 
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
@@ -255,8 +275,12 @@ def _flavor_tag(flavor: tuple[int, int]) -> str:
     return f"d{d_qk}" if d_qk == d_v else f"d{d_qk}_d{d_v}"
 
 
-def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
-    """Smallest flavor whose envelope covers ``(d_qk, d_v)`` (f16/bf16 only).
+def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int], ...]] = None) -> tuple[int, int]:
+    """Smallest flavor whose envelope covers ``(d_qk, d_v)``.
+
+    ``candidates`` restricts the walk to the flavors that have a kernel for the
+    caller's quantization (the FP8 family has no d256 file, so an FP8 graph must
+    not land on it); ``None`` = the full f16/bf16 list.
 
     ENVELOPE (zero-padding) semantics: one flavor covers ``d_qk`` and ``d_v``
     with its own max extents — e.g. (192, 128) runs on the d192/d128 kernel. The
@@ -270,14 +294,12 @@ def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     including the f16 alignment rule (d % 8, the TMA 16-byte global-stride
     rule at 2 bytes/elem).
     """
-    for flavor in _SM100_FLAVORS:
+    pool = candidates if candidates is not None else _SM100_FLAVORS
+    for flavor in pool:
         fdqk, fdv = flavor
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
-    raise ValueError(
-        f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); "
-        f"largest supported: {_SM100_FLAVORS[-1]} (d128/d192-d128/d256/d512 envelopes)."
-    )
+    raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
 def _load_kernel_template(filename: str, params: Hashable, tag: str):
@@ -1017,12 +1039,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # stays exact (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         _fp8_envelope_ok = (
-            self._pertensor and not self.thd and any(int(d_qk) <= sq and int(d_v) <= sv for sq, sv in fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
+            self._pertensor and not self.thd and _fp8_envelope_covers(int(d_qk), int(d_v), fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
         )
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
             f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
-            + (" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16)" if self._pertensor else " (no envelope padding)")
+            + (
+                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; " f"floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
+                if self._pertensor
+                else " (no envelope padding)"
+            )
             + f"; got (D_QK={d_qk}, D_V={d_v})",
         )
         # Envelope alignment gate: the TMA descriptors are built from the
@@ -1036,7 +1062,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"(TMA 16-byte global-stride constraint at 2 bytes/elem); got "
             f"(D_QK={d_qk}, D_V={d_v})",
         )
-        self.flavor = _pick_flavor(d_qk, d_v)
+        # An FP8 graph must only land on a flavor that HAS an fp8 kernel: the
+        # quantized family has no d256 file, so the f16 flavor list would send a
+        # d256 fp8 graph to a kernel that does not exist.
+        self.flavor = _pick_flavor(d_qk, d_v, tuple(f for f in _SM100_FLAVORS if f in fp8_shapes) if self._fp8 else None)
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -1115,9 +1144,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # THD leg; the d192/d128 siblings are dense-only. The engine specs
         # already route this (their d192 rows declare thd=False); the gate
         # covers direct construction.
+        # Of the quantized flavors, d128/d128 (per-tensor + block-scale) and
+        # d512/d512 (per-tensor only) carry the write_thd_meta THD leg; the
+        # d192/d128 siblings are dense-only.
+        _thd_fp8_shapes = {(128, 128), (512, 512)} if self._pertensor else {(128, 128)}
         self._not_implemented_error_if(
-            self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
+            self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)} (the d192/d128 "
+            f"kernels are dense-only, and d512 has no block-scale kernel); got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
