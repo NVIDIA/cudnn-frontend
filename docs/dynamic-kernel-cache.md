@@ -31,8 +31,6 @@ The `KernelCache` API (`build`, `from_json`, `to_json`, `is_finalized`) is **int
 
 `build()` is idempotent under the lock: the first caller to acquire the mutex initializes and finalizes the descriptor; subsequent callers return `OK` immediately without re-initializing it. This makes it safe for N graph threads sharing one `KernelCache` to each call `build()` concurrently — exactly one backend descriptor is created and finalized.
 
-`to_json()` holds the lock only for the descriptor pointer read; the cuDNN serialization call runs outside the lock.
-
 `from_json()` is synchronized the same way as `build()`. Call it before sharing the `KernelCache` with any thread that will call `build()`.
 
 

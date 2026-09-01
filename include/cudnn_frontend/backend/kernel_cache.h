@@ -67,25 +67,25 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     to_json(std::string &str_json) const {
+        std::lock_guard<std::mutex> lk(mutex_);
         str_json.clear();
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
                                        error_code_t::CUDNN_BACKEND_API_FAILED,
                                        "CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION is only available starting 9.10.");
 
-        cudnnBackendDescriptor_t desc = get_ptr_locked();
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            desc == nullptr,
+            get_ptr() == nullptr,
             error_code_t::CUDNN_BACKEND_API_FAILED,
             "KernelCache::to_json: descriptor not initialized; call build() or from_json() first.");
 
         int64_t serializationSize;
         std::vector<char> serialization_buf;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
-            desc, CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
+            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
         serialization_buf.resize(static_cast<size_t>(serializationSize));
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(desc,
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
                                                        CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
                                                        CUDNN_TYPE_CHAR,
                                                        serializationSize,
