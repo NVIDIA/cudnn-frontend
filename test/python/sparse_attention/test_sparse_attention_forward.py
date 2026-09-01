@@ -354,3 +354,31 @@ def test_default_backend_matches_reference(d_k, sink):
     # the contract requires -inf (the LSE-merge identity). out is 0 either way.
     assert torch.isinf(dev["lse"][~live]).all()
     assert torch.isneginf(ref["lse"][~live]).all()
+
+
+# ---------------------------------------------------------------------------
+# Framework neutrality: the package must import without torch (JAX processes)
+# ---------------------------------------------------------------------------
+def test_import_without_torch():
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "class B:\n"
+        "    def find_module(self, name, path=None):\n"
+        "        if name == 'torch' or name.startswith('torch.'):\n"
+        "            raise ImportError('torch blocked')\n"
+        "sys.meta_path.insert(0, B())\n"
+        "import cudnn.sparse_attention\n"
+        "from cudnn.sparse_attention.forward import api\n"
+        "assert 'torch' not in sys.modules\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+    )
+    assert result.returncode == 0, f"torch-free import failed:\n{result.stderr}"

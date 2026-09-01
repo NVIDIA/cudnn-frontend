@@ -44,12 +44,17 @@ for validation; reference-speed by design, never selected implicitly.
 from __future__ import annotations
 
 import math
-from typing import Optional
-
-import torch
-import cuda.bindings.driver as cuda
+from typing import TYPE_CHECKING, Optional
 
 from cudnn.api_base import APIBase, TupleDict
+
+# Framework neutrality: this module must be importable without torch (JAX
+# processes may not import torch at all). torch is imported function-locally
+# on the execute/validate paths only; annotations stay lazy via
+# ``from __future__ import annotations``.
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import torch
+    import cuda.bindings.driver as cuda
 
 _BACKENDS = ("default", "reference")
 
@@ -130,6 +135,8 @@ class SparseAttentionForward(APIBase):
     # Validation
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
+        import torch
+
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major < 9,
@@ -356,6 +363,8 @@ def _reference_forward(
     group_scope: int,
     is_thd: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
+
     g = index_granularity
 
     if is_thd:
