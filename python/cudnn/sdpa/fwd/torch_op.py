@@ -160,14 +160,19 @@ def _thd_desc_stride(t: torch.Tensor, s_max: int) -> Tuple[int, int, int, int]:
     return (s_max * s_t, s_h, s_t, s_d)
 
 
-def _normalize_thd(t: torch.Tensor, name: str) -> torch.Tensor:
+def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torch.Tensor:
     """Innermost dim must be dense and the base pointer 16B-aligned for the
     cuDNN descriptors (an odd-element storage offset has equal strides but
     faults the kernels with a misaligned address). clone(), NOT contiguous():
     contiguous() returns ``self`` unchanged for an already-contiguous tensor,
-    whatever its storage offset, so it cannot repair a misaligned base."""
+    whatever its storage offset, so it cannot repair a misaligned base.
+
+    Applies to BOTH layouts. The descriptor requirement is a property of the
+    operand, not of THD packing: a dense BHSD tensor whose last dim is strided
+    (say a ``[..., ::2]`` slice), or whose base is misaligned, breaks the same
+    way."""
     if t.stride(-1) != 1 or t.data_ptr() % 16:
-        _logger.warning("sdpa_fwd: copying %s to normalize layout/alignment (slow path)", name)
+        _logger.warning("%s: copying %s to normalize layout/alignment (slow path)", op, name)
         t = t.clone(memory_format=torch.contiguous_format)
     return t
 
@@ -344,9 +349,9 @@ def _sdpa_fwd_impl(
         if seq_len_q is not None or seq_len_kv is not None:
             raise ValueError("varlen path derives seq lens from cu_seqlens; do not pass seq_len_q/kv")
         B = cu_seqlens_q.numel() - 1
-        q = _normalize_thd(q, "q")
-        k = _normalize_thd(k, "k")
-        v = _normalize_thd(v, "v")
+        q = _normalize_operand(q, "q")
+        k = _normalize_operand(k, "k")
+        v = _normalize_operand(v, "v")
         T_q, H_q, D_qk = q.shape
         T_kv, H_v, D_v = v.shape
         H_k = k.shape[1]
@@ -375,6 +380,12 @@ def _sdpa_fwd_impl(
             raise ValueError(f"k shape {tuple(k.shape)} must be (B={B}, H_k, S_kv={S_kv}, D_qk={D_qk}) to match q and v")
         if H_q % H_k or H_q % H_v:
             raise ValueError(f"GQA head counts must divide H_q={H_q}; got H_k={H_k}, H_v={H_v}")
+        # Same descriptor contract as THD: dense strides are declared as-is,
+        # but a strided innermost dim or a misaligned base still has to be
+        # repaired before the descriptors are built.
+        q = _normalize_operand(q, "q")
+        k = _normalize_operand(k, "k")
+        v = _normalize_operand(v, "v")
         q_stride, k_stride, v_stride = q.stride(), k.stride(), v.stride()
         o_stride = _like_layout_stride((B, H_q, S_q, D_v), q)  # O adopts Q's layout
         stats_stride = (H_q * S_q, S_q, 1, 1)
@@ -687,6 +698,14 @@ def _sdpa_bwd_dense(
         raise ValueError(f"o {tuple(o.shape)} / grad_out {tuple(grad_out.shape)} must be (B={B}, H_q={H_q}, S_q={S_q}, D_v={D_v})")
     _check_same_device(q, k=k, v=v, o=o, lse=lse, grad_out=grad_out)
 
+    # Descriptor contract (innermost dense, 16B-aligned base) — before the
+    # strides are read and before dO is matched to O, so a repaired O does not
+    # leave dO on the old layout.
+    q = _normalize_operand(q, "q", "sdpa_bwd")
+    k = _normalize_operand(k, "k", "sdpa_bwd")
+    v = _normalize_operand(v, "v", "sdpa_bwd")
+    o = _normalize_operand(o, "o", "sdpa_bwd")
+
     if lse.dtype != torch.float32:
         raise ValueError(f"lse must be float32, got {lse.dtype}")
     if not lse.is_contiguous() or lse.data_ptr() % 16:
@@ -832,10 +851,10 @@ def _sdpa_bwd_impl(
         )
 
     B = cu_seqlens_q.numel() - 1
-    q = _normalize_thd(q, "q")
-    k = _normalize_thd(k, "k")
-    v = _normalize_thd(v, "v")
-    o = _normalize_thd(o, "o")
+    q = _normalize_operand(q, "q")
+    k = _normalize_operand(k, "k")
+    v = _normalize_operand(v, "v")
+    o = _normalize_operand(o, "o", "sdpa_bwd")
     T_q, H_q, D_qk = q.shape
     T_kv, H_v, D_v = v.shape
     H_k = k.shape[1]
@@ -1095,6 +1114,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
             is_causal=ctx.is_causal,
             causal_bottom_right=ctx.causal_bottom_right,
             window_left=ctx.window_left,
+            is_deterministic=torch.are_deterministic_algorithms_enabled(),
         )
         return (dq, dk, dv) + (None,) * 12
 

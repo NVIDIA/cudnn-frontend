@@ -285,6 +285,62 @@ class TestSdpaBwdDense:
             assert grad_t.stride() == src.stride(), f"{name} stride {grad_t.stride()} != input {src.stride()}"
 
     @pytest.mark.L0
+    @pytest.mark.parametrize("flaw", ["strided_innermost", "misaligned_base"])
+    def test_dense_backward_repairs_bad_operands(self, flaw):
+        """A dense operand whose innermost dim is strided, or whose base is not
+        16B-aligned, breaks the descriptor contract exactly like a THD one:
+        both must be repaired before descriptors are built, not passed through."""
+        torch.manual_seed(0)
+        B, H, S, D = 2, 4, 128, 64
+        scale = D**-0.5
+        if flaw == "strided_innermost":
+            # [..., ::2] -> last-dim stride 2
+            k = torch.randn(B, H, S, 2 * D, dtype=torch.bfloat16, device="cuda")[..., ::2]
+        else:
+            # one bf16 element in -> base pointer at +2 bytes
+            k = torch.randn(B, H, S, D + 1, dtype=torch.bfloat16, device="cuda")[..., 1:]
+        q, v = bshd(B, H, S, D), bshd(B, H, S, D)
+        assert k.shape == q.shape
+        o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True, return_lse=True)
+        dq, dk, dv = torch.ops.cudnn.sdpa_bwd(torch.randn_like(o), q, k, v, o, lse, scale, is_causal=True)
+        # Correctness is the point: a silently mis-declared descriptor would
+        # read the wrong elements rather than fail loudly.
+        qr, kr, vr = (t.detach().clone().float().requires_grad_(True) for t in (q, k, v))
+        ref = torch.nn.functional.scaled_dot_product_attention(qr, kr, vr, is_causal=True, scale=scale)
+        assert (o.float() - ref).abs().max().item() < TOL
+        assert dq.isfinite().all() and dk.isfinite().all() and dv.isfinite().all()
+
+    @pytest.mark.L0
+    def test_dense_autograd_honors_deterministic_flag(self):
+        """torch.use_deterministic_algorithms(True) must reach the graph. The
+        dense autograd path used to drop it, silently building the backward
+        with use_deterministic_algorithm=False and giving non-reproducible dq."""
+        torch.manual_seed(0)
+        B, H, S, D = 2, 4, 128, 64
+        scale = D**-0.5
+
+        # Same inputs both times: determinism is about the backward's own
+        # accumulation order, not the data.
+        q, k, v = (bshd(B, H, S, D).requires_grad_(True) for _ in range(3))
+
+        def run():
+            for t in (q, k, v):
+                t.grad = None
+            o, _ = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True, return_lse=True)
+            o.backward(torch.ones_like(o))
+            return q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+        was = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            a = run()
+            b = run()
+        finally:
+            torch.use_deterministic_algorithms(was)
+        for name, x, y in zip(("dq", "dk", "dv"), a, b):
+            assert torch.equal(x, y), f"{name} differs across runs under use_deterministic_algorithms(True)"
+
+    @pytest.mark.L0
     def test_dense_opcheck(self):
         """opcheck on the dense backward: the fake kernel must mirror the real
         gradients' strides, which are the inputs' permutation (not contiguous)."""
