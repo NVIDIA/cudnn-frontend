@@ -224,12 +224,12 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
     attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
     # (H, T) packed -> (B, H, max_q, 1) padded: the backend rejects ragged LSE
     # for bprop THD on SM8X/SM12X, so the bwd op takes the padded layout.
-    B = cu_seq_q.numel() - 1
-    H = query.shape[1]
-    lse_padded = torch.zeros(B, H, max_q, 1, dtype=torch.float32, device=lse.device)
-    for i in range(B):
-        a, b = int(cu_seq_q[i]), int(cu_seq_q[i + 1])
-        lse_padded[i, :, : b - a, 0] = lse[:, a:b]
+    # (H, T) -> (T, H) for the shared device-side repad. The naive
+    # `for i in range(B): int(cu_seq_q[i])` loop that used to live here was
+    # 2*B blocking D2H copies per backward call, before the kernel even
+    # launched — an async-launch API turned synchronous, and un-capturable
+    # (python/cudnn/AGENTS.md Rule 3).
+    lse_padded = _cudnn_ops.thd_lse_to_padded(lse.transpose(0, 1), cu_seq_q, max_q)
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_out, query, key, value, out, lse_padded, attn_scale,
         is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]),

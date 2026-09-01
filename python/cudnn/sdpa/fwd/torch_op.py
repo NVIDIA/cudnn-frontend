@@ -871,6 +871,32 @@ def _sdpa_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[1])
 
 
+def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seqlen_q: int) -> torch.Tensor:
+    """Packed ``(T, H)`` log-sum-exp -> padded ``(B, H, max_seqlen_q, 1)``.
+
+    ``cudnn::sdpa_bwd`` takes the padded layout on the THD path (the backend
+    rejects ragged LSE for bprop THD on SM8X/SM12X). Rows past each sequence's
+    length stay zero and are ignored.
+
+    Entirely DEVICE-side, and deliberately so: the obvious
+    ``for i in range(B): int(cu[i])`` loop is ``2*B`` blocking D2H copies
+    before the backward kernel is even launched, which makes an async-launch
+    API synchronous and cannot be stream-captured (python/cudnn/AGENTS.md,
+    Rule 3). It also keeps the conversion traceable under dynamic-shape AOT
+    dispatch, where reading a cu value to host raises
+    GuardOnDataDependentSymNode.
+    """
+    B = cu_seqlens_q.numel() - 1
+    T, H = lse_th.shape
+    cu = cu_seqlens_q.long()
+    token = torch.arange(T, device=lse_th.device)
+    seq_of_token = torch.searchsorted(cu[1:], token, right=True)  # t in [cu[i], cu[i+1]) -> i
+    pos_in_seq = token - cu[seq_of_token]
+    padded = torch.zeros(B, H, max_seqlen_q, 1, dtype=torch.float32, device=lse_th.device)
+    padded[seq_of_token, :, pos_in_seq, 0] = lse_th
+    return padded
+
+
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
     q, k, v, o, stats, cu_q, cu_kv = ctx.saved_tensors
     if grad_o is None:  # o unused in the loss; stats is non-differentiable
@@ -888,14 +914,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
     # rejects ragged LSE for bprop THD on SM8X/SM12X. Entirely device-side
     # (no host reads of cu values): traceable under dynamic-shape AOT
     # dispatch, and no D2H sync on the backward hot path.
-    B = cu_q.numel() - 1
-    H_q = q.shape[1]
-    T_q = stats.shape[0]
-    token = torch.arange(T_q, device=stats.device)
-    seq_of_token = torch.searchsorted(cu_q[1:].long(), token, right=True)  # token t in [cu[i], cu[i+1]) -> i
-    pos_in_seq = token - cu_q.long()[seq_of_token]
-    lse_padded = torch.zeros(B, H_q, ctx.max_seqlen_q, 1, dtype=torch.float32, device=stats.device)
-    lse_padded[seq_of_token, :, pos_in_seq, 0] = stats[:, :, 0]
+    lse_padded = thd_lse_to_padded(stats[:, :, 0], cu_q, ctx.max_seqlen_q)
 
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_o,

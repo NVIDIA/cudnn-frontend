@@ -211,6 +211,38 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
 
 
 @pytest.mark.L0
+def test_varlen_backward_does_not_sync():
+    """The varlen backward must not read cu_seqlens to host.
+
+    It used to repad the packed LSE with `for i in range(B): int(cu_seq_q[i])`
+    — 2*B blocking D2H copies before the kernel even launched, turning an
+    async-launch API synchronous and blocking stream capture
+    (python/cudnn/AGENTS.md Rule 3). The conversion is device-side now;
+    CUDA's sync-debug mode turns any regression into an error.
+    """
+    torch.manual_seed(0)
+    H, D = 8, 128
+    lens_t = torch.tensor([128, 96, 200], device="cuda")
+    cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
+    T, mx = int(cu[-1]), int(lens_t.max())
+    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True) for _ in range(3))
+
+    bwd0 = provider.calls["bwd"]
+    out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
+    grad = torch.randn_like(out)
+
+    # Any blocking D2H inside the backward raises here.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        out.backward(grad)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert provider.calls["bwd"] == bwd0 + 1, "provider did not serve the backward"
+    assert q.grad is not None and k.grad is not None and v.grad is not None
+
+
+@pytest.mark.L0
 def test_d256_direct_aten_op():
     """d=256: torch's C++ fused_sdp_choice still gates cuDNN to head_dim<=128,
     so F.sdpa cannot reach it — but the python path serves it through the aten
