@@ -76,6 +76,8 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 
 `MoeEpTrainingWeights` contains four address-stable MXFP8 block-scaled tensors:
 forward W1/W2 and independently quantized backward W2-transpose/W1-transpose.
+Backward-transpose data is C-contiguous under both FC1 layout policies, matching
+the single training AOT signature.
 With `weight_interleave_size=32`, compact K-major forward weights and contiguous
 backward transposes are interpreted as already using 32-element W1 gate/up
 strips, and the kernels alias weight data directly; only scales require

@@ -445,6 +445,31 @@ def test_validate_training_weights_accepts_compact_k_major_views(part):
     bindings.refresh()
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "field",
+    ["backward_w2_transpose", "backward_w1_transpose"],
+)
+@pytest.mark.parametrize("weight_interleave_size", [None, 32])
+def test_validate_training_weights_rejects_k_major_backward_data(
+    field,
+    weight_interleave_size,
+):
+    weights, _, _ = _training_weight_defect(
+        _training_weights(),
+        field,
+        "data_noncontiguous",
+    )
+    with pytest.raises(
+        ValueError,
+        match=rf"weights\.{field} data must be contiguous",
+    ):
+        validate_training_weights(
+            _training_config(weight_interleave_size=weight_interleave_size),
+            weights,
+        )
+
+
 def _operator(**overrides) -> MoeEp:
     values = {
         "num_experts": 2,
@@ -711,6 +736,8 @@ def test_training_weight_bindings_alias_data_and_stage_only_scales():
         compatibility_bindings.forward.fc1_weight.data_ptr()
         != weights.forward_fc1.data.data_ptr()
     )
+    assert compatibility_bindings.backward.fc1_weight.is_contiguous()
+    assert compatibility_bindings.backward.fc2_weight.is_contiguous()
 
     bindings = Mxfp8TrainingWeightBindings(
         weights,

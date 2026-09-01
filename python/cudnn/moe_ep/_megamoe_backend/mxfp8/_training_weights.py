@@ -239,7 +239,10 @@ class Mxfp8TrainingWeightBindings:
             fc1_weight=(
                 bwd_w2t.data
                 if self._uses_direct_weight_bindings
-                else torch.empty_like(bwd_w2t.data)
+                else torch.empty_like(
+                    bwd_w2t.data,
+                    memory_format=torch.contiguous_format,
+                )
             ),
             fc1_weight_sf=_empty_blocked_scales(
                 bwd_w2t,
@@ -250,7 +253,10 @@ class Mxfp8TrainingWeightBindings:
             fc2_weight=(
                 bwd_w1t.data
                 if self._uses_direct_weight_bindings
-                else torch.empty_like(bwd_w1t.data)
+                else torch.empty_like(
+                    bwd_w1t.data,
+                    memory_format=torch.contiguous_format,
+                )
             ),
             fc2_weight_sf=_empty_blocked_scales(
                 bwd_w1t,

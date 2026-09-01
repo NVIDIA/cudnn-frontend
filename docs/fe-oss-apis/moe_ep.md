@@ -283,11 +283,13 @@ they are not revalidated by host code after graph capture.
 - `backward_w2_transpose`: `(E_local, H, I)`
 - `backward_w1_transpose`: `(E_local, 2I, H)`
 
-Each data and scale tensor must be contiguous or use compact K-major strides
-`(K*N, 1, K)`, reside on one device, and use logical block axis 1. The K-major
-form lets framework integrations bind transposed weight views without an extra
-copy. Plain FP16 operands are accepted by inference staging, but fixed-resource
-training accepts only BF16 or FP32 `activation` and `grad_output`.
+Forward data and all scale tensors must be contiguous or use compact K-major
+strides `(K*N, 1, K)`. Backward-transpose data must be contiguous to match the
+training AOT kernel signature. All tensors reside on one device and use logical
+block axis 1. The K-major forward form lets framework integrations bind
+transposed weight views without an extra copy. Plain FP16 operands are accepted
+by inference staging, but fixed-resource training accepts only BF16 or FP32
+`activation` and `grad_output`.
 
 Replacing weight storage requires preparing resources and capturing again.
 Callers must establish stream/event ordering for in-place weight updates.

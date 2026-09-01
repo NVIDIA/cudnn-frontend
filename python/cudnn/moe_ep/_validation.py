@@ -295,6 +295,13 @@ def validate_training_weights(
             raise TypeError(f"{name} must be an MXFP8 BlockScaledTensor for " "fixed training resources")
         if tensor.format is not MoeFormat.MXFP8:
             raise NotImplementedError(f"{name} must use format='mxfp8', got {tensor.format.value!r}")
+        if name in (
+            "weights.backward_w2_transpose",
+            "weights.backward_w1_transpose",
+        ) and not tensor.data.is_contiguous():
+            raise ValueError(
+                f"{name} data must be contiguous for fixed training weight binding"
+            )
         if not has_supported_layout(tensor.data) or not has_supported_layout(tensor.scale):
             raise ValueError(
                 f"{name} data and scale must be contiguous or compact K-major "
