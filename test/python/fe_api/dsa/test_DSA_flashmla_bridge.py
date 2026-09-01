@@ -78,6 +78,7 @@ def test_sparse_attention_forward_preserves_semantic_output_contract(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
     monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
     monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace(flash_mla_sparse_fwd=provider))
+    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     device = torch.device("cuda")
     q = torch.zeros((2, heads, head_dim), dtype=torch.bfloat16, device=device)
@@ -120,14 +121,55 @@ def test_flashmla_dependency_without_sparse_entrypoint_fails_closed(monkeypatch)
 
 
 @pytest.mark.L0
-def test_flashmla_dependency_uses_call_capability_not_version_string(monkeypatch):
+def test_flashmla_dependency_accepts_pinned_distribution_identity(monkeypatch):
     def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
-        pytest.fail("signature probing must not execute the external callable")
+        pytest.fail("compatibility probing must not execute the external callable")
 
-    dependency = types.SimpleNamespace(__version__="not-a-supported-version", flash_mla_sparse_fwd=compatible)
+    versions = []
+    dependency = types.SimpleNamespace(__version__="1.0.0", flash_mla_sparse_fwd=compatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(
+        bridge.importlib_metadata,
+        "version",
+        lambda distribution: versions.append(distribution) or "1.0.0+15f13e5",
+    )
 
     assert bridge._resolve_flashmla_sparse_fwd() is compatible
+    assert versions == ["flash_mla"]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("installed_version", ["1.0.0", "1.0.0+deadbee"])
+def test_flashmla_dependency_rejects_unverified_distribution_identity(monkeypatch, installed_version):
+    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
+        pytest.fail("an unverified provider must not execute")
+
+    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: installed_version)
+
+    with pytest.raises(
+        bridge.SparseAttentionBackendUnavailableError,
+        match=r"distribution version .* is incompatible.*1\.0\.0\+15f13e5",
+    ):
+        bridge._resolve_flashmla_sparse_fwd()
+
+
+@pytest.mark.L0
+def test_flashmla_dependency_without_distribution_metadata_fails_closed(monkeypatch):
+    def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
+        pytest.fail("an unidentified provider must not execute")
+
+    dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
+    monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+
+    def missing_distribution(_distribution):
+        raise bridge.importlib_metadata.PackageNotFoundError("flash_mla")
+
+    monkeypatch.setattr(bridge.importlib_metadata, "version", missing_distribution)
+
+    with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no installed distribution metadata"):
+        bridge._resolve_flashmla_sparse_fwd()
 
 
 @pytest.mark.L0
@@ -135,15 +177,18 @@ def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch)
     def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
         pytest.fail("signature probing must not execute the external callable")
 
-    probes = []
+    identity_probes = []
+    signature_probes = []
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=compatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
     monkeypatch.setattr(bridge, "_validated_flashmla_sparse_fwd", None)
-    monkeypatch.setattr(bridge, "_probe_flashmla_sparse_fwd_signature", lambda candidate: probes.append(candidate))
+    monkeypatch.setattr(bridge, "_probe_flashmla_provider_identity", lambda: identity_probes.append(None))
+    monkeypatch.setattr(bridge, "_probe_flashmla_sparse_fwd_signature", lambda candidate: signature_probes.append(candidate))
 
     assert bridge._resolve_flashmla_sparse_fwd() is compatible
     assert bridge._resolve_flashmla_sparse_fwd() is compatible
-    assert probes == [compatible]
+    assert identity_probes == [None]
+    assert signature_probes == [compatible]
 
 
 @pytest.mark.L0
@@ -163,6 +208,7 @@ def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch)
 def test_flashmla_dependency_with_incompatible_call_signature_fails_closed(monkeypatch, incompatible):
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=incompatible)
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"incompatible signature.*topk_length"):
         bridge._resolve_flashmla_sparse_fwd()
@@ -178,6 +224,7 @@ def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch
 
     dependency = types.SimpleNamespace(flash_mla_sparse_fwd=OpaqueCallable())
     monkeypatch.setattr(bridge, "import_module", lambda _name: dependency)
+    monkeypatch.setattr(bridge.importlib_metadata, "version", lambda _distribution: "1.0.0+15f13e5")
 
     with pytest.raises(bridge.SparseAttentionBackendUnavailableError, match=r"no inspectable Python signature"):
         bridge._resolve_flashmla_sparse_fwd()

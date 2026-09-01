@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from importlib import import_module
+from importlib import import_module, metadata as importlib_metadata
 from inspect import signature
 from typing import Any, Callable, Optional, Tuple
 
@@ -37,7 +37,13 @@ import torch
 
 from cudnn.api_base import TupleDict
 
-_FLASHMLA_INSTALL_HINT = "Install the official deepseek-ai/FlashMLA package and make sure its " "compiled extension is importable in this Python environment."
+_FLASHMLA_REVISION = "15f13e5030374295491c5ce31b02d7e63a7772c6"
+_FLASHMLA_DISTRIBUTION_VERSION = "1.0.0+15f13e5"
+_FLASHMLA_INSTALL_HINT = (
+    f"Install official deepseek-ai/FlashMLA revision {_FLASHMLA_REVISION}, whose "
+    f"distribution version is {_FLASHMLA_DISTRIBUTION_VERSION}, and make sure its "
+    "compiled extension is importable in this Python environment."
+)
 _SM100_CAPABILITY = (10, 0)
 _SUPPORTED_HEADS = (16, 32, 64, 128)
 _SUPPORTED_HEAD_DIMS = (512, 576)
@@ -160,8 +166,41 @@ def _probe_flashmla_sparse_fwd_signature(sparse_fwd: Callable[..., Any]) -> None
         ) from exc
 
 
+def _probe_flashmla_provider_identity() -> None:
+    """Require the provider revision whose private launch policy we adapt.
+
+    FlashMLA's module-level ``__version__`` is the generic ``1.0.0``.  Its
+    official build metadata is more specific: ``setup.py`` appends the Git
+    short SHA to the ``flash_mla`` distribution version, and that identity is
+    retained in a built wheel.  The pinned revision reports
+    ``1.0.0+15f13e5``.
+
+    This check runs only when resolving a new provider callable.  It performs
+    no device work and is cached together with the signature probe.
+    """
+
+    try:
+        installed_version = importlib_metadata.version("flash_mla")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "The imported 'flash_mla' package has no installed distribution metadata, " f"so its kernel revision cannot be verified. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+    except Exception as exc:
+        raise SparseAttentionBackendUnavailableError(
+            "Cannot read the installed 'flash_mla' distribution version, so its kernel " f"revision cannot be verified. {_FLASHMLA_INSTALL_HINT}"
+        ) from exc
+
+    if installed_version != _FLASHMLA_DISTRIBUTION_VERSION:
+        raise SparseAttentionBackendUnavailableError(
+            f"The installed 'flash_mla' distribution version {installed_version!r} is "
+            f"incompatible with this adapter; expected {_FLASHMLA_DISTRIBUTION_VERSION!r} "
+            f"from revision {_FLASHMLA_REVISION}. The adapter's head and Top-K padding "
+            "must not be used with an unverified provider launch policy."
+        )
+
+
 def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Resolve and capability-probe the entry point without caching failures."""
+    """Resolve and compatibility-probe the entry point without caching failures."""
 
     global _validated_flashmla_sparse_fwd
 
@@ -176,6 +215,7 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
             "The imported 'flash_mla' package does not export a callable " f"'flash_mla_sparse_fwd'. {_FLASHMLA_INSTALL_HINT}"
         )
     if sparse_fwd is not _validated_flashmla_sparse_fwd:
+        _probe_flashmla_provider_identity()
         _probe_flashmla_sparse_fwd_signature(sparse_fwd)
         _validated_flashmla_sparse_fwd = sparse_fwd
     return sparse_fwd

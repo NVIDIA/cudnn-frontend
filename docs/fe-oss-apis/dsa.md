@@ -131,12 +131,17 @@ symbol. It was developed against official FlashMLA commit
 `15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor vLLM
 implementation source is present in this repository. A missing or incompatible
 optional dependency raises `SparseAttentionBackendUnavailableError` instead
-of silently selecting a different forward. Compatibility is determined from
-the callable's actual signature, not a package version string: the current
-entry point must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`,
-`d_v`, `attn_sink`, and `topk_length` by keyword. Provider selection and launch
-planning remain private, so a future cuDNN forward can replace this bridge
-without renaming the semantic API.
+of silently selecting a different forward. Because the adapter follows the
+pinned provider's private H/Top-K launch tiling, it requires the official
+`flash_mla` distribution version `1.0.0+15f13e5`. FlashMLA's build appends the
+Git short SHA to this distribution version; its module-level `__version__`
+remains the generic `1.0.0` and is not used as proof of compatibility. The
+identity check is cached with a call-signature check: the current entry point
+must accept `q`, `kv`, and `indices` positionally, plus `sm_scale`, `d_v`,
+`attn_sink`, and `topk_length` by keyword. Both checks are host-only and run
+before the first provider launch. Provider selection and launch planning remain
+private, so a future cuDNN forward can replace this bridge without renaming the
+semantic API.
 
 The initial functional contract is exact SM100 (validated on ComputeLab B200),
 BF16, one flat MQA KV stream,
