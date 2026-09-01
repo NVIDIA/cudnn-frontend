@@ -72,9 +72,16 @@ run, patch the finder's `MAPPING` from a `sitecustomize.py` on `PYTHONPATH`
 (`site` imports it after processing `.pth` files, so the finder already exists):
 
 ```python
-# sitecustomize.py
-import __editable___nvidia_cudnn_frontend_1_28_0_finder as f
-f.MAPPING["cudnn"] = "/path/to/your/worktree/python/cudnn"
+# sitecustomize.py -- the finder module name embeds the installed version, so
+# discover it rather than hard-coding it (it changes when __version__ bumps).
+import importlib, pkgutil
+
+name = next(
+    m.name
+    for m in pkgutil.iter_modules()
+    if m.name.startswith("__editable___nvidia_cudnn_frontend_") and m.name.endswith("_finder")
+)
+importlib.import_module(name).MAPPING["cudnn"] = "/path/to/your/worktree/python/cudnn"
 ```
 
 The same trap hides *inside* a run: `python/cudnn/frost/template_loader.py`
