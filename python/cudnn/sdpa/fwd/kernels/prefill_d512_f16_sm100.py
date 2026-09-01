@@ -60,6 +60,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -139,6 +140,10 @@ BMM2_V_NBLOCK_ADVANCE = CFG.TILE_N * (CFG.BMM2_N_PER_CALL // CFG.CTA_MMA) * CFG.
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
+# and the setup kernel publishes the live unit total it stops at.
+THD_PERSISTENT = True
 
 P_TMA_ITERS = (CFG.TILE_N * CFG.BPE) // CFG.Q_SWZ_BYTES
 P_D_BLOCK = CFG.TILE_N // P_TMA_ITERS
@@ -316,8 +321,10 @@ from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _b
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
-# caller's length tensors and the adapter launches the plan-time envelope
-# grid (issue #552) — no length ever reaches the host.
+# caller's length tensors (issue #552) — no length ever reaches the host — and
+# also publishes the live unit total + claim counter the persistent scheduler
+# reads, so the adapter launches a MACHINE-sized grid rather than the plan-time
+# envelope (issue #618).
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
@@ -651,7 +658,24 @@ def _kernel(
 
     else:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
 
 
 @cute.jit
@@ -1984,7 +2008,7 @@ def _host(
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
             cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
-            n_thd_units,  # CLC path: envelope units; the counter goes unused
+            n_thd_units,  # persistent cluster count; also seeds the claim counter
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

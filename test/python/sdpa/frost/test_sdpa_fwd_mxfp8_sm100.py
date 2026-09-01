@@ -892,6 +892,24 @@ def test_mxfp8_thd(in_key, causal):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_multi_unit_per_cta(monkeypatch):
+    """THD where a cluster claims more than one unit (issue #618).
+
+    The persistent grid is machine-sized, so a cluster pulls units repeatedly
+    off the device-bounded counter; every other MXFP8 THD case fits one unit
+    per cluster and never re-enters the K/V pipeline (nor the per-sequence SF
+    tile bases for a second range). FROST_THD_CLUSTERS pins the grid to 4
+    clusters so the claim loop runs deep on any device."""
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    scale = 1.0 / math.sqrt(128)
+    lens = [1024, 768, 512, 256]
+    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=True)
+    _check(o_out, o_ref, torch.float16, "e4m3")
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cross_gqa():
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
     scale = 1.0 / math.sqrt(128)

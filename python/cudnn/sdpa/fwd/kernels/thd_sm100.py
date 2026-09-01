@@ -230,6 +230,8 @@ def build_thd_meta_o_kv_descs_kernel(
     n_qh: cutlass.Int32,
     n_batch: cutlass.Int32,
     o_row_stride: cutlass.Int32,
+    cga_tile_m: cutlass.Int32,
+    n_clusters: cutlass.Int32,
 ) -> None:
     """``build_thd_meta_o_descs_kernel`` + packed-total-clamped K/V descriptors
     (the FP8/MXFP8 THD flavors).
@@ -299,6 +301,25 @@ def build_thd_meta_o_kv_descs_kernel(
     # it leaves the region uninitialized and units decode garbage batches.
     cute.arch.barrier()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
+    # Live unit total + claim counter for the persistent scheduler, exactly as
+    # build_thd_meta_o_descs_kernel writes them. The scheduler reads meta[4B+2]
+    # as its bound, so leaving these two words unwritten hands out units off
+    # uninitialized workspace (an illegal-instruction fault, not a silent
+    # wrong answer). The counter starts at n_clusters: cluster c takes unit c
+    # from its blockIdx, then pulls from the counter.
+    cute.arch.barrier()
+    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
+    # implementation-defined lane, so conjoining it with tidx == 0 can select
+    # no thread at all and leave these words unwritten.
+    if tidx == cutlass.Int32(0):
+        meta_w = cutlass.make_array_view(meta_t)
+        cuq0 = n_batch
+        live = cutlass.Int32(0)
+        for b in cutlass.range(0, n_batch, 1, unroll=1):
+            s_b = cutlass.Int32(meta_w[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta_w[cuq0 + b])
+            live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
+        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
 
 
 @cute.kernel
