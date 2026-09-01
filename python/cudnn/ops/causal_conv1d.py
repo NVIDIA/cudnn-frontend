@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional, Tuple
+import threading
+from collections import OrderedDict
+from contextvars import ContextVar
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -37,6 +40,16 @@ def _activation_to_int(activation: str) -> int:
     return _ACTIVATION_TO_INT[activation]
 
 
+def _match_causal_conv1d_output_layout(output: Tensor, public_x: Tensor) -> Tensor:
+    """Preserve the input's dense memory format across backend selection."""
+
+    if output.stride() == public_x.stride():
+        return output
+    result = torch.empty_like(public_x)
+    result.copy_(output)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Forward primitive
 # ---------------------------------------------------------------------------
@@ -59,6 +72,12 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
     if not (x.dtype == weight.dtype == bias.dtype):
         raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, " f"bias.dtype={bias.dtype} (all must match)")
 
+    # The backend ABI is contiguous BDT, but the public operation preserves
+    # the input's dense memory format.  In particular, model code commonly
+    # passes a BDT transpose view backed by contiguous BTD storage.  Keep that
+    # observable layout stable whether this generic primitive or the native
+    # channel-last route is selected.
+    public_x = x
     x = x.contiguous()
     weight = weight.contiguous()
     bias = bias.contiguous()
@@ -72,7 +91,7 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
     if bias.shape[0] != dim:
         raise ValueError(f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} " f"(expected bias.shape[0]={dim})")
 
-    y = torch.empty_like(x)
+    y_contiguous = torch.empty_like(x)
 
     import cudnn
 
@@ -81,7 +100,7 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
         x.data_ptr(),
         weight.data_ptr(),
         bias.data_ptr(),
-        y.data_ptr(),
+        y_contiguous.data_ptr(),
         batch,
         dim,
         seq_len,
@@ -89,7 +108,7 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
         _dtype_to_int(x.dtype),
         _activation_to_int(activation),
     )
-    return y
+    return _match_causal_conv1d_output_layout(y_contiguous, public_x)
 
 
 @torch.library.register_fake("cudnn::causal_conv1d_fwd_primitive")
@@ -200,47 +219,520 @@ torch.library.register_autograd(
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public semantic API and private bulk-backend adapter
 # ---------------------------------------------------------------------------
+
+
+_CAUSAL_CONV1D_TRAINING_CACHE_CAPACITY = 64
+_CAUSAL_CONV1D_TRAINING_CACHE = OrderedDict()
+_CAUSAL_CONV1D_TRAINING_CACHE_LOCK = threading.Lock()
+_CAUSAL_CONV1D_LAST_ROUTE: ContextVar[Optional[str]] = ContextVar(
+    "_CAUSAL_CONV1D_LAST_ROUTE",
+    default=None,
+)
+
+
+def _get_causal_conv1d_last_route() -> Optional[str]:
+    """Return this context's most recent successful eager public route.
+
+    Compiled calls do not touch this diagnostic, so they leave the previous
+    eager value unchanged instead of adding ContextVar operations to the graph.
+    """
+
+    return _CAUSAL_CONV1D_LAST_ROUTE.get()
+
+
+def _reset_causal_conv1d_last_route() -> None:
+    if not torch.compiler.is_compiling():
+        _CAUSAL_CONV1D_LAST_ROUTE.set(None)
+
+
+def _record_causal_conv1d_route(route: str) -> None:
+    if not torch.compiler.is_compiling():
+        _CAUSAL_CONV1D_LAST_ROUTE.set(route)
+
+
+def _causal_conv1d_native_route(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    initial_state: Optional[Tensor] = None,
+) -> str:
+    differentiable = (x, weight, bias, initial_state)
+    if torch.is_grad_enabled() and any(tensor is not None and tensor.requires_grad for tensor in differentiable):
+        return "native-autograd"
+    return "native-inference"
+
+
+def _tensor_plan_signature(tensor: Optional[Tensor]):
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+    )
+
+
+def _causal_conv1d_training_key(
+    x_btd: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    initial_state: Optional[Tensor] = None,
+    output_final_state: bool = False,
+):
+    """Key every plan-time field consumed by the exact-shape training backend.
+
+    The routed backend is fixed to BF16 width-four SiLU. Tensor signatures key
+    its remaining specializations: dense versus packed presence, packed N,
+    bias and state presence, final-state output, shapes, strides, dtypes, and
+    device. Device properties key the architecture-dependent schedule. Runtime
+    ``cu_seqlens`` values are intentionally absent because the kernel consumes
+    them on device.
+    """
+
+    properties = torch.cuda.get_device_properties(x_btd.device)
+    return (
+        "bf16-width4-silu",
+        "packed" if cu_seqlens is not None else "dense",
+        _tensor_plan_signature(x_btd),
+        _tensor_plan_signature(weight),
+        _tensor_plan_signature(bias),
+        _tensor_plan_signature(cu_seqlens),
+        _tensor_plan_signature(initial_state),
+        bool(output_final_state),
+        (properties.major, properties.minor),
+        properties.multi_processor_count,
+    )
+
+
+def _compile_causal_conv1d_training_backend(
+    x_btd: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    initial_state: Optional[Tensor] = None,
+    output_final_state: bool = False,
+):
+    from cudnn.causal_conv1d_bulk_sm100.autograd import (
+        CausalConv1dBulkAutogradPrototype as _TrainingBackend,
+    )
+
+    return _TrainingBackend(
+        x_btd,
+        weight,
+        cu_seqlens,
+        sample_bias=bias,
+        sample_initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
+
+
+def _get_causal_conv1d_training_backend(
+    x_btd: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    initial_state: Optional[Tensor] = None,
+    output_final_state: bool = False,
+):
+    key = _causal_conv1d_training_key(
+        x_btd,
+        weight,
+        bias,
+        cu_seqlens,
+        initial_state,
+        output_final_state,
+    )
+    with _CAUSAL_CONV1D_TRAINING_CACHE_LOCK:
+        backend = _CAUSAL_CONV1D_TRAINING_CACHE.get(key)
+        if backend is not None:
+            _CAUSAL_CONV1D_TRAINING_CACHE.move_to_end(key)
+            return backend
+
+        backend = _compile_causal_conv1d_training_backend(
+            x_btd,
+            weight,
+            bias,
+            cu_seqlens,
+            initial_state,
+            output_final_state,
+        )
+        _CAUSAL_CONV1D_TRAINING_CACHE[key] = backend
+        if len(_CAUSAL_CONV1D_TRAINING_CACHE) > _CAUSAL_CONV1D_TRAINING_CACHE_CAPACITY:
+            _CAUSAL_CONV1D_TRAINING_CACHE.popitem(last=False)
+        return backend
+
+
+def _run_causal_conv1d_bulk_backend(
+    x_btd: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    *,
+    initial_state: Optional[Tensor] = None,
+    output_final_state: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Run the current backend without exporting its lifecycle or result type."""
+
+    if _causal_conv1d_native_route(x_btd, weight, bias, initial_state) == "native-autograd":
+        backend = _get_causal_conv1d_training_backend(
+            x_btd,
+            weight,
+            bias,
+            cu_seqlens,
+            initial_state,
+            output_final_state,
+        )
+        result = backend(
+            x_btd,
+            weight,
+            cu_seqlens,
+            bias=bias,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        if output_final_state:
+            return result["output_tensor"], result["final_state_tensor"]
+        return result
+
+    from cudnn.causal_conv1d_bulk_sm100.api import (
+        causal_conv1d_bulk_fwd_wrapper_sm100 as _forward_backend,
+    )
+
+    result = _forward_backend(
+        x_btd,
+        weight,
+        cu_seqlens_tensor=cu_seqlens,
+        initial_state_tensor=initial_state,
+        output_final_state=output_final_state,
+        bias_tensor=bias,
+    )
+    if output_final_state:
+        return result["output_tensor"], result["final_state_tensor"]
+    return result["output_tensor"]
+
+
+def _can_route_causal_conv1d_bulk(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    activation: str,
+) -> bool:
+    """Whether the current BF16 width-four backend is a transparent route."""
+
+    if torch.compiler.is_compiling() or activation != "silu":
+        return False
+    if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return False
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        return False
+    if cu_seqlens is not None and not isinstance(cu_seqlens, torch.Tensor):
+        return False
+    if x.ndim != 3 or weight.ndim != 2:
+        return False
+
+    batch, channels, tokens = x.shape
+    if batch <= 0 or channels <= 0 or tokens <= 0 or tuple(weight.shape) != (channels, 4):
+        return False
+    if bias is not None and tuple(bias.shape) != (channels,):
+        return False
+    if cu_seqlens is not None:
+        if batch != 1 or cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            return False
+        if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
+            return False
+    if x.dtype != torch.bfloat16 or weight.dtype not in (
+        torch.bfloat16,
+        torch.float32,
+    ):
+        return False
+    # The current mixed-weight specialization targets the exact GLM contract:
+    # BF16 activations, FP32 depthwise weights, and no bias.  Keep other mixed
+    # combinations out of the route until their epilogue contract is tested.
+    if weight.dtype == torch.float32 and bias is not None:
+        return False
+    if bias is not None and bias.dtype != torch.bfloat16:
+        return False
+    tensors = (x, weight) if bias is None else (x, weight, bias)
+    if not x.is_cuda or any(tensor.device != x.device for tensor in tensors[1:]):
+        return False
+    if cu_seqlens is not None and cu_seqlens.device != x.device:
+        return False
+
+    x_btd = x.transpose(1, 2)
+    if not x_btd.is_contiguous() or x_btd.data_ptr() != x.data_ptr():
+        return False
+    if not weight.is_contiguous() or (bias is not None and not bias.is_contiguous()):
+        return False
+    if any(tensor.data_ptr() % 16 for tensor in tensors):
+        return False
+
+    try:
+        from cudnn._causal_conv1d_arch import is_functional_arch
+        from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+        installed, version = cutedsl_state()
+        capability = torch.cuda.get_device_capability(x.device)
+    except (AttributeError, ImportError, OSError, RuntimeError):
+        return False
+    return installed and not cutedsl_too_old(version) and is_functional_arch(capability)
+
+
+def _normalize_causal_conv1d_activation(activation: Optional[str]) -> str:
+    if activation is None or activation == "identity":
+        return "identity"
+    if activation in ("silu", "swish"):
+        return "silu"
+    raise NotImplementedError("activation must be None, 'identity', 'silu', or 'swish'")
+
+
+def _validate_causal_conv1d_sequence_contract(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    seq_idx: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    initial_states: Optional[Tensor],
+    return_final_states: bool,
+    final_states_out: Optional[Tensor],
+) -> None:
+    """Validate sequence and mathematical-state semantics only.
+
+    Physical layout requirements belong to a private backend route.  Keeping
+    them out of this validator prevents the current kernel schedule from
+    becoming part of the public operation contract.
+    """
+
+    if not isinstance(return_final_states, bool):
+        raise TypeError(f"return_final_states must be bool, got {type(return_final_states).__name__}")
+    if final_states_out is not None and not return_final_states:
+        raise ValueError("final_states_out requires return_final_states=True")
+    if seq_idx is not None and cu_seqlens is not None:
+        raise ValueError("seq_idx and cu_seqlens are mutually exclusive")
+    if seq_idx is not None and return_final_states:
+        raise ValueError("seq_idx and return_final_states are mutually exclusive")
+    for name, tensor in (("x", x), ("weight", weight)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+    for name, tensor in (
+        ("bias", bias),
+        ("seq_idx", seq_idx),
+        ("cu_seqlens", cu_seqlens),
+        ("initial_states", initial_states),
+        ("final_states_out", final_states_out),
+    ):
+        if tensor is not None and not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor or None, got {type(tensor).__name__}")
+
+    if x.ndim != 3:
+        raise ValueError(f"x must have shape [B, D, T], got {tuple(x.shape)}")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must have shape [D, W], got {tuple(weight.shape)}")
+    batch, channels, tokens = x.shape
+    if weight.shape[0] != channels:
+        raise ValueError(f"weight must have shape [D, W] with D={channels}, got {tuple(weight.shape)}")
+    width = weight.shape[1]
+    if width < 2:
+        raise ValueError(f"weight width must be at least two, got W={width}")
+    if bias is not None and tuple(bias.shape) != (channels,):
+        raise ValueError(f"bias must have shape {(channels,)}, got {tuple(bias.shape)}")
+    if seq_idx is not None and tuple(seq_idx.shape) != (batch, tokens):
+        raise ValueError(f"seq_idx must have shape {(batch, tokens)}, got {tuple(seq_idx.shape)}")
+    if cu_seqlens is not None:
+        if batch != 1:
+            raise ValueError(f"packed x must have B=1, got B={batch}")
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must have shape [N + 1] with N >= 1")
+        state_batch = cu_seqlens.shape[0] - 1
+    else:
+        state_batch = batch
+
+    state_shape = (state_batch, channels, width - 1)
+    for name, state in (("initial_states", initial_states), ("final_states_out", final_states_out)):
+        if state is not None and tuple(state.shape) != state_shape:
+            raise ValueError(f"{name} must have shape {state_shape}, got {tuple(state.shape)}")
+        if state is not None and state.dtype != x.dtype:
+            raise TypeError(f"{name} dtype must match x dtype {x.dtype}, got {state.dtype}")
+        if state is not None and state.device != x.device:
+            raise ValueError(f"{name} device must match x device {x.device}, got {state.device}")
+
+
+def _to_causal_conv1d_full_width_state(initial_states: Optional[Tensor]) -> Optional[Tensor]:
+    """Translate public ``W - 1`` history to the backend's private ``W`` cache.
+
+    The backend shifts before filtering the current token.  Prepending one
+    unobservable lane therefore makes ``[0, h0, h1, h2]`` become
+    ``[h0, h1, h2, x0]`` for the first width-four convolution window.
+    """
+
+    if initial_states is None:
+        return None
+    padding = torch.zeros_like(initial_states[..., :1])
+    return torch.cat((padding, initial_states), dim=-1)
+
+
+def _from_causal_conv1d_full_width_state(
+    final_state: Tensor,
+    final_states_out: Optional[Tensor],
+) -> Tensor:
+    """Copy the private ``W`` cache into independent public ``W - 1`` storage."""
+
+    mathematical_state = final_state[..., 1:]
+    if final_states_out is None:
+        # Match the channel-last state allocation used by the consumed API and
+        # avoid returning a view whose stride/storage exposes the private lane.
+        batch, channels, history = mathematical_state.shape
+        final_states_out = torch.empty(
+            (batch, history, channels),
+            dtype=mathematical_state.dtype,
+            device=mathematical_state.device,
+        ).transpose(1, 2)
+    final_states_out.copy_(mathematical_state)
+    return final_states_out
+
+
+def _run_causal_conv1d_sequence_backend(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    activation: str,
+    seq_idx: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    initial_states: Optional[Tensor],
+    return_final_states: bool,
+    final_states_out: Optional[Tensor],
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Adapt mathematical state to the private width-four backend ABI."""
+
+    if seq_idx is not None:
+        raise NotImplementedError("the current backend does not yet implement seq_idx")
+    if not _can_route_causal_conv1d_bulk(x, weight, bias, cu_seqlens, activation):
+        raise NotImplementedError("the current backend cannot execute this stateful causal_conv1d call")
+
+    full_width_initial_state = _to_causal_conv1d_full_width_state(initial_states)
+    result = _run_causal_conv1d_bulk_backend(
+        x.transpose(1, 2),
+        weight,
+        bias,
+        cu_seqlens,
+        initial_state=full_width_initial_state,
+        output_final_state=return_final_states,
+    )
+    if return_final_states:
+        output_btd, full_width_final_state = result
+        public_final_state = _from_causal_conv1d_full_width_state(
+            full_width_final_state,
+            final_states_out,
+        )
+    else:
+        output_btd = result
+        public_final_state = None
+    output = _match_causal_conv1d_output_layout(output_btd.transpose(1, 2), x)
+    return output, public_final_state
 
 
 def causal_conv1d(
     x: Tensor,
     weight: Tensor,
     bias: Optional[Tensor] = None,
-    activation: str = "identity",
-) -> Tensor:
-    r"""Depthwise causal 1D convolution with optional activation.
+    activation: Optional[str] = None,
+    *,
+    seq_idx: Optional[Tensor] = None,
+    cu_seqlens: Optional[Tensor] = None,
+    initial_states: Optional[Tensor] = None,
+    return_final_states: bool = False,
+    final_states_out: Optional[Tensor] = None,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    r"""Apply depthwise causal convolution to ``x[B, D, T]``.
 
-    Computes a depthwise 1D convolution with causal (left-only) padding
-    and optional fused activation::
+    The semantic contract follows the commonly consumed ``causal-conv1d``
+    interface: packed offsets prevent cross-sequence filtering, and optional
+    initial/final histories contain exactly ``W - 1`` samples. A channel-last
+    physical allocation can be passed as its zero-copy ``[B, D, T]`` transpose
+    view. ``seq_idx`` is a reserved compatibility keyword and currently must be
+    ``None``; it and ``cu_seqlens`` are mutually exclusive.
 
-        y = activation(conv1d_causal(x, weight) + bias)
+    Kernel compilation, schedule selection, workspace allocation, result
+    wrappers, architecture class names, and CUDA stream handles are private.
+    The result is a Tensor, or ``(output, final_states)`` when requested.
 
-    Causal padding: ``(kernel_size - 1)`` on the left, ``0`` on the right.
-    Each channel is convolved independently with its own 1D filter.
-
-    Supports ``torch.compile`` and ``torch.autograd`` — backward is handled
-    automatically when inputs require gradients.
-
-    Args:
-        x (torch.Tensor): Input tensor of shape ``(batch, dim, seq_len)``.
-            Must be BF16, FP16, FP32, or FP64. Must be contiguous and on CUDA.
-        weight (torch.Tensor): Filter tensor of shape ``(dim, kernel_size)``.
-            Same dtype as *x*. ``kernel_size`` must be between 2 and 256,
-            inclusive.
-        bias (torch.Tensor | None): Optional bias of shape ``(dim,)``.
-            Same dtype as *x*. Defaults to zeros if ``None``.
-        activation (str): ``"identity"`` (default) or ``"silu"``.
-
-    Returns:
-        torch.Tensor: Output of shape ``(batch, dim, seq_len)``, same dtype as *x*.
+    The current optimized route implements dense and ``cu_seqlens``-packed
+    BF16 width-four SiLU with forward and backward. Dense bias-free calls also
+    accept FP32 weights, matching models which retain the depthwise filter in
+    FP32 while their activations remain BF16. Unsupported optional modes fail
+    explicitly without changing the public state shape to match a backend
+    cache convention.
     """
-    if activation not in _ACTIVATION_TO_INT:
-        raise ValueError(f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'.")
+
+    _reset_causal_conv1d_last_route()
+    normalized_activation = _normalize_causal_conv1d_activation(activation)
+    if seq_idx is not None and cu_seqlens is not None:
+        raise ValueError("seq_idx and cu_seqlens are mutually exclusive")
+    state_or_seq_idx_call = seq_idx is not None or initial_states is not None or return_final_states or final_states_out is not None
+    if state_or_seq_idx_call:
+        _validate_causal_conv1d_sequence_contract(
+            x,
+            weight,
+            bias,
+            seq_idx,
+            cu_seqlens,
+            initial_states,
+            return_final_states,
+            final_states_out,
+        )
+        output, final_states = _run_causal_conv1d_sequence_backend(
+            x,
+            weight,
+            bias,
+            normalized_activation,
+            seq_idx,
+            cu_seqlens,
+            initial_states,
+            return_final_states,
+            final_states_out,
+        )
+        if return_final_states:
+            assert final_states is not None
+            _record_causal_conv1d_route(_causal_conv1d_native_route(x, weight, bias, initial_states))
+            return output, final_states
+        _record_causal_conv1d_route(_causal_conv1d_native_route(x, weight, bias, initial_states))
+        return output
+
+    if cu_seqlens is not None:
+        _validate_causal_conv1d_sequence_contract(
+            x,
+            weight,
+            bias,
+            None,
+            cu_seqlens,
+            None,
+            False,
+            None,
+        )
+        if not _can_route_causal_conv1d_bulk(x, weight, bias, cu_seqlens, normalized_activation):
+            raise NotImplementedError("the current backend cannot execute this cu_seqlens-packed causal_conv1d call")
+        x_btd = x.transpose(1, 2)
+        output = _run_causal_conv1d_bulk_backend(x_btd, weight, bias, cu_seqlens).transpose(1, 2)
+        _record_causal_conv1d_route(_causal_conv1d_native_route(x, weight, bias))
+        return output
+
+    if _can_route_causal_conv1d_bulk(x, weight, bias, None, normalized_activation):
+        output_btd = _run_causal_conv1d_bulk_backend(x.transpose(1, 2), weight, bias, None)
+        output = output_btd.transpose(1, 2)
+        _record_causal_conv1d_route(_causal_conv1d_native_route(x, weight, bias))
+        return output
+
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.float32:
+        raise NotImplementedError("BF16 activation with FP32 weight requires the native channel-last " "width-four SiLU route")
     if bias is None:
         bias = torch.zeros(weight.shape[0], device=x.device, dtype=x.dtype)
-    return torch.ops.cudnn.causal_conv1d_fwd_primitive(x, weight, bias, activation)
+    output = torch.ops.cudnn.causal_conv1d_fwd_primitive(x, weight, bias, normalized_activation)
+    _record_causal_conv1d_route("generic-cudnn")
+    return output
 
 
 # ===========================================================================
