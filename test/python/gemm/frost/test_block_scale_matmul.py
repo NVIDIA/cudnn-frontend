@@ -131,7 +131,10 @@ def test_block_scale_matmul_rejects_virtual_quantizer_outputs():
     b = g.block_scale_dequantize(input=weight, descale=weight_scales, block_size=[16, 1])
     g.matmul(A=a, B=b).set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
-    with pytest.raises(NotImplementedError, match="call cudnn.ops.nvfp4_block_scale_quantize explicitly"):
+    with pytest.raises(
+        NotImplementedError,
+        match=re.escape("call cudnn.ops.nvfp4_block_scale_quantize explicitly"),
+    ):
         analyze_with_binding(g)
 
 
