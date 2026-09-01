@@ -14,8 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.L0
-
 
 def _load_private_backend():
     try:
@@ -34,6 +32,7 @@ def _load_benchmark_module():
     return module
 
 
+@pytest.mark.L0
 def test_operation_package_does_not_publish_backend_lifecycle():
     bulk, api_class, wrapper = _load_private_backend()
     assert bulk.__all__ == []
@@ -43,6 +42,7 @@ def test_operation_package_does_not_publish_backend_lifecycle():
     assert bulk.causal_conv1d_bulk_fwd_wrapper_sm100 is wrapper
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "capability",
     [
@@ -80,6 +80,7 @@ def test_benchmark_accepts_functional_gpu_without_slurm(monkeypatch, capability)
     assert benchmark._slurm_metadata({}) == {}
 
 
+@pytest.mark.L0
 def test_benchmark_rejects_unsupported_gpu(monkeypatch):
     benchmark = _load_benchmark_module()
     properties = SimpleNamespace(major=10, minor=1, name="Unsupported GPU")
@@ -91,6 +92,7 @@ def test_benchmark_rejects_unsupported_gpu(monkeypatch):
         benchmark._validate_environment()
 
 
+@pytest.mark.L0
 def test_benchmark_requires_cuda(monkeypatch):
     benchmark = _load_benchmark_module()
     monkeypatch.setattr(benchmark.torch.cuda, "is_available", lambda: False)
@@ -99,6 +101,7 @@ def test_benchmark_requires_cuda(monkeypatch):
         benchmark._validate_environment()
 
 
+@pytest.mark.L0
 def test_benchmark_slurm_metadata_is_optional():
     benchmark = _load_benchmark_module()
 
@@ -109,6 +112,7 @@ def test_benchmark_slurm_metadata_is_optional():
     }
 
 
+@pytest.mark.L0
 def test_support_rejects_the_package_wide_4_5_dsl_floor(monkeypatch):
     _, api_class, _ = _load_private_backend()
     import cudnn.causal_conv1d_bulk_sm100.api as api_module
@@ -123,6 +127,7 @@ def test_support_rejects_the_package_wide_4_5_dsl_floor(monkeypatch):
         api.check_support()
 
 
+@pytest.mark.L0
 def test_support_accepts_a_source_dsl_without_distribution_metadata(monkeypatch):
     _, api_class, _ = _load_private_backend()
     import cudnn.causal_conv1d_bulk_sm100.api as api_module
@@ -141,6 +146,7 @@ def test_support_accepts_a_source_dsl_without_distribution_metadata(monkeypatch)
     assert api.bias_desc.shape == (8,)
 
 
+@pytest.mark.L0
 def test_support_accepts_fp32_weight_only_without_bias(monkeypatch):
     _, api_class, _ = _load_private_backend()
     import cudnn.causal_conv1d_bulk_sm100.api as api_module
@@ -168,6 +174,7 @@ def test_support_accepts_fp32_weight_only_without_bias(monkeypatch):
         with_bias.check_support()
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("case", ["rank", "shape", "dtype", "stride", "alignment"])
 def test_support_rejects_invalid_bias_contract(monkeypatch, case):
     _, api_class, _ = _load_private_backend()
@@ -196,6 +203,7 @@ def test_support_rejects_invalid_bias_contract(monkeypatch, case):
         api.check_support()
 
 
+@pytest.mark.L0
 def test_bias_presence_must_match_the_compiled_signature(monkeypatch):
     _, api_class, _ = _load_private_backend()
     import cudnn.causal_conv1d_bulk_sm100.api as api_module
@@ -223,6 +231,7 @@ def test_bias_presence_must_match_the_compiled_signature(monkeypatch):
         without_bias.execute(x, weight, output, bias_tensor=bias)
 
 
+@pytest.mark.L0
 def test_constructor_and_wrapper_reject_non_tensor_bias():
     _, api_class, wrapper = _load_private_backend()
     x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
@@ -235,6 +244,7 @@ def test_constructor_and_wrapper_reject_non_tensor_bias():
         wrapper(x, weight, bias_tensor=object())
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "capability,n_channels,expected_vec8",
     [
@@ -269,6 +279,7 @@ def test_support_selects_schedule_from_exact_arch(monkeypatch, capability, n_cha
     assert api.use_vec8_schedule is expected_vec8
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("capability", [(7, 5), (10, 1), (11, 1)])
 def test_support_rejects_unlisted_arch(monkeypatch, capability):
     _, api_class, _ = _load_private_backend()
@@ -287,6 +298,7 @@ def test_support_rejects_unlisted_arch(monkeypatch, capability):
         api.check_support()
 
 
+@pytest.mark.L0
 def test_support_accepts_metadata_only_tensor_descriptors(monkeypatch):
     _, api_class, _ = _load_private_backend()
     import cudnn.causal_conv1d_bulk_sm100.api as api_module
@@ -322,6 +334,7 @@ def test_support_accepts_metadata_only_tensor_descriptors(monkeypatch):
     assert api._sample_alignment_remainders == {}
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("missing_name", ["sample_x", "sample_weight", "sample_output"])
 def test_constructor_rejects_none_for_required_samples(missing_name):
     _, api_class, _ = _load_private_backend()
