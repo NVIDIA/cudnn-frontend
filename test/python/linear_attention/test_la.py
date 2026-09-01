@@ -1067,6 +1067,20 @@ def test_bwd_state_grad_dtype_must_match_state(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_do_dtype_must_match_io(backend, variant):
+    """dO is declared at the io dtype on the graph, so a mismatched buffer is
+    rejected at the op instead of being reinterpreted."""
+    case = make_case(variant, torch.bfloat16, T=128, H=2)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"]))
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=torch.float16)
+    bwd = getattr(torch.ops.cudnn, OP_NAMES[variant] + "_bwd")
+    with pytest.raises(TypeError, match="dO"):
+        bwd(dO, *args, case.cu, float(case.K**-0.5))
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_state_grad_cache_separation(backend, variant):
     """Two state-gradient dtypes for one shape inside one process."""
     case = make_case(variant, torch.bfloat16, T=256, H=2)

@@ -143,7 +143,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
 
     safe_gate = bool(params.get("safe_gate", False))
     checkpoint = int(params.get("checkpoint_every_n_tokens", 0) or 0)
-    num_householder = int(params.get("num_householder", 1) or 1)
+    num_householder = params.get("num_householder", 1)
+    num_householder = 1 if num_householder is None else int(num_householder)
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]

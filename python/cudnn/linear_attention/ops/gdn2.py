@@ -703,6 +703,7 @@ def gdn2_bwd(
     total, H, K = q.shape
     if 0 in dO.stride():
         dO = dO.contiguous()
+    check_dtype("dO", dO, q.dtype)
     if d_final_state is not None and 0 in d_final_state.stride():
         d_final_state = d_final_state.contiguous()
     HK = k.shape[1]
