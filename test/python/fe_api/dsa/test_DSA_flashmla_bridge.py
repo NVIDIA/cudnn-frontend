@@ -18,9 +18,8 @@ from fe_api.dsa.dsa_reference import (
     ref_sparse_attention_forward,
 )
 
-pytestmark = pytest.mark.L0
 
-
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "heads,head_dim,topk,launch_heads,launch_topk,tile",
     [
@@ -40,6 +39,7 @@ def test_flashmla_bridge_plan(heads, head_dim, topk, launch_heads, launch_topk, 
     assert plan.value_dim == 512
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "heads,head_dim,topk,error",
     [
@@ -54,6 +54,7 @@ def test_flashmla_bridge_plan_rejects_unsupported_contract(heads, head_dim, topk
         bridge._plan_flashmla_sparse_forward(heads, head_dim, topk)
 
 
+@pytest.mark.L0
 def test_flashmla_bridge_zero_copy_views_when_aligned():
     q = torch.randn(2, 64, 512, dtype=torch.bfloat16)
     kv = torch.randn(7, 512, dtype=torch.bfloat16)
@@ -71,6 +72,7 @@ def test_flashmla_bridge_zero_copy_views_when_aligned():
     assert launch.indices.shape == (2, 1, 64)
 
 
+@pytest.mark.L0
 def test_flashmla_bridge_pads_heads_and_only_the_topk_tail():
     q = torch.randn(2, 32, 576, dtype=torch.bfloat16)
     kv = torch.randn(7, 576, dtype=torch.bfloat16)
@@ -93,6 +95,7 @@ def test_flashmla_bridge_pads_heads_and_only_the_topk_tail():
     assert launch.topk_length is lengths
 
 
+@pytest.mark.L0
 def test_flashmla_dependency_is_lazy_and_missing_dependency_fails_closed(monkeypatch):
     calls = []
 
@@ -108,12 +111,14 @@ def test_flashmla_dependency_is_lazy_and_missing_dependency_fails_closed(monkeyp
     assert calls == ["flash_mla"]
 
 
+@pytest.mark.L0
 def test_flashmla_dependency_without_sparse_entrypoint_fails_closed(monkeypatch):
     monkeypatch.setattr(bridge, "import_module", lambda _name: types.SimpleNamespace())
     with pytest.raises(bridge.FlashMLAUnavailableError, match="flash_mla_sparse_fwd"):
         bridge._resolve_flashmla_sparse_fwd()
 
 
+@pytest.mark.L0
 def test_flashmla_dependency_uses_call_capability_not_version_string(monkeypatch):
     def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
         pytest.fail("signature probing must not execute the external callable")
@@ -124,6 +129,7 @@ def test_flashmla_dependency_uses_call_capability_not_version_string(monkeypatch
     assert bridge._resolve_flashmla_sparse_fwd() is compatible
 
 
+@pytest.mark.L0
 def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch):
     def compatible(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None):
         pytest.fail("signature probing must not execute the external callable")
@@ -139,6 +145,7 @@ def test_flashmla_dependency_probes_an_unchanged_callable_only_once(monkeypatch)
     assert probes == [compatible]
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "incompatible",
     [
@@ -160,6 +167,7 @@ def test_flashmla_dependency_with_incompatible_call_signature_fails_closed(monke
         bridge._resolve_flashmla_sparse_fwd()
 
 
+@pytest.mark.L0
 def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch):
     class OpaqueCallable:
         __signature__ = "not-an-inspect-signature"
@@ -174,6 +182,7 @@ def test_flashmla_dependency_with_opaque_call_signature_fails_closed(monkeypatch
         bridge._resolve_flashmla_sparse_fwd()
 
 
+@pytest.mark.L0
 def test_flashmla_training_bridge_requires_sink_before_dependency_resolution(
     monkeypatch,
 ):
@@ -186,6 +195,7 @@ def test_flashmla_training_bridge_requires_sink_before_dependency_resolution(
         bridge.flashmla_sparse_attention(None, None, None, None)
 
 
+@pytest.mark.L0
 def test_flashmla_training_metadata_normalizes_all_invalid_sentinels_without_lengths():
     indices = torch.tensor([[0, -7, 4, 5, 99]], dtype=torch.int32)
     safe_indices, safe_length = bridge._normalize_cudnn_sparse_metadata(indices, None, s_kv=5)
@@ -193,6 +203,7 @@ def test_flashmla_training_metadata_normalizes_all_invalid_sentinels_without_len
     assert safe_length is None
 
 
+@pytest.mark.L0
 def test_flashmla_training_metadata_masks_compacts_and_bounds_lengths():
     indices = torch.tensor(
         [
@@ -229,6 +240,7 @@ def test_flashmla_training_metadata_masks_compacts_and_bounds_lengths():
     assert torch.equal(safe_length, torch.tensor([3, 2, 0], dtype=torch.int32))
 
 
+@pytest.mark.L0
 def test_flashmla_training_trusted_compact_metadata_is_identity_fast_path():
     indices = torch.tensor([[4, 3, 2, 1, 0]], dtype=torch.int32)
     lengths = torch.tensor([5], dtype=torch.int32)
@@ -247,6 +259,7 @@ def test_flashmla_training_trusted_compact_metadata_is_identity_fast_path():
     assert safe_length is lengths
 
 
+@pytest.mark.L0
 def test_flashmla_training_trusted_compact_metadata_requires_bool():
     with pytest.raises(TypeError, match="trusted_compact_metadata must be a bool"):
         bridge.flashmla_sparse_attention(
@@ -273,6 +286,7 @@ def _require_b200_flashmla():
         pytest.skip(str(exc))
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "topk,launch_topk",
     [
@@ -324,6 +338,7 @@ def test_flashmla_score_recompute_deepseek_v4_h128_d512_launch_envelope(monkeypa
     )
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "heads,head_dim,topk",
     [
@@ -361,6 +376,7 @@ def test_flashmla_bridge_forward_matches_reference(heads, head_dim, topk):
     torch.testing.assert_close(actual["lse"], lse_ref, atol=2e-4, rtol=2e-4)
 
 
+@pytest.mark.L0
 def test_flashmla_cudnn_training_and_score_recompute_match_references():
     _require_b200_flashmla()
     torch.manual_seed(411)
@@ -434,6 +450,7 @@ def test_flashmla_cudnn_training_and_score_recompute_match_references():
     )
 
 
+@pytest.mark.L2
 def test_flashmla_cudnn_deepseek_v32_h128_d576_k2048_contract():
     """Exercise the production DeepSeek V3.2 H/D/Top-K contract on B200."""
 

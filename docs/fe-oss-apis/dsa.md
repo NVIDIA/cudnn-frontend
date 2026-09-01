@@ -23,16 +23,18 @@ recompute. The pure-PyTorch test reference remains available at
 
 The module packages the following operations:
 
-1. **Optional FlashMLA Training Bridge** – external forward plus cuDNN DSA backward and score recompute (B200 prototype).
-2. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
-3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
+0. **Optional FlashMLA Training Bridge** – external forward plus cuDNN DSA backward and score recompute (B200 prototype).
+1. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
+2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
-4. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
+3. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
    Top-K selection, and optional Top-K softmax in one public API call.
-5. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
+4. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
-6. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
-   of indexer and attention scores for training loss.
+5. **Sparse Indexer Score Recompute** – sparse (top-K) recompute of indexer
+   scores for training loss.
+6. **Sparse Attention Score Recompute** – sparse (top-K) recompute of
+   attention scores for training loss.
 7. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
    of the above.
 8. **Indexer Backward** – three-stage pipeline (score-grad, three

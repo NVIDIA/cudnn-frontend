@@ -663,7 +663,7 @@ def flashmla_sparse_score_recompute(
 
 __all__ = [
     "FlashMLAUnavailableError",
-    "flashmla_sparse_forward",
     "flashmla_sparse_attention",
+    "flashmla_sparse_forward",
     "flashmla_sparse_score_recompute",
 ]
