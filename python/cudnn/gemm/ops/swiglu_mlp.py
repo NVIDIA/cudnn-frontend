@@ -130,7 +130,9 @@ def _graph_scalar(g, value, name):
     # Runtime-param scalars work with the op's cuDNN 9.x floor; compile-time
     # constants need cuDNN >= 9.22. The graph owns the value, and the cache key
     # owns its identity, so execute() has no extra tensor/scalar argument.
-    return g.tensor_scalar(float(value), cudnn.scalar_type.RUNTIME_PARAM, name=name)
+    scalar = g.tensor_scalar(float(value), cudnn.scalar_type.RUNTIME_PARAM)
+    scalar.set_name(name)
+    return scalar
 
 
 def _handle(device):
