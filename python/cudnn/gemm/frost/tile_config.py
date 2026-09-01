@@ -870,16 +870,20 @@ def select_config(
     cta_n_max = max(32, min(256, _floor_pow2(256 // x)))
 
     # --- tile ---------------------------------------------------------------
-    rep_m = min(_floor_pow2(max(1, M)), 4096)
-    # M-starved problems (M <= 128: at most one 128-tall tile row) are occupancy-
-    # bound, and the sweep shows 64-tall / narrow tiles winning them outright, so
-    # the 64-tall family joins the scan and the wide-N restriction steps aside
-    # there; taller problems keep the single 128-tall wide family. Restricted to
-    # the single-GEMM row-major-B path the sweep characterised.
-    cta_m_choices = (64, 128) if (M <= 128 and x == 1 and not block_scale and not b_n_major) else (128,)
+    rep_m = min(max(1, M), 4096)
+    # M-starved problems (few 128-tall tile rows) are occupancy-bound, and the sweep
+    # shows 64-tall tiles winning them well past one tile row, so the 64-tall family
+    # joins the scan up to M = 512 — 128 first, so a scoring tie keeps the taller
+    # tile (fewer CTAs, same waves). The intermediate N widths are likewise measured
+    # wins, and both extensions are restricted to the plain single-GEMM row-major-B
+    # path: block-scale needs cta_n % 128 == 0 (SF swizzle), multi-GEMM squeezes the
+    # shared budget to powers of two, and N-major B re-rounds to swizzle groups.
+    plain = x == 1 and not block_scale and not b_n_major
+    cta_m_choices = (128, 64) if (plain and M <= 512) else (128,)
+    n_axis = (32, 64, 96, 128, 160, 192, 224, 256) if plain else (32, 64, 128, 256)
     tiles = []
     for tm in cta_m_choices:
-        choices = [c for c in (32, 64, 128, 256) if c <= cta_n_max]
+        choices = [c for c in n_axis if c <= cta_n_max]
         if block_scale or (N >= 512 and M > 128):
             # Widening beat every narrower tile family across the measured range —
             # where M supplies more than one 128-tall tile row. M-starved problems
@@ -892,7 +896,10 @@ def select_config(
 
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
     # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
-    cta_group = 1 if x > 1 else (2 if M > cta_m else 1)
+    # Block-scale prefers the CTA pair even without a second M tile (halved per-CTA
+    # B footprint buys pipeline depth) — but only while the pair's padded M row still
+    # fits the machine in one wave; past that the padding costs a whole extra wave.
+    cta_group = 1 if x > 1 else (2 if (M > cta_m or (block_scale and 2 * (-(-N // cta_n)) <= sm)) else 1)
 
     if block_scale:
         cta_m = max(cta_m, 128)
@@ -922,20 +929,21 @@ def select_config(
     pool = [g for g in _CLUSTERS_1D + _CLUSTERS_2D if not _hang_prone(cta_m, cta_n, g[0], g[1])]
     if cta_group == 2:
         pool = [g for g in pool if g[0] % 2 == 0]  # 2-CTA needs cga_size_m % 2 == 0
-    # _cluster_score depends only on the wave count, so shapes tie in whole groups
-    # and the winner used to be whichever came first in the pool. Break those ties
-    # with the sweep's measured preference instead: A-multicast x4 for 1-CTA
-    # non-block-scale picks, and 2x4 / 2x2 for block-scale 2-CTA picks once the
-    # grid runs deep (> 4 waves); everything else keeps the old order.
-    ctas = -(-M // (cta_m * cta_group)) * cta_group * -(-N // cta_n)
-    if cta_group == 1 and not block_scale and x == 1:
-        prefer = ((1, 4),)
-    elif cta_group == 2 and block_scale and ctas > 4 * sm:
-        prefer = ((2, 4), (2, 2))
-    else:
-        prefer = ()
+    # _cluster_score depends only on the wave count, so shapes tie in whole groups —
+    # and under a single wave the quantisation and occupancy terms cancel, so a
+    # padded launch (cluster wider than the grid) ties with an exact fit. Break
+    # ties by fewest launched CTAs first (never pad), then by the sweep's measured
+    # preference: A-multicast x4 — cluster (cta_group, 4) — wins the remaining tie
+    # group in every cohort (fp4/fp8, 1- and 2-CTA, block-scale or not).
+    m_tiles = -(-M // (cta_m * cta_group)) * cta_group
+    n_tiles = -(-N // cta_n)
+
+    def _launched(g: tuple[int, int]) -> int:
+        return (-(-m_tiles // g[0])) * g[0] * (-(-n_tiles // g[1])) * g[1]
+
+    prefer = ((cta_group, 4),)
     rank = {g: len(prefer) - i for i, g in enumerate(prefer)}
-    cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), rank.get(g, 0)))
+    cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), -_launched(g), rank.get(g, 0)))
 
     name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
     return by_name(name)
