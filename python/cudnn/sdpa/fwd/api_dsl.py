@@ -1333,13 +1333,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # head-major (H, head_stride)); without one it compiles with
             # has_lse=False and no LSE buffer exists at all. No slq/slk
             # copies either: the metadata is built DEVICE-side by the setup
-            # kernel (issue #552). o_desc: 16 int64 per
-            # sequence + 16 spare, the per-sequence O TMA descriptors the
-            # builder kernel fills.
-            # o_desc: 16 int64 per sequence + the dead-unit pad slot; the
-            # FP8/MXFP8 flavors carry two more slots for the packed-total-
-            # clamped K/V runtime descriptors (see the kernels' THD closures).
-            o_desc_slots = b + (3 if self._fp8 else 1)
+            # kernel (issue #552).
+            # o_desc: 16 int64 per sequence + the dead-unit pad slot + two
+            # slots for the packed-total-clamped K/V runtime descriptors the
+            # setup kernel writes (see the kernels' THD closures). Every THD
+            # flavor carries those two now, not just FP8/MXFP8 (issue #624).
+            o_desc_slots = b + 3
             return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
@@ -1675,9 +1674,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # before any consumer read, so stale bytes never survive — a fill
         # here is a wasted kernel launch on the execute hot path (Rule 1).
         with _torch_stream_context(current_stream, dev):
-            # +2 slots on the FP8/MXFP8 flavors: the packed-total-clamped K/V
-            # runtime descriptors the setup kernel writes after the pad slot.
-            o_desc_slots = b + (3 if self._fp8 else 1)
+            # +2 past the pad slot: the packed-total-clamped K/V runtime
+            # descriptors the setup kernel writes. Every THD flavor carries
+            # them now, not just FP8/MXFP8 (issue #624).
+            o_desc_slots = b + 3
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
         # PERSISTENT THD grid: cap the launch at what the device can hold

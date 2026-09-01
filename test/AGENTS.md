@@ -50,3 +50,43 @@ pytest fe_api/gemm/          # OSS kernel tests
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
+
+### Confirm you are testing the code you edited
+
+`pip install -e .` does **not** put the package on `sys.path`. It installs a
+`sys.meta_path` finder (`__editable___nvidia_cudnn_frontend_*_finder.py`) whose
+`MAPPING` hard-codes an absolute path to the checkout it was installed from.
+Meta-path finders run *before* `sys.path`, so **`PYTHONPATH` cannot shadow it** —
+if you edit a different clone or a git worktree, your changes are silently not
+under test. Symptoms are indistinguishable from a real result: a probe that
+should change the output leaves it bit-identical, and edits appear to do nothing.
+
+Check first, every time you work outside the installed checkout:
+
+```bash
+python -c "import cudnn; print(cudnn.__file__)"   # must be YOUR tree
+```
+
+`conftest.py` prints the same path in its banner (`cuDNN Frontend Path:`) — read
+it rather than assuming. To point the editable install at another tree for one
+run, patch the finder's `MAPPING` from a `sitecustomize.py` on `PYTHONPATH`
+(`site` imports it after processing `.pth` files, so the finder already exists):
+
+```python
+# sitecustomize.py -- the finder module name embeds the installed version, so
+# discover it rather than hard-coding it (it changes when __version__ bumps).
+import importlib, pkgutil
+
+name = next(
+    m.name
+    for m in pkgutil.iter_modules()
+    if m.name.startswith("__editable___nvidia_cudnn_frontend_") and m.name.endswith("_finder")
+)
+importlib.import_module(name).MAPPING["cudnn"] = "/path/to/your/worktree/python/cudnn"
+```
+
+The same trap hides *inside* a run: `python/cudnn/frost/template_loader.py`
+loads kernel templates by absolute path via `spec_from_file_location`, so the
+template that serves a config may come from elsewhere too. To find out which
+template a test actually compiles, log `path` at the top of `load_template` —
+do not infer it from `_pick_flavor` by reading the source.
