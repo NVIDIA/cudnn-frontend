@@ -382,3 +382,21 @@ def test_import_without_torch():
         env={**os.environ},
     )
     assert result.returncode == 0, f"torch-free import failed:\n{result.stderr}"
+
+
+def test_non_torch_inputs_reach_validation_cleanly():
+    """Framework neutrality: non-torch dlpack tensors traverse validation and
+    fail with the documented error classes, never AttributeError/TypeError on
+    torch-specific attribute access."""
+    import numpy as np
+
+    _require_cuda()
+    q = np.zeros((4, 2, 32), dtype=np.float16)
+    k = np.zeros((8, 1, 32), dtype=np.float16)
+    v = np.zeros((8, 1, 32), dtype=np.float16)
+    idxs = np.zeros((4, 4), dtype=np.int32)
+    cu = np.array([0, 4], dtype=np.int32)
+    # CPU numpy inputs must be rejected by the CUDA-device check (ValueError),
+    # proving the validation path itself is torch-free.
+    with pytest.raises(ValueError, match="CUDA"):
+        _wrapper()(q, k, v, idxs, cu_seqlens_q=cu, backend="reference")

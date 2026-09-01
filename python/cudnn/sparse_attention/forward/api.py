@@ -33,6 +33,12 @@ Contract summary (normative — kernels must match the reference exactly):
   produce ``lse = -inf`` and ``out = 0``.
 * **Deterministic always**: same inputs produce bitwise-identical outputs.
 
+Tensor inputs are framework tensors (anything dlpack-compatible — torch,
+JAX, numpy): validation runs on canonical descriptors (cutlass dtypes,
+adapter devices) and never requires torch. Each backend declares which
+frameworks it can execute and fails loudly otherwise (both current backends
+execute torch tensors).
+
 Backends: ``"default"`` dispatches to registered device kernels — currently
 the SM100 DSA sparse-prefill kernel for its envelope (THD, MQA latent with
 K aliased as V, ``D_k in (512, 576)``, shared token-granularity indices),
@@ -44,16 +50,19 @@ for validation; reference-speed by design, never selected implicitly.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+import cutlass
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.tensor_adapter import detect_framework, get_compute_capability, get_data_ptr
 
 # Framework neutrality: this module must be importable without torch (JAX
-# processes may not import torch at all). torch is imported function-locally
-# on the execute/validate paths only; annotations stay lazy via
-# ``from __future__ import annotations``.
+# processes may not import torch at all), and the public API takes framework
+# tensors (anything dlpack-compatible: torch, JAX, numpy) — validation runs on
+# canonical descriptors (cutlass dtypes, adapter devices), never on torch
+# types. torch appears only function-locally inside torch-only *backends*.
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    import torch
     import cuda.bindings.driver as cuda
 
 _BACKENDS = ("default", "reference")
@@ -100,13 +109,13 @@ class SparseAttentionForward(APIBase):
 
     def __init__(
         self,
-        sample_q: torch.Tensor,
-        sample_k: torch.Tensor,
-        sample_v: torch.Tensor,
-        sample_topk_idxs: torch.Tensor,
-        sample_topk_length: Optional[torch.Tensor] = None,
-        sample_attn_sink: Optional[torch.Tensor] = None,
-        sample_cu_seqlens_q: Optional[torch.Tensor] = None,
+        sample_q: Any,  # framework tensor (dlpack: torch / JAX / numpy)
+        sample_k: Any,
+        sample_v: Any,
+        sample_topk_idxs: Any,
+        sample_topk_length: Optional[Any] = None,
+        sample_attn_sink: Optional[Any] = None,
+        sample_cu_seqlens_q: Optional[Any] = None,
         index_granularity: int = 1,
         softmax_scale: Optional[float] = None,
         backend: str = "default",
@@ -114,13 +123,13 @@ class SparseAttentionForward(APIBase):
         super().__init__()
         _validate_backend(backend)
 
-        self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
-        self.k_desc = self._make_tensor_desc(sample_k, name="sample_k")
-        self.v_desc = self._make_tensor_desc(sample_v, name="sample_v")
-        self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
-        self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
-        self.attn_sink_desc = self._make_tensor_desc(sample_attn_sink, name="sample_attn_sink")
-        self.cu_seqlens_q_desc = self._make_tensor_desc(sample_cu_seqlens_q, name="sample_cu_seqlens_q")
+        self.q_desc = self._make_tensor_desc(sample_q, name="sample_q", canonical=True)
+        self.k_desc = self._make_tensor_desc(sample_k, name="sample_k", canonical=True)
+        self.v_desc = self._make_tensor_desc(sample_v, name="sample_v", canonical=True)
+        self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs", canonical=True)
+        self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length", canonical=True)
+        self.attn_sink_desc = self._make_tensor_desc(sample_attn_sink, name="sample_attn_sink", canonical=True)
+        self.cu_seqlens_q_desc = self._make_tensor_desc(sample_cu_seqlens_q, name="sample_cu_seqlens_q", canonical=True)
 
         self.index_granularity = int(index_granularity)
         self.softmax_scale = softmax_scale
@@ -135,9 +144,7 @@ class SparseAttentionForward(APIBase):
     # Validation
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
-        import torch
-
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = get_compute_capability()
         self._runtime_error_if(
             major < 9,
             f"SparseAttentionForward requires SM90+, found SM{major}",
@@ -166,17 +173,17 @@ class SparseAttentionForward(APIBase):
             f"K and V must follow Q's layout ({expected_kv_ndim}-D), got K {k.shape}, V {v.shape}",
         )
 
-        # ---- dtypes ----
-        self._check_dtype(q, [torch.float16, torch.bfloat16], name="Q")
+        # ---- dtypes (canonical descriptors carry cutlass dtypes) ----
+        self._check_dtype(q, [cutlass.Float16, cutlass.BFloat16], name="Q")
         self._check_dtype(k, q.dtype, name="K", extra_error_msg="K must have same dtype as Q")
         self._check_dtype(v, q.dtype, name="V", extra_error_msg="V must have same dtype as Q")
-        self._check_dtype(idxs, torch.int32, name="topk_idxs")
+        self._check_dtype(idxs, cutlass.Int32, name="topk_idxs")
         if self.topk_length_desc is not None:
-            self._check_dtype(self.topk_length_desc, torch.int32, name="topk_length")
+            self._check_dtype(self.topk_length_desc, cutlass.Int32, name="topk_length")
         if self.attn_sink_desc is not None:
-            self._check_dtype(self.attn_sink_desc, torch.float32, name="attn_sink")
+            self._check_dtype(self.attn_sink_desc, cutlass.Float32, name="attn_sink")
         if self.cu_seqlens_q_desc is not None:
-            self._check_dtype(self.cu_seqlens_q_desc, torch.int32, name="cu_seqlens_q")
+            self._check_dtype(self.cu_seqlens_q_desc, cutlass.Int32, name="cu_seqlens_q")
 
         # ---- shapes ----
         if self.is_thd:
@@ -252,7 +259,7 @@ class SparseAttentionForward(APIBase):
         # ---- devices ----
         ref_device = q.device
         self._value_error_if(
-            ref_device.type != "cuda",
+            getattr(ref_device, "type", str(ref_device)) != "cuda",
             f"Q must live on CUDA, got {ref_device}",
         )
         descriptors = [q, k, v, idxs]
@@ -303,22 +310,27 @@ class SparseAttentionForward(APIBase):
     # ------------------------------------------------------------------
     def execute(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        topk_idxs: torch.Tensor,
-        topk_length: Optional[torch.Tensor] = None,
-        attn_sink: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
+        q: Any,
+        k: Any,
+        v: Any,
+        topk_idxs: Any,
+        topk_length: Optional[Any] = None,
+        attn_sink: Optional[Any] = None,
+        cu_seqlens_q: Optional[Any] = None,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[Any, Any]:
         if self._compiled_kernel is None:
             self.compile()
+        # The CONTRACT is framework-neutral (any dlpack tensor); each BACKEND
+        # declares the frameworks it executes, request-or-fail.
+        framework = detect_framework(q)
+        if framework != "torch":
+            raise NotImplementedError(f"the {self.backend!r} backend currently executes torch tensors only, got {framework!r} inputs")
         if self.backend == "default":
             # K is V aliasing is part of this kernel's envelope; the sample
             # descriptors cannot see storage, so verify on the real tensors.
             d_v = v.shape[-1]
-            if v.data_ptr() != k.data_ptr() or v.shape[0] != k.shape[0]:
+            if get_data_ptr(v) != get_data_ptr(k) or v.shape[0] != k.shape[0]:
                 raise ValueError("the registered DSA sparse-prefill kernel requires V to alias K's storage (MLA latent); pass v as a view of k")
             result = self._dispatch(
                 q,
@@ -351,18 +363,18 @@ class SparseAttentionForward(APIBase):
 # Reference implementation (normative semantics; reference speed)
 # ----------------------------------------------------------------------
 def _reference_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    topk_idxs: torch.Tensor,
+    q: Any,
+    k: Any,
+    v: Any,
+    topk_idxs: Any,
     *,
-    topk_length: Optional[torch.Tensor],
-    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[Any],
+    attn_sink: Optional[Any],
     index_granularity: int,
     softmax_scale: Optional[float],
     group_scope: int,
     is_thd: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[Any, Any]:
     import torch
 
     g = index_granularity
@@ -457,17 +469,17 @@ _cache_of_SparseAttentionForwardObjects: dict = {}
 
 
 def sparse_attention_forward_wrapper(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    topk_length: Optional[torch.Tensor] = None,
+    q: Any,  # framework tensor (dlpack: torch / JAX / numpy); see module docstring
+    k: Any,
+    v: Any,
+    topk_idxs: Any,
+    topk_length: Optional[Any] = None,
     index_granularity: int = 1,
     softmax_scale: Optional[float] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
+    attn_sink: Optional[Any] = None,
+    cu_seqlens_q: Optional[Any] = None,
     max_seqlen_q: Optional[int] = None,
-    page_table: Optional[torch.Tensor] = None,
+    page_table: Optional[Any] = None,
     page_size: Optional[int] = None,
     backend: str = "default",
     stream: Optional[cuda.CUstream] = None,
