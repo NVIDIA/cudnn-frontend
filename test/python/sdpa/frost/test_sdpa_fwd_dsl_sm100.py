@@ -996,14 +996,17 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
         return (S_max * H * dd, dd, H * dd, 1)
 
     def _poisoned_buf(packed, dd):
-        """Capacity-sized storage; only [0, T) is live, the tail is NaN."""
+        """Capacity-sized storage; only [0, T) is live, the tail is NaN.
+
+        Returns the strided view only -- it keeps the storage alive, so there
+        is no need to bind the flat tensor as well."""
         stor = torch.full((B * S_max * H * dd,), float("nan"), device=dev, dtype=dtype)
         stor[: T * H * dd] = packed.reshape(-1)
-        return stor, stor.as_strided((B, H, S_max, dd), _stride(dd))
+        return stor.as_strided((B, H, S_max, dd), _stride(dd))
 
-    q_stor, q_gpu = _poisoned_buf(q_pk, d_qk)
-    k_stor, k_gpu = _poisoned_buf(k_pk, d_qk)
-    v_stor, v_gpu = _poisoned_buf(v_pk, d_v)
+    q_gpu = _poisoned_buf(q_pk, d_qk)
+    k_gpu = _poisoned_buf(k_pk, d_qk)
+    v_gpu = _poisoned_buf(v_pk, d_v)
     o_stor = torch.zeros(B * S_max * H * d_v, device=dev, dtype=dtype)
     o_gpu = o_stor.as_strided((B, H, S_max, d_v), _stride(d_v))
 
