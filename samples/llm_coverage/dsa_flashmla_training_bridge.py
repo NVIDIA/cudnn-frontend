@@ -16,8 +16,8 @@ from cudnn import DSA
 
 
 def main():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0) or torch.cuda.get_device_name() != "NVIDIA B200":
-        raise RuntimeError("this prototype sample requires an exact NVIDIA B200 (SM100)")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        raise RuntimeError("this prototype sample requires SM100")
 
     torch.manual_seed(123)
     device = torch.device("cuda")
