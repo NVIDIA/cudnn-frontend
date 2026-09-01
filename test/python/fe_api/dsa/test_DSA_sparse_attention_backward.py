@@ -88,10 +88,13 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
         "head_dim_v": 512,
         "dtype": torch.bfloat16,
         "max_topk": 512,
-        "device_capability": (10, 0),
     }
-    for max_topk in (128, 512, 1024, 1152, 2048):
-        assert _select_sm100_backend(128, 512, **{**supported, "max_topk": max_topk}) == ("h128_2cta_m64", 64)
+    for device_capability in ((10, 0), (10, 3)):
+        for max_topk in (128, 512, 1024, 1152, 2048):
+            kwargs = {**supported, "device_capability": device_capability, "max_topk": max_topk}
+            assert _select_sm100_backend(128, 512, **kwargs) == ("h128_2cta_m64", 64)
+
+    supported = {**supported, "device_capability": (10, 0)}
 
     assert _select_sm100_backend(128, 512) == ("generic_m64", 64)
     assert _select_sm100_backend(64, 512, **supported) == ("generic_m64", 64)
@@ -106,7 +109,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_dispatch_is_fail_close
         {**supported, "max_topk": 1151},
         {**supported, "max_topk": 1153},
         {**supported, "max_topk": 2112},
-        {**supported, "device_capability": (10, 3)},
+        {**supported, "device_capability": (10, 7)},
     ]
     for kwargs in fallback_cases:
         assert _select_sm100_backend(128, 512, **kwargs) == ("generic_m64", 64)
