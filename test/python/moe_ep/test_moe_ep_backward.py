@@ -26,6 +26,7 @@ from cudnn.moe_ep import (
     MoeEpTrainingSlot,
     MoeEpTrainingWgradOperands,
 )
+from cudnn.moe_ep._contracts import Fc1WeightLayout
 from cudnn.moe_ep._validation import validate_training_weights
 from cudnn.moe_ep._megamoe_backend.mxfp8._adapter import (
     _typed_k_major_view,
@@ -43,6 +44,9 @@ from cudnn.moe_ep._megamoe_backend.mxfp8._training_resources import (
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._training_stage import (
     Mxfp8TrainingStager,
+)
+from cudnn.moe_ep._megamoe_backend.mxfp8._training_wgrad import (
+    Mxfp8TrainingWgradExporter,
 )
 from cudnn.moe_ep._megamoe_backend.mxfp8._fingerprint import (
     canonical_json_sha256,
@@ -230,9 +234,26 @@ def test_training_abi_fingerprint_is_stable_and_structural():
         lane_count=2,
         source_tree_digest="source",
     )
+    changed_layout = _build_training_abi_facts(
+        _training_config(
+            ep_size=2,
+            ep_global_ranks=(0, 1),
+            weight_interleave_size=32,
+        ),
+        forward,
+        backward,
+        weights,
+        requirements,
+        slot_count=2,
+        lane_count=1,
+        source_tree_digest="source",
+    )
 
+    assert first["policy"]["fc1_weight_layout"] == "gate_then_up"
+    assert changed_layout["policy"]["fc1_weight_layout"] == "gate_up_interleaved_32"
     assert canonical_json_sha256(first) == canonical_json_sha256(second)
     assert canonical_json_sha256(first) != canonical_json_sha256(changed)
+    assert canonical_json_sha256(first) != canonical_json_sha256(changed_layout)
 
 
 @pytest.mark.L0
@@ -368,8 +389,6 @@ def test_training_sources_track_adapter_grad_y2_and_dfc2_contracts():
             "plain_tensor",
             "axis",
             "format",
-            "data_noncontiguous",
-            "scale_noncontiguous",
         )
     ],
 )
@@ -402,6 +421,53 @@ def test_validate_training_weights_accepts_complete_fixed_weight_set():
         _training_config(),
         _training_weights(),
     ) == torch.device("cpu")
+
+
+@pytest.mark.L1
+def test_interleaved_training_weights_require_direct_layouts():
+    with pytest.raises(ValueError, match="requires compact K-major forward weights"):
+        validate_training_weights(
+            _training_config(weight_interleave_size=32),
+            _training_weights(),
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("part", ["data_noncontiguous", "scale_noncontiguous"])
+def test_validate_training_weights_accepts_compact_k_major_views(part):
+    weights, _, _ = _training_weight_defect(
+        _training_weights(),
+        "forward_fc1",
+        part,
+    )
+    assert validate_training_weights(_training_config(), weights) == torch.device("cpu")
+    bindings = Mxfp8TrainingWeightBindings(weights)
+    bindings.refresh()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "field",
+    ["backward_w2_transpose", "backward_w1_transpose"],
+)
+@pytest.mark.parametrize("weight_interleave_size", [None, 32])
+def test_validate_training_weights_rejects_k_major_backward_data(
+    field,
+    weight_interleave_size,
+):
+    weights, _, _ = _training_weight_defect(
+        _training_weights(),
+        field,
+        "data_noncontiguous",
+    )
+    with pytest.raises(
+        ValueError,
+        match=rf"weights\.{field} data must be contiguous",
+    ):
+        validate_training_weights(
+            _training_config(weight_interleave_size=weight_interleave_size),
+            weights,
+        )
 
 
 def _operator(**overrides) -> MoeEp:
@@ -462,6 +528,113 @@ def test_k_major_workspace_view_matches_upstream_token_major_abi():
     assert view.shape == (3, 4)
     assert view.stride() == (1, 3)
     assert torch.equal(view, storage.reshape(4, 3).transpose(0, 1))
+
+
+@pytest.mark.L0
+def test_training_wgrad_data_operands_alias_backward_outputs():
+    pool_rows, hidden, intermediate = 8, 4, 6
+    slot = SimpleNamespace(
+        col_quant_data=torch.empty((pool_rows, hidden), dtype=torch.uint8),
+        col_quant_sf=torch.empty(1, dtype=torch.uint8),
+        valid_route_counts=torch.zeros(1, dtype=torch.int32),
+        expert_offsets=torch.zeros(1, dtype=torch.int32),
+        fc1_recompute=torch.empty((pool_rows, intermediate), dtype=torch.uint8),
+        fc1_recompute_sf=torch.empty(1, dtype=torch.uint8),
+        fc1_col_output=torch.empty((pool_rows, 2 * intermediate), dtype=torch.uint8),
+        fc1_col_output_sf=torch.empty(1, dtype=torch.uint8),
+        grad_y2=torch.empty((pool_rows, hidden), dtype=torch.uint8),
+        grad_y2_sf=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_sfb=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfb=torch.empty(1, dtype=torch.uint8),
+    )
+    exporter = Mxfp8TrainingWgradExporter(
+        experts=1,
+        hidden=hidden,
+        intermediate=intermediate,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    )
+    exporter._expand_scales = Mock()
+
+    operands = exporter.export(slot)
+
+    assert operands.fc1_b is slot.fc1_col_output
+    assert operands.fc1_b.data_ptr() == slot.fc1_col_output.data_ptr()
+    assert operands.fc1_b.stride() == slot.fc1_col_output.stride()
+    assert operands.fc2_a.data_ptr() == slot.fc1_recompute.data_ptr()
+    assert operands.fc2_a.shape == (intermediate, pool_rows)
+    assert operands.fc2_a.stride() == slot.fc1_recompute.transpose(0, 1).stride()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "layout",
+    [
+        Fc1WeightLayout.GATE_THEN_UP,
+        Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    ],
+)
+def test_training_wgrad_fc1_layout_matches_reference(layout):
+    pool_rows, hidden, intermediate = 3, 4, 64
+    semantic_dc = (
+        torch.arange(pool_rows * 2 * intermediate, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .reshape(pool_rows, 2 * intermediate)
+    )
+    interleaved_dc = (
+        semantic_dc.view(pool_rows, 2, intermediate // 32, 32)
+        .transpose(1, 2)
+        .reshape_as(semantic_dc)
+    )
+    x = torch.arange(pool_rows * hidden, dtype=torch.uint8).reshape(pool_rows, hidden)
+    slot = SimpleNamespace(
+        col_quant_data=x,
+        col_quant_sf=torch.empty(1, dtype=torch.uint8),
+        valid_route_counts=torch.zeros(1, dtype=torch.int32),
+        expert_offsets=torch.zeros(1, dtype=torch.int32),
+        fc1_recompute=torch.empty((pool_rows, intermediate), dtype=torch.uint8),
+        fc1_recompute_sf=torch.empty(1, dtype=torch.uint8),
+        fc1_col_output=interleaved_dc,
+        fc1_col_output_sf=torch.empty(1, dtype=torch.uint8),
+        grad_y2=torch.empty((pool_rows, hidden), dtype=torch.uint8),
+        grad_y2_sf=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_b=torch.empty_like(interleaved_dc),
+        wgrad_fc1_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc1_sfb=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfa=torch.empty(1, dtype=torch.uint8),
+        wgrad_fc2_sfb=torch.empty(1, dtype=torch.uint8),
+    )
+    exporter = Mxfp8TrainingWgradExporter(
+        experts=1,
+        hidden=hidden,
+        intermediate=intermediate,
+        fc1_weight_layout=layout,
+    )
+    exporter._expand_scales = Mock()
+
+    operands = exporter.export(slot)
+    expected_dc = (
+        semantic_dc
+        if layout is Fc1WeightLayout.GATE_THEN_UP
+        else interleaved_dc
+    )
+    expected_wgrad = x.transpose(0, 1).float() @ expected_dc.float()
+    actual_wgrad = operands.fc1_a.float() @ operands.fc1_b.float()
+
+    torch.testing.assert_close(actual_wgrad, expected_wgrad, atol=0, rtol=0)
+    if layout is Fc1WeightLayout.GATE_THEN_UP:
+        assert operands.fc1_b is slot.wgrad_fc1_b
+        assert operands.fc1_b.data_ptr() != slot.fc1_col_output.data_ptr()
+        assert exporter._expand_scales.call_args_list[1].kwargs[
+            "deinterleave_gate_up"
+        ] == intermediate
+    else:
+        assert operands.fc1_b is slot.fc1_col_output
+        assert exporter._expand_scales.call_args_list[1].kwargs[
+            "deinterleave_gate_up"
+        ] is None
 
 
 @pytest.mark.L0
@@ -534,30 +707,64 @@ def test_distributed_error_mode_requires_nccl(monkeypatch):
 
 
 @pytest.mark.L0
-def test_training_weight_refresh_keeps_destination_addresses_stable():
+def test_training_weight_bindings_alias_data_and_stage_only_scales():
     weights = _training_weights()
-    bindings = Mxfp8TrainingWeightBindings(weights)
+    from cudnn.moe_ep import BlockScaledTensor, MoeEpTrainingWeights
+
+    def compact_k_major(tensor):
+        return BlockScaledTensor(
+            data=tensor.data.transpose(1, 2).contiguous().transpose(1, 2),
+            scale=tensor.scale.transpose(1, 2).contiguous().transpose(1, 2),
+            format=tensor.format,
+            logical_shape=tensor.logical_shape,
+            axis=tensor.axis,
+        )
+
+    weights = MoeEpTrainingWeights(
+        forward_fc1=compact_k_major(weights.forward_fc1),
+        forward_fc2=compact_k_major(weights.forward_fc2),
+        backward_w2_transpose=weights.backward_w2_transpose,
+        backward_w1_transpose=weights.backward_w1_transpose,
+    )
+    assert validate_training_weights(
+        _training_config(weight_interleave_size=32),
+        weights,
+    ) == torch.device("cpu")
+    compatibility_bindings = Mxfp8TrainingWeightBindings(weights)
+    assert not compatibility_bindings._uses_direct_weight_bindings
+    assert (
+        compatibility_bindings.forward.fc1_weight.data_ptr()
+        != weights.forward_fc1.data.data_ptr()
+    )
+    assert compatibility_bindings.backward.fc1_weight.is_contiguous()
+    assert compatibility_bindings.backward.fc2_weight.is_contiguous()
+
+    bindings = Mxfp8TrainingWeightBindings(
+        weights,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    )
     bindings.refresh()
-    tensors = (
-        bindings.forward.fc1_weight,
+    data_pairs = (
+        (bindings.forward.fc1_weight, weights.forward_fc1.data),
+        (bindings.forward.fc2_weight, weights.forward_fc2.data),
+        (bindings.backward.fc1_weight, weights.backward_w2_transpose.data),
+        (bindings.backward.fc2_weight, weights.backward_w1_transpose.data),
+    )
+    scales = (
         bindings.forward.fc1_weight_sf,
-        bindings.forward.fc2_weight,
         bindings.forward.fc2_weight_sf,
-        bindings.backward.fc1_weight,
         bindings.backward.fc1_weight_sf,
-        bindings.backward.fc2_weight,
         bindings.backward.fc2_weight_sf,
     )
-    pointers = tuple(tensor.data_ptr() for tensor in tensors)
-    snapshots = tuple(tensor.clone() for tensor in tensors)
+    scale_pointers = tuple(tensor.data_ptr() for tensor in scales)
+    scale_snapshots = tuple(tensor.clone() for tensor in scales)
 
-    weights.forward_fc1.data.view(torch.uint8).bitwise_xor_(1)
+    weights.forward_fc1.scale.view(torch.uint8).bitwise_xor_(1)
     bindings.refresh()
 
-    assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
-    assert not torch.equal(bindings.forward.fc1_weight, snapshots[0])
-    for tensor in tensors:
-        assert tensor.is_contiguous() or tensor.stride(1) == 1
+    assert all(bound.data_ptr() == source.data_ptr() for bound, source in data_pairs)
+    assert tuple(tensor.data_ptr() for tensor in scales) == scale_pointers
+    assert not torch.equal(bindings.forward.fc1_weight_sf, scale_snapshots[0])
 
 
 @pytest.mark.L0

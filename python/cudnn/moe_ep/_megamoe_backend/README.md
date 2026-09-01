@@ -63,6 +63,9 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 - An execution lane owns mutable router, barrier, and kernel scratch.
 - Every symmetric region is built in deterministic order and its size is
   normalized by name across EP ranks before allocation.
+- The training ABI fingerprint includes the normalized FC1 layout policy
+  (`gate_then_up` or `gate_up_interleaved_32`), so ranks with different
+  gate/up semantics fail the collective handshake before allocation.
 - Multiple streams require distinct lanes. Distributed MegaMoE kernels must be
   ordered consistently on every rank with captured CUDA events; independent
   lane storage does not permit unordered communication overlap.
@@ -73,9 +76,15 @@ forward, backward, and WGrad-export kernels are compiled before capture.
 
 `MoeEpTrainingWeights` contains four address-stable MXFP8 block-scaled tensors:
 forward W1/W2 and independently quantized backward W2-transpose/W1-transpose.
-Their public layout differs from the K-major, gate/up-interleaved, and
-blocked-scale kernel bindings. After every in-place data+scale update, the
-caller must enqueue `resources.refresh_weights()` before the first consumer,
+Backward-transpose data is C-contiguous under both FC1 layout policies, matching
+the single training AOT signature.
+With `weight_interleave_size=32`, compact K-major forward weights and contiguous
+backward transposes are interpreted as already using 32-element W1 gate/up
+strips, and the kernels alias weight data directly; only scales require
+kernel-native staging. With the default `None`, weights use conventional
+gate-then-up order and are copied and interleaved into persistent kernel
+buffers. After every in-place data+scale update, the caller
+must enqueue `resources.refresh_weights()` before the first consumer,
 with explicit stream/event ordering. A matching forward/backward pair must use
 one version; refresh cannot overlap any consumer on another slot/lane. Replacing
 source storage requires closing the old operator, creating a new `MoeEp`
@@ -89,8 +98,14 @@ contract and relaxed atomic accumulation order.
 
 `MoeEpTrainingWgradOperands` is a fixed-capacity producer ABI. Device
 `expert_offsets` and `valid_route_counts` describe the current valid K extent;
-padding is zeroed. No specific downstream grouped-WGrad consumer is guaranteed
-by this milestone.
+padding is zeroed. Its data operands alias persistent forward or backward
+outputs, using transpose views where required. With
+`weight_interleave_size=32`, exporting them performs no full-tensor data
+copies, and FC1 dY data and scales preserve the same 32-element gate/up order
+as W1. With `None`, FC1 dY is copied and deinterleaved to match conventional
+gate-then-up W1 storage. Scale operands are expanded into persistent
+grouped-WGrad layouts. No specific downstream grouped-WGrad consumer is
+guaranteed by this milestone.
 
 ## Overflow policy
 

@@ -3,11 +3,13 @@
 
 from .api import (
     GroupedGemmWgradSm100,
+    get_grouped_gemm_wgrad_workspace_size_sm100,
     grouped_gemm_wgrad_wrapper_sm100,
 )
 
 __all__ = [
     "GroupedGemmWgradSm100",
+    "get_grouped_gemm_wgrad_workspace_size_sm100",
     "grouped_gemm_wgrad_wrapper_sm100",
     "grouped_gemm_wgrad_jax_sm100",
 ]

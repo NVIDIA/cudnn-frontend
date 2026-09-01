@@ -181,7 +181,9 @@ class MoeEpTrainingWeights:
     quantized transposes: ``backward_w2_transpose=(E,H,I)`` for
     ``dH=dY@W2.T`` and ``backward_w1_transpose=(E,2I,H)`` for
     ``dX=dC@W1.T``. Every tensor is block-scaled along logical axis 1, the
-    reduction axis of its corresponding GEMM.
+    reduction axis of its corresponding GEMM. When the owning ``MoeEp`` has
+    ``weight_interleave_size=32``, forward W1's output axis and backward W1T's
+    reduction axis must contain alternating 32-element gate/up strips.
     """
 
     forward_fc1: BlockScaledTensor
@@ -223,7 +225,7 @@ class MoeEpExecutionLane:
 
 
 class MoeEpTrainingResources:
-    """TE-owned lease on fixed-capacity training slots and execution lanes."""
+    """Caller-owned lease on fixed-capacity training slots and execution lanes."""
 
     def __init__(
         self,
@@ -264,7 +266,7 @@ class MoeEpTrainingResources:
             raise ValueError("execution lane does not belong to these resources")
 
     def refresh_weights(self) -> None:
-        """Enqueue fixed-address weight-layout refreshes on the current stream.
+        """Enqueue fixed-address scale-layout refreshes on the current stream.
 
         Call after every in-place data+scale update and before the first
         forward/backward that consumes that version. The caller must establish

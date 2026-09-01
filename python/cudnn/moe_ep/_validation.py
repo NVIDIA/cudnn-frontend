@@ -9,7 +9,7 @@ from typing import Tuple
 
 import torch
 
-from ._contracts import ForwardConfig, ValidatedForwardRequest
+from ._contracts import Fc1WeightLayout, ForwardConfig, ValidatedForwardRequest
 from ._types import (
     BlockScaledTensor,
     MoeEpTrainingWeights,
@@ -185,6 +185,14 @@ def validate_forward(
             config.hidden_size,
         ),
     )
+    if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32 and (
+        not isinstance(fc1_weight, BlockScaledTensor)
+        or fc1_weight.format is not MoeFormat.MXFP8
+    ):
+        raise ValueError(
+            "weight_interleave_size=32 requires an MXFP8 BlockScaledTensor "
+            "for fc1_weight"
+        )
     _validate_routes(
         config,
         token_count,
@@ -226,6 +234,20 @@ def validate_training_weights(
     weights: MoeEpTrainingWeights,
 ) -> torch.device:
     """Validate fixed MXFP8 weight bindings used by training resources."""
+
+    def has_supported_layout(tensor: torch.Tensor) -> bool:
+        if tensor.is_contiguous():
+            return True
+        if tensor.ndim != 3:
+            return False
+        experts, reduction, output = tensor.shape
+        return tensor.stride() == (reduction * output, 1, reduction)
+
+    def is_compact_k_major(tensor: torch.Tensor) -> bool:
+        if tensor.ndim != 3:
+            return False
+        experts, reduction, output = tensor.shape
+        return tensor.stride() == (reduction * output, 1, reduction)
 
     if not isinstance(weights, MoeEpTrainingWeights):
         raise TypeError("weights must be a MoeEpTrainingWeights, " f"got {type(weights).__name__}")
@@ -273,8 +295,28 @@ def validate_training_weights(
             raise TypeError(f"{name} must be an MXFP8 BlockScaledTensor for " "fixed training resources")
         if tensor.format is not MoeFormat.MXFP8:
             raise NotImplementedError(f"{name} must use format='mxfp8', got {tensor.format.value!r}")
-        if not tensor.data.is_contiguous() or not tensor.scale.is_contiguous():
-            raise ValueError(f"{name} data and scale must be contiguous for fixed " "training weight binding")
+        if name in (
+            "weights.backward_w2_transpose",
+            "weights.backward_w1_transpose",
+        ) and not tensor.data.is_contiguous():
+            raise ValueError(
+                f"{name} data must be contiguous for fixed training weight binding"
+            )
+        if not has_supported_layout(tensor.data) or not has_supported_layout(tensor.scale):
+            raise ValueError(
+                f"{name} data and scale must be contiguous or compact K-major "
+                "for fixed training weight binding"
+            )
+    if config.fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32 and not (
+        is_compact_k_major(weights.forward_fc1.data)
+        and is_compact_k_major(weights.forward_fc2.data)
+        and weights.backward_w2_transpose.data.is_contiguous()
+        and weights.backward_w1_transpose.data.is_contiguous()
+    ):
+        raise ValueError(
+            "weight_interleave_size=32 requires compact K-major forward "
+            "weights and contiguous backward transpose weights"
+        )
     device = weights.forward_fc1.device
     for name, tensor, _shape in expected[1:]:
         if tensor.device != device:

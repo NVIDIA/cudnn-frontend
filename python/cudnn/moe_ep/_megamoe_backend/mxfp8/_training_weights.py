@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
+from ..._contracts import Fc1WeightLayout
 from ..._types import BlockScaledTensor, MoeEpTrainingWeights
 from ._adapter import Mxfp8Weights
 
@@ -18,8 +19,6 @@ def _round_up(value: int, multiple: int) -> int:
 
 
 def _empty_k_major_like(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.ndim != 3:
-        raise ValueError(f"K-major training weight must be rank 3, got {tensor.ndim}")
     experts, reduction, output = tensor.shape
     return torch.empty_strided(
         tensor.shape,
@@ -43,77 +42,6 @@ def _empty_blocked_scales(
         dtype=torch.uint8,
         device=source.device,
     ).view(dtype)
-
-
-def _copy_k_major(
-    target: torch.Tensor,
-    source: torch.Tensor,
-) -> None:
-    if target.shape != source.shape:
-        raise ValueError(f"K-major copy shape mismatch: {target.shape} != {source.shape}")
-    target.copy_(source)
-
-
-def _copy_gate_up_interleaved_last(
-    target: torch.Tensor,
-    source: torch.Tensor,
-    intermediate: int,
-) -> None:
-    """Copy ``(E,K,gate||up)`` into 32-column gate/up strip order."""
-
-    experts, reduction, gate_up = source.shape
-    if target.shape != source.shape or gate_up != 2 * intermediate:
-        raise ValueError("forward FC1 training weight shape mismatch")
-    pairs = intermediate // 32
-    source_view = source.view(
-        experts,
-        reduction,
-        2,
-        pairs,
-        32,
-    ).permute(0, 1, 3, 2, 4)
-    target_view = target.as_strided(
-        (experts, reduction, pairs, 2, 32),
-        (
-            target.stride(0),
-            target.stride(1),
-            64 * target.stride(2),
-            32 * target.stride(2),
-            target.stride(2),
-        ),
-    )
-    target_view.copy_(source_view)
-
-
-def _copy_gate_up_interleaved_reduction(
-    target: torch.Tensor,
-    source: torch.Tensor,
-    intermediate: int,
-) -> None:
-    """Copy ``(E,gate||up,N)`` into 32-row gate/up strip order."""
-
-    experts, gate_up, output = source.shape
-    if target.shape != source.shape or gate_up != 2 * intermediate:
-        raise ValueError("backward W1-transpose training weight shape mismatch")
-    pairs = intermediate // 32
-    source_view = source.view(
-        experts,
-        2,
-        pairs,
-        32,
-        output,
-    ).permute(0, 2, 1, 3, 4)
-    target_view = target.as_strided(
-        (experts, pairs, 2, 32, output),
-        (
-            target.stride(0),
-            64 * target.stride(1),
-            32 * target.stride(1),
-            target.stride(1),
-            target.stride(2),
-        ),
-    )
-    target_view.copy_(source_view)
 
 
 def _copy_blocked_scales_plain(
@@ -156,6 +84,46 @@ def _copy_blocked_scales_plain(
     ).copy_(source_view)
 
 
+def _copy_gate_up_interleaved_last(
+    target: torch.Tensor,
+    source: torch.Tensor,
+    intermediate: int,
+) -> None:
+    """Copy ``(E,K,gate||up)`` into 32-column gate/up strip order."""
+
+    experts, reduction, gate_up = source.shape
+    if target.shape != source.shape or gate_up != 2 * intermediate:
+        raise ValueError("forward FC1 training weight shape mismatch")
+    pairs = intermediate // 32
+    source_view = source.view(experts, reduction, 2, pairs, 32).permute(0, 1, 3, 2, 4)
+    target_view = target.as_strided(
+        (experts, reduction, pairs, 2, 32),
+        (
+            target.stride(0),
+            target.stride(1),
+            64 * target.stride(2),
+            32 * target.stride(2),
+            target.stride(2),
+        ),
+    )
+    target_view.copy_(source_view)
+
+
+def _copy_gate_up_interleaved_reduction(
+    target: torch.Tensor,
+    source: torch.Tensor,
+    intermediate: int,
+) -> None:
+    """Copy ``(E,gate||up,N)`` into 32-row gate/up strip order."""
+
+    experts, gate_up, output = source.shape
+    if target.shape != source.shape or gate_up != 2 * intermediate:
+        raise ValueError("backward W1-transpose training weight shape mismatch")
+    pairs = intermediate // 32
+    source_view = source.view(experts, 2, pairs, 32, output).permute(0, 2, 1, 3, 4)
+    target.view(experts, pairs, 2, 32, output).copy_(source_view)
+
+
 def _copy_blocked_scales_gate_up_rows(
     target: torch.Tensor,
     source: torch.Tensor,
@@ -167,34 +135,15 @@ def _copy_blocked_scales_gate_up_rows(
 
     experts = source.shape[0]
     raw_rows = 2 * intermediate
-    raw_columns = reduction_blocks
-    if tuple(source.shape) != (experts, raw_columns, raw_rows):
-        raise ValueError("forward FC1 training scale shape mismatch")
-    if intermediate % 64 or raw_columns % 4:
-        raise ValueError("forward FC1 scale pack requires intermediate divisible by 64 " "and reduction blocks divisible by 4")
-    row_blocks = raw_rows // 128
-    column_blocks = raw_columns // 4
+    if intermediate % 64 or reduction_blocks % 4:
+        raise ValueError("intermediate and reduction block alignment are invalid")
     source_view = (
         source.view(torch.uint8)
-        .view(
-            experts,
-            column_blocks,
-            4,
-            2,
-            row_blocks,
-            2,
-            32,
-        )
+        .view(experts, reduction_blocks // 4, 4, 2, raw_rows // 128, 2, 32)
         .permute(0, 4, 1, 6, 5, 3, 2)
     )
     target.view(torch.uint8).view(
-        experts,
-        row_blocks,
-        column_blocks,
-        32,
-        2,
-        2,
-        4,
+        experts, raw_rows // 128, reduction_blocks // 4, 32, 2, 2, 4
     ).copy_(source_view)
 
 
@@ -209,37 +158,15 @@ def _copy_blocked_scales_gate_up_columns(
 
     experts = source.shape[0]
     reduction_blocks = intermediate // 32
-    if tuple(source.shape) != (
-        experts,
-        2 * reduction_blocks,
-        output,
-    ):
-        raise ValueError("backward W1-transpose training scale shape mismatch")
     if output % 128 or reduction_blocks % 2:
-        raise ValueError("backward W1-transpose scale pack requires output divisible by " "128 and intermediate divisible by 64")
-    row_blocks = output // 128
-    column_blocks = reduction_blocks // 2
+        raise ValueError("output and reduction block alignment are invalid")
     source_view = (
         source.view(torch.uint8)
-        .view(
-            experts,
-            2,
-            column_blocks,
-            2,
-            row_blocks,
-            4,
-            32,
-        )
+        .view(experts, 2, reduction_blocks // 2, 2, output // 128, 4, 32)
         .permute(0, 4, 2, 6, 5, 3, 1)
     )
     target.view(torch.uint8).view(
-        experts,
-        row_blocks,
-        column_blocks,
-        32,
-        4,
-        2,
-        2,
+        experts, output // 128, reduction_blocks // 2, 32, 4, 2, 2
     ).copy_(source_view)
 
 
@@ -254,24 +181,53 @@ class Mxfp8BackwardWeights:
 
 
 class Mxfp8TrainingWeightBindings:
-    """Stable staging tensors refreshed from four pre-quantized sources."""
+    """Direct data bindings with persistent kernel-native scale staging."""
 
-    def __init__(self, weights: MoeEpTrainingWeights) -> None:
+    def __init__(
+        self,
+        weights: MoeEpTrainingWeights,
+        *,
+        fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP,
+    ) -> None:
         self.weights = weights
+        self.fc1_weight_layout = fc1_weight_layout
         fwd_fc1 = weights.forward_fc1
         fwd_fc2 = weights.forward_fc2
         bwd_w2t = weights.backward_w2_transpose
         bwd_w1t = weights.backward_w1_transpose
+        self._uses_direct_weight_bindings = (
+            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
+            and fwd_fc1.data.stride(1) == 1
+            and fwd_fc2.data.stride(1) == 1
+            and bwd_w2t.data.is_contiguous()
+            and bwd_w1t.data.is_contiguous()
+        )
+        if (
+            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
+            and not self._uses_direct_weight_bindings
+        ):
+            raise ValueError(
+                "weight_interleave_size=32 requires compact K-major forward "
+                "weights and contiguous backward transpose weights"
+            )
 
         self.forward = Mxfp8Weights(
-            fc1_weight=_empty_k_major_like(fwd_fc1.data),
+            fc1_weight=(
+                fwd_fc1.data
+                if self._uses_direct_weight_bindings
+                else _empty_k_major_like(fwd_fc1.data)
+            ),
             fc1_weight_sf=_empty_blocked_scales(
                 fwd_fc1,
                 raw_rows=fwd_fc1.data.shape[2],
                 raw_columns=fwd_fc1.data.shape[1] // 32,
                 dtype=torch.uint8,
             ),
-            fc2_weight=_empty_k_major_like(fwd_fc2.data),
+            fc2_weight=(
+                fwd_fc2.data
+                if self._uses_direct_weight_bindings
+                else _empty_k_major_like(fwd_fc2.data)
+            ),
             fc2_weight_sf=_empty_blocked_scales(
                 fwd_fc2,
                 raw_rows=fwd_fc2.data.shape[2],
@@ -280,14 +236,28 @@ class Mxfp8TrainingWeightBindings:
             ),
         )
         self.backward = Mxfp8BackwardWeights(
-            fc1_weight=_empty_k_major_like(bwd_w2t.data),
+            fc1_weight=(
+                bwd_w2t.data
+                if self._uses_direct_weight_bindings
+                else torch.empty_like(
+                    bwd_w2t.data,
+                    memory_format=torch.contiguous_format,
+                )
+            ),
             fc1_weight_sf=_empty_blocked_scales(
                 bwd_w2t,
                 raw_rows=bwd_w2t.data.shape[2],
                 raw_columns=bwd_w2t.data.shape[1] // 32,
                 dtype=torch.float8_e8m0fnu,
             ),
-            fc2_weight=_empty_k_major_like(bwd_w1t.data),
+            fc2_weight=(
+                bwd_w1t.data
+                if self._uses_direct_weight_bindings
+                else torch.empty_like(
+                    bwd_w1t.data,
+                    memory_format=torch.contiguous_format,
+                )
+            ),
             fc2_weight_sf=_empty_blocked_scales(
                 bwd_w1t,
                 raw_rows=bwd_w1t.data.shape[2],
@@ -304,20 +274,28 @@ class Mxfp8TrainingWeightBindings:
         fwd_fc2 = self.weights.forward_fc2
         bwd_w2t = self.weights.backward_w2_transpose
         bwd_w1t = self.weights.backward_w1_transpose
-        intermediate = fwd_fc2.data.shape[1]
 
-        _copy_gate_up_interleaved_last(
-            self.forward.fc1_weight,
-            fwd_fc1.data,
-            intermediate,
-        )
-        _copy_blocked_scales_gate_up_rows(
-            self.forward.fc1_weight_sf,
-            fwd_fc1.scale,
-            intermediate=intermediate,
-            reduction_blocks=fwd_fc1.data.shape[1] // 32,
-        )
-        _copy_k_major(self.forward.fc2_weight, fwd_fc2.data)
+        intermediate = fwd_fc2.data.shape[1]
+        if self._uses_direct_weight_bindings:
+            _copy_blocked_scales_plain(
+                self.forward.fc1_weight_sf,
+                fwd_fc1.scale,
+                raw_rows=fwd_fc1.data.shape[2],
+                raw_columns=fwd_fc1.data.shape[1] // 32,
+            )
+        else:
+            _copy_gate_up_interleaved_last(
+                self.forward.fc1_weight,
+                fwd_fc1.data,
+                intermediate,
+            )
+            _copy_blocked_scales_gate_up_rows(
+                self.forward.fc1_weight_sf,
+                fwd_fc1.scale,
+                intermediate=intermediate,
+                reduction_blocks=fwd_fc1.data.shape[1] // 32,
+            )
+            self.forward.fc2_weight.copy_(fwd_fc2.data)
         _copy_blocked_scales_plain(
             self.forward.fc2_weight_sf,
             fwd_fc2.scale,
@@ -325,24 +303,33 @@ class Mxfp8TrainingWeightBindings:
             raw_columns=fwd_fc2.data.shape[1] // 32,
         )
 
-        _copy_k_major(self.backward.fc1_weight, bwd_w2t.data)
+        if not self._uses_direct_weight_bindings:
+            self.backward.fc1_weight.copy_(bwd_w2t.data)
         _copy_blocked_scales_plain(
             self.backward.fc1_weight_sf,
             bwd_w2t.scale,
             raw_rows=bwd_w2t.data.shape[2],
             raw_columns=bwd_w2t.data.shape[1] // 32,
         )
-        _copy_gate_up_interleaved_reduction(
-            self.backward.fc2_weight,
-            bwd_w1t.data,
-            intermediate,
-        )
-        _copy_blocked_scales_gate_up_columns(
-            self.backward.fc2_weight_sf,
-            bwd_w1t.scale,
-            intermediate=intermediate,
-            output=bwd_w1t.data.shape[2],
-        )
+        if self._uses_direct_weight_bindings:
+            _copy_blocked_scales_plain(
+                self.backward.fc2_weight_sf,
+                bwd_w1t.scale,
+                raw_rows=bwd_w1t.data.shape[2],
+                raw_columns=bwd_w1t.data.shape[1] // 32,
+            )
+        else:
+            _copy_gate_up_interleaved_reduction(
+                self.backward.fc2_weight,
+                bwd_w1t.data,
+                intermediate,
+            )
+            _copy_blocked_scales_gate_up_columns(
+                self.backward.fc2_weight_sf,
+                bwd_w1t.scale,
+                intermediate=intermediate,
+                output=bwd_w1t.data.shape[2],
+            )
 
 
 __all__ = [

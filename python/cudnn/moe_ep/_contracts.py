@@ -6,12 +6,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal, Optional
 
 import torch
 
 from ._tuning import MoeEpTuningConfig
 from ._types import MoeTensor
+
+
+class Fc1WeightLayout(str, Enum):
+    """Logical gate/up ordering used by FC1 weights and their gradients."""
+
+    GATE_THEN_UP = "gate_then_up"
+    GATE_UP_INTERLEAVED_32 = "gate_up_interleaved_32"
+
+
+def normalize_fc1_weight_layout(weight_interleave_size: Optional[int]) -> Fc1WeightLayout:
+    """Normalize the public compatibility flag into the internal layout ABI."""
+
+    if weight_interleave_size is None:
+        return Fc1WeightLayout.GATE_THEN_UP
+    if weight_interleave_size == 32:
+        return Fc1WeightLayout.GATE_UP_INTERLEAVED_32
+    raise ValueError("weight_interleave_size must be None or 32")
 
 
 @dataclass(frozen=True)
@@ -39,6 +57,7 @@ class ForwardConfig:
     backward_wgrad_mode: Literal["none", "operands"] = "none"
     max_recv_size_per_rank: Optional[int] = None
     drop_on_overflow: bool = False
+    fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP
 
 
 @dataclass(frozen=True)
@@ -56,6 +75,8 @@ class ValidatedForwardRequest:
 
 
 __all__ = [
+    "Fc1WeightLayout",
     "ForwardConfig",
     "ValidatedForwardRequest",
+    "normalize_fc1_weight_layout",
 ]

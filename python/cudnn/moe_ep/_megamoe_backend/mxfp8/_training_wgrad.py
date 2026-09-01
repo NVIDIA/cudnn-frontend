@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..._contracts import Fc1WeightLayout
 from ..._types import MoeEpTrainingWgradOperands
 from ._launch import _to_cute
 
@@ -27,11 +28,13 @@ class Mxfp8TrainingWgradExporter:
         hidden: int,
         intermediate: int,
         sf_padding: int = 128,
+        fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP,
     ) -> None:
         self.experts = int(experts)
         self.hidden = int(hidden)
         self.intermediate = int(intermediate)
         self.sf_padding = int(sf_padding)
+        self.fc1_weight_layout = fc1_weight_layout
         self._compiled: dict[tuple[int, int, int | None], object] = {}
         self._lock = threading.RLock()
 
@@ -41,14 +44,10 @@ class Mxfp8TrainingWgradExporter:
         source: torch.Tensor,
         intermediate: int,
     ) -> None:
+        """Deinterleave FC1 dY while copying into K-major staging."""
         pool_rows = source.shape[0]
         pairs = intermediate // 32
-        source_view = source.view(pool_rows, pairs, 2, 32).permute(
-            0,
-            2,
-            1,
-            3,
-        )
+        source_view = source.view(pool_rows, pairs, 2, 32).permute(0, 2, 1, 3)
         target_view = target.as_strided(
             (pool_rows, 2, pairs, 32),
             (
@@ -120,12 +119,17 @@ class Mxfp8TrainingWgradExporter:
         if slot.col_quant_data.shape[0] != pool_rows:
             raise RuntimeError("forward/backward WGrad pool capacities differ")
 
-        self._copy_gate_up_data(
-            slot.wgrad_fc1_b,
-            slot.fc1_col_output,
-            self.intermediate,
-        )
-        slot.wgrad_fc2_a.copy_(slot.fc1_recompute.transpose(0, 1))
+        fc1_b = slot.fc1_col_output
+        if self.fc1_weight_layout is Fc1WeightLayout.GATE_THEN_UP:
+            if slot.wgrad_fc1_b is None:
+                raise RuntimeError("conventional W1 requires FC1 WGrad staging")
+            self._copy_gate_up_data(
+                slot.wgrad_fc1_b,
+                slot.fc1_col_output,
+                self.intermediate,
+            )
+            fc1_b = slot.wgrad_fc1_b
+
         self._expand_scales(
             slot.col_quant_sf,
             slot.valid_route_counts,
@@ -139,7 +143,11 @@ class Mxfp8TrainingWgradExporter:
             slot.expert_offsets,
             slot.wgrad_fc1_sfb,
             non_k_size=2 * self.intermediate,
-            deinterleave_gate_up=self.intermediate,
+            deinterleave_gate_up=(
+                self.intermediate
+                if self.fc1_weight_layout is Fc1WeightLayout.GATE_THEN_UP
+                else None
+            ),
         )
         self._expand_scales(
             slot.fc1_recompute_sf,
@@ -159,9 +167,9 @@ class Mxfp8TrainingWgradExporter:
         return MoeEpTrainingWgradOperands(
             fc1_a=slot.col_quant_data.transpose(0, 1),
             fc1_sfa=slot.wgrad_fc1_sfa,
-            fc1_b=slot.wgrad_fc1_b,
+            fc1_b=fc1_b,
             fc1_sfb=slot.wgrad_fc1_sfb,
-            fc2_a=slot.wgrad_fc2_a,
+            fc2_a=slot.fc1_recompute.transpose(0, 1),
             fc2_sfa=slot.wgrad_fc2_sfa,
             fc2_b=slot.grad_y2,
             fc2_sfb=slot.wgrad_fc2_sfb,

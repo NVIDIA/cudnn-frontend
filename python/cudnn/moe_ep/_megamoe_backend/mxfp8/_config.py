@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..._contracts import ForwardConfig
+from ..._contracts import Fc1WeightLayout, ForwardConfig
 from ._formats import combine_wire_format
 
 
@@ -25,6 +25,7 @@ class Mxfp8KernelConfig:
     top_k: int
     max_tokens_per_rank: int
     apply_topk_in_fc1: bool
+    fc1_weight_layout: Fc1WeightLayout
     gate_up_clamp: float | None
     generate_c: bool
     max_recv_size_per_rank: int | None = None
@@ -78,6 +79,7 @@ class Mxfp8KernelConfig:
             top_k=config.top_k,
             max_tokens_per_rank=config.max_tokens_per_rank,
             apply_topk_in_fc1=config.apply_topk_in_fc1,
+            fc1_weight_layout=config.fc1_weight_layout,
             gate_up_clamp=config.gate_up_clamp,
             generate_c=config.generate_c,
             max_recv_size_per_rank=max_recv_size_per_rank,
@@ -132,6 +134,7 @@ class Mxfp8KernelConfig:
             "max_recv_size_per_rank": self.max_recv_size_per_rank,
             "drop_on_overflow": self.drop_on_overflow,
             "apply_topk_in_fc1": self.apply_topk_in_fc1,
+            "fc1_weight_layout": self.fc1_weight_layout.value,
             "gate_up_clamp": self.gate_up_clamp,
             "generate_c": self.generate_c,
             "enable_col_quant": self.enable_col_quant,
