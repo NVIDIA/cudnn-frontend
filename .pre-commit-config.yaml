@@ -30,3 +30,12 @@ repos:
         types_or: [python, pyi, jupyter]
         additional_dependencies: [".[jupyter]"]
         args: ["--line-length", "160"]
+-   repo: local
+    hooks:
+    -   id: spdx-license-header
+        name: SPDX license header
+        description: "Every first-party source file carries an SPDX-License-Identifier line"
+        language: pygrep
+        entry: 'SPDX-License-Identifier:'
+        args: [--negate]
+        types_or: [c++, c, cuda, python]

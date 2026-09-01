@@ -3,8 +3,7 @@
 - [ ] I agree to license this contribution under the terms of [LICENSE.txt](https://github.com/NVIDIA/cudnn-frontend/blob/develop/LICENSE.txt).
 - [ ] I ran `pre-commit run` and committed any formatting changes.
 - [ ] I reviewed the Hard Rules in the `AGENTS.md` for each directory this PR touches (see [root AGENTS.md § Reviewing a PR](https://github.com/NVIDIA/cudnn-frontend/blob/develop/AGENTS.md#reviewing-a-pr-human-or-agent)) and my changes comply, or I explain the exception below.
-- [ ] I added GitHub labels: one `cat-*`, one or more `mod-*`, and one `orig-*` (see [label list](https://github.com/NVIDIA/cudnn-frontend/labels)).
-- [ ] I set the **Milestone** and **Projects** fields in the sidebar (required to merge; maintainers can set these for external contributions).
+- [ ] I added GitHub labels: one `cat-*`, one or more `area:*` / `op:*`, and one `orig-*` (see [label list](https://github.com/NVIDIA/cudnn-frontend/labels)).
 
 ## Affected area
 
