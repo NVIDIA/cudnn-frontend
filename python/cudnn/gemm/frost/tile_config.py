@@ -678,7 +678,21 @@ def _geom_sm120(
     )
 
 
-_SM120_SMEM_CAP_BYTES = 99 * 1024
+_SM120_SMEM_CAP_FALLBACK_BYTES = 99 * 1024
+def _sm120_smem_cap_bytes() -> int:
+    try:
+        from cudnn.frost.device import compute_capability, is_available, resolve_device
+
+        if not is_available():
+            return _SM120_SMEM_CAP_FALLBACK_BYTES
+        dev = resolve_device(None)
+        if compute_capability(dev)[0] != 12:
+            return _SM120_SMEM_CAP_FALLBACK_BYTES
+        return _sm_smem_budget_bytes_of(dev)
+    except Exception:
+        return _SM120_SMEM_CAP_FALLBACK_BYTES
+
+_SM120_SMEM_CAP_BYTES = _sm120_smem_cap_bytes()
 _SM120_SMEM_FIXED_RESERVE = 2048  # kernel_registry's default smem_fixed_reserve
 _SM120_STG_STAGE_ELEMS = 528  # f32 staging elems per compute warp (template _STG_EPI_WARP_ELEMS)
 
