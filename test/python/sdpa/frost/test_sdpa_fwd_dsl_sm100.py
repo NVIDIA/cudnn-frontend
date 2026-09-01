@@ -1510,6 +1510,30 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm100_thd_d256_multi_unit_per_cta(monkeypatch):
+    """d256 THD with more live units than the grid has clusters (issue #618).
+
+    The persistent grid is sized to the MACHINE, so a cluster claims units
+    repeatedly off the device-bounded counter. Every other d256 THD case is
+    small enough that each cluster is handed at most one unit, so none of them
+    re-enters the K/V pipeline for a second one -- the regime where an
+    unmatched consumer arrival used to desynchronise the next unit's producer
+    handshake. These lengths give 80 live units; FROST_THD_CLUSTERS pins the
+    grid to 4 clusters so the claim loop runs 20 deep regardless of the
+    device's SM count, and the unpinned pass covers the natural sizing.
+    """
+    _require_dsl()
+    lens = [1024, 768, 512, 256]  # (4+3+2+1) CGA tiles * 8 heads = 80 units
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=256, mask="causal", stats_layout="token_major")
+
+    monkeypatch.delenv("FROST_THD_CLUSTERS")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=256, mask="causal", stats_layout="head_major")
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host():
     """Issue #552 (D2H removal): the length tensors are consumed ONLY on
