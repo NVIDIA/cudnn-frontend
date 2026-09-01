@@ -986,9 +986,10 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
     """Padded top-k columns must carry exactly zero probability.
 
     They are zero-filled in shared memory rather than masked, so their score is
-    0 instead of -inf and their probability comes out as exp2(-LSE). Drive the
-    LSE far enough negative and that overflows, after which the dQ GEMM
-    multiplies +inf by the zeroed KV row and the whole tile becomes NaN.
+    0 instead of -inf and their probability is exp2(-LSE_log2). Drive the LSE
+    far enough negative that that exponent overflows FP32 (x > 128, i.e.
+    LSE < -ln(FLT_MAX) ≈ -88.72); the dQ GEMM then multiplies +inf by the
+    zeroed KV row and the whole tile becomes NaN unless those lanes are masked.
 
     Both padding layouts are covered: a compact top-k length whose tail does not
     fill the 64-row tile, and the non-compact layout where -1 marks padding.
@@ -1005,12 +1006,14 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     # Opposing signs make every score strongly negative, which is what pushes
-    # the LSE low enough for exp2(-LSE) to overflow. A deeply negative sink
-    # keeps the softmax mass on the KV rows so O, and hence dP_sum, stay
-    # non-negligible -- with the mass on the sink instead the overflow would be
-    # multiplied by zero and stay hidden.
-    q = (2.0 + torch.randn(s_q, num_heads, head_dim, device=device) * 0.01).to(torch.bfloat16)
-    kv = (-2.0 + torch.randn(s_kv, head_dim, device=device) * 0.01).to(torch.bfloat16)
+    # the LSE past the FP32 exp2 overflow. Magnitude 2.2 (not 2.0) is required:
+    # for d=512, q≈+2 / kv≈-2 / 100 live keys gives LSE ≈ -4*sqrt(512)+ln(100)
+    # ≈ -85.9, whose log2 exponent is ~124 and does *not* overflow exp2.
+    # A deeply negative sink keeps the softmax mass on the KV rows so O, and
+    # hence dP_sum, stay non-negligible — with the mass on the sink instead the
+    # overflow would be multiplied by zero and stay hidden.
+    q = (2.2 + torch.randn(s_q, num_heads, head_dim, device=device) * 0.01).to(torch.bfloat16)
+    kv = (-2.2 + torch.randn(s_kv, head_dim, device=device) * 0.01).to(torch.bfloat16)
     attn_sink = torch.full((num_heads,), -400.0, dtype=torch.float32, device=device)
 
     # The non-compact case sizes topk_idxs to a non-multiple of the 64-row tile
@@ -1036,9 +1039,14 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
         topk_length=topk_length,
         softmax_scale=softmax_scale,
     )
-    # Self-check: without a sufficiently negative LSE this stops being a
-    # regression test, because exp2(-LSE) no longer overflows.
-    assert lse.max() < -80, f"LSE not negative enough to exercise the overflow: {lse.max()}"
+    # Self-check: padded columns have S=0, so p = exp2(-LSE * log2(e)).
+    # FP32 exp2 overflows for exponents > 128. The least-negative LSE must
+    # clear that with margin; lse.max() < -80 is not enough (threshold is
+    # -ln(FLT_MAX) ≈ -88.72).
+    lse_log2_overflow = -lse.max().item() * math.log2(math.e)
+    assert lse_log2_overflow > 128.0 + 4.0, (
+        f"padded-column exp2 overflow not exercised: -LSE_log2={lse_log2_overflow} " f"(need > 132); lse.max()={lse.max().item()}"
+    )
     dout = torch.randn_like(out)
 
     dq_buffer = torch.full_like(q, float("nan"))
@@ -1087,6 +1095,7 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
     "sink_value",
     [
         pytest.param(2.4e38, id="finite-but-rescale-overflows"),
+        pytest.param(-2.4e38, id="neg-finite-but-rescale-overflows"),
         pytest.param(float("inf"), id="pos-inf"),
         pytest.param(float("-inf"), id="neg-inf"),
     ],
@@ -1115,17 +1124,21 @@ def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value):
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
 
-    # A saturating sink makes the reference forward itself degenerate, so build
-    # out/lse against a neutral sink and only feed the saturating value to the
-    # backward, which is where the fold happens.
+    # out/lse must come from the same sink the backward sees: FlashMLA-style
+    # out is sink-normalized while lse is KV-only. d_sink = -p_sink * (O·dO).
     out, lse = ref_sparse_attention_forward(
         q,
         kv,
-        torch.zeros_like(attn_sink),
+        attn_sink,
         topk_idxs,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
     )
+    # PyTorch exp(-inf - inf) NaNs the masked lanes when sink is +inf; the
+    # consistent sink-normalized output is zero. LSE is KV-only and finite.
+    if sink_value == float("inf"):
+        assert torch.isfinite(lse).all()
+        out = torch.zeros_like(out)
     dout = torch.randn_like(out)
 
     dq_buffer = torch.full_like(q, float("nan"))
@@ -1150,13 +1163,31 @@ def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value):
     assert torch.isfinite(dkv).all()
     assert torch.isfinite(d_sink).all()
 
+    # Saturating |sink| makes p_sink 0 or 1. Positive: O underflows to 0, so
+    # d_sink is 0 and no KV row is attended. Negative: p_sink is 0, so d_sink
+    # is 0 and the KV softmax is unchanged.
+    assert torch.equal(d_sink, torch.zeros_like(d_sink))
     if sink_value > 0:
-        # The sink takes the whole softmax denominator, so no KV row is
-        # attended and d_sink absorbs all of dP_sum.
+        assert torch.equal(out, torch.zeros_like(out))
         assert torch.equal(dq, torch.zeros_like(dq))
         assert torch.equal(dkv, torch.zeros_like(dkv))
-        expected_d_sink = -(out.float() * dout.float()).sum(-1).sum(0)
-        torch.testing.assert_close(d_sink, expected_d_sink, atol=1e-4, rtol=1e-4)
+    else:
+        check_ref_dsa_sparse_attention_backward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            out,
+            dout,
+            lse,
+            dq,
+            dkv,
+            d_sink,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            atol=5e-2,
+            rtol=5e-2,
+        )
 
 
 @pytest.mark.L0

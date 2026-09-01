@@ -335,19 +335,11 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                         LOG2_E = math.log2(math.e)
                         lse_log2 = lse_row * LOG2_E
                         sink_log2 = mAttnSink[head_idx] * LOG2_E
-                        # p_sink is the two-way softmax weight of the sink
-                        # against the KV LSE. Taking it as a sigmoid is
-                        # algebraically the same as
-                        # exp2(sink - logaddexp2(lse, sink)) but stays finite
-                        # when either term saturates: the max-shifted logaddexp
-                        # evaluates inf - inf = NaN, and attn_sink reaches that
-                        # through the log2(e) rescale above already for
-                        # |sink| > 3.4e38 / log2(e).
+                        # Sigmoid form of the two-way softmax weight; stays finite
+                        # when either operand saturates.
                         p_sink = Float32(1.0) / (Float32(1.0) + cute.math.exp2(lse_log2 - sink_log2))
-                        # Equal exponents split the mass evenly; this also
-                        # catches the difference being NaN because both
-                        # saturate the same way, where there is no mass to
-                        # attribute (dP_sum is zero for such a row anyway).
+                        # inf == inf is true, so both-saturating operands split
+                        # evenly instead of leaving p_sink as NaN from inf - inf.
                         if lse_log2 == sink_log2:
                             p_sink = Float32(0.5)
                         if lse_row == Float32.inf:
@@ -398,18 +390,21 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                     if cutlass.const_expr(mAttnSink is not None):
                         sink_log2 = mAttnSink[head_idx] * LOG2_E
                         lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        # Shift by the maximum only while it is finite. A
-                        # saturating operand otherwise turns the shift into
-                        # inf - inf = NaN, and this LSE feeds every exp2() in
-                        # the main kernel, so the whole of dQ/dKV goes with it.
-                        # An infinite maximum is already the logaddexp result.
-                        if lse_max_log2 != Float32.inf:
-                            if lse_max_log2 != -Float32.inf:
+                        # Max-shift only while the maximum is finite; an
+                        # infinite max is already the logaddexp result.
+                        # Seed before the staged ifs (CuTeDSL SSA).
+                        lse_with_sink_log2 = lse_max_log2
+                        if lse_max_log2 == Float32.inf:
+                            lse_with_sink_log2 = Float32.inf
+                        else:
+                            if lse_max_log2 == -Float32.inf:
+                                lse_with_sink_log2 = -Float32.inf
+                            else:
                                 sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                                lse_max_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        lse_log2 = lse_max_log2
+                                lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
                         if lse == Float32.inf:
-                            lse_log2 = Float32.inf
+                            lse_with_sink_log2 = Float32.inf
+                        lse_log2 = lse_with_sink_log2
                     gLSElog2[tidx] = lse_log2
 
 
@@ -1183,17 +1178,11 @@ class FlashAttentionDSABackwardSm90:
             load_Q, _, _ = tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
             load_dO, _, _ = tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO, single_stage=True)
 
-            # A nonpositive top-k length means no KV row contributes to this
-            # query, so dQ is exactly zero and WG1 runs zero mainloop
-            # iterations. Skip everything WG1 is not also skipping:
-            #  - the cross-warpgroup named barriers below (G4_half_ready,
-            #    sdS_consumed) would otherwise be waited on by WG0 alone;
-            #  - the Q/dO TMA lands in sQ, which WG1's epilogue writes. On the
-            #    mainloop path the sP_ready/sdS_ready handshake orders that
-            #    load ahead of both epilogues; with the mainloop skipped there
-            #    is no such ordering, and an in-flight Q load would overwrite
-            #    the zeros WG1 already stored to sQ[256:].
-            # The epilogue itself still runs, so caller-owned dQ is written.
+            # Empty top-k: skip everything WG1 also skips. The 256-thread
+            # barriers (G4_half_ready, sdS_consumed) would otherwise wait on
+            # WG0 alone. The Q/dO TMA lands in sQ, which WG1's epilogue
+            # writes; without the mainloop handshake it races that store.
+            # The epilogue still runs so caller-owned dQ is written.
             if topK > 0:
                 if warp_idx_in_wg == 0:
                     with cute.arch.elect_one():
@@ -1309,8 +1298,7 @@ class FlashAttentionDSABackwardSm90:
                     number_of_threads=self.num_mma_threads,
                 )
             else:
-                # No GEMM4 ran, so the accumulators still hold whatever the
-                # registers happened to contain.
+                # No GEMM4 ran; zero the dQ accumulators before the epilogue.
                 acc_dQ_0.fill(0.0)
                 acc_dQ_1.fill(0.0)
 
@@ -1526,16 +1514,11 @@ class FlashAttentionDSABackwardSm90:
 
         # (3) Softmax: P = exp2(S * scale_log2 - LSE)
         #
-        # Padded KV columns are zero-filled in sKV rather than masked, so their
-        # score is exactly 0 instead of -inf and the lane's probability comes
-        # out as exp2(-LSE). For a strongly negative LSE that overflows to
-        # +inf, and GEMM4 below multiplies it by the zeroed KV row, turning the
-        # whole dQ tile into NaN. Force those lanes to probability zero.
-        #
-        # A column is padding in two ways, matching how the gather above filled
-        # it: past the top-k tail (only the first n_block can be partial, so
-        # this costs nothing in the steady-state loop), or, in the non-compact
-        # layout, flagged by a negative top-k index.
+        # Padded columns are zero-filled in sKV, so their score is 0 rather
+        # than -inf. Force those lanes to probability zero.
+        # Compact: past the top-k tail (peeled first n_block only).
+        # Non-compact: a negative top-k index. Positive OOB indices and
+        # compact entries in [0, topK) are trusted as valid KV rows.
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
         COL = const_expr(1 if not self.SdP_swapAB else 0)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -1545,11 +1528,8 @@ class FlashAttentionDSABackwardSm90:
                 if is_first:
                     p = Float32(0.0) if col >= num_valid_rows else p
                 if const_expr(not self.have_topk_length):
-                    # `col` still runs to tile_n - 1 in the peeled partial tile,
-                    # and max_topk need not be a multiple of tile_n, so clamp
-                    # before the load or the row is read past its end. Lanes
-                    # past the tail were zeroed just above and this guard only
-                    # ever zeroes, so the clamped entry cannot change the result.
+                    # Peeled tile still spans tile_n columns; clamp so a
+                    # partial non-compact row is not read past its end.
                     idx = n_block * self.tile_n + col
                     idx = idx if idx < self.max_topk else Int32(self.max_topk - 1)
                     if mTopkIdxs_cur[idx] < 0:
@@ -2038,10 +2018,7 @@ class FlashAttentionDSABackwardSm90:
                 n_block -= 1
                 first_iter = False
 
-            # A nonpositive top-k length skips the mainloop entirely, so the
-            # G4_half GEMMs never ran their zero_init=first_iter pass and the
-            # accumulators still hold whatever the registers happened to
-            # contain. An empty top-k row contributes nothing to dQ.
+            # Empty top-k skipped the G4_half zero_init=first_iter pass.
             if topK <= 0:
                 acc_dQ_2.fill(0.0)
                 acc_dQ_3.fill(0.0)
