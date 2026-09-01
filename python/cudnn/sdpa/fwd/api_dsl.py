@@ -29,6 +29,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams, pack_gqa_supported
+from cudnn.sdpa.fwd.kernels._d192_sm100_policy import apply_d192_template_policy
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -1230,129 +1231,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
-        _pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
-        lpt_head_group = 1
-        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q // _pack_g) % 8 == 0:
-            lpt_head_group = 8
-        lpt_q_tiles = 0
-        if self._fp8 and self.flavor == (192, 128) and not self.thd:
-            lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
-        lpt_l2_size_mib = 0
-        d192_lpt_groups = self.batch_size * self.h_q // _pack_g
-        d192_lpt_l2_8k = (
-            self.flavor == (192, 128) and sched_policy == SCHED_LPT_L2 and not self.thd and self.split_kv == 1 and self.s_q_max == 8192 and self.s_k_max == 8192
-        )
-        if d192_lpt_l2_8k and self._pertensor and self.dtype == torch.float8_e4m3fn and d192_lpt_groups % 24 != 0 and d192_lpt_groups % 16 == 0:
-            # At 8K, the default 60 MiB budget groups 24 K/V heads. A 40 MiB
-            # group holds 16 and avoids a short final group for these grids.
-            lpt_l2_size_mib = 40
-        elif d192_lpt_l2_8k and not self._fp8 and d192_lpt_groups % 12 != 0 and d192_lpt_groups % 8 == 0:
-            # Half inputs double the per-head K/V footprint: 60 MiB groups 12
-            # heads, while 40 MiB groups 8 and avoids the same short tail.
-            lpt_l2_size_mib = 40
-        template_window_right = self.window_right
-        if (
-            self._fp8
-            and self._pertensor
-            and self.flavor == (192, 128)
-            and self.window_left is None
-            and self.window_right is None
-            and not self.seq_kv_lens_present
-        ):
-            # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-            # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
-            # selects the equivalent masked-interior lowering.
-            template_window_right = self.s_k_max
         dtype_qkv_code = _SM100_DTYPE_QKV_CODE[self.dtype]
-        # For an unpadded square matrix the bottom-right diagonal shift
-        # S_KV-S_Q is zero, so it can reuse the measured top-left specialization.
-        d192_square_br_as_tl = (
-            self.flavor == (192, 128)
-            and self.split_kv == 1
-            and not self.thd
-            and not self.seq_q_lens_present
-            and not self.seq_kv_lens_present
-            and self.window_left is None
-            and self.window_right == 0
-            and self.causal_bottom_right
-            and self.s_q_max == self.s_k_max
-            and 4096 < self.s_k_max <= 8192
-        )
-        template_bottom_right = False if d192_square_br_as_tl else self.causal_bottom_right
-        d192_mx_dense_mid_causal_cga1 = (
-            mxfp8
-            and self.flavor == (192, 128)
-            and self.split_kv == 1
-            and not self.thd
-            and self.window_left is None
-            and self.window_right == 0
-            and not template_bottom_right
-            and 4096 < self.s_k_max <= 8192
-            and (dtype_qkv_code == DTYPE_E5M2 or self.s_q_max >= 4096)
-        )
-        if d192_mx_dense_mid_causal_cga1:
-            sched_policy = SCHED_NATURAL
-        # Per-tensor D192 favors independent CTAs for dense sliding windows and
-        # E5M2 no-mask.  Keep cga2's KV reuse for causal, THD, and split-KV.
-        d192_pt_cga1 = (
-            self._pertensor
-            and self.flavor == (192, 128)
-            and self.split_kv == 1
-            and not self.thd
-            and (
-                self.window_left is not None
-                or (dtype_qkv_code == DTYPE_E5M2 and self.window_right is None)
-                or (
-                    dtype_qkv_code == DTYPE_E4M3
-                    and self.dtype_o in (torch.float8_e4m3fn, torch.float8_e5m2)
-                    and self.window_left is None
-                    and self.window_right == 0
-                    and not template_bottom_right
-                )
-            )
-        )
-        d192_mx_cga1 = False
-        # D192 MX cga1 trades two-CTA cooperation for twice as many independent
-        # cluster work assignments and half the KV stage depth. Small packed
-        # SWA tiles need cga2's reuse;
-        # masked dense and sufficiently long packed tiles favor cga1.
-        if mxfp8 and self.flavor == (192, 128) and self.split_kv == 1:
-            masked = self.window_right is not None
-            sliding = self.window_left is not None
-            if self.thd:
-                if dtype_qkv_code == DTYPE_E5M2 and not masked:
-                    d192_mx_cga1 = True
-                elif masked and sliding:
-                    min_s_k = 4096 if dtype_qkv_code == DTYPE_E4M3 else 2048
-                    d192_mx_cga1 = self.s_k_max >= min_s_k
-                elif masked:
-                    d192_mx_cga1 = self.s_k_max >= 2048
-            elif masked:
-                d192_mx_cga1 = dtype_qkv_code == DTYPE_E4M3 or sliding or self.s_k_max <= 4096
-        if d192_mx_dense_mid_causal_cga1:
-            d192_mx_cga1 = True
         from cudnn import data_type as _cudnn_dtype
 
         params = Sm100TemplateParams(
             dtype_qkv=dtype_qkv_code,
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
-            window_right=template_window_right,
-            bottom_right=template_bottom_right,
+            window_right=self.window_right,
+            bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
-            lpt_head_group=lpt_head_group,
-            lpt_q_tiles=lpt_q_tiles,
-            lpt_l2_size_mib=lpt_l2_size_mib,
             thd_varlen=self.thd,
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
-            cta_mma=1 if d192_pt_cga1 or d192_mx_cga1 else 2,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+        )
+        params = apply_d192_template_policy(
+            params,
+            flavor=self.flavor,
+            pertensor=self._pertensor,
+            batch_size=self.batch_size,
+            h_q=self.h_q,
+            pack_gqa_ratio=(self.h_q // self.h_kv) if self.pack_gqa else 1,
+            s_q=self.s_q_max,
+            s_kv=self.s_k_max,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:

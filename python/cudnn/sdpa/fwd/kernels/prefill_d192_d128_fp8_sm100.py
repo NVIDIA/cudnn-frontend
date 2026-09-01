@@ -46,6 +46,7 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 from dataclasses import dataclass
 
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
+from cudnn.sdpa.fwd.kernels._d192_sm100_policy import with_d192_lpt_l2_budget
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
@@ -293,13 +294,13 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
 
 # LPT reverse-row counts are expressed in the selected CGA tile units.
+_SCHED_CFG = with_d192_lpt_l2_budget(CFG, PARAMS)
 _sdpa_h = make_sdpa_helpers(
-    CFG,
+    _SCHED_CFG,
     lpt_q_tiles_in_cga_units=True,
     grouped_lpt=True,
     lpt_head_group=PARAMS.lpt_head_group,
     lpt_q_tiles=PARAMS.lpt_q_tiles,
-    lpt_l2_size_mib=PARAMS.lpt_l2_size_mib,
 )
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
@@ -366,11 +367,10 @@ _nomask_range_split = _split_h.nomask_range_split
 _partial_batch = _split_h.partial_batch
 
 _sdpa_h_mma_runtime = make_sdpa_helpers(
-    CFG,
+    _SCHED_CFG,
     lpt_q_tiles_in_cga_units=True,
     grouped_lpt=True,
     lpt_head_group=PARAMS.lpt_head_group,
-    lpt_l2_size_mib=PARAMS.lpt_l2_size_mib,
 )
 _dispatch_decode_initial_mma = _sdpa_h_mma_runtime.dispatch_decode_initial
 _dispatch_decode_payload_mma = _sdpa_h_mma_runtime.dispatch_decode_payload

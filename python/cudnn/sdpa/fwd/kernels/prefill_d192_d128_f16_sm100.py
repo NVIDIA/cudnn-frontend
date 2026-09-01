@@ -52,6 +52,7 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 from dataclasses import dataclass
 
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
+from cudnn.sdpa.fwd.kernels._d192_sm100_policy import with_d192_lpt_l2_budget
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body executes; a plain import falls back to
@@ -213,9 +214,9 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 THD_PERSISTENT = True
 
 
-# This flavor is cga2-only (CTA_MMA=2), so its LPT q-tile accounting in the
-# shared helper stays in CGA-tile units.
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True, lpt_l2_size_mib=PARAMS.lpt_l2_size_mib)
+# LPT q-tile accounting is expressed in CGA-tile units. The D192-only policy
+# may adjust the scheduler's effective L2 grouping budget for this module.
+_sdpa_h = make_sdpa_helpers(with_d192_lpt_l2_budget(CFG, PARAMS), lpt_q_tiles_in_cga_units=True)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 
