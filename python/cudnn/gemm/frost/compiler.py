@@ -3430,13 +3430,29 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
+_TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
+
+
 def plan_config(chain: FusionChain) -> TileConfig:
+    """Choose the automatic tile strategy for one analyzed fusion chain."""
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
         tile_m = (chain.matmul.M + chain.moe.num_groups - 1) // chain.moe.num_groups
+    declared_rows = chain.matmul.M if chain.moe is not None else chain.matmul.M * chain.matmul.batch
+    force_cta_group = None
+    if chain.num_gemms == 1 and chain.has_block_scale and chain.quants and declared_rows <= _TERMINAL_QUANT_ONE_CTA_MAX_M:
+        # A terminal block-scale quantizer adds a substantial epilogue drain.
+        # Keep both M tiles independently scheduled over the measured row
+        # envelope instead of coupling them in a 2-CTA MMA pair. For dense
+        # batches, every batch contributes M rows; for MoE, total M is the only
+        # plan-time upper bound on a runtime expert group -- the average in
+        # tile_m cannot bound device-resident offsets.
+        # select_config still scores the cluster after this strategy choice;
+        # no cluster shape is pinned here.
+        force_cta_group = 1
     config = select_config(
         tile_m,
         chain.matmul.N,
@@ -3445,6 +3461,7 @@ def plan_config(chain: FusionChain) -> TileConfig:
         block_scale=chain.has_block_scale,
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
+        force_cta_group=force_cta_group,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
