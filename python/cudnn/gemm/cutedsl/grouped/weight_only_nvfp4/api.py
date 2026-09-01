@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import cutlass
 from cutlass import cute
@@ -18,6 +18,9 @@ from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.tensor_adapter import detect_framework, get_data_ptr, get_device
 
 from . import _kernel_sm100
+
+if TYPE_CHECKING:
+    import torch
 
 Epilogue = Literal["linear", "squared_relu"]
 
