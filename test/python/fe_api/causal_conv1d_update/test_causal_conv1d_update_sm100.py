@@ -600,6 +600,7 @@ os._exit(9)
 """
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize("case", ["below_padding", "out_of_range", "duplicate"])
 def test_invalid_state_indices_fail_closed_in_fresh_process(case):
     # A CUDA device assert poisons its process context.  Keep each contract

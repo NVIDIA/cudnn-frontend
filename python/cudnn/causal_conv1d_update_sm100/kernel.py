@@ -79,7 +79,10 @@ def _causal_conv1d_update_kernel(
             # Decode batches are small.  A lane-zero scan keeps the operation
             # single-kernel while failing closed on duplicate mutable slots.
             # Padding rows do not own state, so repeated -1 entries are valid.
-            if slot >= cutlass.Int32(0):
+            if slot >= cutlass.Int32(0) and channel_tile == cutlass.Int32(0):
+                # A trap in the first channel tile aborts the whole launch;
+                # repeating this O(N^2) scan in every channel tile adds no
+                # validation coverage.
                 previous_row = cutlass.Int32(0)
                 while previous_row < row:
                     inline_ptx(
@@ -199,7 +202,10 @@ def _causal_conv1d_update_l3_kernel(
         if tidx == cutlass.Int32(0):
             inline_ptx("trap;", predicate=slot < cutlass.Int32(-1))
             inline_ptx("trap;", predicate=slot >= n_slots)
-            if slot >= cutlass.Int32(0):
+            if slot >= cutlass.Int32(0) and channel_tile == cutlass.Int32(0):
+                # A trap in the first channel tile aborts the whole launch;
+                # repeating this O(N^2) scan in every channel tile adds no
+                # validation coverage.
                 previous_row = cutlass.Int32(0)
                 while previous_row < row:
                     inline_ptx(
