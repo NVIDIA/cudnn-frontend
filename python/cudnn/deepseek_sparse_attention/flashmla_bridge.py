@@ -31,6 +31,7 @@ import math
 from dataclasses import dataclass
 from importlib import import_module, metadata as importlib_metadata
 from inspect import signature
+from numbers import Real
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -223,7 +224,12 @@ def _resolve_flashmla_sparse_fwd() -> Callable[..., Tuple[torch.Tensor, torch.Te
 
 
 def _normalize_softmax_scale(softmax_scale: Optional[float], head_dim: int) -> float:
-    scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else float(softmax_scale)
+    if softmax_scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+    else:
+        if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, Real):
+            raise TypeError(f"softmax_scale must be a host real scalar or None, got {type(softmax_scale).__name__}")
+        scale = float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"softmax_scale must be finite and positive, got {scale}")
     return scale

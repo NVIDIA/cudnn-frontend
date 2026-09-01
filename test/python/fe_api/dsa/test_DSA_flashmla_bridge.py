@@ -63,6 +63,28 @@ def test_sparse_attention_forward_rejects_unsupported_semantic_contract(monkeypa
 
 
 @pytest.mark.L0
+def test_sparse_attention_forward_rejects_device_softmax_scale_without_sync(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
+    monkeypatch.setattr(
+        bridge,
+        "_resolve_flashmla_sparse_fwd",
+        lambda: pytest.fail("an invalid host scalar must be rejected before resolving a provider"),
+    )
+    device = torch.device("cuda")
+    q = torch.empty((1, 64, 512), dtype=torch.bfloat16, device=device)
+    kv = torch.empty((1, 512), dtype=torch.bfloat16, device=device)
+    indices = torch.empty((1, 64), dtype=torch.int32, device=device)
+    device_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with pytest.raises(TypeError, match="host real scalar"):
+            DSA.sparse_attention_forward(q, kv, indices, softmax_scale=device_scale)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("heads,head_dim,topk", [(32, 576, 65), (64, 512, 64), (128, 512, 129)])
 def test_sparse_attention_forward_preserves_semantic_output_contract(monkeypatch, heads, head_dim, topk):
     observed = []
