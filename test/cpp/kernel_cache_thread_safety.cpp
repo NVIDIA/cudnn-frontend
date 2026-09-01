@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <cudnn_frontend.h>
