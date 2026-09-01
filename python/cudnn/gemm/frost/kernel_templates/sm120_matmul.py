@@ -7,11 +7,12 @@ dynamic scheduler (2-stage ring) + warp-level MMA.
 Operand/output layouts: A may be K- or M-major and B K- or N-major — an
 MN-major operand is TMA-loaded in ``*_tma_group_elems``-wide MN groups (same
 row bytes as a K-major row, so both share ``ab_tma_swizzle``) and its
-fragments come through ``ldmatrix.trans``, which is a 16-bit-granule
-instruction: 8-bit operands must be K-major (enforced upstream and by the
-render guard below). The output may be N- or M-major; the M-major store is
-the per-element scatter ``epilogue_codegen`` emits, so the epilogue loop here
-is layout-agnostic.
+fragments come through a transposing ldmatrix: the classic ``.trans`` b16
+form for 16-bit dtypes, and the SM 12x byte-granule ``m16n16.trans.b8`` form
+for 8-bit dtypes (sub-byte dtypes have no transposed load and must be
+K-major; enforced upstream and by the render guard below). The output may be
+N- or M-major; the M-major store is the per-element scatter
+``epilogue_codegen`` emits, so the epilogue loop here is layout-agnostic.
 """
 
 from __future__ import annotations
@@ -120,10 +121,18 @@ assert (
     EPI_REG_COUNT * 32 * NUM_COMPUTE_WARPS + PROD_REG_COUNT * 32 * (NUM_WARPS - NUM_COMPUTE_WARPS) <= 64 * 1024
 ), f"register budget: {WARPS_M}x{WARPS_N} compute warps at {EPI_REG_COUNT} regs/thread exceed the 64K-regs/CTA file"
 assert not multicast_a and not multicast_b, "sm120 has no TMA multicast (no clusters)"
-# MN-major operands ride ldmatrix.trans (16-bit granule): 8-bit A/B must be K-major.
-assert _ELEM_BITS == 16 or (
+# MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
+# m16n16.trans.b8 (SM 12x byte granule) for 8-bit ones. No sub-byte form exists.
+assert _ELEM_BITS in (16, 8) or (
     not a_is_m_major and not b_is_n_major
-), "sm120 MN-major operand loads use ldmatrix.trans (16-bit granule); 8-bit operands must be K-major"
+), "sm120 MN-major operand loads use ldmatrix.trans (b16) / ldmatrix.m16n16.trans.b8; sub-byte operands must be K-major"
+# One m16n16.b8 tile spans 16 N bytes = two n-frags, and its 16B row addresses
+# must stay 16-aligned for every warp column, so the warp N tile must hold
+# whole frag pairs. Every constructible ConfigSm120 satisfies this (it enforces
+# warp_tile_n % mma_tile_n(=16) == 0); the assert guards the template constants.
+assert (
+    _ELEM_BITS != 8 or not b_is_n_major or _N_FRAGS % 2 == 0
+), f"sm120 8-bit N-major B pairs n-frags per m16n16.b8 load; warp N tile {_WARP_TILE_N} is not a multiple of 16"
 assert not a_is_m_major or cta_tile_mnk[0] % a_tma_group_elems == 0, "M-major A: cta_tile_m must be a whole number of TMA groups"
 assert not b_is_n_major or cta_tile_mnk[1] % b_tma_group_elems == 0, "N-major B: cta_tile_n must be a whole number of TMA groups"
 # Non-fp4 output only — enforced upstream by Sm120KernelTemplate._extra_reject.
@@ -526,7 +535,9 @@ def _kernel(
         # B x2 tail: one n-frag (rows 0-7 x two 16B cols; lanes 16-31 unused).
         b_ldm_tail_row = lane % 8
         b_ldm_tail_col16 = (lane // 8) % 2
-        # Transposed (MN-major SMEM) maps: rows run along K, 16B units along M/N.
+        # Transposed (MN-major SMEM) maps for the b16 form: rows run along K,
+        # 16B units along M/N. (The 8-bit m16n16.trans.b8 form needs no map: its
+        # two tiles' 16 k-row addresses are simply k = kb_base + lane.)
         # ldmatrix.trans keeps the x4 reg->tile order, so the tile-to-lane-group
         # assignment is chosen to reproduce the SAME fragment order as above.
         # A trans x4 tiles: (m0-7,k0-7), (m8-15,k0-7), (m0-7,k8-15), (m8-15,k8-15).
@@ -568,10 +579,30 @@ def _kernel(
                 for k_blk in cutlass.range_constexpr(_NUM_K_BLOCKS):
                     kb_base = k_blk * _K_BLK_ELEMS
                     a_frags = []
-                    if cutlass.const_expr(a_is_m_major):
+                    if cutlass.const_expr(a_is_m_major and _ELEM_BITS == 8):
+                        # Byte-granule transpose (ldmatrix.m16n16.x2.trans.b8): both
+                        # tiles are 16 k-rows x 16 m-bytes at the frag's M base —
+                        # lanes 0-15 address the k half kb..kb+15, lanes 16-31 the
+                        # half kb+16..kb+31 (k = kb_base + lane for every lane) —
+                        # and the four result regs land directly as mma.sync a0..a3.
+                        for mf in cutlass.range_constexpr(_M_FRAGS):
+                            a_m = warp_row * _WARP_TILE_M + mf * 16
+                            a_off = (
+                                (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS) + (kb_base + lane) * a_tma_group_elems + a_m % a_tma_group_elems
+                            )
+                            a_frags.append(
+                                nvvm.ldmatrix(
+                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                    4,
+                                    nvvm.MMALayout.COL,
+                                    shape=nvvm.LoadShape.M16N16,
+                                    src_format=nvvm.LoadSrcFormat.B8,
+                                )
+                            )
+                    elif cutlass.const_expr(a_is_m_major):
                         # M-major SMEM: group g holds K_tile rows of
                         # a_tma_group_elems M elements; ldmatrix.trans transposes
-                        # each (k x m) 8x8 tile back into the (m x k) fragment.
+                        # each (k x m) 8x8 b16 tile back into the (m x k) fragment.
                         for mf in cutlass.range_constexpr(_M_FRAGS):
                             a_m = warp_row * _WARP_TILE_M + mf * 16 + at_ldm_m8 * 8
                             a_off = (
@@ -598,7 +629,27 @@ def _kernel(
                                 )
                             )
                     b_frags = []
-                    if cutlass.const_expr(b_is_n_major):
+                    if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
+                        # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
+                        # transposed columns span n-frags (2p, 2p+1), so the result
+                        # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses
+                        # mirror the A-side b8 form: k = kb_base + lane, no lane map.
+                        # (_N_FRAGS is even here — asserted at render.)
+                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                            b_n = warp_col * _WARP_TILE_N + npair * 16
+                            b_off = (
+                                (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS) + (kb_base + lane) * b_tma_group_elems + b_n % b_tma_group_elems
+                            )
+                            bv = nvvm.ldmatrix(
+                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                4,
+                                nvvm.MMALayout.COL,
+                                shape=nvvm.LoadShape.M16N16,
+                                src_format=nvvm.LoadSrcFormat.B8,
+                            )
+                            b_frags.append((bv[0], bv[2]))
+                            b_frags.append((bv[1], bv[3]))
+                    elif cutlass.const_expr(b_is_n_major):
                         for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
                             b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
                             b_off = (

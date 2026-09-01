@@ -416,28 +416,35 @@ class Sm120KernelTemplate(KernelTemplate):
     asserts in the template source; encoding it here lets the funnel (and the
     jit paths, via ``active_reject``) reject cleanly instead of faulting
     mid-render. All eight A/B/output major combinations are served, with two
-    carve-outs: an MN-major operand rides ``ldmatrix.trans`` (a 16-bit-granule
-    instruction, so 8-bit operands must be K-major), and an N-major output
-    stores whole (n, n+1) accumulator pairs (an M-major output scatters per
-    element, so its chunk may narrow freely). Non-fp4 output only."""
+    carve-outs: an MN-major operand rides a transposing ldmatrix (the b16 form
+    for 16-bit dtypes, the SM 12x byte-granule ``m16n16.trans.b8`` form for
+    8-bit ones — sub-byte dtypes have no transposed load and must be K-major),
+    and an N-major output stores whole (n, n+1) accumulator pairs (an M-major
+    output scatters per element, so its chunk may narrow freely). Non-fp4
+    output only."""
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        from .dtypes import DTYPE_BYTES
+        from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
         mm = chain.matmul
-        if mm.a_major == "m" and DTYPE_BYTES[mm.a_dtype] != 2:
-            return f"{self.file} loads MN-major operands with ldmatrix.trans (16-bit " f"granule); {mm.a_dtype} A must be K-major"
-        if mm.b_major == "n" and DTYPE_BYTES[mm.b_dtype] != 2:
-            return f"{self.file} loads MN-major operands with ldmatrix.trans (16-bit " f"granule); {mm.b_dtype} B must be K-major"
+        if mm.a_major == "m" and DTYPE_BITS[mm.a_dtype] not in (16, 8):
+            return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.a_dtype} A must be K-major"
+        if mm.b_major == "n" and DTYPE_BITS[mm.b_dtype] not in (16, 8):
+            return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.b_dtype} B must be K-major"
+        # (The template also asserts _N_FRAGS is even for an 8-bit N-major B —
+        # one m16n16.b8 tile spans two n-frags. No funnel mirror is needed:
+        # every constructible ConfigSm120 satisfies it, because construction
+        # enforces warp_tile_n % mma_tile_n(=16) == 0.)
         if mm.a_major == "m" or mm.b_major == "n":
-            # Same rule _render_tile_constants raises ValueError on: an MN-major
-            # operand's per-MMA SMEM slice must be whole swizzle groups.
+            # Mirror of _render_tile_constants' rule. The sm120 ldmatrix path
+            # has no per-MMA SMEM descriptors (that is a tcgen05 fact), so only
+            # the WHOLE extent must cut into whole swizzle groups -- that is
+            # what the template's TMA group walk needs.
             elem_bytes = DTYPE_BYTES[mm.a_dtype]
             group = config.cta_tile_k_bytes // elem_bytes
             cta_smem_m, cta_smem_n, _ = config.cta_smem_tile_mnk(elem_bytes)
-            mma_smem_m = cta_smem_m // config.mma_size_m
-            if mm.a_major == "m" and (mma_smem_m < group or mma_smem_m % group):
-                return f"{self.file}: M-major A per-MMA SMEM extent {mma_smem_m} is not a " f"whole number of {group}-element swizzle groups"
+            if mm.a_major == "m" and (cta_smem_m < group or cta_smem_m % group):
+                return f"{self.file}: M-major A SMEM extent {cta_smem_m} is not a " f"whole number of {group}-element swizzle groups"
             if mm.b_major == "n" and (cta_smem_n < group or cta_smem_n % group):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":

@@ -273,9 +273,12 @@ def _compatible(
         )
     cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
-    # Each MMA instruction reads its own M sub-block of the SMEM tile, so the
-    # swizzle-group rule applies per MMA (== the whole extent at mma_size_m == 1).
-    mma_smem_m = cta_smem_m // cfg.mma_size_m
+    # Each tcgen05 MMA instruction reads its own M sub-block of the SMEM tile
+    # through its own descriptor, so the swizzle-group rule applies per MMA. A
+    # warp-scoped family (fixed mma tile: sm120) has no per-MMA descriptors --
+    # only the whole extent must cut into whole groups (the TMA group walk).
+    _per_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    mma_smem_m = cta_smem_m // _per_mma
     mma_smem_n = cta_smem_n
     if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
         return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
@@ -284,10 +287,16 @@ def _compatible(
     if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
     if cfg.pipeline == "sm120":
-        # MN-major operands ride ldmatrix.trans (16-bit granule): 8-bit A/B must
-        # be K-major. All eight major combinations are served for 16-bit inputs.
-        if in_eb != 2 and (a_major == "m" or b_major == "n"):
-            return False, (f"sm120 MN-major operands are 16-bit only (ldmatrix.trans), " f"got {in_dtype} A {a_major}-major / B {b_major}-major")
+        # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
+        # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
+        # dtypes have no transposed load and must be K-major. (The n-frag pair
+        # rule for 8-bit N-major B is met by every catalog config, whose
+        # warp_tile_n = mma_size_n * 16.)
+        in_bits = 4 if in_dtype == "fp4_e2m1" else in_eb * 8
+        if in_bits not in (16, 8) and (a_major == "m" or b_major == "n"):
+            return False, (
+                f"sm120 MN-major operands are 16- or 8-bit only (ldmatrix.trans " f"b16 / m16n16.b8), got {in_dtype} A {a_major}-major / B {b_major}-major"
+            )
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
@@ -3234,9 +3243,10 @@ def test_sm120_template_routing() -> None:
 
 def test_sm120_scope_gates() -> None:
     """The scope contract rejects through the registry (never a template
-    AssertionError mid-render): all eight major combinations pass for 16-bit
-    inputs, MN-major 8-bit operands are rejected (ldmatrix.trans is a 16-bit
-    instruction), and an N-major output needs a pair-storable epilogue chunk."""
+    AssertionError mid-render): all eight major combinations pass for both
+    16-bit inputs (b16 ldmatrix.trans) and 8-bit inputs (byte-granule
+    ldmatrix.m16n16.trans.b8), and an N-major output needs a pair-storable
+    epilogue chunk."""
     from cudnn.gemm.frost.kernel_registry import select_template
 
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
@@ -3245,23 +3255,20 @@ def test_sm120_scope_gates() -> None:
     def scope_reject(in_dt="bf16", **graph_kw):
         return tmpl._extra_reject(analyze(_build_graph(256, 256, 128, in_dt, "bf16", **graph_kw)), cfg)
 
-    # 16-bit inputs: every major combination is in scope.
-    for a_major in ("k", "m"):
-        for b_major in ("k", "n"):
-            for out_major in ("n", "m"):
-                assert scope_reject(a_major=a_major, b_major=b_major, out_major=out_major) is None, (a_major, b_major, out_major)
+    # 16-bit and 8-bit inputs: every major combination is in scope.
+    for in_dt in ("bf16", "fp8_e4m3"):
+        for a_major in ("k", "m"):
+            for b_major in ("k", "n"):
+                for out_major in ("n", "m"):
+                    assert scope_reject(in_dt=in_dt, a_major=a_major, b_major=b_major, out_major=out_major) is None, (in_dt, a_major, b_major, out_major)
+    assert scope_reject(in_dt="fp8_e5m2", a_major="m", b_major="n") is None
 
-    # 8-bit inputs must be K-major; K-major 8-bit stays in scope.
-    assert scope_reject(in_dt="fp8_e4m3") is None
-    assert "K-major" in scope_reject(in_dt="fp8_e4m3", a_major="m")
-    assert "K-major" in scope_reject(in_dt="fp8_e4m3", b_major="n")
-    assert "K-major" in scope_reject(in_dt="fp8_e5m2", a_major="m")
-
-    # the funnel offers sm120 points for an MN-major 16-bit chain
+    # the funnel offers sm120 points for MN-major 16-bit AND 8-bit chains
     from cudnn.gemm.frost.kernel_registry import candidates
 
-    nmaj = analyze(_build_graph(256, 256, 128, "bf16", "bf16", b_major="n"))
-    assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"]
+    for in_dt in ("bf16", "fp8_e4m3"):
+        nmaj = analyze(_build_graph(256, 256, 128, in_dt, "bf16", a_major="m", b_major="n"))
+        assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"], in_dt
 
 
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
@@ -3332,16 +3339,19 @@ def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> N
     ],
     ids=lambda n: n.removeprefix("CONFIG_sm120_"),
 )
-def test_sm120_warp_grid_axis(config_name: str) -> None:
+@pytest.mark.parametrize("a_major", ["k", "m"], ids=["Ak", "Am"])
+def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     """The warp grid is a real geometry axis: every grid (and a non-flagship
-    CTA tile) computes the same matmul on a tail-heavy shape."""
+    CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
+    the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
+    M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
     cfg = _resolve(config_name)
     M, N, K = 192, 192, 160
-    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)
     if not ok:
         pytest.skip(reason)
-    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16"), config=cfg)
-    a, b, c = _mkdata(M, N, K, "bf16", "bf16")
+    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16", a_major=a_major), config=cfg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major)
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
     ref = _reference(a, b, "bf16")
@@ -3349,7 +3359,7 @@ def test_sm120_warp_grid_axis(config_name: str) -> None:
     tol = _tolerance("bf16", "bf16")
     bad = int((diff > tol).sum().item())
     assert bad == 0, (
-        f"\n  config:    {config_name}"
+        f"\n  config:    {config_name} A-{a_major}-major"
         f"\n  shape:     {M}x{N}x{K}"
         f"\n  bad:       {bad}/{diff.numel()}"
         f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"

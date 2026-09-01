@@ -799,10 +799,9 @@ def _render_tile_constants(
         # SMEM extent) to be a whole number of swizzle groups.
         mn_slice = mn_extent // num_mma
         if mn_slice < mn_group_elems or mn_slice % mn_group_elems != 0:
+            what = f"per-MMA SMEM extent {mn_slice}" if num_mma > 1 else f"SMEM extent {mn_slice}"
             raise ValueError(
-                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: "
-                f"per-MMA SMEM extent {mn_slice} is not a multiple of the "
-                f"{mn_group_elems}-element swizzle group"
+                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: " f"{what} is not a multiple of the " f"{mn_group_elems}-element swizzle group"
             )
         group_elems = mn_group_elems
         return (
@@ -812,7 +811,8 @@ def _render_tile_constants(
             group_elems,
         )
 
-    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", cfg.mma_size_m)
+    _desc_num_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", _desc_num_mma)
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
     # Byte step from one MMA sub-block to the next inside the SMEM tile. Same
     # formula for both majors: a K-major tile is (MN x K) rows of
@@ -2889,18 +2889,22 @@ def _check_dtype_config_compat(
                 f"in one box per operand"
             )
     mn_group_elems = config.cta_tile_k_bytes // elem_bytes
-    # Each MMA instruction's operand descriptor starts at its own MN sub-block,
-    # so the check is on the PER-MMA slice (== the whole extent at num_mma == 1).
+    # Each tcgen05 MMA instruction's operand descriptor starts at its own MN
+    # sub-block, so the check is on the PER-MMA slice. A warp-scoped family
+    # (fixed mma tile, e.g. sm120) has no per-MMA descriptors -- only the whole
+    # extent must cut into whole groups (the TMA group walk) -- so num_mma == 1.
+    _per_mma = 1 if getattr(type(config), "FIXED_MMA_TILE_MN", None) is not None else config.mma_size_m
     if chain.matmul.a_major == "m":
-        slice_m = config.cta_tile_m // config.mma_size_m
+        slice_m = config.cta_tile_m // _per_mma
+        what = f"per-MMA M={slice_m}" if _per_mma > 1 else f"M={slice_m}"
         if slice_m < mn_group_elems:
             raise ValueError(
                 f"TileConfig {config.name!r} cannot use M-major A for "
-                f"dtype={chain.matmul.a_dtype!r}: per-MMA M={slice_m} "
+                f"dtype={chain.matmul.a_dtype!r}: {what} "
                 f"is smaller than the {mn_group_elems}-element swizzle group"
             )
         if slice_m % mn_group_elems != 0:
-            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"per-MMA M={slice_m} is not divisible by " f"swizzle group {mn_group_elems}")
+            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"{what} is not divisible by " f"swizzle group {mn_group_elems}")
     if chain.matmul.b_major == "n":
         slice_n = config.cta_smem_tile_mnk(elem_bytes)[1]
         if slice_n < mn_group_elems:
