@@ -57,13 +57,6 @@ def dtype_name(buffer) -> str:
     return str(buffer.dtype).rsplit(".", 1)[-1]
 
 
-def _flatten_f8_128x4_storage(sf: torch.Tensor) -> torch.Tensor:
-    """Flatten an opaque F8_128x4 tensor in physical byte order."""
-
-    full_storage = sf.storage_offset() == 0 and sf.untyped_storage().nbytes() == sf.numel() * sf.element_size()
-    return sf.as_strided((sf.numel(),), (1,)) if full_storage else sf.contiguous().reshape(-1)
-
-
 _SM100_FLAVORS = (
     (128, 128),
     (192, 128),
@@ -1896,8 +1889,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         never from ``sf.shape[0]``, and only the total size is validated.
         """
         b = self.batch_size
-        # Bind full-storage tensors in physical byte order; pack storage views.
-        flat = _flatten_f8_128x4_storage(sf)
+        flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         if flat.numel() != b * h * n_tiles * sf_smem_size:
@@ -1922,7 +1914,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
         every tile is empty there, so no SF byte is ever loaded."""
-        flat = _flatten_f8_128x4_storage(sf)
+        flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
         flat = flat.reshape(-1)

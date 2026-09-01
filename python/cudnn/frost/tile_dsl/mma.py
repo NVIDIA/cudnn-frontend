@@ -103,7 +103,18 @@ def desc_opaque(value):
 
 
 @cute.jit
-def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=None, accumulate: bool = False, k_start: int = 0, k_count=None):
+def mma_ss(
+    desc,
+    desc_a_base,
+    desc_b_base,
+    tmem_c,
+    tmem_sf_a=None,
+    tmem_sf_b=None,
+    accumulate: bool = False,
+    k_start: int = 0,
+    k_count=None,
+    elect_once: bool = False,
+):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1
     else:
@@ -119,6 +130,10 @@ def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=Non
     enable_input_d = accumulate
     SF_CYCLE = 4
     SF_REGISTERS_PER_BLOCK = 4
+    if cutlass.const_expr(elect_once):
+        elected = nvvm.elect_sync()
+    else:
+        elected = cutlass.Boolean(True)
     for kk in cutlass.range_constexpr(k_count):
         k = k_start + kk
         ki_a = k % sps_a
@@ -129,7 +144,11 @@ def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=Non
         inc_b = (intra_b * ki_b + subtile_b * s_b) >> 4
         da = desc_a_base + inc_a
         db = desc_b_base + inc_b
-        if nvvm.elect_sync():
+        if cutlass.const_expr(elect_once):
+            issue_mma = elected
+        else:
+            issue_mma = nvvm.elect_sync()
+        if issue_mma:
             if cutlass.const_expr(desc.is_block_scale):
                 sf_id = (k * desc.sf_blocks_per_step) % SF_CYCLE
                 sf_group = (k * desc.sf_blocks_per_step) // SF_CYCLE
@@ -199,7 +218,17 @@ def mma_ts(desc, tmem_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=Non
 
 
 @cute.jit
-def mma_ts_step(desc, tmem_a_base, desc_b_base, tmem_c, k_idx: int, accumulate, tmem_sf_a=None, tmem_sf_b=None):
+def mma_ts_step(
+    desc,
+    tmem_a_base,
+    desc_b_base,
+    tmem_c,
+    k_idx: int,
+    accumulate,
+    tmem_sf_a=None,
+    tmem_sf_b=None,
+    issue_mma=None,
+):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1
     else:
@@ -209,7 +238,9 @@ def mma_ts_step(desc, tmem_a_base, desc_b_base, tmem_c, k_idx: int, accumulate, 
     db = desc_b_base + increment
     SF_CYCLE = 4
     SF_REGISTERS_PER_BLOCK = 4
-    if nvvm.elect_sync():
+    if cutlass.const_expr(issue_mma is None):
+        issue_mma = nvvm.elect_sync()
+    if issue_mma:
         if cutlass.const_expr(desc.is_block_scale):
             sf_id = (k_idx * desc.sf_blocks_per_step) % SF_CYCLE
             sf_group = (k_idx * desc.sf_blocks_per_step) // SF_CYCLE
