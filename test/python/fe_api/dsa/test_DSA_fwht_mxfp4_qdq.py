@@ -4,6 +4,7 @@
 """Tests for the DeepSeek-V4 normalized H128 plus MXFP4 QDQ operation."""
 
 from importlib import import_module
+from importlib.util import find_spec
 
 import pytest
 import torch
@@ -20,12 +21,41 @@ def _require_operation():
     """Return the operation only when all lazy optional dependencies exist."""
 
     _require_supported_device()
-    try:
-        import_module("cudnn.ops._fwht_mxfp4_qdq_cutedsl")
-        from cudnn.ops import fwht_mxfp4_qdq
-    except ImportError as error:
-        pytest.skip(f"CuTe DSL optional dependencies are unavailable: {error}")
+    if find_spec("cutlass") is None:
+        pytest.skip("CuTe DSL optional dependency 'cutlass' is unavailable")
+
+    # Once the optional package is discoverable, an ImportError means the
+    # installed dependency or this operation is broken.  Let it fail the test
+    # instead of hiding the regression as an environment skip.
+    import_module("cudnn.ops._fwht_mxfp4_qdq_cutedsl")
+    from cudnn.ops import fwht_mxfp4_qdq
+
     return fwht_mxfp4_qdq
+
+
+@pytest.mark.L0
+def test_require_operation_skips_only_when_cutlass_is_absent(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setitem(globals(), "find_spec", lambda _name: None)
+
+    with pytest.raises(pytest.skip.Exception, match="cutlass"):
+        _require_operation()
+
+
+@pytest.mark.L0
+def test_require_operation_propagates_internal_import_errors(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setitem(globals(), "find_spec", lambda _name: object())
+
+    def broken_internal_import(_name):
+        raise ImportError("internal import failure")
+
+    monkeypatch.setitem(globals(), "import_module", broken_internal_import)
+
+    with pytest.raises(ImportError, match="internal import failure"):
+        _require_operation()
 
 
 def _pow2_ceil_positive(values: torch.Tensor) -> torch.Tensor:
@@ -358,7 +388,7 @@ def test_fwht_mxfp4_qdq_respects_non_default_torch_stream():
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch.no_grad()
 def test_fwht_mxfp4_qdq_warmed_cuda_graph_capture_and_replay():
     fwht_mxfp4_qdq = _require_operation()
