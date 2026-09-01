@@ -1208,11 +1208,22 @@ def test_fp8_d512_thd_sink_stats():
 @_skip_d512_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d512_thd_zero_len_kv():
-    """THD on d512 with a zero-length KV sequence: those Q rows are dead
-    (O := 0, LSE := -inf) and must not poison amax_o."""
+    """Zero-length KV and Q sequences on d512 (the d128 sibling's shapes).
+
+    The zero-KV sequence's rows are dead: the epilogue must return O := 0 /
+    LSE := -inf rather than the unwritten O TMEM, and those rows must not
+    poison amax_o -- which, on this flavor, is what the single select on the
+    row's scalar amax result guards.
+    """
     out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=_D512_SCALE, stats=True, d=_D512)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    # The whole ragged Stats buffer, live rows included -- not just the dead
+    # ones, or a wrong-but-finite LSE on the live sequences would pass.
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2, equal_nan=False)
     assert torch.equal(lse[:126], torch.full_like(lse[:126], float("-inf"))), "dead rows must report LSE = -inf"
+    # ... and a zero-length Q sequence, which contributes no tile at all.
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e5m2", scale=_D512_SCALE, d=_D512)
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
 
 
 @pytest.mark.L0
