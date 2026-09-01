@@ -906,6 +906,7 @@ def select_config(
     b_n_major: bool = False,
     b_elem_bytes: int = 2,
     sm_count: int | None = None,
+    force_cta_group: int | None = None,
 ) -> TileConfig:
     """Pick a TileConfig from problem geometry.
 
@@ -919,12 +920,17 @@ def select_config(
     ``K`` is optional only for callers that do not have it to hand; without it the
     small-K bias is neutral and everything else is unchanged. The pick is an sm100
     geometry; a caller building for another template family passes it through
-    :func:`as_pipeline`.
+    :func:`as_pipeline`. ``force_cta_group`` overrides only the 1-CTA/2-CTA
+    strategy heuristic; tile and cluster geometry are still selected and scored
+    normally for that final strategy.
     """
     sm = sm_count if sm_count is not None else _sm_count()
     x = max(1, num_gemms)
     # Multi-GEMM shares the 256-wide N budget across the parallel GEMMs.
     cta_n_max = max(32, min(256, _floor_pow2(256 // x)))
+
+    if force_cta_group not in (None, 1, 2) or isinstance(force_cta_group, bool):
+        raise ValueError(f"force_cta_group must be None, 1, or 2; got {force_cta_group!r}")
 
     # --- tile ---------------------------------------------------------------
     rep_m = min(_floor_pow2(max(1, M)), 4096)
@@ -949,7 +955,14 @@ def select_config(
 
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
     # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
-    cta_group = 1 if x > 1 else (2 if M > cta_m else 1)
+    if x > 1:
+        if force_cta_group == 2:
+            raise NotImplementedError("multi-GEMM is 1ctamma-only; cannot force cta_group=2")
+        cta_group = 1
+    elif force_cta_group is not None:
+        cta_group = force_cta_group
+    else:
+        cta_group = 2 if M > cta_m else 1
 
     if block_scale:
         cta_m = max(cta_m, 128)
