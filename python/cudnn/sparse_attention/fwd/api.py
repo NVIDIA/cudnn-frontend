@@ -35,16 +35,17 @@ Contract summary (normative — kernels must match the reference exactly):
 
 Tensor inputs are framework tensors (anything dlpack-compatible — torch,
 JAX, numpy): validation runs on canonical descriptors (cutlass dtypes,
-adapter devices) and never requires torch. Each backend declares which
-frameworks it can execute and fails loudly otherwise (both current backends
-execute torch tensors).
+adapter devices) and never requires torch. Each registered kernel declares
+which frameworks it can execute and fails loudly otherwise.
 
-Backends: ``"default"`` dispatches to registered device kernels — currently
-the SM100 DSA sparse-prefill kernel for its envelope (THD, MQA latent with
-K aliased as V, ``D_k in (512, 576)``, shared token-granularity indices),
-when that module is present in the tree — and raises ``NotImplementedError``
-otherwise. ``"reference"`` is an explicit opt-in PyTorch implementation used
-for validation; reference-speed by design, never selected implicitly.
+Execution dispatches to registered device kernels — currently the SM100 DSA
+sparse-prefill kernel for its envelope (THD, MQA latent with K aliased as V,
+``D_k in (512, 576)``, shared token-granularity indices), when that module
+is present in the tree. Configurations no kernel serves raise
+``NotImplementedError`` from ``check_support``. The normative reference
+implementation lives with the tests
+(``test/python/sparse_attention/sparse_attention_reference.py``), which is
+also the oracle every kernel is validated against.
 """
 
 from __future__ import annotations
@@ -65,20 +66,14 @@ from cudnn.tensor_adapter import detect_framework, get_compute_capability, get_d
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import cuda.bindings.driver as cuda
 
-_BACKENDS = ("default", "reference")
-
-
-def _validate_backend(backend: str) -> None:
-    if backend not in _BACKENDS:
-        raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
-
 
 def _get_dsa_prefill_kernel():
     """Probe for the SM100 DSA sparse-prefill kernel (ships on its own branch).
 
     Returns the wrapper or ``None``. The generic op registers it as the
-    ``backend="default"`` implementation for its envelope when present, so
-    this module stays landable (and raising) on trees without the kernel.
+    dispatch target for its envelope when present, so this module stays
+    landable (and raising ``NotImplementedError``) on trees without the
+    kernel.
     """
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_forward import (
@@ -118,10 +113,8 @@ class SparseAttentionForward(APIBase):
         sample_cu_seqlens_q: Optional[Any] = None,
         index_granularity: int = 1,
         softmax_scale: Optional[float] = None,
-        backend: str = "default",
     ):
         super().__init__()
-        _validate_backend(backend)
 
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q", canonical=True)
         self.k_desc = self._make_tensor_desc(sample_k, name="sample_k", canonical=True)
@@ -133,12 +126,11 @@ class SparseAttentionForward(APIBase):
 
         self.index_granularity = int(index_granularity)
         self.softmax_scale = softmax_scale
-        self.backend = backend
 
         # Derived in check_support().
         self.is_thd = None
         self.group_scope = None  # G: 1, H_kv, or H_q
-        self._dispatch = None  # device-kernel wrapper for backend="default"
+        self._dispatch = None  # registered device-kernel wrapper (set in check_support)
 
     # ------------------------------------------------------------------
     # Validation
@@ -271,30 +263,27 @@ class SparseAttentionForward(APIBase):
             f"All inputs must share Q's device {ref_device}, got {[d.device for d in descriptors]}",
         )
 
-        # ---- backend envelope ----
-        self._dispatch = None
-        if self.backend == "default":
-            # SM100 DSA sparse-prefill kernel envelope: THD, MQA latent
-            # (H_kv == 1, K aliased as V), shared indices, token granularity,
-            # D_k in {512, 576} (576 splits QK=576 / V=512).
-            in_dsa_envelope = (
-                self.is_thd
-                and self.group_scope == 1
-                and self.index_granularity == 1
-                and h_kv == 1
-                and d_k in (512, 576)
-                and d_v == (512 if d_k == 576 else d_k)
-                and major == 10
-            )
-            kernel = _get_dsa_prefill_kernel() if in_dsa_envelope else None
-            self._not_implemented_error_if(
-                kernel is None,
-                "sparse_attention_forward has no device kernel registered for this "
-                "configuration; the SM100 DSA sparse-prefill kernel serves THD MQA-latent "
-                "(H_kv=1, K aliased as V, D_k in (512, 576), G=1, granularity=1) when its "
-                'module is present. Pass backend="reference" for the PyTorch path.',
-            )
-            self._dispatch = kernel
+        # ---- kernel dispatch ----
+        # SM100 DSA sparse-prefill kernel envelope: THD, MQA latent
+        # (H_kv == 1, K aliased as V), shared indices, token granularity,
+        # D_k in {512, 576} (576 splits QK=576 / V=512).
+        in_dsa_envelope = (
+            self.is_thd
+            and self.group_scope == 1
+            and self.index_granularity == 1
+            and h_kv == 1
+            and d_k in (512, 576)
+            and d_v == (512 if d_k == 576 else d_k)
+            and major == 10
+        )
+        kernel = _get_dsa_prefill_kernel() if in_dsa_envelope else None
+        self._not_implemented_error_if(
+            kernel is None,
+            "sparse_attention_forward: no registered kernel supports this configuration; "
+            "the SM100 DSA sparse-prefill kernel serves THD MQA-latent (H_kv=1, K aliased "
+            "as V, D_k in (512, 576), G=1, granularity=1) when its module is present",
+        )
+        self._dispatch = kernel
 
         self._is_supported = True
         return True
@@ -321,145 +310,26 @@ class SparseAttentionForward(APIBase):
     ) -> tuple[Any, Any]:
         if self._compiled_kernel is None:
             self.compile()
-        # The CONTRACT is framework-neutral (any dlpack tensor); each BACKEND
+        # The CONTRACT is framework-neutral (any dlpack tensor); each KERNEL
         # declares the frameworks it executes, request-or-fail.
         framework = detect_framework(q)
         if framework != "torch":
-            raise NotImplementedError(f"the {self.backend!r} backend currently executes torch tensors only, got {framework!r} inputs")
-        if self.backend == "default":
-            # K is V aliasing is part of this kernel's envelope; the sample
-            # descriptors cannot see storage, so verify on the real tensors.
-            d_v = v.shape[-1]
-            if get_data_ptr(v) != get_data_ptr(k) or v.shape[0] != k.shape[0]:
-                raise ValueError("the registered DSA sparse-prefill kernel requires V to alias K's storage (MLA latent); pass v as a view of k")
-            result = self._dispatch(
-                q,
-                k[:, 0, :],
-                topk_idxs,
-                attn_sink=attn_sink,
-                topk_length=topk_length,
-                softmax_scale=self.softmax_scale,
-                stream=current_stream,
-            )
-            return result["out"][:, :, :d_v], result["lse"]
-        assert self.backend == "reference"
-        # The reference path runs ordinary PyTorch ops on the caller's
-        # current stream; `current_stream` is accepted for signature parity.
-        return _reference_forward(
+            raise NotImplementedError(f"the registered kernel currently executes torch tensors only, got {framework!r} inputs")
+        # K is V aliasing is part of this kernel's envelope; the sample
+        # descriptors cannot see storage, so verify on the real tensors.
+        d_v = v.shape[-1]
+        if get_data_ptr(v) != get_data_ptr(k) or v.shape[0] != k.shape[0]:
+            raise ValueError("the registered DSA sparse-prefill kernel requires V to alias K's storage (MLA latent); pass v as a view of k")
+        result = self._dispatch(
             q,
-            k,
-            v,
+            k[:, 0, :],
             topk_idxs,
-            topk_length=topk_length,
             attn_sink=attn_sink,
-            index_granularity=self.index_granularity,
+            topk_length=topk_length,
             softmax_scale=self.softmax_scale,
-            group_scope=self.group_scope,
-            is_thd=self.is_thd,
+            stream=current_stream,
         )
-
-
-# ----------------------------------------------------------------------
-# Reference implementation (normative semantics; reference speed)
-# ----------------------------------------------------------------------
-def _reference_forward(
-    q: Any,
-    k: Any,
-    v: Any,
-    topk_idxs: Any,
-    *,
-    topk_length: Optional[Any],
-    attn_sink: Optional[Any],
-    index_granularity: int,
-    softmax_scale: Optional[float],
-    group_scope: int,
-    is_thd: bool,
-) -> tuple[Any, Any]:
-    import torch
-
-    g = index_granularity
-
-    if is_thd:
-        t_q, h_q, d_k = q.shape
-        t_kv, h_kv, _ = k.shape
-        d_v = v.shape[-1]
-        q_flat, k_flat, v_flat = q, k, v
-        idxs = topk_idxs.reshape(t_q, -1, topk_idxs.shape[-1]) if topk_idxs.ndim == 3 else topk_idxs.reshape(t_q, 1, -1)
-        kv_bound = torch.full((t_q,), t_kv, dtype=torch.int64, device=q.device)
-        kv_base = torch.zeros((t_q,), dtype=torch.int64, device=q.device)
-    else:
-        b, s_q, h_q, d_k = q.shape
-        _, s_kv, h_kv, _ = k.shape
-        d_v = v.shape[-1]
-        t_q = b * s_q
-        q_flat = q.reshape(t_q, h_q, d_k)
-        k_flat = k.reshape(b * s_kv, h_kv, d_k)
-        v_flat = v.reshape(b * s_kv, h_kv, d_v)
-        idxs = topk_idxs.reshape(t_q, -1, topk_idxs.shape[-1])
-        if topk_idxs.ndim == 3:  # (B, S_q, topk) -> G = 1
-            idxs = idxs.reshape(t_q, 1, -1)
-        # BSHD ids are within-sequence; each query row gathers from its own
-        # batch's KV segment of the flattened stream.
-        batch_of_row = torch.arange(b, device=q.device, dtype=torch.int64).repeat_interleave(s_q)
-        kv_bound = torch.full((t_q,), s_kv, dtype=torch.int64, device=q.device)
-        kv_base = batch_of_row * s_kv
-
-    n_groups = idxs.shape[1]
-    topk_max = idxs.shape[-1]
-    heads_per_kv = h_q // h_kv
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(d_k)
-
-    length = None
-    if topk_length is not None:
-        length = topk_length.reshape(t_q, n_groups) if group_scope != 1 else topk_length.reshape(t_q, 1)
-
-    idxs = idxs.to(torch.int64)
-    slot = torch.arange(topk_max, device=q.device)
-    valid = idxs >= 0  # (T_q, n_groups, topk_max)
-    if length is not None:
-        valid = valid & (slot.view(1, 1, -1) < length.unsqueeze(-1))
-
-    # Expand granularity-g entries to token ids: entry i covers [i*g, i*g+g).
-    token_ids = idxs.unsqueeze(-1) * g + torch.arange(g, device=q.device).view(1, 1, 1, g)
-    token_valid = valid.unsqueeze(-1) & (token_ids < kv_bound.view(-1, 1, 1, 1))
-    token_ids = token_ids.reshape(t_q, n_groups, topk_max * g)
-    token_valid = token_valid.reshape(t_q, n_groups, topk_max * g)
-    gather_ids = (token_ids.clamp(min=0) + kv_base.view(-1, 1, 1)).clamp(max=k_flat.shape[0] - 1)
-
-    out_t = torch.zeros(t_q, h_q, d_v, dtype=q.dtype, device=q.device)
-    lse_t = torch.full((t_q, h_q), float("-inf"), dtype=torch.float32, device=q.device)
-
-    for h in range(h_q):
-        kv_head = h // heads_per_kv
-        if group_scope == 1:
-            grp = 0
-        elif group_scope == h_kv:
-            grp = kv_head
-        else:  # group_scope == h_q
-            grp = h
-        ids_h = gather_ids[:, grp, :]  # (T_q, K')
-        valid_h = token_valid[:, grp, :]
-        kk = k_flat[:, kv_head, :].float()[ids_h]  # (T_q, K', D_k)
-        vv = v_flat[:, kv_head, :].float()[ids_h]  # (T_q, K', D_v)
-        s = torch.einsum("td,tkd->tk", q_flat[:, h, :].float(), kk) * softmax_scale
-        s = torch.where(valid_h, s, torch.full_like(s, float("-inf")))
-
-        row_lse = torch.logsumexp(s, dim=-1)  # -inf on dead rows; KV-only
-        denom_lse = row_lse
-        if attn_sink is not None:
-            denom_lse = torch.logaddexp(row_lse, attn_sink[h].float().expand_as(row_lse))
-        p = torch.exp(s - denom_lse.unsqueeze(-1))
-        p = torch.where(valid_h, p, torch.zeros_like(p))
-        out_t[:, h, :] = torch.einsum("tk,tkd->td", p, vv).to(q.dtype)
-        lse_t[:, h] = row_lse
-
-    if not is_thd:
-        out_t = out_t.reshape(b, s_q, h_q, d_v)
-        lse_t = lse_t.reshape(b, s_q, h_q)
-
-    return out_t, lse_t
+        return result["out"][:, :, :d_v], result["lse"]
 
 
 # ----------------------------------------------------------------------
@@ -481,7 +351,6 @@ def sparse_attention_forward_wrapper(
     max_seqlen_q: Optional[int] = None,
     page_table: Optional[Any] = None,
     page_size: Optional[int] = None,
-    backend: str = "default",
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out', 'lse'}``.
@@ -498,16 +367,14 @@ def sparse_attention_forward_wrapper(
     bitwise-identical outputs.
 
     ``page_table``/``page_size`` (paged KV) and ``max_seqlen_q`` are part of
-    the frozen signature but not yet implemented by any backend.
+    the frozen signature but not yet implemented by any kernel.
     """
-    _validate_backend(backend)
     if page_table is not None or page_size is not None:
         raise NotImplementedError("paged KV is not implemented yet; pass contiguous K/V")
     if max_seqlen_q is not None and cu_seqlens_q is None:
         raise ValueError("max_seqlen_q is only meaningful with cu_seqlens_q (THD)")
 
     key = (
-        backend,
         q.dtype,
         q.shape,
         k.shape,
@@ -531,7 +398,6 @@ def sparse_attention_forward_wrapper(
             sample_cu_seqlens_q=cu_seqlens_q,
             index_granularity=index_granularity,
             softmax_scale=softmax_scale,
-            backend=backend,
         )
         assert obj.check_support()
         obj.compile()

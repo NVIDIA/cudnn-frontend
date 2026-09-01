@@ -1,20 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Contract + reference-backend tests for cudnn.sparse_attention forward.
+"""Contract + oracle + device-kernel tests for cudnn.sparse_attention forward.
 
 Three layers of coverage:
 
 1. Contract tests — the check_support matrix rejects what it must reject,
-   with the documented error classes.
-2. Reference numerics — the ``backend="reference"`` path against independent
+   with the documented error classes; configurations no registered kernel
+   serves raise NotImplementedError.
+2. Oracle numerics — the normative reference
+   (``sparse_attention_reference.py``, test-side by design: the API package
+   is framework-neutral and kernel-only) against independent
    dense-masked-softmax formulations, across layouts, index scopes,
-   granularities, sink, ragged lengths, and dead rows. The DSA corner
-   (G=1, granularity=1, K aliased as V) is additionally cross-checked against
-   the pre-existing ``fe_api.dsa.dsa_reference.ref_sparse_attention_forward``.
-3. Backward interop — forward LSE feeds the shipped DSA
-   ``sparse_attention_backward_wrapper`` and gradients match autograd on the
-   DSA reference forward (SM90+/SM100 kernels).
+   granularities, sink, ragged lengths, and dead rows; the DSA corner is
+   additionally cross-checked against ``fe_api.dsa.dsa_reference``, and the
+   oracle's LSE feeds the shipped DSA backward kernel.
+3. Device parity — the dispatched kernel (when its module is present)
+   against the oracle.
 """
 
 import math
@@ -25,6 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_reference import ref_sparse_attention_forward
+from sparse_attention.sparse_attention_reference import reference_sparse_attention_forward
 
 pytestmark = pytest.mark.L0
 
@@ -138,7 +141,7 @@ def _rand_indices(lead_shape, n_groups, topk_max, n_entries, device, pad_ratio=0
 @pytest.mark.parametrize("scope", ["shared", "kv_group", "per_head"])
 @pytest.mark.parametrize("granularity", [1, 4])
 @pytest.mark.parametrize("sink", [False, True])
-def test_reference_numerics(layout, scope, granularity, sink):
+def test_oracle_numerics(layout, scope, granularity, sink):
     _require_cuda()
     device = "cuda"
     dtype = torch.bfloat16
@@ -168,7 +171,7 @@ def test_reference_numerics(layout, scope, granularity, sink):
     topk_length = torch.randint(0, topk_max + 1, length_shape, dtype=torch.int32, device=device)
     attn_sink = torch.randn(h_q, dtype=torch.float32, device=device) if sink else None
 
-    result = _wrapper()(
+    out, lse = reference_sparse_attention_forward(
         q,
         k,
         v,
@@ -176,13 +179,11 @@ def test_reference_numerics(layout, scope, granularity, sink):
         topk_length=topk_length,
         index_granularity=granularity,
         attn_sink=attn_sink,
-        cu_seqlens_q=cu,
-        backend="reference",
     )
     ref_out, ref_lse = _dense_reference(q, k, v, idxs, topk_length, granularity, None, attn_sink, cu)
 
-    torch.testing.assert_close(result["out"].float(), ref_out.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(result["lse"], ref_lse, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-4)
 
 
 @torch_fork_set_rng(seed=1)
@@ -197,11 +198,11 @@ def test_dsa_corner_matches_dsa_reference():
     idxs = _rand_indices((t_q,), 1, 32, t_kv, device)
     cu = torch.tensor([0, t_q], dtype=torch.int32, device=device)
 
-    result = _wrapper()(q, kv, kv, idxs, attn_sink=attn_sink, cu_seqlens_q=cu, backend="reference")
+    out, lse = reference_sparse_attention_forward(q, kv, kv, idxs, attn_sink=attn_sink)
     ref_out, ref_lse = ref_sparse_attention_forward(q, kv[:, 0, :], attn_sink, idxs)
 
-    torch.testing.assert_close(result["out"][:, :, :].float(), ref_out.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(result["lse"], ref_lse, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-4)
 
 
 @torch_fork_set_rng(seed=2)
@@ -219,12 +220,12 @@ def test_dead_rows_and_determinism():
     length[1] = 0  # dead via zero length
     sink = torch.randn(h_q, dtype=torch.float32, device=device)
 
-    r1 = _wrapper()(q, k, v, idxs, topk_length=length, attn_sink=sink, cu_seqlens_q=cu, backend="reference")
-    r2 = _wrapper()(q, k, v, idxs, topk_length=length, attn_sink=sink, cu_seqlens_q=cu, backend="reference")
+    o1, l1 = reference_sparse_attention_forward(q, k, v, idxs, topk_length=length, attn_sink=sink)
+    o2, l2 = reference_sparse_attention_forward(q, k, v, idxs, topk_length=length, attn_sink=sink)
 
-    assert torch.isneginf(r1["lse"][0]).all() and torch.isneginf(r1["lse"][1]).all()
-    assert (r1["out"][0] == 0).all() and (r1["out"][1] == 0).all()
-    assert torch.equal(r1["out"], r2["out"]) and torch.equal(r1["lse"], r2["lse"])
+    assert torch.isneginf(l1[0]).all() and torch.isneginf(l1[1]).all()
+    assert (o1[0] == 0).all() and (o1[1] == 0).all()
+    assert torch.equal(o1, o2) and torch.equal(l1, l2)
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +246,15 @@ def test_lse_contract_feeds_dsa_backward():
     cu = torch.tensor([0, t_q], dtype=torch.int32, device=device)
 
     v_view = kv[:, :, :512]
-    fwd = _wrapper()(q, kv, v_view, idxs, attn_sink=attn_sink, cu_seqlens_q=cu, backend="reference")
-    dout = torch.randn_like(fwd["out"])
+    fwd_out, fwd_lse = reference_sparse_attention_forward(q, kv, v_view, idxs, attn_sink=attn_sink)
+    dout = torch.randn_like(fwd_out)
 
     bwd = sparse_attention_backward_wrapper(
         q=q,
         kv=kv[:, 0, :],
-        out=fwd["out"],
+        out=fwd_out,
         dout=dout,
-        lse=fwd["lse"],
+        lse=fwd_lse,
         attn_sink=attn_sink,
         topk_idxs=idxs,
     )
@@ -262,9 +263,9 @@ def test_lse_contract_feeds_dsa_backward():
         kv[:, 0, :],
         attn_sink,
         idxs,
-        fwd["out"],
+        fwd_out,
         dout,
-        fwd["lse"],
+        fwd_lse,
         bwd["dq"],
         bwd["dkv"],
         bwd["d_sink"],
@@ -287,7 +288,7 @@ def _mk_valid(device="cuda"):
 @pytest.mark.parametrize(
     "mutate, err",
     [
-        (lambda a: dict(backend="default"), NotImplementedError),  # no kernel registered yet
+        (lambda a: dict(index_granularity=4), NotImplementedError),  # valid config, no registered kernel
         (lambda a: dict(page_table=torch.zeros(1, dtype=torch.int32, device="cuda")), NotImplementedError),
         (lambda a: dict(cu_seqlens_q=None), ValueError),  # THD without cu_seqlens
         (lambda a: dict(index_granularity=3), ValueError),
@@ -296,13 +297,12 @@ def _mk_valid(device="cuda"):
         (lambda a: dict(k=a[1][:, :1, :]), ValueError),  # H_kv mismatch vs V
         (lambda a: dict(attn_sink=torch.zeros(3, device="cuda")), ValueError),  # wrong sink shape (+dtype)
         (lambda a: dict(topk_length=torch.zeros(5, dtype=torch.int32, device="cuda")), ValueError),
-        (lambda a: dict(backend="nope"), ValueError),
     ],
 )
 def test_rejection_matrix(mutate, err):
     _require_cuda()
     q, k, v, idxs, cu = _mk_valid()
-    kwargs = dict(topk_length=None, cu_seqlens_q=cu, backend="reference")
+    kwargs = dict(topk_length=None, cu_seqlens_q=cu)
     kwargs.update(mutate((q, k, v, idxs, cu)))
     args_q, args_k, args_v = q, kwargs.pop("k", k), v
     args_idxs = kwargs.pop("topk_idxs", idxs)
@@ -314,7 +314,7 @@ def test_rejection_matrix(mutate, err):
 # Device-kernel parity: backend="default" vs the normative reference
 # ---------------------------------------------------------------------------
 def _dsa_kernel_available():
-    from cudnn.sparse_attention.forward.api import _get_dsa_prefill_kernel
+    from cudnn.sparse_attention.fwd.api import _get_dsa_prefill_kernel
 
     return _get_dsa_prefill_kernel() is not None
 
@@ -322,7 +322,7 @@ def _dsa_kernel_available():
 @torch_fork_set_rng(seed=4)
 @pytest.mark.parametrize("d_k", [512, 576])
 @pytest.mark.parametrize("sink", [False, True])
-def test_default_backend_matches_reference(d_k, sink):
+def test_device_kernel_matches_oracle(d_k, sink):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 GPU required")
     if not _dsa_kernel_available():
@@ -343,17 +343,17 @@ def test_default_backend_matches_reference(d_k, sink):
     idxs = torch.where(slot < length.unsqueeze(1), idxs, torch.full_like(idxs, -1))
     cu = torch.tensor([0, t_q], dtype=torch.int32, device=device)
 
-    dev = _wrapper()(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink, cu_seqlens_q=cu, backend="default")
-    ref = _wrapper()(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink, cu_seqlens_q=cu, backend="reference")
+    dev = _wrapper()(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink, cu_seqlens_q=cu)
+    ref_out, ref_lse = reference_sparse_attention_forward(q, kv, v, idxs, topk_length=length, attn_sink=attn_sink)
 
-    torch.testing.assert_close(dev["out"].float(), ref["out"].float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(dev["out"].float(), ref_out.float(), atol=2e-2, rtol=2e-2)
     live = (length > 0).unsqueeze(-1).expand_as(dev["lse"])
-    torch.testing.assert_close(dev["lse"][live], ref["lse"][live], atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(dev["lse"][live], ref_lse[live], atol=1e-3, rtol=1e-3)
     # KNOWN DEVIATION (kernel to fix when re-based onto this contract): the
     # current DSA sparse-prefill kernel emits +inf dead-row LSE (FA2-style);
     # the contract requires -inf (the LSE-merge identity). out is 0 either way.
     assert torch.isinf(dev["lse"][~live]).all()
-    assert torch.isneginf(ref["lse"][~live]).all()
+    assert torch.isneginf(ref_lse[~live]).all()
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +372,7 @@ def test_import_without_torch():
         "            raise ImportError('torch blocked')\n"
         "sys.meta_path.insert(0, B())\n"
         "import cudnn.sparse_attention\n"
-        "from cudnn.sparse_attention.forward import api\n"
+        "from cudnn.sparse_attention.fwd import api\n"
         "assert 'torch' not in sys.modules\n"
     )
     result = subprocess.run(
@@ -399,4 +399,4 @@ def test_non_torch_inputs_reach_validation_cleanly():
     # CPU numpy inputs must be rejected by the CUDA-device check (ValueError),
     # proving the validation path itself is torch-free.
     with pytest.raises(ValueError, match="CUDA"):
-        _wrapper()(q, k, v, idxs, cu_seqlens_q=cu, backend="reference")
+        _wrapper()(q, k, v, idxs, cu_seqlens_q=cu)

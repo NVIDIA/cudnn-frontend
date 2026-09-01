@@ -34,9 +34,14 @@ Contract (normative — device kernels must match the reference exactly):
   no valid entry produce `lse = -inf`, `out = 0`.
 - **Deterministic always** — identical inputs give bitwise-identical outputs.
 
-Backends: `"default"` dispatches to registered device kernels (none
-registered yet — contract bring-up), `"reference"` is an explicit opt-in
-PyTorch path used for validation and never selected implicitly.
+Execution dispatches to registered device kernels (currently the SM100 DSA
+sparse-prefill kernel for its envelope, when its module is present);
+configurations no kernel serves raise `NotImplementedError`. The normative
+reference implementation lives with the tests
+(`test/python/sparse_attention/sparse_attention_reference.py`) and is the
+oracle every kernel is validated against. The API surface is
+framework-neutral: dlpack tensors (torch/JAX/numpy), no module-level torch,
+torch-only kernels gate request-or-fail.
 
 Frozen-but-unimplemented signature slots: `page_table`/`page_size` (paged
 KV) and `max_seqlen_q`.

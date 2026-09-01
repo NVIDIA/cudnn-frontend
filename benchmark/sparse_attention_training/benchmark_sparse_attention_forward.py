@@ -26,15 +26,15 @@ from its causal prefix (``i // granularity + 1`` candidates), up to the
 variant's top-k; ``topk_length`` carries the per-row valid count. Index
 generation is row-chunked so no ``S x S`` buffer is ever materialized.
 
-Until a device kernel is registered, run with ``--backend reference``
-(PyTorch reference; reference-speed, small shapes only). ``--q-chunk`` splits
-the call over query-row chunks — correct under this API because indices are
-storage-native (global) ids, so a row's selection is independent of how rows
-are batched into calls.
+Runs through the dispatched device kernels; variants whose configuration no
+registered kernel serves fail with ``NotImplementedError``. ``--q-chunk``
+splits each call over query-row chunks — correct under this API because
+indices are storage-native (global) ids, so a row's selection is independent
+of how rows are batched into calls.
 
 Usage:
-    python benchmark_sparse_attention_forward.py --variant dsv4 --backend reference --seqlens 4096
-    python benchmark_sparse_attention_forward.py --variant qwen3.8,minimax --seqlens 4096,8192 --csv out.csv
+    python benchmark_sparse_attention_forward.py --variant dsv4 --seqlens 4096
+    python benchmark_sparse_attention_forward.py --variant dsv4,glm5.2 --seqlens 4096,8192 --csv out.csv
     python benchmark_sparse_attention_forward.py profile --variant dsv4 --seqlens 8192
 
 ``profile`` mode runs one warmed-up forward call wrapped in
@@ -145,7 +145,7 @@ def flops_fwd(cfg: VariantConfig, topk_length: torch.Tensor) -> int:
     return 2 * selected_tokens * heads_per_group * (cfg.d_k + cfg.d_v)
 
 
-def run_forward(inputs, cfg: VariantConfig, backend: str, q_chunk: Optional[int]):
+def run_forward(inputs, cfg: VariantConfig, q_chunk: Optional[int]):
     q, k, v, topk_idxs, topk_length, attn_sink, cu_seqlens_q = inputs
     if q_chunk is None or q_chunk >= q.shape[0]:
         return sparse_attention_forward_wrapper(
@@ -157,7 +157,6 @@ def run_forward(inputs, cfg: VariantConfig, backend: str, q_chunk: Optional[int]
             index_granularity=cfg.granularity,
             attn_sink=attn_sink,
             cu_seqlens_q=cu_seqlens_q,
-            backend=backend,
         )
     # Storage-native (global) ids make query chunking exact: each chunk sees
     # the full K/V and its own slice of rows/indices.
@@ -174,23 +173,22 @@ def run_forward(inputs, cfg: VariantConfig, backend: str, q_chunk: Optional[int]
             index_granularity=cfg.granularity,
             attn_sink=attn_sink,
             cu_seqlens_q=cu,
-            backend=backend,
         )
     return result
 
 
-def bench_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, backend: str, q_chunk: Optional[int], warmup: int, repeat: int):
+def bench_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, q_chunk: Optional[int], warmup: int, repeat: int):
     inputs = make_inputs(seqlen_q, cfg, dtype)
     flops = flops_fwd(cfg, inputs[4])
 
     for _ in range(warmup):
-        run_forward(inputs, cfg, backend, q_chunk)
+        run_forward(inputs, cfg, q_chunk)
     torch.cuda.synchronize()
 
     start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(repeat):
-        run_forward(inputs, cfg, backend, q_chunk)
+        run_forward(inputs, cfg, q_chunk)
     stop.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(stop) / repeat
@@ -198,13 +196,13 @@ def bench_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, backend:
     return ms, tflops, flops
 
 
-def profile_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, backend: str, q_chunk: Optional[int]):
+def profile_config(cfg: VariantConfig, seqlen_q: int, dtype: torch.dtype, q_chunk: Optional[int]):
     inputs = make_inputs(seqlen_q, cfg, dtype)
-    run_forward(inputs, cfg, backend, q_chunk)  # warm + compile
+    run_forward(inputs, cfg, q_chunk)  # warm + compile
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStart()
     with torch.cuda.nvtx.range(f"sparse_attention_fwd_{cfg.name}_s{seqlen_q}"):
-        run_forward(inputs, cfg, backend, q_chunk)
+        run_forward(inputs, cfg, q_chunk)
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
@@ -230,7 +228,7 @@ def main():
     seqlens = [int(s) for s in args.seqlens.split(",")]
 
     if args.mode == "profile":
-        profile_config(variants[0], seqlens[0], dtype, args.backend, args.q_chunk)
+        profile_config(variants[0], seqlens[0], dtype, args.q_chunk)
         return
 
     rows = []
@@ -239,7 +237,7 @@ def main():
     print("-" * len(header))
     for cfg in variants:
         for s in seqlens:
-            ms, tflops, flops = bench_config(cfg, s, dtype, args.backend, args.q_chunk, args.warmup, args.repeat)
+            ms, tflops, flops = bench_config(cfg, s, dtype, args.q_chunk, args.warmup, args.repeat)
             print(
                 f"{cfg.name:>8} {s:>8} {f'{cfg.h_q}/{cfg.h_kv}':>9} {f'{cfg.d_k}/{cfg.d_v}':>9} "
                 f"{cfg.granularity:>5} {cfg.topk:>5} {ms:>10.3f} {tflops:>9.2f}"
@@ -255,7 +253,6 @@ def main():
                     granularity=cfg.granularity,
                     topk=cfg.topk,
                     group_scope=cfg.group_scope,
-                    backend=args.backend,
                     dtype=args.dtype,
                     ms=round(ms, 4),
                     tflops=round(tflops, 2),

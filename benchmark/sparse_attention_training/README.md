@@ -46,5 +46,4 @@ nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=st
 Options: `--seqlens` (comma-separated, `seqlen_kv = seqlen_q`), `--variant`
 (comma-separated subset), `--dtype bfloat16|float16`, `--q-chunk N` (split
 each call over query-row chunks — exact under this API because indices are
-storage-native global ids; also bounds reference-backend memory),
-`--warmup/--repeat`, `--csv out.csv`.
+storage-native global ids), `--warmup/--repeat`, `--csv out.csv`.
