@@ -2630,7 +2630,7 @@ def _softmax_warp_group(
         cutlass.Float32,
     )
 
-    q_super_idx, head_idx, batch_idx, split_idx = _load_initial_coords(
+    q_super_idx, _head_idx, batch_idx, split_idx = _load_initial_coords(
         sched,
         sched.bidx_init,
         sched.bidy_init,
@@ -2765,7 +2765,7 @@ def _softmax_warp_group(
         bars.mb_stat_full[sub_tile_id].arrive()
 
         # make_warp_uniform on scheduler loads keeps payload in uniform regs across back-edge (no STL spill).
-        q_super_idx, head_idx, batch_idx, split_idx, is_valid_tile = _load_next_coords(
+        q_super_idx, _head_idx, batch_idx, split_idx, is_valid_tile = _load_next_coords(
             sched,
             sched_state,
             cta_in_pair,

@@ -1158,6 +1158,8 @@ def test_api_splits_the_fp8_family(mx):
 @pytest.mark.L0
 def test_api_splits_per_tensor_fp8_d192():
     """The SM100 router must expose D192 split-KV, not only its direct kernel."""
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("D192 per-tensor FP8 is not supported on cc10.7")
     split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=False, d_qk=192, d_v=128)
     assert split > 1
     assert (got - unsplit).abs().max().item() <= 5e-2

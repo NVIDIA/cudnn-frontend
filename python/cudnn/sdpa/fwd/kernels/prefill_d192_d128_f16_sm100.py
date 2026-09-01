@@ -2156,7 +2156,7 @@ def _softmax_warp_group(
         cutlass.Float32,
     )
 
-    q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
+    q_super_idx, _head_idx, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init,
         sched.bidy_init,
         sched.bidz_init,
@@ -2307,7 +2307,7 @@ def _softmax_warp_group(
 
         (
             q_super_idx,
-            head_idx,
+            _head_idx,
             batch_idx,
             split_idx,
             is_valid_tile,
