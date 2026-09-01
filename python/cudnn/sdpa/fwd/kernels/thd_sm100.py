@@ -231,8 +231,12 @@ def build_thd_meta_o_kv_descs_kernel(
     n_batch: cutlass.Int32,
     o_row_stride: cutlass.Int32,
 ) -> None:
-    """``build_thd_meta_o_descs_kernel`` + packed-total-clamped K/V descriptors
-    (the FP8/MXFP8 THD flavors).
+    """THD setup for the FP8/MXFP8 flavors: metadata, per-batch O descriptors
+    and the packed-total-clamped K/V descriptors.
+
+    Same body as ``build_thd_meta_o_descs_kernel`` minus the persistent
+    scheduler's live-unit total and claim counter, which these flavors do not
+    launch with. Both kernels clamp K/V (issue #624).
 
     The K/V loads tile in TILE_N rows, so the LAST sequence's tile steps past
     the packed KV total into the buffer's capacity tail — caller-owned bytes
@@ -305,6 +309,8 @@ def build_thd_meta_o_kv_descs_kernel(
 def build_thd_meta_o_descs_kernel(
     o_tensor: cute.Tensor,
     base_o_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_v_desc: cutlass.GridConstant[tmap.TensorMap],
     o_desc_words: cute.Tensor,
     meta_t: cute.Tensor,
     q_lens_t: cute.Tensor,
@@ -316,7 +322,9 @@ def build_thd_meta_o_descs_kernel(
     cga_tile_m: cutlass.Int32,
     n_clusters: cutlass.Int32,
 ) -> None:
-    """Per-execute THD setup, one elected thread (issue #552, D2H removal):
+    """Per-execute THD setup for the f16/bf16 flavors, one elected thread —
+    ``build_thd_meta_o_kv_descs_kernel`` plus the persistent scheduler's
+    live-unit total and claim counter (issue #552, D2H removal):
     build the [seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)] metadata
     buffer DEVICE-side from the caller's length tensors — ``(B,)`` per-batch
     lengths (serial cumsum; B is small) or the ``(B+1,)`` cu prefix-sum form
@@ -364,6 +372,27 @@ def build_thd_meta_o_descs_kernel(
                 new_value=s_i,
                 ord=2,
             )
+        # Packed-total-clamped K/V runtime descriptors (issue #624). K/V load
+        # in TILE_N rows, so the LAST sequence's tile steps past the packed KV
+        # total into the buffer's capacity tail — caller-owned bytes that may
+        # never have been written. Masked S columns are NaN-safe (the mask is
+        # a select), but BMM2's P·V is not: 0 · NaN == NaN wipes every valid
+        # row of the tile. Patching the seq extent (GLOBAL_DIM ord=2) to
+        # cu_k[B] makes those rows TMA-OOB, so they land as EXACT ZEROS
+        # without touching memory — no fill kernel, and nothing written into
+        # the caller's buffer. Mirrors build_thd_meta_o_kv_descs_kernel, which
+        # the FP8/MXFP8 flavors have used for this since they were written.
+        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+        k_dptr = desc_base + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (k_dptr + i).store((k_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (v_dptr + i).store((v_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,

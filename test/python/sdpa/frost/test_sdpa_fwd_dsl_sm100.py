@@ -958,6 +958,101 @@ def test_dsl_sm100_thd(dtype, d):
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
+# Issue #624: a THD caller binds K/V at BUFFER CAPACITY, not at the packed
+# total, and the descriptor extent is the host-derived capacity. Rows in
+# [total, capacity) are therefore inside the extent and get loaded. They are
+# masked, so P == 0 -- but 0 * NaN == NaN, so an UNINITIALIZED capacity tail
+# wipes whole tiles of O. The setup kernel patches the K/V descriptor extent to
+# the packed total cu_k[B] device-side so those rows are TMA-OOB and land as
+# exact zeros instead. Total 397 is deliberately not a multiple of TILE_N, so
+# the last sequence's tail tile steps past it.
+@pytest.mark.L0
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_nan_capacity_tail(dtype, d):
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H = 8
+    seq_lens = [200, 150, 47]
+    B = len(seq_lens)
+    S_max = max(seq_lens)
+    T = sum(seq_lens)
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d)
+
+    q_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    k_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+    v_pk = torch.randn(T, H, d, device=dev, dtype=dtype)
+
+    stride = (S_max * H * d, d, H * d, 1)
+
+    def _poisoned_buf(packed):
+        """Capacity-sized storage; only [0, T) is live, the tail is NaN."""
+        stor = torch.full((B * S_max * H * d,), float("nan"), device=dev, dtype=dtype)
+        stor[: T * H * d] = packed.reshape(-1)
+        return stor, stor.as_strided((B, H, S_max, d), stride)
+
+    q_stor, q_gpu = _poisoned_buf(q_pk)
+    k_stor, k_gpu = _poisoned_buf(k_pk)
+    v_stor, v_gpu = _poisoned_buf(v_pk)
+    o_stor = torch.zeros(B * S_max * H * d, device=dev, dtype=dtype)
+    o_gpu = o_stor.as_strided((B, H, S_max, d), stride)
+
+    slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slk = slq.clone()
+    cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+    ro = (cu_t * H * d).view(B + 1, 1, 1, 1)
+
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="q")
+    tk = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="k")
+    tv = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="v")
+    sq = g.tensor_like(slq)
+    skv = g.tensor_like(slk)
+    qro = g.tensor_like(ro)
+    kro = g.tensor_like(ro)
+    vro = g.tensor_like(ro)
+    oro = g.tensor_like(ro)
+    tq.set_ragged_offset(qro)
+    tk.set_ragged_offset(kro)
+    tv.set_ragged_offset(vro)
+    o, _ = g.sdpa(
+        name="sdpa", q=tq, k=tk, v=tv, generate_stats=False, attn_scale=scale, use_causal_mask=True, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv
+    )
+    o.set_output(True).set_dim([B, H, S_max, d]).set_stride(list(stride))
+    o.set_ragged_offset(oro)
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(g, engine_name())
+    g.check_support()
+    g.build_plans()
+    vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
+    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    torch.cuda.synchronize()
+
+    o_out = o_stor[: T * H * d].reshape(T, H, d)
+    assert not torch.isnan(o_out).any(), f"{int(torch.isnan(o_out).sum())} NaNs in O -- the capacity tail reached BMM2"
+
+    o_ref = torch.zeros(T, H, d, device=dev, dtype=dtype)
+    for b in range(B):
+        lo, hi = cu[b], cu[b + 1]
+        qb = q_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        kb = k_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        vb = v_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        ob = _ref_sdpa_full(qb, kb, vb, scale=scale, is_causal=True)
+        o_ref[lo:hi] = ob.squeeze(0).permute(1, 0, 2)
+    torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
