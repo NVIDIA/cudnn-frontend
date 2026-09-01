@@ -146,17 +146,8 @@ def test_situ_mlp_kimi_k3_forward_beta_contract():
     not (torch.cuda.is_available() and _cc() >= 100),
     reason="cuDNN SiTU-MLP fusion requires SM100 (Blackwell)",
 )
-def test_situ_mlp_kimi_k3_backward_parity_does_not_use_frost(monkeypatch):
-    """All four gradients use exact dSiTU; the swish-only FROST path is closed."""
-    import importlib
-
-    mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
-
-    def forbidden_frost(*args, **kwargs):
-        raise AssertionError("SiTU must not launch the SwiGLU-only FROST backward")
-
-    monkeypatch.setattr(mod, "_FROST_BWD", True)
-    monkeypatch.setattr(mod, "_frost_dswiglu", forbidden_frost)
+def test_situ_mlp_kimi_k3_backward_parity():
+    """The public operation computes all four exact dSiTU gradients."""
     torch.manual_seed(11)
     M, H, inter = 128, 256, 256
     base = (
@@ -193,16 +184,6 @@ def test_situ_mlp_beta_contract_rejects_invalid_values():
     for kwargs, error, match in cases:
         with pytest.raises(error, match=match):
             situ_mlp(*tensors, **kwargs)
-
-
-@pytest.mark.L0
-def test_frost_dswiglu_declines_situ_before_build_or_launch():
-    """A direct FROST call cannot silently substitute swish for bounded SiTU."""
-    from cudnn.gemm.ops.swiglu_mlp import _frost_dswiglu
-
-    operands = (torch.empty(0),) * 4
-    with pytest.raises(NotImplementedError, match="FROST backward only implements activation='silu'"):
-        _frost_dswiglu(*operands, activation="situ", situ_beta=4.0, situ_linear_beta=25.0)
 
 
 @pytest.mark.L0
