@@ -42,6 +42,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [NVFP4 Block-Scale Conversion](nvfp4_block_scale_conversion.md)
 
 ## Installation and setup
 
