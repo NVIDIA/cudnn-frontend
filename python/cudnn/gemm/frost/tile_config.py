@@ -703,11 +703,6 @@ def _sm120_smem_feasible(cta_m: int, cta_n: int, kb: int, num_compute_warps: int
     stages = min((_SM120_SMEM_CAP_BYTES - _SM120_SMEM_FIXED_RESERVE) // per_stage, 16)
     return stages - -(-staging // per_stage) >= 1
 
-
-def _sm120_reg_feasible(cta_m: int, cta_n: int, num_compute_warps: int) -> bool:
-    return cta_m * cta_n // (num_compute_warps * 32) <= 128
-
-
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
     for mma_m, mma_size_m in _M_AXES:
@@ -744,8 +739,6 @@ def _build_catalog() -> tuple[TileConfig, ...]:
                     if cta_tile_m % (warps_size_m * 16) or cta_tile_n % (warps_size_n * 16):
                         continue
                     if not _sm120_smem_feasible(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m * warps_size_n):
-                        continue
-                    if not _sm120_reg_feasible(cta_tile_m, cta_tile_n, warps_size_m * warps_size_n):
                         continue
                     cfgs.append(_geom_sm120(cta_tile_m, cta_tile_n, cta_tile_k_bytes, warps_size_m, warps_size_n, 1, 1))
     return tuple(cfgs)

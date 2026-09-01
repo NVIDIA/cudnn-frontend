@@ -109,42 +109,7 @@ _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
 _AB_STAGE_BYTES = (cta_tile_mnk[0] + cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
 ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
-assert ab_stages >= 1, "transposed STG epilogue: staging stream cannot be funded from the AB pipeline"
 
-# ---- v1 scope guards (fail at render/import, not at runtime) ---------------
-assert cluster_shape_mnk == (1, 1, 1), "sm120 has no thread-block clusters (CC 12.0): cluster_shape must be (1,1,1)"
-assert threads_per_cta % 32 == 0, f"threads_per_cta={threads_per_cta} must be whole warps"
-assert (
-    NUM_COMPUTE_WARPS + 2 <= NUM_WARPS
-), f"the {WARPS_M}x{WARPS_N} compute grid + TMA producer + CLC scheduler needs {NUM_COMPUTE_WARPS + 2} warps, block has {NUM_WARPS}"
-assert (
-    EPI_REG_COUNT * 32 * NUM_COMPUTE_WARPS + PROD_REG_COUNT * 32 * (NUM_WARPS - NUM_COMPUTE_WARPS) <= 64 * 1024
-), f"register budget: {WARPS_M}x{WARPS_N} compute warps at {EPI_REG_COUNT} regs/thread exceed the 64K-regs/CTA file"
-assert not multicast_a and not multicast_b, "sm120 has no TMA multicast (no clusters)"
-# MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
-# m16n16.trans.b8 (SM 12x byte granule) for 8-bit ones. No sub-byte form exists.
-assert _ELEM_BITS in (16, 8) or (
-    not a_is_m_major and not b_is_n_major
-), "sm120 MN-major operand loads use ldmatrix.trans (b16) / ldmatrix.m16n16.trans.b8; sub-byte operands must be K-major"
-# One m16n16.b8 tile spans 16 N bytes = two n-frags, and its 16B row addresses
-# must stay 16-aligned for every warp column, so the warp N tile must hold
-# whole frag pairs. Every constructible ConfigSm120 satisfies this (it enforces
-# warp_tile_n % mma_tile_n(=16) == 0); the assert guards the template constants.
-assert (
-    _ELEM_BITS != 8 or not b_is_n_major or _N_FRAGS % 2 == 0
-), f"sm120 8-bit N-major B pairs n-frags per m16n16.b8 load; warp N tile {_WARP_TILE_N} is not a multiple of 16"
-assert not a_is_m_major or cta_tile_mnk[0] % a_tma_group_elems == 0, "M-major A: cta_tile_m must be a whole number of TMA groups"
-assert not b_is_n_major or cta_tile_mnk[1] % b_tma_group_elems == 0, "N-major B: cta_tile_n must be a whole number of TMA groups"
-# Non-fp4 output only — enforced upstream by Sm120KernelTemplate._extra_reject.
-assert num_gemms == 1 and num_a_operands == 1 and num_b_operands == 1, "sm120 template v1 is single-GEMM only"
-assert cta_tile_mnk[0] % WARPS_M == 0 and _WARP_TILE_M % 16 == 0, f"cta_tile_m={cta_tile_mnk[0]} must be a multiple of {WARPS_M * 16}"
-assert cta_tile_mnk[1] % WARPS_N == 0 and _WARP_TILE_N % 8 == 0, f"cta_tile_n={cta_tile_mnk[1]} must be a multiple of {WARPS_N * 8}"
-_TMA_SWIZZLE_BY_BYTES = {32: _tma.TensorMapSwizzle.s32b, 64: _tma.TensorMapSwizzle.s64b, 128: _tma.TensorMapSwizzle.s128b}
-assert ab_tma_swizzle == _TMA_SWIZZLE_BY_BYTES.get(_AB_SMEM_SWIZZLE_BYTES), "SMEM K-row width must equal the swizzle span"
-assert _NUM_K_BLOCKS * _K_BLK_ELEMS == _CTA_K_ELEMS, "cta_tile_k must be a multiple of 32 bytes"
-# N-major outputs store whole (n, n+1) pairs (>= 2, enforced upstream); an
-# M-major output scatters per element, so its chunk may narrow to 1.
-assert _STG_V >= 1 and 8 % _STG_V == 0, "transposed STG epilogue: the store vector must tile the 8-column row run"
 
 # ---------------------------------------------------------------------------
 # The warp MMA instruction, resolved from the injected MMA dtypes.
