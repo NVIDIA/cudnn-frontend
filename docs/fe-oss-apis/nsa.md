@@ -4,7 +4,7 @@
 
 ## Overview
 
-The Native Sparse Attention (NSA) module implements the sparse attention mechanism described in [Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention](https://arxiv.org/pdf/2502.11089). NSA provides high-performance sparse attention kernels optimized for Blackwell (SM100+) GPUs. The Selection, Compression, and Top-K components are implemented with CUTLASS/CUTE. Sliding Window Attention currently utilizes cuDNN backend.
+The Native Sparse Attention (NSA) module implements the sparse attention mechanism described in [Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention](https://arxiv.org/pdf/2502.11089). NSA provides high-performance sparse attention kernels with component-specific architecture support listed below. The Selection, Compression, Top-K, and Lightning Indexer components are implemented with CUTLASS/CUTE. Sliding Window Attention currently utilizes cuDNN backend.
 
 NSA combines multiple attention strategies to efficiently process long sequences:
 
@@ -72,6 +72,9 @@ NSA.sliding_window_attention_wrapper
 
 NSA.TopKReduction
 NSA.topk_reduction_wrapper
+
+NSA.LightningIndexer
+NSA.lightning_indexer
 ```
 
 ---
@@ -540,6 +543,67 @@ topk.execute(
 
 ---
 
+### 5. MiniMax Lightning Indexer Decode
+
+The experimental Lightning Indexer static-cache decode API implements the
+selection branch used by MiniMax-M3 sparse attention. It computes query-key
+scores from BF16 inputs with FP32 accumulation, max-pools every completed
+128-token key block, forces the current local block, and returns at most 16
+selected block IDs.
+
+    from cudnn import NSA
+
+    # q: [B, 1, 4, 128] BF16 (BSHD)
+    # k: [B, S_k, 1, 128] BF16 (BSHD)
+    # position_ids: [B, 1] int64 dense K-cache slot positions
+    result = NSA.lightning_indexer(q, k, position_ids)
+    block_indices = result["block_indices"]  # [B, 4, 1, 16] int32
+    block_counts = result["block_counts"]    # [B, 4, 1] int32
+
+For allocation-free replay, prepare a plan and retain separate workspaces for
+concurrent launches:
+
+    indices = torch.empty(B, 1, 4, 16, dtype=torch.int32, device="cuda").transpose(1, 2)
+    counts = torch.empty(B, 1, 4, dtype=torch.int32, device="cuda").transpose(1, 2)
+    plan = NSA.LightningIndexer(q, k, position_ids, indices, counts)
+    plan.check_support()
+    plan.compile()
+    workspace = plan.make_workspace()
+    plan.execute(q, k, position_ids, indices, counts, workspace)
+
+Contract and limitations:
+
+- Decode only: query length is exactly one, with 4 index heads and head
+  dimension 128.
+- Keys and queries are BF16; positions are int64. Inputs and the resulting FP32
+  dot-product accumulations must remain finite.
+- Position IDs are explicit zero-based dense cache-slot positions. Contiguous
+  and batch-broadcast `(0, 1)` strides are supported. Out-of-capacity positions
+  produce an empty row. This keeps a right-padded static cache correct; growing
+  dynamic caches, paged caches, holes, and left-padding remapping are not
+  supported.
+- The current block occupies one output slot. Remaining valid IDs are the exact
+  top-scoring completed blocks with lower block IDs winning exact-score ties.
+  Their slot order is not part of the API contract. IDs are left-packed and
+  unused slots are -1.
+- Context capacities from 1 through 32768 tokens are admitted. When all visible
+  blocks fit in 16 slots, a metadata-only path returns the exact selected set
+  without reading Q or K.
+- Long-context execution needs initialized, exclusive caller-owned workspace.
+  make_workspace returns a ready buffer and carries stream-ordered
+  initialization across streams with a CUDA event; each successful launch
+  restores its counters. Call initialize_workspace before first use of a
+  separately allocated buffer or after a failed launch. CUDA Graph replay is
+  supported after workspace initialization has been consumed once eagerly, or
+  when initialization and first capture use the same stream. Overlapping
+  launches must use different workspaces.
+- Explicit stream 0 and real CUDA stream handles are supported. CUDA magic
+  sentinel handles 1 and 2 are rejected; pass the resolved stream handle.
+- The kernel is functionally admitted on SM80 and newer. Its schedule and
+  published performance are tuned and measured on B200.
+
+---
+
 ## Tensor Formats
 
 ### Supported Layouts
@@ -550,6 +614,7 @@ topk.execute(
 | Compression Attention | ✅ | ✅ |
 | Sliding Window Attention | ✅ | ✅ |
 | Top-K Reduction | ✅ | ✅ |
+| Lightning Indexer Decode | ❌ | ❌ (uses `B,S,H,D`) |
 
 ### T,H,D Format (Variable-Length Batched)
 
@@ -590,6 +655,7 @@ All components require `float32` accumulator dtype for numerical stability.
 | Compression Attention | SM100 (Blackwell) | - |
 | Sliding Window Attention | SM80+ | Uses cuDNN backend |
 | Top-K Reduction | SM100 (Blackwell) | - |
+| Lightning Indexer Decode | SM80+ | Performance tuned on B200 |
 
 ---
 
@@ -601,6 +667,7 @@ For complete usage examples and tests, see:
 - `test/python/fe_api/nsa/test_NSA_compression_attention.py`
 - `test/python/fe_api/nsa/test_NSA_swa.py`
 - `test/python/fe_api/nsa/test_NSA_topk_reduction.py`
+- `test/python/fe_api/nsa/test_NSA_lightning_indexer.py`
 
 ### Example: Full NSA Pipeline
 

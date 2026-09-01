@@ -8,6 +8,7 @@ from .sliding_window_attention import (
     sliding_window_attention_wrapper,
 )
 from .top_k import TopKReduction, topk_reduction_wrapper
+from .lightning_indexer import LightningIndexer, lightning_indexer
 
 
 class NSANamespace:
@@ -22,6 +23,9 @@ class NSANamespace:
 
     TopKReduction = staticmethod(TopKReduction)
     topk_reduction_wrapper = staticmethod(topk_reduction_wrapper)
+
+    LightningIndexer = staticmethod(LightningIndexer)
+    lightning_indexer = staticmethod(lightning_indexer)
 
 
 NSA = NSANamespace()
