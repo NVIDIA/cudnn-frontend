@@ -38,6 +38,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   launches, and a second copy of the semantics that can drift). If a packed
   extent would be zero, bind a never-dereferenced dummy view over storage
   the contract already guarantees.
+- **Overlapping optional declarations are validated as a set, not one by
+  one.** When two mechanisms can declare the same thing (ragged offsets vs
+  `cu_seqlen` vs plain `seq_len` tensors), each combination is either
+  defined or explicitly rejected — an unhandled overlap is an untested code
+  path with unspecified semantics, and "both supplied" is exactly the case
+  no per-argument check catches (raised in review on PR #266).
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -168,6 +174,15 @@ not become a compile key.
   (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
   token extents like the SM100/SM120 THD compiles rather than copying its
   pattern.
+- **Key on exactly the contract-relevant set — no more, no less.** Both
+  failure modes shipped on PR #553 and were caught in review: *under-keying*
+  (the cache keyed only `x.shape`/`w.shape` while `check_support()`
+  validated weight, RoPE, and scale descriptors — a hit can return an
+  artifact compiled for a different contract, i.e. wrong results) and
+  *over-keying* (`alpha` passed at launch, `m`/`n`/`k` on a shape-generic
+  kernel — every miss is a spurious multi-second recompile). Enumerate what
+  `check_support()` validates and what the kernel specializes on; the key
+  is that set.
 
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
@@ -192,6 +207,13 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **The device is implicit state exactly like the stream.** A `torch.empty`
+  (or any allocator call) without a device context silently allocates on the
+  *current* GPU, not the input tensor's — wrap execute-path allocations in
+  the right device context as well as the stream context. And a raw pointer
+  argument is a contract: validate device-residency and dtype (a CUDA int64
+  tensor, not a host tensor) before handing its address to a kernel — both
+  flagged in review on PR #517.
 
 **Rule 6 — THD/packed Stats (LSE) must stay packed: token-major or
 head-major, never dense-padded.**

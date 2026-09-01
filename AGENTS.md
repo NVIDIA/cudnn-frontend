@@ -87,6 +87,9 @@ First invocation builds the hook environments and can take >5 minutes; later run
 - Frontend-only OSS APIs are experimental; keep the `[cutedsl]` optional-dependency boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time).
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
+- Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
+- Never delete an existing log or diagnostic statement in a cleanup/refactor — several were added after repeated hard-to-repro failures and are the only tripwire for a recurrence (review on PR #280). If one looks redundant, ask before removing.
+- Every new source file needs the repo's SPDX/license header (flagged in review on PR #747).
 
 ## Agent skills
 
