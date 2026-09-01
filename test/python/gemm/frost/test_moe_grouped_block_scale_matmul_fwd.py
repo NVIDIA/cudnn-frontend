@@ -27,6 +27,7 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+    with_static_segmented_capacity as _with_static_segmented_capacity,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -50,13 +51,6 @@ def _block_quant_q_atol(scale_dtype) -> float:
     # Non-pow2 E4M3 scales use the kernel's approximate reciprocal → up to one
     # smallest E4M3 output step off the torch reference.
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
-
-
-def _with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
-    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
-    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
-    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
-    return result
 
 
 # combo -> (block_size, data dtype, SF dtype).
@@ -424,7 +418,7 @@ def test_segmented_row_scale_address_map_is_concatenated_per_group_atoms() -> No
             for scale_col in (0, 3, 4, 83, 167):
                 base = start_block * n_col_quads * 512
                 expr = _f8_128x4_row_scale_index_expr(str(local_row), str(scale_col), str(n_col_quads), atom_base=str(base))
-                got = eval(expr, {"__builtins__": {}}, {})
+                got = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - expression is generated locally from integer inputs
                 within = ((local_row // 128) * n_col_quads + scale_col // 4) * 512 + (local_row % 32) * 16 + ((local_row % 128) // 32) * 4 + scale_col % 4
                 assert got == base + within
                 addresses.append(got)
@@ -986,6 +980,7 @@ def _run_e2e_segmented_row_quant_matches_bridge_and_down_output(config_name: str
 
 
 @requires_sm100
+@pytest.mark.L1
 @pytest.mark.parametrize(
     "config_name,cta_group,use_non_default_stream",
     [

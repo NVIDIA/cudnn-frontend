@@ -25,21 +25,14 @@ from gemm_test_utils import (
     unpack_fp4 as _unpack_fp4,
     rand_e8m0 as _rand_e8m0,
     block_quant_ref as _block_quant_ref,
+    with_static_segmented_capacity as _with_static_segmented_capacity,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
-from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
 pytestmark = pytest.mark.L0
-
-
-def _with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_groups: int, scale_cols: int) -> torch.Tensor:
-    capacity_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
-    result = torch.ones((1, capacity_rows, scale_cols), dtype=live.dtype, device=live.device)
-    result.view(-1)[: live.numel()].copy_(live.reshape(-1))
-    return result
 
 
 def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
