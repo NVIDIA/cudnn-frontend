@@ -693,7 +693,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -772,7 +771,11 @@ else:
             scale_s_fwd = graph_fwd.tensor_like(scale_s_gpu)
             scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
 
-            o_fwd, stats_fwd, amax_s_fwd, amax_o_fwd = graph_fwd.sdpa_fp8(
+            # Amax_S is returned unconditionally but never requested: it only becomes a
+            # real graph output if set_output(True) is called on it, and nothing here
+            # consumes it. Leaving it virtual also keeps the graph servable by engines
+            # that do not produce Amax_S.
+            o_fwd, stats_fwd, _amax_s_unused, amax_o_fwd = graph_fwd.sdpa_fp8(
                 q=q_fwd,
                 k=k_fwd,
                 v=v_fwd,
@@ -871,7 +874,6 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
 
         if args.data_type == "fp8":
-            amax_s_fwd.set_output(True).set_dim(amax_s_gpu.size()).set_stride(amax_s_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
         elif args.data_type == "mxfp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
@@ -1175,7 +1177,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
 
@@ -1301,7 +1302,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -1583,7 +1583,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -1625,7 +1624,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                     variant_pack_bwd = {
@@ -1737,7 +1735,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                 elif args.data_type == "mxfp8":
