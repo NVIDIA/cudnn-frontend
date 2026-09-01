@@ -57,3 +57,36 @@ KV) and `max_seqlen_q`.
    scale-padded cu_seqlens — names as in `deepseek_sparse_attention`
    indexer forward), keyword-only additions.
 5. Backward superset wrapper (deterministic two-pass dK/dV mode).
+
+## Indexer + top-k — `indexer_topk_wrapper`
+
+Fused indexer scoring + top-k selection: one pass, no dense `(T_q, T_e)`
+logits tensor ever materialized. Returns `{'indices', 'topk_length'[, 'logits']}`.
+
+Contract (normative):
+
+- **Scoring**: `score[t,g,e] = sum_{h in group g} w[t,h] * f(q[t,h]·k[e,gk])`,
+  `f ∈ {relu, identity}`, `weights=None` means 1, any softmax/temperature
+  scale folds into `weights`. `k_index` has 1 (shared) or `head_groups` heads.
+- **Causal bound**: entry `e` (covering tokens `[e·ratio, e·ratio+ratio)`)
+  is a candidate iff fully past: per-row count `(p+1) // ratio`, with
+  `q_causal_offsets` giving each segment's global start (chunked prefill).
+- **`score_pool`**: max-pool scores over `score_pool` consecutive entries
+  pre-selection; emitted ids are pooled ids
+  (`index_granularity = ratio * score_pool` downstream).
+- **`force_first` / `force_last`**: always-selected candidate entries, inside
+  the `top_k` budget.
+- **Output**: storage-native global entry ids, **compact + ascending**
+  (`-1` beyond `topk_length`); `logits` slot-aligned FP32 opt-in
+  (`return_logits=True`, off by default — serving discards them).
+- **Deterministic always**: exact top-k, boundary ties → smallest id;
+  ascending output order makes the downstream gather monotonic and the whole
+  indexer→attention pipeline bitwise-reproducible.
+
+Variant mapping: DSv4 (64 weighted ReLU heads, ratio 4, top-512/1024),
+GLM-5.x (32 weighted heads, ratio 1, top-2048), QSA (4 unweighted heads,
+ratio 4, top-512, `force_last=1`), MSA (`head_groups=H_kv`,
+`activation="none"`, `score_pool=128`, top-16, `force_last=1`).
+
+No device kernel is registered yet; the oracle lives at
+`test/python/sparse_attention/indexer_topk_reference.py`.
