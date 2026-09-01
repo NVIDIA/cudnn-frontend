@@ -1801,9 +1801,11 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     FINITE. A caller that over-allocates and leaves the tail unwritten
     therefore poisons whole tiles through ``0 * NaN`` (issue #624).
 
-    Declaring the total clamps the TMA extent to the packed total, putting that
-    tail out of reach. Same graph, same data, only the tail fill differs: with
-    the declaration a NaN tail must be inert."""
+    Two mechanisms now put that tail out of reach: declaring the total clamps
+    the host-derived extent, and the THD setup kernel clamps the K/V extent to
+    ``cu_k[B]`` device-side regardless. Same graph, same data, only the tail
+    fill differs -- a NaN tail must be inert either way, and the two paths must
+    agree bit for bit."""
     _require_dsl()
     import cudnn
 
@@ -1877,13 +1879,22 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     )
     assert torch.equal(declared_nan, declared_zero), "O must not depend on the capacity tail once the total is declared"
 
-    # Control: the tail is genuinely reachable without the declaration, so the
-    # assertions above are testing the clamp rather than a benign shape.
+    # The undeclared path is NaN-safe too, and deliberately so: the THD setup
+    # kernel now patches the K/V descriptor extent to cu_k[B] device-side on
+    # every flavor, which bounds the tail without any host declaration. Before
+    # that clamp this same call poisoned ~50% of O, and this assertion was
+    # inverted -- it asserted the NaN to prove the tail was reachable.
     undeclared_nan = _run(float("nan"), declare_total=False)
-    assert torch.isnan(undeclared_nan).any(), (
-        "expected the undeclared path to read the capacity tail (issue #624); if this no longer "
-        "holds the extent is exact by other means and this test needs rethinking"
+    undeclared_zero = _run(0.0, declare_total=False)
+    assert not torch.isnan(undeclared_nan).any(), (
+        f"the device-side K/V extent clamp must bound the capacity tail with or without a declared "
+        f"total: {int(torch.isnan(undeclared_nan).sum())} NaNs in O"
     )
+    assert torch.equal(undeclared_nan, undeclared_zero), "O must not depend on the capacity tail"
+    # Declaring the total is now a host-side tightening (capacity, grid and
+    # workspace sizing) rather than the only thing standing between the kernel
+    # and the tail -- so both paths must agree bit for bit.
+    assert torch.equal(declared_nan, undeclared_nan), "declaring the packed total must not change the result"
 
 
 @pytest.mark.L0
