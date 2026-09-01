@@ -48,8 +48,7 @@ class KernelCache : public detail::backend_descriptor {
 
     // Returns the underlying descriptor pointer by VALUE under the lock.
     // Use this instead of get_ptr() when the cache may still be under concurrent build().
-    // IMPORTANT: build(), from_json(), to_json() must NOT call this — they already hold mutex_
-    // and std::mutex is non-recursive. Use the inherited get_ptr() inside those methods.
+    // IMPORTANT: do not call from any method that already holds mutex_ (non-recursive).
     cudnnBackendDescriptor_t
     get_ptr_locked() const {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -68,7 +67,7 @@ class KernelCache : public detail::backend_descriptor {
 
     error_t
     to_json(std::string &str_json) const {
-        std::lock_guard<std::mutex> lk(mutex_);
+        cudnnBackendDescriptor_t desc = get_ptr_locked();
         str_json.clear();
 #if (CUDNN_VERSION >= 91000)
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 91000,
@@ -78,10 +77,10 @@ class KernelCache : public detail::backend_descriptor {
         int64_t serializationSize;
         std::vector<char> serialization_buf;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
-            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
+            desc, CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, 0, &serializationSize, nullptr));
         serialization_buf.resize(static_cast<size_t>(serializationSize));
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(get_ptr(),
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(desc,
                                                        CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION,
                                                        CUDNN_TYPE_CHAR,
                                                        serializationSize,

@@ -31,11 +31,10 @@ The `KernelCache` API (`build`, `from_json`, `to_json`, `is_finalized`) is **int
 
 `build()` is idempotent under the lock: the first caller to acquire the mutex initializes and finalizes the descriptor; subsequent callers return `OK` immediately without re-initializing it. This makes it safe for N graph threads sharing one `KernelCache` to each call `build()` concurrently — exactly one backend descriptor is created and finalized.
 
-`to_json()` holds the lock across the full backend JSON render. A caller thread entering `build_operation_graph` concurrently may block briefly behind an ongoing serialize. The three calls Myelin makes in `flush()` — `is_finalized`, `build(nullptr)`, `to_json` — are individually atomic but not jointly; another thread can interleave between them. This is safe: the design intent is that `flush()` is called after the pool finishes.
+`to_json()` holds the lock only for the descriptor pointer read; the cuDNN serialization call runs outside the lock.
 
 `from_json()` is synchronized the same way as `build()`. Call it before sharing the `KernelCache` with any thread that will call `build()`.
 
-**Scope of the thread-safety claim.** The lock protects the `KernelCache` API members and the inherited `desc`/`status` fields. The inherited raw-descriptor operations (`initialize`, `finalize`, `get_ptr`) remain **unsynchronized** — callers that use them directly must provide their own synchronization. The backend cuDNN descriptor pointed to by `get_ptr()` is owned by the `KernelCache` and destroyed only in the destructor; it is safe to read the pointer value (and dereference it via cuDNN API calls) from any thread after `build()` or `from_json()` completes, without holding the lock. For callers that must read the pointer while `build()` may still be in flight on another thread, use `get_ptr_locked()` (returns by value, lock held for the load only).
 
 ## Override Shape
 

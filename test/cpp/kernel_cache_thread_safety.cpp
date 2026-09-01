@@ -3,27 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- * Thread-safety tests for cudnn_frontend::KernelCache (FE-01).
- *
- * Observable failure without the mutex: two threads both pass the
- * is_finalized() check before either sets the flag, both call initialize(),
- * and both call cudnnBackendFinalize().  The second finalize returns
- * CUDNN_STATUS_BAD_PARAM, which propagates as an error from build_operation_graph().
- *
- * Tests verify user-visible invariants after concurrent access:
- *   - All build_operation_graph() calls return is_good()
- *   - KC is finalized with a non-null descriptor
- *   - Subsequent build() calls are idempotent
- *
- * Measured unpatched failure rates on cuDNN 9.26.0.29, N=16, 40 iterations:
- *   CUDNN_STATUS_BAD_PARAM: 11 of 640 build calls
- * A small run can pass unpatched by luck; tests use N=16, 40 iterations.
- *
- * Note: TSan (the gold-standard witness) cannot run inside a Docker container
- * by default (setarch -R is blocked by seccomp).  A bare-metal TSan run names
- * kernel_cache.h and backend_descriptor.h as the contested locations.
- */
 
 #include <catch2/catch_test_macros.hpp>
 

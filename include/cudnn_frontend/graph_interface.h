@@ -1697,8 +1697,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
             "Graph::serialize: no built execution plan (candidate = " + std::to_string(candidate) + ")");
 
-        auto serialized_plan    = plans.execution_plans[candidate]->getJsonRepresentation();
-        j["cudnn_backend_data"] = std::move(serialized_plan);
+        j["cudnn_backend_data"] = plans.execution_plans[candidate]->getJsonRepresentation();
         j["variant_pack_uids"]  = variant_pack_uids;
 
         std::vector<BehaviorNote_t> selected_behavior_notes;
