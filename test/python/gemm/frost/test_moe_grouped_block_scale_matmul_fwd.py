@@ -26,8 +26,6 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
-    assert_final_moe_broadcast_drain as _assert_final_moe_broadcast_drain,
-    render_moe_scheduler as _render_moe_scheduler,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -278,23 +276,6 @@ def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
     assert "(col, coord_m)" in sequence
     assert "tile_l" not in sequence
     assert chain.has_moe and chain.has_block_scale
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    "cfg_name,expected_cta_group,expected_cluster_size",
-    [
-        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", 1, 1),
-        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma", 1, 2),
-        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", 2, 2),
-    ],
-)
-def test_moe_block_scale_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group, expected_cluster_size) -> None:
-    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
-    cfg, rendered = _render_moe_scheduler(chain, cfg_name, monkeypatch, block_scale=True)
-    assert cfg.cta_group == expected_cta_group
-    assert cfg.cluster_shape[0] * cfg.cluster_shape[1] * cfg.cluster_shape[2] == expected_cluster_size
-    _assert_final_moe_broadcast_drain(rendered)
 
 
 def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None:

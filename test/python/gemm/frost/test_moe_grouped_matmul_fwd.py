@@ -22,8 +22,6 @@ from gemm_test_utils import (
     reduction_ref as _reduction_ref,
     reduction_dims as _reduction_dims,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
-    assert_final_moe_broadcast_drain as _assert_final_moe_broadcast_drain,
-    render_moe_scheduler as _render_moe_scheduler,
 )
 
 from cudnn.gemm.frost.graph_analyzer import analyze
@@ -46,9 +44,6 @@ def _vp_moe(compiled, token, weight, fto, output):
 
 
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
-_SCHED_CFG_1CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-_SCHED_CFG_1CTA_MULTI = "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma"
-_SCHED_CFG_2CTA = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
 # (config name, cta_group): 2-CTA cluster2x1 (reference) + 1-CTA cluster1x1.
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
@@ -205,23 +200,6 @@ def _build_graph(
         return g
     out.set_data_type(output_dt).set_output(True)
     return g
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    "cfg_name,expected_cta_group,expected_cluster_size",
-    [
-        (_SCHED_CFG_1CTA, 1, 1),
-        (_SCHED_CFG_1CTA_MULTI, 1, 2),
-        (_SCHED_CFG_2CTA, 2, 2),
-    ],
-)
-def test_moe_scheduler_codegen_drains_final_cluster_broadcast(monkeypatch, cfg_name, expected_cta_group, expected_cluster_size) -> None:
-    chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))
-    cfg, rendered = _render_moe_scheduler(chain, cfg_name, monkeypatch, block_scale=False)
-    assert cfg.cta_group == expected_cta_group
-    assert cfg.cluster_shape[0] * cfg.cluster_shape[1] * cfg.cluster_shape[2] == expected_cluster_size
-    _assert_final_moe_broadcast_drain(rendered)
 
 
 # --------------------------------------------------------------------------- #

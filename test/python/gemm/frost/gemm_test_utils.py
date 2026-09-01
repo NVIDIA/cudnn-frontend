@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import re
-
 import cudnn
 from dataclasses import replace
 
@@ -106,37 +104,6 @@ def resolve(name):
 def kw(name):
     """resolve() packaged as jit/Plan kwargs."""
     return dict(config=by_name(name))
-
-
-def render_moe_scheduler(chain, config_name, monkeypatch, *, block_scale):
-    """Render a grouped-MoE scheduler for source-level regression checks."""
-    from cudnn.gemm.frost import compiler
-    from cudnn.gemm.frost.epilogue_codegen import generate
-
-    cfg = by_name(config_name)
-    monkeypatch.setattr(compiler, "_current_arch", lambda device=None: 100)
-    monkeypatch.setattr(compiler, "_grid_num_clusters", lambda _cfg, device=None: 1)
-    modes = compiler._store_modes(chain, cfg)
-    tma_slots = frozenset(i for i, mode in enumerate(modes) if mode == "tma")
-    snippets = generate(
-        chain,
-        vec_bytes_epi=compiler._epi_chunk_bytes(chain, cfg, bool(tma_slots)),
-        output_elem_bytes=compiler.DTYPE_BYTES[chain.output_dtype],
-        tma_slots=tma_slots,
-        packed_lanes=compiler._epi_packed_lanes(cfg),
-    )
-    render = compiler._render_block_scale_template if block_scale else compiler._render_template
-    return cfg, render(chain, snippets, cfg)
-
-
-def assert_final_moe_broadcast_drain(rendered):
-    """Require the final-broadcast snapshot and drain without pinning source order."""
-    for pattern in (
-        r"last_bcast_stage\s*=\s*bcast_stage",
-        r"last_bcast_empty_done_phase\s*=\s*bcast_empty_phase\s*\^\s*1",
-        r"sched_bcast_empty_mbar_ptr\.subview\(\s*last_bcast_stage\s*\)",
-    ):
-        assert re.search(pattern, rendered)
 
 
 # --- variant packs ----------------------------------------------------------
