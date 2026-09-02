@@ -344,6 +344,7 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     make_classic_bars,
     make_sdpa_helpers,
     assert_tile_n_supported,
+    sanitize_mxfp8_thd_v_sf_padding,
 )
 
 assert_tile_n_supported(CFG)
@@ -1986,6 +1987,8 @@ def _mma_warp_group(
                         _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
 
                 bars.mb_v_full[old_state.idx].wait(old_state.phase)
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    sanitize_mxfp8_thd_v_sf_padding(sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv)
                 desc_V = sV[old_state.idx].desc()
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
@@ -2104,6 +2107,8 @@ def _mma_warp_group(
                     if nvvm.elect_sync():
                         _utccp_bmm2_p_sf(tmem_SF_P0, desc_P_SF_0)
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                sanitize_mxfp8_thd_v_sf_padding(sV_SF[kv_state.idx], kv_right - cutlass.Int32(1), eff_seqlen_kv)
             desc_V = sV[kv_state.idx].desc()
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
@@ -3256,6 +3261,8 @@ def compile(  # noqa: A001
     partial O and LSE workspaces on a split-major batch axis."""
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires has_lse=True (the per-split LSE drives the combine)")
+    if lse_stride is not None and (CFG.THD_VARLEN or SPLIT_KV > 1):
+        raise ValueError("dense LSE strides are not valid for THD or split-KV workspaces")
     _fake_batch = 1 if CFG.THD_VARLEN else b
     _o_batch = _fake_batch * SPLIT_KV
     _lse_batch = b * SPLIT_KV

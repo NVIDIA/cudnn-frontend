@@ -17,6 +17,7 @@ Each check runs in a FRESH interpreter: once a module is imported in the test
 process it stays, so an in-process assertion would pass for the wrong reason.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -105,6 +106,50 @@ else:
     raise AssertionError("lazy symbol access unexpectedly succeeded without torch")
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.L0
+def test_d192_f16_kernel_compile_does_not_require_torch(tmp_path):
+    if importlib.util.find_spec("cutlass") is None:
+        pytest.skip("cutlass/dsl not installed")
+    probe = """
+import importlib.abc
+import pathlib
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import cudnn
+import cutlass
+import cutlass.cute as cute
+from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
+from cudnn.frost.template_loader import load_template
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+path = pathlib.Path(cudnn.__file__).parent / "sdpa/fwd/kernels/prefill_d192_d128_f16_sm100.py"
+load_template(str(path), TemplateParams(dtype_qkv=3), tag="d192_f16_no_torch")
+
+class Ex2Probe:
+    @cute.jit
+    def __call__(self):
+        self.kernel().launch(grid=(1, 1, 1), block=(1, 1, 1))
+
+    @cute.kernel
+    def kernel(self):
+        ex2_emulation_2(cutlass.Float32(0.25), cutlass.Float32(-0.5))
+
+cute.compile(Ex2Probe(), options="--enable-tvm-ffi")
+assert "torch" not in sys.modules
+"""
+    probe_path = tmp_path / "d192_f16_no_torch.py"
+    probe_path.write_text(probe)
+    run = subprocess.run([sys.executable, str(probe_path)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
 
 

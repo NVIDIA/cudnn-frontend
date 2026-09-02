@@ -1038,3 +1038,40 @@ def test_mxfp8_d192_d128_thd_mask_variants(in_key, mask):
     )
     _check(o_out, o_ref, torch.float16, in_key, d_qk=d_qk)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk", [128, 192])
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_nonfinite_v_sf_padding(d_qk, in_key, monkeypatch):
+    """Fully padded V scale blocks must not poison zero-filled V rows."""
+    original = _quantize_seq
+
+    def quantize(*args, **kwargs):
+        data, dequant, sf = original(*args, **kwargs)
+        if kwargs["columnwise"]:
+            # S=129: block 0 of the second F8_128x4 tile is partially valid;
+            # blocks 1..3 are physical padding. Each lane-group is 16 bytes.
+            offsets = [
+                (row % 32) * 16 + (row // 32) * 4 + col
+                for row in range(128)
+                for col in (1, 2, 3)
+            ]
+            sf[:, 1, torch.tensor(offsets, device=sf.device)] = 0xFF
+        return data, dequant, sf
+
+    monkeypatch.setitem(globals(), "_quantize_seq", quantize)
+    out, ref, _, _ = _run_thd(
+        [129],
+        [129],
+        2,
+        2,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(d_qk),
+        d_qk=d_qk,
+        d_v=128,
+    )
+    assert torch.isfinite(out).all()
+    _check(out, ref, torch.float16, in_key, d_qk=d_qk)

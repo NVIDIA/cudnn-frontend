@@ -132,8 +132,6 @@ def mma_ss(
     SF_REGISTERS_PER_BLOCK = 4
     if cutlass.const_expr(elect_once):
         elected = nvvm.elect_sync()
-    else:
-        elected = cutlass.Boolean(True)
     for kk in cutlass.range_constexpr(k_count):
         k = k_start + kk
         ki_a = k % sps_a

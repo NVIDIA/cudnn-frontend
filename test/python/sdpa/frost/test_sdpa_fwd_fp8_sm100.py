@@ -395,6 +395,28 @@ def test_fp8_d192_d128_masks(mask):
 
 @_skip_on_rubin
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_wide_swa_boundary_dense():
+    """Dense cga1 at WL + WR == cluster rows + TILE_N - 2; the final seam is KV row 130."""
+    swa_window = 2 * 128 * 1 + 128 - 2
+    out, o_ref, a_o, a_o_ref = _run(
+        1,
+        2,
+        2,
+        513,
+        513,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(192),
+        sdpa_kwargs=dict(use_causal_mask=True, left_bound=swa_window + 1),
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
 @pytest.mark.parametrize(
     ("in_key", "out_key", "with_sink"),
     [
@@ -1007,6 +1029,27 @@ def test_fp8_d192_d128_thd(in_key, causal, bottom_right):
         d_v=128,
     )
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_wide_swa_boundary_thd():
+    """THD cga2 at WL + WR == cluster rows + TILE_N - 2; the final seam is KV row 130."""
+    swa_window = 2 * 128 * 2 + 128 - 2
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(
+        [769],
+        [769],
+        2,
+        2,
+        "e4m3",
+        scale=1.0 / math.sqrt(192),
+        causal=True,
+        swa_window=swa_window,
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @_skip_on_rubin

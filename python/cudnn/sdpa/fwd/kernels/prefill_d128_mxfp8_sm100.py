@@ -214,6 +214,7 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     lpt_tile_coords,
     make_sdpa_helpers,
     assert_tile_n_supported,
+    sanitize_mxfp8_thd_v_sf_padding,
 )
 
 assert_tile_n_supported(CFG)
@@ -1500,6 +1501,8 @@ def _mma_warp_group(
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
                 bars.mb_v_full[old_state.idx].wait(old_state.phase)
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    sanitize_mxfp8_thd_v_sf_padding(sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv)
                 desc_V = sV[old_state.idx].desc()
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
@@ -1605,6 +1608,8 @@ def _mma_warp_group(
                     bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
             bars.mb_v_full[kv_state.idx].wait(kv_state.phase)
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                sanitize_mxfp8_thd_v_sf_padding(sV_SF[kv_state.idx], kv_right - cutlass.Int32(1), eff_seqlen_kv)
             desc_V = sV[kv_state.idx].desc()
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))

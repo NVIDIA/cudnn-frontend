@@ -1944,7 +1944,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``T_sf * sf_smem_size``, so a larger allocation could not be
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
-        every tile is empty there, so no SF byte is ever loaded."""
+        every tile is empty there, so no SF byte is ever loaded.
+
+        Scale bytes for valid or partially valid 32-element blocks must be
+        finite. Fully padded V blocks are sanitized in shared memory before
+        BMM2, so arbitrary bytes in the physical tail cannot turn TMA-zeroed
+        data into NaNs through ``0 * NaN``."""
         flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)

@@ -664,6 +664,20 @@ def test_split_kv_mxfp8_d192(in_key, splits, causal):
 
 
 @pytest.mark.L0
+def test_split_kv_mxfp8_d192_rejects_dense_lse_stride():
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_FP16
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_d192_d128_mxfp8_sm100.py")
+    params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, split_kv=2, cta_mma=2)
+    mod = load_template(path, params, tag="d192_mxfp8_split_lse_stride_reject")
+    with pytest.raises(ValueError, match="dense LSE strides"):
+        mod.compile(b=1, qh=2, kh=2, sq=128, skv=256, has_lse=True, lse_stride=(256, 128, 1))
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("cta_mma", [2, 1], ids=["cga2", "cga1"])
 @pytest.mark.parametrize("splits", [1, 4], ids=lambda s: f"split{s}")
 def test_split_kv_mxfp8(splits, cta_mma):

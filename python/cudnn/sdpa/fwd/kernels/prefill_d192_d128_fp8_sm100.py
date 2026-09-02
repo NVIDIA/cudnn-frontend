@@ -259,6 +259,7 @@ else:
     raise ValueError(f"prefill_sdpa_fp8: DTYPE_O={CFG.DTYPE_O} not supported " f"(expected 0=E4M3 / 1=E5M2 / 2=BF16 / 3=FP16)")
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
+    KvLoopBounds,
     make_split_helpers,
     make_classic_bars,
     make_sdpa_helpers,
@@ -2087,6 +2088,12 @@ def _softmax_warp_group(
         decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
             True, sched, cutlass.Int32(0)
         )
+        bounds = KvLoopBounds(
+            left=decoded_swa_left,
+            unmasked_lo=decoded_swa_left_end,
+            unmasked_hi=decoded_swa_right_start,
+            right=decoded_swa_right,
+        )
     else:
         bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
 
@@ -2237,6 +2244,12 @@ def _softmax_warp_group(
         if cutlass.const_expr(_PREDECODE_THD_SWA_SEGMENTS):
             decoded_swa_left, decoded_swa_left_pad_start, decoded_swa_left_end, decoded_swa_right_start, decoded_swa_right = _load_swa_segment_bounds(
                 False, sched, decoded_base
+            )
+            bounds = KvLoopBounds(
+                left=decoded_swa_left,
+                unmasked_lo=decoded_swa_left_end,
+                unmasked_hi=decoded_swa_right_start,
+                right=decoded_swa_right,
             )
         else:
             bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, None, None, split_idx, CFG.QH_PER_KH)
