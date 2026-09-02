@@ -235,13 +235,15 @@ def build_thd_meta_o_kv_descs_kernel(
     o_row_stride: cutlass.Int32,
     cga_tile_m: cutlass.Int32,
     n_clusters: cutlass.Int32,
+    k_seq_dim: cutlass.Constexpr[int] = 2,
+    v_seq_dim: cutlass.Constexpr[int] = 2,
 ) -> None:
     """THD setup for the FP8/MXFP8 flavors: metadata, per-batch O descriptors
     and the packed-total-clamped K/V descriptors.
 
-    Same body as ``build_thd_meta_o_descs_kernel`` minus the persistent
-    scheduler's live-unit total and claim counter, which these flavors do not
-    launch with. Both kernels clamp K/V (issue #624).
+    Like ``build_thd_meta_o_descs_kernel``, this publishes the persistent
+    scheduler's live-unit total and claim counter. Both kernels also clamp K/V
+    (issue #624).
 
     The K/V loads tile in TILE_N rows, so the LAST sequence's tile steps past
     the packed KV total into the buffer's capacity tail — caller-owned bytes
@@ -250,7 +252,7 @@ def build_thd_meta_o_kv_descs_kernel(
     (``0 · NaN == NaN`` wipes every valid row of the tile), and on cc10.3 the
     fused-LDTM row-max reduces S BEFORE the mask. So the setup thread also
     copies the K and V base descriptors into ``o_desc_words`` slots
-    ``n_batch+1`` / ``n_batch+2`` with their seq extent (GLOBAL_DIM ord=2)
+    ``n_batch+1`` / ``n_batch+2`` with each descriptor's sequence extent
     patched to the packed total ``cu_k[B]`` — tile-tail loads past it become
     TMA-OOB and land as EXACT ZEROS in SMEM (zero V nulls the masked P·V
     terms; zero K keeps the pre-mask row-max finite). Slot ``n_batch`` stays
@@ -291,12 +293,12 @@ def build_thd_meta_o_kv_descs_kernel(
         k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (k_dptr + i).store((k_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=k_seq_dim)
         v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
         v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (v_dptr + i).store((v_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=v_seq_dim)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,

@@ -10,7 +10,7 @@ import math
 import os
 from abc import abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
 
@@ -28,7 +28,12 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams, pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm100 import (
+    TemplateParams as Sm100TemplateParams,
+    canonicalize_d192_lowering,
+    derive_d192_internal_params,
+    pack_gqa_supported,
+)
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -443,6 +448,8 @@ class SdpaFwdDsl(APIBase):
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
         self.cga = None if cga is None else int(cga)
+        # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
+        # graph heuristics pass an explicit split count when splitting wins.
         self.split_kv = 1 if split_kv is None else int(split_kv)
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
@@ -1073,12 +1080,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
             (self.tile_n, 128, "tile_n"),
-            (self.cga, 2, "cga"),
         ):
             self._value_error_if(
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
+        supported_cgas = (1, 2) if self.flavor == (192, 128) else (2,)
+        self._value_error_if(
+            self.cga is not None and self.cga not in supported_cgas,
+            f"SM100 DSL SDPA only supports cga in {supported_cgas}",
+        )
+        self._value_error_if(
+            self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
+            "D192 split_kv > 1 is validated only with cga=2",
+        )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -1140,18 +1155,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
-        # Of the FP8/MXFP8 flavors only d128/d128 carries the write_thd_meta
-        # THD leg; the d192/d128 siblings are dense-only. The engine specs
-        # already route this (their d192 rows declare thd=False); the gate
-        # covers direct construction.
-        # Of the quantized flavors, d128/d128 (per-tensor + block-scale) and
-        # d512/d512 (per-tensor only) carry the write_thd_meta THD leg; the
-        # d192/d128 siblings are dense-only.
-        _thd_fp8_shapes = {(128, 128), (512, 512)} if self._pertensor else {(128, 128)}
+        # Keep direct construction aligned with each quantized family's THD
+        # kernels; graph routing enforces the same per-family shape domain.
+        _thd_fp8_shapes = {(128, 128), (192, 128), (512, 512)} if self._pertensor else {(128, 128), (192, 128)}
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
-            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)} (the d192/d128 "
-            f"kernels are dense-only, and d512 has no block-scale kernel); got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1231,47 +1240,54 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
-        _pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
-        lpt_head_group = 1
-        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q // _pack_g) % 8 == 0:
-            lpt_head_group = 8
-        lpt_q_tiles = 0
-        if self._fp8 and self.flavor == (192, 128) and not self.thd:
-            lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
-        template_window_right = self.window_right
-        if (
-            self._fp8
-            and self._pertensor
-            and self.flavor == (192, 128)
-            and self.window_left is None
-            and self.window_right is None
-            and not self.seq_kv_lens_present
-        ):
-            # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-            # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
-            # selects the equivalent masked-interior lowering.
-            template_window_right = self.s_k_max
         from cudnn import data_type as _cudnn_dtype
 
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
-            window_right=template_window_right,
+            window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
-            lpt_head_group=lpt_head_group,
-            lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            cta_mma=2 if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
+        if self.flavor == (192, 128):
+            from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+            auto_sched, auto_cga = select_d192_auto_knobs(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d192_lowering(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = derive_d192_internal_params(
+                params,
+                pertensor=self._pertensor,
+                batch_size=self.batch_size,
+                h_q=self.h_q,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -1632,8 +1648,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
         )
         if self._fp8:
-            # The FP8/MXFP8 cells serve only the packed contract at exact
-            # d128 (check_support) — no stride/head-dim keys.
+            # FP8/MXFP8 THD serves only native packed contracts. Flavor
+            # selection chooses the exact kernel module, so no stride or
+            # head-dim entries are needed in this per-module compile key.
             return kwargs
         kwargs.update(
             d_qk=self.head_dim_qk,
@@ -1713,8 +1730,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # them now, not just FP8/MXFP8 (issue #624).
             o_desc_slots = b + 3
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
-        # The PLAN-TIME envelope grid — dead units exit by kernel contract.
-        # PERSISTENT THD grid: cap the launch at what the device can hold
+        # The plan-time envelope bounds the possible unit count. Persistent THD
+        # kernels cap the launch at what the device can hold
         # resident (one cluster per CGA_SIZE SMs) instead of the plan-time
         # envelope. The kernel pulls units from a device-bounded counter, so
         # the grid no longer has to cover the work list -- which is what made
@@ -1922,7 +1939,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``T_sf * sf_smem_size``, so a larger allocation could not be
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
-        every tile is empty there, so no SF byte is ever loaded."""
+        every tile is empty there, so no SF byte is ever loaded.
+
+        Scale bytes for valid or partially valid 32-element blocks must be
+        finite. Fully padded V blocks are sanitized in shared memory before
+        BMM2, so arbitrary bytes in the physical tail cannot turn TMA-zeroed
+        data into NaNs through ``0 * NaN``."""
         flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
