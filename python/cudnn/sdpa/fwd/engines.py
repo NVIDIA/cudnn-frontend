@@ -138,6 +138,17 @@ class Capabilities:
     # quantized rows' packed THD compile key carries no head-dim entries
     # (native-tile contract), so their envelope is dense-only.
     thd_d_shapes: Optional[frozenset] = None
+    # Per-native-shape ENVELOPE FLOOR: a tuple of ``((d_qk, d_v), min_dim)``
+    # pairs (a tuple, not a dict, so the row stays hashable). A shape with a
+    # floor serves graphs whose head dims are in ``(min_dim, shape]`` rather
+    # than ``(0, shape]``, so a kernel whose geometry is tuned for a large head
+    # dim does not silently swallow a much smaller graph at a multiple-x
+    # zero-padding cost. The floor applies to BOTH head dims and only to
+    # ENVELOPE matches — an exact ``d_shapes`` hit always passes. Example: the
+    # d512 FP8 flavor floors at 256, so it serves (256, 512] on both dims
+    # (at most 2x padding) and a d256 graph is declined rather than routed
+    # onto it. ``()`` = no floors.
+    d_envelope_floors: tuple = ()
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
@@ -353,11 +364,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     shapes = sorted(capabilities.d_shapes)
-    if capabilities.d_pad_multiple:
+    if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         # Envelope family: native flavor shapes are upper bounds (TMA
         # zero-padding semantics — see Capabilities.d_shapes/d_pad_multiple);
-        # the lowering picks the smallest covering flavor.
-        if not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.d_shapes):
+        # the lowering picks the smallest covering flavor. An EXACT native
+        # shape is served above, so only inexact graphs walk the envelope —
+        # where a per-shape floor (d_envelope_floors) may also apply.
+        floors = dict(capabilities.d_envelope_floors)
+        if not any(facts.d_qk <= sq and facts.d_v <= sv and min(facts.d_qk, facts.d_v) > floors.get((sq, sv), 0) for sq, sv in capabilities.d_shapes):
             return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {shapes}"
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
@@ -365,7 +379,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
                 f"global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
-    elif (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
+    elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return (
@@ -619,9 +633,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     kernel flavor (d128 or d192xd128) covering the graph. Each row declares
     exactly what its own kernels carry:
 
-    - d_shapes: the sm100 row picks between the d128 and d192xd128 flavors;
-      Rubin has only the d128 sibling, so a Rubin d192 graph is ineligible
-      at probe time instead of a late build error.
+    - d_shapes: the sm100 row picks between the d128, d192xd128 and d512
+      flavors; Rubin has only the d128 sibling, so a Rubin d192 graph is
+      ineligible at probe time instead of a late build error.  There is no
+      d256 per-tensor FP8 kernel, so the adapter's flavor walk is restricted
+      to this set (api_dsl._pick_flavor's ``candidates``) rather than the
+      f16 flavor list.
     - The ENVELOPE (d_pad_multiple=16, the TMA 16-byte global-stride rule at
       1 byte/elem): smaller head dims ride TMA zero-padding — exact in FP8,
       and the descales are scalars so no per-column plumbing is affected.
@@ -630,6 +647,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
+    - thd_d_shapes: the d128 and d512 per-tensor kernels carry the
+      write_thd_meta THD leg; the d192x128 file is dense-only.
     - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers
       (the SM107 sibling carries the same plumbing as its SM100 twin), so both
       rows advertise the split; the d192x128 file forks its own scheduler and
@@ -659,9 +678,15 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128)}),
+            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (512, 512)}),
             d_pad_multiple=16,
-            thd_d_shapes=frozenset({(128, 128)}),
+            # The d512 flavor serves the (256, 512] band on BOTH head dims —
+            # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
+            # Below that floor it declines rather than swallowing e.g. a d256
+            # graph onto a kernel whose cga4x1 role-split geometry is tuned for
+            # d = 512. Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
+            d_envelope_floors=() if rubin_row else (((512, 512), 256),),
+            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,

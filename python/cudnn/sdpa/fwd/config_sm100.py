@@ -142,8 +142,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor not in ("d128", "d192"):
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128 and d192")
+    if fp8 and flavor not in ("d128", "d192", "d512"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192 and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
@@ -545,6 +545,7 @@ class CfgD512:
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
+    _fp8 = cfg.DTYPE_QKV <= DTYPE_E5M2
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d512: MMA/TMALDG/TMASTG/Scheduler regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d512: register budget over 512"),
@@ -556,11 +557,33 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         (cfg.SOFTMAX_WARPGROUPS == 1, "d512 (role-split): SOFTMAX_WARPGROUPS must be 1"),
         (cfg.CORRECTION_WARPS == 0, "d512 (role-split): CORRECTION_WARPS must be 0"),
         (cfg.READ_TILE_ARRIVERS == 25, f"d512 cga4x1: expected READ_TILE_ARRIVERS=25, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128, "d512: Q/K/V/O swizzle must all be 128B"),
-        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d512 f16: TILE_K_HW must be 16 (1-chunk only on SM10x — 2-chunk silently wrong)"),
-        (cfg.STAGES_KV == 2, "d512 f16 (SM100): STAGES_KV must be 2 (SMEM-cap driven)"),
-        (cfg.XFER_STAGES == 2, "d512 f16 (SM100): XFER_STAGES must be 2 (TMEM-cap driven: 2*128 S_acc + 256 Q = 512)"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d512: DTYPE_O must equal DTYPE_QKV for half input"),
+        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128, "d512: Q/K/V swizzle must all be 128B"),
+        (cfg.O_SWZ_BYTES == 128, "d512: O swizzle must be 128B"),
+        # Both dtype families run the SM10x 1-chunk MMA step: f16 at K=16,
+        # FP8 at the K=32 QMMA (k_dim=0).  The Rubin K=64 2-chunk fast path is
+        # silently WRONG on Blackwell — see rules/mma-tma-matrix.md § 1.
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if _fp8 else 16),
+            "d512: TILE_K_HW must be 32 (fp8 K=32 QMMA) / 16 (f16, 1-chunk on SM10x — 2-chunk silently wrong)",
+        ),
+        # SMEM-cap driven: the K/V ring costs STAGES_KV * 64 KiB at f16 and
+        # STAGES_KV * 32 KiB at FP8, so FP8 buys a third stage under the same
+        # 227 KiB cap.
+        (cfg.STAGES_KV == (3 if _fp8 else 2), "d512 (SM100): STAGES_KV must be 3 (fp8) / 2 (f16) — SMEM-cap driven"),
+        # TMEM-cap driven (512 cols on Blackwell): the sg0 carve is
+        # XFER_STAGES * TILE_N (S_acc parities) + TILE_K / (4 // BPE) (Q, moved
+        # to TMEM by UTCCP).  f16: 2*128 + 256 = 512.  FP8 packs 4 elems per
+        # 4-byte column, so Q costs only 128 cols and a third parity fits:
+        # 3*128 + 128 = 512.
+        (cfg.XFER_STAGES == (3 if _fp8 else 2), "d512 (SM100): XFER_STAGES must be 3 (fp8) / 2 (f16) — TMEM-cap driven"),
+        (
+            cfg.XFER_STAGES * cfg.TILE_N + cfg.TILE_K // (4 // cfg.BPE) == 512,
+            f"d512 (SM100): sg0 TMEM carve (S_acc {cfg.XFER_STAGES * cfg.TILE_N} + Q {cfg.TILE_K // (4 // cfg.BPE)}) must be exactly 512 cols",
+        ),
+        (
+            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
+            "d512: DTYPE_O must equal DTYPE_QKV for half input; fp8 allows an independent output dtype",
+        ),
     )
     for ok, msg in checks:
         if not ok:
@@ -570,18 +593,29 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
 def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     _validate_params("d512", params)
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv <= DTYPE_E5M2  # E4M3/E5M2 inputs → the fp8 kernel file
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
+    # FP8 pins the Blackwell K=32 QMMA path.  NOT tile_k_hw(), which returns the
+    # Rubin K=64 answer (see mma-tma-matrix.md § 1 "latent trap in the shared
+    # helper") — k_dim=0 with TILE_K_HW=64 is the silently-wrong combination.
+    tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
     cfg = CfgD512(
         DTYPE_QKV=params.dtype_qkv,
-        DTYPE_O=params.dtype_qkv,
+        DTYPE_O=dtype_o,
         BPE=b,
-        BPE_O=b,
+        BPE_O=b_o,
         Q_SWZ_BYTES=q_swz_bytes(512, b),
         K_SWZ_BYTES=q_swz_bytes(512, b),
         V_SWZ_BYTES=v_swz_bytes(512, 2, b),
-        O_SWZ_BYTES=o_swz_bytes(512, b),
+        O_SWZ_BYTES=o_swz_bytes(512, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=tile_k_hw_fp8,
+        # FP8 halves the K/V ring and the TMEM-resident Q, buying a third KV
+        # stage and a third S_acc parity under the same SMEM / TMEM caps.
+        STAGES_KV=3 if fp8 else 2,
+        XFER_STAGES=3 if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
