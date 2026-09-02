@@ -95,8 +95,9 @@ class TemplateParams:
     bias_broadcast: bool = True  # bias batch dim 1 (broadcast) vs B
     has_sink: bool = False  # sinks input => dSink output (standalone reduction)
     has_rope: bool = False
-    # Deterministic dQ: the kv-ordered gmem-semaphore relay (forces
-    # SCHED_DEFAULT; the semaphore is carved caller scratch).
+    # Deterministic dQ: the kv-ordered gmem-semaphore relay (requires
+    # SCHED_NATURAL; the semaphore is caller scratch — carved on the dense
+    # engine path, sized from max_s_q on the THD wrapper path).
     deterministic: bool = False
     # Packed varlen (wrapper-only today; the engine row declares thd=False).
     thd_varlen: bool = False
@@ -130,13 +131,8 @@ def validate_bwd_params(p: TemplateParams) -> None:
         raise ValueError("sm80 bwd: deterministic dQ requires SCHED_NATURAL (the kv-ordered semaphore relay)")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):
         raise ValueError("sm80 bwd: causal_bottom_right requires is_causal and/or has_swa (nothing to align otherwise)")
-    if p.thd_varlen and (p.has_bias or p.has_rope or p.has_sink or p.has_seq_kv_lens or p.has_seq_q_lens):
-        raise ValueError("sm80 bwd: THD carries lengths via cu_seqlens; bias / rope / sink / dense seq-lens are dense-only")
-    if p.thd_varlen and p.deterministic:
-        # The dQ-relay semaphore is sized at compile time from the dense sq;
-        # THD compiles sq as a dynamic sym_int so there is nothing to size it
-        # from (the FE support surface already rejects deterministic + ragged).
-        raise ValueError("sm80 bwd: deterministic dQ is dense-only (THD compiles sq dynamic; the relay semaphore has no plan-time size)")
+    if p.thd_varlen and (p.has_bias or p.has_rope or p.has_seq_kv_lens or p.has_seq_q_lens):
+        raise ValueError("sm80 bwd: THD carries lengths via cu_seqlens; bias / rope / dense seq-lens are dense-only")
 
 
 def bwd_params_for_flavor(flavor: str, **overrides) -> TemplateParams:
