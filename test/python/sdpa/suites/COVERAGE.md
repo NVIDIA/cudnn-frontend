@@ -28,6 +28,7 @@ Conventions:
 | context.fp8.dense | fp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp8/fp16, layout padded/full, sink | infer, impl AUTO |  |
 | context.fp8.thd | fp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, layout ragged/cu_ragged/cu_ragged_mult, total_q/kv slack, declare totals on graph | infer, no mask, diag TL |  |
 | context.mxfp8.dense | mxfp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, sink, unfuse_fma | infer, impl AUTO, SM100+, layout full (mxfp8 API has no seq-len args, #646) | SM>=100 |
+| context.mxfp8.thd | mxfp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, layout ragged/cu_ragged, sink, total_q/kv slack, declare totals on graph | infer, stats token-major TH1, d=128/128 (frost THD leg), SM100+ | SM>=100; fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native backend check_support-accepts THD mxfp8 but cannot execute it |
 | models.llama31.context.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
 | models.llama31.context.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
 | models.qwen35.context.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
@@ -88,4 +89,4 @@ Conventions:
 | models.kimi_k3.bprop.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 | models.kimi_k3.bprop.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 
-**Total configs: 5112 across 60 suites.**
+**Total configs: 5240 across 61 suites.**

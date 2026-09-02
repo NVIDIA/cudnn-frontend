@@ -221,6 +221,37 @@ _SPECS = [
             "layout full (mxfp8 API has no seq-len args, #646)",
         ),
     ),
+    SuiteSpec(
+        name="context.mxfp8.thd",
+        phase="context",
+        dtype="mxfp8",
+        level="L0",
+        num_tests=128,
+        rng_seed=1003,
+        knobs=knobs.mxfp8_thd_fwd,
+        exec_kind="mxfp8",
+        min_sm=(10, 0),
+        post=post_mxfp8,
+        fuzzed=_COMMON_FUZZ
+        + _MASK_FUZZ
+        + (
+            "e4m3/e5m2 in",
+            "out fp16/bf16",
+            "layout ragged/cu_ragged",
+            "sink",
+            "total_q/kv slack",
+            "declare totals on graph",
+        ),
+        pinned=(
+            "infer",
+            "stats token-major TH1",
+            "d=128/128 (frost THD leg)",
+            "SM100+",
+        ),
+        notes="fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine "
+        "(CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native "
+        "backend check_support-accepts THD mxfp8 but cannot execute it",
+    ),
     # ---- generation (decode / small-s_q forward) ----
     SuiteSpec(
         name="generation.fp16.decode",

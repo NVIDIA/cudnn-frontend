@@ -728,6 +728,37 @@ def thd_chunked(dtype):
     )
 
 
+def mxfp8_thd_fwd():
+    # Forward THD/ragged mxfp8 (SM100+): packed tokens + ragged offsets +
+    # packed per-sequence-TILE-padded SF (engine contract from
+    # frost/test_sdpa_fwd_mxfp8_sm100.py). Causal / no-mask, TL alignment,
+    # token-major stats — the validated THD mxfp8 envelope.
+    return dict(
+        batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
+        s_q_s_kv=RandomSequenceLength(
+            s_q_min=128,
+            s_q_max=2048,
+            s_kv_min=128,
+            s_kv_max=2048,
+            s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
+        ),
+        # The FROST mxfp8 prefill engine's THD leg is d=128/128 only
+        # (thd_d_shapes; the d192x128 kernel is dense-only) — any other d
+        # declines to the native backend, which cannot run THD mxfp8.
+        d_qk_d_v=Fixed((128, 128)),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
+        diag_align=RandomChoice(DIAG_BOTH),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
+        with_sink_token=RandomChoice({True: 1, False: 2}),
+        total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
+        declare_total_seq_len=RandomChoice({True: 1, False: 1}),
+        # no unfuse_fma: the frost mxfp8 engine declines it
+    )
+
+
 # ---- model presets ----------------------------------------------------------
 
 
