@@ -47,8 +47,13 @@ def _bshd_randn(b, h, s, d, **kw):
     return torch.randn((b, s, h, d), **kw).permute(0, 2, 1, 3)
 
 
-def _ref_grads(q, k, v, do, *, is_causal, window_left, scale):
-    """fp32 autograd reference; returns (o, dq, dk, dv)."""
+def _ref_grads(q, k, v, do, *, is_causal, window_left, scale, causal_bottom_right=False):
+    """fp32 autograd reference; returns (o, dq, dk, dv).
+
+    Mask semantics mirror the kernel's ``_mask_p``: the diagonal anchor is
+    ``q`` (top-left) or ``q + (s_kv - s_q)`` (bottom-right); causal keeps
+    ``kv <= anchor``; a left window keeps ``kv >= anchor - W`` (also without
+    causal — the non-causal "swa" mask)."""
     _, h_q, s_q, _ = q.shape
     _, h_kv, s_kv, _ = k.shape
     g = h_q // h_kv
@@ -59,15 +64,15 @@ def _ref_grads(q, k, v, do, *, is_causal, window_left, scale):
     k_exp = k_ref.repeat_interleave(g, dim=1)
     v_exp = v_ref.repeat_interleave(g, dim=1)
     scores = torch.matmul(q_ref, k_exp.transpose(-1, -2)) * scale
-    if is_causal:
-        # Top-left diagonal, matching the wrapper's default mask (the tests
-        # never pass causal_bottom_right); with a bottom-right-anchored
-        # reference the two would agree only while s_q == s_kv.
+    if is_causal or window_left >= 0:
         i = torch.arange(s_q, device=q.device).view(s_q, 1)
         j = torch.arange(s_kv, device=q.device).view(1, s_kv)
-        keep = j <= i
+        anchor = i + (s_kv - s_q) if causal_bottom_right else i
+        keep = torch.ones(s_q, s_kv, dtype=torch.bool, device=q.device)
+        if is_causal:
+            keep &= j <= anchor
         if window_left >= 0:
-            keep &= (i - j) <= window_left
+            keep &= (anchor - j) <= window_left
         scores = scores.masked_fill(~keep, float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     o = torch.matmul(probs, v_exp)
@@ -247,7 +252,7 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     torch.testing.assert_close(dv_d.float(), dv_g.float(), rtol=2e-2, atol=2e-2)
 
 
-def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True):
+def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1):
     """Run the THD fwd+bwd wrappers on packed random inputs; when
     ``check_grads``, compare each sequence's dQ/dK/dV slice against the dense
     fp32 autograd reference (the existing ``_ref_grads`` pattern)."""
@@ -262,8 +267,11 @@ def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True):
     k = torch.randn(1, t, h, d_qk, dtype=torch.float16, device="cuda")
     v = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
     do = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
-    fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens)))
-    out = sdpa_bwd_wrapper_sm80(q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu)
+    window = (window_left, 0)
+    fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, window_size=window, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens)))
+    out = sdpa_bwd_wrapper_sm80(
+        q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, window_size=window, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu
+    )
     if check_grads:
         for i in range(len(lens)):
             lo, hi = int(cu[i]), int(cu[i + 1])
@@ -272,7 +280,9 @@ def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True):
             def _bhsd(x, _lo=lo, _hi=hi):
                 return x[0, _lo:_hi].permute(1, 0, 2).unsqueeze(0)
 
-            _, dq_ref, dk_ref, dv_ref = _ref_grads(_bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=-1, scale=1.0 / math.sqrt(d_qk))
+            _, dq_ref, dk_ref, dv_ref = _ref_grads(
+                _bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=window_left, scale=1.0 / math.sqrt(d_qk)
+            )
             torch.testing.assert_close(_bhsd(out["dq_tensor"]).to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(_bhsd(out["dk_tensor"]).to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(_bhsd(out["dv_tensor"]).to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
@@ -546,3 +556,112 @@ def test_sm80_bwd_wrapper_lse_stride_in_cache_key():
     )
     with pytest.raises(ValueError, match="device"):
         eng.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "is_causal,bottom_right,s_q,s_kv",
+    [(True, False, 2048, 2048), (False, False, 2048, 2048), (True, True, 1536, 2048)],
+    ids=["causal_swa_tl", "swa_only", "causal_swa_br"],
+)
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_swa_long_seq(is_causal, bottom_right, s_q, s_kv):
+    """Sliding window at S >> W: the backward bounds each kv-tile's q-loop to
+    the window (q <= kv + W - br_diag), the mirror of the forward's kv_left
+    trim, instead of sweeping every q-tile and masking. Correctness against the
+    dense reference across the three window geometries the kernel serves:
+    top-left causal+window, window-only (non-causal), bottom-right causal+window
+    with s_q != s_kv (the anchor shifts by s_kv - s_q)."""
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    b, h, d, w = 1, 4, 64, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bshd_randn(b, h, s_q, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h, s_kv, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h, s_kv, d, dtype=torch.float16, device="cuda")
+    do = _bshd_randn(b, h, s_q, d, dtype=torch.float16, device="cuda")
+    # window_size_right is a causal-band attribute: the wrappers take -1
+    # (unset) for a non-causal left window and 0 (no widening) under causal.
+    window = (w, 0 if is_causal else -1)
+    fwd = sdpa_fwd_wrapper_sm80(
+        q_tensor=q, k_tensor=k, v_tensor=v, is_causal=is_causal, window_size=window, causal_bottom_right=bottom_right, scale_softmax=scale
+    )
+    out = sdpa_bwd_wrapper_sm80(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=fwd["o_tensor"],
+        do_tensor=do,
+        lse_tensor=fwd["lse_tensor"],
+        is_causal=is_causal,
+        window_size=window,
+        causal_bottom_right=bottom_right,
+        scale_softmax=scale,
+    )
+    _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=is_causal, window_left=w, scale=scale, causal_bottom_right=bottom_right)
+    torch.testing.assert_close(out["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dk_tensor"].to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dv_tensor"].to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_swa():
+    """THD + sliding window: the q-loop bound is per packed sequence (in-seq
+    q/kv indices); sequences longer and shorter than the window mix."""
+    try:
+        _thd_run_and_check([96, 1024, 640], h=4, d_qk=64, d_v=64, window_left=128)
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("bottom_right,s_q,s_kv", [(False, 2048, 2048), (True, 1536, 2048)], ids=["tl", "br"])
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_swa_deterministic(bottom_right, s_q, s_kv):
+    """Deterministic dQ + sliding window at S >> W: the window-bounded q-loop
+    means a q-tile's kv-tile visitors start at the window floor, not at 0, so
+    the ordered relay counts turns from that first visitor (the SM120 kernel's
+    `relay_turn`). Must be bitwise repeatable AND agree with the
+    non-deterministic path — a wrong first-visitor would hang or mis-order."""
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    b, h, d, w = 1, 4, 64, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bshd_randn(b, h, s_q, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h, s_kv, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h, s_kv, d, dtype=torch.float16, device="cuda")
+    do = _bshd_randn(b, h, s_q, d, dtype=torch.float16, device="cuda")
+    window = (w, 0)
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, window_size=window, causal_bottom_right=bottom_right, scale_softmax=scale)
+
+    def run(det):
+        return sdpa_bwd_wrapper_sm80(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=fwd["o_tensor"],
+            do_tensor=do,
+            lse_tensor=fwd["lse_tensor"],
+            is_causal=True,
+            window_size=window,
+            causal_bottom_right=bottom_right,
+            scale_softmax=scale,
+            deterministic=det,
+        )
+
+    a, bb = run(True), run(True)
+    for key in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        assert torch.equal(a[key], bb[key]), key
+    nd = run(False)
+    _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=True, window_left=w, scale=scale, causal_bottom_right=bottom_right)
+    torch.testing.assert_close(a["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(a["dq_tensor"].to(torch.float32), nd["dq_tensor"].to(torch.float32), rtol=2e-2, atol=2e-2)
