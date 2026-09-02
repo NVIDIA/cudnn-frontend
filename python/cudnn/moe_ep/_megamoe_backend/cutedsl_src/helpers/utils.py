@@ -19,6 +19,17 @@ def ceil_div(value: IntegerType, divisor: IntegerType) -> IntegerType:
     return (value + divisor - 1) // divisor
 
 
+def padded_expert_rows(token_count: IntegerType, padding_block: IntegerType) -> IntegerType:
+    """Row span one expert occupies in a block-padded pool.
+
+    The single definition of a pool's per-expert stride. Communication components
+    write bases derived from it while the FC12 scheduler rebuilds the same bases
+    from ``expert_sizes`` at runtime; if the two ever disagree the metadata a
+    kernel reads no longer describes the rows it loads.
+    """
+    return round_up(token_count, padding_block)
+
+
 def is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -95,6 +106,7 @@ __all__ = [
     "is_nested_shape",
     "is_power_of_two",
     "ordered_stride",
+    "padded_expert_rows",
     "product",
     "row_major_stride",
     "round_up",

@@ -13,6 +13,7 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import Boolean, Int32, extract_mlir_values, new_from_mlir_values
 
 from ...helpers.iket_compat import iket
+from ...helpers.utils import padded_expert_rows
 from .base import SchedulerWorkTileBase
 
 
@@ -494,12 +495,8 @@ def _load_expert_batch_metrics(
     token_blocks = (token_count + Int32(mapping_state.mapping_cluster_tile_m - 1)) // Int32(
         mapping_state.mapping_cluster_tile_m
     )
-    data_rows = (
-        (token_count + Int32(mapping_state.token_padding_block - 1)) // Int32(mapping_state.token_padding_block)
-    ) * Int32(mapping_state.token_padding_block)
-    sf_rows = (
-        (token_count + Int32(mapping_state.sf_padding_block - 1)) // Int32(mapping_state.sf_padding_block)
-    ) * Int32(mapping_state.sf_padding_block)
+    data_rows = padded_expert_rows(token_count, Int32(mapping_state.token_padding_block))
+    sf_rows = padded_expert_rows(token_count, Int32(mapping_state.sf_padding_block))
     fc1_tiles = token_blocks * mapping_state.num_fc1_intermediate_blocks
     fc2_tiles = token_blocks * mapping_state.num_fc2_hidden_blocks
     return expert_idx, token_count, token_blocks, data_rows, sf_rows, fc1_tiles, fc2_tiles
@@ -660,13 +657,12 @@ def _seek_expert_for_work_id(linear_work_id: Int32, mapping_state: Fc12TaskMappi
     base_token_block_cumulative = cursor.current_token_block_cumulative
     if cursor.current_expert_idx >= cursor.current_group_first_expert:
         current_token_count = cursor.current_expert_token_count
-        base_data_cumulative = base_data_cumulative + (
-            (current_token_count + Int32(mapping_state.token_padding_block - 1))
-            // Int32(mapping_state.token_padding_block)
-        ) * Int32(mapping_state.token_padding_block)
-        base_sf_cumulative = base_sf_cumulative + (
-            (current_token_count + Int32(mapping_state.sf_padding_block - 1)) // Int32(mapping_state.sf_padding_block)
-        ) * Int32(mapping_state.sf_padding_block)
+        base_data_cumulative = base_data_cumulative + padded_expert_rows(
+            current_token_count, Int32(mapping_state.token_padding_block)
+        )
+        base_sf_cumulative = base_sf_cumulative + padded_expert_rows(
+            current_token_count, Int32(mapping_state.sf_padding_block)
+        )
         base_token_block_cumulative = base_token_block_cumulative + cursor.current_token_block_count
 
     search_begin = cutlass.max(cursor.current_expert_idx + Int32(1), cursor.current_group_first_expert)
@@ -1034,13 +1030,12 @@ def _advance_phase_cursor(
     cursor: _PhaseFc12CursorState, mapping_state: PhaseInterleavedFc12MappingState
 ) -> _PhaseFc12CursorState:
     previous_token_count = cursor.current_expert_token_count
-    cursor.data_cumulative = cursor.data_cumulative + (
-        (previous_token_count + Int32(mapping_state.token_padding_block - 1))
-        // Int32(mapping_state.token_padding_block)
-    ) * Int32(mapping_state.token_padding_block)
-    cursor.sf_cumulative = cursor.sf_cumulative + (
-        (previous_token_count + Int32(mapping_state.sf_padding_block - 1)) // Int32(mapping_state.sf_padding_block)
-    ) * Int32(mapping_state.sf_padding_block)
+    cursor.data_cumulative = cursor.data_cumulative + padded_expert_rows(
+        previous_token_count, Int32(mapping_state.token_padding_block)
+    )
+    cursor.sf_cumulative = cursor.sf_cumulative + padded_expert_rows(
+        previous_token_count, Int32(mapping_state.sf_padding_block)
+    )
     cursor.token_block_cumulative = cursor.token_block_cumulative + cursor.current_token_block_count
 
     cursor.expert_idx = cursor.expert_idx + Int32(1)

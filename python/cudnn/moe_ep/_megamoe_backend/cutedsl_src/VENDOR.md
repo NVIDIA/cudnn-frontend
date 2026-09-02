@@ -9,14 +9,16 @@ documented in the parent backend `README.md`.
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
 - **Source tree**: `cutedsl_megamoe/next/sources`.
 - **Current synchronized commit**:
-  `5b89819cb16069dfe20a1a0ba0778d35cb428352`.
+  `9b15c450e2d19472bdfaae37489317f029beb01c`.
 - **Earlier import points**:
   - base forward:
     `882c83e2ce4086c3cd4211fc5a2296143c5e2aea`;
   - selected forward updates and backward dGLU:
-    `92dd334af2eeedb36087834354b58ace08e880c6`.
-- **Last synced**: 2026-08-28. Earlier imports occurred on 2026-08-11,
-  2026-08-17, 2026-08-20, and 2026-08-24.
+    `92dd334af2eeedb36087834354b58ace08e880c6`;
+  - forward column-quantization output-layout updates:
+    `5b89819cb16069dfe20a1a0ba0778d35cb428352`.
+- **Last synced**: 2026-09-02. Earlier imports occurred on 2026-08-11,
+  2026-08-17, 2026-08-20, 2026-08-24, and 2026-08-28.
 - **Vendored subset**: the recursive Python import closure required by Rubin
   SM107 training MegaMoE forward GLU, optional forward MXFP8 column
   requantization, and backward dGLU.

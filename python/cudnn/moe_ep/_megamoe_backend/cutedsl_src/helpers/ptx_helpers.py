@@ -42,6 +42,21 @@ def nanosleep(sleep_cycles: int, *, loc: Optional[ir.Location] = None, ip: Optio
 
 
 @dsl_user_op
+def exit(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="exit;",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def read_clock64(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
     """Read the per-SM 64-bit cycle counter."""
     return Int64(
@@ -432,6 +447,31 @@ def red_async_add_release_gpu_s32(
 
 
 @dsl_user_op
+def red_async_add_release_sys_u32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
+    """Fire-and-forget cross-rank counter bump carrying its own release ordering.
+
+    The issuing warp does not wait for the L2/HBM round trip, and the release is
+    enforced by the memory system, so this replaces an explicit ``membar.sys``
+    followed by a relaxed reduction. ``u32`` rather than ``s32`` only because a
+    counter bump is the same two's-complement add either way and this is the
+    spelling already proven on this path.
+
+    Operands go through uniform registers, so the address must be warp-uniform:
+    a fan-out where lanes target different peers cannot use this.
+    """
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.async.release.sys.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_v2_bf16x2(
     address, value0, value1, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
 ) -> None:
@@ -559,6 +599,7 @@ __all__ = [
     "cp_reduce_async_bulk_add_u32_s2g",
     "cvt_f32_to_fp8_to_f32",
     "cvt_f32x4_to_f8x4_pack_i32",
+    "exit",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
     "movmatrix_b16",
@@ -568,6 +609,7 @@ __all__ = [
     "red_add_relaxed_sys_s32",
     "red_add_relaxed_sys_v2_bf16x2",
     "red_async_add_release_gpu_s32",
+    "red_async_add_release_sys_u32",
     "red_add_release_gpu_s32",
     "red_add_release_sys_s32",
     "store_i32_to_peer_cluster_smem_async",

@@ -14,6 +14,7 @@ from cutlass.cutlass_dsl import Int32, Int64
 from .utils import (
     ceil_div,
     cosize_from_shape_stride_tuples,
+    flatten_shape_stride,
     is_nested_shape,
     is_power_of_two,
     ordered_stride,
@@ -27,6 +28,15 @@ BufferResetAttr = Literal["data", "zero_on_first_allocate", "tail_reset"]
 BufferSpace = Literal["local", "shared"]
 
 _reset_order = {"tail_reset": 0, "zero_on_first_allocate": 1, "data": 2}
+
+
+def _footprint_from_shape_stride(shape: Tuple, stride: Tuple) -> int:
+    """Elements a region must own, as opposed to the ones its layout can address."""
+    leaf_pairs = flatten_shape_stride(shape, stride) if shape else []
+    claimed = max((size * step for size, step in leaf_pairs), default=1)
+    # Layouts whose leaves overlap can address past what any single leaf tiles,
+    # so the cosize stays a floor.
+    return int(max(claimed, cosize_from_shape_stride_tuples(shape, stride)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,7 +152,7 @@ class DeviceWorkspace:
                 if stride is None:
                     raise RuntimeError(f"Region {region.name!r} stride was not resolved.")
                 cosize = cosize_from_shape_stride_tuples(region.shape, stride)
-                nbytes = (cosize * int(region.dtype.width) + 7) // 8
+                nbytes = (_footprint_from_shape_stride(region.shape, stride) * int(region.dtype.width) + 7) // 8
                 if region.reset == "tail_reset" and (
                     region_index == 0 or ordered[region_index - 1].reset != "tail_reset"
                 ):

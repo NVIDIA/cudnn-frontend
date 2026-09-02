@@ -1262,8 +1262,10 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
 
 
 @pytest.mark.L0
-def test_ep32_peer_mapping_selects_vector_payload():
+def test_ep32_peer_mapping_selects_version_compatible_payload():
+    import cutlass
     from cutlass._mlir import ir
+    from packaging.version import Version
 
     from cudnn.moe_ep._megamoe_backend._comm import PeerMapping
     from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.nvlink_domain.symmetric_buffer import (
@@ -1286,7 +1288,10 @@ def test_ep32_peer_mapping_selects_vector_payload():
 
     assert host.offsets == offsets
     assert int(host.max_ranks) == 32
-    assert device_type_text == "vector<32xi64>"
+    dsl_release = Version(Version(cutlass.__version__).base_version)
+    grid_constant_width_is_free = dsl_release < Version("4.0.0") or dsl_release >= Version("4.7.0")
+    expected_type = "!llvm.ptr" if grid_constant_width_is_free else "vector<32xi64>"
+    assert device_type_text == expected_type
 
 
 @pytest.fixture

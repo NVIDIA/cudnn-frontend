@@ -731,32 +731,32 @@ class Sm107Mxfp8DgluDfc21Kernel:
     @cute.jit
     def __call__(
         self,
-        activation: cute.Tensor,           # (token_sum_padded, hidden) = grad_out
-        fc1_weight: cute.Tensor,           # (experts, hidden, inter_half)
-        activation_sf: cute.Tensor,         # (token_sum_padded_sf, hidden / sf_vec_size)
+        activation: cute.Tensor,            # (token_sum_padded, hidden) grad_out
+        fc1_weight: cute.Tensor,            # (experts, hidden, intermediate_downproj)
+        activation_sf: cute.Tensor,         # row-SF for activation
         fc1_weight_sf: cute.Tensor,         # dfc2-weight SF
-        fc1_output: cute.Tensor,         # (token_sum_padded, intermediate)
-        fc1_output_sf: cute.Tensor,      # (token_sum_padded_sf, intermediate / sf_vec_size)
-        fc1_recompute: Optional[cute.Tensor],      # (token_sum_padded, inter_half)
-        fc1_recompute_sf: Optional[cute.Tensor],   # (token_sum_padded_sf, inter_half / sf_vec_size)
-        fc1_col_output: Optional[cute.Tensor],     # (token_sum_padded, intermediate)
-        fc1_col_output_sf: Optional[cute.Tensor],  # (sf_row_blocks, intermediate) col-SF
-        fc2_weight: cute.Tensor,          # (experts, intermediate, hidden)
-        fc2_weight_sf: cute.Tensor,        # dfc1-weight SF
-        fc2_output: cute.Tensor,         # (token_sum_padded, hidden) BFloat16 = grad_x
-        fc1_preact: cute.Tensor,         # (token_sum_padded, intermediate) BFloat16
-        topk_scores: cute.Tensor,     # (token_sum_padded,) Float32
-        beta: cute.Tensor,            # (experts,) Float32
-        dprob: cute.Tensor,           # (token_sum_padded,) Float32
-        fc1_done_counter: cute.Tensor,  # (max_token_block_per_rank,) Int32
-        offs: Optional[cute.Tensor] = None,  # (experts,) Int32 cumulative end offsets
+        fc1_output: cute.Tensor,            # (token_sum_padded, intermediate_gateup)
+        fc1_output_sf: cute.Tensor,         # (token_sum_padded_sf, intermediate_gateup_sf)
+        fc1_recompute: Optional[cute.Tensor],      # (token_sum_padded, intermediate_downproj)
+        fc1_recompute_sf: Optional[cute.Tensor],   # (intermediate_downproj_padded, col_sf_rows)
+        fc1_col_output: Optional[cute.Tensor],     # (token_sum_padded, intermediate_gateup)
+        fc1_col_output_sf: Optional[cute.Tensor],  # (intermediate_gateup_padded, col_sf_rows)
+        fc2_weight: cute.Tensor,            # (experts, intermediate_gateup, hidden)
+        fc2_weight_sf: cute.Tensor,         # (experts, hidden_padded * intermediate_gateup_sf_padded)
+        fc2_output: cute.Tensor,            # (token_sum_padded, hidden)
+        fc1_preact: cute.Tensor,            # (token_sum_padded, intermediate_gateup) BFloat16
+        topk_scores: cute.Tensor,           # (token_sum_padded,) Float32
+        beta: cute.Tensor,                  # (experts,) Float32
+        dprob: cute.Tensor,                 # (token_sum_padded,) Float32
+        fc1_done_counter: cute.Tensor,      # (fc1_ready_slot_count,) Int32
+        offs: Optional[cute.Tensor] = None,  # unsupported for dGLU; use expert_token_sizes
         max_active_clusters: cutlass.Constexpr = None,
         stream: cuda.CUstream = None,
         norm_const_tensor: Optional[cute.Tensor] = None,
         global_activation_sf: Optional[cute.Tensor] = None,
         global_fc1_weight_sf: Optional[cute.Tensor] = None,
         load_balance_counter: Optional[cute.Tensor] = None,
-        expert_token_sizes: Optional[cute.Tensor] = None,
+        expert_token_sizes: Optional[cute.Tensor] = None,  # (experts,) valid token counts
         token_comm_args=None,
         overflow_flag: cute.Tensor = None,
         mega_peer_rank_ptr_mapper=None,
@@ -857,9 +857,8 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # B_gemm (W2T): reinterpret public C-contiguous (experts, hidden, inter_half)
-        # as (N=inter_half, K=hidden, L=experts). The stride permutation makes this
-        # an N-major GEMM operand without staging or moving data.
+        # B_gemm (fc1 weights): (experts, hidden, intermediate_gateup) with hidden stride-1 (K-major)
+        # -> (N=intermediate_gateup, K=hidden, L=experts).
         experts, hidden_b, intermediate_gateup = fc1_weight.shape
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
@@ -925,9 +924,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
             ),
         )
 
-        # GEMM-domain transform for fc2 phase. W1T is public C-contiguous
-        # (experts, 2 * inter_half, hidden), with its reduction rows already in
-        # 32-wide gate/up order. Preserve that K ordering and expose hidden as N.
+        # GEMM-domain transform for fc2 phase ──
         experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
@@ -1168,16 +1165,16 @@ class Sm107Mxfp8DgluDfc21Kernel:
         else:
             load_balance_counter_ptr = None
 
-        # On the MegaMoE path the per-expert sizes come from the Router (device-side), so the
-        # caller supplies neither offs nor expert_token_sizes.
+        # dGLU auxiliary layouts require per-expert token counts; cumulative offsets
+        # alone are insufficient.
         if cutlass.const_expr(not self.enable_token_comm):
-            if cutlass.const_expr((offs is None) == (expert_token_sizes is None)):
+            if cutlass.const_expr(offs is not None):
                 raise ValueError(
-                    "Exactly one of `offs` / `expert_token_sizes` must be "
-                    "non-None.  Got offs="
-                    f"{'set' if offs is not None else 'None'}, "
-                    f"expert_token_sizes="
-                    f"{'set' if expert_token_sizes is not None else 'None'}."
+                    "`offs` is not supported by dGLU; provide `expert_token_sizes`."
+                )
+            if cutlass.const_expr(expert_token_sizes is None):
+                raise ValueError(
+                    "`expert_token_sizes` must be provided for dGLU auxiliary layouts."
                 )
 
         self._build_scheduler(

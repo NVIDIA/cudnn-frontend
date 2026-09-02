@@ -13,6 +13,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import (
     Float32,
     Int32,
@@ -329,6 +331,7 @@ class Mxfp8ColRequant:
     # --- this kernel's tile ------------------------------------------------
     TILE_TOK: int = 128  # == SfAtomNonK, so a tile is one whole SF atom row
     NSTAGE: int = 2  # 2 is what leaves shared memory for 2 CTAs per SM
+    KMajorStages: int = 1  # Short-lived K-major CTAs do not amortize stage two.
 
     # Tile width and per-lane access width, per requant path.  Both are tuned:
     # the two paths have different shared-memory budgets and different
@@ -354,6 +357,7 @@ class Mxfp8ColRequant:
 
     # Grid depth, in resident waves.  The curve is broad and flat above this.
     GridWaves: int = 24
+    KMajorGridWaves: int = 13
 
     ProducerWarps: int = 1
     # ConsumerWarps is derived:
@@ -444,6 +448,13 @@ class Mxfp8ColRequant:
         if self.scaled_cvt:
             _cols_choices = (self.ColsPerLaneScaled, self.ColsPerLanePortable)
             _preferred_tile_hid = self.TileHidScaled
+            # The extra K-major staging tile makes 256 columns faster on Rubin:
+            # it preserves two resident CTAs and wins despite twice as many
+            # hidden groups (84 us versus 101 us for the DS3 production case).
+            if self.dst_k_major:
+                _preferred_tile_hid = min(
+                    _preferred_tile_hid, self.TileHidPortable
+                )
         else:
             _cols_choices = (self.ColsPerLanePortable,)
             _preferred_tile_hid = self.TileHidPortable
@@ -487,14 +498,14 @@ class Mxfp8ColRequant:
         self.sf_in_pad = self.SfInPad
         self.sf_out_pad = self.SfOutPad
         self.smem_capacity = _smem_capacity()
+        self.NumStages = self.KMajorStages if self.dst_k_major else self.NSTAGE
         while (
-            self._smem_bytes_for(self.TILE_HID, self.NSTAGE) > self.smem_capacity
+            self._smem_bytes_for(self.TILE_HID, self.NumStages) > self.smem_capacity
             and len(self._tile_hid_choices) > 1
         ):
             self._tile_hid_choices.pop()
             self.TILE_HID = self._tile_hid_choices[-1]
 
-        self.NumStages = self.NSTAGE
         self.TmaBoxHidU32 = self.TILE_HID // 4
 
         self._hidden_atoms = self.hidden // self.SfAtomNonK
@@ -519,17 +530,22 @@ class Mxfp8ColRequant:
 
         # --- SMEM ------------------------------------------------------------
         self.smem_data_bytes = self.NumStages * self.TILE_TOK * self.TILE_HID
+        # K-major output staging is separate from the input pipeline.
+        self.smem_data_out_bytes = (
+            self.TILE_TOK * self.TILE_HID if self.dst_k_major else 0
+        )
         self.smem_sf_in_bytes = self.NumStages * self.SfTileBytes
         self.SfOutStride = self.SfAtomBytes + self.sf_out_pad
         self.smem_sf_out_bytes = self.HidAtomsPerTile * self.SfOutStride
         self.smem_table_bytes = 3 * (self.num_experts + 1) * 4
         self.smem_bytes = (
             self.smem_data_bytes
+            + self.smem_data_out_bytes
             + self.smem_sf_in_bytes
             + self.smem_sf_out_bytes
             + self.smem_table_bytes
             + 2 * self.NumStages * 8
-            + 256
+            + (1024 if self.dst_k_major else 256)
         )
         if self.smem_bytes > self.smem_capacity:
             raise ValueError(
@@ -560,7 +576,12 @@ class Mxfp8ColRequant:
         # The wave count is tuned for 2 resident CTAs.  A shape that gets only
         # one keeps a single-wave grid rather than extrapolating that tuning
         # point outside the regime it was taken in.
-        _want = self.GridWaves if self.CtasPerSm >= 2 else 1
+        if self.CtasPerSm >= 2:
+            _want = (
+                self.KMajorGridWaves if self.dst_k_major else self.GridWaves
+            )
+        else:
+            _want = 1
         _max_tiles = -(-self.max_total_tokens // self.TILE_TOK) * self.hidden_groups
         _waves = max(1, min(_want, _max_tiles // (_min_tiles * self.ResidentCtas)))
         if num_persistent_ctas > 0:
@@ -588,6 +609,16 @@ class Mxfp8ColRequant:
         self._experts_per_lane = (self.num_experts + 31) // 32
 
     # ------------------------------------------------------------------ host
+    def _k_major_tma_smem_layout(self):
+        """Canonical swizzled FP8 hidden-by-token TMA staging tile."""
+        staged = sm100_utils.make_smem_layout_epi(
+            self.quant_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.TILE_HID, self.TILE_TOK),
+            1,
+        )
+        return cute.select(staged, mode=[0, 1])
+
     @cute.jit
     def __call__(
         self,
@@ -630,8 +661,20 @@ class Mxfp8ColRequant:
         )
 
         if cutlass.const_expr(self.dst_k_major):
-            tma_atom_st = None
-            tma_tensor_st = None
+            k_major_smem_layout = self._k_major_tma_smem_layout()
+            dst_u8 = cute.make_tensor(
+                cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint8),
+                cute.make_layout(
+                    (dst_data.shape[1], dst_data.shape[0]),
+                    stride=(dst_data.shape[0], 1),
+                ),
+            )
+            tma_atom_st, tma_tensor_st = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                dst_u8,
+                k_major_smem_layout,
+                (self.TILE_HID, BOX_T),
+            )
         else:
             dst_u32 = cute.make_tensor(
                 cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint32),
@@ -778,6 +821,11 @@ class Mxfp8ColRequant:
         smem_data = smem.allocate_array(
             self.quant_dtype, self.NumStages * TOK * W, byte_alignment=128
         )
+        smem_data_out = None
+        if cutlass.const_expr(self.dst_k_major):
+            smem_data_out = smem.allocate_array(
+                self.quant_dtype, TOK * W, byte_alignment=1024
+            )
 
         if tidx == Int32(0):
             for s in cutlass.range_constexpr(0, S, 1):
@@ -794,6 +842,9 @@ class Mxfp8ColRequant:
         total_tiles = Int32(tbl_data[self.num_experts]) // Int32(TOK)
 
         smem_data_base = smem_data.toint()
+        smem_data_out_base = None
+        if cutlass.const_expr(self.dst_k_major):
+            smem_data_out_base = smem_data_out.toint()
         smem_sf_in_base = smem_sf_in.toint()
         smem_sf_out_base = smem_sf_out.toint()
         src_sf_base = src_sf_u8.iterator.toint()
@@ -808,8 +859,9 @@ class Mxfp8ColRequant:
             )
         else:
             self.consume_scaled(
-                smem_data_base, smem_sf_in_base, smem_sf_out_base, mbar_full, mbar_empty,
-                tbl_vend, tbl_data, tbl_sf, dst_data, dst_sf_base,
+                smem_data_base, smem_data_out_base, smem_sf_in_base,
+                smem_sf_out_base, mbar_full, mbar_empty,
+                tbl_vend, tbl_data, tbl_sf, dst_sf_base,
                 bidx, grid_dim_x, total_tiles,
                 warp_idx - Int32(self.ProducerWarps), lane_idx,
                 tma_atom_st, tma_tensor_st, TOKPAD,
@@ -909,8 +961,9 @@ class Mxfp8ColRequant:
     # ------------------------------------------------- consumer (scaled cvt)
     @cute.jit
     def consume_scaled(
-        self, smem_data_base, smem_sf_in_base, smem_sf_out_base, mbar_full, mbar_empty,
-        tbl_vend, tbl_data, tbl_sf, dst_data, dst_sf_base,
+        self, smem_data_base, smem_data_out_base, smem_sf_in_base,
+        smem_sf_out_base, mbar_full, mbar_empty,
+        tbl_vend, tbl_data, tbl_sf, dst_sf_base,
         bidx, grid_dim_x, total_tiles, cw, lane_idx,
         tma_atom_st=None, tma_tensor_st=None,
         token_padding_block: cutlass.Constexpr = None,
@@ -928,7 +981,6 @@ class Mxfp8ColRequant:
         CONS_THREADS = cutlass.const_expr(self.ConsumerWarps * 32)
         HATOMS = cutlass.const_expr(self.HidAtomsPerTile)
         SF_PREFIX_DIFFERS = cutlass.const_expr(TOKPAD != self.sf_padding_block)
-        SFOUT_ONE = cutlass.const_expr(self.HidAtomsPerTile * self.SfOutStride)
         C = cutlass.const_expr(self.ColsPerLane)     # hidden columns per lane
         SEGW = cutlass.const_expr(32 * C)            # columns per consumer segment
 
@@ -945,13 +997,27 @@ class Mxfp8ColRequant:
         sf_lane_off = tb * Int32(4)
 
         if cutlass.const_expr(self.dst_k_major):
-            sDo_u8 = cute.make_tensor(
+            k_major_smem_layout = self._k_major_tma_smem_layout()
+            sDoT = cute.make_tensor(
                 cute.make_ptr(
-                    cutlass.Uint8, smem_data_base, AddressSpace.smem, assumed_align=128,
+                    cutlass.Uint8,
+                    smem_data_out_base,
+                    AddressSpace.smem,
+                    assumed_align=128,
                 ),
-                cute.make_layout((TOK, W, S), stride=(W, 1, TOK * W)),
+                k_major_smem_layout,
             )
-            dst_u8_pointer = cute.recast_ptr(dst_data.iterator, dtype=cutlass.Uint8)
+            gDo = cute.group_modes(
+                cute.local_tile(tma_tensor_st, (W, TOK), (None, None)), 0, 2
+            )
+            tDsDo, tDgDo = cpasync.tma_partition(
+                tma_atom_st,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sDoT, 0, 2),
+                gDo,
+            )
+            cpasync.prefetch_descriptor(tma_atom_st)
         else:
             BOX_HS = cutlass.const_expr(self.TmaBoxHidU32)
             sDo = cute.make_tensor(
@@ -993,16 +1059,28 @@ class Mxfp8ColRequant:
             if cutlass.const_expr(SF_PREFIX_DIFFERS):
                 sf_live = cutlass.min(Int32(1), cutlass.max(Int32(0), valid_rows))
 
-            cute.arch.mbarrier_wait(mbar_full + stage, (t // Int32(S)) % Int32(2))
-
-            stage_data = smem_data_base + stage * Int32(TOK * W) + data_lane_off
-            stage_sf = smem_sf_in_base + stage * Int32(SFB) + sf_lane_off
-            # A tile's sf_out store is drained before the stage is handed
-            # back, so one buffer is enough.
+            cute.arch.mbarrier_wait(
+                mbar_full + stage, (t // Int32(S)) % Int32(2)
+            )
+            stage_data = (
+                smem_data_base + stage * Int32(TOK * W) + data_lane_off
+            )
+            stage_sf = (
+                smem_sf_in_base + stage * Int32(SFB) + sf_lane_off
+            )
             sfout = smem_sf_out_base
 
             self._sp_tile_body(
-                stage_data, stage_sf, sfout, ldsw, hb0, seg, tb, lane_idx, valid_rows,
+                stage_data,
+                stage_sf,
+                sfout,
+                smem_data_out_base,
+                ldsw,
+                hb0,
+                seg,
+                tb,
+                lane_idx,
+                valid_rows,
             )
 
             # Cross-proxy ordering, and it is NOT optional.  The consumer warps
@@ -1017,23 +1095,18 @@ class Mxfp8ColRequant:
             # neutralised to zero in shared memory, which is what the pool
             # expects to find there.
             if cutlass.const_expr(self.dst_k_major):
-                linear = cw * Int32(32) + lane_idx
-                while linear < Int32(TOK * W):
-                    token_in_tile = linear // Int32(W)
-                    feature_in_tile = linear % Int32(W)
-                    token = data_row0 + token_in_tile
-                    feature = hid_begin + feature_in_tile
-                    if token < dst_data.shape[0] and feature < dst_data.shape[1]:
-                        dst_offset = (
-                            Int64(feature) * Int64(dst_data.shape[0])
-                            + Int64(token)
-                        )
-                        dst_slot = cute.make_tensor(
-                            dst_u8_pointer + dst_offset,
-                            cute.make_layout(1),
-                        )
-                        dst_slot[0] = sDo_u8[token_in_tile, feature_in_tile, stage]
-                    linear = linear + Int32(CONS_THREADS)
+                if cw == Int32(0):
+                    cute.copy(
+                        tma_atom_st,
+                        tDsDo,
+                        tDgDo[
+                            (
+                                None,
+                                hid_begin // Int32(W),
+                                token_tile,
+                            )
+                        ],
+                    )
             else:
                 if cw == Int32(0):
                     cute.copy(
@@ -1063,19 +1136,50 @@ class Mxfp8ColRequant:
                     ),
                     Int32(self.SfAtomBytes),
                 )
-            cute.arch.cp_async_bulk_commit_group()
-            # Drain every store before the stage goes back to the producer.
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-            cute.arch.barrier(barrier_id=self.ConsumerBarrierId, number_of_threads=CONS_THREADS)
-            if lane_idx == Int32(0):
-                cute.arch.mbarrier_arrive(mbar_empty + stage)
+            # Only consumer warp 0 issues async stores.  Its wait followed by
+            # the CTA barrier makes completion visible to every consumer before
+            # either the output buffer or the producer stage is reused.
+            if cw == Int32(0):
+                cute.arch.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.dst_k_major):
+                # K-major has a separate output tile: release the input stage
+                # while its async store drains, overlapping the next TMA load.
+                if lane_idx == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_empty + stage)
+                if cw == Int32(0):
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.barrier(
+                    barrier_id=self.ConsumerBarrierId,
+                    number_of_threads=CONS_THREADS,
+                )
+            else:
+                # Row-major stores directly from the input stage, so it cannot
+                # be released until the async store has finished reading it.
+                if cw == Int32(0):
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.barrier(
+                    barrier_id=self.ConsumerBarrierId,
+                    number_of_threads=CONS_THREADS,
+                )
+                if lane_idx == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_empty + stage)
 
             t = t + Int32(1)
             work_idx = work_idx + grid_dim_x
 
     @cute.jit
     def _sp_tile_body(
-        self, stage_data, stage_sf_base, sfout, ldsw, hb0, seg, tb, lane_idx, valid_rows,
+        self,
+        stage_data,
+        stage_sf_base,
+        sfout,
+        smem_data_out_base,
+        ldsw,
+        hb0,
+        seg,
+        tb,
+        lane_idx,
+        valid_rows,
     ):
         """The single-pass arithmetic for one lane's share of one tile."""
         TOK = cutlass.const_expr(self.TILE_TOK)
@@ -1114,20 +1218,23 @@ class Mxfp8ColRequant:
             # instead of 0x00.  The fc1 pool really does leave 0xFF in padding
             # scale bytes.  Writing 127 is the same value the masked arm
             # substitutes, paid once per tile instead of once per read.
-            if valid_rows < Int32(TOK):
-                for tt in cutlass.range_constexpr(0, NB, 1):
-                    if tb * Int32(NB) + Int32(tt) >= valid_rows:
-                        self._store_words(
-                            base + Int32(tt * W), ldsw, zeros, NWc, LW
-                        )
-                        sf_t = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Uint8, sfb + Int32(tt * 16),
-                                AddressSpace.smem, assumed_align=1,
-                            ),
-                            cute.make_layout((1,)),
-                        )
-                        sf_t[0] = Uint8(127)
+            dead_tt = cutlass.min(
+                Int32(NB),
+                cutlass.max(Int32(0), valid_rows - tb * Int32(NB)),
+            )
+            while dead_tt < Int32(NB):
+                self._store_words(
+                    base + dead_tt * Int32(W), ldsw, zeros, NWc, LW
+                )
+                sf_t = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint8, sfb + dead_tt * Int32(16),
+                        AddressSpace.smem, assumed_align=1,
+                    ),
+                    cute.make_layout((1,)),
+                )
+                sf_t[0] = Uint8(127)
+                dead_tt = dead_tt + Int32(1)
 
             # ---- the one scan: unpack-with-scale, keep BF16, accumulate amax --
             d = [[None] * NPc for _ in range(NB)]
@@ -1135,7 +1242,9 @@ class Mxfp8ColRequant:
             for tt in cutlass.range_constexpr(0, NB, 1):
                 # Both loads are issued before either is consumed, so the scale
                 # load overlaps the data load.
-                words = self._load_words(base + Int32(tt * W), ldsw, NWc, LW)
+                words = self._load_words(
+                    base + Int32(tt * W), ldsw, NWc, LW
+                )
                 raw_sf = self._src_scale_raw(sfb + Int32(tt * 16))
                 s16 = raw_sf | (raw_sf << Int32(8))
                 for w in cutlass.range_constexpr(0, NWc, 1):
@@ -1187,16 +1296,158 @@ class Mxfp8ColRequant:
                 )
                 out_t[0] = Uint8(raws[j])
 
-            for tt in cutlass.range_constexpr(0, NB, 2):
-                out0, out1 = self._requant_token_pair(
-                    d[tt], d[tt + 1], scs, invs, NPc, NWc
+            if cutlass.const_expr(self.dst_k_major):
+                for tt in cutlass.range_constexpr(0, NB, 16):
+                    # Keep the two-token result column-major and stage it
+                    # directly.  The previous implementation first stored
+                    # out0/out1 back to row-major SMEM and then reread every
+                    # byte in a separate transpose pass.
+                    rot = (lane_idx >> Int32(1)) & Int32(3)
+                    swap_adjacent = (rot & Int32(1)) != Int32(0)
+                    swap_halves = (rot & Int32(2)) != Int32(0)
+                    adjacent_rotated = [
+                        cute.make_rmem_tensor((4,), cutlass.Int32)
+                        for _ in range(LW)
+                    ]
+
+                    # Produce only two token pairs at a time and immediately
+                    # combine them into one four-token word.  This avoids
+                    # keeping all eight pair tensors live until a later pass.
+                    for q in cutlass.range_constexpr(0, 4, 1):
+                        pair0 = self._requant_token_pair_kmajor(
+                            d[tt + 4 * q],
+                            d[tt + 4 * q + 1],
+                            scs,
+                            invs,
+                            NPc,
+                            NWc,
+                            LW,
+                        )
+                        pair1 = self._requant_token_pair_kmajor(
+                            d[tt + 4 * q + 2],
+                            d[tt + 4 * q + 3],
+                            scs,
+                            invs,
+                            NPc,
+                            NWc,
+                            LW,
+                        )
+                        packed = [None] * LW
+                        for j in cutlass.range_constexpr(0, LW, 1):
+                            packed[j] = Int32(
+                                cute.arch.prmt(
+                                    pair0[j],
+                                    pair1[j],
+                                    Int32(0x5410),
+                                )
+                            )
+                        for j in cutlass.range_constexpr(0, LW, 1):
+                            adjacent_rotated[j][q] = Int32(
+                                arith.select(
+                                    swap_adjacent.ir_value(),
+                                    packed[j ^ 1].ir_value(),
+                                    packed[j].ir_value(),
+                                )
+                            )
+
+                    token = tb * Int32(NB) + Int32(tt)
+                    # The adjacent-column exchange above applies rot bit 0.
+                    # This final exchange applies rot bit 1, preserving the
+                    # same XOR-rotated store order with one select per word.
+                    for phase in cutlass.range_constexpr(0, LW, 1):
+                        j_rot = Int32(phase) ^ rot
+                        token_words = cute.make_rmem_tensor(
+                            (4,), cutlass.Int32
+                        )
+                        for q in cutlass.range_constexpr(0, 4, 1):
+                            token_words[q] = Int32(
+                                arith.select(
+                                    swap_halves.ir_value(),
+                                    Int32(
+                                        adjacent_rotated[phase ^ 2][q]
+                                    ).ir_value(),
+                                    Int32(
+                                        adjacent_rotated[phase][q]
+                                    ).ir_value(),
+                                )
+                            )
+                        self._store_kmajor_token_16(
+                            smem_data_out_base,
+                            col0 + j_rot,
+                            token,
+                            token_words,
+                        )
+            else:
+                for tt in cutlass.range_constexpr(0, NB, 2):
+                    out0, out1 = self._requant_token_pair(
+                        d[tt], d[tt + 1], scs, invs, NPc, NWc
+                    )
+                    self._store_words(base + Int32(tt * W), ldsw, out0, NWc, LW)
+                    self._store_words(
+                        base + Int32((tt + 1) * W), ldsw, out1, NWc, LW
+                    )
+
+    def _requant_token_pair_kmajor(self, d0, d1, scs, invs, NPc, NWc, LW):
+        """Return one packed token pair per hidden column for K-major staging."""
+        QT = self.quant_dtype
+        pairs = cute.make_rmem_tensor((LW,), cutlass.Int32)
+        if cutlass.const_expr(self.scaled_cvt):
+            for k in range(0, NPc, 1):
+                lo = Int32(cute.arch.prmt(d0[k], d1[k], Int32(0x5410)))
+                hi = Int32(cute.arch.prmt(d0[k], d1[k], Int32(0x7632)))
+                pairs[2 * k] = cvt_scaled_dn_fp8x2(lo, scs[2 * k], QT)
+                pairs[2 * k + 1] = cvt_scaled_dn_fp8x2(
+                    hi, scs[2 * k + 1], QT
                 )
-                self._store_words(base + Int32(tt * W), ldsw, out0, NWc, LW)
-                self._store_words(base + Int32((tt + 1) * W), ldsw, out1, NWc, LW)
+        else:
+            for w in range(0, NWc, 1):
+                k0 = 2 * w
+                k1 = 2 * w + 1
+                p00 = cvt_dn_fp8x2_portable(
+                    d0[k0], invs[2 * k0], invs[2 * k0 + 1], QT
+                )
+                p01 = cvt_dn_fp8x2_portable(
+                    d0[k1], invs[2 * k1], invs[2 * k1 + 1], QT
+                )
+                p10 = cvt_dn_fp8x2_portable(
+                    d1[k0], invs[2 * k0], invs[2 * k0 + 1], QT
+                )
+                p11 = cvt_dn_fp8x2_portable(
+                    d1[k1], invs[2 * k1], invs[2 * k1 + 1], QT
+                )
+                pair01 = Int32(cute.arch.prmt(p00, p10, Int32(0x5140)))
+                pair23 = Int32(cute.arch.prmt(p01, p11, Int32(0x5140)))
+                pairs[4 * w] = pair01 & Int32(0xFFFF)
+                pairs[4 * w + 1] = (pair01 >> Int32(16)) & Int32(0xFFFF)
+                pairs[4 * w + 2] = pair23 & Int32(0xFFFF)
+                pairs[4 * w + 3] = (pair23 >> Int32(16)) & Int32(0xFFFF)
+        return pairs
+
+    @cute.jit
+    def _store_kmajor_token_16(
+        self, smem_data_out_base, col, token, token_words
+    ):
+        """Store 16 adjacent tokens with one 128-bit R2S copy."""
+        linear = col * Int32(self.TILE_TOK) + token
+        offset = linear ^ ((linear & Int32(0x380)) >> Int32(3))
+        st128 = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Int32,
+            num_bits_per_copy=128,
+        )
+        dst = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Int32,
+                smem_data_out_base + offset,
+                AddressSpace.smem,
+                assumed_align=16,
+            ),
+            cute.make_layout((4,)),
+        )
+        cute.copy(st128, token_words, dst)
 
     def _requant_token_pair(self, d0, d1, scs, invs, NPc, NWc):
-        """Requantise one lane's two consecutive tokens.  THE ONLY PLACE THIS
-        KERNEL DEPENDS ON THE TARGET ARCHITECTURE.
+        """Requantise one lane's two consecutive tokens for row-major output.
 
         ``d0``/``d1`` are lists of NPc Int32, each a token-major BF16x2: register
         ``k`` is hidden columns ``(2k, 2k+1)`` of one token.  ``out0``/``out1``
@@ -1282,11 +1533,12 @@ class Mxfp8ColRequant:
         hid_atoms = tile_hid // self.SfAtomNonK
         return (
             stages * self.TILE_TOK * tile_hid
+            + (self.TILE_TOK * tile_hid if self.dst_k_major else 0)
             + stages * hid_atoms * (self.SfAtomBytes + self.sf_in_pad)
             + hid_atoms * (self.SfAtomBytes + self.sf_out_pad)
             + 3 * (self.num_experts + 1) * 4
             + 2 * stages * 8
-            + 256
+            + (1024 if self.dst_k_major else 256)
         )
 
     @cute.jit

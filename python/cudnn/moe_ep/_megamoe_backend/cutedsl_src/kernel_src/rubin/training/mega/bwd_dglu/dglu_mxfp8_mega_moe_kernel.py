@@ -141,11 +141,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         fake_arguments = dict(
             grad_out=fake_tensor(activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
             grad_out_sf=fake_tensor(sf_dtype, (tokens, self.token_comm.activation_sf_hidden_padded), (1, 0), {0}, 16),
-            topk_idx=fake_tensor(cutlass.Int64, (tokens, self.num_topk), (1, 0), {0}, 16),
+            topk_idx=fake_tensor(cutlass.Int32, (tokens, self.num_topk), (1, 0), {0}, 16),
             topk_weights=fake_tensor(cutlass.Float32, (tokens, self.num_topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(self.ab_dtype, (experts, hidden, inter_half), (2, 1, 0), {0, 2}, 16),
+            fc1_weight=fake_tensor(self.ab_dtype, (experts, hidden, inter_half), (2, 0, 1), {0, 2}, 16),
             fc1_weight_sf=fake_tensor(sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
-            fc2_weight=fake_tensor(self.ab_dtype, (experts, gate_up, hidden), (2, 1, 0), {0, 2}, 16),
+            fc2_weight=fake_tensor(self.ab_dtype, (experts, gate_up, hidden), (2, 0, 1), {0, 2}, 16),
             fc2_weight_sf=fake_tensor(sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
             beta=fake_tensor(cutlass.Float32, (experts,), (0,), {0}, 4),
             fc1_preact=fake_tensor(cutlass.BFloat16, self.get_fc1_preact_shape(), (1, 0), set(), 128),
@@ -754,7 +754,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
     def __call__(
         self,
         grad_out: cute.Tensor,  # (max_tokens_per_rank, hidden) fp8
-        grad_out_sf: cute.Tensor,  # (max_tokens_per_rank, hidden // sf_vec_size) E8M0
+        grad_out_sf: cute.Tensor,  # (max_tokens_per_rank, activation_sf_hidden_padded) E8M0
         topk_idx: cute.Tensor,  # (max_tokens_per_rank, num_topk)
         topk_weights: cute.Tensor,  # (max_tokens_per_rank, num_topk) Float32 (prob)
         fc1_weight: cute.Tensor,  # W2^T: (experts_per_rank, hidden, inter_downproj)
@@ -763,13 +763,13 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         fc2_weight_sf: cute.Tensor,
         beta: cute.Tensor,  # (experts_per_rank,) Float32
         fc1_preact: cute.Tensor,  # (pool_token_capacity, intermediate_gateup) BFloat16
-        output_activation: cute.Tensor,  # (max_tokens_per_rank, topk, hidden) BF16
+        output_activation: cute.Tensor,  # (max_tokens_per_rank, hidden) BF16
         overflow_flag: cute.Tensor,  # (1,) Int32, per-rank FC12 overflow output
         dprob: cute.Tensor,  # (max_tokens_per_rank, topk) Float32; symmetric, pre-zeroed
-        fc1_recompute: cute.Tensor,  # (pool_token_capacity, inter_downproj), token-major
-        fc1_recompute_sf: cute.Tensor,  # WGrad2 SFA: (inter_padded, col_sf_rows)
-        fc1_col_output: cute.Tensor,  # (pool_token_capacity, gateup), token-major
-        fc1_col_output_sf: cute.Tensor,  # WGrad1 SFB: (gateup_padded, col_sf_rows)
+        fc1_recompute: cute.Tensor,  # (pool_token_capacity, inter_downproj)
+        fc1_recompute_sf: cute.Tensor,  # (inter_padded, col_sf_rows)
+        fc1_col_output: cute.Tensor,  # (pool_token_capacity, gateup)
+        fc1_col_output_sf: cute.Tensor,  # (gateup_padded, col_sf_rows)
         grad_y2: cute.Tensor,  # (pool_token_capacity, hidden) token-axis MXFP8
         grad_y2_sf: cute.Tensor,  # flat MN-major E8M0 bytes
         local_workspace: cute.Pointer,
