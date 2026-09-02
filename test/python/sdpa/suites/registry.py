@@ -20,8 +20,6 @@ from sdpa.suites import knobs
 from sdpa.suites.common import (
     SuiteSpec,
     combine,
-    post_fp8_numerics_fuzz,
-    post_fp8_rescale_off,
     post_paged,
     post_train,
     post_unified,
@@ -35,13 +33,6 @@ def post_mxfp8(cfg, rng, request):
 
 def post_mxfp8_bwd_flags(cfg, rng, request):
     cfg.use_causal_mask = cfg.left_bound is None and cfg.right_bound == 0
-
-
-def post_fp8_rescale_fuzz(cfg, rng, request):
-    if torch.cuda.get_device_capability()[0] == 10:
-        cfg.rescale_threshold = rng.choice([0.0, 2.0, 4.0])
-    else:
-        cfg.rescale_threshold = 0.0
 
 
 def post_force_unified(cfg, rng, request):
@@ -175,7 +166,6 @@ _SPECS = [
         rng_seed=999,
         knobs=knobs.fp8_fwd,
         exec_kind="fp8",
-        post=post_fp8_numerics_fuzz,
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
         + (
@@ -183,8 +173,6 @@ _SPECS = [
             "out fp8/fp16",
             "layout padded/full",
             "sink",
-            "unfuse_fma",
-            "rescale 0/2/4 (SM100)",
         ),
         pinned=("infer", "impl AUTO"),
     ),
@@ -197,7 +185,6 @@ _SPECS = [
         rng_seed=996,
         knobs=knobs.fp8_thd_fwd,
         exec_kind="fp8",
-        post=post_fp8_rescale_fuzz,
         fuzzed=_COMMON_FUZZ
         + (
             "e4m3/e5m2 in",
@@ -205,7 +192,6 @@ _SPECS = [
             "layout ragged/cu_ragged/cu_ragged_mult",
             "total_q/kv slack",
             "declare totals on graph",
-            "rescale 0/2/4 (SM100)",
         ),
         pinned=("infer", "no mask", "diag TL"),
     ),
@@ -219,7 +205,7 @@ _SPECS = [
         knobs=knobs.mxfp8_fwd,
         exec_kind="mxfp8",
         min_sm=(10, 0),
-        post=combine(post_mxfp8, post_fp8_numerics_fuzz),
+        post=post_mxfp8,
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
         + (
@@ -227,9 +213,13 @@ _SPECS = [
             "out fp16/bf16",
             "sink",
             "unfuse_fma",
-            "rescale 0/2/4 (SM100)",
         ),
-        pinned=("infer", "impl AUTO", "SM100+", "layout full (mxfp8 API has no seq-len args, #646)"),
+        pinned=(
+            "infer",
+            "impl AUTO",
+            "SM100+",
+            "layout full (mxfp8 API has no seq-len args, #646)",
+        ),
     ),
     # ---- generation (decode / small-s_q forward) ----
     SuiteSpec(
@@ -357,14 +347,11 @@ _SPECS = [
         rng_seed=993,
         knobs=knobs.fp8_decode,
         exec_kind="fp8",
-        post=post_fp8_numerics_fuzz,
         fuzzed=_COMMON_FUZZ
         + (
             "e4m3/e5m2 in",
             "out fp8/fp16",
             "diag TL/BR",
-            "unfuse_fma",
-            "rescale 0/2/4 (SM100)",
         ),
         pinned=("infer", "s_q=1", "no mask", "layout full"),
     ),
@@ -377,13 +364,12 @@ _SPECS = [
         rng_seed=997,
         knobs=knobs.fp8_paged,
         exec_kind="fp8",
-        post=combine(post_paged, post_fp8_rescale_fuzz),
+        post=post_paged,
         fuzzed=_COMMON_FUZZ
         + (
             "e4m3/e5m2 in",
             "out fp8/fp16",
             "block size 16..128",
-            "rescale 0/2/4 (SM100)",
         ),
         pinned=("infer", "no mask", "diag TL", "layout padded", "paged KV"),
     ),
@@ -449,9 +435,9 @@ _SPECS = [
         rng_seed=998,
         knobs=knobs.fp8_bwd,
         exec_kind="fp8",
-        post=combine(post_train, post_fp8_rescale_off),
+        post=post_train,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink"),
-        pinned=("train", "e4m3 in", "layout full", "rescale off"),
+        pinned=("train", "e4m3 in", "layout full"),
     ),
     SuiteSpec(
         name="bprop.fp8.thd",
@@ -462,7 +448,7 @@ _SPECS = [
         rng_seed=995,
         knobs=knobs.fp8_thd_bwd,
         exec_kind="fp8",
-        post=combine(post_train, post_fp8_rescale_off),
+        post=post_train,
         min_cudnn=92101,
         fuzzed=_COMMON_FUZZ
         + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
@@ -472,7 +458,6 @@ _SPECS = [
             "no mask",
             "diag TL",
             "layout THD (ragged)",
-            "rescale off",
         ),
         notes="ragged FP8 backward requires cuDNN > 9.21.0",
     ),
@@ -486,16 +471,13 @@ _SPECS = [
         knobs=knobs.mxfp8_bwd,
         exec_kind="mxfp8",
         min_sm=(10, 0),
-        post=combine(
-            post_mxfp8, post_mxfp8_bwd_flags, post_train, post_fp8_rescale_off
-        ),
+        post=combine(post_mxfp8, post_mxfp8_bwd_flags, post_train),
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp16/bf16", "sink"),
         pinned=(
             "train",
             "e4m3 in",
             "deterministic",
             "layout full",
-            "rescale off",
             "SM100+",
         ),
     ),

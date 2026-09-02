@@ -8,7 +8,6 @@ Every fuzz test prints a self-contained repro command that targets
 """
 
 import ast
-import os
 
 import pytest
 import torch
@@ -31,23 +30,9 @@ def test_repro(env_info, request, cudnn_handle):
     repro_str = request.config.getoption("--repro")
     cfg = ExecConfig.deserialize(ast.literal_eval(repro_str))
 
-    if getattr(cfg, "with_unfuse_fma", False):
-        os.environ["CUDNN_UNFUSE_FMA"] = "1"
+    if cfg.is_mxfp8:
+        exec_sdpa_mxfp8(cfg, request, cudnn_handle)
+    elif cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+        exec_sdpa_fp8(cfg, request, cudnn_handle)
     else:
-        os.environ.pop("CUDNN_UNFUSE_FMA", None)
-
-    if getattr(cfg, "rescale_threshold", None) is not None:
-        os.environ["CUDNN_RESCALE_THRESHOLD"] = str(cfg.rescale_threshold)
-    else:
-        os.environ.pop("CUDNN_RESCALE_THRESHOLD", None)
-
-    try:
-        if cfg.is_mxfp8:
-            exec_sdpa_mxfp8(cfg, request, cudnn_handle)
-        elif cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
-            exec_sdpa_fp8(cfg, request, cudnn_handle)
-        else:
-            exec_sdpa(cfg, request, cudnn_handle)
-    finally:
-        os.environ.pop("CUDNN_UNFUSE_FMA", None)
-        os.environ.pop("CUDNN_RESCALE_THRESHOLD", None)
+        exec_sdpa(cfg, request, cudnn_handle)

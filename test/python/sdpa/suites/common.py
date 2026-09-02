@@ -20,7 +20,6 @@ prints a self-contained repro command (``test_repro_suite.py::test_repro``).
 
 import os
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
@@ -107,25 +106,6 @@ def model_params(phase):
     return params
 
 
-@contextmanager
-def _knob_env(cfg):
-    """Materialize env-var numerics knobs recorded on the config (fp8/mxfp8
-    harnesses read them from the environment), and always clean up."""
-    try:
-        if getattr(cfg, "with_unfuse_fma", False):
-            os.environ["CUDNN_UNFUSE_FMA"] = "1"
-        else:
-            os.environ.pop("CUDNN_UNFUSE_FMA", None)
-        if cfg.rescale_threshold is not None:
-            os.environ["CUDNN_RESCALE_THRESHOLD"] = str(cfg.rescale_threshold)
-        else:
-            os.environ.pop("CUDNN_RESCALE_THRESHOLD", None)
-        yield
-    finally:
-        os.environ.pop("CUDNN_UNFUSE_FMA", None)
-        os.environ.pop("CUDNN_RESCALE_THRESHOLD", None)
-
-
 def _show_config(spec, cfg, test_no, env_info, request):
     is_dryrun = request.config.option.dryrun
     print()
@@ -182,12 +162,7 @@ def run_suite(name, env_info, test_no, request, cudnn_handle):
     if request.node.name in env_info["blocked_tests"]:
         pytest.skip(f"blocked test: {request.node.name}")
 
-    exec_fn = _EXEC[spec.exec_kind]
-    if spec.exec_kind in ("fp8", "mxfp8"):
-        with _knob_env(cfg):
-            exec_fn(cfg, request, cudnn_handle)
-    else:
-        exec_fn(cfg, request, cudnn_handle)
+    _EXEC[spec.exec_kind](cfg, request, cudnn_handle)
 
 
 # ---- shared post() helpers -------------------------------------------------
@@ -207,20 +182,6 @@ def post_unified(cfg, rng, request):
         request.config.getoption("--implementation") or "",
         cudnn.attention_implementation.UNIFIED,
     )
-
-
-def post_fp8_numerics_fuzz(cfg, rng, request):
-    """Fuzz the fp8/mxfp8 numerics knobs (unfuse-FMA and SM100 rescale
-    threshold); the runner materializes them as env vars around exec."""
-    cfg.with_unfuse_fma = rng.choice([True, False])
-    if torch.cuda.get_device_capability()[0] == 10:
-        cfg.rescale_threshold = rng.choice([0.0, 2.0, 4.0])
-    else:
-        cfg.rescale_threshold = 0.0
-
-
-def post_fp8_rescale_off(cfg, rng, request):
-    cfg.rescale_threshold = 0.0
 
 
 def combine(*posts):

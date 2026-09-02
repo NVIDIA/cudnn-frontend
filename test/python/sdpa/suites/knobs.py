@@ -660,6 +660,9 @@ def mxfp8_fwd():
         # Re-add padded/ragged once the API grows seq-len support.
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
+        # Passed to the graph as sdpa(unfuse_fma=...) by the mxfp8 harness
+        # (a graph attribute, not an env var).
+        with_unfuse_fma=RandomChoice({True: 1, False: 1}),
     )
 
 
