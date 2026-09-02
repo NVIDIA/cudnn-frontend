@@ -1978,8 +1978,29 @@ else:
     except Exception:
         pass
 
-    fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
-    bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
+    def _sol(tflops):
+        """SOL% against the dense-MMA peak, or an explicit note when we cannot
+        compute it.
+
+        The peak needs a sampled boost clock, which needs ``pynvml``. When that
+        import is missing the SOL suffix used to vanish entirely and an
+        impossible TFLOPS number printed unremarked -- the only cross-check this
+        harness has on its own arithmetic, silently disabled by a missing
+        optional dependency. Say so instead, and shout when a number exceeds the
+        hardware: >100% SOL means the FLOP model or the timing is wrong, never
+        that the kernel is fast.
+        """
+        if tflops <= 0:
+            return ""
+        if not _peak_mma_tflops:
+            return ", SOL n/a (no clock sample -- pip install pynvml)"
+        pct = tflops / _peak_mma_tflops * 100
+        if pct > 100.0:
+            return f", {pct:.1f}% SOL -- ABOVE HARDWARE PEAK, MEASUREMENT IS WRONG"
+        return f", {pct:.1f}% SOL"
+
+    fwd_sol_str = _sol(fwd_tflops)
+    bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
         print(

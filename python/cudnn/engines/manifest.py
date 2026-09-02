@@ -209,6 +209,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
+            "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),

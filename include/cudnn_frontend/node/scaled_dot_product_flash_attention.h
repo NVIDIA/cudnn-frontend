@@ -1343,9 +1343,25 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 is_d256_on_blackwell = true;
                 attributes.is_deterministic_algorithm = true;
             } else {
-                RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
+                // Head dims in (256, 512] on BOTH sides are served by the
+                // frontend-only FROST SM100 backward engine (sdpa_bwd_sm100),
+                // which runs the band through its native d = 512 tiles: the TMA
+                // descriptors carry the real extent and the overshoot is
+                // hardware zero-filled, so the padded lanes contribute nothing.
+                // The floor is the engine's -- below it the d256 flavors are the
+                // right kernel and this one would pad by more than 2x. Multiple
+                // of 8 rather than the forward surface's 16: the backward's
+                // stage-3 epilogue narrows its store vector from 32 B to 16 B
+                // when d is not also a multiple of 16, which the forward has no
+                // equivalent lever for. As on the forward path, the cuDNN
+                // backend itself has no plan for the band, so a graph that does
+                // not select that engine still fails at plan creation.
+                bool const d512_supported =
+                    (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 8 == 0) && (d_v % 8 == 0);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)) && !d512_supported,
                                             error_code_t::GRAPH_NOT_SUPPORTED,
-                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v");
+                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v, "
+                                            "unless both head dims are in (256, 512] and multiples of 8");
             }
         } else {
             // validate basic dimension requirements
