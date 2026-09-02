@@ -16,18 +16,6 @@ def test_generation_fp16_decode(env_info, test_no, request, cudnn_handle):
     run_suite("generation.fp16.decode", env_info, test_no, request, cudnn_handle)
 
 
-@pytest.mark.L1
-@pytest.mark.parametrize(
-    "test_no",
-    suite_seeds("generation.fp16.decode_unified"),
-    ids=lambda p: f"test{p[0]}",
-)
-def test_generation_fp16_decode_unified(env_info, test_no, request, cudnn_handle):
-    run_suite(
-        "generation.fp16.decode_unified", env_info, test_no, request, cudnn_handle
-    )
-
-
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "test_no", suite_seeds("generation.fp16.lean"), ids=lambda p: f"test{p[0]}"
@@ -50,11 +38,3 @@ def test_generation_fp16_thd_chunked(env_info, test_no, request, cudnn_handle):
 )
 def test_generation_fp16_paged(env_info, test_no, request, cudnn_handle):
     run_suite("generation.fp16.paged", env_info, test_no, request, cudnn_handle)
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("generation.fp16.paged_unified"), ids=lambda p: f"test{p[0]}"
-)
-def test_generation_fp16_paged_unified(env_info, test_no, request, cudnn_handle):
-    run_suite("generation.fp16.paged_unified", env_info, test_no, request, cudnn_handle)

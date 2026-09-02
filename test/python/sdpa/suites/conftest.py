@@ -4,8 +4,6 @@
 import pytest
 import torch
 
-from sdpa.blocked import fetch_blocked_tests
-
 
 @pytest.fixture(scope="session")
 def env_info():
@@ -20,11 +18,4 @@ def env_info():
     gpu_info = f"{sm_count} SM-s, {gpu_name}"
     cudnn_ver = str(torch.backends.cudnn.version())
 
-    blocked_tests = fetch_blocked_tests(gpu_arch, cudnn_ver)
-
-    return {
-        "gpu_arch": gpu_arch,
-        "gpu_info": gpu_info,
-        "cudnn_ver": cudnn_ver,
-        "blocked_tests": blocked_tests,
-    }
+    return {"gpu_arch": gpu_arch, "gpu_info": gpu_info, "cudnn_ver": cudnn_ver}

@@ -22,7 +22,6 @@ from sdpa.suites.common import (
     combine,
     post_paged,
     post_train,
-    post_unified,
 )
 from sdpa.suites.models.catalog import CATALOG
 
@@ -33,12 +32,6 @@ def post_mxfp8(cfg, rng, request):
 
 def post_mxfp8_bwd_flags(cfg, rng, request):
     cfg.use_causal_mask = cfg.left_bound is None and cfg.right_bound == 0
-
-
-def post_force_unified(cfg, rng, request):
-    import cudnn
-
-    cfg.implementation = cudnn.attention_implementation.UNIFIED
 
 
 _COMMON_FUZZ = (
@@ -67,8 +60,10 @@ _SPECS = [
         num_tests=128,
         rng_seed=888,
         knobs=partial(knobs.dense_fwd, torch.float16),
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/full", "sink", "bias(1:5)"),
-        pinned=("infer", "impl AUTO"),
+        fuzzed=_COMMON_FUZZ
+        + _MASK_FUZZ
+        + ("layout padded/cu_padded/full", "sink", "bias(1:5)", "unfuse_fma"),
+        pinned=("infer",),
     ),
     SuiteSpec(
         name="context.bf16.dense",
@@ -78,36 +73,10 @@ _SPECS = [
         num_tests=128,
         rng_seed=888,
         knobs=partial(knobs.dense_fwd, torch.bfloat16),
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/full", "sink", "bias(1:5)"),
-        pinned=("infer", "impl AUTO"),
-    ),
-    SuiteSpec(
-        name="context.fp16.unified",
-        phase="context",
-        dtype="fp16",
-        level="L1",
-        num_tests=64,
-        rng_seed=889,
-        knobs=partial(knobs.dense_fwd_unified, torch.float16),
-        post=post_unified,
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
-        + ("layout padded/cu_padded/full", "sink", "bias(1:3)", "unfuse_fma"),
-        pinned=("infer", "impl UNIFIED"),
-    ),
-    SuiteSpec(
-        name="context.bf16.unified",
-        phase="context",
-        dtype="bf16",
-        level="L1",
-        num_tests=64,
-        rng_seed=889,
-        knobs=partial(knobs.dense_fwd_unified, torch.bfloat16),
-        post=post_unified,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + ("layout padded/cu_padded/full", "sink", "bias(1:3)", "unfuse_fma"),
-        pinned=("infer", "impl UNIFIED"),
+        + ("layout padded/cu_padded/full", "sink", "bias(1:5)", "unfuse_fma"),
+        pinned=("infer",),
     ),
     SuiteSpec(
         name="context.fp16.thd",
@@ -118,7 +87,7 @@ _SPECS = [
         rng_seed=890,
         knobs=partial(knobs.thd_fwd, torch.float16),
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("sink",),
-        pinned=("infer", "layout THD (ragged)", "impl AUTO"),
+        pinned=("infer", "layout THD (ragged/cu_ragged)"),
     ),
     SuiteSpec(
         name="context.bf16.thd",
@@ -129,19 +98,7 @@ _SPECS = [
         rng_seed=890,
         knobs=partial(knobs.thd_fwd, torch.bfloat16),
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("sink",),
-        pinned=("infer", "layout THD (ragged)", "impl AUTO"),
-    ),
-    SuiteSpec(
-        name="context.fp16.thd_unified",
-        phase="context",
-        dtype="fp16",
-        level="L1",
-        num_tests=128,
-        rng_seed=891,
-        knobs=partial(knobs.thd_fwd_unified, torch.float16),
-        post=post_unified,
-        fuzzed=_COMMON_FUZZ + _THD_FUZZ + ("layout ragged/cu_ragged", "sink"),
-        pinned=("infer", "no mask", "diag TL", "impl UNIFIED"),
+        pinned=("infer", "layout THD (ragged/cu_ragged)"),
     ),
     SuiteSpec(
         name="context.fp16.thd_offset_mult",
@@ -151,11 +108,9 @@ _SPECS = [
         num_tests=128,
         rng_seed=892,
         knobs=partial(knobs.thd_offset_mult, torch.float16),
-        post=post_force_unified,
-        min_cudnn=92400,
         fuzzed=_COMMON_FUZZ + _THD_FUZZ + ("layout ragged_mult/cu_ragged_mult", "sink"),
-        pinned=("infer", "no mask", "diag TL", "impl UNIFIED"),
-        notes="ragged offset multiplier: unified fwd engine only, cuDNN >= 9.24",
+        pinned=("infer", "no mask", "diag TL"),
+        notes="ragged offset multiplier; engines without the attribute waive at build",
     ),
     SuiteSpec(
         name="context.fp8.dense",
@@ -174,7 +129,7 @@ _SPECS = [
             "layout padded/full",
             "sink",
         ),
-        pinned=("infer", "impl AUTO"),
+        pinned=("infer",),
     ),
     SuiteSpec(
         name="context.fp8.thd",
@@ -216,7 +171,6 @@ _SPECS = [
         ),
         pinned=(
             "infer",
-            "impl AUTO",
             "SM100+",
             "layout full (mxfp8 API has no seq-len args, #646)",
         ),
@@ -262,7 +216,7 @@ _SPECS = [
         rng_seed=111,
         knobs=partial(knobs.decode, torch.float16),
         fuzzed=_COMMON_FUZZ + ("diag TL/BR",),
-        pinned=("infer", "s_q=1", "no mask", "layout full", "impl AUTO"),
+        pinned=("infer", "s_q=1", "no mask", "layout full"),
     ),
     SuiteSpec(
         name="generation.bf16.decode",
@@ -273,19 +227,7 @@ _SPECS = [
         rng_seed=111,
         knobs=partial(knobs.decode, torch.bfloat16),
         fuzzed=_COMMON_FUZZ + ("diag TL/BR",),
-        pinned=("infer", "s_q=1", "no mask", "layout full", "impl AUTO"),
-    ),
-    SuiteSpec(
-        name="generation.fp16.decode_unified",
-        phase="generation",
-        dtype="fp16",
-        level="L1",
-        num_tests=32,
-        rng_seed=112,
-        knobs=partial(knobs.decode_unified, torch.float16),
-        post=post_unified,
-        fuzzed=_COMMON_FUZZ,
-        pinned=("infer", "s_q=1", "no mask", "diag TL", "layout full", "impl UNIFIED"),
+        pinned=("infer", "s_q=1", "no mask", "layout full"),
     ),
     SuiteSpec(
         name="generation.fp16.lean",
@@ -296,7 +238,7 @@ _SPECS = [
         rng_seed=222,
         knobs=partial(knobs.lean_attn, torch.float16),
         fuzzed=_COMMON_FUZZ + ("diag TL/BR", "layout padded/full"),
-        pinned=("infer", "s_q=1", "s_kv 513..4096", "no mask", "impl AUTO"),
+        pinned=("infer", "s_q=1", "s_kv 513..4096", "no mask"),
     ),
     SuiteSpec(
         name="generation.bf16.lean",
@@ -307,7 +249,7 @@ _SPECS = [
         rng_seed=222,
         knobs=partial(knobs.lean_attn, torch.bfloat16),
         fuzzed=_COMMON_FUZZ + ("diag TL/BR", "layout padded/full"),
-        pinned=("infer", "s_q=1", "s_kv 513..4096", "no mask", "impl AUTO"),
+        pinned=("infer", "s_q=1", "s_kv 513..4096", "no mask"),
     ),
     SuiteSpec(
         name="generation.fp16.paged",
@@ -319,7 +261,7 @@ _SPECS = [
         knobs=partial(knobs.paged, torch.float16),
         post=post_paged,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("block size 1..1024", "sink"),
-        pinned=("infer", "s_q<=64", "layout padded", "paged KV", "impl AUTO"),
+        pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
     ),
     SuiteSpec(
         name="generation.bf16.paged",
@@ -331,19 +273,7 @@ _SPECS = [
         knobs=partial(knobs.paged, torch.bfloat16),
         post=post_paged,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("block size 1..1024", "sink"),
-        pinned=("infer", "s_q<=64", "layout padded", "paged KV", "impl AUTO"),
-    ),
-    SuiteSpec(
-        name="generation.fp16.paged_unified",
-        phase="generation",
-        dtype="fp16",
-        level="L0",
-        num_tests=64,
-        rng_seed=886,
-        knobs=partial(knobs.paged_unified, torch.float16),
-        post=combine(post_paged, post_unified),
-        fuzzed=_COMMON_FUZZ + ("layout padded/cu_padded", "block size 1..1024"),
-        pinned=("infer", "s_q<=64", "no mask", "diag TL", "paged KV", "impl UNIFIED"),
+        pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
     ),
     SuiteSpec(
         name="generation.fp16.thd_chunked",
@@ -354,7 +284,7 @@ _SPECS = [
         rng_seed=445,
         knobs=partial(knobs.thd_chunked, torch.float16),
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ,
-        pinned=("infer", "s_q<=64", "layout THD (ragged)", "impl AUTO"),
+        pinned=("infer", "s_q<=64", "layout THD (ragged)"),
         notes="varlen chunked generation: packed THD chunks against long KV",
     ),
     SuiteSpec(
@@ -366,7 +296,7 @@ _SPECS = [
         rng_seed=445,
         knobs=partial(knobs.thd_chunked, torch.bfloat16),
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ,
-        pinned=("infer", "s_q<=64", "layout THD (ragged)", "impl AUTO"),
+        pinned=("infer", "s_q<=64", "layout THD (ragged)"),
         notes="varlen chunked generation: packed THD chunks against long KV",
     ),
     SuiteSpec(
@@ -417,7 +347,7 @@ _SPECS = [
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
         + ("layout padded/full", "deterministic", "sink", "bias(1:7)"),
-        pinned=("train", "impl AUTO"),
+        pinned=("train"),
     ),
     SuiteSpec(
         name="bprop.bf16.dense",
@@ -431,7 +361,7 @@ _SPECS = [
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
         + ("layout padded/full", "deterministic", "sink", "bias(1:7)"),
-        pinned=("train", "impl AUTO"),
+        pinned=("train"),
     ),
     SuiteSpec(
         name="bprop.fp16.thd",
@@ -443,7 +373,7 @@ _SPECS = [
         knobs=partial(knobs.thd_bwd, torch.float16),
         post=post_train,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("deterministic", "sink"),
-        pinned=("train", "layout THD (ragged)", "impl AUTO"),
+        pinned=("train", "layout THD (ragged)"),
     ),
     SuiteSpec(
         name="bprop.bf16.thd",
@@ -455,7 +385,7 @@ _SPECS = [
         knobs=partial(knobs.thd_bwd, torch.bfloat16),
         post=post_train,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("deterministic", "sink"),
-        pinned=("train", "layout THD (ragged)", "impl AUTO"),
+        pinned=("train", "layout THD (ragged)"),
     ),
     SuiteSpec(
         name="bprop.fp8.dense",
@@ -480,7 +410,6 @@ _SPECS = [
         knobs=knobs.fp8_thd_bwd,
         exec_kind="fp8",
         post=post_train,
-        min_cudnn=92101,
         fuzzed=_COMMON_FUZZ
         + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
         pinned=(

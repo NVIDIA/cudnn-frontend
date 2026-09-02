@@ -17,28 +17,12 @@ def test_context_fp16_dense(env_info, test_no, request, cudnn_handle):
     run_suite("context.fp16.dense", env_info, test_no, request, cudnn_handle)
 
 
-@pytest.mark.L1
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.fp16.unified"), ids=lambda p: f"test{p[0]}"
-)
-def test_context_fp16_unified(env_info, test_no, request, cudnn_handle):
-    run_suite("context.fp16.unified", env_info, test_no, request, cudnn_handle)
-
-
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "test_no", suite_seeds("context.fp16.thd"), ids=lambda p: f"test{p[0]}"
 )
 def test_context_fp16_thd(env_info, test_no, request, cudnn_handle):
     run_suite("context.fp16.thd", env_info, test_no, request, cudnn_handle)
-
-
-@pytest.mark.L1
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.fp16.thd_unified"), ids=lambda p: f"test{p[0]}"
-)
-def test_context_fp16_thd_unified(env_info, test_no, request, cudnn_handle):
-    run_suite("context.fp16.thd_unified", env_info, test_no, request, cudnn_handle)
 
 
 @pytest.mark.L1

@@ -47,8 +47,6 @@ def render():
             if spec.phase != phase:
                 continue
             gates = []
-            if spec.min_cudnn:
-                gates.append(f"cuDNN>={spec.min_cudnn}")
             if spec.min_sm:
                 gates.append(f"SM>={spec.min_sm[0]}{spec.min_sm[1]}")
             if spec.notes:

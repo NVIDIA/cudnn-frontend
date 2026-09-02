@@ -26,7 +26,6 @@ from typing import Callable, Optional
 
 import pytest
 import torch
-import cudnn
 
 from sdpa.random_config import ExecConfig, RandomizationContext
 from sdpa.fp16 import exec_sdpa
@@ -72,7 +71,6 @@ class SuiteSpec:
     post: Optional[Callable] = (
         None  # post(cfg, rng, request) tweaks after randomization
     )
-    min_cudnn: Optional[int] = None  # cudnn.backend_version() gate
     min_sm: Optional[tuple] = None  # torch.cuda.get_device_capability() gate
     fuzzed: tuple = ()
     pinned: tuple = ()
@@ -147,8 +145,6 @@ def run_suite(name, env_info, test_no, request, cudnn_handle):
 
     spec = REGISTRY[name]
 
-    if spec.min_cudnn is not None and cudnn.backend_version() < spec.min_cudnn:
-        pytest.skip(f"{name} requires cuDNN backend >= {spec.min_cudnn}")
     if spec.min_sm is not None and torch.cuda.get_device_capability() < spec.min_sm:
         pytest.skip(f"{name} requires SM >= {spec.min_sm}")
 
@@ -158,9 +154,6 @@ def run_suite(name, env_info, test_no, request, cudnn_handle):
         spec.post(cfg, rng, request)
 
     _show_config(spec, cfg, test_no, env_info, request)
-
-    if request.node.name in env_info["blocked_tests"]:
-        pytest.skip(f"blocked test: {request.node.name}")
 
     _EXEC[spec.exec_kind](cfg, request, cudnn_handle)
 
@@ -174,14 +167,6 @@ def post_train(cfg, rng, request):
 
 def post_paged(cfg, rng, request):
     cfg.is_paged = True
-
-
-def post_unified(cfg, rng, request):
-    cfg.implementation = getattr(
-        cudnn.attention_implementation,
-        request.config.getoption("--implementation") or "",
-        cudnn.attention_implementation.UNIFIED,
-    )
 
 
 def combine(*posts):
