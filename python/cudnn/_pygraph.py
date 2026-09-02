@@ -845,8 +845,15 @@ class pygraph:
                     _sdpa_validate.validate_node(node)
             else:
                 self._lowered_graph = self._lower_to_cpp()
-                self._lowered_graph.validate()
-                self._verify_uid_ownership()
+                try:
+                    self._lowered_graph.validate()
+                    self._verify_uid_ownership()
+                except Exception:
+                    # A rejected lowering must not survive: the next validate()
+                    # would find _lowered_graph set, skip the backend check, and mark
+                    # the rejected graph valid.
+                    self._reset_lowered_state()
+                    raise
         # Only a graph that passed EVERY check above is validated: a rejection
         # (python-native or C++) leaves the flag False so build()/plan() re-run
         # validate() and raise again instead of planning a rejected graph.
@@ -1007,12 +1014,7 @@ class pygraph:
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
             _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
             self._backend_declined = exc
-            self._lowered_graph = None
-            self._cpp_tensors.clear()
-            self._cpp_bog_done = False
-            self._cpp_plans_created = False
-            self._backend_mode_spans.clear()
-            self._backend_entries = []
+            self._reset_lowered_state()
 
     def _attach_facts(self) -> None:
         """Describe this frozen graph in its family's vocabulary.
@@ -1126,12 +1128,7 @@ class pygraph:
             _LOG.warning("backend could not lower this graph, treating as a decline: %s", exc)
             # Roll back: a half-lowered graph makes a later build_operation_graph()
             # walk into the descriptor that just failed.
-            self._lowered_graph = None
-            self._cpp_tensors.clear()
-            self._cpp_bog_done = False
-            self._cpp_plans_created = False
-            self._backend_mode_spans.clear()
-            self._backend_entries = []
+            self._reset_lowered_state()
             return self._backend_entries
         try:
             # "Which engines does it offer?" — here only an unsupported-graph
@@ -1310,6 +1307,17 @@ class pygraph:
     def _build_context(self, handle: Any = None) -> Any:
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
+
+    def _reset_lowered_state(self) -> None:
+        """Drop every artifact of a C++ lowering (graph, tensors, BOG/plan flags,
+        backend entries) so a later lowering starts from the IR, not from a
+        half-built or rejected descriptor."""
+        self._lowered_graph = None
+        self._cpp_tensors.clear()
+        self._cpp_bog_done = False
+        self._cpp_plans_created = False
+        self._backend_mode_spans.clear()
+        self._backend_entries = []
 
     def _verify_uid_ownership(self) -> None:
         # Verify the uid-ownership invariant (see _lower_to_cpp): every C++

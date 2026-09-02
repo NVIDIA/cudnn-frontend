@@ -94,6 +94,19 @@ def test_rejected_graph_stays_unvalidated(frost_candidate):
         g.build_operation_graph()
 
 
+def test_rejected_classic_graph_stays_unvalidated(no_candidates):
+    """Classic path (no python candidate): a backend rejection rolls the lowering
+    back, so the retry re-runs the backend check and raises again instead of
+    finding a stale lowered graph and marking the rejected graph valid."""
+    g, _ = _sdpa_graph(h_q=3, h_kv=2)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g.validate()
+    assert g._is_validated is False and g._lowered_graph is None
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g.build_operation_graph()
+    assert g._is_validated is False
+
+
 def test_gqa_head_divisibility(frost_candidate):
     """h_q not a multiple of h_kv is rejected with the classic error type, without lowering."""
     g, _ = _sdpa_graph(h_q=3, h_kv=2)
