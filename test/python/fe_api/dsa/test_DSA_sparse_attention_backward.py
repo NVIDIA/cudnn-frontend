@@ -375,7 +375,7 @@ def test_DSA_sparse_attention_backward_sm100_h16_partial_max_topk():
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
