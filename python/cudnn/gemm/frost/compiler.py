@@ -3484,6 +3484,7 @@ def plan_config(chain: FusionChain) -> TileConfig:
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
         force_cta_group=force_cta_group,
+        m_is_group_average=chain.moe is not None,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is

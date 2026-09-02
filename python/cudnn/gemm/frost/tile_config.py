@@ -911,6 +911,7 @@ def select_config(
     b_elem_bytes: int = 2,
     sm_count: int | None = None,
     force_cta_group: int | None = None,
+    m_is_group_average: bool = False,
 ) -> TileConfig:
     """Pick a TileConfig from problem geometry.
 
@@ -973,7 +974,12 @@ def select_config(
         # Block-scale prefers the CTA pair even without a second M tile (halved per-CTA
         # B footprint buys pipeline depth) — but only while the pair's padded M row still
         # fits the machine in one wave; past that the padding costs a whole extra wave.
-        cta_group = 2 if (M > cta_m or (block_scale and 2 * (-(-N // cta_n)) <= sm)) else 1
+        # NOT when M is a per-group average (MoE): the pairing win was measured on dense
+        # block-scale GEMMs where M is exact, and a one-wave bound computed against the
+        # average of ragged runtime groups bounds nothing — grouped M-starved problems
+        # keep 1-CTA through the ordinary rule, as the MoE planner tests pin.
+        early_pair = block_scale and not m_is_group_average and 2 * (-(-N // cta_n)) <= sm
+        cta_group = 2 if (M > cta_m or early_pair) else 1
 
     if block_scale:
         cta_m = max(cta_m, 128)
