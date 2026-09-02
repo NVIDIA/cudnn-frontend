@@ -357,7 +357,7 @@ class SparseAttentionForwardSm100Head64:
 
         # Reuse the drained arena as an eight-tile SW128 output stage.  Keep
         # the tensor map rank three, (D, H, Tq), so every 64x64 store lowers to
-        # the source-style UTMASTG.3D rather than a tiled-dimension 4-D map.
+        # the rank-3 bulk TMA store form rather than a tiled-dimension 4-D map.
         o_chunk_smem_layout = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3),
             0,
@@ -690,7 +690,7 @@ class SparseAttentionForwardSm100Head64:
             cute.arch.mbarrier_wait(q_ready_mbar_ptr, 0)
         if const_expr(self.head_dim == 576):
             # The public TMA-A builder decomposes this SW64 tail into 64-byte
-            # destination steps, which violates UTMALDG's alignment contract.
+            # destination steps, which violate the bulk TMA load alignment contract.
             # Copy the small one-time 8-KiB tail with aligned cp.async chunks;
             # the following S2T path and QK descriptor remain source-exact.
             if tidx < Int32(4 * self.WARP_SIZE):
