@@ -420,10 +420,20 @@ def _bprop_kernel(
     k_tile_gmem = K_view.data_ptr() + k_tile_base
     v_tile_gmem = V_view.data_ptr() + v_tile_base
 
-    # LSE / do_dot: dense [B,H,SQ] → (batch*H+head)*SQ; THD packed [1,H,T_q]
-    # (T_q == SQ here) → head*T_q + cu_q[b].  Read below at + the in-seq q index.
-    lse_head_base = (head * cutlass.Int32(SQ) + cu_q_b) if cutlass.const_expr(THD_VARLEN) else (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
-    dot_head_base = lse_head_base
+    # LSE: STRIDE-AWARE on the dense path (a graph Stats input may carry any
+    # dense-compatible [B,H,SQ] layout; the compile-time strides come from the
+    # fake — a compact fake folds them to the packed constants, so the packed
+    # case is byte-identical).  THD keeps the packed [1,H,T_q] math (the grid
+    # `batch` is the LOGICAL sequence index, not the tensor's batch-1 dim).
+    # do_dot is an internal packed buffer → packed math always.
+    if cutlass.const_expr(THD_VARLEN):
+        lse_head_base = cutlass.Int64(head * cutlass.Int32(SQ) + cu_q_b)
+        LSE_Q_STRIDE = cutlass.Int64(1)
+        dot_head_base = head * cutlass.Int32(SQ) + cu_q_b
+    else:
+        lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
+        LSE_Q_STRIDE = cutlass.Int64(LSE.stride[2])
+        dot_head_base = (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
 
     # ---- SMEM tiles -------------------------------------------------------
     # Q∪dO is MERGED into one array so BMM1/dV/dK's per-sub-group B operand is a
@@ -704,8 +714,8 @@ def _bprop_kernel(
                 # clamped value is dead.
                 qr0 = _clamp_lt(qc0, q_bound) if cutlass.const_expr(GATE_Q) else qc0
                 qr1 = _clamp_lt(qc1, q_bound) if cutlass.const_expr(GATE_Q) else qc1
-                lse0 = Pointer(LSE_view.data_ptr() + lse_head_base + qr0, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
-                lse1 = Pointer(LSE_view.data_ptr() + lse_head_base + qr1, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+                lse0 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr0) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+                lse1 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr1) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
                 off = nf * 4
                 # Bias: add bias/scale to UNSCALED acc1 (post-scale → +bias),
                 # matching the forward.  Cells: (kv_a,qc0)(kv_a,qc1)(kv_a8,qc0)(kv_a8,qc1).
@@ -1229,15 +1239,20 @@ def _dsink_kernel(
     if row < n_bh:
         H = SINKS.shape[0]
         h = row % cutlass.Int32(H)
+        b = row // cutlass.Int32(H)
         sink_h = Pointer(cutlass.make_array_view(SINKS).data_ptr() + h, dtype=cutlass.Float32).load()
         base = row * cutlass.Int32(SQ)
+        # LSE is stride-aware (a graph Stats input may be any dense-compatible
+        # layout; compact strides fold to the packed math).  do_dot is an
+        # internal packed buffer.
+        lse_base = cutlass.Int64(b) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(h) * cutlass.Int64(LSE.stride[1])
         lse_p = cutlass.make_array_view(LSE).data_ptr()
         dot_p = cutlass.make_array_view(DO_DOT).data_ptr()
         acc = cutlass.Float32(0.0)
         for k in cutlass.range_constexpr((SQ + 31) // 32):
             q = lane + cutlass.Int32(k * 32)
             if q < cutlass.Int32(SQ):
-                lse_q = Pointer(lse_p + base + q, dtype=cutlass.Float32).load()
+                lse_q = Pointer(lse_p + lse_base + cutlass.Int64(q) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32).load()
                 dd_q = Pointer(dot_p + base + q, dtype=cutlass.Float32).load()
                 # Padded / fully-masked q-rows have LSE = -inf (forward writes -inf
                 # for an empty softmax denom).  exp2((sink - (-inf))·log2e) = +inf →
@@ -1542,10 +1557,10 @@ def scratch_bytes(
 # there; ``n_batch_logical`` (the logical sequence count) sizes the
 # ``cu_seqlens`` ABI and IS plan-time. Launch marshaling lives in the adapter
 # (``api_dsl._sm80_bwd_call``); this module holds no host runtime logic.
-# The stats input is READ as a packed (B, H, SQ) LSE (raw-pointer packed
-# addressing in the device code) — a strided graph stats input is gathered
-# into carved staging by the adapter, unlike the forward's #712-style native
-# strided WRITES.
+# The stats input is READ stride-aware on the dense path: ``compile()``
+# takes a plan-time ``lse_stride`` and the device code loads through the
+# fake's strides (the #712 analogue for the backward's loads; a contiguous
+# plan keeps the packed compact fake — byte-identical codegen).
 # ===========================================================================
 from typing import NamedTuple  # noqa: E402
 
@@ -1572,6 +1587,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     swa_window: int = 0,
     rope_max_s: int = 0,
     n_batch_logical: int = 0,
+    lse_stride: "Optional[tuple[int, int, int]]" = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1582,6 +1598,11 @@ def compile(  # noqa: A001 — the template contract's entry point
     ``cute.sym_int`` per ragged group (Q/dO/dQ/LSE/do_dot share t_q; K/V and
     the per-query-head dK/dV write buffers share t_kv), so one artifact
     re-binds any totals.
+
+    ``lse_stride`` (dense only, plan-time): declared (B, H, SQ) strides of a
+    non-contiguous Stats input — the kernels then READ the LSE natively at
+    that layout (the #712 analogue for the backward's loads; ``None`` keeps
+    the packed compact fake, byte-identical codegen).
     """
     p = PARAMS
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
@@ -1617,7 +1638,11 @@ def compile(  # noqa: A001 — the template contract's entry point
     # dK/dV WRITE buffers carry H_q heads (per-query-head; GQA reduces after).
     fdk_ws = _fake(io_dtype, (_b, _skv, h, p.d_qk), r4)
     fdv_ws = _fake(io_dtype, (_b, _skv, h, p.d_v), r4)
-    fl = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    fl = (
+        cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
+        if lse_stride is not None and not p.thd_varlen
+        else _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    )
     fdt = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
     fsk = _fake(cutlass.Int32, (b if p.has_seq_kv_lens else 1,), (0,), align=4)
     bias_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype

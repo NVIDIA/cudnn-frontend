@@ -547,9 +547,9 @@ def _sm80_spec() -> EngineSpec:
             sink=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
-            # Served by gathering the strided stats into carved contiguous
-            # staging (issue #514 workspace machinery) — the kernels read a
-            # packed LSE; sm120 reads declared strides natively instead.
+            # The kernels READ the declared stats strides natively (the
+            # #712 analogue for the backward's loads), same as sm120 — no
+            # gather staging.
             strided_stats=True,
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),

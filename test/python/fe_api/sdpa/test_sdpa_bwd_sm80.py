@@ -358,3 +358,191 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
     # call 1's key (n_seqs=2, different token totals) and MUST cache-hit.
     assert misses_1 - misses_0 <= 1, f"THD bprop compile key leaked runtime data: {misses_1 - misses_0} new misses"
     assert hits_1 - hits_0 >= 1, "expected a cache hit on the same-batch-count re-call"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_strided_stats_native_reads():
+    """The kernels read a STRIDED Stats/LSE input natively (the #712 analogue
+    for the backward's loads): an interleaved-stride stats declaration must
+    produce bitwise the same grads as the contiguous run — with no gather
+    staging (the workspace stays exactly the packed plan's size)."""
+    try:
+        from cudnn.sdpa.bwd import api_dsl as api_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    b, h, s, d = 2, 4, 512, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    do = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, scale_softmax=scale)
+    lse_c = fwd["lse_tensor"].contiguous()
+
+    # Interleave the (B, H, S) LSE into a doubled-S buffer: stride (2*H*S, 2*S, 2).
+    buf = torch.full((b, h, s, 2), float("nan"), dtype=torch.float32, device="cuda")
+    lse_strided = buf.as_strided((b, h, s), (2 * h * s, 2 * s, 2))
+    lse_strided.copy_(lse_c)
+
+    def run(lse):
+        dq = torch.empty(b, s, h, d, dtype=torch.float16, device="cuda").transpose(1, 2)
+        dk, dv = torch.empty_like(dq), torch.empty_like(dq)
+        eng = api_sm80.SdpaBwdDslSm80(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=fwd["o_tensor"],
+            sample_do=do,
+            sample_stats=lse,
+            sample_dq=dq,
+            sample_dk=dk,
+            sample_dv=dv,
+            is_causal=True,
+            scale_softmax=scale,
+        )
+        assert eng.check_support()
+        eng.compile()
+        ws = torch.empty(eng.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+        eng.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=fwd["o_tensor"],
+            do_tensor=do,
+            stats_tensor=lse,
+            dq_tensor=dq,
+            dk_tensor=dk,
+            dv_tensor=dv,
+            scale_softmax=scale,
+            workspace=ws,
+        )
+        return eng, dq, dk, dv
+
+    eng_c, dq_c, dk_c, dv_c = run(lse_c)
+    eng_s, dq_s, dk_s, dv_s = run(lse_strided)
+    assert eng_s._lse_stride == (2 * h * s, 2 * s, 2)
+    # Native reads: the strided plan needs NO staging — same scratch as packed.
+    assert eng_s.scratch_workspace_bytes() == eng_c.scratch_workspace_bytes()
+    assert torch.equal(dq_s, dq_c)
+    assert torch.equal(dk_s, dk_c)
+    assert torch.equal(dv_s, dv_c)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_max_s_kv_hint():
+    """The THD wrapper's max_s_kv grid hint must (a) produce bitwise the same
+    grads as the hint-less host-read path, including when over-provisioned
+    (short kv-tiles early-out), and (b) be rejected on the dense path."""
+    import itertools
+
+    try:
+        from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    h, d = 4, 128
+    lens = [96, 320, 160]
+    t = int(sum(lens))
+    cu = torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device="cuda")
+    q = torch.randn(1, t, h, d, dtype=torch.float16, device="cuda")
+    k, v, do = torch.randn_like(q), torch.randn_like(q), torch.randn_like(q)
+    fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=max(lens))
+
+    def run(**kw):
+        return sdpa_bwd_wrapper_sm80(q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, **kw)
+
+    base = run()
+    exact = run(max_s_kv=max(lens))
+    over = run(max_s_kv=t)  # upper bound: extra kv-tiles early-out
+    for key in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        assert torch.equal(exact[key], base[key]), key
+        assert torch.equal(over[key], base[key]), key
+
+    with pytest.raises(ValueError, match="max_s_kv"):
+        sdpa_bwd_wrapper_sm80(
+            _bshd_randn(1, h, 128, d, dtype=torch.float16, device="cuda"),
+            _bshd_randn(1, h, 128, d, dtype=torch.float16, device="cuda"),
+            _bshd_randn(1, h, 128, d, dtype=torch.float16, device="cuda"),
+            _bshd_randn(1, h, 128, d, dtype=torch.float16, device="cuda"),
+            _bshd_randn(1, h, 128, d, dtype=torch.float16, device="cuda"),
+            torch.randn(1, h, 128, dtype=torch.float32, device="cuda"),
+            max_s_kv=128,
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_wrapper_lse_stride_in_cache_key():
+    """The wrapper's plan cache must key on the Stats/LSE geometry: the
+    compiled kernel is SPECIALIZED on the declared LSE strides (native
+    strided reads), so a cache hit across differently-laid-out LSE views
+    would misread the stats — same q/k/v, contiguous-then-strided LSE must
+    produce bitwise-identical gradients."""
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    b, h, s, d = 2, 4, 512, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    do = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, scale_softmax=scale)
+    lse_c = fwd["lse_tensor"].contiguous()
+
+    # Interleaved-stride view of the SAME values: stride (2*h*s, 2*s, 2).
+    buf = torch.full((b, h, s, 2), float("nan"), dtype=torch.float32, device="cuda")
+    lse_strided = buf.as_strided((b, h, s), (2 * h * s, 2 * s, 2))
+    lse_strided.copy_(lse_c)
+
+    def run(lse):
+        return sdpa_bwd_wrapper_sm80(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=fwd["o_tensor"],
+            do_tensor=do,
+            lse_tensor=lse,
+            is_causal=True,
+            scale_softmax=scale,
+        )
+
+    base = run(lse_c)  # plan cached with the packed LSE layout
+    strided = run(lse_strided)  # must NOT reuse the packed plan
+    for key in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        assert torch.equal(strided[key], base[key]), key
+
+    # Device guard: a host-side LSE must be rejected loudly, never bound as a
+    # kernel pointer (the plan's cached adapter would otherwise launch on it).
+    with pytest.raises(ValueError, match="device"):
+        run(lse_c.cpu())
+
+    # And at PLAN time: a CPU Stats DECLARATION must fail check_support —
+    # otherwise the execute-time guard (which validates against
+    # stats_desc.device) would anchor to the host device and pass.
+    from cudnn.sdpa.bwd import api_dsl as _api
+
+    dq = torch.empty_like(q)
+    eng = _api.SdpaBwdDslSm80(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=fwd["o_tensor"],
+        sample_do=do,
+        sample_stats=lse_c.cpu(),
+        sample_dq=dq,
+        sample_dk=dq,
+        sample_dv=dq,
+        is_causal=True,
+        scale_softmax=scale,
+    )
+    with pytest.raises(ValueError, match="device"):
+        eng.check_support()
