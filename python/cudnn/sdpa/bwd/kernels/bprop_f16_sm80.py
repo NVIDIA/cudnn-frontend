@@ -52,9 +52,8 @@ Forces SCHED_DEFAULT (LPT remaps ``kv_tile`` and would break the order); zero
 extra GMEM beyond the small counter; perf-insensitive (gated knob).  dK/dV are
 already deterministic (each CTA owns distinct K rows → no cross-tile atomic).
 All semaphore code folds out under ``const_expr(deterministic)`` → the default
-(non-deterministic) path is byte-identical.  With a sliding window the q-loop
-is also bounded from above, so a q-tile's visitors start at the window floor;
-the relay then counts turns from that first visitor (``relay_turn``).
+(non-deterministic) path is byte-identical.  Under a sliding window the relay
+counts turns from a q-tile's first visiting kv-tile (``relay_turn``).
 
 Why two sub-groups: register capacity.  dV_acc + dK_acc + frags at d=128 bust
 the 255-reg/thread Ampere cap in a single group; splitting halves the live
@@ -407,20 +406,11 @@ def _bprop_kernel(
     else:
         q_lo_tile = cutlass.Int32(0)
     n_iters = cutlass.Int32(arith.maxsi((n_q_tiles_eff - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
-    # ---- SWA compute-skip (UPPER bound).  With a left window W the mask keeps
-    #      kv >= anchor(q) - W (anchor = q, or q + causal_diag under bottom-right,
-    #      see _mask_p), so this kv-tile is attended by NO q with anchor(q) >
-    #      kv_base + tile_kv - 1 + W, i.e. q >= kv_base + tile_kv + W - diag.
-    #      Cap the q-loop there — the mirror of the forward's kv_left trim.
-    #      Without it every kv-tile sweeps the q-tiles to the end of the sequence
-    #      and masks them: O(S^2) work for an O(S*W) problem (gpt_oss W=128 on
-    #      A100: 5x slower than the backend at 2k, 75x at 32k).  Fully-masked
-    #      tiles (q_hi <= q_lo) run 0 iters and the epilogue stores dK = dV = 0.
-    #      Deterministic relay: a high-end cut means a q-tile's kv-tile visitors
-    #      no longer start at 0 (a lower tile may skip a q-tile this one runs),
-    #      so the relay counts turns from the FIRST visitor of the q-tile —
-    #      see relay_turn at the dQ atomicAdd (mirrors bprop_f16_sm120.py's
-    #      `relay_turn`, which inverts the same clamp).
+    # ---- SWA compute-skip (upper bound): the window keeps kv >= anchor(q) - W
+    #      (anchor = q, or q + causal_diag under bottom-right; see _mask_p), so
+    #      no q >= kv_base + tile_kv + W - diag attends this kv-tile.  Cap the
+    #      q-loop there (the forward trims kv_left the same way).  Fully-masked
+    #      tiles run 0 iters and the epilogue stores dK = dV = 0.
     if cutlass.const_expr(mask_flags & MASK_SWA):
         _q_hi_abs = kv_base + cutlass.Int32(tile_kv + swa_window)
         if cutlass.const_expr(causal_bottom_right):
@@ -941,26 +931,18 @@ def _bprop_kernel(
             mma_step(dq_acc, adst, bk, k_step=0, M=16 * DQ_M_BLOCKS, N=DQ_N, ab_dtype=io_dtype)
 
         # ---- dQ atomicAdd ---------------------------------------------------
-        # Deterministic relay (acquire): wait until every lower kv-tile has added
-        # its contribution to THIS (seq,head,q_tile) slot, so the fp32 atomicAdds
-        # land in fixed kv order → bitwise-reproducible dQ.  q-skip-safe: q_lo_tile
-        # is monotonic in kv_tile, so every kv' < kv_tile that reaches this q-tile
-        # relays before us → the wait target is exactly kv_tile.  Folds out (byte-
-        # identical fast path) when deterministic=False.
+        # Deterministic relay (acquire): the fp32 dQ atomicAdds of a (seq, head,
+        # q_tile) land in ascending kv_tile order, gated by a per-slot counter.
+        # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
+        # set is contiguous in kv_tile: the causal q_lo skip removes only higher
+        # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
+        # kv_first = max((q_row0 + diag - W) // tile_kv, 0) (the inverse of the
+        # q_hi cap; 0 without a window) and turn = kv_tile - kv_first.  Every
+        # visitor computes the same kv_first, so acquire (== turn) and release
+        # (turn + 1) agree.  Folds out when deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
-            # Relay turn of this kv-tile for this q-tile.  Without a window
-            # every kv-tile 0..kv_tile-1 visits the q-tile (the causal q_lo
-            # skip only removes HIGHER kv-tiles), so the turn is kv_tile.  With
-            # a left window the SWA q-loop upper bound (above) means the
-            # q-tile's visitors start at the window floor of its FIRST row:
-            # kv_first = max((q_row0 + diag - W) // tile_kv, 0) — the inverse
-            # of the q_hi clamp — so count turns from there (SM120 precedent:
-            # bprop_f16_sm120.py `relay_turn`).  The counter is per (seq, head,
-            # q_tile) and every visitor computes the same kv_first, so the
-            # ordering (ascending kv_tile) and the release (turn + 1) stay
-            # consistent.  Folds to kv_tile when MASK_SWA is off.
             if cutlass.const_expr(mask_flags & MASK_SWA):
                 _q_row0 = q_iter * cutlass.Int32(tile_q)
                 if cutlass.const_expr(causal_bottom_right):
