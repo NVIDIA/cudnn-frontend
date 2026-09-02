@@ -91,6 +91,24 @@ output = op(
 For inference CUDA Graph capture, call `op.warmup(...)` with the exact
 bindings before capture. `MoeEp` supports `close()` and context-manager use.
 
+Explicit sweep autotuning is available before capture:
+
+```python
+from cudnn import MoeEpTuningConfig
+
+result = op.autotune(
+    activation, fc1_weight, fc2_weight, topk_idx, topk_weights,
+    candidates=[
+        MoeEpTuningConfig(token_in_flag_batch=2),
+        MoeEpTuningConfig(group_hint=256),
+    ],
+)
+```
+
+The current tuning is always included as the baseline. Candidates are
+de-duplicated and limited to 32 including that baseline. The winner is applied
+only to this operator instance.
+
 Stateless training prepares only private execution lanes. Every invocation
 receives independent native weights and caller-owned outputs:
 

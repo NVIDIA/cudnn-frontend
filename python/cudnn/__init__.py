@@ -108,7 +108,9 @@ def set_stream(handle, stream):
     per stream regardless.)
     """
     if not isinstance(handle, Handle):
-        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+        raise TypeError(
+            f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
+        )
     if handle.stream == stream:
         return
     if handle.backend_handle is not None:
@@ -120,7 +122,9 @@ def get_stream(handle):
     """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
     backend round-trip."""
     if not isinstance(handle, Handle):
-        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+        raise TypeError(
+            f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
+        )
     return handle.stream
 
 
@@ -129,7 +133,9 @@ def destroy_handle(handle):
     after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
     C++ (a double-destroy or a later set_stream)."""
     if not isinstance(handle, Handle):
-        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+        raise TypeError(
+            f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}"
+        )
     backend = handle.backend_handle
     if backend is None:
         handle.stream = None
@@ -202,10 +208,14 @@ _pybind_module.backend_graph.tensor = _tensor
 
 def load_cudnn():
     # First look at python site packages
-    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll"))
+    lib_path = glob.glob(
+        os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/bin/cudnn64_9.dll")
+    )
 
     if lib_path:
-        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
+        assert (
+            len(lib_path) == 1
+        ), f"Found {len(lib_path)} libcudnn.dll.x in nvidia-cudnn-cuXX."
         lib = ctypes.windll.LoadLibrary(lib_path[0])
     else:  # Fallback
         lib = ctypes.windll.LoadLibrary("cudnn64_9.dll")
@@ -230,13 +240,23 @@ def _dlopen_cudnn():
             return
 
     # Then look at python site packages
-    lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
+    lib_path = glob.glob(
+        os.path.join(
+            sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"
+        )
+    )
 
     if not lib_path:
-        lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"))
+        lib_path = glob.glob(
+            os.path.join(
+                sysconfig.get_path("purelib"), "nvidia/cudnn_jit/lib/libcudnn.so.*[0-9]"
+            )
+        )
 
     if lib_path:
-        assert len(lib_path) == 1, f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
+        assert (
+            len(lib_path) == 1
+        ), f"Found {len(lib_path)} libcudnn.so.x in nvidia-cudnn-cuXX."
         lib = ctypes.CDLL(lib_path[0])
     else:  # Fallback
         try:
@@ -306,11 +326,16 @@ _EAGER_PUBLIC_NAMES = (
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _CUTEDSL_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
-_MOE_EP_INSTALL_HINT = "Install with 'pip install " '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
+_MOE_EP_INSTALL_HINT = (
+    "Install with 'pip install "
+    '"nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext\''
+)
 _MOE_EP_OPTIONAL_IMPORTS = {
     "moe_ep",
     "BlockScaledTensor",
     "MoeEp",
+    "MoeEpAutotuneCandidateResult",
+    "MoeEpAutotuneResult",
     "MoeEpBackwardWeightStaging",
     "MoeEpBackwardWeights",
     "MoeEpExecutionLane",
@@ -335,6 +360,11 @@ _LAZY_OPTIONAL_IMPORTS = {
     "moe_ep": (".moe_ep", None),
     "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
     "MoeEp": (".moe_ep", "MoeEp"),
+    "MoeEpAutotuneCandidateResult": (
+        ".moe_ep",
+        "MoeEpAutotuneCandidateResult",
+    ),
+    "MoeEpAutotuneResult": (".moe_ep", "MoeEpAutotuneResult"),
     "MoeEpBackwardWeightStaging": (".moe_ep", "MoeEpBackwardWeightStaging"),
     "MoeEpBackwardWeights": (".moe_ep", "MoeEpBackwardWeights"),
     "MoeEpExecutionLane": (".moe_ep", "MoeEpExecutionLane"),
@@ -356,9 +386,18 @@ _LAZY_OPTIONAL_IMPORTS = {
     "pack_backward_weights": (".moe_ep", "pack_backward_weights"),
     "pack_forward_weights": (".moe_ep", "pack_forward_weights"),
     "BSA": (".block_sparse_attention", "BSA"),
-    "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
-    "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
-    "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_forward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_forward",
+    ),
+    "block_sparse_attention_fp8_forward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_fp8_forward",
+    ),
+    "block_sparse_attention_backward": (
+        ".block_sparse_attention",
+        "block_sparse_attention_backward",
+    ),
     "DSA": (".deepseek_sparse_attention", "DSA"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
@@ -367,66 +406,159 @@ _LAZY_OPTIONAL_IMPORTS = {
     "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.swiglu",
+        "gemm_swiglu_wrapper_sm100",
+    ),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
     "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
-    "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
+    "gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.srelu",
+        "gemm_srelu_wrapper_sm100",
+    ),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
-    "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "gemm_dsrelu_wrapper_sm100": (
+        ".gemm.cutedsl.dense.dsrelu",
+        "gemm_dsrelu_wrapper_sm100",
+    ),
     "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
     "gemm_amax_jax_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_jax_sm100"),
-    "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
-    "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
-    "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
-    "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
+    "GemmProjRopeMxfp8Bf16InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Bf16InSm100",
+    ),
+    "GemmProjRopeMxfp8Mxfp8InSm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "GemmProjRopeMxfp8Mxfp8InSm100",
+    ),
+    "gemm_proj_rope_mxfp8_wrapper_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_wrapper_sm100",
+    ),
+    "gemm_proj_rope_mxfp8_jax_sm100": (
+        ".gemm.cutedsl.dense.proj_rope_mxfp8",
+        "gemm_proj_rope_mxfp8_jax_sm100",
+    ),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
-    "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
+    "rmsnorm_rht_amax_wrapper_sm100": (
+        ".rmsnorm_rht_amax",
+        "rmsnorm_rht_amax_wrapper_sm100",
+    ),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
-    "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "grouped_gemm_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wrapper_sm100",
+    ),
     "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
-    "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
-    "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
-    "grouped_gemm_dsrelu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_jax_sm100"),
-    "grouped_gemm_wgrad_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_jax_sm100"),
-    "discrete_grouped_gemm_swiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_jax_sm100"),
-    "discrete_grouped_gemm_dswiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_jax_sm100"),
+    "grouped_gemm_glu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_jax_sm100",
+    ),
+    "grouped_gemm_dglu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_jax_sm100",
+    ),
+    "grouped_gemm_dsrelu_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dsrelu_jax_sm100",
+    ),
+    "grouped_gemm_wgrad_jax_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_jax_sm100",
+    ),
+    "discrete_grouped_gemm_swiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_jax_sm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_jax_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_jax_sm100",
+    ),
     "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
-    "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_swiglu_wrapper_sm100",
+    ),
     "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
-    "grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dswiglu_wrapper_sm100",
+    ),
     "GroupedGemmSreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSreluSm100"),
-    "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_srelu_wrapper_sm100",
+    ),
     "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
-    "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "grouped_gemm_dsrelu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dsrelu_wrapper_sm100",
+    ),
     "HSTUFwdSm100": (".hstu_attention", "HSTUFwdSm100"),
     "HSTUBwdSm100": (".hstu_attention", "HSTUBwdSm100"),
     "hstu_attention_forward": (".hstu_attention", "hstu_attention_forward"),
     "hstu_attention_backward": (".hstu_attention", "hstu_attention_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
-    "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
+    "grouped_gemm_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_wrapper_sm100",
+    ),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
-    "grouped_gemm_glu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_wrapper_sm100"),
-    "GroupedGemmGluHadamardSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardSm100"),
-    "grouped_gemm_glu_hadamard_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_wrapper_sm100"),
-    "GroupedGemmGluHadamardQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardQuantSm100"),
-    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_quant_wrapper_sm100"),
+    "grouped_gemm_glu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardSm100",
+    ),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_wrapper_sm100",
+    ),
+    "GroupedGemmGluHadamardQuantSm100": (
+        ".gemm.cutedsl.grouped",
+        "GroupedGemmGluHadamardQuantSm100",
+    ),
+    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_quant_wrapper_sm100",
+    ),
     "GroupedGemmDgluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDgluSm100"),
-    "grouped_gemm_dglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_wrapper_sm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_dglu_wrapper_sm100",
+    ),
     "GroupedGemmWgradSm100": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm100"),
     "get_grouped_gemm_wgrad_workspace_size_sm100": (
         ".gemm.cutedsl.grouped",
         "get_grouped_gemm_wgrad_workspace_size_sm100",
     ),
-    "grouped_gemm_wgrad_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_wrapper_sm100"),
+    "grouped_gemm_wgrad_wrapper_sm100": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_wgrad_wrapper_sm100",
+    ),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
-    "DiscreteGroupedGemmSwigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmSwigluSm100"),
-    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
-    "DiscreteGroupedGemmDswigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmDswigluSm100"),
-    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmSwigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmSwigluSm100",
+    ),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_swiglu_wrapper_sm100",
+    ),
+    "DiscreteGroupedGemmDswigluSm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "DiscreteGroupedGemmDswigluSm100",
+    ),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (
+        ".gemm.cutedsl.discrete_grouped",
+        "discrete_grouped_gemm_dswiglu_wrapper_sm100",
+    ),
 }
 
 
@@ -436,8 +568,14 @@ def _load_optional_symbol(name: str) -> Any:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
     except Exception as e:
-        install_hint = _MOE_EP_INSTALL_HINT if name in _MOE_EP_OPTIONAL_IMPORTS else _CUTEDSL_INSTALL_HINT
-        raise ImportError(f"{name} requires optional dependencies. {install_hint}: {e}") from e
+        install_hint = (
+            _MOE_EP_INSTALL_HINT
+            if name in _MOE_EP_OPTIONAL_IMPORTS
+            else _CUTEDSL_INSTALL_HINT
+        )
+        raise ImportError(
+            f"{name} requires optional dependencies. {install_hint}: {e}"
+        ) from e
 
     globals()[name] = value
     return value

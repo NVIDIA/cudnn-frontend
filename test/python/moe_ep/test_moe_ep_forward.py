@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from moe_ep.moe_ep_distributed_workers import (
+    _distributed_autotune_worker,
     _distributed_output_worker,
     _distributed_subgroup_output_worker,
 )
@@ -120,7 +121,9 @@ def test_moe_ep_tuning_public_contract_mapping_and_cache_key():
     )
 
     with MoeEp(**_forward_config()) as default_op:
-        default_config = Mxfp8KernelConfig.from_forward_config(default_op._forward_config)
+        default_config = Mxfp8KernelConfig.from_forward_config(
+            default_op._forward_config
+        )
     key_args = (
         torch.device("cuda", 0),
         (10, 7),
@@ -147,7 +150,11 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
         )
 
     assert default_config.enable_col_quant is False
-    assert default_config.max_recv_size_per_rank == (default_forward.ep_size * default_forward.max_tokens_per_rank * default_forward.top_k)
+    assert default_config.max_recv_size_per_rank == (
+        default_forward.ep_size
+        * default_forward.max_tokens_per_rank
+        * default_forward.top_k
+    )
     assert enabled_config.enable_col_quant is True
     assert enabled_config.col_quant_num_ctas == 512
     with pytest.raises(ValueError, match="max_recv_size_per_rank"):
@@ -155,7 +162,9 @@ def test_internal_column_requant_config_is_disabled_by_default_and_cache_distinc
     with pytest.raises(ValueError, match="col_quant_num_ctas"):
         replace(default_config, col_quant_num_ctas=0)
     key_args = (torch.device("cuda", 0), (10, 7), 123, ())
-    assert default_config.compile_key(*key_args) != enabled_config.compile_key(*key_args)
+    assert default_config.compile_key(*key_args) != enabled_config.compile_key(
+        *key_args
+    )
 
 
 @pytest.mark.L0
@@ -459,8 +468,12 @@ def test_moe_ep_rejects_interleaved_plain_fc1_weight():
 
     config = _forward_config()
     activation = torch.zeros((1, config["hidden_size"]))
-    fc1_weight = torch.zeros((config["num_experts"], config["hidden_size"], 2 * config["intermediate_size"]))
-    fc2_weight = torch.zeros((config["num_experts"], config["intermediate_size"], config["hidden_size"]))
+    fc1_weight = torch.zeros(
+        (config["num_experts"], config["hidden_size"], 2 * config["intermediate_size"])
+    )
+    fc2_weight = torch.zeros(
+        (config["num_experts"], config["intermediate_size"], config["hidden_size"])
+    )
     topk_idx = torch.zeros((1, config["top_k"]), dtype=torch.int32)
     topk_weights = torch.ones((1, config["top_k"]))
     with MoeEp(**config, weight_interleave_size=32) as op:
@@ -737,7 +750,9 @@ def test_nondefault_moe_ep_tuning_matches_reference_and_reuses_plan():
 
         assert backend._compiled is compiled
         assert backend._plan._workspace is workspace
-        assert backend.kernel_config.tuning_signature(backend._prepared_kernel.launch_cluster_count) == ("standalone_warps", (4, 2), 4, 64, False)
+        assert backend.kernel_config.tuning_signature(
+            backend._prepared_kernel.launch_cluster_count
+        ) == ("standalone_warps", (4, 2), 4, 64, False)
 
     _assert_matches_reference(first, expected)
     _assert_matches_reference(second, expected)
@@ -940,6 +955,21 @@ def test_mxfp8_forward_multi_gpu_matches_reference(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
+def test_mxfp8_forward_ep2_autotune_is_rank_consistent(tmp_path):
+    world_size = 2
+    _require_distributed_sm107(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / "autotune_ep2.init"
+    mp.spawn(
+        _distributed_autotune_worker,
+        args=(world_size, str(init_file)),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
 def test_mxfp8_forward_noncontiguous_ep_subgroups(tmp_path):
     global_world_size = 4
     _require_distributed_sm107(global_world_size)
@@ -1024,7 +1054,11 @@ def test_activation_scale_rows_are_padded_to_16_bytes():
             kernel_local_workspace_bytes=128,
             kernel_shared_workspace_bytes=128,
         )
-    activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
+    activation_scale = next(
+        region
+        for region in requirements.symmetric_regions
+        if region.name == "activation_scale"
+    )
     assert activation_scale.nbytes == 5 * 16
 
 
@@ -1133,7 +1167,11 @@ def test_reference_interleaved_fc1_matches_logical_fc1():
 
     def interleave_last(tensor):
         shape = tensor.shape
-        return tensor.view(*shape[:-1], 2, intermediate // 32, 32).transpose(-3, -2).reshape(shape)
+        return (
+            tensor.view(*shape[:-1], 2, intermediate // 32, 32)
+            .transpose(-3, -2)
+            .reshape(shape)
+        )
 
     interleaved_fc1 = BlockScaledTensor(
         data=interleave_last(logical_fc1.data),
@@ -1289,7 +1327,9 @@ def test_ep32_peer_mapping_selects_version_compatible_payload():
     assert host.offsets == offsets
     assert int(host.max_ranks) == 32
     dsl_release = Version(Version(cutlass.__version__).base_version)
-    grid_constant_width_is_free = dsl_release < Version("4.0.0") or dsl_release >= Version("4.7.0")
+    grid_constant_width_is_free = dsl_release < Version(
+        "4.0.0"
+    ) or dsl_release >= Version("4.7.0")
     expected_type = "!llvm.ptr" if grid_constant_width_is_free else "vector<32xi64>"
     assert device_type_text == expected_type
 

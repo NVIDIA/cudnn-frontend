@@ -31,11 +31,67 @@ from moe_ep.moe_ep_test_support import (
 )
 
 __all__ = [
+    "_distributed_autotune_worker",
     "_distributed_output_worker",
     "_distributed_subgroup_output_worker",
     "_run_backward_reference_case",
     "_run_forward_output_case",
 ]
+
+
+def _distributed_autotune_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> None:
+    """Run an EP sweep and verify one rank-consistent applied winner."""
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        from cudnn import MoeEp, MoeEpTuningConfig
+
+        args = make_distributed_forward_inputs(rank, world_size, device)
+        config = _forward_config(
+            num_experts=2 * world_size,
+            ep_group=dist.group.WORLD,
+            max_tokens_per_rank=8,
+        )
+        expected = _reference_forward(args, **config)
+        candidate = MoeEpTuningConfig(token_in_flag_batch=2)
+        op = MoeEp(**config)
+        try:
+            result = op.autotune(
+                *args,
+                candidates=[candidate],
+                warmup_iters=1,
+                timed_iters=2,
+            )
+            actual = op(*args)
+            torch.cuda.synchronize(device)
+            winners = [None] * world_size
+            dist.all_gather_object(winners, result.winner)
+            assert all(winner == result.winner for winner in winners)
+            assert op.tuning == result.winner
+            _assert_matches_reference(actual, expected)
+            dist.barrier()
+            op.close()
+            op = None
+            dist.barrier()
+        finally:
+            if op is not None:
+                op.close()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _run_forward_output_case(
@@ -141,12 +197,17 @@ def _distributed_subgroup_output_worker(
     )
     try:
         subgroup_memberships = ((0, 2), (1, 3))
-        subgroups = [dist.new_group(list(members), backend="nccl") for members in subgroup_memberships]
+        subgroups = [
+            dist.new_group(list(members), backend="nccl")
+            for members in subgroup_memberships
+        ]
         subgroup_index = global_rank % 2
         ep_group = subgroups[subgroup_index]
         ep_rank = dist.get_rank(ep_group)
         ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
+        actual_global_ranks = tuple(
+            dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size)
+        )
 
         _run_forward_output_case(
             device=device,

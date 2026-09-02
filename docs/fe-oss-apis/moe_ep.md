@@ -46,6 +46,57 @@ op = MoeEp(
 Native training requires `weight_interleave_size=32`. FC1 payloads then use
 alternating 32-element gate/up strips.
 
+## Explicit sweep autotuning
+
+`MoeEp.autotune` measures inference forward. `MoeEp.autotune_training`
+measures one training forward immediately followed by its matching backward:
+
+```python
+result = op.autotune(
+    activation, fc1_weight, fc2_weight, topk_idx, topk_weights,
+    candidates=candidates,
+    warmup_iters=3,
+    timed_iters=10,
+)
+
+training_result = op.autotune_training(
+    activation, grad_output, topk_idx, topk_weights,
+    forward_weights=native_fw,
+    backward_weights=native_bw,
+    candidates=candidates,
+)
+```
+
+Both calls are collective over `ep_group`, must use the same ordered candidate
+list on every rank, and must run outside CUDA Graph capture.
+`autotune_training` must run before `prepare_training`. It accepts only native
+weights; source packing and allocation are intentionally outside its measured
+region.
+
+The current `MoeEpTuningConfig` is prepended as a baseline, duplicate values are
+removed, and the normalized list is limited to 32 candidates. Autotuning keeps
+`reduce_topk_in_kernel` fixed because that flag changes where top-k reduction
+is performed. Each timed iteration is reduced with rank MAX and the candidate
+score is the median of those slow-rank samples. Equal scores select the earlier
+candidate. `MoeEpAutotuneResult` reports `winner`, per-candidate `latency_ms`
+and `samples_ms`, and `evaluated_candidates`.
+
+The sweep is fail-fast. Any validation, allocation, compile, launch, timing,
+synchronization, or teardown error ends the whole sweep. An error after
+runtime/collective entry poisons the operator, and later execution is rejected;
+close it and create a new instance. Compiled candidate kernels remain in the
+process JIT cache. The production sweep does not compare candidate outputs at
+runtime; supported candidates are covered by the separate correctness suite.
+
+Autotuning commits one active winner per instance. A later inference or
+training sweep replaces it. Existing CUDA Graph executables are invalid after
+the winner changes. Use these sequences:
+
+- inference: `autotune` → eager winner launch (performed by `autotune`) →
+  capture;
+- training: `autotune_training` → `prepare_training` → allocate outputs →
+  eager forward/backward → rank synchronization → capture.
+
 ## Stateless training preparation
 
 Preparation is collective over `ep_group` and must run outside CUDA Graph

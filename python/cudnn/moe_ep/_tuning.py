@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+AutotuneMode = Literal["inference", "training"]
+
 TokenBackMode = Literal[
     "epi_warps",
     "standalone_warps",
@@ -56,18 +58,75 @@ class MoeEpTuningConfig:
     reduce_topk_in_kernel: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.token_back_mode, str) or self.token_back_mode not in _TOKEN_BACK_MODES:
-            raise ValueError("token_back_mode must be one of " f"{tuple(sorted(_TOKEN_BACK_MODES))}, got " f"{self.token_back_mode!r}")
-        if not isinstance(self.epi_flag_batch, tuple) or self.epi_flag_batch not in _EPI_FLAG_BATCHES:
-            raise ValueError("epi_flag_batch must be one of " f"{tuple(sorted(_EPI_FLAG_BATCHES))}, got " f"{self.epi_flag_batch!r}")
-        if isinstance(self.token_in_flag_batch, bool) or self.token_in_flag_batch not in _TOKEN_IN_FLAG_BATCHES:
-            raise ValueError("token_in_flag_batch must be one of " f"{tuple(sorted(_TOKEN_IN_FLAG_BATCHES))}, got " f"{self.token_in_flag_batch!r}")
-        if self.group_hint is not None and (isinstance(self.group_hint, bool) or self.group_hint not in _GROUP_HINTS):
-            raise ValueError("group_hint must be None or one of " f"{tuple(sorted(_GROUP_HINTS))}, got {self.group_hint!r}")
+        if (
+            not isinstance(self.token_back_mode, str)
+            or self.token_back_mode not in _TOKEN_BACK_MODES
+        ):
+            raise ValueError(
+                "token_back_mode must be one of "
+                f"{tuple(sorted(_TOKEN_BACK_MODES))}, got "
+                f"{self.token_back_mode!r}"
+            )
+        if (
+            not isinstance(self.epi_flag_batch, tuple)
+            or self.epi_flag_batch not in _EPI_FLAG_BATCHES
+        ):
+            raise ValueError(
+                "epi_flag_batch must be one of "
+                f"{tuple(sorted(_EPI_FLAG_BATCHES))}, got "
+                f"{self.epi_flag_batch!r}"
+            )
+        if (
+            isinstance(self.token_in_flag_batch, bool)
+            or self.token_in_flag_batch not in _TOKEN_IN_FLAG_BATCHES
+        ):
+            raise ValueError(
+                "token_in_flag_batch must be one of "
+                f"{tuple(sorted(_TOKEN_IN_FLAG_BATCHES))}, got "
+                f"{self.token_in_flag_batch!r}"
+            )
+        if self.group_hint is not None and (
+            isinstance(self.group_hint, bool) or self.group_hint not in _GROUP_HINTS
+        ):
+            raise ValueError(
+                "group_hint must be None or one of "
+                f"{tuple(sorted(_GROUP_HINTS))}, got {self.group_hint!r}"
+            )
         if not isinstance(self.reduce_topk_in_kernel, bool):
-            raise ValueError("reduce_topk_in_kernel must be a bool, got " f"{self.reduce_topk_in_kernel!r}")
+            raise ValueError(
+                "reduce_topk_in_kernel must be a bool, got "
+                f"{self.reduce_topk_in_kernel!r}"
+            )
         if self.reduce_topk_in_kernel and self.token_back_mode != "epi_warps":
-            raise ValueError("reduce_topk_in_kernel requires " "token_back_mode='epi_warps'")
+            raise ValueError(
+                "reduce_topk_in_kernel requires " "token_back_mode='epi_warps'"
+            )
 
 
-__all__ = ["MoeEpTuningConfig"]
+@dataclass(frozen=True)
+class MoeEpAutotuneCandidateResult:
+    """Measured slow-rank latency for one successfully evaluated candidate."""
+
+    tuning: MoeEpTuningConfig
+    latency_ms: float
+    samples_ms: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class MoeEpAutotuneResult:
+    """Winner and measurements produced by one explicit tuning sweep."""
+
+    mode: AutotuneMode
+    winner: MoeEpTuningConfig
+    candidates: tuple[MoeEpAutotuneCandidateResult, ...]
+
+    @property
+    def evaluated_candidates(self) -> int:
+        return len(self.candidates)
+
+
+__all__ = [
+    "MoeEpAutotuneCandidateResult",
+    "MoeEpAutotuneResult",
+    "MoeEpTuningConfig",
+]
