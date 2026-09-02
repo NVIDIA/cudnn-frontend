@@ -388,11 +388,11 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                         sink_log2 = mAttnSink[head_idx] * LOG2_E
                         lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
                         # Infinite max is already the logaddexp; shifting it is inf-inf.
-                        if cute.math.isfinite(lse_max_log2):
+                        if lse_max_log2 == Float32.inf or lse_max_log2 == -Float32.inf:
+                            lse_log2 = lse_max_log2
+                        else:
                             sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
                             lse_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        else:
-                            lse_log2 = lse_max_log2
                     gLSElog2[tidx] = lse_log2
 
 
