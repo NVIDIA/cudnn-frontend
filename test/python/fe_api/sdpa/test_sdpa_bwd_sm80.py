@@ -559,6 +559,15 @@ def test_sm80_bwd_wrapper_lse_stride_in_cache_key():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_swa_long_seq_smoke():
+    """One long-sequence sliding-window case at L0 (the q-loop bound is a kernel
+    change, so a single S >> W check runs by default); the three window
+    geometries sweep at L1."""
+    test_sm80_bwd_swa_long_seq(True, False, 2048, 2048)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize(
     "is_causal,bottom_right,s_q,s_kv",
     [(True, False, 2048, 2048), (False, False, 2048, 2048), (True, True, 1536, 2048)],
@@ -620,6 +629,14 @@ def test_sm80_bwd_thd_swa():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_swa_deterministic_smoke():
+    """Top-left deterministic + window at L0 (the relay's first-visitor turn is
+    the hang-risk path, so one case runs by default); bottom-right at L1."""
+    test_sm80_bwd_swa_deterministic(False, 2048, 2048)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize("bottom_right,s_q,s_kv", [(False, 2048, 2048), (True, 1536, 2048)], ids=["tl", "br"])
 @torch_fork_set_rng(seed=0)
 def test_sm80_bwd_swa_deterministic(bottom_right, s_q, s_kv):
@@ -662,6 +679,6 @@ def test_sm80_bwd_swa_deterministic(bottom_right, s_q, s_kv):
     for key in ("dq_tensor", "dk_tensor", "dv_tensor"):
         assert torch.equal(a[key], bb[key]), key
     nd = run(False)
-    _, dq_ref, dk_ref, dv_ref = _ref_grads(q, k, v, do, is_causal=True, window_left=w, scale=scale, causal_bottom_right=bottom_right)
+    _, dq_ref, _, _ = _ref_grads(q, k, v, do, is_causal=True, window_left=w, scale=scale, causal_bottom_right=bottom_right)
     torch.testing.assert_close(a["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(a["dq_tensor"].to(torch.float32), nd["dq_tensor"].to(torch.float32), rtol=2e-2, atol=2e-2)
