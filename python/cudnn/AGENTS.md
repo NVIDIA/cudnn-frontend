@@ -231,6 +231,7 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 - Use the decorated function's actual name, keep the default
   ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
   instead.
+- Verify with ``pytest -q test/python/test_frost_kernel_name_prefix.py``.
 
 
 ## Frontend-only kernel package layout
