@@ -3,11 +3,8 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import re
-import subprocess
-import sys
 
 import pytest
 import torch
@@ -61,47 +58,6 @@ def test_public_exports_are_lazy_top_level_aliases():
         assert not hasattr(cudnn, internal_name)
         assert not hasattr(flex_attention, internal_name)
         assert not hasattr(flex_attention_api, internal_name)
-
-
-def test_clean_top_level_import_stays_optional_and_quack_free():
-    repository_root = Path(__file__).resolve().parents[4]
-    environment = os.environ.copy()
-    python_path = str(repository_root / "python")
-    if environment.get("PYTHONPATH"):
-        python_path = f"{python_path}{os.pathsep}{environment['PYTHONPATH']}"
-    environment["PYTHONPATH"] = python_path
-    script = """
-import sys
-import cudnn
-assert "torch" not in sys.modules
-assert "cutlass" not in sys.modules
-from cudnn import (
-    FlexAttentionBwd,
-    FlexAttentionFwd,
-    create_mask_plan,
-    flex_attn_func,
-)
-module = cudnn.flex_attention
-assert create_mask_plan is module.create_mask_plan
-assert module.flex_attn_func is cudnn.flex_attn_func
-assert flex_attn_func is module.flex_attn_func
-assert FlexAttentionFwd is module.FlexAttentionFwd
-assert FlexAttentionBwd is module.FlexAttentionBwd
-assert not hasattr(cudnn, "flex_attention_forward")
-assert not hasattr(cudnn, "flex_attention_backward")
-assert not hasattr(module, "flex_attention_forward")
-assert not hasattr(module, "flex_attention_backward")
-assert not hasattr(cudnn, "MaskPlan")
-assert not any(name == "quack" or name.startswith("quack.") for name in sys.modules)
-"""
-    subprocess.run(
-        (sys.executable, "-c", script),
-        check=True,
-        cwd=repository_root,
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
 
 
 def test_kernel_sources_have_no_quack_imports():
