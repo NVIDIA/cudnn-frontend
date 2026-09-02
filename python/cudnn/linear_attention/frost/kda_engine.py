@@ -59,38 +59,37 @@ class KdaFrostEngine(BaseEngine):
         if not facts.gates_at_ho:
             raise NotImplementedError(f"KdaFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
         fp32 = cudnn.data_type.FLOAT
-        beta_want = facts.io_dtype if facts.use_beta_sigmoid else fp32
-        if beta_want is not None and facts.beta_dtype not in (beta_want, None):
-            raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {beta_want} (io-dtype logits under use_beta_sigmoid), got {facts.beta_dtype}")
+        beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (fp32, facts.io_dtype)
+        if facts.beta_dtype not in beta_wants + (None,):
+            raise NotImplementedError(f"KdaFrostEngine: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
+        state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
+        for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
+            if got not in state_dtypes + (None,):
+                raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
+        if not facts.state_pair_match:
+            raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
             if got not in (fp32, None):
                 raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32, got {got}")
         if facts.is_bwd:
-            for port, got in (
-                ("d_a_log", facts.d_a_log_dtype),
-                ("d_dt_bias", facts.d_dt_bias_dtype),
-                ("initial_state", facts.state_dtype),
-                ("d_final_state", facts.d_final_state_dtype),
-                ("d_initial_state", facts.d_initial_state_dtype),
-                ("dG", facts.dg_dtype),
-            ):
+            for port, got in (("d_a_log", facts.d_a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype)):
                 if got not in (fp32, None):
                     raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32, got {got}")
+            state_grad_want = facts.state_dtype if facts.state_dtype is not None else fp32
+            for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
+                if got not in (state_grad_want, None):
+                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the state dtype ({state_grad_want}), got {got}")
+            if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
+                raise NotImplementedError(f"KdaFrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
+            if facts.dg_dtype not in (facts.g_dtype, None):
+                raise NotImplementedError(f"KdaFrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
             for port, got in (("dO", facts.do_dtype), ("state_checkpoints", facts.state_checkpoints_dtype)):
                 if got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"KdaFrostEngine: '{port}' must match the io dtype")
-            dbeta_want = facts.io_dtype if facts.use_beta_sigmoid and facts.io_dtype is not None else fp32
-            if facts.dbeta_dtype not in (dbeta_want, None):
-                raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must be {dbeta_want}, got {facts.dbeta_dtype}")
-        else:
-            state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
-            for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-                if got not in state_dtypes + (None,):
-                    raise NotImplementedError(f"KdaFrostEngine: '{port}' must be fp32/bf16, got {got}")
-            if facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-                raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
-            if not facts.state_pair_match:
-                raise NotImplementedError("KdaFrostEngine: initial_state and final_state dtypes must match")
+            if facts.dbeta_dtype not in (facts.beta_dtype, None):
+                raise NotImplementedError(f"KdaFrostEngine: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError("KdaFrostEngine: 'state_checkpoints' must match the io dtype")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         # Bake the plan for the handle's device (via ctx), not the ambient one; a
@@ -338,10 +337,8 @@ class CompiledKdaBwd:
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(16)
         self.num_sm = multiprocessor_count(current_device())
-        # dynamic always: static costs 2.5-10.5% at multi-wave tile counts and never wins (lyris job 2752338)
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # cuts never in batch-invariant mode
         self.split = not self.batch_invariant
         self.n_tiles = B * HO
         if self.split:

@@ -31,6 +31,14 @@ from .mxfp8_quant import (
     quantize_to_mxfp8,
 )  # noqa: F401  (re-exported; mxfp8_ref imports it from here)
 
+# NOTE: this harness is dense-full only. The sdpa_mxfp8 python API exposes no
+# seq_len/padding arguments (and the MXFP8 engines defer THD/varlen), so
+# cfg.is_padding / cfg.seq_len_q / cfg.seq_len_kv are intentionally ignored
+# here. When padding/THD support lands in the API, wire it through the shared
+# packed_token_capacity / convert_uniform_to_packed helpers so the ragged
+# capacity tails come NaN-poisoned (see GitHub issue #624 for why that
+# poisoning is load-bearing).
+
 # fmt: off
 
 def ceil_div(a: int, b: int) -> int:

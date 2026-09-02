@@ -15,11 +15,14 @@ import functools
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import data_ptr
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, ffma2, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v4
+
+USE_PDL = True
 
 THREADS_PER_ROW = 16
 ROWS_PER_CTA = 8
@@ -43,12 +46,12 @@ def frost_l2norm_qk(
     """Grid over all q rows then all k rows, FWD_LANES lanes x 32 elements
     per row (4 x 128-bit loads per lane), FWD_ROWS_PER_GROUP consecutive rows
     batched per lane group.  All rows' loads issue before the reductions and
-    the 4-lane butterfly is 2 steps, so memory latency pipelines (the
-    16-lane single-row shape measured 75.7% of DRAM peak on GB200, this one
-    88.3%; FLA's autotuned Triton tile is 91%).  fp32 sums of squares,
-    rsqrt with the shared epsilon floor, normalized rows to the compact io
-    workspace, fp32 inverse norms to their slots.  Tail rows clamp their
-    loads and skip stores."""
+    the 4-lane butterfly is 2 steps, so memory latency pipelines.  fp32
+    sums of squares, rsqrt with the shared epsilon floor, normalized rows
+    to the compact io workspace, fp32 inverse norms to their slots.  Tail
+    rows clamp their loads and skip stores."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     bid = cute.arch.block_idx()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     grp = tidx // cutlass.Int32(FWD_LANES)
@@ -85,11 +88,7 @@ def frost_l2norm_qk(
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         chunks = []
         for c in cutlass.range_constexpr(4):
-            w0, w1, w2, w3 = inline_ptx(
-                "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-                write_only_types=[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32],
-                read_only_args=[src_addr + cutlass.Int64(16 * c)],
-            )
+            w0, w1, w2, w3 = ld_global_v4(src_addr + cutlass.Int64(16 * c), cutlass.Int32)
             f0, f1 = f16x2_to_f32(w0, dtype=mQ.element_type)
             f2, f3 = f16x2_to_f32(w1, dtype=mQ.element_type)
             f4, f5 = f16x2_to_f32(w2, dtype=mQ.element_type)
@@ -116,12 +115,11 @@ def frost_l2norm_qk(
                 w1 = fp32_to_fp16(s2, s3, dtype=mQ.element_type)
                 w2 = fp32_to_fp16(s4, s5, dtype=mQ.element_type)
                 w3 = fp32_to_fp16(s6, s7, dtype=mQ.element_type)
-                inline_ptx(
-                    "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-                    read_only_args=[workspace_addrs[r] + cutlass.Int64(16 * c), w0, w1, w2, w3],
-                )
+                st_global_v4(workspace_addrs[r] + cutlass.Int64(16 * c), (w0, w1, w2, w3), cutlass.Int32)
             if lane_idx == cutlass.Int32(0):
-                inline_ptx("st.global.f32 [$0], $1;", read_only_args=[nrm_addrs[r], inv])
+                st_global(nrm_addrs[r], inv, cutlass.Float32)
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.kernel
@@ -140,9 +138,9 @@ def frost_l2norm_qk_bwd(
     """In-place normalize-Jacobian projection of dq/dk: per row, fp32 dot of
     the incoming gradient with the saved normalized row (butterfly reduce),
     then ``inv_norm * (grad - dot * row_n)`` back to the caller's buffer.
-    Single row per lane group: the dot+projection already fills the memory
-    latency (92.9% SOL measured; the forward's row batching REGRESSED this
-    kernel to 86% on GB200, lyris job 2694953)."""
+    Single row per lane group."""
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     bid = cute.arch.block_idx()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     row = cutlass.Int32(bid[0]) * cutlass.Int32(ROWS_PER_CTA) + tidx // cutlass.Int32(THREADS_PER_ROW)
@@ -167,20 +165,12 @@ def frost_l2norm_qk_bwd(
             grad_addr = mDk.iterator.toint() + grad_elements * cutlass.Int64(2)
             workspace_addr = mKn.iterator.toint() + (cutlass.Int64(k_row) * cutlass.Int64(128) + cutlass.Int64(v0)) * cutlass.Int64(2)
             nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
-        gw0, gw1, gw2, gw3 = inline_ptx(
-            "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-            write_only_types=[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32],
-            read_only_args=[grad_addr],
-        )
+        gw0, gw1, gw2, gw3 = ld_global_v4(grad_addr, cutlass.Int32)
         d0, d1 = f16x2_to_f32(gw0, dtype=mDq.element_type)
         d2, d3 = f16x2_to_f32(gw1, dtype=mDq.element_type)
         d4, d5 = f16x2_to_f32(gw2, dtype=mDq.element_type)
         d6, d7 = f16x2_to_f32(gw3, dtype=mDq.element_type)
-        nw0, nw1, nw2, nw3 = inline_ptx(
-            "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-            write_only_types=[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32],
-            read_only_args=[workspace_addr],
-        )
+        nw0, nw1, nw2, nw3 = ld_global_v4(workspace_addr, cutlass.Int32)
         n0, n1 = f16x2_to_f32(nw0, dtype=mQn.element_type)
         n2, n3 = f16x2_to_f32(nw1, dtype=mQn.element_type)
         n4, n5 = f16x2_to_f32(nw2, dtype=mQn.element_type)
@@ -190,11 +180,7 @@ def frost_l2norm_qk_bwd(
         dot_lo, dot_hi = ffma2(d4, d5, n4, n5, dot_lo, dot_hi)
         dot_lo, dot_hi = ffma2(d6, d7, n6, n7, dot_lo, dot_hi)
         dot = lane_group_sum(dot_lo + dot_hi, THREADS_PER_ROW)
-        inv = inline_ptx(
-            "ld.global.f32 $0, [$1];",
-            write_only_types=[cutlass.Float32],
-            read_only_args=[nrm_addr],
-        )
+        inv = ld_global(nrm_addr, cutlass.Float32)
         neg_dot = -dot
         p0, p1 = ffma2(neg_dot, neg_dot, n0, n1, d0, d1)
         p2, p3 = ffma2(neg_dot, neg_dot, n2, n3, d2, d3)
@@ -208,10 +194,9 @@ def frost_l2norm_qk_bwd(
         w1 = fp32_to_fp16(q2, q3, dtype=mDq.element_type)
         w2 = fp32_to_fp16(q4, q5, dtype=mDq.element_type)
         w3 = fp32_to_fp16(q6, q7, dtype=mDq.element_type)
-        inline_ptx(
-            "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-            read_only_args=[grad_addr, w0, w1, w2, w3],
-        )
+        st_global_v4(grad_addr, (w0, w1, w2, w3), cutlass.Int32)
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.jit
@@ -230,7 +215,7 @@ def l2norm_qk_launch(
     stream: cuda.CUstream,
 ):
     frost_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
-        grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream
+        grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
 
@@ -250,7 +235,7 @@ def l2norm_qk_bwd_launch(
     stream: cuda.CUstream,
 ):
     frost_l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, n_q_rows, n_rows, h_q, h_k).launch(
-        grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream
+        grid=(n_blocks, 1, 1), block=(THREADS_PER_ROW * ROWS_PER_CTA, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
 

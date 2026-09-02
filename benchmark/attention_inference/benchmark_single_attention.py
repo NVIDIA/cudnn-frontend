@@ -23,9 +23,14 @@ Backends:
   flash_mla          FlashMLA (mla_absorbed generation only, SM90/SM100).
   flash_attention_4  FlashAttention-4 CuTe DSL (dense, with auto split-KV).
 
-Timing uses CUDA events around the steady-state loop (median of iterations).
+Timing mirrors the training suite (attention_training/benchmark_single_sdpa.py):
+the torch profiler around each iteration, an L2 flush before it, and the sum of
+``device_time_total`` over kernels matching the shared kernel-name filter, as
+the median. Keeping one methodology across the two suites is what makes a row
+here comparable to a training row.
+
 All setup (plans, page tables, workspace) happens outside the timed region —
-this measures per-step kernel cost, not host planning.
+this measures per-step kernel cost, not host planning or launch overhead.
 """
 
 import argparse
@@ -84,20 +89,63 @@ def attention_bytes(batch, q_tokens, kv_len, num_q_heads, num_kv_heads, d_qk, d_
     return kv_bytes + qo_bytes
 
 
+# Kernel-name filter, kept byte-identical to the training suite's
+# ``matched_kernels`` predicate (attention_training/benchmark_single_sdpa.py).
+# The two must stay in lockstep: a kernel prefix missing from one suite makes
+# its numbers silently non-comparable with the other's. Grow BOTH together.
+def _is_attention_kernel(key: str) -> bool:
+    return (
+        key.startswith("cudnn")
+        or key.startswith("kernel_cutlass")
+        or "pytorch_flash::" in key
+        or "flash::" in key
+        or "at::native::" in key
+        or "cutlass3x" in key
+        or "(anonymous namespace)::" in key
+        or key.startswith("fmha_")
+    )
+
+
 def time_fn(fn, num_warmup, num_iters) -> float:
-    """Median wall time of fn() in ms via CUDA events."""
+    """Median per-call CUDA-kernel time of fn() in ms, via the torch profiler.
+
+    The training suite's methodology, so the two suites measure the same thing:
+    an L2 flush before each iteration, one profiler window per iteration, and
+    the sum of ``device_time_total`` over kernels matching the shared name filter.
+
+    This is kernel time, NOT wall clock: the host launch path is excluded. A
+    backend that spends real time between its kernels will look better here
+    than it does end to end -- the same caveat the training numbers carry.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    # Same 256 MiB scrub buffer the training suite uses, so neither suite gets
+    # to measure an L2 the other one paid to fill.
+    l2_flush = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.int8)
     for _ in range(num_warmup):
         fn()
     torch.cuda.synchronize()
     times = []
-    start = torch.cuda.Event(enable_timing=True)
-    stop = torch.cuda.Event(enable_timing=True)
     for _ in range(num_iters):
-        start.record()
-        fn()
-        stop.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(stop))
+        l2_flush.zero_()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        matched = [it for it in prof.key_averages() if _is_attention_kernel(it.key)]
+        if not matched:
+            # A silently-empty profiler (typically CUPTI failing to init against
+            # this driver) would report 0.000 ms for every case and ship as
+            # valid data; events present but unmatched means a new kernel name
+            # needs adding to the filter. Fail loudly for both.
+            raise RuntimeError(
+                "torch.profiler recorded no matching CUDA kernels for this case "
+                + ("(no CUDA events at all -- CUPTI init failure?)" if not prof.key_averages() else "(events present but none matched the kernel-name filter)")
+            )
+        # device_time_total, NOT device_time: key_averages() aggregates by kernel
+        # name, and device_time is the per-occurrence MEAN. A kernel launched more
+        # than once per call (a normalization copy over Q/K/V/O, a split emitted as
+        # separate launches) would otherwise be counted once instead of n times.
+        times.append(sum(it.device_time_total for it in matched) / 1000.0)
     times.sort()
     return times[len(times) // 2]
 
@@ -118,17 +166,24 @@ def setup_cudnn(args, dtype, oss=False):
     if args.kv_cache_dtype == "fp8_e4m3":
         return setup_cudnn_fp8(args, cudnn, oss=oss)
 
-    q_gpu = torch.randn(b, hq, sq, dqk, device="cuda", dtype=dtype) * 0.1
+    # Allocate (B, S, H, D) and transpose to the logical (B, H, S, D) the graph
+    # takes. Same logical tensor either way — only the physical stride order
+    # differs — but (B, S, H, D) is what a fused QKV projection produces, what
+    # the training suite measures, and what every other backend in this file
+    # already allocates (b12x, flash_mla, flash_attention_4; flashinfer packs
+    # token-major). Allocating head-major here handed cuDNN a different memory
+    # layout from the backends it is compared against.
+    q_gpu = (torch.randn(b, sq, hq, dqk, device="cuda", dtype=dtype) * 0.1).transpose(1, 2)
     if args.kind == "mla_absorbed":
         # Single shared record: K = full record, V = leading d_vo of the same
         # storage. hkv is expected to be 1 here.
-        rec = torch.randn(b, hkv, skv, dqk, device="cuda", dtype=dtype) * 0.1
+        rec = (torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1).transpose(1, 2)
         k_gpu = rec
         v_gpu = rec[..., :dvo]
     else:
-        k_gpu = torch.randn(b, hkv, skv, dqk, device="cuda", dtype=dtype) * 0.1
-        v_gpu = torch.randn(b, hkv, skv, dvo, device="cuda", dtype=dtype) * 0.1
-    o_gpu = torch.empty(b, hq, sq, dvo, device="cuda", dtype=dtype)
+        k_gpu = (torch.randn(b, skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1).transpose(1, 2)
+        v_gpu = (torch.randn(b, skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1).transpose(1, 2)
+    o_gpu = torch.empty(b, sq, hq, dvo, device="cuda", dtype=dtype).transpose(1, 2)
 
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF,
@@ -224,14 +279,16 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
     sq, skv = args.q_tokens, args.kv_len
     f8 = torch.float8_e4m3fn
 
-    q_gpu = (torch.randn(b, hq, sq, dqk, device="cuda") * 0.1).to(f8)
+    # (B, S, H, D) physical, transposed to the logical (B, H, S, D) — see the
+    # note in setup_cudnn.
+    q_gpu = (torch.randn(b, sq, hq, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
     if args.kind == "mla_absorbed":
-        rec = (torch.randn(b, hkv, skv, dqk, device="cuda") * 0.1).to(f8)
+        rec = (torch.randn(b, skv, hkv, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
         k_gpu, v_gpu = rec, rec[..., :dvo]
     else:
-        k_gpu = (torch.randn(b, hkv, skv, dqk, device="cuda") * 0.1).to(f8)
-        v_gpu = (torch.randn(b, hkv, skv, dvo, device="cuda") * 0.1).to(f8)
-    o_gpu = torch.empty(b, hq, sq, dvo, device="cuda", dtype=f8)
+        k_gpu = (torch.randn(b, skv, hkv, dqk, device="cuda") * 0.1).to(f8).transpose(1, 2)
+        v_gpu = (torch.randn(b, skv, hkv, dvo, device="cuda") * 0.1).to(f8).transpose(1, 2)
+    o_gpu = torch.empty(b, sq, hq, dvo, device="cuda", dtype=f8).transpose(1, 2)
     amax_s_gpu = torch.empty(1, 1, 1, 1, device="cuda", dtype=torch.float32)
     amax_o_gpu = torch.empty(1, 1, 1, 1, device="cuda", dtype=torch.float32)
     ones = {n: torch.ones(1, 1, 1, 1, device="cuda", dtype=torch.float32) for n in ("dq", "dk", "dv", "ds", "ss", "so")}

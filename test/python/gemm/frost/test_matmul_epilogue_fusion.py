@@ -2387,6 +2387,46 @@ def test_epi_n_is_one_shared_column_count_not_a_per_output_one(cfg_name: str, dt
     assert _store_modes(chain, cfg) == want
 
 
+@pytest.mark.L0
+def test_col_quant_uses_a_wide_epilogue_drain() -> None:
+    """Column quant performs the same one-warp reduction per column at either
+    drain width.  Taking 64 columns at once halves the subtile/store overhead;
+    row quant keeps the lower-register 32-column default."""
+    from cudnn.gemm.frost.compiler import _epi_n, _epi_n_for_chain
+
+    M = N = K = 128
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+
+    def build(axis: int):
+        g = cudnn.pygraph(
+            io_data_type=cudnn.data_type.BFLOAT16,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        C = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        Q, SF = g.block_scale_quantize(input=C, block_size=32, axis=axis, name="q")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        if axis == 1:
+            SF.set_dim([1, M // 32, N]).set_stride([M * N // 32, N, 1])
+        else:
+            SF.set_dim([1, M, N // 32]).set_stride([M * N // 32, N // 32, 1])
+        SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        return analyze(g)
+
+    row = build(-1)
+    col = build(1)
+    assert _epi_n(cfg, col.output_dtype) == 32, "the geometry-only default stays narrow"
+    assert _epi_n_for_chain(cfg, row) == 32
+    assert _epi_n_for_chain(cfg, col) == 64
+
+    # The wider cap must not turn a non-power-of-two drain into a partial
+    # subtile: 16 is the largest capped power-of-two divisor of 48.
+    cfg_48 = by_name("CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma")
+    assert _epi_n_for_chain(cfg_48, col) == 16
+
+
 @pytest.mark.parametrize(
     "majors,want",
     [
@@ -2803,16 +2843,41 @@ def test_tma_staged_values_reach_the_store_as_vectors() -> None:
 
     sites = src.count("cute.make_rmem_tensor(")
     converted = src.count(".load().to_vector()")
-    assert sites == 4, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 4. A new one either "
+    assert sites == 6, (
+        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 6. A new one either "
         f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
         f"then update this test."
     )
     assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
+    # Col quant's `_scale_mine` is the fifth rmem tensor. It is a one-byte-per-
+    # block side-store carrier, not a dense value entering the TMA staging ring.
+    assert src.count("_scale_mine = cute.make_rmem_tensor(") == 1
     # The two block-quantize emitters were the last holdouts: their result now
     # reaches a TMA-stored dense output, so they must convert like the rest.
     assert src.count("_out = cute.make_rmem_tensor(") == 2
     assert src.count("_vec = {p}_out.load().to_vector()") == 2, "the block-quantize emitters must hand on a Vector"
+
+
+def test_col_quant_uses_four_wide_inverse_scale_pipeline() -> None:
+    """The FP8 scale conversion itself is deterministic x2 in hardware, but
+    the four scales in one col-quant batch should share a TensorSSA reciprocal
+    and clamp instead of lowering to four scalar compare/select pairs."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    assert "{p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)" in src
+    assert "{p}_iv = cute.math.min(cute.math.rcp({p}_upv" in src
+    assert "cute.arch.rcp_approx({p}_u{lane_in_batch})" not in src
+
+
+def test_row_quant_amax_uses_vector_reduce() -> None:
+    """A scalar max tree lowers every pair to FSETP/FSEL.  Keep the row-block
+    amax in TensorSSA form so MLIR lowers it to the compact vector reduction
+    used by the specialized grouped-GLU epilogue."""
+    src = pathlib.Path(epilogue_codegen.__file__).read_text()
+    assert "cute.TensorSSA({p}_src.ir_value(), ({bs}, {n_sub}), cutlass.Float32)" in src
+    assert "{p}_abs = cute.math.absf({p}_frg)" in src
+    assert "cutlass._mlir.dialects.math.absf" not in src
+    assert "{p}_abs[None, {k}].reduce(cute.ReductionOp.MAX" in src
+    assert 'lines.append(f"{var} = cute.math.max(' not in src
 
 
 _PW_M, _PW_N, _PW_K = 128, 128, 128

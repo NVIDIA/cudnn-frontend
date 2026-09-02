@@ -188,3 +188,20 @@ class BenchmarkResult:
     # sampled during the measurement window — the SOL denominator. None on
     # arches without a rate-table entry.
     peak_mma_tflops: Optional[float] = None
+
+
+def fa2_on_ampere():
+    """flash_attention (FA2) as an extra backend on Ampere only.
+
+    FA4's backward asserts SM90+ (flash_attn/cute/interface.py,
+    _flash_attn_bwd) while its forward supports SM80, so without FA2 the
+    SM80 dashboards have no flash-attention backward reference column. On
+    SM90+ FA4 is the reference and FA2 is not run. FA2's own limits still
+    apply per model (matching Q/KV head dims, head_dim <= 256); unsupported
+    combos record as failed rows per the usual convention.
+    """
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
+        return ["flash_attention"]
+    return []

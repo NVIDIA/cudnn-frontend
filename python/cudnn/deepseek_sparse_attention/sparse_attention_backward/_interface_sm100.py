@@ -51,6 +51,8 @@ def _select_sm100_backend(
         # The H16 KV-major specialization can use the full M128 UMMA tile,
         # halving the top-k loop count while keeping one CTA per query token.
         return "h16_m128", 128
+    if num_heads == 32 and head_dim == 576:
+        return "h32_m64", 64
     return "generic_m64", 64
 
 
@@ -69,6 +71,10 @@ def _get_sm100_kernel_class(backend: str):
         from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
         return FlashAttentionDSABackwardSm100H16
+    if backend == "h32_m64":
+        from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
+
+        return FlashAttentionDSABackwardSm100H32
     return FlashAttentionDSABackwardSm100
 
 
