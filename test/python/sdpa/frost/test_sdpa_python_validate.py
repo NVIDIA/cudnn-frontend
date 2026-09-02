@@ -30,6 +30,7 @@ def frost_candidate(monkeypatch):
 
 @pytest.fixture
 def no_candidates(monkeypatch):
+    """Manifest offers no python engine (frost off / family unavailable)."""
     monkeypatch.setattr(manifest, "engines_for", lambda graph: [])
 
 
@@ -42,6 +43,7 @@ def _sdpa_graph(
     d=64,
     **sdpa_kwargs,
 ):
+    """A minimal SDPA forward pygraph; returns (graph, tensors-by-name)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -58,18 +60,30 @@ def _sdpa_graph(
 
 
 def test_valid_graph_does_not_lower(frost_candidate):
+    """With a python candidate, validate() skips the eager C++ lowering."""
     g, _ = _sdpa_graph(use_causal_mask=True)
     g.validate()
     assert g._lowered_graph is None, "validate() must not lower to C++ when a python engine is a candidate"
 
 
 def test_classic_path_still_lowers(no_candidates):
+    """No python candidate: validate() keeps the classic eager C++ lowering."""
     g, _ = _sdpa_graph(use_causal_mask=True)
     g.validate()
     assert g._lowered_graph is not None, "without python candidates the classic eager lowering must be unchanged"
 
 
+def test_mixed_graph_still_lowers(frost_candidate):
+    """A node outside COVERED_NODE_TYPES (pointwise on O) forces the classic eager
+    lowering even with a python candidate: the routing rule is every-node-covered."""
+    g, ts = _sdpa_graph(use_causal_mask=True)
+    g.swish(ts["o"]).set_output(True)
+    g.validate()
+    assert g._lowered_graph is not None, "a graph with an uncovered node must keep the classic eager lowering"
+
+
 def test_gqa_head_divisibility(frost_candidate):
+    """h_q not a multiple of h_kv is rejected with the classic error type, without lowering."""
     g, _ = _sdpa_graph(h_q=3, h_kv=2)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="group-query attention"):
         g.validate()
@@ -77,6 +91,7 @@ def test_gqa_head_divisibility(frost_candidate):
 
 
 def test_bottom_right_causal_with_bias(frost_candidate):
+    """Bottom-right causal + bias is a classic GRAPH_NOT_SUPPORTED combination."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -95,12 +110,14 @@ def test_bottom_right_causal_with_bias(frost_candidate):
 
 
 def test_padding_mask_requires_seq_lens(frost_candidate):
+    """Padding mask without seq_len tensors is an ATTRIBUTE_NOT_SET-class ValueError."""
     g, _ = _sdpa_graph(use_padding_mask=True)
     with pytest.raises(ValueError, match="Padding mask requires"):
         g.validate()
 
 
 def test_seq_lens_require_padding_mask(frost_candidate):
+    """seq_len tensors without the padding mask are rejected (classic INVALID_VALUE parity)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -120,6 +137,7 @@ def test_seq_lens_require_padding_mask(frost_candidate):
 
 
 def test_dropout_probability_one_rejected(frost_candidate):
+    """Probability-form dropout with p = 1.0 is rejected at validate()."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -139,12 +157,14 @@ def test_dropout_probability_one_rejected(frost_candidate):
 
 
 def test_alibi_requires_causal(frost_candidate):
+    """ALiBi without the causal mask is rejected."""
     g, _ = _sdpa_graph(use_alibi_mask=True)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="alibi"):
         g.validate()
 
 
 def test_non_fp32_stats_rejected(frost_candidate):
+    """Stats must be FP32; a HALF Stats output is rejected."""
     g, ts = _sdpa_graph(use_causal_mask=True)
     ts["stats"].set_data_type(cudnn.data_type.HALF)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Stats output of sdpa must be an FP32"):
@@ -152,18 +172,21 @@ def test_non_fp32_stats_rejected(frost_candidate):
 
 
 def test_head_dim_multiple_of_8(frost_candidate):
+    """Head dim not a multiple of 8 is rejected."""
     g, _ = _sdpa_graph(d=68, use_causal_mask=True)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="multiple of 8"):
         g.validate()
 
 
 def test_sliding_window_sq_gt_skv_rejected(frost_candidate):
+    """Sliding window with s_q > s_kv is rejected."""
     g, _ = _sdpa_graph(s_q=128, s_kv=64, use_causal_mask=True, sliding_window_length=16)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Sliding window attention"):
         g.validate()
 
 
 def test_bwd_sq1_skv1_rejected(frost_candidate):
+    """Backward with s_q = s_kv = 1 is rejected, without lowering."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,

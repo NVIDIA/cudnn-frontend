@@ -188,6 +188,8 @@ def test_fwd_engine_strided_stats_d256():
 
 
 def _check_bwd_engine_end_to_end(d):
+    """Forward on the SM80 engine, then the backward graph pinned to sdpa_bwd_sm80 at head dim
+    ``d``; dQ/dK/dV against torch autograd."""
     scale = 1.0 / math.sqrt(d)
     # Forward via the SM80 engine to produce O / stats.
     g, q, k, v, o, stats = _build_fwd_graph(d=d)
@@ -235,6 +237,7 @@ def _check_bwd_engine_end_to_end(d):
 @_SM80
 @pytest.mark.L0
 def test_bwd_engine_end_to_end():
+    """Default (d=128) backward through the graph API on the SM80 engine."""
     _check_bwd_engine_end_to_end(D)
 
 

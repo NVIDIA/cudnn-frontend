@@ -407,8 +407,11 @@ class pygraph:
         if self._frozen:
             raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (planning is one-shot; build a new graph)")
         # a mutation while merely validated (python-engine graphs stay mutable
-        # until planning) must re-validate later — never run on stale inference
+        # until planning) must re-validate later — never run on stale inference,
+        # and never plan on candidates matched against the pre-mutation graph
+        # (validate() may have cached them before the freeze).
         self._is_validated = False
+        self._candidates = None
 
     def _freeze(self) -> None:
         """Freeze the ENTIRE public graph surface.

@@ -43,17 +43,20 @@ COVERED_NODE_TYPES = frozenset(_FWD_TYPES + _BWD_TYPES)
 
 
 def _not_supported(message: str) -> Exception:
+    """Classic GRAPH_NOT_SUPPORTED parity: the error type callers catch to skip a config."""
     import cudnn
 
     return cudnn.cudnnGraphNotSupportedError(message)
 
 
 def _dtype_name(t: Any) -> Optional[str]:
+    """Enum name of a tensor's data type, or None when the tensor/dtype is unset."""
     dt = t.get_data_type() if t is not None else None
     return getattr(dt, "name", None)
 
 
 def _tensor(node, port: str):
+    """The tensor bound to ``port`` on either side of the node, or None."""
     return node.inputs.get(port) or node.outputs.get(port)
 
 
@@ -95,16 +98,18 @@ def _dropout(node) -> tuple:
     if not node.params.get("_dropout_n"):
         return None, False
     prob = node.params.get("dropout_0")
-    if isinstance(prob, float):
-        return prob, False
+    if isinstance(prob, (int, float)) and not isinstance(prob, bool):
+        return float(prob), False
     return None, "dropout_0" in node.inputs
 
 
 def _is_ragged(*tensors) -> bool:
+    """Whether any given tensor carries a ragged (packed THD) offset."""
     return any(t is not None and t.ragged_offset is not None for t in tensors)
 
 
 def _has(node, port: str) -> bool:
+    """Whether an input port is bound."""
     return node.inputs.get(port) is not None
 
 
@@ -190,6 +195,8 @@ def _validate_common(node, q, k, v, o, s_q, s_kv) -> None:
 
 
 def _validate_forward(node) -> None:
+    """SDPA / SDPA_FP8 / SDPA_MXFP8 forward: the classic C++ pre-validation rules that
+    do not depend on backend version or device arch."""
     params = node.params
     q, k, v = node.inputs.get("q"), node.inputs.get("k"), node.inputs.get("v")
     o = node.outputs.get("O")
@@ -215,7 +222,7 @@ def _validate_forward(node) -> None:
     if is_ragged and not (bool(params.get("use_padding_mask")) or score_mod):
         raise _not_supported("Ragged offsets are only supported with padding mask.")
 
-    alignment, left, right = _diagonal(params)
+    _alignment, left, right = _diagonal(params)
     if score_mod and (bool(params.get("use_alibi_mask")) or right is not None or bool(params.get("use_padding_mask")) or left is not None):
         raise _not_supported("Attention score mod enabled and hence other subgraphs are disabled.")
 
@@ -253,6 +260,8 @@ def _validate_forward(node) -> None:
 
 
 def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
+    """MXFP8 block-scale descale tensors: F8_128x4 reordering and batch/head dims matching
+    their base operand."""
     b, h_q, _, d = q.get_dim()
     h_k, h_v = k.get_dim()[1], v.get_dim()[1]
     block_size = 32  # MXFP8 block size is fixed at 32
@@ -282,6 +291,8 @@ def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
 
 
 def _validate_backward(node) -> None:
+    """SDPA_BWD / FP8 / MXFP8 backward: the version- and arch-agnostic classic rules,
+    including the s_q = s_kv = 1 rejection."""
     q, k, v = node.inputs.get("q"), node.inputs.get("k"), node.inputs.get("v")
     # sdpa_mxfp8_backward carries O as its f16 twin (port "o_f16")
     o = node.inputs.get("o") or node.inputs.get("o_f16")
@@ -298,7 +309,7 @@ def _validate_backward(node) -> None:
     _validate_common(node, q, k, v, o, s_q, s_kv)
 
     params = node.params
-    alignment, left, right = _diagonal(params)
+    _alignment, left, right = _diagonal(params)
     score_mod = params.get("score_mod") is not None
     if score_mod and (bool(params.get("use_alibi_mask")) or bool(params.get("use_padding_mask")) or right is not None or left is not None):
         raise _not_supported("Attention score mod enabled and hence other subgraphs are disabled.")

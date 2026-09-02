@@ -239,6 +239,8 @@ def _bprop_kernel(
     sem_q_stride: cutlass.Int32,  # DQ_SEM per-(seq,head) stride = ceil(max_SQ/tile_q) (deterministic only)
 ):
     # ---- compile-time derived counts --------------------------------------
+    """SM80 SDPA backward main kernel: one CTA per (kv-tile, head, batch|sequence) owns dK/dV
+    and streams Q-tiles, accumulating dQ across CTAs (atomics or the deterministic relay)."""
     threads = 2 * warps_per_sg * 32
     DQK_CHUNKS = d_qk // 16  # BMM1 K-reduce over d (S = K·Qᵀ)
     DV_CHUNKS = d_v // 16  # BMM1' K-reduce over d (dP = V·dOᵀ)
@@ -469,7 +471,7 @@ def _bprop_kernel(
     sV = cutlass.Array(io_dtype, tile_kv * d_v, alignment=128, space=cutlass.AddressSpace.smem)
     sQ = cutlass.Array(io_dtype, qo_stages * QSTAGE_Q, alignment=128, space=cutlass.AddressSpace.smem)
     sdO = cutlass.Array(io_dtype, qo_stages * QSTAGE_O, alignment=128, space=cutlass.AddressSpace.smem)
-    # sP carries P sg0→sg1 in fp32: dS = (dP − do_dot)·P is formed from the
+    # sP carries P sg0->sg1 in fp32: dS = (dP - do_dot)*P is formed from the
     # unrounded softmax so only the MMA operands (bmm2_a / sdSᵀ) see a bf16
     # rounding.  +PT*2 B of SMEM over the bf16 copy (fits every flavor).
     sP = cutlass.Array(cutlass.Float32, PT, alignment=128, space=cutlass.AddressSpace.smem)
