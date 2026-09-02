@@ -361,6 +361,59 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("skip_amax", [False, True], ids=["with_amax", "no_amax"])
+@pytest.mark.parametrize("h_q,h_kv", [(4, 4), (4, 2)], ids=["mha", "gqa"])
+@torch_fork_set_rng(seed=61)
+def test_mxfp8_qk_bf16_pv_direct_experiment(skip_amax, h_q, h_kv):
+    """Exercise the direct-only hybrid Amax contract in both specializations.
+
+    This deliberately exercises the direct-only adapter switch rather than a
+    graph route: graph capability selection remains unchanged until benchmark
+    evidence establishes that this tradeoff is worth exposing publicly.
+    """
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 serves per-tensor FP8 d128, not block-scaled MXFP8")
+
+    b, s, d = 1, 256, 128
+    dev = "cuda"
+    scale = d**-0.5
+    qf = torch.randn(b, h_q, s, d, device=dev) * 0.5
+    kf = torch.randn(b, h_kv, s, d, device=dev) * 0.5
+    v = (torch.randn(b, h_kv, s, d, device=dev) * 0.5).to(torch.bfloat16)
+    q, sf_q, dq, _ = _quantize(qf, b, h_q, s, d, torch.float8_e4m3fn, columnwise=False)
+    k, sf_k, dk, _ = _quantize(kf, b, h_kv, s, d, torch.float8_e4m3fn, columnwise=False)
+    o = torch.empty_like(qf, dtype=torch.bfloat16)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=True,
+        pv_bf16_skip_amax_o=skip_amax,
+    )
+    assert api.check_support()
+    api.compile()
+    amax = torch.full((1,), 123.0, device=dev, dtype=torch.float32)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax)
+    torch.cuda.synchronize()
+
+    o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
+    _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d)
+
+    if skip_amax:
+        assert amax.item() == 123.0
+    else:
+        assert amax.item() > 0.0
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=59)
 def test_mxfp8_strided_stats():
     """The block-scaled FP8 L0 flavor preserves dense Stats strides."""

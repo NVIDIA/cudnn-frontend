@@ -127,6 +127,15 @@ class TemplateParams:
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # Experimental D128 MXFP8 specialization: Q/K remain block-scaled FP8,
+    # while the complete softmax(P) @ V leg uses BF16 operands. This is a
+    # template axis because it changes the TMA maps, shared-memory layout and
+    # BMM2 instruction kind. It is intentionally not wired into graph routing.
+    pv_bf16: bool = False
+    # Performance-only companion to pv_bf16: omit the MXFP8 Amax_O reduction
+    # and atomic when the hybrid writes BF16 O. This intentionally leaves the
+    # caller's amax_o buffer untouched and is not a graph/API contract.
+    pv_bf16_skip_amax_o: bool = False
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -149,6 +158,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
+    if k.pv_bf16 and (not fp8 or flavor != "d128"):
+        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128-only specialization")
+    if k.pv_bf16_skip_amax_o and not k.pv_bf16:
+        raise ValueError(f"{flavor}: pv_bf16_skip_amax_o requires pv_bf16")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
@@ -296,7 +309,7 @@ class TmaIters:
 
 def _tma_iters(cfg) -> TmaIters:
     qk = _tma_iters_for(cfg.TILE_K, cfg.BPE, cfg.Q_SWZ_BYTES)
-    vo = _tma_iters_for(cfg.TILE_O, cfg.BPE, cfg.V_SWZ_BYTES)
+    vo = _tma_iters_for(cfg.TILE_O, getattr(cfg, "BPE_V", cfg.BPE), cfg.V_SWZ_BYTES)
     return TmaIters(
         QK_ITERS=qk,
         VO_ITERS=vo,
@@ -810,6 +823,10 @@ class CfgD128:
     DTYPE_QKV: int = DTYPE_FP16
     DTYPE_O: int = DTYPE_FP16
     BPE: int = 2
+    # V may be BF16 in the experimental MXFP8-QK/BF16-PV path while Q/K
+    # retain their one-byte MXFP8 storage.
+    BPE_V: int = 2
+    PV_BF16: int = 0
     BPE_O: int = 2
 
     CGA_M: int = 2
@@ -916,7 +933,7 @@ def _d128_smem_bytes(cfg) -> int:
     o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
-    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     return qo + k + v
 
 
@@ -949,10 +966,12 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
         ),
         (
-            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if _fp8 else 16),
-            "d128: TILE_K_HW must be 32 (fp8/mxfp8 K=32 QMMA) / 16 (f16, 1-chunk on SM10x)",
+            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if _fp8 else 16)),
+            "d128: BMM1 uses K=32 for MXFP8; experimental BF16 PV uses K=16",
         ),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d128: Q/K swizzle must be 64/128B"),
+        (cfg.PV_BF16 in (0, 1) and (not cfg.PV_BF16 or _fp8), "d128: pv_bf16 requires MXFP8 Q/K"),
+        (cfg.BPE_V == (2 if cfg.PV_BF16 else cfg.BPE), "d128: V bytes/element must match the PV specialization"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d128: V/O swizzle out of range"),
         (
             cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
@@ -970,6 +989,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    b_v = 2 if params.pv_bf16 else b
     # FP8/MXFP8 pins the Blackwell K=32 QMMA path (TILE_K_HW=32) and STAGES_KV=4
     # (BPE=1 → 8 KiB/stage, fits 4); f16/bf16 keep 16 / 2.
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
@@ -977,6 +997,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
         BPE_O=b_o,
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
@@ -985,11 +1007,11 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         QO_ALIAS=1 if params.cta_mma == 1 else 0,
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
-        TILE_K_HW_BMM2=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else tile_k_hw_fp8,
         # KV stage depth scales with the cluster width, as in cuDNN's own
         # kernels (stages_kv = N * CTA_MMA): cga1 has no collective MMA to halve
         # per-CTA K/V, so the stage count halves instead to keep the product --
@@ -1200,6 +1222,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        BPE_V=b,
         BPE_O=b_o,
         SPLIT_KV=int(params.split_kv),
         QO_ALIAS=0 if fp8 else 1,

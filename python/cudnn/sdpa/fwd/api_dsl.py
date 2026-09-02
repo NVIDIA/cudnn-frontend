@@ -385,6 +385,8 @@ class SdpaFwdDsl(APIBase):
         split_kv: Optional[int] = None,
         softmax_precision: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
+        pv_bf16: bool = False,
+        pv_bf16_skip_amax_o: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -451,6 +453,13 @@ class SdpaFwdDsl(APIBase):
         self._fp8 = False
         # Per-tensor FP8 (sdpa_fp8) vs block-scale MXFP8 (sdpa_mxfp8); both use FP8 Q/K/V.
         self._pertensor = bool(pertensor_fp8)
+        # Direct-adapter-only experiment. It deliberately has no graph node or
+        # engine capability: its purpose is to isolate the QK-MXFP8/BF16-PV
+        # kernel tradeoff before exposing an API contract.
+        self.pv_bf16 = bool(pv_bf16)
+        # Direct-adapter-only performance ablation. Its only valid semantic is
+        # BF16 P/V and BF16 O; Amax_O is deliberately not produced.
+        self.pv_bf16_skip_amax_o = bool(pv_bf16_skip_amax_o)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch). None means the
@@ -1000,8 +1009,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
             "(see the SF layout note in prefill_d128_mxfp8_sm100.py)",
         )
-        for desc in [self.k_desc, self.v_desc]:
-            self._check_dtype(desc, self.dtype, name=desc.name, extra_error_msg=f"{desc.name} must match Q dtype")
+        self._check_dtype(self.k_desc, self.dtype, name=self.k_desc.name, extra_error_msg=f"{self.k_desc.name} must match Q dtype")
+        if self.pv_bf16:
+            self._not_implemented_error_if(not self._fp8 or self._pertensor, "pv_bf16 requires block-scale MXFP8 Q/K")
+            self._check_dtype(self.v_desc, torch.bfloat16, name="V", extra_error_msg="V must be BF16 when pv_bf16=True")
+        else:
+            self._check_dtype(self.v_desc, self.dtype, name=self.v_desc.name, extra_error_msg=f"{self.v_desc.name} must match Q dtype")
         if self._fp8:
             # MXFP8 block-scale input: O may be BF16/FP16 (half) or FP8, decoupled from the input dtype.
             self.dtype_o = self._check_dtype(self.o_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="O")
@@ -1013,6 +1026,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 extra_error_msg=f"{self.o_desc.name} must match Q dtype (FP16/BF16 on SM100 DSL)",
             )
             self.dtype_o = self.dtype
+        self._not_implemented_error_if(
+            self.pv_bf16_skip_amax_o and (not self.pv_bf16 or self.dtype_o != torch.bfloat16),
+            "pv_bf16_skip_amax_o is a performance-only experiment requiring pv_bf16=True and BF16 O",
+        )
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
@@ -1129,6 +1146,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
             "D192 split_kv > 1 is validated only with cga=2",
+        )
+        self._not_implemented_error_if(
+            self.pv_bf16 and (self.flavor != (128, 128) or self.thd or self.split_kv != 1),
+            "pv_bf16 is an experimental direct-only MXFP8 D128 dense specialization (THD and split-KV are not wired)",
         )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -1295,6 +1316,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             cta_mma=(1 if self._fp8 and self.flavor == (256, 256) else 2) if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+            pv_bf16=self.pv_bf16,
+            pv_bf16_skip_amax_o=self.pv_bf16_skip_amax_o,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
@@ -2057,8 +2080,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """
         import cutlass
 
-        if sf_q is None or sf_k is None or sf_v is None:
-            raise ValueError("Frost MXFP8 execute requires sf_q/sf_k/sf_v (block-scale descale tensors)")
+        if sf_q is None or sf_k is None or (sf_v is None and not self.pv_bf16):
+            raise ValueError("Frost MXFP8 execute requires sf_q/sf_k and, unless pv_bf16=True, sf_v (block-scale descale tensors)")
 
         km = self._k_mod
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
@@ -2132,7 +2155,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
         sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
         sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
-        sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+        sf_v_v = self._reshape_sf(sf_k if self.pv_bf16 else sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
         lse = lse_tensor
@@ -2147,11 +2170,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
 
         amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        # Must be enqueued on the SAME stream as the kernel launch below, else the
-        # reset and the kernel's atomicMax are unordered (and the reset is missing
-        # from a CUDA-graph capture taken on the handle's stream).
-        with _torch_stream_context(current_stream, device):
-            amax_o_buf.zero_()
+        # The hybrid no-Amax ablation intentionally leaves this buffer untouched.
+        # Otherwise the reset must share the kernel stream: atomicMax is unordered
+        # with a reset on a different stream (and capture would miss the reset).
+        if not self.pv_bf16_skip_amax_o:
+            with _torch_stream_context(current_stream, device):
+                amax_o_buf.zero_()
 
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
         # Split-KV: the mainloop writes split-major partials (skipping its own
