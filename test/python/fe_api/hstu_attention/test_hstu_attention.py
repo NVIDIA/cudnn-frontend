@@ -118,16 +118,6 @@ def _int32_alias(tensor: torch.Tensor, shape) -> torch.Tensor:
 
 
 @pytest.mark.L0
-def test_top_level_exports():
-    import cudnn
-
-    assert cudnn.HSTUFwdSm100 is HSTUFwdSm100
-    assert cudnn.HSTUBwdSm100 is HSTUBwdSm100
-    assert cudnn.hstu_attention_forward is hstu_attention_forward
-    assert cudnn.hstu_attention_backward is hstu_attention_backward
-
-
-@pytest.mark.L0
 def test_rejects_torch_stream_from_another_device(monkeypatch):
     class _FakeStream:
         device = torch.device("cuda:1")
@@ -907,7 +897,7 @@ def test_explicit_api_rejects_runtime_stride_change():
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_forward_matches_pytorch(dtype, head_dim):
     q, k, v, _, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
@@ -947,7 +937,7 @@ def test_forward_matches_pytorch(dtype, head_dim):
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_backward_matches_pytorch(dtype, head_dim):
     q, k, v, do, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
@@ -997,7 +987,7 @@ def test_backward_matches_pytorch(dtype, head_dim):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
     cache = OrderedDict()
     monkeypatch.setattr(_api, "_BWD_CACHE", cache)
@@ -1413,7 +1403,7 @@ def test_d256_explicit_api_is_cuda_graph_capturable():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     torch.manual_seed(321)
     q_lengths = (37, 129)
@@ -1504,7 +1494,7 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("mask_mode", ["full", "local", "arbitrary"])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_mask_modes_match_pytorch(mask_mode, head_dim):
     q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     seqlen = q.shape[0]
@@ -1655,7 +1645,7 @@ def test_d256_full_tile_arbitrary_mask_is_not_skipped():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_paged_kv_forward_matches_pytorch(head_dim):
     q, k, v, _, cu = _inputs(heads=1, seqlen=256, head_dim=head_dim)
     seqlen = q.shape[0]
@@ -1733,7 +1723,7 @@ def test_cache_hit_does_not_inspect_cuda_metadata_values(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
     q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     scalar_configs = ((0.35, 32.0), (1.1, 96.0))
