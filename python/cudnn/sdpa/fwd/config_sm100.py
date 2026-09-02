@@ -969,9 +969,10 @@ def canonicalize_d192_lowering(
     template_window_right = window_right
     if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-        # MASK_NONE x32 path. This bound removes no valid K and selects the
-        # equivalent masked-interior lowering.
-        template_window_right = s_kv
+        # MASK_NONE x32 path. 1 << 30 exceeds any dense D192 sequence that
+        # fits in SM100 memory while leaving signed-int32 headroom for q + R;
+        # it preserves the lowering without making the module key depend on S_kv.
+        template_window_right = 1 << 30
 
     template_bottom_right = False if d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params.bottom_right
 
