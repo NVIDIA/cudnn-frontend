@@ -156,7 +156,7 @@ def generate_charts(
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
             dims = dims_label if dims_label else f"d = {head_dim}"
             fig.suptitle(
-                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}{gpu_info}",
+                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}, " f"use_qk_l2norm = True{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 
