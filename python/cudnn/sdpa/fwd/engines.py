@@ -252,6 +252,11 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    # Shape-specific CGA domains for rows that lower several native flavors.
+    # ``cgas`` remains the default. A split-specific entry further narrows the
+    # domain for split-KV plans without changing the unsplit public domain.
+    cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    split_cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
     pack_gqas: frozenset[bool] = frozenset({False})
     # Does this row's lowering wire the KV-split path (kernel SplitHelpers +
     # adapter carving the partial slabs + launching the combine)? A GATE, not a
@@ -288,6 +293,31 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
     return facts.s_q + r <= facts.s_kv
 
 
+def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
+    """Smallest native flavor whose envelope covers this graph."""
+
+    covering = [shape for shape in capabilities.d_shapes if facts.d_qk <= shape[0] and facts.d_v <= shape[1]]
+    return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
+
+
+def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
+    """CGA domain of the native flavor and split leg selected by the graph."""
+
+    selected = _selected_d_shape(capabilities, facts)
+    domain = capabilities.cgas
+    if selected is not None:
+        for shape, shape_domain in capabilities.cgas_by_d_shape:
+            if shape == selected:
+                domain = shape_domain
+                break
+        if (split_kv or 1) > 1:
+            for shape, split_domain in capabilities.split_cgas_by_d_shape:
+                if shape == selected:
+                    domain = split_domain
+                    break
+    return domain
+
+
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
@@ -310,7 +340,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.sched_policy, capabilities.sched_policies, "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
-            (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
             (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
@@ -558,6 +588,8 @@ def _sm100_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
             # carves the partial slabs + launches split_combine_sm100 when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
@@ -608,6 +640,8 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # The split path also needs a half-precision O (mismatch's
             # facts x knobs gate).
             split_kv_supported=True,
@@ -719,6 +753,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(() if rubin_row else (((192, 128), frozenset({1, 2})),)),
+            split_cgas_by_d_shape=(() if rubin_row else (((192, 128), frozenset({2})),)),
             # f16x2-softmax arm: only the SM107 sibling kernel carries the
             # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
             # it). FLOAT is the f32 pipeline every flavor already runs.

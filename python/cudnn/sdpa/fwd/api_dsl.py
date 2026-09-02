@@ -10,7 +10,7 @@ import math
 import os
 from abc import abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
 
@@ -30,8 +30,9 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
+    canonicalize_d192_lowering,
+    derive_d192_internal_params,
     pack_gqa_supported,
-    resolve_d192_template_params,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
@@ -447,6 +448,8 @@ class SdpaFwdDsl(APIBase):
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
         self.cga = None if cga is None else int(cga)
+        # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
+        # graph heuristics pass an explicit split count when splitting wins.
         self.split_kv = 1 if split_kv is None else int(split_kv)
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
@@ -1077,12 +1080,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
             (self.tile_n, 128, "tile_n"),
-            (self.cga, 2, "cga"),
         ):
             self._value_error_if(
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
+        supported_cgas = (1, 2) if self.flavor == (192, 128) else (2,)
+        self._value_error_if(
+            self.cga is not None and self.cga not in supported_cgas,
+            f"SM100 DSL SDPA only supports cga in {supported_cgas}",
+        )
+        self._value_error_if(
+            self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
+            "D192 split_kv > 1 is validated only with cga=2",
+        )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -1250,11 +1261,31 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            cta_mma=2 if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
         if self.flavor == (192, 128):
-            params = resolve_d192_template_params(
+            from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+            auto_sched, auto_cga = select_d192_auto_knobs(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d192_lowering(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = derive_d192_internal_params(
                 params,
                 pertensor=self._pertensor,
                 batch_size=self.batch_size,
