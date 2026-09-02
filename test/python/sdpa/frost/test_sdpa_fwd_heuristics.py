@@ -114,6 +114,34 @@ def test_recommend_every_set_is_admissible():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "engine_name,dtype,is_fp8",
+    [
+        ("sdpa_fwd_prefill_sm120", cudnn.data_type.HALF, False),
+        ("sdpa_fwd_prefill_sm120_fp8", cudnn.data_type.FP8_E4M3, True),
+    ],
+)
+def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
+    facts = _facts(
+        s_q=256,
+        s_kv=256,
+        d_qk=192,
+        d_v=128,
+        dtype=dtype,
+        dtype_o=cudnn.data_type.HALF,
+        is_fp8=is_fp8,
+        device_cc=(12, 0),
+        device_sm_count=84,
+    )
+    offered = {engine_name: 20504}
+    plans = recommend("A", facts, offered)
+    assert plans
+    assert all(plan.knobs.cga == 1 for plan in plans)
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == engine_name)
+    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+
+
+@pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     """Placement is the SHARED layer's job (engines/heuristics._assemble):
     proposals lead the backend's entries inside each mode block by standing

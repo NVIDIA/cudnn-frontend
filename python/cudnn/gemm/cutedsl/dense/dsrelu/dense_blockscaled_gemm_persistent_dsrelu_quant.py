@@ -1539,6 +1539,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             c_pipeline.producer_tail(c_pipeline_producer_state)
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     def mainloop_s2t_copy_and_partition(
         self,
         sSF: cute.Tensor,

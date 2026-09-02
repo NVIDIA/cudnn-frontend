@@ -250,15 +250,35 @@ def test_d256_direct_aten_op():
     """d=256: torch's C++ fused_sdp_choice still gates cuDNN to head_dim<=128,
     so F.sdpa cannot reach it — but the python path serves it through the aten
     op directly (what a fixed selection gate would dispatch to)."""
+    # Plan-time gates first, before any allocation (same floors as
+    # test_torch_ops.py's module gate): older stacks skip cleanly here rather
+    # than via a broad exception net below.
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("cuDNN SDPA requires sm80+")
+    if cudnn.backend_version() < 90600:
+        pytest.skip("requires cuDNN >= 9.6")
     torch.manual_seed(0)
     q = torch.randn(2, 4, 384, 256, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     k, v = torch.randn_like(q, requires_grad=True), torch.randn_like(q, requires_grad=True)
+    # Both directions must be servable: the forward may build while the
+    # BACKWARD graph is rejected at validate() (e.g. Ampere's native support
+    # surface caps the backward at d<=128 and runs before FROST routing, so
+    # the graph never reaches an OSS engine that could serve d=256 — #864).
+    # The frontend signals that with cudnnGraphNotSupportedError (a plain
+    # Exception, not a RuntimeError). A RuntimeError is a skip ONLY when it
+    # is the engine-selection rejection itself; anything else (allocation
+    # failures, autograd regressions) must surface as a failure.
     try:
         out = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, None, True, 0.0, False)
+        o = out[0]
+        o.backward(torch.ones_like(o))
+    except cudnn.cudnnGraphNotSupportedError as e:
+        pytest.skip(f"no engine serves d=256 fwd+bwd on this arch: {str(e).splitlines()[0][:80]}")
     except RuntimeError as e:
-        pytest.skip(f"no engine serves d=256 on this arch: {str(e).splitlines()[0][:80]}")
-    o = out[0]
-    o.backward(torch.ones_like(o))
+        msg = str(e).splitlines()[0]
+        if any(t in msg.lower() for t in ("not supported", "unsupported", "no valid engine", "no engine")):
+            pytest.skip(f"no engine serves d=256 fwd+bwd on this arch: {msg[:80]}")
+        raise
     o_ref, q_ref, _, _ = math_ref(q, k, v, False, None)
     o_ref.backward(torch.ones_like(o_ref))
     assert (o.float() - o_ref).abs().max().item() < 0.05

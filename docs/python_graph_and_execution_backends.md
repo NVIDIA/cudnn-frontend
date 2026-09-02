@@ -296,6 +296,30 @@ are close.
   `KdaFrostEngine`), and serves `gdn2_bwd` the same way (checkpoint
   recompute when the series is absent); the op is
   `cudnn.linear_attention.ops.gated_delta_net_v2`.
+- Gated DeltaProduct (`gdp` / `gdp_bwd`) applies `num_householder` beta-gated
+  Householder updates per token with one scalar decay per token: the GDN
+  recurrence on an expanded sub-token timeline (gate on sub-token 0, readout
+  on sub-token `n - 1`). The node carries q/g/O/dO/dQ/dG at real-token rows
+  and k/v/beta/dK/dV/dBeta at `total_T * num_householder` rows;
+  `num_householder == 1` is exactly `gdn`. `GdpFrostEngine`
+  (`cudnn.linear_attention.frost.gdp_engine`, SM100/SM103) is its only
+  engine and runs the shared GDN kernels, except at `d_v == 64`, where both
+  directions take their own forks: `kernel/gdp_prefill_v64_f16.py` reads q
+  compact and cp.async-scatters it into shared memory, and
+  `kernel/gdp_bprop_v64_f16.py` reads q/dO and writes dQ in the token
+  domain. At `d_v == 128` the expanded q read is already hidden behind the
+  wider V/O/checkpoint traffic while the scatter would pay full congestion
+  price, so the normalize writes q onto the expanded timeline and the shared
+  prefill reads it with a plain TMA. Otherwise only dO
+  (and q, when `use_qk_l2norm` is off) is zero-scattered into an expanded
+  workspace copy and only dQ is gathered back (`frost/common/expand.py`);
+  the gate is read compact with the sub-token rows derived in registers,
+  O and dG are stored compact in-kernel, and `cu_seqlens` is scaled by `n`
+  at every read site. `checkpoint_every_n_tokens` counts expanded sub-tokens (64 = the
+  bwd-reusable chunk cadence; a multiple of `lcm(64, n)` puts every
+  checkpoint on a real-token boundary). `safe_gate`, `use_beta_sigmoid` and
+  `allow_neg_eigval` (beta as `2 * sigmoid(x)`) all pass through. The op is
+  `cudnn.linear_attention.ops.gated_delta_product`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching

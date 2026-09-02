@@ -156,6 +156,14 @@ class DeviceView:
     def view_as(self, other):
         return self.reshape(tuple(other.shape))
 
+    def stride(self):
+        st = []
+        acc = 1
+        for s in reversed(self.shape):
+            st.append(acc)
+            acc *= s
+        return tuple(reversed(st))
+
     def contiguous(self):
         return self  # row-major contiguous by construction
 

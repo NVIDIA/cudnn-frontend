@@ -55,6 +55,28 @@ $$
 \mathrm{dprob}[m, 0, 0] = \sum_n C[m, n, 0] \cdot \mathrm{relu}(G[m, n])^2
 $$
 
+#### Tanh soft clamp (`tanh_clamp_scale`)
+
+`tanh_clamp_scale=s` differentiates the soft-clamped forward epilogue
+(see [grouped_gemm_srelu](grouped_gemm_srelu.md)) instead of the plain one. Writing
+$t = \tanh(\mathrm{relu}(G)/s)$ and $b = s\,t$, both equations keep their shape with
+$\mathrm{relu}(G)$ replaced by $b$, and the row output picks up the chain-rule factor
+$1 - t^2$:
+
+$$
+D\_{row}[m, n] = \mathrm{prob}[m, 0, 0] \cdot 2 \cdot C[m, n, 0] \cdot b[m, n] \cdot \left(1 - t[m, n]^2\right)
+$$
+
+$$
+\mathrm{dprob}[m, 0, 0] = \sum_n C[m, n, 0] \cdot b[m, n]^2
+$$
+
+Both kernels must be built with the same `s`, or the saved pre-activation is differentiated
+against the wrong nonlinearity. `s` is baked in at compile time, so distinct values compile
+distinct kernels. Determinism is unaffected: the clamp changes only the per-element value that
+feeds the dprob accumulation, never the slotting or reduction order, so
+[deterministic dprob](#deterministic-dprob) stays bit-exact for the clamped path too.
+
 `D_col` stores the companion column-quantized output used by the grouped kernel family. When FP8 output is enabled, the kernel also emits `SFD_row` and `SFD_col`. When fp16/bf16 output is used, the kernel can emit per-expert `Amax`.
 
 ### Diagram

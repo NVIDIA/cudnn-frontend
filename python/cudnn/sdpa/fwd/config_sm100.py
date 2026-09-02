@@ -20,7 +20,7 @@ those support checks have a gap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -93,6 +93,9 @@ class TemplateParams:
     # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
+    # Optional L2 working-set budget for SCHED_LPT_L2. Zero keeps the flavor's
+    # default budget.
+    lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
@@ -142,8 +145,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor not in ("d128", "d192"):
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128 and d192")
+    if fp8 and flavor not in ("d128", "d192", "d512"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192 and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
@@ -169,11 +172,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
-    # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor,
-    # but only make_cfg_d128 threads them into a Cfg and only the d128 kernel
-    # reads them.  Accepting them elsewhere would silently ignore them — and for
-    # split_kv that is not merely surprising but WRONG: the caller sizes an
-    # (S*B)-batch partial workspace and runs the combine, while the kernel keeps
+    # A flavor must explicitly consume split_kv / cta_mma. Accepting either
+    # elsewhere would silently ignore it; for split_kv that is also WRONG: the
+    # caller sizes an (S*B)-batch partial workspace and runs the combine, while the kernel keeps
     # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
     # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
     # corrupt the result instead of dropping out.  Reject at the door.
@@ -181,6 +182,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: split_kv is not implemented on this flavor (got {k.split_kv}); supported: {sorted(_SPLIT_KV_FLAVORS)}")
     if k.cta_mma != 2 and flavor not in _CTA_MMA_FLAVORS:
         raise ValueError(f"{flavor}: cta_mma is not selectable on this flavor (got {k.cta_mma}); supported: {sorted(_CTA_MMA_FLAVORS)}")
+    if flavor == "d192" and k.split_kv > 1 and k.cta_mma != 2:
+        raise ValueError("d192: split_kv > 1 is validated only with cta_mma=2")
     if k.split_kv < 1:
         raise ValueError(f"{flavor}: split_kv must be >= 1 (1 = KV-split off); got {k.split_kv}")
     if k.split_kv > 1:
@@ -194,8 +197,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
     if k.lpt_head_group not in (1, 8, 16):
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
-    if fp8 and flavor == "d192" and k.split_kv != 1:
-        raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
@@ -261,14 +262,15 @@ def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128) -> bool:
     return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and tile_m % (h_q // h_kv) == 0
 
 
-def cga_tile_m(d_qk: int) -> int:
+def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     """Q rows one cluster covers for a flavor: TILES_Q * TILE_M * CTA_MMA.
 
-    The tile-count denominator the pack_gqa heuristic needs (d128/d192: 512;
-    d256/d512: 256), computed from the flavor Cfg classes, not literals.
+    ``cta_mma`` overrides the flavor default when the selected kernel exposes a
+    CGA-width knob (D192). This keeps scheduler and heuristic geometry tied to
+    the configuration the launcher actually uses.
     """
     cls = {128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
-    return cls.TILES_Q * cls.TILE_M * cls.CTA_MMA
+    return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
 def _tma_iters_for(d_elems: int, bpe_val: int, swz_b: int) -> int:
@@ -545,6 +547,7 @@ class CfgD512:
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
+    _fp8 = cfg.DTYPE_QKV <= DTYPE_E5M2
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d512: MMA/TMALDG/TMASTG/Scheduler regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d512: register budget over 512"),
@@ -556,11 +559,33 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         (cfg.SOFTMAX_WARPGROUPS == 1, "d512 (role-split): SOFTMAX_WARPGROUPS must be 1"),
         (cfg.CORRECTION_WARPS == 0, "d512 (role-split): CORRECTION_WARPS must be 0"),
         (cfg.READ_TILE_ARRIVERS == 25, f"d512 cga4x1: expected READ_TILE_ARRIVERS=25, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128, "d512: Q/K/V/O swizzle must all be 128B"),
-        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d512 f16: TILE_K_HW must be 16 (1-chunk only on SM10x — 2-chunk silently wrong)"),
-        (cfg.STAGES_KV == 2, "d512 f16 (SM100): STAGES_KV must be 2 (SMEM-cap driven)"),
-        (cfg.XFER_STAGES == 2, "d512 f16 (SM100): XFER_STAGES must be 2 (TMEM-cap driven: 2*128 S_acc + 256 Q = 512)"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d512: DTYPE_O must equal DTYPE_QKV for half input"),
+        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128, "d512: Q/K/V swizzle must all be 128B"),
+        (cfg.O_SWZ_BYTES == 128, "d512: O swizzle must be 128B"),
+        # Both dtype families run the SM10x 1-chunk MMA step: f16 at K=16,
+        # FP8 at the K=32 QMMA (k_dim=0).  The Rubin K=64 2-chunk fast path is
+        # silently WRONG on Blackwell — see rules/mma-tma-matrix.md § 1.
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if _fp8 else 16),
+            "d512: TILE_K_HW must be 32 (fp8 K=32 QMMA) / 16 (f16, 1-chunk on SM10x — 2-chunk silently wrong)",
+        ),
+        # SMEM-cap driven: the K/V ring costs STAGES_KV * 64 KiB at f16 and
+        # STAGES_KV * 32 KiB at FP8, so FP8 buys a third stage under the same
+        # 227 KiB cap.
+        (cfg.STAGES_KV == (3 if _fp8 else 2), "d512 (SM100): STAGES_KV must be 3 (fp8) / 2 (f16) — SMEM-cap driven"),
+        # TMEM-cap driven (512 cols on Blackwell): the sg0 carve is
+        # XFER_STAGES * TILE_N (S_acc parities) + TILE_K / (4 // BPE) (Q, moved
+        # to TMEM by UTCCP).  f16: 2*128 + 256 = 512.  FP8 packs 4 elems per
+        # 4-byte column, so Q costs only 128 cols and a third parity fits:
+        # 3*128 + 128 = 512.
+        (cfg.XFER_STAGES == (3 if _fp8 else 2), "d512 (SM100): XFER_STAGES must be 3 (fp8) / 2 (f16) — TMEM-cap driven"),
+        (
+            cfg.XFER_STAGES * cfg.TILE_N + cfg.TILE_K // (4 // cfg.BPE) == 512,
+            f"d512 (SM100): sg0 TMEM carve (S_acc {cfg.XFER_STAGES * cfg.TILE_N} + Q {cfg.TILE_K // (4 // cfg.BPE)}) must be exactly 512 cols",
+        ),
+        (
+            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
+            "d512: DTYPE_O must equal DTYPE_QKV for half input; fp8 allows an independent output dtype",
+        ),
     )
     for ok, msg in checks:
         if not ok:
@@ -570,18 +595,29 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
 def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     _validate_params("d512", params)
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv <= DTYPE_E5M2  # E4M3/E5M2 inputs → the fp8 kernel file
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
+    # FP8 pins the Blackwell K=32 QMMA path.  NOT tile_k_hw(), which returns the
+    # Rubin K=64 answer (see mma-tma-matrix.md § 1 "latent trap in the shared
+    # helper") — k_dim=0 with TILE_K_HW=64 is the silently-wrong combination.
+    tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
     cfg = CfgD512(
         DTYPE_QKV=params.dtype_qkv,
-        DTYPE_O=params.dtype_qkv,
+        DTYPE_O=dtype_o,
         BPE=b,
-        BPE_O=b,
+        BPE_O=b_o,
         Q_SWZ_BYTES=q_swz_bytes(512, b),
         K_SWZ_BYTES=q_swz_bytes(512, b),
         V_SWZ_BYTES=v_swz_bytes(512, 2, b),
-        O_SWZ_BYTES=o_swz_bytes(512, b),
+        O_SWZ_BYTES=o_swz_bytes(512, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=tile_k_hw_fp8,
+        # FP8 halves the K/V ring and the TMEM-resident Q, buying a third KV
+        # stage and a third S_acc parity under the same SMEM / TMEM caps.
+        STAGES_KV=3 if fp8 else 2,
+        XFER_STAGES=3 if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -825,7 +861,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 # ---------------------------------------------------------------------------
-# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga2
+# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga1/cga2
 # ---------------------------------------------------------------------------
 
 
@@ -901,12 +937,107 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             raise ValueError(msg)
 
 
+def d192_square_br_as_tl(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
+    """Whether a D192 bottom-right mask is exactly top-left causal."""
+
+    return (
+        params.split_kv == 1
+        and not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+        and 4096 < s_kv <= 8192
+    )
+
+
+def canonicalize_d192_lowering(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    s_q: int,
+    s_kv: int,
+) -> TemplateParams:
+    """Apply strictly equivalent D192 lowering canonicalizations."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    window_left = params.window_left
+    window_right = params.window_right
+
+    template_window_right = window_right
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+        # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
+        # MASK_NONE x32 path. 1 << 30 exceeds any dense D192 sequence that
+        # fits in SM100 memory while leaving signed-int32 headroom for q + R;
+        # it preserves the lowering without making the module key depend on S_kv.
+        template_window_right = 1 << 30
+
+    template_bottom_right = False if d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params.bottom_right
+
+    return replace(
+        params,
+        window_right=template_window_right,
+        bottom_right=template_bottom_right,
+    )
+
+
+def derive_d192_internal_params(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    batch_size: int,
+    h_q: int,
+    s_q: int,
+    s_kv: int,
+) -> TemplateParams:
+    """Derive D192-private codegen fields after public knobs are fixed."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    pack_gqa_ratio = params.qh_per_kh if params.pack_gqa else 1
+    groups = batch_size * h_q // pack_gqa_ratio
+    lpt_head_group = 8 if fp8 and not params.thd_varlen and groups % 8 == 0 else 1
+    q_rows_per_cluster = cga_tile_m(192, params.cta_mma)
+    lpt_q_tiles = (s_q * pack_gqa_ratio + q_rows_per_cluster - 1) // q_rows_per_cluster if fp8 and not params.thd_varlen else 0
+
+    lpt_l2_size_mib = 0
+    lpt_l2_8k = params.sched_policy == SCHED_LPT_L2 and not params.thd_varlen and params.split_kv == 1 and s_q == 8192 and s_kv == 8192
+    if lpt_l2_8k and pertensor and params.dtype_qkv == DTYPE_E4M3 and groups % 24 != 0 and groups % 16 == 0:
+        # At 8K, 60 MiB groups 24 one-byte K/V heads; 40 MiB groups 16 and
+        # avoids a short final group for these grids.
+        lpt_l2_size_mib = 40
+    elif lpt_l2_8k and not fp8 and not params.pack_gqa and groups % 16 == 0:
+        # At 8K, each half-precision K/V head occupies 5 MiB. Grouping exactly
+        # 16 heads avoids a short final LPT-L2 group on the model grids.
+        lpt_l2_size_mib = 80
+
+    return replace(
+        params,
+        lpt_head_group=lpt_head_group,
+        lpt_q_tiles=lpt_q_tiles,
+        lpt_l2_size_mib=lpt_l2_size_mib,
+    )
+
+
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     _validate_params("d192", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    mask_flags = _mask_flags_from(params)
+    thd_swa = fp8 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    e4_thd_swa = thd_swa and params.dtype_qkv == DTYPE_E4M3
+    e5_dense_causal_regs = (
+        params.dtype_qkv == DTYPE_E5M2
+        and not params.thd_varlen
+        and params.split_kv == 1
+        and not params.bottom_right
+        and mask_flags == MASK_CAUSAL
+        and (params.window_right or 0) == 0
+    )
+    wide_role_regs = thd_swa or e5_dense_causal_regs
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -924,14 +1055,16 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
-        MASK_FLAGS=_mask_flags_from(params),
+        SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
+        MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=1,
-        SOFTMAX_REGS=184 if fp8 else 216 if _mask_flags_from(params) == MASK_NONE else 192,
-        CORRECTION_REGS=104 if fp8 else 40 if _mask_flags_from(params) == MASK_NONE else 88,
+        L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
+        SCHEDULER_POLICY=params.sched_policy,
+        SOFTMAX_REGS=192 if wide_role_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
+        CORRECTION_REGS=88 if wide_role_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),

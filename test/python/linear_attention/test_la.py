@@ -32,7 +32,7 @@ la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 import torch.nn.functional as F  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
-from .reference_gdn import gdn_reference, rms_ratio  # noqa: E402
+from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
 from .reference_gdn2 import beta_guard_reference, gdn2_reference  # noqa: E402
 from .reference_kda import kda_reference  # noqa: E402
 
@@ -51,6 +51,9 @@ FWD_TOL = {torch.bfloat16: 2e-2, torch.float16: 1e-2}
 STATE_TOL = {torch.bfloat16: 2e-2, torch.float16: 1e-2}
 BWD_TOL = {torch.bfloat16: 4e-2, torch.float16: 3e-2}
 STATE_GRAD_TOL = 6e-2
+
+HEAD_DIMS = [(64, 64), (64, 128), (128, 64), (128, 128)]  # (K, V) pairs every FROST family serves
+WIDE_HEAD_DIMS = [(192, 128), (256, 128)]  # cuTile only
 
 # (H, HV) pairs: H = Q/K heads, HV = V heads; gates/O/states live at HO = max.
 HEAD_CONFIGS = [(1, 1), (3, 3), (1, 2), (2, 4), (16, 32), (16, 64)]
@@ -89,9 +92,9 @@ OP_NAMES = {"gdn": "gated_delta_net", "kda": "kimi_delta_attention", "gdn2": "ga
 
 
 def op_modules():
-    from cudnn.linear_attention.ops import gdn, gdn2, kda
+    from cudnn.linear_attention.ops import gdn, gdn2, gdp, kda
 
-    return {"gdn": gdn, "kda": kda, "gdn2": gdn2}
+    return {"gdn": gdn, "kda": kda, "gdn2": gdn2, "gdp": gdp}
 
 
 def family_engines(backend_name):
@@ -512,14 +515,28 @@ def test_fwd_packed_matches_per_sequence(backend, variant):
         torch.testing.assert_close(fs[b], fs_b[0])
 
 
-@pytest.mark.parametrize(
-    "variant,K,V",
-    [("gdn", 64, 64), ("gdn", 64, 128), ("gdn", 128, 128), ("gdn", 256, 128), ("kda", 64, 64), ("kda", 64, 128), ("kda", 128, 128), ("gdn2", 128, 128)],
-)
+@pytest.mark.parametrize("K,V", HEAD_DIMS + WIDE_HEAD_DIMS)
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_head_dims(backend, variant, K, V):
-    """K/V head-dim variants; engines that only serve K = V = 128 decline."""
+    """K/V head-dim variants; an engine that does not serve a combination declines."""
     case = make_case(variant, torch.bfloat16, T=192, K=K, V=V)
     assert_fwd_parity(backend, case)
+
+
+@pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
+@pytest.mark.parametrize("K,V", HEAD_DIMS)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_head_dims(backend, variant, K, V, l2norm):
+    """Backward over the full K x V matrix, with and without the in-kernel Q/K
+    l2 norm (V = 64 exercises the m64 lane-packed accumulator paths, K = 64 the
+    single-subtile KQ walk, and the norm reduces over exactly d_qk channels)."""
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=192, H=2, HV=4, K=K, V=V), l2norm=l2norm)
+
+
+@pytest.mark.parametrize("K,V", HEAD_DIMS)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_head_dims_states_varlen(backend, variant, K, V):
+    assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[64, 128], K=K, V=V), use_initial_state=True, use_dfs=True, l2norm=True)
 
 
 @pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
@@ -630,6 +647,9 @@ def assert_bwd_parity(
     if case.varlen:
         ref_kwargs["cu_seqlens"] = case.cu
     o_ref, fs_ref = ref_fn(*ref_args, **ref_kwargs)
+    assert_rms_close("o", o, o_ref, FWD_TOL[case.dtype])
+    if fs is not None and fs.numel():
+        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[case.dtype])
     ref_outputs, ref_gos = [o_ref], [dO.double().reshape(o_ref.shape)]
     if use_dfs:
         ref_outputs.append(fs_ref)
@@ -663,6 +683,14 @@ def test_bwd_parity(backend, variant, dtype, T, H, HV):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_gqa(backend, variant, H, HK, HV):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128, H=H, HK=HK, HV=HV))
+
+
+@pytest.mark.parametrize("V", [64, 128])
+@pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
+def test_bwd_gqa_qk_l2norm(backend, H, HK, HV, V):
+    """The fused l2norm projection under head folds: per-output-head
+    projection with native-head q_n/k_n/inv, folded after."""
+    assert_bwd_parity(backend, make_case("gdn", torch.bfloat16, T=192, H=H, HK=HK, HV=HV, V=V), l2norm=True)
 
 
 @pytest.mark.parametrize("seq_lens", [[64, 192], [31, 63, 93, 123]], ids=["two", "ragged"])
@@ -700,6 +728,31 @@ def test_bwd_split_initial_state(backend, variant):
         if dO is None:
             dO = torch.randn_like(o)
         grads[tag] = torch.autograd.grad([o], leaves + [s0], [dO])
+    for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
+        assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_split_d_final_state(backend, variant):
+    """Backward over a cut work-item table with a final-state gradient: only
+    the piece that owns the sequence end seeds from it, every other piece
+    seeds zero, so the gradients must match the uncut (batch-invariant) table."""
+    case = make_case(variant, torch.bfloat16, B=1, T=SPLIT_T)
+    set_seed(SEED + 1)
+    state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda", dtype=torch.float32) * 0.05
+    tensors = {"q": case.q, "k": case.k, "v": case.v, "g": case.gates["g"], "beta": case.gates["beta"]}
+    if variant == "gdn2":
+        tensors["w"] = case.gates["w"]
+    dO, dFinal, grads = None, None, {}
+    for tag, kw in (("split", {}), ("uncut", {"batch_invariant": True})):
+        leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in tensors.values()]
+        s0 = state0.detach().clone().requires_grad_(True)
+        with waive_unsupported(backend, variant):
+            o, final_state = pinned_op(backend, variant)(*leaves, case.cu, initial_state=s0, output_final_state=True, **kw)
+        if dO is None:
+            dO = torch.randn_like(o)
+            dFinal = torch.randn_like(final_state) * 0.05
+        grads[tag] = torch.autograd.grad([o, final_state], leaves + [s0], [dO, dFinal])
     for name, got, want in zip(list(tensors) + ["initial_state"], grads["split"], grads["uncut"]):
         assert_rms_close(f"d{name} split-vs-uncut", got, want.float(), BWD_TOL[torch.bfloat16])
 
@@ -1014,6 +1067,20 @@ def test_bwd_state_grad_dtype_must_match_state(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_do_dtype_must_match_io(backend, variant):
+    """dO is declared at the io dtype on the graph, so a mismatched buffer is
+    rejected at the op instead of being reinterpreted."""
+    case = make_case(variant, torch.bfloat16, T=128, H=2)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"]))
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=torch.float16)
+    bwd = getattr(torch.ops.cudnn, OP_NAMES[variant] + "_bwd")
+    with pytest.raises(TypeError, match="dO"):
+        bwd(dO, *args, case.cu, float(case.K**-0.5))
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_state_grad_cache_separation(backend, variant):
     """Two state-gradient dtypes for one shape inside one process."""
     case = make_case(variant, torch.bfloat16, T=256, H=2)
@@ -1294,12 +1361,13 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
 
 
 @pytest.mark.parametrize("ckpt_mult", [2, 3])
+@pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_checkpoints_coarse_cadence(backend, variant, ckpt_mult):
+def test_checkpoints_coarse_cadence(backend, variant, K, ckpt_mult):
     """Coarser cadences (multiples of the base chunk) keep the prefix contract."""
     ckpt = CHUNK[variant] * ckpt_mult
     T = 5 * ckpt
-    case = make_case(variant, torch.bfloat16, T=T)
+    case = make_case(variant, torch.bfloat16, T=T, K=K)
     o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
@@ -1363,15 +1431,44 @@ def test_safe_gate_forward_parity(backend, variant):
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
-@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_safe_gate_backward(backend, variant, gate_dtype):
+def test_allow_neg_eigval_parity(backend, variant):
+    """The fused ``2 * sigmoid(beta)`` matches the same activation fed
+    post-hoc, forward and backward. beta in (0, 2) is the regime where
+    ``I - beta k k^T`` can reach negative eigenvalues."""
+    case = make_case(variant, torch.bfloat16, T=128)
+    logits = torch.randn(1, case.T, case.HO, device="cuda")
+    if variant == "gdn2":
+        logits = torch.randn(1, case.T, case.HO, case.K, device="cuda")
+    activated = 2.0 * logits.to(case.dtype).float().sigmoid()
+    eff_beta = activated.to(case.dtype) if variant == "gdn2" else activated
+    kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True)
+    raw_case = case.clone(gates=dict(case.gates, beta=logits.to(case.dtype)))
+    eff_case = case.clone(gates=dict(case.gates, beta=eff_beta))
+    o_raw, fs_raw = run_fwd(backend, raw_case, use_beta_sigmoid_in_kernel=True, allow_neg_eigval=True, **kw)
+    o_eff, fs_eff = run_fwd(backend, eff_case, **kw)
+    assert_rms_close("o", o_raw, o_eff.double(), 2e-2)
+    assert rms_ratio(fs_raw, fs_eff) < 2e-2
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_allow_neg_eigval_requires_beta_sigmoid(backend, variant):
+    """The 2x rides on the fused sigmoid; without it the op declines."""
+    case = make_case(variant, torch.bfloat16, T=64)
+    with pytest.raises(ValueError, match="allow_neg_eigval requires use_beta_sigmoid_in_kernel"):
+        run_fwd(backend, case, allow_neg_eigval=True)
+
+
+@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_backward(backend, variant, K, gate_dtype):
     """Fused-gate training: dG comes back in raw-logit space and the
     parameter gradients satisfy their exact identities over dG
     (d_dt_bias = sum dg_raw; d_a_log = sum dg_raw * (g + dt_bias) per-channel,
     or sum dg_raw * softplus(y) / sigmoid(y) for GDN's scalar gate)."""
     lb = -5.0
-    case, graw, a_log, dt_bias = safe_gate_case(variant, T=128)
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=128, K=K)
     set_seed(SEED + 9)
     a_leaf = (torch.randn_like(a_log) * 0.3).requires_grad_(True)
     dt_leaf = (torch.randn_like(dt_bias) * 0.3).requires_grad_(True)
@@ -1407,6 +1504,61 @@ def test_safe_gate_backward(backend, variant, gate_dtype):
         assert (got - ident).abs().max().item() / scale < ident_tol, name
     for name, leaf in (("dq", args[0]), ("dbeta", beta_leaf)):
         assert leaf.grad is not None and bool(torch.isfinite(leaf.grad).all()), name
+
+
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_param_16bit(backend, variant, param_dtype):
+    """a_log/dt_bias are widened on load: 16-bit parameters match their exact
+    fp32 twins bitwise."""
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=256)
+    set_seed(SEED + 12)
+    a16 = (torch.randn_like(a_log) * 0.3).to(param_dtype)
+    dt16 = (torch.randn_like(dt_bias) * 0.3).to(param_dtype)
+    raw_case = case.clone(gates=dict(case.gates, g=graw))
+    kw = dict(safe_gate=True, output_final_state=True)
+    if variant != "gdn":
+        kw["gate_lower_bound"] = -5.0
+    o16, fs16 = run_fwd(backend, raw_case, a_log=a16, dt_bias=dt16, **kw)
+    o32, fs32 = run_fwd(backend, raw_case, a_log=a16.float(), dt_bias=dt16.float(), **kw)
+    assert_bitwise("o", o16, o32)
+    assert_bitwise("final_state", fs16, fs32)
+
+
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_backward_param_16bit(backend, variant, K, param_dtype):
+    """d_a_log/d_dt_bias come back in the parameter dtype and satisfy the dG
+    identities to that dtype's precision."""
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=128, K=K)
+    set_seed(SEED + 9)
+    a_leaf = (torch.randn_like(a_log) * 0.3).to(param_dtype).requires_grad_(True)
+    dt_leaf = (torch.randn_like(dt_bias) * 0.3).to(param_dtype).requires_grad_(True)
+    raw_gates = dict(case.gates, g=graw)
+    kw = dict(safe_gate=True, a_log=a_leaf, dt_bias=dt_leaf, use_qk_l2norm_in_kernel=True)
+    if variant != "gdn":
+        kw["gate_lower_bound"] = -5.0
+    raw_case = case.clone(gates=raw_gates)
+    g_leaf = to_thd(raw_gates["g"]).detach().clone().requires_grad_(True)
+    args = [to_thd(raw_case.q).detach().clone().requires_grad_(True), to_thd(raw_case.k), to_thd(raw_case.v), g_leaf, to_thd(raw_gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(raw_gates["w"]))
+    with waive_unsupported(backend, variant):
+        o, _ = pinned_op(backend, variant)(*args, case.cu, **kw)
+        o.sum().backward()
+    assert a_leaf.grad.dtype == param_dtype, f"d_a_log is {a_leaf.grad.dtype}, a_log is {param_dtype}"
+    assert dt_leaf.grad.dtype == param_dtype, f"d_dt_bias is {dt_leaf.grad.dtype}, dt_bias is {param_dtype}"
+    dg_raw = g_leaf.grad.double()
+    ddt_id = dg_raw.sum(0)
+    if variant == "gdn":
+        y = g_leaf.detach().double() + dt_leaf.detach().double()[None]
+        da_id = (dg_raw * (F.softplus(y) / torch.sigmoid(y))).sum(0)
+    else:
+        da_id = (dg_raw * (g_leaf.detach().double() + dt_leaf.detach().double()[None])).sum(dim=(0, 2))
+    for name, got, ident in (("d_dt_bias", dt_leaf.grad.double(), ddt_id), ("d_a_log", a_leaf.grad.double(), da_id)):
+        scale = max(ident.abs().max().item(), 1e-6)
+        assert (got - ident).abs().max().item() / scale < 5e-2, name
 
 
 def test_beta_sigmoid_in_kernel(backend):
@@ -1932,11 +2084,12 @@ def test_batch_invariance_bwd(backend, variant):
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_bwd_checkpoint_reuse(backend, variant):
+def test_bwd_checkpoint_reuse(backend, variant, K):
     """Training with chunk-cadence checkpoints: the bwd consumes the fwd's
     series instead of recomputing it, and the grads match bitwise."""
-    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
     grads_by_mode = []
     for ckpt in (0, CHUNK[variant]):
         leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
@@ -1951,6 +2104,38 @@ def test_bwd_checkpoint_reuse(backend, variant):
             grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
     for gr, gc in zip(grads_by_mode[0], grads_by_mode[1]):
         assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("ckpt_mult", [2, 3])
+def test_bwd_coarse_checkpoint_seeded_recompute(backend, variant, ckpt_mult, K):
+    """Training with a coarse checkpoint cadence: the bwd reconstructs the
+    dense series with one checkpoint-seeded recompute item per interval, and
+    the grads match the zero-seed recompute path BITWISE. The reseed reads the
+    same io-dtype row the dense path would have written, and every chunk's
+    state carry passes through that same rounding, so an interval boundary
+    costs nothing; a deviation here means some chunk carries precision the
+    checkpoint does not. Both arms run batch-invariant: the default split-K
+    cuts are accurate to ``2^log2_threshold``, not bitwise, so the reference
+    arm must be uncut for the comparison to isolate the reseed."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], K=K)
+    grads_by_mode = []
+    for ckpt in (0, CHUNK[variant] * ckpt_mult):
+        leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
+        args = [leaves[0], leaves[1], to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"]))
+        with waive_unsupported(backend, variant):
+            out = pinned_op(backend, variant)(*args, case.cu, checkpoint_every_n_tokens=ckpt, batch_invariant=True)
+            o = out[0]
+            set_seed(SEED + 5)
+            dO = torch.randn_like(o)
+            grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
+    for name, gr, gc in zip(("dq", "dk"), grads_by_mode[0], grads_by_mode[1]):
+        assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
+        assert torch.equal(bits(gr), bits(gc)), f"coarse-checkpoint {name} differs from the recompute path"
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
@@ -2199,3 +2384,540 @@ def test_hang_stress_initial_state_boundaries(backend, variant, capfd):
     (the gdn prefill/recompute seed-credit wedge)."""
     case = make_case(variant, torch.bfloat16, seq_lens=[64, 0, 128, 0, 64] * 24, H=16)
     run_hang_stress(backend, case, use_initial_state=True, fwd_each_iter=True, label=f"initial_state_boundaries[{variant}]", capfd=capfd)
+
+
+# ---------------------------------------------------------------------------
+# GDP (Gated DeltaProduct)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def gdp_frost():
+    """Pin gdp_frost; skip when the gdp family offers no engine here."""
+    from cudnn.engines import manifest
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    family = next(f for f in manifest.MANIFEST if f.name == "gdp")
+    if not manifest.instantiate(family, family.offered_ids()):
+        pytest.skip("no gdp engine available in this environment")
+    gdp_module.fprop_cache.clear()
+    gdp_module.bprop_cache.clear()
+    try:
+        yield functools.partial(la_ops.gated_delta_product, plan_name="gdp_frost")
+    finally:
+        gdp_module.fprop_cache.clear()
+        gdp_module.bprop_cache.clear()
+
+
+def run_gdp(pinned, *args, **kw):
+    try:
+        return pinned(*args, **kw)
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        pytest.skip(f"gdp_frost declined: {exc}")
+
+
+def make_gdp_case(dtype, n, *, B=1, T=None, seq_lens=None, H=2, HK=None, HV=None, K=128, V=128, lo=None, seed=SEED):
+    """q/g/cu at real tokens plus k/v/beta on the expanded sub-token timeline."""
+    base = make_case("gdn", dtype, B=B, T=T, seq_lens=seq_lens, H=H, HK=HK, HV=HV, K=K, V=V, lo=lo, seed=seed)
+    expanded = make_case(
+        "gdn",
+        dtype,
+        B=B,
+        T=None if seq_lens is not None else base.T * n,
+        seq_lens=None if seq_lens is None else [sl * n for sl in seq_lens],
+        H=H,
+        HK=HK,
+        HV=HV,
+        K=K,
+        V=V,
+        lo=lo,
+        seed=seed + 1,
+    )
+    return base, expanded
+
+
+def gdp_args(base, expanded, n):
+    return [to_thd(base.q), to_thd(expanded.k), to_thd(expanded.v), to_thd(base.gates["g"]), to_thd(expanded.gates["beta"]), base.cu, n]
+
+
+def gdp_ref(base, expanded, n, *, scale=None, initial_state=None, l2norm=False):
+    q, k = base.q, expanded.k
+    if l2norm:
+        q = F.normalize(q.float(), dim=-1)
+        k = F.normalize(k.float(), dim=-1)
+    kwargs = dict(num_householder=n, scale=scale, initial_state=initial_state)
+    if base.varlen:
+        kwargs["cu_seqlens"] = base.cu
+    with torch.no_grad():
+        return gdp_reference(q, k, expanded.v, base.gates["g"], expanded.gates["beta"], **kwargs)
+
+
+def assert_gdp_fwd_parity(pinned, base, expanded, n, *, scale=None, use_initial_state=False, state_dtype=torch.float32, l2norm=False, seed=SEED + 1):
+    set_seed(seed)
+    state0 = None
+    if use_initial_state:
+        state0 = (torch.randn(base.N, base.HO, base.V, base.K, device="cuda", dtype=torch.float32) * 0.05).to(state_dtype)
+    o, fs = run_gdp(pinned, *gdp_args(base, expanded, n), scale=scale, initial_state=state0, output_final_state=True, use_qk_l2norm_in_kernel=l2norm)
+    if use_initial_state:
+        assert fs.dtype == state_dtype, f"final_state is {fs.dtype}, initial_state is {state_dtype}"
+    o_ref, fs_ref = gdp_ref(base, expanded, n, scale=scale, initial_state=state0.float() if state0 is not None else None, l2norm=l2norm)
+    assert_rms_close("o", o, o_ref, FWD_TOL[base.dtype])
+    assert_rms_close("final_state", fs, fs_ref, STATE_TOL[base.dtype])
+
+
+def assert_gdp_bwd_parity(
+    pinned, base, expanded, n, *, use_initial_state=False, use_dfs=False, state_dtype=torch.float32, l2norm=False, gate_grad_tol=None, seed=SEED + 1
+):
+    tol = BWD_TOL[base.dtype]
+    tensors = {"q": base.q, "k": expanded.k, "v": expanded.v, "g": base.gates["g"], "beta": expanded.gates["beta"]}
+    op_leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
+    ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in tensors.items()}
+    set_seed(seed)
+    state0_op = state0_ref = None
+    if use_initial_state:
+        state0 = (torch.randn(base.N, base.HO, base.V, base.K, device="cuda", dtype=torch.float32) * 0.05).to(state_dtype)
+        state0_op = state0.detach().clone().requires_grad_(True)
+        state0_ref = state0.detach().double().requires_grad_(True)
+
+    o, fs = run_gdp(
+        pinned,
+        op_leaves["q"],
+        op_leaves["k"],
+        op_leaves["v"],
+        op_leaves["g"],
+        op_leaves["beta"],
+        base.cu,
+        n,
+        initial_state=state0_op,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=l2norm,
+    )
+    dO = torch.randn_like(o)
+    outputs, grad_outputs = [o], [dO]
+    dFS = None
+    if use_dfs:
+        dFS = torch.randn_like(fs) * 0.1
+        outputs.append(fs)
+        grad_outputs.append(dFS)
+    grad_inputs = list(op_leaves.values()) + ([state0_op] if use_initial_state else [])
+    grads = torch.autograd.grad(outputs, grad_inputs, grad_outputs)
+
+    qd, kd = ref_leaves["q"], ref_leaves["k"]
+    if l2norm:
+        qd, kd = F.normalize(qd, dim=-1), F.normalize(kd, dim=-1)
+    ref_kwargs = dict(num_householder=n, initial_state=state0_ref)
+    if base.varlen:
+        ref_kwargs["cu_seqlens"] = base.cu
+    o_ref, fs_ref = gdp_reference(qd, kd, ref_leaves["v"], ref_leaves["g"], ref_leaves["beta"], **ref_kwargs)
+    assert_rms_close("o", o, o_ref, FWD_TOL[base.dtype])
+    if fs is not None and fs.numel():
+        assert_rms_close("final_state", fs, fs_ref, STATE_TOL[base.dtype])
+    ref_outputs, ref_gos = [o_ref], [dO.double().reshape(o_ref.shape)]
+    if use_dfs:
+        ref_outputs.append(fs_ref)
+        ref_gos.append(dFS.double().reshape(fs_ref.shape))
+    ref_grads = torch.autograd.grad(ref_outputs, list(ref_leaves.values()) + ([state0_ref] if use_initial_state else []), ref_gos)
+
+    names = list(op_leaves) + (["initial_state"] if use_initial_state else [])
+    for name, got, want in zip(names, grads, ref_grads):
+        tol_n = tol
+        if name == "initial_state":
+            tol_n = STATE_GRAD_TOL
+        elif name == "g" and gate_grad_tol is not None:
+            tol_n = gate_grad_tol
+        assert_rms_close(f"d{name}", got, want, tol_n)
+
+
+@pytest.mark.parametrize("n", (1, 2, 3))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_gdp_fwd_parity(gdp_frost, n, dtype):
+    base, expanded = make_gdp_case(dtype, n, T=256)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n)
+
+
+@pytest.mark.parametrize("n", (2, 3))
+def test_gdp_fwd_varlen_l2norm_state(gdp_frost, n):
+    base, expanded = make_gdp_case(torch.bfloat16, n, seq_lens=[100, 156])
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n, l2norm=True, use_initial_state=True)
+
+
+@pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
+def test_gdp_fwd_gqa(gdp_frost, H, HK, HV):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_fwd_split_table(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=SPLIT_T, lo=0.1)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+@pytest.mark.parametrize("l2norm", (False, True), ids=["plain", "l2norm"])
+@pytest.mark.parametrize("n", (2, 3))
+def test_gdp_bwd_parity(gdp_frost, n, l2norm):
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, n, l2norm=l2norm)
+
+
+@pytest.mark.parametrize("H,HK,HV", [(6, 6, 2), (2, 4, 4)])
+def test_gdp_bwd_gqa(gdp_frost, H, HK, HV):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_bwd_varlen_states(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, seq_lens=[64, 128])
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, use_initial_state=True, use_dfs=True)
+
+
+def test_gdp_beta_two(gdp_frost):
+    """beta in (0, 2): the negative-eigenvalue GDP regime (fp32 beta, fusion off)."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128)
+    expanded.gates["beta"] = torch.rand_like(expanded.gates["beta"]) * 1.95
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_use_beta_sigmoid(gdp_frost):
+    n = 2
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    logits = torch.randn(expanded.T, expanded.HO, device="cuda", dtype=torch.bfloat16)
+    args = gdp_args(base, expanded, n)
+    args[4] = logits
+    o, fs = run_gdp(gdp_frost, *args, output_final_state=True, use_beta_sigmoid_in_kernel=True)
+    expanded.gates["beta"] = logits.float().sigmoid().reshape(1, expanded.T, expanded.HO)
+    o_ref, fs_ref = gdp_ref(base, expanded, n)
+    assert_rms_close("o", o, o_ref, FWD_TOL[torch.bfloat16])
+    assert_rms_close("final_state", fs, fs_ref, STATE_TOL[torch.bfloat16])
+
+
+def test_gdp_allow_neg_eigval(gdp_frost):
+    """The fused 2x reaches the same (0, 2) beta regime that
+    ``test_gdp_beta_two`` covers with the fusion off."""
+    n = 2
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    logits = torch.randn(expanded.T, expanded.HO, device="cuda", dtype=torch.bfloat16)
+    args = gdp_args(base, expanded, n)
+    args[4] = logits
+    o, fs = run_gdp(gdp_frost, *args, output_final_state=True, use_beta_sigmoid_in_kernel=True, allow_neg_eigval=True)
+    expanded.gates["beta"] = (2.0 * logits.float().sigmoid()).reshape(1, expanded.T, expanded.HO)
+    o_ref, fs_ref = gdp_ref(base, expanded, n)
+    assert_rms_close("o", o, o_ref, FWD_TOL[torch.bfloat16])
+    assert_rms_close("final_state", fs, fs_ref, STATE_TOL[torch.bfloat16])
+
+
+def test_gdp_safe_gate(gdp_frost):
+    """GDP applies the safe gate in the expansion pass (the transform has no
+    finite logit that leaves the filler sub-token rows neutral), so it must
+    match feeding the same activated gate with safe_gate off."""
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    HO = expanded.HO
+    g_raw = torch.randn(base.T, HO, device="cuda") * 0.5
+    a_log = (torch.randn(HO, device="cuda") * 0.3).requires_grad_(True)
+    dt_bias = (torch.randn(HO, device="cuda") * 0.3).requires_grad_(True)
+    args = gdp_args(base, expanded, n)
+    args[3] = g_raw
+    o, fs = run_gdp(gdp_frost, *args, output_final_state=True, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    g_eff = (-torch.exp(a_log.detach()) * F.softplus(g_raw + dt_bias.detach())).float()
+    args_eff = gdp_args(base, expanded, n)
+    args_eff[3] = g_eff
+    o_eff, fs_eff = run_gdp(gdp_frost, *args_eff, output_final_state=True)
+    assert_rms_close("o", o, o_eff.double(), 2e-2)
+    assert rms_ratio(fs, fs_eff) < 2e-2
+
+
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_gdp_safe_gate_param_16bit(gdp_frost, param_dtype):
+    """16-bit a_log/dt_bias match their exact fp32 twins bitwise (widened on
+    load in the expansion pass)."""
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    HO = expanded.HO
+    set_seed(SEED + 12)
+    g_raw = torch.randn(base.T, HO, device="cuda") * 0.5
+    a16 = (torch.randn(HO, device="cuda") * 0.3).to(param_dtype)
+    dt16 = (torch.randn(HO, device="cuda") * 0.3).to(param_dtype)
+    args = gdp_args(base, expanded, n)
+    args[3] = g_raw
+    o16, fs16 = run_gdp(gdp_frost, *args, output_final_state=True, safe_gate=True, a_log=a16, dt_bias=dt16)
+    o32, fs32 = run_gdp(gdp_frost, *args, output_final_state=True, safe_gate=True, a_log=a16.float(), dt_bias=dt16.float())
+    assert_bitwise("o", o16, o32)
+    assert_bitwise("final_state", fs16, fs32)
+
+
+def test_gdp_safe_gate_requires_params(gdp_frost):
+    """safe_gate needs a_log and dt_bias; the op declines without them."""
+    n = 2
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=64)
+    with pytest.raises(ValueError, match="safe_gate requires a_log and dt_bias"):
+        run_gdp(gdp_frost, *gdp_args(base, expanded, n), safe_gate=True)
+
+
+def test_gdp_n1_matches_gdn_bitwise(gdp_frost):
+    """num_householder == 1 is the GDN math on the GDN kernels: bitwise."""
+    case = make_case("gdn", torch.bfloat16, T=256)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"]), case.cu]
+    o, fs = run_gdp(gdp_frost, *args, 1, output_final_state=True)
+    o_gdn, fs_gdn = la_ops.gated_delta_net(*args, output_final_state=True, plan_name="gdn_frost")
+    assert torch.equal(o, o_gdn) and torch.equal(fs, fs_gdn)
+
+
+def test_gdp_checkpoint_series(gdp_frost):
+    """checkpoint counts expanded sub-tokens: 64 = bwd-reusable chunk cadence,
+    64 * n = every checkpoint on a real-token boundary."""
+    n, T = 3, 256
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=T)
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64)
+    assert out[2].shape[0] == T * n // 64 + base.N
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64 * n)
+    assert out[2].shape[0] == T * n // (64 * n) + base.N
+
+
+def test_gdp_bwd_checkpoint_reuse(gdp_frost):
+    """checkpoint_every_n_tokens=64 makes the backward consume the forward's
+    series instead of recomputing; gradients stay at oracle parity."""
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
+    leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+    out = run_gdp(gdp_frost, *leaves, base.cu, n, checkpoint_every_n_tokens=64)
+    grads = torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
+    assert all(torch.isfinite(gr.float()).all() for gr in grads)
+    assert any(t.get("checkpoints") is not None for _g, t in gdp_module.bprop_cache.values()), "backward did not consume the forward's checkpoint series"
+
+
+def test_gdp_bwd_coarse_checkpoint(gdp_frost):
+    """A coarse expanded-sub-token cadence (64 * n * m) feeds the backward's
+    checkpoint-seeded per-interval recompute; grads track the zero-seed
+    recompute path closely (the guard below is a loose bound)."""
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=512)
+    grads_by_mode = []
+    for ckpt in (0, 64 * n * 2):
+        leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+        out = run_gdp(gdp_frost, *leaves, base.cu, n, checkpoint_every_n_tokens=ckpt)
+        set_seed(SEED + 5)
+        dO = torch.randn_like(out[0])
+        grads_by_mode.append(torch.autograd.grad([out[0]], leaves, [dO]))
+    for name, gr, gc in zip(("dq", "dk", "dv", "dg", "dbeta"), grads_by_mode[0], grads_by_mode[1]):
+        assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
+        rel = ((gr.float() - gc.float()).abs().max() / gr.float().abs().max().clamp_min(1e-6)).item()
+        assert rel < 5e-2, f"coarse-checkpoint {name} diverges from the recompute path (rel {rel:.3e})"
+
+
+def test_gdp_engine_routing(gdp_frost):
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    base, expanded = make_gdp_case(torch.bfloat16, 2, T=128)
+    run_gdp(gdp_frost, *gdp_args(base, expanded, 2))
+    names = {g.selected_engine.name for g, _t in gdp_module.fprop_cache.values() if g.selected_engine is not None}
+    assert names == {"gdp_frost"}
+
+
+@pytest.mark.parametrize("l2norm", (False, True), ids=["plain", "l2norm"])
+@pytest.mark.parametrize("K,V", HEAD_DIMS)
+def test_gdp_head_dims(gdp_frost, K, V, l2norm):
+    """GDP over the same K x V matrix as GDN, whose kernels it reuses."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, K=K, V=V)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3, l2norm=l2norm)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, l2norm=l2norm)
+
+
+# ---------------------------------------------------------------------------
+# GDP at d_v = 64
+# ---------------------------------------------------------------------------
+
+V64 = dict(K=128, V=64)
+
+
+def test_gdp_v64_routes_to_the_fork(gdp_frost):
+    """A d_v = 64 GDP compiles the fork kernels in both directions."""
+    from cudnn.linear_attention.frost.kernel import gdp_bprop_v64_f16, gdp_prefill_v64_f16
+
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, **V64)
+    leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+    out = run_gdp(gdp_frost, *leaves, base.cu, 3)
+    torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
+    assert gdp_prefill_v64_f16.get_compiled_cache.cache_info().currsize > 0, "d_v = 64 GDP forward did not compile gdp_prefill_v64_f16"
+    assert gdp_bprop_v64_f16.get_compiled_cache.cache_info().currsize > 0, "d_v = 64 GDP backward did not compile gdp_bprop_v64_f16"
+
+
+@pytest.mark.parametrize("n", (1, 2, 3))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_gdp_v64_fwd_parity(gdp_frost, n, dtype):
+    base, expanded = make_gdp_case(dtype, n, T=256, **V64)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n)
+
+
+@pytest.mark.parametrize("n", (2, 3))
+def test_gdp_v64_fwd_varlen_l2norm_state(gdp_frost, n):
+    base, expanded = make_gdp_case(torch.bfloat16, n, seq_lens=[100, 156], **V64)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, n, l2norm=True, use_initial_state=True)
+
+
+@pytest.mark.parametrize("H,HK,HV", GQA_CONFIGS)
+def test_gdp_v64_fwd_gqa(gdp_frost, H, HK, HV):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV, **V64)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_v64_fwd_split_table(gdp_frost):
+    """Long enough that the work-item table cuts: the compact stores must stay
+    correct when a piece starts mid-sequence."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=SPLIT_T, lo=0.1, **V64)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3)
+
+
+@pytest.mark.parametrize("l2norm", (False, True), ids=["plain", "l2norm"])
+@pytest.mark.parametrize("n", (2, 3, 4))
+def test_gdp_v64_bwd_parity(gdp_frost, n, l2norm):
+    """n = 4 is here because b_t = 64 is divisible by it, so the final-slot run
+    lands at a different phase than n = 3."""
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, **V64)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, n, l2norm=l2norm)
+
+
+@pytest.mark.parametrize("H,HK,HV", [(6, 6, 2), (2, 4, 4)])
+def test_gdp_v64_bwd_gqa(gdp_frost, H, HK, HV):
+    """HK/HV < HO folds dq/dk through head_group_reduce, a second consumer of
+    whatever layout the dQ store writes."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, H=H, HK=HK, HV=HV, **V64)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
+
+
+def test_gdp_v64_bwd_varlen_states(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, seq_lens=[64, 128], **V64)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, use_initial_state=True, use_dfs=True)
+
+
+def test_gdp_v64_bwd_split_table(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=SPLIT_T, lo=0.1, **V64)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, l2norm=True)
+
+
+def test_gdp_v64_checkpoint_series(gdp_frost):
+    n, T = 3, 256
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=T, **V64)
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64)
+    assert out[2].shape[0] == T * n // 64 + base.N
+    out = run_gdp(gdp_frost, *gdp_args(base, expanded, n), output_final_state=True, checkpoint_every_n_tokens=64 * n)
+    assert out[2].shape[0] == T * n // (64 * n) + base.N
+
+
+def test_gdp_v64_bwd_checkpoint_reuse(gdp_frost):
+    from cudnn.linear_attention.ops import gdp as gdp_module
+
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, **V64)
+    leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+    out = run_gdp(gdp_frost, *leaves, base.cu, n, checkpoint_every_n_tokens=64)
+    grads = torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
+    assert all(torch.isfinite(gr.float()).all() for gr in grads)
+    assert any(t.get("checkpoints") is not None for _g, t in gdp_module.bprop_cache.values()), "backward did not consume the forward's checkpoint series"
+
+
+def test_gdp_v64_bwd_coarse_checkpoint(gdp_frost):
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=512, **V64)
+    grads_by_mode = []
+    for ckpt in (0, 64 * n * 2):
+        leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
+        out = run_gdp(gdp_frost, *leaves, base.cu, n, checkpoint_every_n_tokens=ckpt)
+        set_seed(SEED + 5)
+        dO = torch.randn_like(out[0])
+        grads_by_mode.append(torch.autograd.grad([out[0]], leaves, [dO]))
+    for name, gr, gc in zip(("dq", "dk", "dv", "dg", "dbeta"), grads_by_mode[0], grads_by_mode[1]):
+        assert torch.isfinite(gc.float()).all(), f"coarse-checkpoint {name} is not finite"
+        rel = ((gr.float() - gc.float()).abs().max() / gr.float().abs().max().clamp_min(1e-6)).item()
+        assert rel < 5e-2, f"coarse-checkpoint {name} diverges from the recompute path (rel {rel:.3e})"
+
+
+def test_gdp_v64_safe_gate(gdp_frost):
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, **V64)
+    HO = expanded.HO
+    g_raw = torch.randn(base.T, HO, device="cuda") * 0.5
+    a_log = (torch.randn(HO, device="cuda") * 0.3).requires_grad_(True)
+    dt_bias = (torch.randn(HO, device="cuda") * 0.3).requires_grad_(True)
+    args = gdp_args(base, expanded, n)
+    args[3] = g_raw
+    o, fs = run_gdp(gdp_frost, *args, output_final_state=True, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    g_eff = (-torch.exp(a_log.detach()) * F.softplus(g_raw + dt_bias.detach())).float()
+    args_eff = gdp_args(base, expanded, n)
+    args_eff[3] = g_eff
+    o_eff, fs_eff = run_gdp(gdp_frost, *args_eff, output_final_state=True)
+    assert_rms_close("o", o, o_eff.double(), 2e-2)
+    assert rms_ratio(fs, fs_eff) < 2e-2
+
+
+def gdp_gate_dtype_pair(gate_dtype, n, **case_kw):
+    """One GDP case with a 16-bit gate and its EXACT fp32 twin."""
+    base, expanded = make_gdp_case(torch.bfloat16, n, **case_kw)
+    g16 = base.gates["g"].to(gate_dtype)
+    narrow = base.clone(gates=dict(base.gates, g=g16))
+    wide = base.clone(gates=dict(base.gates, g=g16.float()))
+    return narrow, wide, expanded
+
+
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("geometry", ["v128", "v64"])
+def test_gdp_fwd_gate_16bit(gdp_frost, geometry, gate_dtype):
+    """The gate is widened on load, so the 16-bit arm matches its fp32 twin
+    bitwise on the shared kernel and on the d_v = 64 fork."""
+    kw = V64 if geometry == "v64" else {}
+    narrow, wide, expanded = gdp_gate_dtype_pair(gate_dtype, 3, T=256, **kw)
+    o16, fs16 = run_gdp(gdp_frost, *gdp_args(narrow, expanded, 3), output_final_state=True)
+    o32, fs32 = run_gdp(gdp_frost, *gdp_args(wide, expanded, 3), output_final_state=True)
+    assert_bitwise("o", o16, o32)
+    assert_bitwise("final_state", fs16, fs32)
+    assert_gdp_fwd_parity(gdp_frost, narrow, expanded, 3)
+
+
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+def test_gdp_v64_fwd_gate_16bit_l2norm(gdp_frost, gate_dtype):
+    narrow, wide, expanded = gdp_gate_dtype_pair(gate_dtype, 3, T=256, **V64)
+    o16, _ = run_gdp(gdp_frost, *gdp_args(narrow, expanded, 3), use_qk_l2norm_in_kernel=True)
+    o32, _ = run_gdp(gdp_frost, *gdp_args(wide, expanded, 3), use_qk_l2norm_in_kernel=True)
+    assert_bitwise("o", o16, o32)
+
+
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16], ids=DTYPE_IDS.get)
+@pytest.mark.parametrize("geometry", ["v128", "v64"])
+def test_gdp_bwd_gate_16bit(gdp_frost, geometry, gate_dtype):
+    """dG leaves in the gate's own dtype, as the forward takes it."""
+    kw = V64 if geometry == "v64" else {}
+    narrow, _wide, expanded = gdp_gate_dtype_pair(gate_dtype, 3, T=128, **kw)
+    assert_gdp_bwd_parity(gdp_frost, narrow, expanded, 3, gate_grad_tol=8e-2)
+
+
+@pytest.mark.parametrize("geometry", ["v128", "v64"])
+def test_gdp_state_bf16(gdp_frost, geometry):
+    """bf16 initial_state: final_state and the state gradients follow its dtype."""
+    kw = V64 if geometry == "v64" else {}
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, **kw)
+    assert_gdp_fwd_parity(gdp_frost, base, expanded, 3, use_initial_state=True, state_dtype=torch.bfloat16)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, use_initial_state=True, use_dfs=True, state_dtype=torch.bfloat16)
+
+
+def test_gdp_v64_beta_io_dtype(gdp_frost):
+    """beta at the io dtype without the fused sigmoid (widened on load)."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, **V64)
+    b16 = expanded.gates["beta"].to(torch.bfloat16)
+    narrow = expanded.clone(gates=dict(expanded.gates, beta=b16))
+    wide = expanded.clone(gates=dict(expanded.gates, beta=b16.float()))
+    o16, _ = run_gdp(gdp_frost, *gdp_args(base, narrow, 3))
+    o32, _ = run_gdp(gdp_frost, *gdp_args(base, wide, 3))
+    assert_bitwise("o", o16, o32)
+    assert_gdp_bwd_parity(gdp_frost, base, narrow, 3)
+
+
+def test_gdp_invalid_rows_raise(gdp_frost):
+    base, expanded = make_gdp_case(torch.bfloat16, 3, T=64)
+    args = gdp_args(base, expanded, 3)
+    args[1] = to_thd(base.k)
+    with pytest.raises(ValueError, match="rows"):
+        la_ops.gated_delta_product(*args)
+    with pytest.raises(ValueError, match="positive"):
+        la_ops.gated_delta_product(*gdp_args(base, expanded, 3)[:-1], 0)

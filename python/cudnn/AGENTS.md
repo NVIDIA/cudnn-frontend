@@ -219,6 +219,20 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
 `python/cudnn/sdpa/`.
 
+**Rule 6 — every Frost-generated kernel has a cuDNN-attributable symbol.**
+
+- Immediately after every ``@cute.kernel`` definition, including auxiliary and
+  generated-template kernels, call the public naming API:
+
+  ```python
+  kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+  ```
+
+- Use the decorated function's actual name, keep the default
+  ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
+  instead.
+- Verify with ``(cd test/python && pytest -q test_frost_kernel_name_prefix.py)``.
+
 
 ## Frontend-only kernel package layout
 

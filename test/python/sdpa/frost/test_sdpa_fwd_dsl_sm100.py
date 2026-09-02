@@ -1612,6 +1612,32 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm100_thd_multi_unit_per_cta(monkeypatch, d):
+    """THD with more live units than the grid has clusters (issue #618).
+
+    The persistent grid is sized to the MACHINE, so a cluster claims units
+    repeatedly off the device-bounded counter. Every other THD case here is
+    small enough that each cluster is handed at most one unit, so none of them
+    re-enters the K/V pipeline for a second one -- the regime where an
+    unmatched consumer arrival used to desynchronise the next unit's producer
+    handshake. These lengths give 48-80 live units depending on the flavor's
+    CGA tile; FROST_THD_CLUSTERS pins the grid to 4 clusters so the claim loop
+    runs deep regardless of the device's SM count, and the unpinned pass covers
+    the natural sizing.
+    """
+    _require_dsl()
+    lens = [1024, 768, 512, 256]
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="token_major")
+
+    monkeypatch.delenv("FROST_THD_CLUSTERS")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="head_major")
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host():
     """Issue #552 (D2H removal): the length tensors are consumed ONLY on
@@ -1719,6 +1745,47 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
     assert api.check_support()
     api.compile()
     seq_lens = [200, 150]
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    base_q = q.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_k = k.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_v = v.transpose(1, 2).reshape(b * s, h, d_v)
+    base_o = o.transpose(1, 2).reshape(b * s, h, d_v)
+    off = 0
+    for length in seq_lens:
+        qs = base_q[off : off + length].float()
+        ks = base_k[off : off + length].float()
+        vs = base_v[off : off + length].float()
+        scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+        ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+        torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+        off += length
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
+    """d192/d128 THD where a cluster claims more than one unit (issue #618).
+
+    The sibling device_meta case is one unit per cluster, so it never re-enters
+    the K/V pipeline. FROST_THD_CLUSTERS pins the persistent grid to 4 clusters
+    against 16 live units, making every cluster run four unit ranges."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    b, h, s = 2, 4, 1024
+    d_qk, d_v = 192, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
+    v = _bhsd(b, h, s, d_v, dtype)
+    o = torch.zeros_like(v)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    seq_lens = [1024, 768]
     lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()

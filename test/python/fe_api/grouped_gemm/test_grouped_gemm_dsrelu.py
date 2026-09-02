@@ -14,6 +14,7 @@ import torch
 import pytest
 from test_utils import torch_fork_set_rng, assert_bitwise_runs, bitwise_bits
 from fe_api.grouped_gemm.test_grouped_gemm_dsrelu_utils import (
+    run_grouped_gemm_dsrelu_ref,
     with_grouped_gemm_dsrelu_params_fp4,
     with_grouped_gemm_dsrelu_params_fp8,
     allocate_grouped_gemm_dsrelu_tensors,
@@ -494,11 +495,15 @@ def _torch_deterministic_algorithms():
         torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
-def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None, dprob_rtol=1e-4, dprob_atol=1e-4):
+def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None, dprob_rtol=1e-4, dprob_atol=1e-4, ref_kwargs=None):
     """The three properties deterministic=True has to hold, shared by dense and discrete.
 
     ``relaunch`` produces another deterministic run; it is called repeatedly, because a
     reduction-order race is timing-dependent and one repeat proves little.
+
+    ``ref_kwargs`` is forwarded to the final reference check. It exists for the clamped fp8
+    caller, whose block-scaled outputs need a wider rtol for a reason that has nothing to do
+    with determinism (see _clamp_ref_tolerances); default behaviour is unchanged.
     """
     torch.cuda.synchronize()
     inputs, cfg = case
@@ -533,7 +538,7 @@ def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inp
     # 3. The deterministic path clears the same bar as the default one, not merely agrees
     # with it: the reference the non-deterministic wrapper tests run, over the whole backward
     # output set (dprob, dA row/col, d_srelu, amax, scale factors).
-    check_ref_grouped_gemm_dsrelu(inputs if ref_inputs is None else ref_inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
+    check_ref_grouped_gemm_dsrelu(inputs if ref_inputs is None else ref_inputs, deterministic, cfg, **(ref_kwargs or {}), skip_ref=cfg["skip_ref"])
 
 
 # n defaults to 512 against an mma_tiler_mn[1] of 256, so grid_n is 2 and the cross-N-tile
@@ -1883,3 +1888,524 @@ def _test_grouped_gemm_dsrelu_wrapper_zero_m_cache_behavior(
         grouped_gemm_dsrelu_api._cache_of_GroupedGemmDsreluSm100Objects.clear()
 
     return compile_count["value"], cache_entries
+
+
+# =============================================================================
+# Soft-clamped dSReLU (tanh_clamp_scale)
+# =============================================================================
+#
+# tanh_clamp_scale=s replaces relu(C) with c = s*tanh(relu(C)/s) throughout the backward:
+#     dgrad = g * 2*c*(1-t^2) * w      (was  g * 2*relu(C) * w)
+#     dprob = sum_n c^2 * g            (was  sum_n relu(C)^2 * g)
+#     d_srelu regen = c^2 * w          (was  relu(C)^2 * w)
+# Unclamped is the s -> infinity limit. See the srelu test file for why the cache key and
+# the vector_f32 axis are correctness requirements rather than coverage nice-to-haves.
+#
+# The backward has three consumers of the activation, and the third (d_srelu regen, used
+# only under FP8 activation recompute) is the one a partial implementation drops -- so
+# generate_d_srelu is exercised explicitly below rather than left to the default.
+
+GROUPED_GEMM_DSRELU_CLAMP_CONFIGS = [
+    pytest.param(torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, True, False, id="fp4-vector_f32"),
+    pytest.param(torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, False, False, id="fp4-scalar_f32"),
+    pytest.param(torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, True, True, id="fp8-vector_f32"),
+    pytest.param(torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, id="fp8-scalar_f32"),
+]
+
+GROUPED_GEMM_DSRELU_CLAMP_SCALES = [
+    pytest.param(None, id="unclamped"),
+    pytest.param(16.0, id="clamp16"),
+    pytest.param(32.0, id="clamp32"),
+]
+
+
+# Block-scaled (MXFP8) outputs vs an independently quantized reference, once the kernel is
+# perturbed at all -- measured on GB300 (sm_103) at the clamp's 7.7e-6 max tanh perturbation
+# (repos/sqrelu_tanh/tools/):
+#   * the e8m0 scale factors do not flip at all, even though ~25% of the 32-element block
+#     amaxes in this harness sit exactly ON an exponent boundary;
+#   * d_row/d_col show rare one-ULP straddles -- 12 of 524288 elements (2.3e-5), max ratio
+#     exactly one e4m3 ULP (1.125), none beyond;
+#   * dprob (plain fp32, not block-scaled) shows no outliers.
+# A boundary straddle is a one-ULP event produced by an arbitrarily small cause, which no
+# blanket rtol below 12.5% can distinguish from a real error. The clamped fp8 cases therefore
+# allow one ULP of relative slack; the tight elementwise check of the epilogue math lives on
+# the bf16-output fp4 configs above.
+_FP8_E4M3_ULP_RTOL = 2.0**-3
+
+
+def _is_block_scaled_output(d_dtype, discrete_col_sfd):
+    return d_dtype is torch.float8_e4m3fn and discrete_col_sfd
+
+
+def _clamp_ref_tolerances(d_dtype, tanh_clamp_scale):
+    if d_dtype is torch.float8_e4m3fn and tanh_clamp_scale is not None:
+        return {"rtol": _FP8_E4M3_ULP_RTOL + 1e-2}
+    return {}
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("use_dsrelu_reuse", [False, True], ids=["no_reuse", "reuse"])
+@pytest.mark.parametrize("tanh_clamp_scale", GROUPED_GEMM_DSRELU_CLAMP_SCALES)
+@pytest.mark.parametrize(
+    "ab_dtype,c_dtype,d_dtype,sf_vec_size,sf_dtype,vector_f32,discrete_col_sfd",
+    GROUPED_GEMM_DSRELU_CLAMP_CONFIGS,
+)
+def test_grouped_gemm_dsrelu_wrapper_tanh_clamp_scale(
+    request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, tanh_clamp_scale, use_dsrelu_reuse
+):
+    """All three backward consumers agree with the torch reference, on both f32 variants.
+
+    use_dsrelu_reuse is crossed in because it routes dprob and d_srelu through a different
+    pair of helpers (compute_relu2 + compute_dprob_from_relu2 + scale_srelu_from_relu2)
+    than the default path -- the clamped value has to flow correctly through both.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
+    inputs, cfg = case
+    cfg["tanh_clamp_scale"] = tanh_clamp_scale
+
+    try:
+        outputs = _run_dsrelu_case(case, tanh_clamp_scale=tanh_clamp_scale, use_dsrelu_reuse=use_dsrelu_reuse)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    torch.cuda.synchronize()
+    # The wrapper always regenerates d_srelu; assert it so a future change that makes it
+    # conditional cannot silently drop the third backward consumer from this test.
+    assert outputs.get("d_srelu_tensor") is not None, "wrapper must return the regenerated activation"
+
+    if tanh_clamp_scale is not None and _is_block_scaled_output(d_dtype, discrete_col_sfd):
+        # See the comment on _is_block_scaled_output: the code-for-code comparison of the
+        # MXFP8 outputs is not a valid oracle for a perturbed kernel. dprob is, and it is the
+        # consumer that would catch a wrong c^2, so assert it at full tightness.
+        if not cfg["skip_ref"]:
+            ref_tensors = run_grouped_gemm_dsrelu_ref(
+                a_ref=inputs["a_ref"],
+                b_ref=inputs["b_ref"],
+                c_ref=inputs["c_ref"],
+                sfa_ref=inputs["sfa_ref"],
+                sfb_ref=inputs["sfb_ref"],
+                alpha_tensor=inputs["alpha_tensor"],
+                prob_tensor=inputs["prob_tensor"],
+                aligned_group_m_list=inputs["aligned_group_m_list"],
+                valid_m=inputs["valid_m"],
+                generate_dbias=outputs.get("dbias_tensor") is not None,
+                generate_amax=outputs.get("amax_tensor") is not None,
+                generate_sfd=outputs.get("sfd_row_tensor") is not None and outputs.get("sfd_col_tensor") is not None,
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                sf_dtype=cfg["sf_dtype"],
+                tanh_clamp_scale=tanh_clamp_scale,
+            )
+            torch.testing.assert_close(outputs["dprob_tensor"].float(), ref_tensors["dprob_ref"].float(), atol=1e-1, rtol=1e-2)
+            assert torch.isfinite(outputs["d_srelu_tensor"].float()).all()
+            assert torch.isfinite(outputs["d_row_tensor"].float()).all()
+    else:
+        check_ref_grouped_gemm_dsrelu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+@pytest.mark.parametrize(
+    "ab_dtype,c_dtype,d_dtype,sf_vec_size,sf_dtype,vector_f32,discrete_col_sfd",
+    # fp4 only: the fp8 entry has a block-scaled D whose codes are not a valid oracle for a
+    # perturbed kernel (see _is_block_scaled_output), and _assert_dprob_deterministic ends in a
+    # full reference check. Determinism itself is value-agnostic, so the fp4 entry covers it.
+    [c for c in GROUPED_GEMM_DSRELU_DETERMINISTIC_CONFIGS if c.id != "fp8"],
+)
+def test_grouped_gemm_dsrelu_deterministic_dprob_clamped(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+    """deterministic=True still holds when dprob sums c^2 instead of relu(C)^2.
+
+    The slot-parking reduction is value-agnostic, so this is expected to pass for free --
+    which is exactly why it is worth asserting: 'expected to work by construction' is the
+    class of claim that silently stops being true.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    tanh_clamp_scale = 16.0
+    case = _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
+    case[1]["tanh_clamp_scale"] = tanh_clamp_scale
+
+    try:
+        baseline = _run_dsrelu_case(case, deterministic=False, tanh_clamp_scale=tanh_clamp_scale)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    deterministic = _run_dsrelu_case(case, deterministic=True, tanh_clamp_scale=tanh_clamp_scale)
+    _assert_dprob_deterministic(
+        case,
+        baseline,
+        deterministic,
+        lambda: _run_dsrelu_case(case, deterministic=True, tanh_clamp_scale=tanh_clamp_scale),
+        ref_kwargs=_clamp_ref_tolerances(d_dtype, tanh_clamp_scale),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=31)
+@pytest.mark.parametrize(
+    "ab_dtype,c_dtype,d_dtype,sf_vec_size,sf_dtype,vector_f32,discrete_col_sfd",
+    GROUPED_GEMM_DSRELU_DETERMINISTIC_CONFIGS,
+)
+def test_grouped_gemm_dsrelu_tanh_clamp_scale_none_is_bit_identical(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+    """tanh_clamp_scale=None must be BIT-identical to not passing the argument at all.
+
+    The backward counterpart of the srelu test of the same name, and the direct evidence
+    for the additive-only claim on this kernel: the clamped branch is const_expr'd out, so
+    an existing caller should get the same traced program and the same bits. Covers the
+    fp4 and fp8 configurations, which compile different kernels.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
+
+    try:
+        omitted = _run_dsrelu_case(case)  # exactly the pre-change call signature
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    explicit_none = _run_dsrelu_case(case, tanh_clamp_scale=None)
+    torch.cuda.synchronize()
+
+    # d_col is only written under the fp8 scale-factor path; elsewhere it keeps its
+    # allocation contents, which differ between two independent calls for reasons that
+    # have nothing to do with this flag (same caveat as the determinism test above).
+    compared = ["d_row_tensor", "d_srelu_tensor", "dprob_tensor"]
+    if omitted.get("sfd_col_tensor") is not None:
+        compared += ["d_col_tensor", "sfd_row_tensor", "sfd_col_tensor"]
+    if omitted.get("amax_tensor") is not None:
+        compared.append("amax_tensor")
+
+    for key in compared:
+        a, b = omitted[key], explicit_none[key]
+        if a is None and b is None:
+            continue
+        assert a is not None and b is not None, f"{key} missing from one of the two runs"
+        assert torch.equal(a, b), f"{key} differs between omitted and tanh_clamp_scale=None"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar_f32", "vector_f32"])
+def test_grouped_gemm_dsrelu_tanh_clamp_scale_saturated_dgrad_is_zero(request, vector_f32):
+    """Deep in the saturated tail the row gradient must be EXACTLY zero.
+
+    dgrad carries the factor 1 - t^2, which goes to zero as t -> 1, so for relu(C) >> s the
+    row output is 0 with no tolerance argument needed -- the one assertion in this file
+    sensitive to the sign of 1 - t^2 (a t above 1 from tanh.approx would come back small,
+    non-zero and sign-flipped, invisible to every fp8-tolerance test). The kernel caps t at
+    1; this asserts the cap holds.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    # d_dtype bf16 (the fp4 config): 0.0 is exactly representable and there is no output
+    # quantization to blur an exact-zero check.
+    case = _build_dsrelu_case(request, torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, vector_f32, False)
+    inputs, cfg = case
+
+    # Drive every element far past saturation. 512 is exact in bf16, so c_tensor and the
+    # fp32 c_ref agree exactly and relu(C)/s is ~1e3 even at the largest scale tested.
+    saturated = 512.0
+    inputs["c_tensor"].fill_(saturated)
+    inputs["c_ref"].fill_(saturated)
+
+    tanh_clamp_scale = 0.5
+    try:
+        outputs = _run_dsrelu_case(case, tanh_clamp_scale=tanh_clamp_scale)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    d_row = outputs["d_row_tensor"].float()
+    assert torch.equal(d_row, torch.zeros_like(d_row)), (
+        "saturated dgrad is not exactly zero: max |d_row| = "
+        f"{d_row.abs().max().item():.6g}, min = {d_row.min().item():.6g}. "
+        "A negative value here means 1 - t^2 went negative, i.e. tanh returned t > 1."
+    )
+
+    # dprob keeps the c^2 term, which saturates to s^2 rather than to zero, so it is a live
+    # control: if the whole epilogue had simply produced zeros the assertion above would be
+    # vacuous.
+    dprob = outputs["dprob_tensor"].float()
+    assert torch.count_nonzero(dprob).item() > 0, "dprob is all zero -- the epilogue produced nothing"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+def test_grouped_gemm_dsrelu_tanh_clamp_scale_cache_key(request, monkeypatch):
+    """Two clamp scales in one process must compile two kernels, not reuse the first.
+
+    ``s`` is folded at trace time, so a cache key missing it returns the s=16 kernel for an
+    s=32 call -- wrong numbers, no error. This is the backward-side twin of the srelu test
+    of the same name; both dense and discrete keys are covered because the wrapper picks
+    between them on the weight mode, and this config is the dense one.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cudnn.gemm.cutedsl.grouped.dsrelu import api as dsrelu_api
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.setattr(dsrelu_api, "_cache_of_GroupedGemmDsreluSm100Objects", {})
+
+    compile_count = {"value": 0}
+    original_compile = dsrelu_api.GroupedGemmDsreluSm100.compile
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+        return original_compile(self)
+
+    monkeypatch.setattr(dsrelu_api.GroupedGemmDsreluSm100, "compile", counted_compile)
+
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    case = _build_dsrelu_case(request, *args)
+    inputs, cfg = case
+
+    results = {}
+    for tanh_clamp_scale in (16.0, 32.0):
+        try:
+            results[tanh_clamp_scale] = _run_dsrelu_case(case, tanh_clamp_scale=tanh_clamp_scale)
+        except (ValueError, NotImplementedError) as e:
+            pytest.skip(f"Unsupported testcase: {e}")
+        torch.cuda.synchronize()
+
+    assert compile_count["value"] == 2, f"expected one compile per tanh_clamp_scale, got {compile_count['value']}"
+
+    # This config has an MXFP8 block-scaled D, so only dprob is a valid elementwise oracle
+    # (see _is_block_scaled_output). That is enough here: the point of this test is the cache
+    # key, and dprob moving with s is exactly what a stale kernel would fail to do.
+    if not cfg["skip_ref"]:
+        for tanh_clamp_scale, outputs in results.items():
+            ref_tensors = run_grouped_gemm_dsrelu_ref(
+                a_ref=inputs["a_ref"],
+                b_ref=inputs["b_ref"],
+                c_ref=inputs["c_ref"],
+                sfa_ref=inputs["sfa_ref"],
+                sfb_ref=inputs["sfb_ref"],
+                alpha_tensor=inputs["alpha_tensor"],
+                prob_tensor=inputs["prob_tensor"],
+                aligned_group_m_list=inputs["aligned_group_m_list"],
+                valid_m=inputs["valid_m"],
+                generate_dbias=outputs.get("dbias_tensor") is not None,
+                generate_amax=outputs.get("amax_tensor") is not None,
+                generate_sfd=outputs.get("sfd_row_tensor") is not None and outputs.get("sfd_col_tensor") is not None,
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                sf_dtype=cfg["sf_dtype"],
+                tanh_clamp_scale=tanh_clamp_scale,
+            )
+            torch.testing.assert_close(outputs["dprob_tensor"].float(), ref_tensors["dprob_ref"].float(), atol=1e-1, rtol=1e-2)
+
+    # A kernel that ignored tanh_clamp_scale would pass the count check and, if the reference
+    # shared the bug, the reference check too. Different s must move every consumer.
+    if not cfg["skip_ref"]:
+        assert not torch.equal(results[16.0]["d_row_tensor"], results[32.0]["d_row_tensor"])
+        assert not torch.equal(results[16.0]["dprob_tensor"], results[32.0]["dprob_tensor"])
+        assert not torch.equal(results[16.0]["d_srelu_tensor"], results[32.0]["d_srelu_tensor"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+@pytest.mark.parametrize("c_dtype", [torch.bfloat16, torch.float32], ids=["c_bf16", "c_fp32"])
+def test_grouped_gemm_dsrelu_tanh_clamp_scale_regen_matches_forward(request, c_dtype):
+    """The backward's d_srelu regen must reproduce the forward kernel's own output.
+
+    Under FP8 activation recompute the fc2 input is regenerated by the backward rather than
+    saved, so forward output and backward regen have to be the same function. They are two
+    separate kernels with two separate copies of the tanh expression, and nothing else in the
+    suite compares them to each other -- each is only ever checked against the torch oracle.
+
+    Sensitivity, stated rather than assumed: the forward applies the activation to its fp32
+    accumulator while the backward applies it to the SAVED C, so the two disagree by the C
+    round-trip no matter how well the tanh forms match. That floor is not guessed here, it is
+    computed from the inputs (``floor`` below) and used as the tolerance. With c_dtype=bf16
+    the floor is ~1e-2 relative, which is coarser than a pure fastmath-tanh discrepancy
+    (~1e-3), so THAT case cannot detect a subtly different tanh form -- it catches gross
+    mismatches (a swapped s vs 1/s, a missing square, prob folded in twice). The c_fp32 case
+    is the sharp one: C then stores the accumulator exactly, the floor collapses, and the two
+    tanh expressions are compared against each other with nothing in between.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cudnn import grouped_gemm_srelu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    tanh_clamp_scale = 16.0
+    # bf16 D so the comparison is not floored by fp8 output quantization instead.
+    args = (torch.uint8, c_dtype, torch.bfloat16, 16, torch.float8_e8m0fnu, True, False)
+    case = _build_dsrelu_case(request, *args)
+    inputs, cfg = case
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    # 1. Forward over this case's A/B/SF/prob: gives both the stored C and the activation
+    #    the forward actually produced from its fp32 accumulator.
+    try:
+        fwd = grouped_gemm_srelu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            prob_tensor=inputs["prob_tensor"],
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            tanh_clamp_scale=tanh_clamp_scale,
+            current_stream=stream,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    # 2. Backward fed the forward's own C, regenerating the activation. The forward returns
+    #    only the valid_m rows while the backward's C carries the padded tensor_m, so copy
+    #    into the case's existing buffer rather than substituting a differently shaped one.
+    valid_m = inputs["valid_m"]
+    bwd_inputs = dict(inputs)
+    bwd_inputs["c_tensor"] = inputs["c_tensor"].clone()
+    bwd_inputs["c_tensor"][:valid_m].copy_(fwd["c_tensor"])
+    try:
+        bwd = _run_dsrelu_case((bwd_inputs, cfg), tanh_clamp_scale=tanh_clamp_scale)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    d_fwd = fwd["d_tensor"].float()[:valid_m]
+    d_regen = bwd["d_srelu_tensor"].float()[:valid_m]
+    assert d_fwd.shape == d_regen.shape, f"{d_fwd.shape} vs {d_regen.shape}"
+
+    # 3. The C round-trip floor, computed from this run's own C rather than assumed.
+    c_saved = fwd["c_tensor"].float()[:valid_m]
+    prob = inputs["prob_tensor"].float().expand(-1, cfg["n"], -1)[:valid_m]
+
+    def _act(x):
+        t = torch.tanh(torch.relu(x) / tanh_clamp_scale)
+        return (tanh_clamp_scale * t) ** 2 * prob
+
+    # The forward applied the activation to its fp32 accumulator; the backward applied it to
+    # c_saved, which is that accumulator rounded to c_dtype. The unknown is the rounding, and
+    # it is bounded by one ulp -- so propagate one ulp of C through the activation and take
+    # that as the floor. For c_dtype=fp32 the ulp is 2^-24 and the floor collapses, which is
+    # what makes that parametrization the sharp one.
+    c_ulp_rel = 2.0**-8 if c_dtype is torch.bfloat16 else 2.0**-24
+    c_ulp = c_saved.abs() * c_ulp_rel
+    floor = torch.maximum((_act(c_saved + c_ulp) - _act(c_saved)).abs(), (_act(c_saved - c_ulp) - _act(c_saved)).abs()).max().item()
+
+    # Both sides are stored in d_dtype (bf16 here) and the two kernels multiply prob in a
+    # different order, so allow a couple of ulps of the output on top.
+    d_ulp = d_fwd.abs().max().item() * 2.0**-8
+    atol = floor + 2 * d_ulp
+    gap = (d_fwd - d_regen).abs().max().item()
+    assert gap <= atol, f"forward output and backward d_srelu regen disagree by {gap:.4g}, above the computed floor {atol:.4g}"
+
+
+@pytest.mark.L0
+def test_grouped_gemm_dsrelu_tanh_clamp_scale_validation(request):
+    """tanh_clamp_scale must be finite and positive; the API rejects the rest at construction."""
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    case = _build_dsrelu_case(request, *args)
+
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="tanh_clamp_scale"):
+            _run_dsrelu_case(case, tanh_clamp_scale=bad)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=101)
+@pytest.mark.parametrize("tanh_clamp_scale", [None, 16.0, 32.0], ids=["unclamped", "clamp16", "clamp32"])
+def test_clamped_srelu_backward_is_the_forward_derivative(tanh_clamp_scale):
+    """The backward formulas really are the derivative of the forward one -- checked by autograd.
+
+    Closes a loop nothing else in this suite closes. Every other test compares a KERNEL against
+    a torch REFERENCE, but the forward reference (test_grouped_gemm_srelu_utils) and the backward
+    reference (test_grouped_gemm_dsrelu_utils) are two halves of the same hand-derived math:
+
+        forward   y      = (s*tanh(relu(x)/s))^2 * w
+        backward  dy/dx  = g * 2c(1-t^2) * w
+                  dy/dw  = sum_n c^2 * g
+
+    If that derivative were wrong, the kernels and the references would be wrong TOGETHER and
+    every kernel-vs-reference test would still pass. So differentiate the forward expression
+    with autograd and compare against the closed forms the backward reference and the kernel
+    both use. Pure torch, fp64, no GPU kernel involved -- this validates the math, and the rest
+    of the file validates that the kernels implement it.
+
+    The unclamped case is kept as a control: it must reduce to d/dx relu(x)^2 = 2*relu(x).
+    """
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m, n = 64, 48
+    # fp64 so the comparison is limited by the formulas, not by rounding. Scaled to straddle
+    # the clamp: relu(x)/s spans roughly [0, 4] at s=16, so both the near-linear and the
+    # saturated regimes are exercised in one tensor.
+    x = (torch.randn(m, n, dtype=torch.float64, device=dev) * 40.0).requires_grad_(True)
+    w = torch.randn(m, 1, dtype=torch.float64, device=dev).requires_grad_(True)
+    g = torch.randn(m, n, dtype=torch.float64, device=dev)
+
+    def forward(xx, ww):
+        """Exactly what run_grouped_gemm_srelu_ref computes, clamped or not."""
+        if tanh_clamp_scale is None:
+            return torch.relu(xx) ** 2 * ww
+        t = torch.tanh(torch.relu(xx) / tanh_clamp_scale)
+        return (tanh_clamp_scale * t) ** 2 * ww
+
+    (forward(x, w) * g).sum().backward()
+
+    with torch.no_grad():
+        if tanh_clamp_scale is None:
+            # The s -> infinity limit: dgrad reduces to 2*relu(x), dprob to sum relu(x)^2 * g.
+            closed_dx = 2 * torch.relu(x) * g * w
+            closed_dw = (torch.relu(x) ** 2 * g).sum(dim=-1, keepdim=True)
+        else:
+            t = torch.tanh(torch.relu(x) / tanh_clamp_scale)
+            c = tanh_clamp_scale * t
+            closed_dx = 2 * c * (1 - t**2) * g * w
+            closed_dw = ((c**2) * g).sum(dim=-1, keepdim=True)
+
+    torch.testing.assert_close(x.grad, closed_dx, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(w.grad, closed_dw, rtol=1e-10, atol=1e-10)
+
+    # Non-vacuous on both sides of the clamp: without saturated elements this would only be
+    # testing the near-linear regime, where clamped and unclamped agree anyway.
+    if tanh_clamp_scale is not None:
+        ratio = torch.relu(x) / tanh_clamp_scale
+        assert (ratio > 3.0).any(), "no saturated element -- the clamped branch is untested"
+        assert (ratio < 0.5).any() and (ratio > 0).any(), "no near-linear element"

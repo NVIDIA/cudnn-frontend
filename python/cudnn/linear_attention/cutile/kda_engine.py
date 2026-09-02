@@ -237,10 +237,14 @@ class KdaCuTileEngine(BaseEngine):
         cutile_la_gate("KdaCuTileEngine", facts, "KDA", facts.g_dtype if facts is not None else None)
         if facts.is_bwd and (facts.safe_gate or facts.use_beta_sigmoid):
             raise NotImplementedError("KdaCuTileEngine: raw-logit gate modes (safe_gate / use_beta_sigmoid) are forward-only")
+        if facts.is_bwd and facts.d_v != 128:
+            raise NotImplementedError(
+                f"KdaCuTileEngine: bwd requires v head dim 128 (the cuda.tile runtime rejects the fused wy/dqkg kernel otherwise), got {facts.d_v}"
+            )
         low, high = GATE_LOWER_BOUND_RANGE
-        glb = facts.gate_lower_bound
-        if glb is not None and not (low <= glb < high):
-            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [{low}, {high}) (chunk_kda log-gate floor), got {glb}")
+        gate_lower_bound = facts.gate_lower_bound
+        if gate_lower_bound is not None and not (low <= gate_lower_bound < high):
+            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [{low}, {high}) (chunk_kda log-gate floor), got {gate_lower_bound}")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         return KdaCuTilePlan(graph)
