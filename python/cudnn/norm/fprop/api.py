@@ -30,6 +30,8 @@ from ..config_sm100 import (
 _WARP_VARIANTS = (NormVariant.LAYER_NORM, NormVariant.RMS_NORM)
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
 from .kernels import (
+    batchnorm_nchw_sm100,
+    batchnorm_nhwc_sm100,
     batchnorm_sm100,
     groupnorm_sm100,
     instancenorm_sm100,
@@ -47,6 +49,13 @@ _ROWWISE_KERNEL = {
 
 def _as_variant(v) -> NormVariant:
     return v if isinstance(v, NormVariant) else NormVariant(v)
+
+
+def _is_nhwc(x) -> bool:
+    """True for a 4-D tensor whose memory is channels-last (NHWC)."""
+    import torch
+
+    return x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last)
 
 
 def norm_fprop(
@@ -71,7 +80,10 @@ def norm_fprop(
     import torch
 
     variant = _as_variant(variant)
-    x = x.contiguous()
+    # BatchNorm has a dedicated channels-last kernel, so preserve NHWC inputs
+    # instead of paying a transpose in ``.contiguous()``.
+    if not (variant == NormVariant.BATCH_NORM and _is_nhwc(x)):
+        x = x.contiguous()
     io = torch_dtype_to_str(x.dtype)
 
     if variant in ROWWISE_VARIANTS:
@@ -108,6 +120,27 @@ def norm_fprop(
             training=training, update_running=update_running,
         )
         eb = DTYPE_BYTES[io]
+
+        # --- NHWC (channels-last): fused cooperative split-K kernel over [M=N*H*W, C] ---
+        if _is_nhwc(x) and batchnorm_nhwc_sm100.nhwc_cfg(spec.C, eb) is not None:
+            N, C, H, W = (int(v) for v in x.shape)
+            x2d = x.permute(0, 2, 3, 1).reshape(N * H * W, C)  # view, no copy
+            y2d, sm, sr = batchnorm_nhwc_sm100.forward(
+                spec, x2d, gamma, beta, eps=eps, momentum=momentum, training=training,
+                running_mean=running_mean, running_var=running_var, cfg=None, params=params,
+            )
+            y = y2d.reshape(N, H, W, C).permute(0, 3, 1, 2)
+            return y, sm, sr
+
+        # --- NCHW: split-K over the (n, c) rows, each of S contiguous elements ---
+        if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
+            x3d = x.reshape(spec.N, spec.C, spec.S)
+            y3, sm, sr = batchnorm_nchw_sm100.forward(
+                spec, x3d, gamma, beta, eps=eps, momentum=momentum, training=training,
+                running_mean=running_mean, running_var=running_var, cfg=None, params=params,
+            )
+            return y3.reshape(x.shape), sm, sr
+
         cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb),
                   stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
