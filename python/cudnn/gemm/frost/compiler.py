@@ -15,6 +15,7 @@ import hashlib
 from collections import Counter
 import importlib.util
 import logging
+import math
 import os
 import re
 import sys
@@ -56,8 +57,13 @@ from .dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_value
-from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
+from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
+from .fusion_ir import (
+    ZERO_PRESERVING_OPS,
+    FusionChain,
+    TensorRef,
+    segmented_row_scale_capacity_rows,
+)
 from .recipe import (
     CONST,
     FROM_M,
@@ -284,16 +290,31 @@ def _epi_row_elems(dt: str, epi_n: int) -> int:
     return _epi_row_bytes(dt, epi_n) * 8 // _cd_view_bits(dt)
 
 
-def _tma_store_issue(chain, j: int, coord: str, ptr: str) -> "list[str]":
+def _tma_store_issue(chain, cfg, j: int, coord: str, ptr: str) -> "list[str]":
+    # MoE rewrites D's `global_dim` per routed group to clip the ragged tail, so
+    # it stores through its per-CTA workspace copy -- unless the offsets promise
+    # says no tile crosses a group, in which case the original descriptor serves.
+    desc = f"tma_c_descs[{j}].get_ptr()" if (not chain.has_moe or _moe_aligned_offsets(chain, cfg)) else f"d_desc_ptr_list[{j}]"
     return [
         "if warp_idx == 0:",
         "    if elect_one:",
         "        nvvm.cp_async_bulk_tensor_global_shared_cta(",
-        f"            {f'd_desc_ptr_list[{j}]' if chain.has_moe else f'tma_c_descs[{j}].get_ptr()'},",
+        f"            {desc},",
         f"            {ptr},",
         f"            {coord},",
         "        )",
     ]
+
+
+def _tma_store_coord(chain, dim0: str, dim1: str) -> str:
+    """Coordinate tuple matching the output TMA descriptor rank.
+
+    Routed MoE outputs are one flat ``(S, N)`` surface: their logical batch is
+    fixed to one and every store used to carry a redundant third coordinate.
+    Keep ordinary GEMM descriptors rank-3, but let MoE issue the cheaper 2-D
+    TMA-store form.
+    """
+    return f"({dim0}, {dim1})" if chain.has_moe else f"({dim0}, {dim1}, tile_l)"
 
 
 def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list[str]":
@@ -335,10 +356,22 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
         for mb in range(m_rows // atom_m):
-            lines += _tma_store_issue(chain, j, f"(coord_m + {mb * atom_m}, col, tile_l)", f"{v}.data_ptr({mb * atom_m * epi_n})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, f"coord_m + {mb * atom_m}", "col"),
+                f"{v}.data_ptr({mb * atom_m * epi_n})",
+            )
         if _epi_dp22(cfg):
             # the other COLUMN half, not another M block: same rows, further along N
-            lines += _tma_store_issue(chain, j, "(coord_m, col + epi_cols_per_mma_m, tile_l)", f"{v}.data_ptr({atom_m * epi_n})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, "coord_m", "col + epi_cols_per_mma_m"),
+                f"{v}.data_ptr({atom_m * epi_n})",
+            )
     else:
         row_bytes = _epi_row_bytes(dt, epi_n)
         row_elems = _epi_row_elems(dt, epi_n)
@@ -352,11 +385,17 @@ def _tma_store_one(chain, cfg, epi_n: int, j: int, dt: str, major: str) -> "list
             "cute.arch.fence_view_async_shared()",
             "nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)",
         ]
-        lines += _tma_store_issue(chain, j, f"({col_c}, coord_m, tile_l)", f"{v}.data_ptr()")
+        lines += _tma_store_issue(chain, cfg, j, _tma_store_coord(chain, col_c, "coord_m"), f"{v}.data_ptr()")
         if _epi_dp22(cfg):
             # warps 2/3's column half, staged behind the first tile
             half = "(col + epi_cols_per_mma_m) // 2" if DTYPE_BITS[dt] < 8 else "col + epi_cols_per_mma_m"
-            lines += _tma_store_issue(chain, j, f"({half}, coord_m, tile_l)", f"{v}.data_ptr({m_rows * row_elems})")
+            lines += _tma_store_issue(
+                chain,
+                cfg,
+                j,
+                _tma_store_coord(chain, half, "coord_m"),
+                f"{v}.data_ptr({m_rows * row_elems})",
+            )
     lines += [
         "    if elect_one:",
         "        nvvm.cp_async_bulk_commit_group()",
@@ -382,6 +421,25 @@ def _tma_store_sequence(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> 
     return "\n".join(lines) if lines else "pass"
 
 
+def _place_tma_stores(epilogue: str, chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> tuple[str, str]:
+    """Inline each multi-output TMA store at its fragment's last use.
+
+    Single-output graphs retain the aggregate trailing sequence, preserving
+    their existing instruction scheduling.
+    """
+    outputs = _tma_out_dtypes(chain, tma_slots)
+    stream = len(outputs) > 1
+    for j, (slot, dt) in enumerate(outputs):
+        marker = tma_out_ready_marker(j)
+        if epilogue.count(marker) != 1:
+            raise RuntimeError(f"epilogue missing unique TMA-output marker {marker}")
+        replacement = ""
+        if stream:
+            replacement = "\n".join(_tma_store_one(chain, cfg, epi_n, j, dt, chain.output_specs[slot].major))
+        epilogue = epilogue.replace(marker, replacement)
+    return epilogue, "pass" if stream else _tma_store_sequence(chain, cfg, tma_slots, epi_n)
+
+
 def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> str:
     """Build one C descriptor per TMA-stored output. Each carries its OWN dtype,
     strides, box and swizzle, so outputs of different dtypes and different
@@ -405,20 +463,23 @@ def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> st
             ]
         )
     outs = _tma_out_dtypes(chain, tma_slots)
-    batch = "1" if chain.has_moe else "batch"
     lines: list[str] = []
     for j, (slot, dt) in enumerate(outs):
         width = _cd_view_bits(dt)
         if chain.output_specs[slot].major == "m":
-            dims = f"[m, n, {batch}]"
+            dims = "[m, n]" if chain.has_moe else "[m, n, batch]"
             outer = f"out_stride_n_{slot}"
-            box = f"[{_mmajor_atom_m(dt)}, {epi_n}, 1]"
+            box = f"[{_mmajor_atom_m(dt)}, {epi_n}]" if chain.has_moe else f"[{_mmajor_atom_m(dt)}, {epi_n}, 1]"
             sw = "s128b"
         else:
-            dims = f"[{'n // 2' if DTYPE_BITS[dt] < 8 else 'n'}, m, {batch}]"
+            n_dim = "n // 2" if DTYPE_BITS[dt] < 8 else "n"
+            dims = f"[{n_dim}, m]" if chain.has_moe else f"[{n_dim}, m, batch]"
             outer = f"out_stride_m_{slot}"
-            box = f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0], 1]"
+            box = f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0]]" if chain.has_moe else f"[{_epi_row_elems(dt, epi_n)}, epi_tile_mn[0], 1]"
             sw = _EPI_SWIZZLE_BY_ROW_BYTES[_epi_row_bytes(dt, epi_n)][1]
+        strides = [f"        {outer} * {width} // 128,"]
+        if not chain.has_moe:
+            strides.append(f"        out_stride_l_{slot} * {width} // 128,")
         lines += [
             f"_c{j} = _tma_c_outputs[{j}]",
             f"tma_c_desc_{j} = _tma.create_tensor_map_tiled(",
@@ -426,8 +487,7 @@ def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> st
             f"    dtype={_cd_cutlass(dt)},",
             f"    global_dims={dims},",
             "    global_strides=[",
-            f"        {outer} * {width} // 128,",
-            f"        out_stride_l_{slot} * {width} // 128,",
+            *strides,
             "    ],",
             f"    box_dims={box},",
             f"    swizzle=_tma.TensorMapSwizzle.{sw},",
@@ -770,10 +830,9 @@ def _render_tile_constants(
         # SMEM extent) to be a whole number of swizzle groups.
         mn_slice = mn_extent // num_mma
         if mn_slice < mn_group_elems or mn_slice % mn_group_elems != 0:
+            what = f"per-MMA SMEM extent {mn_slice}" if num_mma > 1 else f"SMEM extent {mn_slice}"
             raise ValueError(
-                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: "
-                f"per-MMA SMEM extent {mn_slice} is not a multiple of the "
-                f"{mn_group_elems}-element swizzle group"
+                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: " f"{what} is not a multiple of the " f"{mn_group_elems}-element swizzle group"
             )
         group_elems = mn_group_elems
         return (
@@ -783,7 +842,8 @@ def _render_tile_constants(
             group_elems,
         )
 
-    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", cfg.mma_size_m)
+    _desc_num_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", _desc_num_mma)
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
     # Byte step from one MMA sub-block to the next inside the SMEM tile. Same
     # formula for both majors: a K-major tile is (MN x K) rows of
@@ -810,6 +870,7 @@ def _render_tile_constants(
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
         f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=smem_fixed_reserve)}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
@@ -949,6 +1010,7 @@ def _render_tile_constants(
     # (fallback). See _use_tma_store_epi() for gating.
     use_tma = _use_tma_store_epi(chain, cfg)
     lines.append(f"n_tma_outputs = {len(_tma_slots_for(chain, cfg))}")
+    lines.append(f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}")
     lines.append(f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}")
     # The three drain layouts, decided host-side so the templates can key on the
     # LAYOUT rather than re-deriving it from the mode: packed lane<16 (hardware
@@ -994,16 +1056,15 @@ def _render_tile_constants(
 
 def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[str]:
     """A ``fp32 -> <8-bit scale> byte`` helper, emitted into the generated kernel
-    so it stays self-contained. The x2 destination gets the value in both lanes;
-    only the low byte is read back."""
+    so it stays self-contained. The cvt unit is natively x2, so the pair form is
+    the primitive and the scalar one converts a value against itself and drops
+    the high byte -- col-quant, which has one scale per COLUMN, calls the pair."""
     return [
         "",
         "",
-        f"def {fn_name}(x):",
-        "    src = cutlass.Float32(x).ir_value()",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Float32.mlir_type), [src, src])",
-        "    lo = _frost_vector.extract(pair, dynamic_position=[], static_position=[0])",
-        "    hi = _frost_vector.extract(pair, dynamic_position=[], static_position=[1])",
+        f"def {fn_name}_x2(a, b):",
+        "    lo = cutlass.Float32(a).ir_value()",
+        "    hi = cutlass.Float32(b).ir_value()",
         "    packed = _frost_nvvm.convert_f32x2_to_f8x2(",
         "        _frost_ir.VectorType.get([2], cutlass.Int8.mlir_type),",
         "        hi,",
@@ -1012,8 +1073,11 @@ def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[s
         f"        rnd=_frost_nvvm.FPRoundingMode.{rnd},",
         "        sat=_frost_nvvm.SaturationMode.SATFINITE,",
         "    )",
-        "    byte = _frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed))",
-        "    return cutlass.Int32(byte) & 0xFF",
+        "    return cutlass.Int32(_frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed)))",
+        "",
+        "",
+        f"def {fn_name}(x):",
+        f"    return {fn_name}_x2(x, x) & 0xFF",
     ]
 
 
@@ -1025,15 +1089,23 @@ def _cvt_e5m3_bits_to_f32() -> list[str]:
     return [
         "",
         "",
-        "def _frost_e5m3_bits_to_f32(b):",
-        "    byte = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
-        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [byte, byte])",
+        "def _frost_e5m3_bits_to_f32_x2(a, b):",
+        "    lo = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(a).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    hi = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [lo, hi])",
         "    widened = _frost_nvvm.convert_f8x2_to_bf16x2(",
         "        _frost_ir.VectorType.get([2], cutlass.BFloat16.mlir_type),",
         "        pair,",
         "        _frost_ir.TypeAttr.get(cutlass.FloatNV8E5M3FNU.mlir_type),",
         "    )",
-        "    return cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0])))",
+        "    return (",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0]))),",
+        "        cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[1]))),",
+        "    )",
+        "",
+        "",
+        "def _frost_e5m3_bits_to_f32(b):",
+        "    return _frost_e5m3_bits_to_f32_x2(b, b)[0]",
     ]
 
 
@@ -1094,6 +1166,14 @@ def _b_collector_supported(arch: int | None = None) -> bool:
     """Whether this GPU's MMA can hold B in a collector buffer across MMAs."""
     a = _current_arch() if arch is None else arch
     return a is not None and any(lo <= a < hi for lo, hi in _B_COLLECTOR_ARCH_RANGES)
+
+
+def _b_collector_ok(cfg, arch: int | None = None) -> bool:
+    """...and whether THIS geometry may ask for it. The 64-row MMA may not: measured
+    `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under both CTA groups, so it
+    is the per-CTA instruction M that decides, not the hardware M. Block-scale never
+    reaches it (`validate_block_scale_config` requires `mma_tile_m % 128 == 0`)."""
+    return _b_collector_supported(arch) and cfg.mma_tile_m == 128
 
 
 def _tmem_cols_for_arch(arch: int | None = None) -> int:
@@ -1651,6 +1731,7 @@ def _render_block_scale_tile_constants(
         # output on the TMA-C surface, and on MoE this number also sizes the
         # tensormap scratch and the per-CTA workspace stride.
         f"n_tma_outputs = {len(_tma_slots_for(chain, cfg))}",
+        f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}",
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
@@ -1689,7 +1770,7 @@ def _render_block_scale_tile_constants(
         f"sf_block_desc_stride = {sf_block_desc_stride}",
         f"num_tmem_alloc_cols = {num_tmem_alloc_cols}",
         f"tmem_alloc_exclusive = {num_tmem_alloc_cols > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
-        f"b_collector_ok = {_b_collector_supported()}",
+        f"b_collector_ok = {_b_collector_ok(cfg)}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
@@ -1943,7 +2024,7 @@ def _render_template(
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n(config, _epi_store_dtype(chain, config))
-        replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
+        replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, config, tma_slots, _epi)
     if "@@INJECT_SPLITK_OUTPUT@@" in src:
         splitk_final_output = "c_0," if use_tma else "c_tap_0,"
@@ -1975,7 +2056,7 @@ def _render_template(
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
     return src
@@ -2156,7 +2237,7 @@ def _render_block_scale_template(
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n(config, chain.output_dtype)
-        replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
+        replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, config, tma_slots, _epi)
     # MoE block-scale raw-A-tensor plumbing (per-routed-group descriptor patch).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:
@@ -2173,7 +2254,7 @@ def _render_block_scale_template(
 
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
     return src
 
@@ -2871,18 +2952,22 @@ def _check_dtype_config_compat(
                 f"in one box per operand"
             )
     mn_group_elems = config.cta_tile_k_bytes // elem_bytes
-    # Each MMA instruction's operand descriptor starts at its own MN sub-block,
-    # so the check is on the PER-MMA slice (== the whole extent at num_mma == 1).
+    # Each tcgen05 MMA instruction's operand descriptor starts at its own MN
+    # sub-block, so the check is on the PER-MMA slice. A warp-scoped family
+    # (fixed mma tile, e.g. sm120) has no per-MMA descriptors -- only the whole
+    # extent must cut into whole groups (the TMA group walk) -- so num_mma == 1.
+    _per_mma = 1 if getattr(type(config), "FIXED_MMA_TILE_MN", None) is not None else config.mma_size_m
     if chain.matmul.a_major == "m":
-        slice_m = config.cta_tile_m // config.mma_size_m
+        slice_m = config.cta_tile_m // _per_mma
+        what = f"per-MMA M={slice_m}" if _per_mma > 1 else f"M={slice_m}"
         if slice_m < mn_group_elems:
             raise ValueError(
                 f"TileConfig {config.name!r} cannot use M-major A for "
-                f"dtype={chain.matmul.a_dtype!r}: per-MMA M={slice_m} "
+                f"dtype={chain.matmul.a_dtype!r}: {what} "
                 f"is smaller than the {mn_group_elems}-element swizzle group"
             )
         if slice_m % mn_group_elems != 0:
-            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"per-MMA M={slice_m} is not divisible by " f"swizzle group {mn_group_elems}")
+            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"{what} is not divisible by " f"swizzle group {mn_group_elems}")
     if chain.matmul.b_major == "n":
         slice_n = config.cta_smem_tile_mnk(elem_bytes)[1]
         if slice_n < mn_group_elems:
@@ -2989,6 +3074,34 @@ def _sf_blob_reject(named_blobs) -> "str | None":
     return None
 
 
+def _grouped_row_quant_scale_blob_reject(
+    chain: FusionChain,
+    outputs,
+    total_rows: int,
+    runtime_n: int,
+    num_groups: int,
+) -> str | None:
+    """Reject a strided view where grouped-row quant stores raw blob offsets.
+
+    The F8_128x4 epilogue deliberately addresses the physical atom stream and
+    does not apply the runtime tensor strides. Reuse the input-SF packed-blob
+    contract so every accepted destination is one dense byte run.
+    """
+    blobs = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        quant_idx = int(spec.source.rsplit("_", 1)[1])
+        quant = chain.quants[quant_idx]
+        if not quant.grouped_by_moe or quant.axis == 1:
+            continue
+        padded_n_blocks = ((runtime_n // quant.block_size + 3) // 4) * 4
+        required_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+        required = required_rows * padded_n_blocks * DTYPE_BYTES[quant.scale_dtype]
+        blobs.append((f"grouped row quant scale output[{quant_idx}]", buf, required))
+    return _sf_blob_reject(blobs) if blobs else None
+
+
 def _check_input_alignment(chain: FusionChain) -> None:
     """Graph-time TMA input-alignment gate (the runtime dims are re-checked in
     ``CompiledFusedGemm.__call__`` — the kernel is shape-agnostic, so the call
@@ -3003,6 +3116,28 @@ def _check_input_alignment(chain: FusionChain) -> None:
 # next). 2 is the minimum useful value; more helps only if TMA-store latency
 # exceeds one subtile's sts cost, not generally the case on B200.
 _EPI_SMEM_STAGES = 2
+
+
+_SF_ATOM_ROWS = 128  # F8_128x4: the SF blob is padded to whole 128-row blocks
+
+
+def _moe_required_offset_multiple(chain, cfg) -> int:
+    """Divisor every routed-group start must carry for the GLOBAL-descriptor path."""
+    req = cfg.cga_tile_mn[0]
+    if chain.block_scale is not None:
+        req = math.lcm(req, _SF_ATOM_ROWS)
+    return req
+
+
+def _moe_aligned_offsets(chain, cfg) -> bool:
+    """Can this (graph, geometry) address A and SFA globally, skipping the
+    per-routed-group TMA-descriptor rewrite? The promise is the caller's
+    `alignment_value` on the first_token_offset tensor; 1 (the default) never
+    qualifies, so an un-annotated graph keeps the rewrite."""
+    if not chain.has_moe or chain.moe is None:
+        return False
+    return chain.moe.offset_multiple % _moe_required_offset_multiple(chain, cfg) == 0
+
 
 # TMEM accumulator stages: 2 = MMA of tile N+1 overlaps the epilogue of tile N.
 # The TMEM budget is the only thing that can take it back down to 1.
@@ -3150,6 +3285,17 @@ def _output_store_mode(
     return "tma"
 
 
+def _store_mode_tag(store_modes: "tuple[str, ...]") -> str:
+    """Suffix for the kernel symbol naming its store arm, empty for the TMA one.
+
+    Two builds of the SAME geometry that differ only in store mode -- `force_stg_epi`
+    against the gate's own choice -- otherwise carry an IDENTICAL symbol, so nsys
+    reports them as one kernel."""
+    if not store_modes or all(m == "tma" for m in store_modes):
+        return ""
+    return "_stg" if all(m == "stg" for m in store_modes) else "_mixedstore"
+
+
 def _store_modes(
     chain,
     cfg,
@@ -3236,6 +3382,14 @@ def _check_block_quant_supported(
                 f"cols_per_acc_stage={cols_per_acc_stage} and to {MAX_EPI_CHUNK_ELEMS} "
                 f"elements); got block_size={q.block_size}, vsize={vsize}"
             )
+        if q.grouped_by_moe and q.axis != 1:
+            if not chain.has_moe:
+                raise NotImplementedError("grouped row block_scale_quantize requires a MoE grouped matmul graph")
+            if not chain.has_block_scale:
+                raise NotImplementedError(
+                    "grouped row block_scale_quantize currently requires a block-scaled MoE "
+                    "matmul whose scheduler supplies the per-group 128-row scale prefix"
+                )
         if q.axis == 1:
             # Col quant: a warp (block 32) or half-warp (block 16) of rows is
             # one M block; the redux needs every row guard uniform across the
@@ -3277,13 +3431,26 @@ def _check_block_quant_supported(
                 f"config={config.name}"
             )
         if q.scale_reorder == "F8_128x4":
-            expected_scale_dim = (
-                chain.matmul.batch,
-                ((chain.matmul.M + 127) // 128) * 128,
-                (((chain.matmul.N // q.block_size) + 3) // 4) * 4,
-            )
-            if q.scale_dim != expected_scale_dim:
-                raise NotImplementedError("F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}")
+            padded_n_blocks = (((chain.matmul.N // q.block_size) + 3) // 4) * 4
+            if q.grouped_by_moe and q.axis != 1:
+                required_rows = segmented_row_scale_capacity_rows(chain.matmul.M, chain.moe.num_groups)
+                if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_n_blocks:
+                    raise NotImplementedError(
+                        "grouped F8_128x4 row block_scale_quantize requires "
+                        "scale_dim=(1, segmented_rows, padded_N_blocks), with "
+                        f"segmented_rows a multiple of 128 and >= the static worst-case {required_rows}, and "
+                        f"padded_N_blocks={padded_n_blocks}; got {q.scale_dim}"
+                    )
+            else:
+                expected_scale_dim = (
+                    chain.matmul.batch,
+                    ((chain.matmul.M + 127) // 128) * 128,
+                    padded_n_blocks,
+                )
+                if q.scale_dim != expected_scale_dim:
+                    raise NotImplementedError(
+                        "F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}"
+                    )
 
 
 _FORCE_STG_EPI = False
@@ -3367,13 +3534,29 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     return replace(config, split_k_slices=slices)
 
 
+_TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
+
+
 def plan_config(chain: FusionChain) -> TileConfig:
+    """Choose the automatic tile strategy for one analyzed fusion chain."""
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
         tile_m = (chain.matmul.M + chain.moe.num_groups - 1) // chain.moe.num_groups
+    declared_rows = chain.matmul.M if chain.moe is not None else chain.matmul.M * chain.matmul.batch
+    force_cta_group = None
+    if chain.num_gemms == 1 and chain.has_block_scale and chain.quants and declared_rows <= _TERMINAL_QUANT_ONE_CTA_MAX_M:
+        # A terminal block-scale quantizer adds a substantial epilogue drain.
+        # Keep both M tiles independently scheduled over the measured row
+        # envelope instead of coupling them in a 2-CTA MMA pair. For dense
+        # batches, every batch contributes M rows; for MoE, total M is the only
+        # plan-time upper bound on a runtime expert group -- the average in
+        # tile_m cannot bound device-resident offsets.
+        # select_config still scores the cluster after this strategy choice;
+        # no cluster shape is pinned here.
+        force_cta_group = 1
     config = select_config(
         tile_m,
         chain.matmul.N,
@@ -3382,6 +3565,7 @@ def plan_config(chain: FusionChain) -> TileConfig:
         block_scale=chain.has_block_scale,
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
+        force_cta_group=force_cta_group,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
@@ -4249,6 +4433,15 @@ class CompiledMoeBlockScaleGemm:
                     f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
                     f"got {tuple(t.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            self.chain,
+            outputs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
         # num_experts = weight batch (E); num_groups = first_token_offset len
         # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
@@ -4318,8 +4511,9 @@ class CompiledMoeBlockScaleGemm:
         if sfa or sfb:
             _S, _N, _K = snk[0], snk[1], snk[2]
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
+            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
             _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 512 * _sf_k4 * ((_S + 127) // 128)) for i, x in enumerate(sfa or [])]
+                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(sfa or [])]
                 + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(b_bufs[j].shape[0])) for j, x in enumerate(sfb or [])]
             )
             if _r_sf is not None:
@@ -4386,6 +4580,15 @@ class CompiledMoeBlockScaleGemm:
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
                     f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            chain,
+            outs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = int(first_token_offset.shape[0])

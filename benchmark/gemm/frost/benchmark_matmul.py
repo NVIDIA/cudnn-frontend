@@ -59,6 +59,7 @@ def _build_spec_map():
     m = {}
     for t, cfg in _candidates(chain):
         label = cfg.name
+        # A family without the CTA-pair axis (sm120) has no cta_group at all.
         m[label] = (cfg, getattr(cfg, "cta_group", 1))
     return m
 

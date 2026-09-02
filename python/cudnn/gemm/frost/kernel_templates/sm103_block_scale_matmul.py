@@ -154,11 +154,17 @@ def _sm103_make_circular_mma_desc(current_desc_circular, phase_k16, next_addr_bi
     return nvvm.Tcgen05SmemDesc(desc_with_phase | next_addr_bits)
 
 
+def _a_collector_op(g):
+    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+        return None
+    if cutlass.const_expr(g == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(g == num_gemms - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
+
+
 def _b_collector_op(mi):
-    """B is identical across the M sub-blocks (only A's address advances), so the
-    first MMA fills the B collector and the rest read it back instead of
-    re-fetching the same operand from SMEM. `.collector::b::*` is silicon-gated
-    (sm_107a only), hence `b_collector_ok`."""
     if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
         return None
     if cutlass.const_expr(mi == 0):
@@ -1146,6 +1152,7 @@ def _kernel(
                                             ),
                                             scale_b=nvvm.make_tmem_ptr(sfb_tmem_bases[_bj] + sfb_mma_col_off_by_j[_pj], cutlass.Float32),
                                             scale_vec_size=scale_vec_size,
+                                            collector_op=_a_collector_op(g),
                                             b_collector_op=_b_collector_op(mi),
                                         )
                             scale_d = cutlass.Boolean(True)
@@ -1241,6 +1248,7 @@ def _kernel(
                                     scale_a=nvvm.make_tmem_ptr(sfa_tmem_bases[_ai] + sfa_mma_col_off_by_j[_pj] + mi * registers_per_atom, cutlass.Float32),
                                     scale_b=nvvm.make_tmem_ptr(sfb_tmem_bases[_bj] + sfb_mma_col_off_by_j[_pj], cutlass.Float32),
                                     scale_vec_size=scale_vec_size,
+                                    collector_op=_a_collector_op(g),
                                     b_collector_op=_b_collector_op(mi),
                                 )
                     scale_d = cutlass.Boolean(True)

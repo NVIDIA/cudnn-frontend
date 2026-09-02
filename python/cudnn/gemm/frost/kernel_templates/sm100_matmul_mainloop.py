@@ -39,6 +39,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
+    tcgen05_mma as _tcgen05_mma,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
@@ -105,6 +106,26 @@ def _auto_swizzle_w(m, n, k, nt_n):
     if cutlass.min(m, n) * row_bytes <= budget and m <= n:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
+
+
+def _a_collector_op(g):
+    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+        return None
+    if cutlass.const_expr(g == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(g == num_gemms - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
+
+
+def _b_collector_op(mi):
+    if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
+        return None
+    if cutlass.const_expr(mi == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(mi == mma_size_m - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
 
 
 @cute.kernel
@@ -937,7 +958,7 @@ def _kernel(
                             # descriptor's swizzle phase is preserved. B is shared.
                             desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                             if elect_one:
-                                nvvm.tcgen05_mma(
+                                _tcgen05_mma(
                                     mma_kind,
                                     _CTA_GROUP,
                                     tmem_addr_mmas[mi],
@@ -945,6 +966,7 @@ def _kernel(
                                     desc_b,
                                     idesc,
                                     scale_d,
+                                    b_collector_op=_b_collector_op(mi),
                                 )
                         # Every accumulator sees scale_d=False on exactly the first
                         # k_block of the tile, so the flip stays outside mi.

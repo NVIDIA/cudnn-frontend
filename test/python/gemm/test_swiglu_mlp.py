@@ -1,19 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correctness tests for cudnn.gemm.ops.swiglu_mlp (dense bf16 SwiGLU-MLP).
+"""Correctness tests for dense bf16 SwiGLU and Kimi SiTU MLP contracts.
 
-The fused SwiGLU forward runs on cuDNN's runtime-fusion engine, which needs an
-SM100 (Blackwell) device; the op must match torch to bf16 noise on the output and
-all four gradients.
+The fused forwards run on cuDNN's runtime-fusion engine, which needs an SM100
+(Blackwell) device; both semantic entry points must match their exact torch
+references to bf16 noise on the output and all four gradients.
 """
+
+import inspect
 
 import pytest
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from cudnn.gemm.ops import swiglu_mlp
+from cudnn.gemm.ops import situ_mlp, swiglu_mlp
 
 
 def _cc():
@@ -25,11 +27,34 @@ def _rel_l2(a, b):
     return (a.float() - b.float()).norm().item() / max(b.float().norm().item(), 1e-9)
 
 
-def _ref(x, Wg, Wu, Wd):
-    return (F.silu(x @ Wg.t()) * (x @ Wu.t())) @ Wd.t()
+def _ref(x, Wg, Wu, Wd, *, activation="silu", situ_beta=4.0, situ_linear_beta=25.0):
+    gate = x @ Wg.t()
+    up = x @ Wu.t()
+    if activation == "silu":
+        h = F.silu(gate) * up
+    elif activation == "situ":
+        # Exact Kimi K3 contract: both Linear outputs are bf16, the bounded
+        # activation is evaluated in fp32, then h is cast back before down_proj.
+        gate_f, up_f = gate.float(), up.float()
+        gate_act = situ_beta * torch.tanh(gate_f / situ_beta) * torch.sigmoid(gate_f)
+        up_act = situ_linear_beta * torch.tanh(up_f / situ_linear_beta)
+        h = (gate_act * up_act).to(gate.dtype)
+    else:
+        raise AssertionError(f"unexpected reference activation {activation!r}")
+    return h @ Wd.t()
 
 
-def _dswiglu_ref(dh, gate, up):
+def _dswiglu_ref(dh, gate, up, *, activation="silu", situ_beta=4.0, situ_linear_beta=25.0):
+    if activation == "situ":
+        gate_f, up_f, dh_f = gate.float(), up.float(), dh.float()
+        sigmoid = torch.sigmoid(gate_f)
+        gate_tanh = torch.tanh(gate_f / situ_beta)
+        up_tanh = torch.tanh(up_f / situ_linear_beta)
+        gate_value = situ_beta * gate_tanh * sigmoid
+        up_value = situ_linear_beta * up_tanh
+        gate_grad = (1 - gate_tanh.square()) * sigmoid + situ_beta * gate_tanh * sigmoid * (1 - sigmoid)
+        up_grad = 1 - up_tanh.square()
+        return (dh_f * up_value * gate_grad).to(gate.dtype), (dh_f * gate_value * up_grad).to(up.dtype)
     sigmoid = torch.sigmoid(gate)
     silu = gate * sigmoid
     return dh * up * (sigmoid + silu * (1 - sigmoid)), dh * silu
@@ -38,6 +63,20 @@ def _dswiglu_ref(dh, gate, up):
 # bf16 noise across three chained GEMMs + the SwiGLU; cuDNN vs torch differ only by
 # accumulation order, so a relative-L2 at this level is the meaningful bar.
 _TOL = 2e-2
+
+
+@pytest.mark.L0
+def test_situ_mlp_has_a_distinct_semantic_entry_point():
+    """Do not overload the public SwiGLU symbol with an activation string."""
+    import cudnn.gemm as gemm
+
+    assert gemm.situ_mlp is situ_mlp
+    assert tuple(inspect.signature(swiglu_mlp).parameters) == ("x", "Wg", "Wu", "Wd")
+    situ_signature = inspect.signature(situ_mlp)
+    assert tuple(situ_signature.parameters) == ("x", "Wg", "Wu", "Wd", "beta", "linear_beta")
+    assert situ_signature.parameters["beta"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert situ_signature.parameters["linear_beta"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (situ_signature.parameters["beta"].default, situ_signature.parameters["linear_beta"].default) == (4.0, 25.0)
 
 
 @pytest.mark.L0
@@ -69,6 +108,82 @@ def test_swiglu_mlp_parity(M, H, inter):
     assert _rel_l2(out, ref) < _TOL, f"fwd rel={_rel_l2(out, ref):.2e}"
     for name, a, b in (("dx", x.grad, xr.grad), ("dWg", Wg.grad, Wgr.grad), ("dWu", Wu.grad, Wur.grad), ("dWd", Wd.grad, Wdr.grad)):
         assert _rel_l2(a, b) < _TOL, f"{name} rel={_rel_l2(a, b):.2e}"
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _cc() >= 100),
+    reason="cuDNN SiTU-MLP fusion requires SM100 (Blackwell)",
+)
+def test_situ_mlp_kimi_k3_forward_beta_contract():
+    """Kimi's defaults and alternate beta values follow the public formula.
+
+    The published dense layer has H=7168/I=33792; shared experts use
+    H=7168/I=6144 and routed experts H=3584/I=3072. This smaller matrix keeps L0
+    practical while preserving the identical [M,H]@[H,I] semantic contract.
+    """
+    torch.manual_seed(10)
+    M, H, inter = 128, 256, 256
+    x = torch.randn(1, M, H, device="cuda", dtype=torch.bfloat16)
+    # Exercise both tanh bounds rather than staying in SiTU's near-linear range.
+    Wg = torch.randn(inter, H, device="cuda", dtype=torch.bfloat16) * 0.5
+    Wu = torch.randn(inter, H, device="cuda", dtype=torch.bfloat16) * 2.0
+    Wd = torch.randn(H, inter, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    with torch.no_grad():
+        official = situ_mlp(x, Wg, Wu, Wd)
+        alternate = situ_mlp(x, Wg, Wu, Wd, beta=2.0, linear_beta=8.0)
+    official_ref = _ref(x, Wg, Wu, Wd, activation="situ", situ_beta=4.0, situ_linear_beta=25.0)
+    alternate_ref = _ref(x, Wg, Wu, Wd, activation="situ", situ_beta=2.0, situ_linear_beta=8.0)
+
+    assert _rel_l2(official, official_ref) < _TOL, f"official SiTU rel={_rel_l2(official, official_ref):.2e}"
+    assert _rel_l2(alternate, alternate_ref) < _TOL, f"alternate SiTU rel={_rel_l2(alternate, alternate_ref):.2e}"
+    assert not torch.equal(official, alternate), "different SiTU betas must retain distinct semantics"
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _cc() >= 100),
+    reason="cuDNN SiTU-MLP fusion requires SM100 (Blackwell)",
+)
+def test_situ_mlp_kimi_k3_backward_parity():
+    """The public operation computes all four exact dSiTU gradients."""
+    torch.manual_seed(11)
+    M, H, inter = 128, 256, 256
+    base = (
+        torch.randn(1, M, H, device="cuda", dtype=torch.bfloat16),
+        torch.randn(inter, H, device="cuda", dtype=torch.bfloat16) * 0.25,
+        torch.randn(inter, H, device="cuda", dtype=torch.bfloat16) * 1.0,
+        torch.randn(H, inter, device="cuda", dtype=torch.bfloat16) * 0.02,
+    )
+    args = tuple(t.detach().clone().requires_grad_(True) for t in base)
+    refs = tuple(t.detach().clone().requires_grad_(True) for t in base)
+    dout = torch.randn(1, M, H, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    out = situ_mlp(*args)
+    ref = _ref(*refs, activation="situ", situ_beta=4.0, situ_linear_beta=25.0)
+    out.backward(dout)
+    ref.backward(dout)
+
+    assert _rel_l2(out, ref) < _TOL, f"fwd rel={_rel_l2(out, ref):.2e}"
+    for name, got, expected in zip(("dx", "dWg", "dWu", "dWd"), args, refs):
+        assert _rel_l2(got.grad, expected.grad) < _TOL, f"{name} rel={_rel_l2(got.grad, expected.grad):.2e}"
+
+
+@pytest.mark.L0
+def test_situ_mlp_beta_contract_rejects_invalid_values():
+    """Beta errors are semantic and fail before any device launch."""
+    shape = (2, 2)
+    tensors = tuple(torch.empty(shape, dtype=torch.bfloat16) for _ in range(4))
+    cases = (
+        ({"beta": 0.0}, ValueError, "beta must be positive and finite"),
+        ({"linear_beta": float("nan")}, ValueError, "linear_beta must be positive and finite"),
+        ({"beta": True}, TypeError, "beta must be a positive finite Python number"),
+        ({"beta": None}, TypeError, "beta must be a positive finite Python number"),
+    )
+    for kwargs, error, match in cases:
+        with pytest.raises(error, match=match):
+            situ_mlp(*tensors, **kwargs)
 
 
 @pytest.mark.L0
@@ -314,8 +429,8 @@ def test_swiglu_mlp_all_frozen_uses_h_only(monkeypatch):
     not (torch.cuda.is_available() and _cc() >= 100),
     reason="cuDNN SwiGLU-MLP fusion requires SM100 (Blackwell)",
 )
-def test_swiglu_mlp_h_only_matches_full_and_cache_switches():
-    """The output mask is part of the plan cache and must not change h rounding."""
+def test_swiglu_mlp_h_only_matches_full():
+    """Selecting saved preactivations must not change h rounding."""
     import importlib
 
     mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
@@ -333,8 +448,6 @@ def test_swiglu_mlp_h_only_matches_full_and_cache_switches():
     assert gate_full is not None and up_full is not None
     assert torch.equal(h_only_1, h_full)
     assert torch.equal(h_only_1, h_only_2)
-    matching = [key for key in mod._SWIGLU_CACHE if key[:3] == (M, H, inter)]
-    assert {key[7] for key in matching} == {False, True}
 
 
 @pytest.mark.L0

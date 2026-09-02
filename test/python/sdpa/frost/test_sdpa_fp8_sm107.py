@@ -73,9 +73,14 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA: Rubin has no d192 sibling.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128)})
+    # Kernel flavors are row DATA: Rubin has no d192 or d512 sibling.
+    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (512, 512)})
     assert sm107.d_shapes == frozenset({(128, 128)})
+    # d512 carries an envelope FLOOR: it serves (256, 512] on both head dims,
+    # so a smaller graph is declined rather than routed onto the d512 kernel at
+    # a multiple-x zero-padding cost.  Rubin has no d512 flavor, hence no floor.
+    assert sm100.d_envelope_floors == (((512, 512), 256),)
+    assert sm107.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -284,7 +289,10 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-        assert row.thd_d_shapes == frozenset({(128, 128)}), arch
+    # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
+    # d512 flavor's THD leg.
+    assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
+    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 
@@ -326,11 +334,29 @@ def test_fp8_envelope_mismatch_rules():
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
-    # THD at the d192 native shape is dense-only (thd_d_shapes = {(128, 128)}).
+    # THD at the d192 native shape is dense-only (thd_d_shapes excludes it).
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True))
+    # d512 is a NATIVE shape (accepted exactly, dense and THD) and serves the
+    # (256, 512] envelope band on BOTH head dims -- at most 2x zero-padding.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512, thd=True, padded=True)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=464, d_v=368)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=272)) is None
+    # Below the floor, or straddling it, the row declines rather than routing a
+    # much smaller graph onto the d512 kernel.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256))
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=128))
+    # THD stays native-tile: the (256, 512] envelope band is dense-only.
+    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
+    # d % 16 still applies inside the band (TMA 16-byte global-stride rule).
+    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=392, d_v=392))
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case)
     # but has no d192 flavor at all.
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
+    # There is no Rubin d512 kernel at all.
+    assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))

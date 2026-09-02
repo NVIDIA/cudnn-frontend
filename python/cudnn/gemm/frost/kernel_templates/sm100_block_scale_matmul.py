@@ -116,10 +116,17 @@ def _auto_swizzle_w(m, n, k, nt_n):
     return cutlass.Int32(w)
 
 
+def _a_collector_op(g):
+    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+        return None
+    if cutlass.const_expr(g == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(g == num_gemms - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
+
+
 def _b_collector_op(mi):
-    """B is identical across the M sub-blocks (only A's address advances), so the
-    first MMA fills the B collector and the rest read it back instead of
-    re-fetching the same operand from SMEM."""
     if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
         return None
     if cutlass.const_expr(mi == 0):
@@ -1117,6 +1124,7 @@ def _kernel(
                                             scale_a=sfa_dst_ptrs[_ai][mma_m][0],
                                             scale_b=sfb_scale_ptrs[_bj],
                                             scale_vec_size=scale_vec_size,
+                                            collector_op=_a_collector_op(gemm_i),
                                             b_collector_op=_b_collector_op(mma_m),
                                         )
                             # Every accumulator sees scale_d=False on exactly the first

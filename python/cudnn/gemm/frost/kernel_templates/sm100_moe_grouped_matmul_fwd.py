@@ -33,6 +33,7 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
+    tcgen05_mma as _tcgen05_mma,
     TENSOR_MAP_QWORDS,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
@@ -89,6 +90,26 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     if cutlass.min(rows, n) * row_bytes <= budget and rows <= n:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
+
+
+def _a_collector_op(g):
+    if cutlass.const_expr(num_gemms == 1 or num_a_operands != 1 or mma_size_m != 1):
+        return None
+    if cutlass.const_expr(g == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(g == num_gemms - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
+
+
+def _b_collector_op(mi):
+    if cutlass.const_expr(not b_collector_ok or mma_size_m == 1):
+        return None
+    if cutlass.const_expr(mi == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(mi == mma_size_m - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
 
 
 @cute.kernel
@@ -386,6 +407,8 @@ def _kernel(
         bcast_stage = cutlass.Int32(0)
         bcast_full_phase = cutlass.Int32(0)
         bcast_empty_phase = cutlass.Int32(1)
+        last_bcast_stage = cutlass.Int32(0)
+        last_bcast_empty_done_phase = cutlass.Int32(0)
         linear_idx = cutlass.Int32(0)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
@@ -429,6 +452,12 @@ def _kernel(
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
+            if cutlass.const_expr(cluster_size > 1):
+                # The final invalid broadcast has no next reuse of this stage to
+                # wait for its cluster-wide acknowledgements, so retain its exact
+                # stage and completion parity for the scheduler-warp drain below.
+                last_bcast_stage = bcast_stage
+                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
             bcast_stage += 1
             if bcast_stage == SCHED_BCAST_STAGES:
                 bcast_stage = cutlass.Int32(0)
@@ -525,6 +554,21 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_empty_phase = sched_empty_phase ^ 1
 
+        # Every multi-CTA cluster emits one invalid scheduler record before
+        # leaving the loop. Keep the leader CTA's DSM alive until every
+        # scheduler warp has consumed that final broadcast and acknowledged the
+        # leader slot. A singleton cluster has no remote DSM lifetime to drain.
+        if cutlass.const_expr(cluster_size > 1):
+            if cta_rank_in_cluster == 0:
+                # Each acknowledgement flips the saved pre-wrap empty phase, so
+                # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
+                while not nvvm.mbarrier_try_wait_parity(
+                    sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
+                    last_bcast_empty_done_phase,
+                    time_limit=10_000_000,
+                ):
+                    pass
+
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
@@ -549,7 +593,11 @@ def _kernel(
             for _ai in range(num_a_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if elect_one:
+        if cutlass.const_expr(moe_aligned_offsets):
+            a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
+        else:
+            a_desc_load_list = a_desc_tma_ptr_list
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -577,12 +625,16 @@ def _kernel(
 
             if is_valid != 0:
                 coord_m_group = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
+                if cutlass.const_expr(moe_aligned_offsets):
+                    coord_m_desc = group_begin + coord_m_group
+                else:
+                    coord_m_desc = coord_m_group
                 if cutlass.const_expr(cta_group == 1):
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin:
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
@@ -631,8 +683,8 @@ def _kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sA_stage.subview(_a_off * cta_tile_mnk[2]),
-                                    a_desc_tma_ptr_list[_ai],
-                                    (coord_k, coord_m_group + _a_off, cutlass.Int32(0)),
+                                    a_desc_load_list[_ai],
+                                    (coord_k, coord_m_desc + _a_off, cutlass.Int32(0)),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
@@ -811,7 +863,7 @@ def _kernel(
                                     # so the descriptor's swizzle phase is preserved.
                                     desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                     if elect_one:
-                                        nvvm.tcgen05_mma(
+                                        _tcgen05_mma(
                                             mma_kind,
                                             _CTA_GROUP,
                                             tmem_addr_mmas[g][mi],
@@ -819,6 +871,8 @@ def _kernel(
                                             desc_b_k,
                                             idesc,
                                             scale_d,
+                                            collector_op=_a_collector_op(g),
+                                            b_collector_op=_b_collector_op(mi),
                                         )
                             # Every accumulator sees scale_d=False on exactly the first
                             # k_block of the tile, so the flip stays outside mi.
@@ -960,7 +1014,7 @@ def _kernel(
                                         # descriptor's swizzle phase is preserved. B is shared.
                                         desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                         if elect_one:
-                                            nvvm.tcgen05_mma(
+                                            _tcgen05_mma(
                                                 mma_kind,
                                                 _CTA_GROUP,
                                                 tmem_addr_mmas[g][mi],
@@ -968,6 +1022,8 @@ def _kernel(
                                                 desc_b,
                                                 idesc,
                                                 scale_d,
+                                                collector_op=_a_collector_op(g),
+                                                b_collector_op=_b_collector_op(mi),
                                             )
                                 # Every accumulator sees scale_d=False on exactly the first
                                 # k_block of the tile, so the flip stays outside mi/ni.
@@ -1089,7 +1145,7 @@ def _kernel(
 
         # @@TMA_STORE_ONLY:BEGIN@@
         epi_stage_idx = cutlass.Int32(EPI_SMEM_STAGES - 1)
-        # The routed output is a single (1, S, N) tensor, so the batch coord is fixed.
+        # The routed output is one flat (S, N) TMA surface.
         tile_l = cutlass.Int32(0)
         epi_block_linear = bidx + bidy * gridx
         d_desc_base_list = [
@@ -1097,7 +1153,7 @@ def _kernel(
         ]
         d_desc_ptr_list = [cute.make_ptr(cutlass.Int64, _b.toint(), mem_space=cute.AddressSpace.generic) for _b in d_desc_base_list]
         previous_group_end = cutlass.Int32(-1)
-        if warp_idx == 0:
+        if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
             for _di in cutlass.range_constexpr(n_tma_outputs):
                 if elect_one:
                     _copy_tensormap_to_workspace(tma_c_descs[_di].get_ptr(), tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS))
@@ -1125,7 +1181,10 @@ def _kernel(
             # @@TMA_STORE_ONLY:BEGIN@@
             # Re-dimension D to this group's last row so the hardware clips the
             # ragged tail; the base stays put, so the store coords are global.
-            if warp_idx == 0:
+            # Under `moe_aligned_offsets` no tile crosses `group_end` in the
+            # first place -- `cgrp_tile_m` divides every group -- so the clip
+            # has nothing to clip and the original descriptor serves.
+            if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets):
                 if group_end != previous_group_end:
                     previous_group_end = group_end
                     # One drain retires the in-flight stores of EVERY descriptor,

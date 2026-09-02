@@ -291,9 +291,13 @@ class pygraph:
         name: str = "",
         uid: Optional[int] = None,
         ragged_offset_multiplier: int = 1,
+        alignment_value: int = 1,
         **kwargs,
     ) -> Tensor:
-        """Create a tensor."""
+        """Create a tensor.
+
+        `alignment_value` promises every VALUE the tensor holds is a multiple of
+        it; it constrains the contents, not the layout, and is not validated."""
         if not name:
             name = f"tensor_{len(self._tensors)}"
         if data_type is not None and getattr(data_type, "name", None) == "NOT_SET":
@@ -330,6 +334,7 @@ class pygraph:
             ragged_offset=ragged_offset,
             reordering_type=reordering_type,
             ragged_offset_multiplier=ragged_offset_multiplier,
+            alignment_value=alignment_value,
             uid=uid if uid is not None else self._alloc_uid(),
             uid_assigned=uid is not None,
             dim_assigned=True,  # graph inputs: the user specified the layout
@@ -2386,8 +2391,11 @@ _install_pointwise_builders()
 #   attrs              scalar/enum/list params stored in node.params verbatim
 #                      and forwarded as keywords at lowering
 #   outputs            output ports, in C++ return order
+#   maybe              per-output presence predicate over the node (an output
+#                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
 #   no_cdt             True for bindings without a compute_data_type kwarg
@@ -2666,6 +2674,7 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state"},
         python_only=True,
     ),
     "kda": dict(
@@ -2709,6 +2718,7 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state"},
         python_only=True,
     ),
     "gdn2": dict(
@@ -2754,6 +2764,7 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state"},
         python_only=True,
     ),
     # ---- convolution ---------------------------------------------------------
