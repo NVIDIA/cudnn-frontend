@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""One-launch BF16/FP32 to MXFP8 staging for fixed training resources."""
+"""One-launch BF16/FP32 to MXFP8 private symmetric staging."""
 
 from __future__ import annotations
 

@@ -91,34 +91,35 @@ output = op(
 For inference CUDA Graph capture, call `op.warmup(...)` with the exact
 bindings before capture. `MoeEp` supports `close()` and context-manager use.
 
-Fixed-resource training uses the same operator and binds graph-stable weights,
-slots, and execution lanes:
+Stateless training prepares only private execution lanes. Every invocation
+receives independent native weights and caller-owned outputs:
 
 ```python
-from cudnn import MoeEpTrainingWeights
+requirements = op.prepare_training(lane_count=1, device=device)
+lane = op.training_lanes[0]
 
-weights = MoeEpTrainingWeights(
-    forward_fc1=forward_fc1_mxfp8,
-    forward_fc2=forward_fc2_mxfp8,
-    backward_w2_transpose=backward_w2t_mxfp8,
-    backward_w1_transpose=backward_w1t_mxfp8,
+output = op.training_forward(
+    lane, activation, topk_idx, topk_weights,
+    weights=native_forward_weights,
+    out=forward_outputs,
 )
-resources = op.prepare_training_resources(weights, slot_count=2, lane_count=1)
-slot, lane = resources.slots[0], resources.lanes[0]
-
-resources.refresh_weights()
-output = resources.forward(slot, lane, activation, topk_idx, topk_weights)
-grad_activation, dprob, wgrad_operands = resources.backward(
-    slot, lane, grad_output
+grad_activation, dprob, wgrad_operands = op.training_backward(
+    lane, grad_output, topk_idx, topk_weights,
+    weights=native_backward_weights,
+    fc1_preact=forward_outputs.fc1_preact,
+    fc1_a=forward_outputs.fc1_a,
+    fc1_sfa=forward_outputs.fc1_sfa,
+    valid_route_counts=forward_outputs.valid_route_counts,
+    expert_offsets=forward_outputs.expert_offsets,
+    out=backward_outputs,
 )
-overflow = resources.finalize_overflow((slot,), lane)
 ```
 
 The WGrad result is a fixed-capacity grouped-GEMM operand bundle, not dense
 optimizer-ready weight gradients. See the detailed
 [MoE + Expert Parallel API](../fe-oss-apis/moe_ep.md) reference for
-installation, all constructor arguments, tensor formats, training resource
-lifecycle, tuning, overflow handling, and CUDA Graph requirements. MoeEP is
+installation, all constructor arguments, native layouts, buffer ownership,
+overflow handling, and CUDA Graph requirements. MoeEP is
 distinct from the cuDNN graph [MoE Grouped Matmul](MoeGroupedMatmul.md)
 operation.
 
@@ -137,7 +138,7 @@ operation.
 - `num_experts` divisible by the expert-parallel group size.
 - An explicit positive `max_tokens_per_rank`.
 
-The fixed-resource CUDA Graph path has hardware acceptance through EP32 when
+The stateless training CUDA Graph path has hardware acceptance through EP32 when
 all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability
 layer does not impose an EP-size ceiling; cross-MNNVL execution is not part of
 the validated support surface.
@@ -153,9 +154,9 @@ The current executable output format is BF16. The expert-combine path accepts
 BF16 or MXFP8. NVFP4 types are represented by the public API but native NVFP4
 operands, combine, and output are not executable by this backend.
 
-Fixed-resource training narrows dynamic activation and gradient inputs to
-contiguous BF16 or FP32 tensors. Training weights are contiguous MXFP8
-block-scaled tensors.
+Training accepts contiguous BF16/FP32 or MXFP8 block-scaled activation and
+gradient inputs. Execution weights use versioned kernel-native E4M3 payload
+and Rubin-blocked E8M0 scale layouts.
 
 ## Tensor contracts
 
@@ -180,19 +181,21 @@ Inference uses:
 All inference tensors must reside on one device, and the local token count must
 satisfy `T <= max_tokens_per_rank`.
 
-Fixed-resource training uses a narrower graph-stable contract:
+Stateless training uses:
 
-- `activation` and `grad_output`: contiguous `(T, H)`, BF16 or FP32;
+- `activation` and `grad_output`: contiguous `(T, H)`, BF16, FP32, or MXFP8;
 - `topk_idx`: contiguous `(T, K)`, Int32;
 - `topk_weights`: contiguous `(T, K)`, FP32;
-- forward FC1 and FC2 weights: contiguous MXFP8 block-scaled tensors with
-  shapes `(E_local, H, 2I)` and `(E_local, I, H)`;
-- transposed backward weights: contiguous MXFP8 block-scaled tensors with
-  shapes `(E_local, H, I)` and `(E_local, 2I, H)`;
-- forward output: `(T, H)`, BF16;
-- `grad_activation`: fixed-slot `(T, H)`, FP32;
-- `dprob`: source-order `(T, K)`, FP32;
-- `wgrad_operands`: a fixed-capacity `MoeEpTrainingWgradOperands` bundle.
+- independent forward and backward native weight packs with exact versioned
+  `layout_id` values;
+- required caller-owned forward output: `(T, H)`, BF16;
+- required caller-owned `fc1_preact`, produced by training forward with
+  `generate_c=True` and retained through matching backward;
+- required caller-owned `grad_activation`: `(T, H)` view of a capacity buffer,
+  FP32;
+- required caller-owned `dprob`: source-order `(T, K)`, FP32;
+- required caller-owned WGrad saved state and a fixed-capacity
+  `MoeEpTrainingWgradOperands` bundle.
 
 All dynamic training tensors must reside on one device and satisfy
 `T <= max_tokens_per_rank`.
@@ -204,7 +207,7 @@ EP2+ execution requires:
 - an initialized NCCL process group;
 - `nvshmem4py` and usable NVSHMEM libraries;
 - direct peer access among every pair of participating ranks; and
-- consistent rank ordering, resource sizes, tuning, slot selection, and lane
+- consistent rank ordering, buffer schemas, tuning, lane selection, and launch
   ordering across the group.
 
 `max_recv_size_per_rank` bounds receive capacity. When omitted, it defaults to
@@ -214,5 +217,5 @@ the worst-case route count:
 ep_size * max_tokens_per_rank * top_k
 ```
 
-Resources cannot grow during CUDA Graph replay. Capacity or storage changes
-require resource preparation and graph capture again.
+Private lane resources cannot grow during CUDA Graph replay. Capacity changes
+require a new operator preparation; caller-address changes require recapture.

@@ -13,7 +13,6 @@ import torch.distributed as dist
 
 from ..._backend import BackendUnavailableError
 from ..._contracts import ForwardConfig, ValidatedForwardRequest
-from ..._types import MoeEpTrainingWeights
 from .._plan import ExecutionPlanOwner
 from ._adapter import Mxfp8InputAdapter
 from ._backward_compile import prepare_backward_kernel
@@ -44,7 +43,7 @@ class Mxfp8Backend:
         self._completion_recorded = False
         self._device_work_may_be_pending = False
         self._ep_launch_ready = config.ep_size == 1
-        self._training_resource_owner = None
+        self._training_state = None
         self._lock = threading.RLock()
 
     @property
@@ -180,20 +179,18 @@ class Mxfp8Backend:
                 self._warmed_up = True
                 return output
 
-    def prepare_training_resources(
+    def prepare_training(
         self,
-        weights: MoeEpTrainingWeights,
         *,
-        slot_count: int,
         lane_count: int,
     ):
-        """Allocate the fixed slot/lane roots used by the training graph path."""
+        """Allocate private per-lane state for stateless training calls."""
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("MoeEp MXFP8 backend is closed")
-            if self._training_resource_owner is not None:
-                raise RuntimeError("MoeEp training resources already exist")
+            if self._training_state is not None:
+                raise RuntimeError("MoeEp training is already prepared")
             training_config = replace(
                 self.config,
                 generate_c=True,
@@ -224,24 +221,22 @@ class Mxfp8Backend:
                 graph_kernel_config,
                 self.device,
             )
-            from ._training_resources import Mxfp8TrainingResourceOwner
+            from ._training_resources import Mxfp8TrainingState
 
-            owner = Mxfp8TrainingResourceOwner(
+            state = Mxfp8TrainingState(
                 training_config,
                 self.device,
                 forward,
                 backward,
-                weights,
-                slot_count=slot_count,
                 lane_count=lane_count,
             )
             try:
-                owner.prepare()
+                state.prepare()
             except Exception:
-                owner.close()
+                state.close()
                 raise
-            self._training_resource_owner = owner
-            return owner
+            self._training_state = state
+            return state
 
     def close(self) -> None:
         with self._lock:
@@ -250,12 +245,12 @@ class Mxfp8Backend:
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("MoeEp MXFP8 backend cannot be closed during " "CUDA graph capture")
-                if self._plan is not None or self._training_resource_owner is not None:
+                if self._plan is not None or self._training_state is not None:
                     torch.cuda.synchronize(self.device)
                 self._adapter.close()
-                if self._training_resource_owner is not None:
-                    self._training_resource_owner.close()
-                    self._training_resource_owner = None
+                if self._training_state is not None:
+                    self._training_state.close()
+                    self._training_state = None
                 if self._plan is not None:
                     self._plan.close()
                     self._plan = None

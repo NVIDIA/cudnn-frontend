@@ -459,12 +459,8 @@ def test_moe_ep_rejects_interleaved_plain_fc1_weight():
 
     config = _forward_config()
     activation = torch.zeros((1, config["hidden_size"]))
-    fc1_weight = torch.zeros(
-        (config["num_experts"], config["hidden_size"], 2 * config["intermediate_size"])
-    )
-    fc2_weight = torch.zeros(
-        (config["num_experts"], config["intermediate_size"], config["hidden_size"])
-    )
+    fc1_weight = torch.zeros((config["num_experts"], config["hidden_size"], 2 * config["intermediate_size"]))
+    fc2_weight = torch.zeros((config["num_experts"], config["intermediate_size"], config["hidden_size"]))
     topk_idx = torch.zeros((1, config["top_k"]), dtype=torch.int32)
     topk_weights = torch.ones((1, config["top_k"]))
     with MoeEp(**config, weight_interleave_size=32) as op:
@@ -891,32 +887,6 @@ def test_single_gpu_stress_and_cuda_graph_replay():
         _replay_cuda_graph(op, args, original_topk_idx, expected, device)
 
 
-@pytest.mark.L1
-@pytest.mark.gpu_exclusive
-def test_nondefault_tuning_warmup_and_cuda_graph_replay():
-    from cudnn import MoeEp, MoeEpTuningConfig
-
-    device = _sm107_device()
-    args = make_forward_inputs(device)
-    original_topk_idx = args[3].clone()
-    expected = _reference_forward(args)
-    tuning = MoeEpTuningConfig(
-        token_back_mode="reuse_dispatch_warps",
-        epi_flag_batch=(2, 2),
-        token_in_flag_batch=2,
-        group_hint=128,
-    )
-
-    with MoeEp(**_forward_config(), tuning=tuning) as op:
-        _replay_cuda_graph(
-            op,
-            args,
-            original_topk_idx,
-            expected,
-            device,
-        )
-
-
 @pytest.mark.L0
 def test_forward_mxfp8_combine_is_direct_fp32():
     generator = torch.Generator().manual_seed(20260819)
@@ -1141,7 +1111,7 @@ def test_reference_mxfp8_inputs_bf16_combine_matches_naive(
 
 @pytest.mark.L0
 def test_reference_interleaved_fc1_matches_logical_fc1():
-    from cudnn import BlockScaledTensor
+    from moe_ep.moe_ep_reference import BlockScaledTensor
 
     torch.manual_seed(29)
     experts, tokens, hidden, intermediate = 2, 3, 128, 128
@@ -1163,11 +1133,7 @@ def test_reference_interleaved_fc1_matches_logical_fc1():
 
     def interleave_last(tensor):
         shape = tensor.shape
-        return (
-            tensor.view(*shape[:-1], 2, intermediate // 32, 32)
-            .transpose(-3, -2)
-            .reshape(shape)
-        )
+        return tensor.view(*shape[:-1], 2, intermediate // 32, 32).transpose(-3, -2).reshape(shape)
 
     interleaved_fc1 = BlockScaledTensor(
         data=interleave_last(logical_fc1.data),

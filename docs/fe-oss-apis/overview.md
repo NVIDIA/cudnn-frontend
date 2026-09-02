@@ -37,7 +37,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
 - [MoE + Expert Parallel API](moe_ep.md) — Rubin SM107 fused SwiGLU with
-  fixed-resource training and CUDA Graph support; see the
+  stateless caller-owned training buffers and CUDA Graph support; see the
   [MoeEP operation reference](../operations/moe_ep.md) for support details
 
 ## Installation and setup
@@ -72,7 +72,8 @@ Each operation exposes two APIs:
 
 MoeEP is an exception to the generic wrapper/kernel pattern below. It exposes
 an object API: `MoeEp.__call__` for inference and
-`MoeEp.prepare_training_resources` for fixed-resource training. See
+`prepare_training` plus stateless `training_forward`/`training_backward` calls
+for training. See
 [MoE + Expert Parallel API](moe_ep.md) for its lifecycle and CUDA Graph
 contract.
 

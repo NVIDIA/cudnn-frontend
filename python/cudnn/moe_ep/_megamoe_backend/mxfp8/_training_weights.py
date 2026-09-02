@@ -10,38 +10,20 @@ from dataclasses import dataclass
 import torch
 
 from ..._contracts import Fc1WeightLayout
-from ..._types import BlockScaledTensor, MoeEpTrainingWeights
+from ..._math import round_up
+from ..._types import (
+    BlockScaledTensor,
+    MoeEpBackwardWeightStaging,
+    MoeEpBackwardWeights,
+    MoeEpForwardWeightStaging,
+    MoeEpForwardWeights,
+    MoeEpNativeBackwardWeights,
+    MoeEpNativeForwardWeights,
+    MoeEpNativeWeight,
+    MoeEpNativeWeightLayout,
+)
+from ..._validation import validate_training_non_aliasing
 from ._adapter import Mxfp8Weights
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return (value + multiple - 1) // multiple * multiple
-
-
-def _empty_k_major_like(tensor: torch.Tensor) -> torch.Tensor:
-    experts, reduction, output = tensor.shape
-    return torch.empty_strided(
-        tensor.shape,
-        (reduction * output, 1, reduction),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-
-
-def _empty_blocked_scales(
-    source: BlockScaledTensor,
-    *,
-    raw_rows: int,
-    raw_columns: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    experts = source.data.shape[0]
-    packed_bytes = _round_up(raw_rows, 128) * _round_up(raw_columns, 4)
-    return torch.empty(
-        (experts, packed_bytes),
-        dtype=torch.uint8,
-        device=source.device,
-    ).view(dtype)
 
 
 def _copy_blocked_scales_plain(
@@ -137,14 +119,8 @@ def _copy_blocked_scales_gate_up_rows(
     raw_rows = 2 * intermediate
     if intermediate % 64 or reduction_blocks % 4:
         raise ValueError("intermediate and reduction block alignment are invalid")
-    source_view = (
-        source.view(torch.uint8)
-        .view(experts, reduction_blocks // 4, 4, 2, raw_rows // 128, 2, 32)
-        .permute(0, 4, 1, 6, 5, 3, 2)
-    )
-    target.view(torch.uint8).view(
-        experts, raw_rows // 128, reduction_blocks // 4, 32, 2, 2, 4
-    ).copy_(source_view)
+    source_view = source.view(torch.uint8).view(experts, reduction_blocks // 4, 4, 2, raw_rows // 128, 2, 32).permute(0, 4, 1, 6, 5, 3, 2)
+    target.view(torch.uint8).view(experts, raw_rows // 128, reduction_blocks // 4, 32, 2, 2, 4).copy_(source_view)
 
 
 def _copy_blocked_scales_gate_up_columns(
@@ -160,14 +136,8 @@ def _copy_blocked_scales_gate_up_columns(
     reduction_blocks = intermediate // 32
     if output % 128 or reduction_blocks % 2:
         raise ValueError("output and reduction block alignment are invalid")
-    source_view = (
-        source.view(torch.uint8)
-        .view(experts, 2, reduction_blocks // 2, 2, output // 128, 4, 32)
-        .permute(0, 4, 2, 6, 5, 3, 1)
-    )
-    target.view(torch.uint8).view(
-        experts, output // 128, reduction_blocks // 2, 32, 4, 2, 2
-    ).copy_(source_view)
+    source_view = source.view(torch.uint8).view(experts, 2, reduction_blocks // 2, 2, output // 128, 4, 32).permute(0, 4, 2, 6, 5, 3, 1)
+    target.view(torch.uint8).view(experts, output // 128, reduction_blocks // 2, 32, 4, 2, 2).copy_(source_view)
 
 
 @dataclass(frozen=True)
@@ -180,159 +150,288 @@ class Mxfp8BackwardWeights:
     fc2_weight_sf: torch.Tensor
 
 
-class Mxfp8TrainingWeightBindings:
-    """Direct data bindings with persistent kernel-native scale staging."""
+def _expect_staging_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.layout is not torch.strided:
+        raise ValueError(f"{name} must use torch.strided layout, got {tensor.layout}")
+    if tuple(tensor.shape) != shape or tuple(tensor.stride()) != stride:
+        raise ValueError(f"{name} must have shape={shape}, stride={stride}; got " f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}")
+    if tensor.dtype is not dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tensor.data_ptr() % 16:
+        raise ValueError(f"{name} must be at least 16-byte aligned")
 
-    def __init__(
-        self,
-        weights: MoeEpTrainingWeights,
-        *,
-        fc1_weight_layout: Fc1WeightLayout = Fc1WeightLayout.GATE_THEN_UP,
-    ) -> None:
-        self.weights = weights
-        self.fc1_weight_layout = fc1_weight_layout
-        fwd_fc1 = weights.forward_fc1
-        fwd_fc2 = weights.forward_fc2
-        bwd_w2t = weights.backward_w2_transpose
-        bwd_w1t = weights.backward_w1_transpose
-        self._uses_direct_weight_bindings = (
-            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
-            and fwd_fc1.data.stride(1) == 1
-            and fwd_fc2.data.stride(1) == 1
-            and bwd_w2t.data.is_contiguous()
-            and bwd_w1t.data.is_contiguous()
-        )
-        if (
-            fc1_weight_layout is Fc1WeightLayout.GATE_UP_INTERLEAVED_32
-            and not self._uses_direct_weight_bindings
-        ):
-            raise ValueError(
-                "weight_interleave_size=32 requires compact K-major forward "
-                "weights and contiguous backward transpose weights"
-            )
 
-        self.forward = Mxfp8Weights(
-            fc1_weight=(
-                fwd_fc1.data
-                if self._uses_direct_weight_bindings
-                else _empty_k_major_like(fwd_fc1.data)
-            ),
-            fc1_weight_sf=_empty_blocked_scales(
-                fwd_fc1,
-                raw_rows=fwd_fc1.data.shape[2],
-                raw_columns=fwd_fc1.data.shape[1] // 32,
-                dtype=torch.uint8,
-            ),
-            fc2_weight=(
-                fwd_fc2.data
-                if self._uses_direct_weight_bindings
-                else _empty_k_major_like(fwd_fc2.data)
-            ),
-            fc2_weight_sf=_empty_blocked_scales(
-                fwd_fc2,
-                raw_rows=fwd_fc2.data.shape[2],
-                raw_columns=fwd_fc2.data.shape[1] // 32,
-                dtype=torch.uint8,
-            ),
-        )
-        self.backward = Mxfp8BackwardWeights(
-            fc1_weight=(
-                bwd_w2t.data
-                if self._uses_direct_weight_bindings
-                else torch.empty_like(
-                    bwd_w2t.data,
-                    memory_format=torch.contiguous_format,
-                )
-            ),
-            fc1_weight_sf=_empty_blocked_scales(
-                bwd_w2t,
-                raw_rows=bwd_w2t.data.shape[2],
-                raw_columns=bwd_w2t.data.shape[1] // 32,
-                dtype=torch.float8_e8m0fnu,
-            ),
-            fc2_weight=(
-                bwd_w1t.data
-                if self._uses_direct_weight_bindings
-                else torch.empty_like(
-                    bwd_w1t.data,
-                    memory_format=torch.contiguous_format,
-                )
-            ),
-            fc2_weight_sf=_empty_blocked_scales(
-                bwd_w1t,
-                raw_rows=bwd_w1t.data.shape[2],
-                raw_columns=bwd_w1t.data.shape[1] // 32,
-                dtype=torch.float8_e8m0fnu,
-            ),
-        )
-        self.refresh()
+def _expect_scale_staging(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    experts: int,
+    raw_rows: int,
+    raw_columns: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    elements = round_up(raw_rows, 128) * round_up(raw_columns, 4)
+    _expect_staging_tensor(
+        name,
+        tensor,
+        shape=(experts, elements),
+        stride=(elements, 1),
+        dtype=dtype,
+        device=device,
+    )
 
-    def refresh(self) -> None:
-        """Enqueue fixed-address layout copies; safe to record in a graph."""
 
-        fwd_fc1 = self.weights.forward_fc1
-        fwd_fc2 = self.weights.forward_fc2
-        bwd_w2t = self.weights.backward_w2_transpose
-        bwd_w1t = self.weights.backward_w1_transpose
+def forward_native_to_kernel(weights: MoeEpNativeForwardWeights) -> Mxfp8Weights:
+    """Create kernel views without allocating, copying, or retaining inputs."""
 
-        intermediate = fwd_fc2.data.shape[1]
-        if self._uses_direct_weight_bindings:
-            _copy_blocked_scales_plain(
-                self.forward.fc1_weight_sf,
-                fwd_fc1.scale,
-                raw_rows=fwd_fc1.data.shape[2],
-                raw_columns=fwd_fc1.data.shape[1] // 32,
-            )
-        else:
-            _copy_gate_up_interleaved_last(
-                self.forward.fc1_weight,
-                fwd_fc1.data,
-                intermediate,
-            )
-            _copy_blocked_scales_gate_up_rows(
-                self.forward.fc1_weight_sf,
-                fwd_fc1.scale,
-                intermediate=intermediate,
-                reduction_blocks=fwd_fc1.data.shape[1] // 32,
-            )
-            self.forward.fc2_weight.copy_(fwd_fc2.data)
-        _copy_blocked_scales_plain(
-            self.forward.fc2_weight_sf,
-            fwd_fc2.scale,
-            raw_rows=fwd_fc2.data.shape[2],
-            raw_columns=fwd_fc2.data.shape[1] // 32,
-        )
+    return Mxfp8Weights(
+        fc1_weight=weights.fc1.payload,
+        fc1_weight_sf=weights.fc1.scale,
+        fc2_weight=weights.fc2.payload,
+        fc2_weight_sf=weights.fc2.scale,
+    )
 
-        if not self._uses_direct_weight_bindings:
-            self.backward.fc1_weight.copy_(bwd_w2t.data)
-        _copy_blocked_scales_plain(
-            self.backward.fc1_weight_sf,
-            bwd_w2t.scale,
-            raw_rows=bwd_w2t.data.shape[2],
-            raw_columns=bwd_w2t.data.shape[1] // 32,
-        )
-        if self._uses_direct_weight_bindings:
-            _copy_blocked_scales_plain(
-                self.backward.fc2_weight_sf,
-                bwd_w1t.scale,
-                raw_rows=bwd_w1t.data.shape[2],
-                raw_columns=bwd_w1t.data.shape[1] // 32,
-            )
-        else:
-            _copy_gate_up_interleaved_reduction(
-                self.backward.fc2_weight,
-                bwd_w1t.data,
-                intermediate,
-            )
-            _copy_blocked_scales_gate_up_columns(
-                self.backward.fc2_weight_sf,
-                bwd_w1t.scale,
-                intermediate=intermediate,
-                output=bwd_w1t.data.shape[2],
-            )
+
+def backward_native_to_kernel(
+    weights: MoeEpNativeBackwardWeights,
+) -> Mxfp8BackwardWeights:
+    """Create kernel views without allocating, copying, or retaining inputs."""
+
+    return Mxfp8BackwardWeights(
+        fc1_weight=weights.w2_transpose.payload,
+        fc1_weight_sf=weights.w2_transpose.scale,
+        fc2_weight=weights.w1_transpose.payload,
+        fc2_weight_sf=weights.w1_transpose.scale,
+    )
+
+
+def materialize_forward(
+    weights: MoeEpForwardWeights,
+    *,
+    out: MoeEpForwardWeightStaging,
+    fc1_weight_layout: Fc1WeightLayout,
+) -> MoeEpNativeForwardWeights:
+    """Materialize source forward weights into caller-owned native storage."""
+
+    if fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training materialization requires weight_interleave_size=32")
+    if not isinstance(weights, MoeEpForwardWeights):
+        raise TypeError("weights must be a MoeEpForwardWeights")
+    if not isinstance(out, MoeEpForwardWeightStaging):
+        raise TypeError("out must be a MoeEpForwardWeightStaging")
+    fc1 = weights.fc1
+    fc2 = weights.fc2
+    for name, value in (("weights.fc1", fc1), ("weights.fc2", fc2)):
+        if not isinstance(value, BlockScaledTensor) or value.format.value != "mxfp8" or value.axis != 1:
+            raise TypeError(f"{name} must be an axis-1 MXFP8 BlockScaledTensor")
+        if not value.data.is_contiguous() or not value.scale.is_contiguous():
+            raise ValueError(f"{name} data and scale must be contiguous")
+    experts, hidden, gate_up = fc1.data.shape
+    intermediate = fc2.data.shape[1]
+    if tuple(fc2.data.shape) != (experts, intermediate, hidden) or gate_up != 2 * intermediate:
+        raise ValueError("forward source weight shapes are inconsistent")
+    if fc2.device != fc1.device:
+        raise ValueError("forward source weights must share one device")
+    sf_dtype = torch.float8_e8m0fnu
+    _expect_staging_tensor(
+        "out.fc1_payload",
+        out.fc1_payload,
+        shape=tuple(fc1.data.shape),
+        stride=(hidden * gate_up, 1, hidden),
+        dtype=fc1.data.dtype,
+        device=fc1.device,
+    )
+    _expect_staging_tensor(
+        "out.fc2_payload",
+        out.fc2_payload,
+        shape=tuple(fc2.data.shape),
+        stride=(intermediate * hidden, 1, intermediate),
+        dtype=fc2.data.dtype,
+        device=fc1.device,
+    )
+    _expect_scale_staging(
+        "out.fc1_scale",
+        out.fc1_scale,
+        experts=experts,
+        raw_rows=gate_up,
+        raw_columns=hidden // 32,
+        dtype=sf_dtype,
+        device=fc1.device,
+    )
+    _expect_scale_staging(
+        "out.fc2_scale",
+        out.fc2_scale,
+        experts=experts,
+        raw_rows=hidden,
+        raw_columns=intermediate // 32,
+        dtype=sf_dtype,
+        device=fc1.device,
+    )
+    validate_training_non_aliasing(
+        {
+            "weights.fc1.data": fc1.data,
+            "weights.fc1.scale": fc1.scale,
+            "weights.fc2.data": fc2.data,
+            "weights.fc2.scale": fc2.scale,
+            "out.fc1_payload": out.fc1_payload,
+            "out.fc1_scale": out.fc1_scale,
+            "out.fc2_payload": out.fc2_payload,
+            "out.fc2_scale": out.fc2_scale,
+        }
+    )
+    _copy_gate_up_interleaved_last(out.fc1_payload, fc1.data, intermediate)
+    _copy_blocked_scales_gate_up_rows(
+        out.fc1_scale,
+        fc1.scale,
+        intermediate=intermediate,
+        reduction_blocks=hidden // 32,
+    )
+    out.fc2_payload.copy_(fc2.data)
+    _copy_blocked_scales_plain(
+        out.fc2_scale,
+        fc2.scale,
+        raw_rows=hidden,
+        raw_columns=intermediate // 32,
+    )
+    return MoeEpNativeForwardWeights(
+        fc1=MoeEpNativeWeight(
+            out.fc1_payload,
+            out.fc1_scale,
+            MoeEpNativeWeightLayout.FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1,
+        ),
+        fc2=MoeEpNativeWeight(
+            out.fc2_payload,
+            out.fc2_scale,
+            MoeEpNativeWeightLayout.FORWARD_FC2_K_MAJOR_V1,
+        ),
+    )
+
+
+def materialize_backward(
+    weights: MoeEpBackwardWeights,
+    *,
+    out: MoeEpBackwardWeightStaging,
+    fc1_weight_layout: Fc1WeightLayout,
+) -> MoeEpNativeBackwardWeights:
+    """Materialize source backward weights into caller-owned native storage."""
+
+    if fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
+        raise ValueError("native training materialization requires weight_interleave_size=32")
+    if not isinstance(weights, MoeEpBackwardWeights):
+        raise TypeError("weights must be a MoeEpBackwardWeights")
+    if not isinstance(out, MoeEpBackwardWeightStaging):
+        raise TypeError("out must be a MoeEpBackwardWeightStaging")
+    w2t = weights.w2_transpose
+    w1t = weights.w1_transpose
+    for name, value in (
+        ("weights.w2_transpose", w2t),
+        ("weights.w1_transpose", w1t),
+    ):
+        if not isinstance(value, BlockScaledTensor) or value.format.value != "mxfp8" or value.axis != 1:
+            raise TypeError(f"{name} must be an axis-1 MXFP8 BlockScaledTensor")
+        if not value.data.is_contiguous() or not value.scale.is_contiguous():
+            raise ValueError(f"{name} data and scale must be contiguous")
+    experts, hidden, intermediate = w2t.data.shape
+    if tuple(w1t.data.shape) != (experts, 2 * intermediate, hidden):
+        raise ValueError("backward source weight shapes are inconsistent")
+    if w1t.device != w2t.device:
+        raise ValueError("backward source weights must share one device")
+    _expect_staging_tensor(
+        "out.w2_transpose_payload",
+        out.w2_transpose_payload,
+        shape=tuple(w2t.data.shape),
+        stride=(hidden * intermediate, intermediate, 1),
+        dtype=w2t.data.dtype,
+        device=w2t.device,
+    )
+    _expect_staging_tensor(
+        "out.w1_transpose_payload",
+        out.w1_transpose_payload,
+        shape=tuple(w1t.data.shape),
+        stride=(2 * intermediate * hidden, hidden, 1),
+        dtype=w1t.data.dtype,
+        device=w2t.device,
+    )
+    sf_dtype = torch.float8_e8m0fnu
+    _expect_scale_staging(
+        "out.w2_transpose_scale",
+        out.w2_transpose_scale,
+        experts=experts,
+        raw_rows=intermediate,
+        raw_columns=hidden // 32,
+        dtype=sf_dtype,
+        device=w2t.device,
+    )
+    _expect_scale_staging(
+        "out.w1_transpose_scale",
+        out.w1_transpose_scale,
+        experts=experts,
+        raw_rows=hidden,
+        raw_columns=2 * intermediate // 32,
+        dtype=sf_dtype,
+        device=w2t.device,
+    )
+    validate_training_non_aliasing(
+        {
+            "weights.w2_transpose.data": w2t.data,
+            "weights.w2_transpose.scale": w2t.scale,
+            "weights.w1_transpose.data": w1t.data,
+            "weights.w1_transpose.scale": w1t.scale,
+            "out.w2_transpose_payload": out.w2_transpose_payload,
+            "out.w2_transpose_scale": out.w2_transpose_scale,
+            "out.w1_transpose_payload": out.w1_transpose_payload,
+            "out.w1_transpose_scale": out.w1_transpose_scale,
+        }
+    )
+    out.w2_transpose_payload.copy_(w2t.data)
+    _copy_blocked_scales_plain(
+        out.w2_transpose_scale,
+        w2t.scale,
+        raw_rows=intermediate,
+        raw_columns=hidden // 32,
+    )
+    _copy_gate_up_interleaved_reduction(
+        out.w1_transpose_payload,
+        w1t.data,
+        intermediate,
+    )
+    _copy_blocked_scales_gate_up_columns(
+        out.w1_transpose_scale,
+        w1t.scale,
+        intermediate=intermediate,
+        output=hidden,
+    )
+    return MoeEpNativeBackwardWeights(
+        w2_transpose=MoeEpNativeWeight(
+            out.w2_transpose_payload,
+            out.w2_transpose_scale,
+            MoeEpNativeWeightLayout.BACKWARD_W2_TRANSPOSE_V1,
+        ),
+        w1_transpose=MoeEpNativeWeight(
+            out.w1_transpose_payload,
+            out.w1_transpose_scale,
+            MoeEpNativeWeightLayout.BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1,
+        ),
+    )
 
 
 __all__ = [
     "Mxfp8BackwardWeights",
-    "Mxfp8TrainingWeightBindings",
+    "backward_native_to_kernel",
+    "forward_native_to_kernel",
+    "materialize_backward",
+    "materialize_forward",
 ]

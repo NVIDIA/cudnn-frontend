@@ -15,24 +15,41 @@ import math
 import threading
 import warnings
 from numbers import Real
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from ._contracts import ForwardConfig, normalize_fc1_weight_layout
+from ._contracts import Fc1WeightLayout, ForwardConfig, normalize_fc1_weight_layout
 from ._tuning import MoeEpTuningConfig
 from ._types import (
     BlockScaledTensor,
+    MoeEpBackwardWeightStaging,
+    MoeEpBackwardWeights,
     MoeEpExecutionLane,
-    MoeEpTrainingResources,
-    MoeEpTrainingSlot,
-    MoeEpTrainingWeights,
+    MoeEpForwardWeightStaging,
+    MoeEpForwardWeights,
+    MoeEpNativeBackwardWeights,
+    MoeEpNativeForwardWeights,
+    MoeEpTrainingBackwardOutputs,
+    MoeEpTrainingForwardOutputs,
+    MoeEpTrainingWgradOperands,
     MoeFormat,
     MoeTensor,
     parse_format as _parse_format,
 )
-from ._validation import validate_forward, validate_training_weights
+from ._validation import (
+    validate_backward_source_weights,
+    validate_forward,
+    validate_forward_source_weights,
+    validate_native_backward_weights,
+    validate_native_forward_weights,
+    validate_training_backward_outputs,
+    validate_training_forward_outputs,
+    validate_training_forward_state,
+    validate_training_input,
+    validate_training_non_aliasing,
+)
 
 
 def _resolve_ep_topology(
@@ -64,12 +81,78 @@ def _validate_training_assert_capability(config: ForwardConfig) -> None:
     if config.drop_on_overflow:
         return
     if not callable(getattr(torch, "_assert_async", None)):
-        raise RuntimeError("drop_on_overflow=False training resources require callable " "torch._assert_async before CUDA Graph capture")
+        raise RuntimeError("drop_on_overflow=False training requires callable " "torch._assert_async before CUDA Graph capture")
     if config.ep_size <= 1:
         return
     backend = dist.get_backend(config.ep_group)
     if backend != dist.Backend.NCCL and str(backend).lower() != "nccl":
-        raise NotImplementedError("drop_on_overflow=False EP2+ training resources require an NCCL " "process group for the captured scalar global overflow OR")
+        raise NotImplementedError("drop_on_overflow=False EP2+ training requires an NCCL " "process group for the captured scalar global overflow OR")
+
+
+def _resolve_training_device(
+    device: torch.device | str | int | None,
+) -> torch.device:
+    if device is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("prepare_training requires an available CUDA device")
+        return torch.device("cuda", torch.cuda.current_device())
+    if isinstance(device, bool):
+        raise TypeError("device must be a CUDA device, ordinal, or None")
+    if isinstance(device, int):
+        resolved = torch.device("cuda", device)
+    else:
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and resolved.index is None:
+            resolved = torch.device("cuda", torch.cuda.current_device())
+    if resolved.type != "cuda":
+        raise ValueError(f"training device must be CUDA, got {resolved}")
+    if resolved.index is None or resolved.index < 0 or resolved.index >= torch.cuda.device_count():
+        raise ValueError(f"CUDA device {resolved} is not available")
+    return resolved
+
+
+def _named_moe_tensors(
+    name: str,
+    value: MoeTensor,
+) -> dict[str, torch.Tensor]:
+    if isinstance(value, BlockScaledTensor):
+        return {
+            f"{name}.data": value.data,
+            f"{name}.scale": value.scale,
+        }
+    return {name: value}
+
+
+def pack_forward_weights(
+    weights: MoeEpForwardWeights,
+    *,
+    out: MoeEpForwardWeightStaging,
+) -> MoeEpNativeForwardWeights:
+    """Standalone allocation-free forward weight materialization."""
+
+    from ._megamoe_backend.mxfp8._training_weights import materialize_forward
+
+    return materialize_forward(
+        weights,
+        out=out,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    )
+
+
+def pack_backward_weights(
+    weights: MoeEpBackwardWeights,
+    *,
+    out: MoeEpBackwardWeightStaging,
+) -> MoeEpNativeBackwardWeights:
+    """Standalone allocation-free backward weight materialization."""
+
+    from ._megamoe_backend.mxfp8._training_weights import materialize_backward
+
+    return materialize_backward(
+        weights,
+        out=out,
+        fc1_weight_layout=Fc1WeightLayout.GATE_UP_INTERLEAVED_32,
+    )
 
 
 class MoeEp:
@@ -79,7 +162,7 @@ class MoeEp:
     ``e // experts_per_rank``.  The constructor captures static configuration;
     calling the instance accepts runtime tensors for this rank.
 
-    The Rubin training-Mega backend accepts plain BF16/FP16/FP32 operands
+    The Rubin training-Mega backend accepts plain BF16/FP32 operands
     (staged to MXFP8 E4M3) or MXFP8 ``BlockScaledTensor`` operands. Final
     output is BF16. ``combine_format`` may be BF16 or MXFP8; forward MXFP8
     combine quantizes each FP32 route accumulator directly before top-k
@@ -88,9 +171,10 @@ class MoeEp:
     Native NVFP4 operands and NVFP4 combine/output are not executable.
 
     ``__call__`` is the inference-only forward surface. Training uses
-    :meth:`prepare_training_resources`; the returned fixed-slot resource handle
-    provides ordinary/capturable ``forward`` and ``backward`` methods without
-    compact host-visible stashes.
+    :meth:`prepare_training`, :meth:`training_forward`, and
+    :meth:`training_backward`. Caller-owned output bundles carry all explicit
+    cross-phase state; the operator retains only private runtime and lane
+    scratch.
 
     The backend is created lazily on the first supported forward call. Valid
     combinations outside the current backend capability matrix fail explicitly
@@ -227,7 +311,15 @@ class MoeEp:
         self._validated_topk_idx = None
         self._validated_topk_version = None
         self._operator_token = object()
-        self._training_resources: MoeEpTrainingResources | None = None
+        self._training_state = None
+        self._training_lanes: tuple[MoeEpExecutionLane, ...] = ()
+        self._training_requirements: (
+            Mapping[
+                str,
+                tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int],
+            ]
+            | None
+        ) = None
         self._closed = False
 
     @staticmethod
@@ -275,8 +367,8 @@ class MoeEp:
         ``fc1_weight=(E_local,H,2I)``, ``fc2_weight=(E_local,I,H)``, and
         ``topk_idx=topk_weights=(T,K)``.
 
-        Training callers must use :meth:`prepare_training_resources` and the
-        returned fixed-slot resource handle.
+        Training callers must use :meth:`prepare_training` followed by the
+        stateless training methods.
         """
 
         with self._lifecycle_lock:
@@ -337,67 +429,313 @@ class MoeEp:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
 
-    def prepare_training_resources(
-        self,
-        weights: MoeEpTrainingWeights,
-        *,
-        slot_count: int = 2,
-        lane_count: int = 1,
-    ) -> MoeEpTrainingResources:
-        """Bind MXFP8 weights and allocate fixed-capacity training resources.
+    @property
+    def training_lanes(self) -> tuple[MoeEpExecutionLane, ...]:
+        """Operator-bound lanes created by :meth:`prepare_training`."""
 
-        This collective preparation must run on every EP rank before CUDA
-        Graph capture. The returned handle owns persistent microbatch slots
-        and mutable per-stream execution lanes; closing the operator also
-        closes the handle. A closed handle cannot be replaced on this
-        operator; create a new ``MoeEp`` instance to bind new weight storage.
+        return self._training_lanes
+
+    def prepare_training(
+        self,
+        *,
+        lane_count: int = 1,
+        device: torch.device | str | int | None = None,
+    ) -> Mapping[
+        str,
+        tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int],
+    ]:
+        """Collectively prepare private training runtime and return contracts.
+
+        ``device`` defaults to the current CUDA device. No weights or caller
+        output buffers are retained by the operator.
         """
 
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("MoeEp is closed")
-            for name, value in (
-                ("slot_count", slot_count),
-                ("lane_count", lane_count),
-            ):
-                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    raise ValueError(f"{name} must be a positive integer, got {value!r}")
-            if self._training_resources is not None:
-                if not self._training_resources.closed:
-                    raise RuntimeError("MoeEp training resources already exist")
-                raise RuntimeError("MoeEp training resources were closed; create a new " "MoeEp instance before preparing replacement weights")
-
-            device = validate_training_weights(
-                self._forward_config,
-                weights,
-            )
+            if isinstance(lane_count, bool) or not isinstance(lane_count, int) or lane_count <= 0:
+                raise ValueError(f"lane_count must be a positive integer, got {lane_count!r}")
+            if self._training_state is not None:
+                raise RuntimeError("MoeEp training is already prepared")
+            if self._fc1_weight_layout is not Fc1WeightLayout.GATE_UP_INTERLEAVED_32:
+                raise ValueError("prepare_training requires weight_interleave_size=32")
+            resolved_device = _resolve_training_device(device)
             _validate_training_assert_capability(self._forward_config)
             from . import _backend
 
             _backend.validate_config(self._forward_config)
-            if self._forward_backend is not None and device != self._forward_backend_device:
-                raise ValueError(f"MoeEp backend is bound to " f"{self._forward_backend_device}; got {device}")
+            if self._forward_backend is not None and resolved_device != self._forward_backend_device:
+                raise ValueError(f"MoeEp backend is bound to {self._forward_backend_device}; " f"got {resolved_device}")
             if self._forward_backend is None:
                 self._forward_backend = _backend.create_backend(
                     self._forward_config,
-                    device,
+                    resolved_device,
                 )
-                self._forward_backend_device = device
-            owner = self._forward_backend.prepare_training_resources(
+                self._forward_backend_device = resolved_device
+            with torch.cuda.device(resolved_device):
+                state = self._forward_backend.prepare_training(
+                    lane_count=lane_count,
+                )
+            self._training_state = state
+            self._training_lanes = tuple(MoeEpExecutionLane(index, self._operator_token) for index in range(lane_count))
+            self._training_requirements = state.public_requirements()
+            return self._training_requirements
+
+    def _require_training_lane(
+        self,
+        lane: MoeEpExecutionLane,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("MoeEp is closed")
+        if self._training_state is None or self._training_requirements is None:
+            raise RuntimeError("prepare_training() must be called first")
+        if not isinstance(lane, MoeEpExecutionLane) or lane._operator_token is not self._operator_token or lane not in self._training_lanes:
+            raise ValueError("execution lane does not belong to this MoeEp")
+
+    def _training_requirement_subset(
+        self,
+        names: tuple[str, ...],
+    ) -> dict[str, tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int]]:
+        assert self._training_requirements is not None
+        return {name: self._training_requirements[name] for name in names}
+
+    def pack_forward_weights(
+        self,
+        weights: MoeEpForwardWeights,
+        *,
+        out: MoeEpForwardWeightStaging,
+    ) -> MoeEpNativeForwardWeights:
+        """Materialize source weights into caller-owned native storage."""
+
+        validate_forward_source_weights(self._forward_config, weights)
+        from ._megamoe_backend.mxfp8._training_weights import materialize_forward
+
+        return materialize_forward(
+            weights,
+            out=out,
+            fc1_weight_layout=self._forward_config.fc1_weight_layout,
+        )
+
+    def pack_backward_weights(
+        self,
+        weights: MoeEpBackwardWeights,
+        *,
+        out: MoeEpBackwardWeightStaging,
+    ) -> MoeEpNativeBackwardWeights:
+        """Materialize source transpose weights into caller-owned storage."""
+
+        validate_backward_source_weights(self._forward_config, weights)
+        from ._megamoe_backend.mxfp8._training_weights import materialize_backward
+
+        return materialize_backward(
+            weights,
+            out=out,
+            fc1_weight_layout=self._forward_config.fc1_weight_layout,
+        )
+
+    def training_forward(
+        self,
+        lane: MoeEpExecutionLane,
+        activation: MoeTensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        weights: MoeEpNativeForwardWeights,
+        out: MoeEpTrainingForwardOutputs,
+    ) -> torch.Tensor:
+        """Run forward into caller-owned prepared-training outputs."""
+
+        with self._lifecycle_lock:
+            self._require_training_lane(lane)
+            assert self._training_state is not None
+            assert self._training_requirements is not None
+            assert self._forward_backend_device is not None
+            token_count = validate_training_input(
+                self._forward_config,
+                "activation",
+                activation,
+                topk_idx,
+                topk_weights,
+                device=self._forward_backend_device,
+            )
+            validate_native_forward_weights(
+                self._forward_config,
                 weights,
-                slot_count=slot_count,
-                lane_count=lane_count,
+                device=self._forward_backend_device,
             )
-            resources = MoeEpTrainingResources(
-                owner=owner,
-                operator_token=self._operator_token,
-                weights=weights,
-                slot_count=slot_count,
-                lane_count=lane_count,
-                device=device,
+            validate_training_forward_outputs(
+                out,
+                self._training_requirement_subset(
+                    (
+                        "output",
+                        "fc1_preact",
+                        "fc1_a",
+                        "fc1_sfa",
+                        "valid_route_counts",
+                        "expert_offsets",
+                    )
+                ),
+                device=self._forward_backend_device,
             )
-            self._training_resources = resources
-            return resources
+            validate_training_non_aliasing(
+                {
+                    **_named_moe_tensors("activation", activation),
+                    "topk_idx": topk_idx,
+                    "topk_weights": topk_weights,
+                    "weights.fc1.payload": weights.fc1.payload,
+                    "weights.fc1.scale": weights.fc1.scale,
+                    "weights.fc2.payload": weights.fc2.payload,
+                    "weights.fc2.scale": weights.fc2.scale,
+                    "out.output": out.output,
+                    "out.fc1_preact": out.fc1_preact,
+                    "out.fc1_a": out.fc1_a,
+                    "out.fc1_sfa": out.fc1_sfa,
+                    "out.valid_route_counts": out.valid_route_counts,
+                    "out.expert_offsets": out.expert_offsets,
+                }
+            )
+            from ._megamoe_backend.mxfp8._training_execute import (
+                launch_training_forward,
+            )
+
+            with torch.cuda.device(self._forward_backend_device):
+                execution = self._training_state.views(
+                    lane=lane.index,
+                    token_count=token_count,
+                )
+                return launch_training_forward(
+                    self._training_state,
+                    execution,
+                    activation,
+                    topk_idx,
+                    topk_weights,
+                    weights=weights,
+                    out=out,
+                )
+
+    def training_backward(
+        self,
+        lane: MoeEpExecutionLane,
+        grad_output: MoeTensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        weights: MoeEpNativeBackwardWeights,
+        fc1_preact: torch.Tensor,
+        fc1_a: torch.Tensor | None = None,
+        fc1_sfa: torch.Tensor | None = None,
+        valid_route_counts: torch.Tensor | None = None,
+        expert_offsets: torch.Tensor | None = None,
+        out: MoeEpTrainingBackwardOutputs | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        MoeEpTrainingWgradOperands,
+    ]:
+        """Run backward into caller-owned outputs using explicit forward state."""
+
+        with self._lifecycle_lock:
+            self._require_training_lane(lane)
+            assert self._training_state is not None
+            assert self._forward_backend_device is not None
+            if out is None:
+                raise TypeError("out must be a MoeEpTrainingBackwardOutputs")
+            token_count = validate_training_input(
+                self._forward_config,
+                "grad_output",
+                grad_output,
+                topk_idx,
+                topk_weights,
+                device=self._forward_backend_device,
+            )
+            validate_native_backward_weights(
+                self._forward_config,
+                weights,
+                device=self._forward_backend_device,
+            )
+            if fc1_preact is None:
+                raise ValueError("fc1_preact from the matching forward is required")
+            backward_output = out
+            validate_training_backward_outputs(
+                backward_output,
+                self._training_requirement_subset(
+                    (
+                        "grad_activation",
+                        "dprob",
+                        "fc1_b",
+                        "fc1_sfb",
+                        "fc2_a",
+                        "fc2_sfa",
+                        "fc2_b",
+                        "fc2_sfb",
+                    )
+                ),
+                device=self._forward_backend_device,
+            )
+            validate_training_forward_state(
+                fc1_preact=fc1_preact,
+                fc1_a=fc1_a,
+                fc1_sfa=fc1_sfa,
+                valid_route_counts=valid_route_counts,
+                expert_offsets=expert_offsets,
+                requirements=self._training_requirement_subset(
+                    (
+                        "fc1_preact",
+                        "fc1_a",
+                        "fc1_sfa",
+                        "valid_route_counts",
+                        "expert_offsets",
+                    )
+                ),
+                device=self._forward_backend_device,
+            )
+            validate_training_non_aliasing(
+                {
+                    **_named_moe_tensors("grad_output", grad_output),
+                    "topk_idx": topk_idx,
+                    "topk_weights": topk_weights,
+                    "weights.w2_transpose.payload": weights.w2_transpose.payload,
+                    "weights.w2_transpose.scale": weights.w2_transpose.scale,
+                    "weights.w1_transpose.payload": weights.w1_transpose.payload,
+                    "weights.w1_transpose.scale": weights.w1_transpose.scale,
+                    "fc1_preact": fc1_preact,
+                    "fc1_a": fc1_a,
+                    "fc1_sfa": fc1_sfa,
+                    "valid_route_counts": valid_route_counts,
+                    "expert_offsets": expert_offsets,
+                    "out.grad_activation": backward_output.grad_activation,
+                    "out.dprob": backward_output.dprob,
+                    "out.fc1_b": backward_output.fc1_b,
+                    "out.fc1_sfb": backward_output.fc1_sfb,
+                    "out.fc2_a": backward_output.fc2_a,
+                    "out.fc2_sfa": backward_output.fc2_sfa,
+                    "out.fc2_b": backward_output.fc2_b,
+                    "out.fc2_sfb": backward_output.fc2_sfb,
+                }
+            )
+            from ._megamoe_backend.mxfp8._training_execute import (
+                launch_training_backward,
+            )
+
+            with torch.cuda.device(self._forward_backend_device):
+                execution = self._training_state.views(
+                    lane=lane.index,
+                    token_count=token_count,
+                )
+                return launch_training_backward(
+                    self._training_state,
+                    execution,
+                    grad_output,
+                    topk_idx,
+                    topk_weights,
+                    weights=weights,
+                    fc1_preact=fc1_preact,
+                    fc1_a=fc1_a,
+                    fc1_sfa=fc1_sfa,
+                    valid_route_counts=valid_route_counts,
+                    expert_offsets=expert_offsets,
+                    out=backward_output,
+                )
 
     def close(self) -> None:
         """Release compiled-backend instance resources; idempotent."""
@@ -413,9 +751,9 @@ class MoeEp:
                 self._forward_backend_device = None
             self._validated_topk_idx = None
             self._validated_topk_version = None
-            if self._training_resources is not None:
-                self._training_resources.close()
-                self._training_resources = None
+            self._training_state = None
+            self._training_lanes = ()
+            self._training_requirements = None
             self._closed = True
 
     def __enter__(self) -> "MoeEp":
@@ -449,10 +787,18 @@ class MoeEp:
 __all__ = [
     "BlockScaledTensor",
     "MoeEp",
+    "MoeEpBackwardWeightStaging",
+    "MoeEpBackwardWeights",
     "MoeEpExecutionLane",
-    "MoeEpTrainingResources",
-    "MoeEpTrainingSlot",
-    "MoeEpTrainingWeights",
+    "MoeEpForwardWeightStaging",
+    "MoeEpForwardWeights",
+    "MoeEpNativeBackwardWeights",
+    "MoeEpNativeForwardWeights",
+    "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingForwardOutputs",
+    "MoeEpTrainingWgradOperands",
     "MoeFormat",
     "MoeTensor",
+    "pack_backward_weights",
+    "pack_forward_weights",
 ]

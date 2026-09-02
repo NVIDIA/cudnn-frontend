@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -16,8 +15,8 @@ from ..._contracts import ForwardConfig
 from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._adapter import Mxfp8LaunchInputs
+from ._compile_common import _compile_kernel, _prepare_rubin_environment
 from ._config import Mxfp8KernelConfig
-from ._cutedsl import require_rubin_cutedsl
 from ._fingerprint import build_kernel_fingerprint
 from ._launch import build_runtime_kwargs, layout_signature
 
@@ -58,15 +57,6 @@ _TOKEN_SRC_METADATA_REGION = "nvlink.token_comm.token_src_metadata"
 _COL_QUANT_SIZES_REGION = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
 _PRE_REDUCED_ACTIVATION_REGION = "nvlink.token_comm.pre_reduced_activation"
 _PRE_REDUCED_ACTIVATION_SF_REGION = "nvlink.token_comm.pre_reduced_activation_sf"
-
-
-def _compile_kernel(kernel: Any, compile_kwargs: dict[str, Any]) -> Any:
-    """Import CuTeDSL only on a cache miss and compile one callable."""
-
-    require_rubin_cutedsl()
-    import cutlass.cute as cute
-
-    return cute.compile(kernel, **compile_kwargs)
 
 
 def _pre_reduced_workspace_metadata(
@@ -133,28 +123,18 @@ def prepare_kernel(
 ) -> PreparedMxfp8Kernel:
     """Instantiate the kernel and derive exact allocation requirements."""
 
-    require_rubin_cutedsl()
-    torch.cuda.set_device(device)
-    architecture = torch.cuda.get_device_capability(device)
-    if architecture != (10, 7):
-        raise RuntimeError("Rubin MXFP8 kernel preparation requires compute capability " f"(10, 7), got {architecture}")
-    configured_architecture = os.environ.get("CUTE_DSL_ARCH")
-    if configured_architecture is None:
-        os.environ["CUTE_DSL_ARCH"] = "sm_107a"
-    elif configured_architecture not in ("sm_107", "sm_107a"):
-        raise RuntimeError("CUTE_DSL_ARCH must target SM107 for the Rubin MXFP8 backend, " f"got {configured_architecture!r}")
-
+    architecture, launch_cluster_count = _prepare_rubin_environment(
+        device,
+        config,
+        context="forward",
+    )
     import cutlass
-    import cutlass.utils as utils
 
     from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu import (
         Sm107MegaMoEMxfp8GluKernel,
     )
     from ..cutedsl_src.quant_def import CombineFormat
 
-    launch_cluster_count = int(utils.HardwareInfo().get_max_active_clusters(config.cluster_size))
-    if launch_cluster_count <= 0:
-        raise RuntimeError("hardware occupancy query returned no launchable Rubin clusters")
     group_hint = launch_cluster_count if config.group_hint is None else config.group_hint
     kernel_kwargs = dict(
         mma_tiler_mnk=config.mma_tiler_mnk,
@@ -316,18 +296,9 @@ def compile_or_get(
         _COMPILE_CACHE[key] = compiled
         return compiled
 
-
-def clear_compile_cache() -> None:
-    """Drop process-local compiled callable references."""
-
-    with _COMPILE_LOCK:
-        _COMPILE_CACHE.clear()
-
-
 __all__ = [
     "CompiledMxfp8Kernel",
     "PreparedMxfp8Kernel",
-    "clear_compile_cache",
     "compile_or_get",
     "prepare_kernel",
 ]

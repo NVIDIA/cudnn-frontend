@@ -13,6 +13,7 @@ from typing import Mapping, Optional, Protocol, Sequence
 import torch
 
 from .._contracts import ForwardConfig
+from .._math import round_up
 from ._comm import (
     PeerMapping,
     SymmetricMemoryProvider,
@@ -22,15 +23,11 @@ from ._comm import (
 from ._runtime import RuntimeHandle, _runtime_debug
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def padded_mxfp8_scale_columns(hidden: int) -> int:
     """Return the E8M0 row width required by Rubin's 16-byte token-in copy."""
 
     logical_columns = (hidden + 31) // 32
-    return _align_up(logical_columns, 16)
+    return round_up(logical_columns, 16)
 
 
 @dataclass(frozen=True)
@@ -76,7 +73,7 @@ class BufferLayout:
             if region.name in names:
                 raise ValueError(f"duplicate workspace region {region.name!r}")
             names.add(region.name)
-            offset = _align_up(offset, region.alignment)
+            offset = round_up(offset, region.alignment)
             placements.append(
                 BufferPlacement(
                     name=region.name,
@@ -88,7 +85,7 @@ class BufferLayout:
             max_alignment = max(max_alignment, region.alignment)
         return cls(
             placements=tuple(placements),
-            total_bytes=_align_up(offset, max_alignment),
+            total_bytes=round_up(offset, max_alignment),
         )
 
     def placement(self, name: str) -> BufferPlacement:
@@ -129,7 +126,6 @@ class WorkspaceRequirements:
         kernel_shared_workspace_bytes: int,
         col_quant_data_bytes: int = 0,
         col_quant_sf_bytes: int = 0,
-        backward_fc1_preact_bytes: int = 0,
         backward_dprob_bytes: int = 0,
         backward_aux_data_bytes: int = 0,
         backward_aux_scale_bytes: int = 0,
@@ -141,7 +137,6 @@ class WorkspaceRequirements:
             ("kernel_shared_workspace_bytes", kernel_shared_workspace_bytes),
             ("col_quant_data_bytes", col_quant_data_bytes),
             ("col_quant_sf_bytes", col_quant_sf_bytes),
-            ("backward_fc1_preact_bytes", backward_fc1_preact_bytes),
             ("backward_dprob_bytes", backward_dprob_bytes),
             ("backward_aux_data_bytes", backward_aux_data_bytes),
             ("backward_aux_scale_bytes", backward_aux_scale_bytes),
@@ -151,13 +146,12 @@ class WorkspaceRequirements:
         if bool(col_quant_data_bytes) != bool(col_quant_sf_bytes):
             raise ValueError("column requant data and scale workspace must be enabled together")
         backward_sizes = (
-            backward_fc1_preact_bytes,
             backward_dprob_bytes,
             backward_aux_data_bytes,
             backward_aux_scale_bytes,
         )
         if any(backward_sizes) and not all(backward_sizes):
-            raise ValueError("backward preactivation, dprob, data, and scale workspace " "must be enabled together")
+            raise ValueError("backward dprob, data, and scale workspace must be enabled together")
 
         tokens = config.max_tokens_per_rank
         hidden = config.hidden_size
@@ -190,11 +184,6 @@ class WorkspaceRequirements:
         backward_local_regions = (
             (
                 BufferRegion(
-                    "backward_fc1_preact",
-                    backward_fc1_preact_bytes,
-                    alignment=128,
-                ),
-                BufferRegion(
                     "backward_aux_data",
                     backward_aux_data_bytes,
                     alignment=128,
@@ -205,7 +194,7 @@ class WorkspaceRequirements:
                     alignment=128,
                 ),
             )
-            if backward_fc1_preact_bytes
+            if backward_aux_data_bytes
             else ()
         )
         local_regions = (

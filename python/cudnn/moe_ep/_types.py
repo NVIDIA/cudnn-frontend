@@ -8,9 +8,11 @@ from __future__ import annotations
 import operator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Tuple, Union
+from typing import Tuple, Union
 
 import torch
+
+from ._math import ceil_div
 
 
 class MoeFormat(str, Enum):
@@ -44,6 +46,41 @@ def _normalize_axis(axis: int, ndim: int) -> int:
     if normalized < 0 or normalized >= ndim:
         raise ValueError(f"axis {axis} is out of range for a {ndim}-D tensor")
     return normalized
+
+
+def _block_scaled_representation(
+    fmt: MoeFormat,
+    logical_shape: Tuple[int, ...],
+    axis: int,
+) -> tuple[Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.dtype]:
+    if fmt is MoeFormat.BF16:
+        raise ValueError("BlockScaledTensor only represents mxfp8 or nvfp4")
+    logical_extent = logical_shape[axis]
+    block_size = 32 if fmt is MoeFormat.MXFP8 else 16
+    payload_extent = (
+        logical_extent
+        if fmt is MoeFormat.MXFP8
+        else ceil_div(logical_extent, 2)
+    )
+    data_shape = list(logical_shape)
+    data_shape[axis] = payload_extent
+    scale_shape = list(logical_shape)
+    scale_shape[axis] = ceil_div(logical_extent, block_size)
+
+    e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
+    if e4m3_dtype is None:
+        raise RuntimeError("this PyTorch build does not provide torch.float8_e4m3fn")
+    if fmt is MoeFormat.MXFP8:
+        scale_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if scale_dtype is None:
+            raise RuntimeError(
+                "this PyTorch build does not provide torch.float8_e8m0fnu"
+            )
+        data_dtype = e4m3_dtype
+    else:
+        data_dtype = torch.uint8
+        scale_dtype = e4m3_dtype
+    return tuple(data_shape), tuple(scale_shape), data_dtype, scale_dtype
 
 
 @dataclass(frozen=True)
@@ -83,31 +120,16 @@ class BlockScaledTensor:
             logical_shape.append(dim)
         normalized_shape = tuple(logical_shape)
         axis = _normalize_axis(self.axis, len(normalized_shape))
-        logical_extent = normalized_shape[axis]
-        block_size = 32 if fmt is MoeFormat.MXFP8 else 16
-        payload_extent = logical_extent if fmt is MoeFormat.MXFP8 else (logical_extent + 1) // 2
-        scale_extent = (logical_extent + block_size - 1) // block_size
-        expected_data_shape = list(normalized_shape)
-        expected_data_shape[axis] = payload_extent
-        expected_scale_shape = list(normalized_shape)
-        expected_scale_shape[axis] = scale_extent
-        expected_data_shape = tuple(expected_data_shape)
-        expected_scale_shape = tuple(expected_scale_shape)
+        (
+            expected_data_shape,
+            expected_scale_shape,
+            expected_data_dtype,
+            expected_scale_dtype,
+        ) = _block_scaled_representation(fmt, normalized_shape, axis)
         if tuple(self.data.shape) != expected_data_shape:
             raise ValueError(f"{fmt.value} data shape must be {expected_data_shape}, " f"got {tuple(self.data.shape)}")
         if tuple(self.scale.shape) != expected_scale_shape:
             raise ValueError(f"{fmt.value} scale shape must be {expected_scale_shape}, " f"got {tuple(self.scale.shape)}")
-        e4m3_dtype = getattr(torch, "float8_e4m3fn", None)
-        if e4m3_dtype is None:
-            raise RuntimeError("this PyTorch build does not provide torch.float8_e4m3fn")
-        if fmt is MoeFormat.MXFP8:
-            expected_data_dtype = e4m3_dtype
-            expected_scale_dtype = getattr(torch, "float8_e8m0fnu", None)
-            if expected_scale_dtype is None:
-                raise RuntimeError("this PyTorch build does not provide torch.float8_e8m0fnu")
-        else:
-            expected_data_dtype = torch.uint8
-            expected_scale_dtype = e4m3_dtype
         if self.data.dtype is not expected_data_dtype:
             raise ValueError(f"{fmt.value} data must have dtype {expected_data_dtype}, " f"got {self.data.dtype}")
         if self.scale.dtype is not expected_scale_dtype:
@@ -172,29 +194,123 @@ class BlockScaledTensor:
         return (values * expanded_scale).movedim(-1, self.axis).to(dtype)
 
 
+class MoeEpNativeWeightLayout(str, Enum):
+    """Versioned kernel-native MXFP8 weight layouts."""
+
+    FORWARD_FC1_GATE_UP_INTERLEAVED_32_V1 = "mxfp8.forward_fc1.gate_up_interleaved_32.blocked_sf.v1"
+    FORWARD_FC2_K_MAJOR_V1 = "mxfp8.forward_fc2.k_major.blocked_sf.v1"
+    BACKWARD_W2_TRANSPOSE_V1 = "mxfp8.backward_w2_transpose.contiguous.blocked_sf.v1"
+    BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1 = "mxfp8.backward_w1_transpose.gate_up_interleaved_32.blocked_sf.v1"
+
+
 @dataclass(frozen=True)
-class MoeEpTrainingWeights:
-    """Stable MXFP8 bindings for forward and dgrad GEMMs.
+class MoeEpForwardWeights:
+    """Logical gate-then-up MXFP8 sources accepted by the fallback packer."""
 
-    Forward consumes ``forward_fc1`` with logical shape ``(E,H,2I)`` and
-    ``forward_fc2`` with ``(E,I,H)``. Backward consumes independently
-    quantized transposes: ``backward_w2_transpose=(E,H,I)`` for
-    ``dH=dY@W2.T`` and ``backward_w1_transpose=(E,2I,H)`` for
-    ``dX=dC@W1.T``. Every tensor is block-scaled along logical axis 1, the
-    reduction axis of its corresponding GEMM. When the owning ``MoeEp`` has
-    ``weight_interleave_size=32``, forward W1's output axis and backward W1T's
-    reduction axis must contain alternating 32-element gate/up strips.
-    """
+    fc1: BlockScaledTensor
+    fc2: BlockScaledTensor
 
-    forward_fc1: BlockScaledTensor
-    forward_fc2: BlockScaledTensor
-    backward_w2_transpose: BlockScaledTensor
-    backward_w1_transpose: BlockScaledTensor
+
+@dataclass(frozen=True)
+class MoeEpBackwardWeights:
+    """Logical gate-then-up MXFP8 transpose sources for the fallback packer."""
+
+    w2_transpose: BlockScaledTensor
+    w1_transpose: BlockScaledTensor
+
+
+@dataclass(frozen=True)
+class MoeEpNativeWeight:
+    """One kernel-executable payload plus Rubin blocked/interleaved scales."""
+
+    payload: torch.Tensor
+    scale: torch.Tensor
+    layout_id: Union[MoeEpNativeWeightLayout, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, torch.Tensor):
+            raise TypeError("payload must be a torch.Tensor, " f"got {type(self.payload).__name__}")
+        if not isinstance(self.scale, torch.Tensor):
+            raise TypeError("scale must be a torch.Tensor, " f"got {type(self.scale).__name__}")
+        if self.payload.device != self.scale.device:
+            raise ValueError(f"payload device {self.payload.device} does not match " f"scale device {self.scale.device}")
+        try:
+            layout_id = MoeEpNativeWeightLayout(self.layout_id)
+        except (TypeError, ValueError) as exc:
+            choices = ", ".join(layout.value for layout in MoeEpNativeWeightLayout)
+            raise ValueError(f"unsupported native weight layout_id {self.layout_id!r}; " f"expected one of: {choices}") from exc
+        object.__setattr__(self, "layout_id", layout_id)
+
+    @property
+    def device(self) -> torch.device:
+        return self.payload.device
+
+
+@dataclass(frozen=True)
+class MoeEpNativeForwardWeights:
+    """Independent kernel-native weights consumed by one forward call."""
+
+    fc1: MoeEpNativeWeight
+    fc2: MoeEpNativeWeight
+
+
+@dataclass(frozen=True)
+class MoeEpNativeBackwardWeights:
+    """Independent kernel-native transpose weights consumed by one backward."""
+
+    w2_transpose: MoeEpNativeWeight
+    w1_transpose: MoeEpNativeWeight
+
+
+@dataclass(frozen=True)
+class MoeEpForwardWeightStaging:
+    """Caller-owned destinations used by forward weight materialization."""
+
+    fc1_payload: torch.Tensor
+    fc1_scale: torch.Tensor
+    fc2_payload: torch.Tensor
+    fc2_scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MoeEpBackwardWeightStaging:
+    """Caller-owned destinations used by backward weight materialization."""
+
+    w2_transpose_payload: torch.Tensor
+    w2_transpose_scale: torch.Tensor
+    w1_transpose_payload: torch.Tensor
+    w1_transpose_scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MoeEpTrainingForwardOutputs:
+    """Caller-owned forward destinations."""
+
+    fc1_preact: torch.Tensor
+    output: torch.Tensor | None = None
+    fc1_a: torch.Tensor | None = None
+    fc1_sfa: torch.Tensor | None = None
+    valid_route_counts: torch.Tensor | None = None
+    expert_offsets: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class MoeEpTrainingBackwardOutputs:
+    """Caller-owned backward and final grouped-WGrad destinations."""
+
+    grad_activation: torch.Tensor | None = None
+    dprob: torch.Tensor | None = None
+    fc1_b: torch.Tensor | None = None
+    fc1_sfb: torch.Tensor | None = None
+    fc2_a: torch.Tensor | None = None
+    fc2_sfa: torch.Tensor | None = None
+    fc2_b: torch.Tensor | None = None
+    fc2_sfb: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class MoeEpTrainingWgradOperands:
-    """Fixed-capacity MXFP8 operands produced by the training resource path."""
+    """Non-owning views over caller-owned grouped-WGrad operand buffers."""
 
     fc1_a: torch.Tensor
     fc1_sfa: torch.Tensor
@@ -209,164 +325,11 @@ class MoeEpTrainingWgradOperands:
 
 
 @dataclass(frozen=True)
-class MoeEpTrainingSlot:
-    """Opaque index of one persistent forward/backward training slot."""
-
-    index: int
-    _resource_token: object
-
-
-@dataclass(frozen=True)
 class MoeEpExecutionLane:
-    """Opaque index of one mutable per-stream execution lane."""
+    """Operator-bound index of one mutable per-stream execution lane."""
 
     index: int
-    _resource_token: object
-
-
-class MoeEpTrainingResources:
-    """Caller-owned lease on fixed-capacity training slots and execution lanes."""
-
-    def __init__(
-        self,
-        *,
-        owner: Any,
-        operator_token: object,
-        weights: MoeEpTrainingWeights,
-        slot_count: int,
-        lane_count: int,
-        device: torch.device,
-    ) -> None:
-        self._owner = owner
-        self._operator_token = operator_token
-        self._resource_token = object()
-        self.weights = weights
-        self.device = torch.device(device)
-        self.slots = tuple(MoeEpTrainingSlot(index, self._resource_token) for index in range(slot_count))
-        self.lanes = tuple(MoeEpExecutionLane(index, self._resource_token) for index in range(lane_count))
-        self._closed = False
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    def _check_binding(
-        self,
-        operator_token: object,
-        slot: MoeEpTrainingSlot,
-        lane: MoeEpExecutionLane,
-    ) -> None:
-        if self._closed:
-            raise RuntimeError("MoeEp training resources are closed")
-        if self._operator_token is not operator_token:
-            raise ValueError("training resources belong to another MoeEp instance")
-        if slot._resource_token is not self._resource_token or slot not in self.slots:
-            raise ValueError("training slot does not belong to these resources")
-        if lane._resource_token is not self._resource_token or lane not in self.lanes:
-            raise ValueError("execution lane does not belong to these resources")
-
-    def refresh_weights(self) -> None:
-        """Enqueue fixed-address scale-layout refreshes on the current stream.
-
-        Call after every in-place data+scale update and before the first
-        forward/backward that consumes that version. The caller must establish
-        stream/event ordering, must not refresh between a matching forward and
-        backward, and must not overlap refresh with any consumer of these
-        resources. Replacing source storage requires closing the old operator,
-        creating a new ``MoeEp`` instance and resources, and capturing a new
-        graph. This method may itself be captured, in which case replay executes
-        only the recorded device transforms.
-        """
-
-        if self._closed:
-            raise RuntimeError("MoeEp training resources are closed")
-        self._owner.refresh_weights()
-
-    def forward(
-        self,
-        slot: MoeEpTrainingSlot,
-        lane: MoeEpExecutionLane,
-        activation: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the fixed-slot forward in ordinary or capture mode."""
-
-        self._check_binding(self._operator_token, slot, lane)
-        execution = self._owner.views(
-            slot=slot.index,
-            lane=lane.index,
-            token_count=int(activation.shape[0]),
-        )
-        from ._megamoe_backend.mxfp8._training_execute import (
-            launch_training_forward,
-        )
-
-        return launch_training_forward(
-            self._owner,
-            execution,
-            activation,
-            topk_idx,
-            topk_weights,
-        )
-
-    def backward(
-        self,
-        slot: MoeEpTrainingSlot,
-        lane: MoeEpExecutionLane,
-        grad_output: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        MoeEpTrainingWgradOperands,
-    ]:
-        """Run fixed-slot dgrad/dprob in ordinary or capture mode."""
-
-        self._check_binding(self._operator_token, slot, lane)
-        execution = self._owner.views(
-            slot=slot.index,
-            lane=lane.index,
-            token_count=int(grad_output.shape[0]),
-        )
-        from ._megamoe_backend.mxfp8._training_execute import (
-            launch_training_backward,
-        )
-
-        grad_activation, grad_topk_weights, operands = launch_training_backward(
-            self._owner,
-            execution,
-            grad_output,
-        )
-        return grad_activation, grad_topk_weights, operands
-
-    def finalize_overflow(
-        self,
-        slots: Tuple[MoeEpTrainingSlot, ...],
-        lane: MoeEpExecutionLane | None = None,
-    ) -> torch.Tensor:
-        """Aggregate one computation group's flags and apply its policy."""
-
-        if self._closed:
-            raise RuntimeError("MoeEp training resources are closed")
-        if lane is None:
-            lane = self.lanes[0]
-        if not isinstance(lane, MoeEpExecutionLane) or lane._resource_token is not self._resource_token or lane not in self.lanes:
-            raise ValueError("overflow execution lane does not belong to these resources")
-        slot_indices = []
-        for slot in slots:
-            if not isinstance(slot, MoeEpTrainingSlot) or slot._resource_token is not self._resource_token or slot not in self.slots:
-                raise ValueError("overflow slot does not belong to these resources")
-            slot_indices.append(slot.index)
-        return self._owner.finalize_overflow(
-            tuple(slot_indices),
-            lane=lane.index,
-        )
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._owner.close()
-        self._closed = True
+    _operator_token: object
 
 
 MoeTensor = Union[torch.Tensor, BlockScaledTensor]
@@ -375,9 +338,16 @@ MoeTensor = Union[torch.Tensor, BlockScaledTensor]
 __all__ = [
     "BlockScaledTensor",
     "MoeEpExecutionLane",
-    "MoeEpTrainingResources",
-    "MoeEpTrainingSlot",
-    "MoeEpTrainingWeights",
+    "MoeEpBackwardWeightStaging",
+    "MoeEpBackwardWeights",
+    "MoeEpForwardWeightStaging",
+    "MoeEpForwardWeights",
+    "MoeEpNativeBackwardWeights",
+    "MoeEpNativeForwardWeights",
+    "MoeEpNativeWeight",
+    "MoeEpNativeWeightLayout",
+    "MoeEpTrainingBackwardOutputs",
+    "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
     "MoeFormat",
     "MoeTensor",

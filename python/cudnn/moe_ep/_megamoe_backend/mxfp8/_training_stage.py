@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Cached fused MXFP8 staging for fixed-address training resources."""
+"""Cached BF16/FP32 staging into private symmetric training scratch."""
 
 from __future__ import annotations
 

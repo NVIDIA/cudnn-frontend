@@ -1,13 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Ordinary/capturable launch path over fixed MXFP8 training resources."""
+"""Ordinary/capturable stateless launch path over private lane resources."""
 
 from __future__ import annotations
 
 import torch
 
-from ..._types import MoeEpTrainingWgradOperands
+from ..._types import (
+    BlockScaledTensor,
+    MoeEpNativeBackwardWeights,
+    MoeEpNativeForwardWeights,
+    MoeEpTrainingBackwardOutputs,
+    MoeEpTrainingForwardOutputs,
+    MoeEpTrainingWgradOperands,
+    MoeTensor,
+)
 from .._runtime import _runtime_debug
 from .._workspace import padded_mxfp8_scale_columns
 from ._adapter import (
@@ -23,8 +31,13 @@ from ._compile import compile_or_get
 from ._launch import build_runtime_kwargs
 from ._training_resources import (
     Mxfp8TrainingExecutionViews,
-    Mxfp8TrainingResourceOwner,
+    Mxfp8TrainingState,
 )
+from ._training_weights import (
+    backward_native_to_kernel,
+    forward_native_to_kernel,
+)
+from ._training_wgrad import assemble_training_wgrad_operands
 
 
 def _zero_pre_reduced(inputs, prepared) -> None:
@@ -69,15 +82,51 @@ def _activation_views(
     )
 
 
+def _stage_input(
+    state: Mxfp8TrainingState,
+    value: MoeTensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    activation_data: torch.Tensor,
+    activation_sf: torch.Tensor,
+    routing_topk_idx: torch.Tensor,
+    routing_topk_weights: torch.Tensor,
+) -> None:
+    """Stage into private symmetric memory, bypassing quantization for MXFP8."""
+
+    if not isinstance(value, BlockScaledTensor):
+        state.stager.stage(
+            value,
+            topk_idx,
+            topk_weights,
+            activation_data,
+            activation_sf,
+            routing_topk_idx,
+            routing_topk_weights,
+        )
+        return
+
+    token_count = int(value.logical_shape[0])
+    scale_columns = int(value.scale.shape[1])
+    activation_data.zero_()
+    activation_sf.zero_()
+    routing_topk_idx.fill_(-1)
+    routing_topk_weights.zero_()
+    if token_count == 0:
+        return
+    activation_data[:token_count].copy_(value.data)
+    activation_sf[:token_count, :scale_columns].copy_(value.scale)
+    routing_topk_idx[:token_count].copy_(topk_idx)
+    routing_topk_weights[:token_count].copy_(topk_weights)
+
+
 def _write_expert_offsets(
     execution: Mxfp8TrainingExecutionViews,
     padding: int,
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> None:
     snapshot = execution.forward_expert_size_snapshot
-    if snapshot is None:
-        raise RuntimeError("training forward requires the persistent expert-size snapshot")
-    counts = execution.slot.valid_route_counts
-    offsets = execution.slot.expert_offsets
     counts.copy_(snapshot)
     torch.add(counts, padding - 1, out=offsets)
     torch.div(offsets, padding, rounding_mode="floor", out=offsets)
@@ -86,22 +135,26 @@ def _write_expert_offsets(
 
 
 def launch_training_forward(
-    owner: Mxfp8TrainingResourceOwner,
+    state: Mxfp8TrainingState,
     execution: Mxfp8TrainingExecutionViews,
-    activation: torch.Tensor,
+    activation: MoeTensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    *,
+    weights: MoeEpNativeForwardWeights,
+    out: MoeEpTrainingForwardOutputs,
 ) -> torch.Tensor:
-    """Stage and launch one fixed-slot forward without host-visible routing."""
+    """Launch one stateless forward over caller-owned outputs."""
 
-    prepared = owner.forward_prepared
+    prepared = state.forward_prepared
     config = prepared.config
     capacity = config.max_tokens_per_rank
-    slot = execution.slot
+    scratch = execution.scratch
+    token_count = int(activation.logical_shape[0] if isinstance(activation, BlockScaledTensor) else activation.shape[0])
     _runtime_debug(
         "training-forward.begin",
-        slot=execution.slot.index,
-        token_count=int(activation.shape[0]),
+        lane=scratch.index,
+        token_count=token_count,
     )
     activation_data, activation_sf = _activation_views(
         execution,
@@ -109,78 +162,113 @@ def launch_training_forward(
         capacity=capacity,
         hidden=config.hidden,
     )
-    _runtime_debug("training-forward.stage.begin", slot=execution.slot.index)
-    owner.stager.stage(
+    _runtime_debug("training-forward.stage.begin", lane=scratch.index)
+    _stage_input(
+        state,
         activation,
         topk_idx,
         topk_weights,
         activation_data,
         activation_sf,
-        slot.routing_topk_idx,
-        slot.routing_topk_weights,
+        scratch.routing_topk_idx,
+        scratch.routing_topk_weights,
     )
-    _runtime_debug("training-forward.stage.end", slot=execution.slot.index)
-    slot.forward_output.zero_()
-    slot.forward_overflow.zero_()
-    if slot.col_quant_data is not None:
-        slot.col_quant_data.zero_()
-    if slot.col_quant_sf is not None:
-        slot.col_quant_sf.zero_()
-    _runtime_debug("training-forward.reset.end", slot=execution.slot.index)
+    _runtime_debug("training-forward.stage.end", lane=scratch.index)
+
+    assert out.output is not None
+    assert out.fc1_a is not None
+    assert out.fc1_sfa is not None
+    assert out.valid_route_counts is not None
+    assert out.expert_offsets is not None
+    fc1_preact = out.fc1_preact
+    col_quant_data = out.fc1_a.transpose(0, 1)
+    col_quant_sf = out.fc1_sfa.view(torch.uint8).reshape(-1)
+    expected_elements = int(prepared.col_quant_sf_elements)
+    if col_quant_sf.numel() != expected_elements:
+        raise ValueError("out.fc1_sfa storage does not match the forward producer ABI: " f"{col_quant_sf.numel()} != {expected_elements}")
+    valid_route_counts = out.valid_route_counts
+    expert_offsets = out.expert_offsets
+
+    scratch.forward_output.zero_()
+    scratch.forward_overflow.zero_()
+    col_quant_data.zero_()
+    # E8M0 byte 127 encodes scale 1.0. The producer only overwrites active
+    # expert segments, so the unused grouped-WGrad capacity must stay neutral.
+    col_quant_sf.fill_(127)
+    _runtime_debug("training-forward.reset.end", lane=scratch.index)
 
     workspace = execution.forward.workspace
     inputs = Mxfp8LaunchInputs(
         activation=activation_data,
         activation_sf=activation_sf,
-        topk_indices=slot.routing_topk_idx,
-        topk_scores=slot.routing_topk_weights,
-        weights=owner.weight_bindings.forward,
-        fc1_c=slot.fc1_preact,
-        output_data=slot.forward_output,
-        col_quant_data=slot.col_quant_data,
-        col_quant_sf=slot.col_quant_sf,
-        overflow_flag=slot.forward_overflow,
+        topk_indices=scratch.routing_topk_idx,
+        topk_scores=scratch.routing_topk_weights,
+        weights=forward_native_to_kernel(weights),
+        fc1_c=fc1_preact,
+        output_data=scratch.forward_output,
+        col_quant_data=col_quant_data,
+        col_quant_sf=col_quant_sf,
+        overflow_flag=scratch.forward_overflow,
         local_workspace=workspace.local["kernel_local_workspace"],
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
-        token_count=int(activation.shape[0]),
+        token_count=token_count,
     )
     _zero_pre_reduced(inputs, prepared)
-    _runtime_debug("training-forward.compile.begin", slot=execution.slot.index)
+    _runtime_debug("training-forward.compile.begin", lane=scratch.index)
     compiled = compile_or_get(
         prepared,
         inputs,
         execution.forward,
     )
-    _runtime_debug("training-forward.compile.end", slot=execution.slot.index)
-    _runtime_debug("training-forward.launch.begin", slot=execution.slot.index)
+    _runtime_debug("training-forward.compile.end", lane=scratch.index)
+    _runtime_debug("training-forward.launch.begin", lane=scratch.index)
     compiled.callable(**build_runtime_kwargs(inputs, execution.forward))
-    _runtime_debug("training-forward.launch.end", slot=execution.slot.index)
-    _runtime_debug("training-forward.offsets.begin", slot=execution.slot.index)
-    _write_expert_offsets(execution, config.token_padding_block)
-    _runtime_debug("training-forward.offsets.end", slot=execution.slot.index)
-    _runtime_debug("training-forward.end", slot=execution.slot.index)
-    return slot.forward_output[: inputs.token_count]
+    _runtime_debug("training-forward.launch.end", lane=scratch.index)
+    _runtime_debug("training-forward.offsets.begin", lane=scratch.index)
+    _write_expert_offsets(
+        execution,
+        config.token_padding_block,
+        valid_route_counts,
+        expert_offsets,
+    )
+    _runtime_debug("training-forward.offsets.end", lane=scratch.index)
+    state.apply_overflow(lane=scratch.index, phase="forward")
+
+    output = out.output[:token_count]
+    output.copy_(scratch.forward_output[:token_count])
+    _runtime_debug("training-forward.end", lane=scratch.index)
+    return output
 
 
 def launch_training_backward(
-    owner: Mxfp8TrainingResourceOwner,
+    state: Mxfp8TrainingState,
     execution: Mxfp8TrainingExecutionViews,
-    grad_output: torch.Tensor,
+    grad_output: MoeTensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    weights: MoeEpNativeBackwardWeights,
+    fc1_preact: torch.Tensor,
+    fc1_a: torch.Tensor | None,
+    fc1_sfa: torch.Tensor | None,
+    valid_route_counts: torch.Tensor | None,
+    expert_offsets: torch.Tensor | None,
+    out: MoeEpTrainingBackwardOutputs,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     MoeEpTrainingWgradOperands,
 ]:
-    """Stage and launch one fixed-slot backward using forward's raw pool."""
+    """Launch one stateless backward using explicit caller-owned saved state."""
 
-    prepared = owner.backward_prepared
+    prepared = state.backward_prepared
     config = prepared.config
     capacity = config.max_tokens_per_rank
-    slot = execution.slot
-    token_count = int(grad_output.shape[0])
+    scratch = execution.scratch
+    token_count = int(grad_output.logical_shape[0] if isinstance(grad_output, BlockScaledTensor) else grad_output.shape[0])
     _runtime_debug(
         "training-backward.begin",
-        slot=execution.slot.index,
+        lane=scratch.index,
         token_count=token_count,
     )
     activation_data, activation_sf = _activation_views(
@@ -189,77 +277,103 @@ def launch_training_backward(
         capacity=capacity,
         hidden=config.hidden,
     )
-    _runtime_debug("training-backward.stage.begin", slot=execution.slot.index)
-    owner.stager.stage(
+    _runtime_debug("training-backward.stage.begin", lane=scratch.index)
+    _stage_input(
+        state,
         grad_output,
-        slot.routing_topk_idx[:token_count],
-        slot.routing_topk_weights[:token_count],
+        topk_idx,
+        topk_weights,
         activation_data,
         activation_sf,
-        slot.routing_topk_idx,
-        slot.routing_topk_weights,
+        scratch.routing_topk_idx,
+        scratch.routing_topk_weights,
     )
-    _runtime_debug("training-backward.stage.end", slot=execution.slot.index)
+    _runtime_debug("training-backward.stage.end", lane=scratch.index)
 
-    slot.backward_output.zero_()
-    slot.grad_activation.zero_()
-    slot.backward_overflow.zero_()
-    slot.dprob.zero_()
-    slot.fc1_recompute.zero_()
-    slot.fc1_recompute_sf.view(torch.uint8).fill_(127)
-    slot.fc1_col_output.zero_()
-    slot.fc1_col_output_sf.view(torch.uint8).fill_(127)
-    slot.grad_y2.zero_()
-    slot.grad_y2_sf.fill_(127)
-    _runtime_debug("training-backward.reset.end", slot=execution.slot.index)
+    assert fc1_a is not None
+    assert fc1_sfa is not None
+    assert valid_route_counts is not None
+    assert expert_offsets is not None
+    assert out.grad_activation is not None
+    assert out.dprob is not None
+    assert out.fc1_b is not None
+    assert out.fc1_sfb is not None
+    assert out.fc2_a is not None
+    assert out.fc2_sfa is not None
+    assert out.fc2_b is not None
+    assert out.fc2_sfb is not None
+    fc1_recompute = out.fc2_a.transpose(0, 1)
+    fc1_recompute_sf = out.fc2_sfa
+    fc1_col_output = out.fc1_b
+    fc1_col_output_sf = out.fc1_sfb
+    grad_y2 = out.fc2_b
+    grad_y2_sf = out.fc2_sfb.view(torch.uint8).reshape(-1)
+
+    scratch.backward_output.zero_()
+    scratch.backward_overflow.zero_()
+    scratch.dprob.zero_()
+    fc1_recompute.zero_()
+    fc1_recompute_sf.view(torch.uint8).fill_(127)
+    fc1_col_output.zero_()
+    fc1_col_output_sf.view(torch.uint8).fill_(127)
+    grad_y2.zero_()
+    grad_y2_sf.fill_(127)
+    _runtime_debug("training-backward.reset.end", lane=scratch.index)
 
     workspace = execution.backward.workspace
-    weights = owner.weight_bindings.backward
+    kernel_weights = backward_native_to_kernel(weights)
     inputs = Mxfp8BackwardLaunchInputs(
         grad_out=activation_data,
         grad_out_sf=activation_sf,
-        topk_idx=slot.routing_topk_idx,
-        topk_weights=slot.routing_topk_weights,
-        fc1_weight=weights.fc1_weight,
-        fc1_weight_sf=weights.fc1_weight_sf,
-        fc2_weight=weights.fc2_weight,
-        fc2_weight_sf=weights.fc2_weight_sf,
-        beta=owner.beta,
-        fc1_preact=slot.fc1_preact,
-        output_activation=slot.backward_output,
-        overflow_flag=slot.backward_overflow,
-        dprob=slot.dprob,
-        fc1_recompute=slot.fc1_recompute,
-        fc1_recompute_sf=slot.fc1_recompute_sf,
-        fc1_col_output=slot.fc1_col_output,
-        fc1_col_output_sf=slot.fc1_col_output_sf,
-        grad_y2=slot.grad_y2,
-        grad_y2_sf=slot.grad_y2_sf,
+        topk_idx=scratch.routing_topk_idx,
+        topk_weights=scratch.routing_topk_weights,
+        fc1_weight=kernel_weights.fc1_weight,
+        fc1_weight_sf=kernel_weights.fc1_weight_sf,
+        fc2_weight=kernel_weights.fc2_weight,
+        fc2_weight_sf=kernel_weights.fc2_weight_sf,
+        beta=state.beta,
+        fc1_preact=fc1_preact,
+        output_activation=scratch.backward_output,
+        overflow_flag=scratch.backward_overflow,
+        dprob=scratch.dprob,
+        fc1_recompute=fc1_recompute,
+        fc1_recompute_sf=fc1_recompute_sf,
+        fc1_col_output=fc1_col_output,
+        fc1_col_output_sf=fc1_col_output_sf,
+        grad_y2=grad_y2,
+        grad_y2_sf=grad_y2_sf,
         local_workspace=workspace.local["kernel_local_workspace"],
         shared_workspace=workspace.symmetric["kernel_shared_workspace"],
         token_count=token_count,
     )
     _zero_pre_reduced(inputs, prepared)
-    _runtime_debug("training-backward.compile.begin", slot=execution.slot.index)
+    _runtime_debug("training-backward.compile.begin", lane=scratch.index)
     compiled = compile_backward_or_get(
         prepared,
         inputs,
         execution.backward,
     )
-    _runtime_debug("training-backward.compile.end", slot=execution.slot.index)
-    _runtime_debug("training-backward.launch.begin", slot=execution.slot.index)
+    _runtime_debug("training-backward.compile.end", lane=scratch.index)
+    _runtime_debug("training-backward.launch.begin", lane=scratch.index)
     compiled.callable(**build_backward_runtime_kwargs(inputs, execution.backward))
-    _runtime_debug("training-backward.launch.end", slot=execution.slot.index)
-    slot.grad_activation.copy_(slot.backward_output)
-    _runtime_debug("training-backward.wgrad-export.begin", slot=execution.slot.index)
-    operands = owner.wgrad_exporter.export(slot)
-    _runtime_debug("training-backward.wgrad-export.end", slot=execution.slot.index)
-    _runtime_debug("training-backward.end", slot=execution.slot.index)
-    return (
-        slot.grad_activation[:token_count],
-        slot.dprob[:token_count],
-        operands,
+    _runtime_debug("training-backward.launch.end", lane=scratch.index)
+    state.apply_overflow(lane=scratch.index, phase="backward")
+
+    grad_activation = out.grad_activation[:token_count]
+    grad_activation.copy_(scratch.backward_output[:token_count])
+
+    dprob = out.dprob[:token_count]
+    dprob.copy_(scratch.dprob[:token_count])
+
+    operands = assemble_training_wgrad_operands(
+        fc1_a=fc1_a,
+        fc1_sfa=fc1_sfa,
+        expert_offsets=expert_offsets,
+        valid_route_counts=valid_route_counts,
+        backward=out,
     )
+    _runtime_debug("training-backward.end", lane=scratch.index)
+    return grad_activation, dprob, operands
 
 
 __all__ = [

@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 
 from moe_ep.moe_ep_test_support import (
+    _allocate_stateless_training_outputs,
+    _allocate_training_weight_staging,
     _assert_backward_matches,
     _assert_grouped_wgrads_match_reference,
     _assert_matches_reference,
@@ -21,6 +23,7 @@ from moe_ep.moe_ep_test_support import (
     _fixed_training_weights,
     _forward_config,
     _grad_output,
+    _interleave_fc1_wgrad,
     _output_as_float,
     _reference_forward,
     make_distributed_forward_inputs,
@@ -28,9 +31,7 @@ from moe_ep.moe_ep_test_support import (
 )
 
 __all__ = [
-    "_distributed_backward_reference_worker",
     "_distributed_output_worker",
-    "_distributed_subgroup_backward_reference_worker",
     "_distributed_subgroup_output_worker",
     "_run_backward_reference_case",
     "_run_forward_output_case",
@@ -237,7 +238,7 @@ def _run_backward_reference_case(
     gate_up_clamp: float | None = None,
     expected_global_ranks: tuple[int, ...] | None = None,
 ) -> None:
-    """Run fixed-resource training after the independent distributed oracle."""
+    """Run stateless training after the independent distributed oracle."""
 
     from cudnn import MoeEp
 
@@ -262,7 +263,11 @@ def _run_backward_reference_case(
         drop_on_overflow=True,
     )
     expected_y, expected_dx, expected_dprob, expected_wgrads = expected
-    expected_dense_wgrads = expected_wgrads.dense_wgrads()
+    expected_fc1_wgrad, expected_fc2_wgrad = expected_wgrads.dense_wgrads()
+    expected_dense_wgrads = (
+        _interleave_fc1_wgrad(expected_fc1_wgrad),
+        expected_fc2_wgrad,
+    )
     weights = _fixed_training_weights(args)
 
     op = MoeEp(
@@ -276,29 +281,48 @@ def _run_backward_reference_case(
         drop_on_overflow=True,
         combine_format=combine_format,
         gate_up_clamp=gate_up_clamp,
+        weight_interleave_size=32,
     )
     try:
-        resources = op.prepare_training_resources(
-            weights,
-            slot_count=1,
+        requirements = op.prepare_training(
             lane_count=1,
+            device=device,
         )
-        slot = resources.slots[0]
-        lane = resources.lanes[0]
-        resources.refresh_weights()
-        actual_y = resources.forward(
-            slot,
+        lane = op.training_lanes[0]
+        forward_staging, backward_staging = _allocate_training_weight_staging(weights)
+        native_forward = op.pack_forward_weights(
+            weights[0],
+            out=forward_staging,
+        )
+        native_backward = op.pack_backward_weights(
+            weights[1],
+            out=backward_staging,
+        )
+        forward_out, backward_out = _allocate_stateless_training_outputs(
+            requirements,
+            device,
+        )
+        actual_y = op.training_forward(
             lane,
             args[0],
             args[3],
             args[4],
+            weights=native_forward,
+            out=forward_out,
         )
-        actual_dx, actual_dprob, actual_wgrads = resources.backward(
-            slot,
+        actual_dx, actual_dprob, actual_wgrads = op.training_backward(
             lane,
             grad_output,
+            args[3],
+            args[4],
+            weights=native_backward,
+            fc1_preact=forward_out.fc1_preact,
+            fc1_a=forward_out.fc1_a,
+            fc1_sfa=forward_out.fc1_sfa,
+            valid_route_counts=forward_out.valid_route_counts,
+            expert_offsets=forward_out.expert_offsets,
+            out=backward_out,
         )
-        overflow = resources.finalize_overflow((slot,), lane)
         grouped_wgrads = _dense_wgrads_from_grouped_kernel(actual_wgrads)
         torch.cuda.synchronize(device)
 
@@ -311,7 +335,6 @@ def _run_backward_reference_case(
             assert op.ep_size == ep_size
             if expected_global_ranks is not None:
                 assert op.ep_global_ranks == expected_global_ranks
-            assert overflow.eq(0).all()
             assert args[3][0, 0] // 2 == ep_rank
             assert args[3][0, 1] // 2 == (ep_rank + 1) % ep_size
             assert args[3].eq(-1).any()
@@ -364,110 +387,3 @@ def _run_backward_reference_case(
             raise assertion_error
     finally:
         op.close()
-
-
-def _distributed_subgroup_backward_reference_worker(
-    global_rank: int,
-    global_world_size: int,
-    init_file: str,
-) -> None:
-    """Run fixed-resource backward in two non-contiguous EP2 groups."""
-
-    device = torch.device("cuda", global_rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{init_file}",
-        rank=global_rank,
-        world_size=global_world_size,
-        device_id=device,
-        timeout=timedelta(minutes=10),
-    )
-    ep_group = None
-    try:
-        subgroup_memberships = ((0, 2), (1, 3))
-        # Every WORLD rank must create every subgroup in the same order.
-        subgroups = [
-            dist.new_group(
-                list(members),
-                backend="nccl",
-                timeout=timedelta(minutes=10),
-            )
-            for members in subgroup_memberships
-        ]
-        subgroup_index = global_rank % 2
-        expected_global_ranks = subgroup_memberships[subgroup_index]
-        ep_group = subgroups[subgroup_index]
-        ep_rank = dist.get_rank(ep_group)
-        ep_size = dist.get_world_size(ep_group)
-        actual_global_ranks = tuple(dist.get_global_rank(ep_group, group_rank) for group_rank in range(ep_size))
-        assert ep_size == len(expected_global_ranks)
-        assert ep_rank == expected_global_ranks.index(global_rank)
-        assert actual_global_ranks == expected_global_ranks
-
-        _run_backward_reference_case(
-            device=device,
-            ep_group=ep_group,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            combine_format="bf16",
-            expected_global_ranks=expected_global_ranks,
-        )
-    finally:
-        if dist.is_initialized():
-            try:
-                # Keep both independent groups alive until all work is done,
-                # then collectively finalize the process-local runtime.
-                dist.barrier()
-                from cudnn.moe_ep._megamoe_backend._runtime import (
-                    get_runtime_manager,
-                )
-
-                get_runtime_manager().shutdown()
-                dist.barrier()
-            finally:
-                if ep_group is not None:
-                    dist.destroy_process_group(ep_group)
-                dist.destroy_process_group()
-
-
-def _distributed_backward_reference_worker(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    combine_format: str,
-    gate_up_clamp: float | None = None,
-) -> None:
-    """Initialize one local rank and run distributed training parity."""
-
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
-        device_id=device,
-        timeout=timedelta(minutes=10),
-    )
-    try:
-        _run_backward_reference_case(
-            device=device,
-            ep_group=dist.group.WORLD,
-            ep_rank=rank,
-            ep_size=world_size,
-            combine_format=combine_format,
-            gate_up_clamp=gate_up_clamp,
-        )
-    finally:
-        if dist.is_initialized():
-            try:
-                dist.barrier()
-                from cudnn.moe_ep._megamoe_backend._runtime import (
-                    get_runtime_manager,
-                )
-
-                get_runtime_manager().shutdown()
-                dist.barrier()
-            finally:
-                dist.destroy_process_group()

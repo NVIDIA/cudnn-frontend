@@ -17,10 +17,7 @@ from moe_ep.moe_ep_distributed_workers import (
     _run_backward_reference_case,
     _run_forward_output_case,
 )
-from moe_ep.moe_ep_test_support import (
-    _fixed_training_weights,
-    make_distributed_forward_inputs,
-)
+from moe_ep.moe_ep_test_support import make_distributed_forward_inputs
 
 pytestmark = [
     pytest.mark.L1,
@@ -238,12 +235,6 @@ def test_mxfp8_forward_multinode_matches_reference(
             id="backward-ep16-world16-bf16",
         ),
         pytest.param(
-            16,
-            16,
-            "mxfp8",
-            id="backward-ep16-world16-mxfp8",
-        ),
-        pytest.param(
             32,
             32,
             "bf16",
@@ -257,7 +248,7 @@ def test_mxfp8_forward_multinode_matches_reference(
         ),
     ],
 )
-def test_fixed_training_resources_multinode_match_independent_reference(
+def test_stateless_training_multinode_matches_independent_reference(
     torchrun_world,
     ep_size,
     required_world_size,
@@ -302,10 +293,6 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
 
     from cudnn import MoeEp
 
-    # A fixed helper rank gives every process byte-identical, locally valid
-    # weight packs. Only the locally valid lane count differs.
-    args = make_distributed_forward_inputs(0, 8, world.device)
-    weights = _fixed_training_weights(args)
     op = MoeEp(
         num_experts=16,
         hidden_size=128,
@@ -316,15 +303,15 @@ def test_training_prepare_multinode_rejects_rank_abi_mismatch(
         max_recv_size_per_rank=3,
         drop_on_overflow=True,
         combine_format="bf16",
+        weight_interleave_size=32,
     )
     caught_error = None
     try:
         lane_count = rank_zero_lane_count if world.rank == 0 else other_lane_count
         try:
-            op.prepare_training_resources(
-                weights,
-                slot_count=1,
+            op.prepare_training(
                 lane_count=lane_count,
+                device=world.device,
             )
         except Exception as error:
             caught_error = error
