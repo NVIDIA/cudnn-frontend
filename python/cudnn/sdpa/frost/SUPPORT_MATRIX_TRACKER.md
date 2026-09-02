@@ -17,12 +17,16 @@ before `import cudnn` or the graph silently runs a cuDNN backend plan.
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
 > the same commit — see `python/cudnn/sdpa/AGENTS.md` **Rule S2** and
-> `python/cudnn/frost/README.md` § "The rules" #14. This table is maintained by
-> hand; nothing else catches it going stale.
+> `python/cudnn/frost/README.md` § "The rules" #14. This tracker is maintained
+> by hand; nothing else catches it going stale. It lives beside the engines it
+> tracks (`../fwd/engines.py`, `../bwd/engines.py`) rather than under `docs/`
+> precisely so that "in the same commit" is the path of least resistance.
 
 Legend: ✅ served natively · ⚠️ served, but **no native kernel for this head dim** —
 the graph rides another flavor's envelope with TMA zero-padding (correct, but pays
-the larger flavor's MMA cost) · ❌ declined at plan time · — not applicable · ⁿ footnote.
+the larger flavor's MMA cost) · ❔ **accepted by the capability row but not
+validated on this path** — treat as untested, not as a guarantee · ❌ declined at
+plan time · — not applicable · ⁿ footnote.
 
 ---
 
@@ -34,18 +38,18 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 
 | Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
-| **Data types** |
+| **Data types** | | | | | | |
 | FP16 / BF16 | ⚠️⁷ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| O dtype ≠ QKV dtype (fp16/bf16/fp8 out) | ✅¹ | ✅¹ | ✅¹ | — | ✅¹ | — |
+| O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | — |
 | Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 | f16 ×8 · fp8 ×16, floor 256² | — |
-| **Layout** |
+| **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ❌ |
 | THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ❌ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Masks / features** |
+| **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -58,8 +62,10 @@ Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ❌ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
-¹ Quantized rows only (fp8/mxfp8): O may be FP16, BF16, E4M3 or E5M2. On the f16
-row O must equal Q.
+¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
+BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
+row has no `out_dtypes` domain and `facts.uniform_dtype` requires O == Q there.
+`—` marks a column with no quantized kernel at all.
 ² The d512 FP8 flavor serves head dims in (256, 512] on both axes; a smaller
 graph is declined rather than routed onto it at >2× zero-padding cost.
 ³ The d192×d128 fp8/mxfp8 kernels are dense-only; d512 has no MXFP8 kernel.
@@ -95,7 +101,7 @@ no backward** on the Rubin line — those graphs fall through to the backend.
 | FP16 / BF16 | ❌ | ❌ | ❌ |
 | FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ❌ |
 | MXFP8 | ❌ | ❌ | ❌ |
-| O dtype ≠ QKV (fp16/bf16/fp8 out) | ✅ | ✅ | — |
+| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | — |
 | Head-dim envelope | none — runs the d128 kernelⁱ | ×16 up to 128 | — |
 | BSHD / `dense_flex` | ✅ / ❌ | ✅ / ❌ | ❌ |
 | THD + `cu_seq_len` | ❌ⁱⁱ | ✅ | ❌ |
@@ -104,15 +110,16 @@ no backward** on the Rubin line — those graphs fall through to the backend.
 | Dense padded-Q trim | ❌ | ❌ | ❌ |
 | Attention sink | ✅ | ✅ | ❌ |
 | Bias | ❌ | ❌ | ❌ |
-| FP16 softmax accumulate (`softmax_precision=HALF`) | ❌ⁱⁱⁱ | ✅ (Rubin-only f16x2 arm) | — |
+| FP16 softmax accumulate (`softmax_precision=HALF`) | ❔ⁱⁱⁱ | ✅ (Rubin-only f16x2 arm) | — |
 
 ⁱ Same story as SM100 footnote ⁷: no native d=64 Rubin kernel, so a d=64 FP8
 graph rides the d128 envelope (64 is a multiple of 16) at ~2× the MMA cost.
 ⁱⁱ `thd_d_shapes={(128,128)}` is exact — d=64 THD is declined.
-ⁱⁱⁱ The `softmax_precision=HALF` domain is gated on `flavor == (128, 128)`
-(`fwd/api_dsl.py:1100`), and a d=64 graph's *flavor* is (128,128) — so the knob
-is in fact accepted. Marked ❌ here only because the padded d=64 path has not
-been validated with the f16x2 arm; treat as untested rather than rejected.
+ⁱⁱⁱ **Accepted, not validated.** The `softmax_precision=HALF` domain is gated on
+`flavor == (128, 128)` (`fwd/api_dsl.py:1100`), and a d=64 graph's *flavor* IS
+(128,128), so the knob passes the probe and the kernel runs. What is untested is
+the f16x2 exponent arm over the zero-padded 64 → 128 region. Validate before
+relying on it; do not read ❔ as either a guarantee or a rejection.
 
 ---
 
@@ -122,21 +129,21 @@ Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently.
 
-| Feature | FPROP<br>d ≤ 256, any ×16 | FPROP FP8<br>d ≤ 256, any ×32 tile | BPROP<br>d ≤ 256, any ×8 |
+| Feature | FPROP<br>d ≤ 256, any ×8 | FPROP FP8<br>d ≤ 256, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
-| **Data types** |
+| **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
 | FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
 | MXFP8 | ❌ | ❌ | ❌ |
-| O dtype ≠ QKV (fp16/bf16/fp8 out) | ❌ | ✅ | — |
+| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
 | Rectangular head dims (D_QK ≠ D_V) | ✅ (independent) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment | ×8, ≤ 256 | ×16, tile ×32, ≤ 256 | ×8, ≤ 256 |
-| **Layout** |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, ≤ 256ᵃ | ×16, ≤ 256ᵃ | ×8, ≤ 256 |
+| **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
-| **Masks / features** |
+| **Masks / features** | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ |
 | Causal bottom-right | ✅ | ✅ | ✅ |
 | Causal right-band widening | ✅ | ✅ | ✅ |
@@ -148,6 +155,14 @@ kernel picks Q/K and V head tiles independently.
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
+
+ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
+headers quote the head-dim rule.** `SUPPORTED_HEAD_TILES` steps by 16 (f16) /
+32 (FP8), but those are the kernel's native tile sizes; an actual `D_QK`/`D_V`
+only has to satisfy `d_pad_multiple` — **8** on the f16 row, **16** on the FP8
+row (the TMA 16-byte global-stride rule at 2 and 1 bytes/elem) — and is
+zero-padded up to the next tile. So a d=72 f16 graph is eligible and computes
+on the 80-wide tile.
 
 ---
 
@@ -161,15 +176,15 @@ is no alignment rule.
 | Feature | d64 (GPT-OSS) | d128 (Llama) | d192×d128 (DSv3) | d256 (Qwen) |
 |---|:--:|:--:|:--:|:--:|
 | | F / B | F / B | F / B | F / B |
-| **Data types** |
+| **Data types** | | | | |
 | FP16 / BF16 | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | FP8 / MXFP8 | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
-| **Layout** |
+| **Layout** | | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 | `cu_seq_len_q/kv` | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 | Strided / permuted Stats | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| **Masks / features** |
+| **Masks / features** | | | | |
 | Causal (top-left) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Causal bottom-right | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Causal right-band widening | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |

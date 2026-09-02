@@ -34,7 +34,7 @@ head-major, never dense-padded.**
   siblings) in `test/python/sdpa/frost/`.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
-`docs/frost/SDPA_SUPPORT_MATRIX.md` in the same commit.**
+`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 
 - The matrix is the only place a reader can see what FROST serves across
   arch x pass x head-dim x dtype without reading five `engines.py` rows. It
@@ -55,5 +55,5 @@ head-major, never dense-padded.**
   a `Capabilities` row. `d_pad_multiple=0` means exact-only, so no
   envelope at all.
 - Reviewing: if the diff touches `fwd/engines.py`, `bwd/engines.py` or
-  `cudnn/engines/manifest.py` and `docs/frost/SDPA_SUPPORT_MATRIX.md` is
+  `cudnn/engines/manifest.py` and `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` is
   untouched, ask why before approving.
