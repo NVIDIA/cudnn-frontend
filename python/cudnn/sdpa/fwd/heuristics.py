@@ -450,7 +450,8 @@ def _d192_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
-    if _selected_d_shape(caps, facts) != (192, 128):
+    has_d192_cga_domain = any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape)
+    if _selected_d_shape(caps, facts) != (192, 128) or not has_d192_cga_domain:
         return sched_policy, _sole(domain)
     params = _d192_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
     selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
