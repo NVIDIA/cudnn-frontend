@@ -46,7 +46,6 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
-_SKIP_AMAX_O = PARAMS.pv_bf16_skip_amax_o
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
 Cfg = type(CFG)
@@ -2405,7 +2404,7 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
-            if cutlass.const_expr(not _SKIP_AMAX_O):
+            if cutlass.const_expr(not CFG.PV_BF16):
                 _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
                 _amax_o_local = cutlass.Float32(0.0)
 
@@ -2426,7 +2425,7 @@ def _correction_warp_group(
                     tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
                     cutlass.Float32,
                 )
-                if cutlass.const_expr(not _SKIP_AMAX_O):
+                if cutlass.const_expr(not CFG.PV_BF16):
                     for _i in cutlass.range_constexpr(O_CHUNK):
                         _e = o_scaled[_i]
                         _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
@@ -2450,7 +2449,7 @@ def _correction_warp_group(
             # over partials over-reports the output amax.  split_combine_sm100
             # computes it over the recombined O instead; this write has to stay
             # out of the way, since atomicMax only grows.
-            if cutlass.const_expr(SPLIT_KV == 1 and not _SKIP_AMAX_O):
+            if cutlass.const_expr(SPLIT_KV == 1 and not CFG.PV_BF16):
                 if _row_valid:
                     nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 

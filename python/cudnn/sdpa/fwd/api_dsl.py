@@ -386,7 +386,6 @@ class SdpaFwdDsl(APIBase):
         softmax_precision: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         pv_bf16: bool = False,
-        pv_bf16_skip_amax_o: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -455,11 +454,9 @@ class SdpaFwdDsl(APIBase):
         self._pertensor = bool(pertensor_fp8)
         # Direct-adapter-only experiment. It deliberately has no graph node or
         # engine capability: its purpose is to isolate the QK-MXFP8/BF16-PV
-        # kernel tradeoff before exposing an API contract.
+        # kernel tradeoff before exposing an API contract. It writes BF16 O
+        # only; unlike the MXFP8 path, it deliberately has no Amax_O output.
         self.pv_bf16 = bool(pv_bf16)
-        # Direct-adapter-only performance ablation. Its only valid semantic is
-        # BF16 P/V and BF16 O; Amax_O is deliberately not produced.
-        self.pv_bf16_skip_amax_o = bool(pv_bf16_skip_amax_o)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch). None means the
@@ -1027,8 +1024,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self.dtype_o = self.dtype
         self._not_implemented_error_if(
-            self.pv_bf16_skip_amax_o and (not self.pv_bf16 or self.dtype_o != torch.bfloat16),
-            "pv_bf16_skip_amax_o is a performance-only experiment requiring pv_bf16=True and BF16 O",
+            self.pv_bf16 and self.dtype_o != torch.bfloat16,
+            "pv_bf16 requires BF16 O because it has no output quantization or Amax_O contract",
         )
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
@@ -1317,7 +1314,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             pv_bf16=self.pv_bf16,
-            pv_bf16_skip_amax_o=self.pv_bf16_skip_amax_o,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
@@ -2082,6 +2078,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if sf_q is None or sf_k is None or (sf_v is None and not self.pv_bf16):
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k and, unless pv_bf16=True, sf_v (block-scale descale tensors)")
+        if self.pv_bf16 and amax_o is not None:
+            raise ValueError("pv_bf16 produces BF16 O only and does not produce Amax_O")
 
         km = self._k_mod
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
@@ -2169,11 +2167,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
 
-        amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        # The hybrid no-Amax ablation intentionally leaves this buffer untouched.
-        # Otherwise the reset must share the kernel stream: atomicMax is unordered
-        # with a reset on a different stream (and capture would miss the reset).
-        if not self.pv_bf16_skip_amax_o:
+        if self.pv_bf16:
+            # This unused ABI slot is compiled out of the hybrid kernel.
+            amax_o_buf = self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+        else:
+            amax_o_buf = (
+                amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+            )
             with _torch_stream_context(current_stream, device):
                 amax_o_buf.zero_()
 

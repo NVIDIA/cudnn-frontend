@@ -361,11 +361,10 @@ def _check_mxfp8_strided_stats(d_qk, d_v, in_key):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("skip_amax", [False, True], ids=["with_amax", "no_amax"])
 @pytest.mark.parametrize("h_q,h_kv", [(4, 4), (4, 2)], ids=["mha", "gqa"])
 @torch_fork_set_rng(seed=61)
-def test_mxfp8_qk_bf16_pv_direct_experiment(skip_amax, h_q, h_kv):
-    """Exercise the direct-only hybrid Amax contract in both specializations.
+def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv):
+    """Validate the direct-only hybrid BF16-output contract.
 
     This deliberately exercises the direct-only adapter switch rather than a
     graph route: graph capability selection remains unchanged until benchmark
@@ -396,21 +395,16 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(skip_amax, h_q, h_kv):
         dtype_o=torch.bfloat16,
         split_kv=1,
         pv_bf16=True,
-        pv_bf16_skip_amax_o=skip_amax,
     )
     assert api.check_support()
     api.compile()
-    amax = torch.full((1,), 123.0, device=dev, dtype=torch.float32)
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax)
+    with pytest.raises(ValueError, match="does not produce Amax_O"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
     _check(o, o_ref, torch.bfloat16, "e4m3", d_qk=d)
-
-    if skip_amax:
-        assert amax.item() == 123.0
-    else:
-        assert amax.item() > 0.0
 
 
 @pytest.mark.L0

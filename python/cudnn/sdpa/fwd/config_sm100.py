@@ -132,10 +132,6 @@ class TemplateParams:
     # template axis because it changes the TMA maps, shared-memory layout and
     # BMM2 instruction kind. It is intentionally not wired into graph routing.
     pv_bf16: bool = False
-    # Performance-only companion to pv_bf16: omit the MXFP8 Amax_O reduction
-    # and atomic when the hybrid writes BF16 O. This intentionally leaves the
-    # caller's amax_o buffer untouched and is not a graph/API contract.
-    pv_bf16_skip_amax_o: bool = False
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -160,8 +156,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     if k.pv_bf16 and (not fp8 or flavor != "d128"):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128-only specialization")
-    if k.pv_bf16_skip_amax_o and not k.pv_bf16:
-        raise ValueError(f"{flavor}: pv_bf16_skip_amax_o requires pv_bf16")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")

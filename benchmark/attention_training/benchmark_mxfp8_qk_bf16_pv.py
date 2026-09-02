@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000, help="total timed launches per kernel and execution mode")
     parser.add_argument("--samples", type=int, default=10, help="number of equal CUDA-event samples; must divide --iters")
-    parser.add_argument("--mode", choices=("all", "hybrid", "hybrid-no-amax", "mxfp8", "bf16"), default="all")
+    parser.add_argument("--mode", choices=("all", "hybrid", "mxfp8", "bf16"), default="all")
     parser.add_argument("--execution", choices=("both", "eager", "graph"), default="both")
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
@@ -122,7 +122,7 @@ def main() -> None:
     v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
     scale = 1.0 / math.sqrt(args.dim)
 
-    def build(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, pv_bf16: bool, pv_bf16_skip_amax_o: bool = False):
+    def build(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, pv_bf16: bool):
         o = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16)
         api = SdpaFwdDslSm100(
             sample_q=q,
@@ -134,7 +134,6 @@ def main() -> None:
             dtype_o=torch.bfloat16,
             split_kv=1,
             pv_bf16=pv_bf16,
-            pv_bf16_skip_amax_o=pv_bf16_skip_amax_o,
         )
         assert api.check_support()
         api.compile()
@@ -147,14 +146,6 @@ def main() -> None:
             (
                 "QK MXFP8 / PV BF16",
                 lambda: hybrid.execute(q_tensor=q_mx, k_tensor=k_mx, v_tensor=v_bf16, o_tensor=o_hybrid, sf_q=sf_q, sf_k=sf_k),
-            )
-        )
-    if args.mode in ("all", "hybrid-no-amax"):
-        hybrid_no_amax, o_hybrid_no_amax = build(q_mx, k_mx, v_bf16, pv_bf16=True, pv_bf16_skip_amax_o=True)
-        entries.append(
-            (
-                "QK MXFP8 / PV BF16 (no Amax)",
-                lambda: hybrid_no_amax.execute(q_tensor=q_mx, k_tensor=k_mx, v_tensor=v_bf16, o_tensor=o_hybrid_no_amax, sf_q=sf_q, sf_k=sf_k),
             )
         )
     if args.mode in ("all", "mxfp8"):
