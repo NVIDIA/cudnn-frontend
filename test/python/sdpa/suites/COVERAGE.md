@@ -38,8 +38,6 @@ Conventions:
 | models.dsv3.context.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=128, h_kv=128, d_qk=192, d_v=128, sink=off | dsv3 full/global attention layers |
 | models.kimi_k3.context.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 | models.kimi_k3.context.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
-| models.glm46.context.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
-| models.glm46.context.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
 
 ## Generation (decode / small-s_q forward)
 
@@ -67,8 +65,6 @@ Conventions:
 | models.dsv3.generation.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=128, h_kv=128, d_qk=192, d_v=128, sink=off | dsv3 full/global attention layers |
 | models.kimi_k3.generation.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 | models.kimi_k3.generation.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
-| models.glm46.generation.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
-| models.glm46.generation.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data, paged 50% | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
 
 ## Bprop (training fwd+bwd)
 
@@ -91,7 +87,5 @@ Conventions:
 | models.dsv3.bprop.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=128, h_kv=128, d_qk=192, d_v=128, sink=off | dsv3 full/global attention layers |
 | models.kimi_k3.bprop.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 | models.kimi_k3.bprop.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
-| models.glm46.bprop.fp16 | fp16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
-| models.glm46.bprop.bf16 | bf16 | L0 | 4 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=8, d_qk=128, d_v=128, sink=off | glm46 full/global attention layers |
 
-**Total configs: 5136 across 66 suites.**
+**Total configs: 5112 across 60 suites.**

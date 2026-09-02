@@ -75,12 +75,4 @@ KIMI_K3 = ModelPreset(
     head_dim_vo=128,
 )
 
-GLM46 = ModelPreset(
-    name="glm46",
-    num_q_heads=96,
-    num_kv_heads=8,
-    head_dim_qk=128,
-    head_dim_vo=128,
-)
-
-CATALOG = [LLAMA31, QWEN35, GPT_OSS, DSV3, KIMI_K3, GLM46]
+CATALOG = [LLAMA31, QWEN35, GPT_OSS, DSV3, KIMI_K3]
