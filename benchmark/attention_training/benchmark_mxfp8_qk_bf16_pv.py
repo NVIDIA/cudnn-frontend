@@ -15,12 +15,13 @@ Example (GB200):
 import argparse
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 
 
-def _quantize_mxfp8(x: torch.Tensor, *, columnwise: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8(
+    x: torch.Tensor, *, columnwise: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Return an MXFP8 tensor and its F8_128x4 SF tensor for direct SDPA."""
     from sdpa.mxfp8_quant import quantize_to_mxfp8
 
@@ -30,53 +31,25 @@ def _quantize_mxfp8(x: torch.Tensor, *, columnwise: bool) -> tuple[torch.Tensor,
     return data.reshape_as(x), sf
 
 
-@dataclass(frozen=True)
-class TimingStats:
-    """CUDA-event timing summary, in microseconds per launch."""
-
-    mean_us: float
-    stdev_us: float
-    min_us: float
-    max_us: float
-    samples: int
-    iters_per_sample: int
-
-
-def _time_cuda_events(fn: Callable[[], None], *, warmup: int, iters: int, samples: int) -> TimingStats:
-    """Time GPU launches with CUDA events, never host wall-clock time."""
+def _time_cuda_events(fn: Callable[[], None], *, warmup: int, iters: int) -> float:
+    """Return CUDA-event average microseconds per launch after warmup."""
     if warmup < 0:
         raise ValueError("warmup must be non-negative")
-    if iters <= 0 or samples <= 0:
-        raise ValueError("iters and samples must be positive")
-    if iters % samples:
-        raise ValueError("iters must be divisible by samples so every event sample has equal work")
+    if iters <= 0:
+        raise ValueError("iters must be positive")
 
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    iters_per_sample = iters // samples
-    sample_us: list[float] = []
-    for _ in range(samples):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters_per_sample):
-            fn()
-        end.record()
-        end.synchronize()
-        sample_us.append(start.elapsed_time(end) * 1000.0 / iters_per_sample)
-
-    mean_us = sum(sample_us) / len(sample_us)
-    stdev_us = math.sqrt(sum((sample - mean_us) ** 2 for sample in sample_us) / len(sample_us))
-    return TimingStats(
-        mean_us=mean_us,
-        stdev_us=stdev_us,
-        min_us=min(sample_us),
-        max_us=max(sample_us),
-        samples=samples,
-        iters_per_sample=iters_per_sample,
-    )
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters
 
 
 def _capture_cuda_graph(fn: Callable[[], None]) -> Callable[[], None]:
@@ -97,12 +70,20 @@ def main() -> None:
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=100)
-    parser.add_argument("--iters", type=int, default=1000, help="total timed launches per kernel and execution mode")
-    parser.add_argument("--samples", type=int, default=10, help="number of equal CUDA-event samples; must divide --iters")
-    parser.add_argument("--mode", choices=("all", "hybrid", "mxfp8", "bf16"), default="all")
-    parser.add_argument("--execution", choices=("both", "eager", "graph"), default="both")
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=1000,
+        help="timed launches averaged for each kernel and execution mode",
+    )
+    parser.add_argument(
+        "--execution", choices=("both", "eager", "graph"), default="both"
+    )
     args = parser.parse_args()
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
         raise RuntimeError("the MXFP8 experiment requires an SM100/SM103 GPU")
     if args.q_heads % args.kv_heads:
         raise ValueError("q-heads must be divisible by kv-heads")
@@ -140,55 +121,73 @@ def main() -> None:
         return api, o
 
     entries: list[tuple[str, Callable[[], None]]] = []
-    if args.mode in ("all", "hybrid"):
-        hybrid, o_hybrid = build(q_mx, k_mx, v_bf16, pv_bf16=True)
-        entries.append(
-            (
-                "QK MXFP8 / PV BF16",
-                lambda: hybrid.execute(q_tensor=q_mx, k_tensor=k_mx, v_tensor=v_bf16, o_tensor=o_hybrid, sf_q=sf_q, sf_k=sf_k),
-            )
+    hybrid, o_hybrid = build(q_mx, k_mx, v_bf16, pv_bf16=True)
+    entries.append(
+        (
+            "Hybrid QK MXFP8 / PV BF16 (no Amax)",
+            lambda: hybrid.execute(
+                q_tensor=q_mx,
+                k_tensor=k_mx,
+                v_tensor=v_bf16,
+                o_tensor=o_hybrid,
+                sf_q=sf_q,
+                sf_k=sf_k,
+            ),
         )
-    if args.mode in ("all", "mxfp8"):
-        baseline_mx, o_mx = build(q_mx, k_mx, v_mx, pv_bf16=False)
-        entries.append(
-            (
-                "QKV MXFP8",
-                lambda: baseline_mx.execute(q_tensor=q_mx, k_tensor=k_mx, v_tensor=v_mx, o_tensor=o_mx, sf_q=sf_q, sf_k=sf_k, sf_v=sf_v),
-            )
+    )
+    baseline_mx, o_mx = build(q_mx, k_mx, v_mx, pv_bf16=False)
+    entries.append(
+        (
+            "QKV MXFP8",
+            lambda: baseline_mx.execute(
+                q_tensor=q_mx,
+                k_tensor=k_mx,
+                v_tensor=v_mx,
+                o_tensor=o_mx,
+                sf_q=sf_q,
+                sf_k=sf_k,
+                sf_v=sf_v,
+            ),
         )
-    if args.mode in ("all", "bf16"):
-        baseline_bf16, o_bf16 = build(q_bf16, k_bf16, v_bf16, pv_bf16=False)
-        entries.append(
-            (
-                "QKV BF16",
-                lambda: baseline_bf16.execute(q_tensor=q_bf16, k_tensor=k_bf16, v_tensor=v_bf16, o_tensor=o_bf16),
-            )
+    )
+    baseline_bf16, o_bf16 = build(q_bf16, k_bf16, v_bf16, pv_bf16=False)
+    entries.append(
+        (
+            "QKV BF16",
+            lambda: baseline_bf16.execute(
+                q_tensor=q_bf16, k_tensor=k_bf16, v_tensor=v_bf16, o_tensor=o_bf16
+            ),
         )
+    )
 
     print(
         f"shape: B={args.batch} Hq={args.q_heads} Hkv={args.kv_heads} S={args.seqlen} D={args.dim}; causal; "
-        f"{args.warmup} warmup + {args.iters} CUDA-event timed launches ({args.samples} samples)"
+        f"{args.warmup} warmup launches; average of {args.iters} CUDA-event timed launches per row"
     )
-    results: dict[tuple[str, str], TimingStats] = {}
+    results: dict[tuple[str, str], float] = {}
     for name, fn in entries:
         if args.execution in ("eager", "both"):
-            results[(name, "eager")] = _time_cuda_events(fn, warmup=args.warmup, iters=args.iters, samples=args.samples)
+            results[(name, "eager")] = _time_cuda_events(
+                fn, warmup=args.warmup, iters=args.iters
+            )
         if args.execution in ("graph", "both"):
             try:
                 graph_replay = _capture_cuda_graph(fn)
             except RuntimeError as exc:
                 raise RuntimeError(f"{name} is not CUDA-graph capturable") from exc
-            results[(name, "cuda graph")] = _time_cuda_events(graph_replay, warmup=args.warmup, iters=args.iters, samples=args.samples)
+            results[(name, "cuda graph")] = _time_cuda_events(
+                graph_replay, warmup=args.warmup, iters=args.iters
+            )
 
-    print(f"{'kernel':34s} {'execution':11s} {'mean us':>10s} {'stdev':>9s} {'min':>9s} {'max':>9s} {'vs BF16':>9s}")
+    print(f"{'kernel':38s} {'execution':11s} {'avg us/launch':>14s} {'vs BF16':>9s}")
     for name, _fn in entries:
         for execution in ("eager", "cuda graph"):
-            stats = results.get((name, execution))
-            if stats is None:
+            average_us = results.get((name, execution))
+            if average_us is None:
                 continue
-            bf16 = results.get(("QKV BF16", execution))
-            relative = "n/a" if bf16 is None else f"{stats.mean_us / bf16.mean_us:.3f}x"
-            print(f"{name:34s} {execution:11s} {stats.mean_us:10.2f} {stats.stdev_us:9.2f} " f"{stats.min_us:9.2f} {stats.max_us:9.2f} {relative:>9s}")
+            bf16_us = results.get(("QKV BF16", execution))
+            relative = "n/a" if bf16_us is None else f"{average_us / bf16_us:.3f}x"
+            print(f"{name:38s} {execution:11s} {average_us:14.2f} {relative:>9s}")
 
 
 if __name__ == "__main__":
