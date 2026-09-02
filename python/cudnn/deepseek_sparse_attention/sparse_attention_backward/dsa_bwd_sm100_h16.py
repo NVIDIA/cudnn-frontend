@@ -1101,6 +1101,7 @@ class FlashAttentionDSABackwardSm100H16:
         sSum_OdO: cute.Tensor,
         pipelines,
     ):
+        """Load the CTA's Q/dO tiles and per-head LSE/O·dO scalars into SMEM."""
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
@@ -1141,13 +1142,13 @@ class FlashAttentionDSABackwardSm100H16:
         load_mma_QdO_producer_state.advance()
 
         async_copy_atom = cute.make_copy_atom(cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS), self.acc_dtype, num_bits_per_copy=64)
-        lse_copy_threads = 8
+        lse_copy_threads = self.h_tile // 2
         thr_layout = cute.make_layout((lse_copy_threads), stride=(1))
         val_layout = cute.make_layout((2), stride=(1))
         async_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, thr_layout, val_layout)
         thr_async_copy = async_tiled_copy.get_slice(local_tidx % lse_copy_threads)
 
-        softmax_rows = 16
+        softmax_rows = self.h_tile
         gLSE = cute.flat_divide(mLSE, (softmax_rows,))
         gSum_OdO = cute.flat_divide(mSum_OdO, (softmax_rows,))
 
