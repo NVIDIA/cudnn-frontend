@@ -172,19 +172,18 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
 
 @pytest.mark.L0
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
-    """A non-native dense shape inherits the geometry of its covering flavor."""
+    """The D256 flavor's geometry (cga = 1) reaches the plan list for its exact
+    shape; a non-native shape in its padded envelope is declined (the flavor is
+    floored to exact shapes until its padded paths are validated), so no plan is
+    proposed for it at all."""
 
     name = engines.engine_name(fp8=True)
-    facts = _facts(
-        d_qk=224,
-        d_v=224,
-        dtype=cudnn.data_type.FP8_E4M3,
-        dtype_o=cudnn.data_type.HALF,
-        is_fp8=True,
-    )
-    plans = recommend("A", facts, {name: 20510})
+    exact = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    plans = recommend("A", exact, {name: 20510})
     assert plans
     assert {plan.knobs.cga for plan in plans} == {1}
+    padded = _facts(d_qk=224, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert not recommend("A", padded, {name: 20510})
 
 
 @pytest.mark.L0
