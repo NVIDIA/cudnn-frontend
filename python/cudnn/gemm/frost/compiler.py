@@ -27,7 +27,7 @@ import cudnn
 from cuda.bindings import driver as _cuda
 from cudnn.frost import buffers
 from cudnn.frost.device import current_device
-from cudnn.frost.workspace import Workspace
+from cudnn.frost.workspace import Workspace, align_up
 
 _LOG = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ from .graph_analyzer import (
     analyze_with_binding,
     resolve_variant_pack,
 )
-from .tile_config import DEFAULT_CONFIG, TileConfig
+from .tile_config import DEFAULT_CONFIG, TileConfig, _sm_count
 
 _TEMPLATE_DIR = Path(__file__).parent / "kernel_templates"
 
@@ -374,15 +374,36 @@ def _tma_store_sequence(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> 
     cost no extra SMEM. `epi_n` is a COLUMN count and is shared; what differs per
     output is its dtype and its layout, both compile-time here."""
     lines: list[str] = []
-    for j, (slot, dt) in enumerate(_tma_out_dtypes(chain, tma_slots)):
-        lines += _tma_store_one(chain, cfg, epi_n, j, dt, chain.output_specs[slot].major)
+    if cfg.split_k_slices > 1:
+        lines += _tma_store_one(chain, cfg, epi_n, 0, "fp32", "n")
+    else:
+        for j, (slot, dt) in enumerate(_tma_out_dtypes(chain, tma_slots)):
+            lines += _tma_store_one(chain, cfg, epi_n, j, dt, chain.output_specs[slot].major)
     return "\n".join(lines) if lines else "pass"
 
 
-def _host_tma_c_descs(chain, tma_slots: "frozenset[int]", epi_n: int) -> str:
+def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> str:
     """Build one C descriptor per TMA-stored output. Each carries its OWN dtype,
     strides, box and swizzle, so outputs of different dtypes and different
     layouts can share one epilogue."""
+    if cfg.split_k_slices > 1:
+        # workspace: [batch * split][M][N]
+        return "\n".join(
+            [
+                "tma_c_desc_0 = _tma.create_tensor_map_tiled(",
+                "    global_address=splitk_partials.iterator.toint(),",
+                "    dtype=cutlass.Float32,",
+                "    global_dims=[n, m, batch * split_k_slices],",
+                "    global_strides=[",
+                "        n * 32 // 128,",
+                "        m * n * 32 // 128,",
+                "    ],",
+                f"    box_dims=[{epi_n}, epi_tile_mn[0], 1],",
+                "    swizzle=_tma.TensorMapSwizzle.s128b,",
+                ")",
+                "tma_c_desc_list = [tma_c_desc_0]",
+            ]
+        )
     outs = _tma_out_dtypes(chain, tma_slots)
     batch = "1" if chain.has_moe else "batch"
     lines: list[str] = []
@@ -645,10 +666,14 @@ def _epi_vec_bytes(
     return min(vec, _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline] * DTYPE_BYTES[chain.output_dtype])
 
 
+def _epi_store_dtype(chain: FusionChain, config: TileConfig) -> str:
+    return "fp32" if config.split_k_slices > 1 else chain.output_dtype
+
+
 def _epi_chunk_elems(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
     if not use_tma_store:
         return _epi_vec_bytes(chain, config) // DTYPE_BYTES[chain.output_dtype]
-    return _epi_n(config, chain.output_dtype)
+    return _epi_n(config, _epi_store_dtype(chain, config))
 
 
 def _epi_chunk_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
@@ -708,6 +733,7 @@ def _render_tile_constants(
     mma_b_dt = _mma_b_dtype(chain)
     accum_dt = chain.matmul.accum_dtype
     out_dt = chain.output_dtype
+    epi_store_dt = _epi_store_dtype(chain, cfg)
     # Always the MMA dtype bytes (e.g. 2 for BF16 even when GMEM A is fp32);
     # drives K_TILE, swizzle, and MMA instruction sizing.
     elem_bytes = DTYPE_BYTES[mma_a_dt]
@@ -812,6 +838,7 @@ def _render_tile_constants(
         # ab_dtype: MMA operand dtype (SMEM holds / MMA reads).
         f"ab_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
+        f"epi_store_dtype = {DTYPE_TO_CUTLASS[epi_store_dt]}",
         f"mma_a_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_b_dtype = {DTYPE_TO_CUTLASS[mma_b_dt]}",
         f"mma_c_dtype = {DTYPE_TO_CUTLASS[accum_dt]}",
@@ -820,7 +847,7 @@ def _render_tile_constants(
         # only cares about element byte width, identical across an a/b pair).
         f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_kind = {DTYPE_TO_MMA_KIND[mma_a_dt]}",
-        *_epi_swizzle_lines(cfg, out_dt),
+        *_epi_swizzle_lines(cfg, epi_store_dt),
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     # (acc_stages is emitted below, once the TMEM budget is known.)
@@ -911,6 +938,12 @@ def _render_tile_constants(
     # divides every power-of-2 subtile span of this config's N-tile).
     vec_bytes_epi = _epi_vec_bytes(chain, cfg)
     lines.append(f"vec_bytes_epi = {vec_bytes_epi}")
+    lines.append(f"split_k_slices = {cfg.split_k_slices}")
+    if cfg.split_k_slices > 1:
+        reduce_elems = 2 if chain.matmul.N <= 256 and cfg.split_k_slices in (8, 9) else 4
+        while chain.matmul.N % reduce_elems:
+            reduce_elems //= 2
+        lines.append(f"splitk_reduce_elems = {reduce_elems}")
     lines.append(f"frost_compile_options = {_frost_compile_options()!r}")
     # Epilogue store mode: TMA-store-via-SMEM (preferred) vs per-thread STG
     # (fallback). See _use_tma_store_epi() for gating.
@@ -1731,19 +1764,18 @@ def _resolve_path_blocks(src: str, use_tma_store_epi: bool) -> str:
     leaving both would trip cute's type-consistency check; stripping the dead
     branch avoids it. Block syntax: `# @@{TMA_STORE,STG}_ONLY:BEGIN@@ ... :END@@`
     (one per pair, no nesting)."""
-    keep_marker = "TMA_STORE_ONLY" if use_tma_store_epi else "STG_ONLY"
-    drop_marker = "STG_ONLY" if use_tma_store_epi else "TMA_STORE_ONLY"
-    keep_pat = re.compile(
-        rf"^[ \t]*# *@@{keep_marker}:BEGIN@@[ \t]*\n(.*?)" rf"^[ \t]*# *@@{keep_marker}:END@@[ \t]*\n",
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    drop_pat = re.compile(
-        rf"^[ \t]*# *@@{drop_marker}:BEGIN@@[ \t]*\n.*?" rf"^[ \t]*# *@@{drop_marker}:END@@[ \t]*\n",
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    src = keep_pat.sub(r"\1", src)
-    src = drop_pat.sub("", src)
+    src = _resolve_blocks(src, "TMA_STORE_ONLY", use_tma_store_epi)
+    src = _resolve_blocks(src, "STG_ONLY", not use_tma_store_epi)
     return src
+
+
+def _resolve_blocks(src: str, marker: str, keep: bool) -> str:
+    """Keep or drop a template's `# @@<marker>:BEGIN/END@@` blocks."""
+    pat = re.compile(
+        rf"^[ \t]*# *@@{marker}:BEGIN@@[ \t]*\n(.*?)" rf"^[ \t]*# *@@{marker}:END@@[ \t]*\n",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    return pat.sub(r"\1" if keep else "", src)
 
 
 _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
@@ -1789,6 +1821,11 @@ def _render_template(
     tma_slots = frozenset(i for i, m in enumerate(store_modes) if m == "tma")
     use_tma = bool(tma_slots)
     src = _resolve_path_blocks(src, use_tma)
+    # Split-K blocks
+    if "@@SPLITK_ONLY:BEGIN@@" in src:
+        src = _resolve_blocks(src, "SPLITK_ONLY", config.split_k_slices > 1)
+    elif config.split_k_slices > 1:
+        raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
 
     aux_tensors = chain.aux_tensors
 
@@ -1905,9 +1942,12 @@ def _render_template(
     if "@@INJECT_KERNEL_TMA_C_PARAMS@@" in src:
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
-        _epi = _epi_n(config, chain.output_dtype)
+        _epi = _epi_n(config, _epi_store_dtype(chain, config))
         replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
-        replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
+        replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, config, tma_slots, _epi)
+    if "@@INJECT_SPLITK_OUTPUT@@" in src:
+        splitk_final_output = "c_0," if use_tma else "c_tap_0,"
+        replacements["INJECT_SPLITK_OUTPUT"] = splitk_final_output
     # Per-GEMM STG vector bindings — on every STG-epilogue template (mainloop
     # included; single-GEMM → `pass`).
     if "@@INJECT_STG_VEC_BINDINGS@@" in src:
@@ -2117,7 +2157,7 @@ def _render_block_scale_template(
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
         _epi = _epi_n(config, chain.output_dtype)
         replacements["INJECT_TMA_STORE_SEQUENCE"] = _tma_store_sequence(chain, config, tma_slots, _epi)
-        replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
+        replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, config, tma_slots, _epi)
     # MoE block-scale raw-A-tensor plumbing (per-routed-group descriptor patch).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:
         replacements.update(
@@ -2544,6 +2584,8 @@ class CompiledFusedGemm:
         # split-K slices for the kernel
         needs_workspace = bool(r.workspace_bytes)
         split_k_slices = self.config.split_k_slices
+        if needs_workspace:
+            cta_k_elems = self.config.cta_smem_tile_mnk(DTYPE_BYTES[_mma_a_dtype(self.chain)])[2]
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
@@ -2668,8 +2710,12 @@ class CompiledFusedGemm:
             if needs_workspace:
                 if workspace is None:
                     raise ValueError(
-                        "cudnn.frost gemm: this plan needs a workspace; allocate "
-                        "graph.get_workspace_size() bytes and pass the buffer to execute()"
+                        "cudnn.frost gemm: this plan needs a workspace; allocate " "graph.get_workspace_size() bytes and pass the buffer to execute()"
+                    )
+                # Every slice must own at least one whole CTA-K tile.
+                if (k + cta_k_elems - 1) // cta_k_elems < split_k_slices:
+                    raise ValueError(
+                        f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the " f"{(k + cta_k_elems - 1) // cta_k_elems} K tile(s) of K={k}"
                     )
                 extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
@@ -3005,6 +3051,8 @@ def _epi_slot_widen(
 ) -> int:
     """One shared slot spans the widest TMA-stored row. An STG output never
     touches the ring, so it must not widen it."""
+    if cfg.split_k_slices > 1:
+        return 1
     epi_n = _epi_n(cfg, chain.output_dtype)
     tma = _tma_slots_for(chain, cfg)
     widths = [_epi_row_bytes(chain.output_specs[i].dtype, epi_n) for i in sorted(tma) if i < len(chain.output_specs)]
@@ -3049,8 +3097,8 @@ def _smem_d_bytes(
     one epilogue subtile (one MMA-M block x epi_n) + a 16-byte alignment pad. With
     mma_size_m > 1 the M blocks reuse the same slots. epi_n MUST be the same value
     the kernel renders, or the reserve under-counts and the launch is rejected."""
-    out_dt = chain.output_dtype
-    row_bytes = _epi_row_bytes(out_dt, _epi_n(cfg, out_dt))
+    store_dt = _epi_store_dtype(chain, cfg)
+    row_bytes = _epi_row_bytes(store_dt, _epi_n(cfg, store_dt))
     return _EPI_SMEM_STAGES * _epi_stage_rows(cfg) * row_bytes * _epi_slot_widen(chain, cfg) + 16
 
 
@@ -3117,6 +3165,9 @@ def _store_modes(
     outs = chain.outputs
     if _FORCE_STG_EPI:
         return ("stg",) * len(outs)
+    if cfg.split_k_slices > 1:
+        mode = "tma" if cfg.pipeline in _TMA_STORE_EPI_PIPELINES and chain.matmul.N % 4 == 0 else "stg"
+        return (mode,) * len(outs)
     modes = ["stg"] * len(outs)
     for i in range(len(chain.output_specs)):
         modes[i] = _output_store_mode(outs[i], chain, cfg)
@@ -3279,6 +3330,43 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
+def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
+    """Layer split-K onto the selected config when the output grid underfills
+    the GPU and K is deep. Heuristic ported from cuDNN FORT's external-split-K
+    recommender: enable only when output CTA tiles < SM count and K >= 2048
+    bytes (measured 256x256 boundary: S>1 loses up to K=512 bf16, wins from
+    K=1024); S = the largest slice count that still fits one full wave of CTAs
+    (measured better here than cuDNN's two-wave over-subscription: fractional
+    waves leave a ragged tail, and partial traffic grows with S); every slice
+    keeps at least max(64 elements, 2 CTA-K tiles) of K; cap 32 (the reducer
+    unrolls chained loads only up to S=32 — S=37 measured 1.76x worse than 32)
+    and the CUDA grid.z limit (kernel 1's z = batch * S)."""
+    if config.split_k_slices != 1 or config.pipeline != "sm100":
+        return config
+    if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
+        return config
+    mm = chain.matmul
+    elem_bytes = DTYPE_BYTES[_mma_a_dtype(chain)]
+    if mm.K * elem_bytes < 2048:
+        return config
+    sm = sm_count if sm_count is not None else _sm_count()
+    output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
+    if output_tiles >= sm:
+        return config
+    cta_k_elems = config.cta_smem_tile_mnk(elem_bytes)[2]
+    num_k_tiles = -(-mm.K // cta_k_elems)
+    min_k_tiles_per_slice = max(-(-64 // cta_k_elems), 2)
+    slices = min(
+        sm // output_tiles,  # one full wave of CTAs
+        num_k_tiles // min_k_tiles_per_slice,  # per-slice K floor
+        32,  # reducer chain-unroll limit; S>32 runs one serial dynamic loop
+        65535 // mm.batch,  # CUDA grid.z hard limit
+    )
+    if slices <= 1:
+        return config
+    return replace(config, split_k_slices=slices)
+
+
 def plan_config(chain: FusionChain) -> TileConfig:
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
@@ -3298,7 +3386,7 @@ def plan_config(chain: FusionChain) -> TileConfig:
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
-    return preferred_strategy(chain, config)
+    return _auto_split_k(chain, preferred_strategy(chain, config))
 
 
 def _precheck_plain(
@@ -3455,6 +3543,48 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     precheck_path(chain, config)
 
 
+def _check_splitk_supported(chain: FusionChain, config: TileConfig) -> None:
+    reason = _splitk_reject_reason(chain, config)
+    if reason is not None:
+        raise NotImplementedError(reason)
+
+
+def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None":
+    """v1 two-kernel split-K applicability: a single pure matmul (no epilogue
+    fusion — the reduce kernel is sum → cast → store only), fp32 accum,
+    one dense N-major output. None = supported."""
+    if config.split_k_slices == 1:
+        return None
+    reasons = []
+    if chain.has_moe:
+        reasons.append("MoE grouped matmul")
+    if chain.has_block_scale:
+        reasons.append("block-scale matmul")
+    if chain.is_multi_gemm:
+        reasons.append("multi-GEMM")
+    if chain.has_mainloop_fusion:
+        reasons.append("mainloop fusion")
+    if chain.ops:
+        reasons.append("epilogue fusion ops")
+    if chain.aux_tensors:
+        reasons.append("aux tensors")
+    if chain.reductions:
+        reasons.append("reduction outputs")
+    if chain.quants:
+        reasons.append("block-scale quantize")
+    if len(chain.outputs) != 1 or len(chain.output_specs) != 1:
+        reasons.append(f"{len(chain.outputs)} outputs")
+    elif chain.output_specs[0].major != "n":
+        reasons.append("M-major output")
+    if chain.output_dtype == "fp4_e2m1":
+        reasons.append("packed fp4 output")
+    if chain.matmul.accum_dtype != "fp32":
+        reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    if reasons:
+        return f"split_k_slices={config.split_k_slices} supports only a plain matmul with one " f"dense N-major output; got: {', '.join(reasons)}"
+    return None
+
+
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
@@ -3481,6 +3611,7 @@ def jit_from_cudnn_graph(
         raise NotImplementedError(_dtype_reason)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
+    _check_splitk_supported(chain, config)
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
@@ -3516,10 +3647,15 @@ def jit_from_cudnn_graph(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
+        split_k_slices=config.split_k_slices,
     )
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+    splitk_ws = 0
+    if config.split_k_slices > 1:
+        # fp32 partials buffer: split_k_slices * B * M * N * 4B
+        splitk_ws = align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
     return CompiledFusedGemm(
         chain=chain,
         config=config,
@@ -3531,6 +3667,7 @@ def jit_from_cudnn_graph(
         store_modes=store_modes,
         use_tma_store=use_tma,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
+        workspace_bytes=splitk_ws,
     )
 
 
