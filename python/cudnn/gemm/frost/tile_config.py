@@ -255,7 +255,6 @@ class TileConfig:
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
             + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
-            # Split-K is spelled only when active, so every S=1 name is unchanged.
             + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
         )
 

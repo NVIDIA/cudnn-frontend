@@ -1337,14 +1337,13 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     return "\n".join(lines)
 
 
-def _splitk_partial_store_lines(vsize: int) -> list[str]:
-    """Two-kernel split-K kernel-1 epilogue: store the raw fp32 accumulator
-    chunk to the workspace at partials[tile_l][M][N] (tile_l = the launch's
-    z coord indexes the batch*split_k partials), in <=16-byte sub-stores."""
-    chunk = min(vsize, 4)  # fp32 elems per store, capped at 16 bytes
-    lines = [f"_spk_off = (tile_l * M + row) * N + col_j"]
+def _emit_splitk_partial_store(vsize: int) -> list[str]:
+    """Split-K kernel-1 STG fallback: store the raw fp32 accumulator chunk to
+    partials[tile_l][M][N]; tile_l = grid z = batch*split."""
+    chunk = min(vsize, 4)  # 4 fp32 = one 16-byte STG
+    lines = [f"_split_k_off = (tile_l * M + row) * N + col_j"]
     for s in range(0, vsize, chunk):
-        lines.append(f"(gSplitK_partials_ptr + _spk_off + {s}).store(vec_f32[{s} : {s + chunk}], alignment={chunk * 4})")
+        lines.append(f"(gSplitK_partials_ptr + _split_k_off + {s}).store(vec_f32[{s} : {s + chunk}], alignment={chunk * 4})")
     return lines
 
 
@@ -1550,13 +1549,12 @@ def generate(
         red_source = _parent_value(red.source_ref)
         body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_pred))
 
-    # Split-K kernel 1 stores raw fp32 partials INSTEAD of the user epilogue;
-    # the reduce kernel (template-owned) applies the store cast to D.
+    # Split-K partial store handling
     if split_k_slices > 1:
         if tma_slots:
             body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
         else:
-            body_lines = _splitk_partial_store_lines(vsize)
+            body_lines = _emit_splitk_partial_store(vsize)
 
     epilogue = "\n".join(body_lines)
 

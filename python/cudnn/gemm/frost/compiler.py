@@ -1001,7 +1001,9 @@ def _render_tile_constants(
     lines.append(f"vec_bytes_epi = {vec_bytes_epi}")
     lines.append(f"split_k_slices = {cfg.split_k_slices}")
     if cfg.split_k_slices > 1:
-        reduce_elems = 2 if chain.matmul.N <= 256 and cfg.split_k_slices in (8, 9) else 4
+        # Reducer fp32 elems per thread: one 16-byte load, halved until it
+        # divides N so a thread's group never crosses a workspace row.
+        reduce_elems = 4
         while chain.matmul.N % reduce_elems:
             reduce_elems //= 2
         lines.append(f"splitk_reduce_elems = {reduce_elems}")
@@ -3181,8 +3183,6 @@ def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
     the measured 32-column default and its lower register footprint.
     """
     if not any(q.axis == 1 for q in chain.quants):
-        # Split-K drains fp32 partials, so the width is sized off the STORE
-        # dtype (the gate rejects quants under split-K, so this branch is it).
         return _epi_n(cfg, _epi_store_dtype(chain, cfg))
     cols = _epi_tile_cols(cfg)
     return min(
@@ -3519,15 +3519,18 @@ def _check_executable(chain: FusionChain) -> None:
 
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills
-    the GPU and K is deep. Heuristic ported from cuDNN FORT's external-split-K
-    recommender: enable only when output CTA tiles < SM count and K >= 2048
-    bytes (measured 256x256 boundary: S>1 loses up to K=512 bf16, wins from
-    K=1024); S = the largest slice count that still fits one full wave of CTAs
-    (measured better here than cuDNN's two-wave over-subscription: fractional
-    waves leave a ragged tail, and partial traffic grows with S); every slice
-    keeps at least max(64 elements, 2 CTA-K tiles) of K; cap 32 (the reducer
-    unrolls chained loads only up to S=32 — S=37 measured 1.76x worse than 32)
-    and the CUDA grid.z limit (kernel 1's z = batch * S)."""
+    the GPU and K is deep.
+
+    Enable only when BOTH hold:
+    - output CTA tiles < SM count (otherwise the grid already fills the GPU);
+    - K >= 2048 bytes (below that the reducer overhead outweighs the split).
+
+    S = min over four bounds:
+    - one full wave of CTAs (sm // output_tiles): fractional waves leave a
+      ragged tail, and partial traffic grows with S;
+    - every slice keeps at least max(64 elements, 2 CTA-K tiles) of K;
+    - 32, the reducer's trace-time unroll bound;
+    - the CUDA grid.z limit (kernel 1's z = batch * S)."""
     if config.split_k_slices != 1 or config.pipeline != "sm100":
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
@@ -3784,6 +3787,10 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("packed fp4 output")
     if chain.matmul.accum_dtype != "fp32":
         reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    if config.split_k_slices > 32:
+        # The reducer unrolls its accumulation at trace time; 32 bounds the
+        # unroll and is where the auto-selector caps S anyway.
+        reasons.append(f"more than 32 slices ({config.split_k_slices})")
     if reasons:
         return f"split_k_slices={config.split_k_slices} supports only a plain matmul with one " f"dense N-major output; got: {', '.join(reasons)}"
     return None

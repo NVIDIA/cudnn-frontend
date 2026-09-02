@@ -127,66 +127,24 @@ def _splitk_reduce_kernel(
     if col < n:
         elems_per_partial = m * n
         partials_ptr = mSplitK_partials.iterator.raw_ptr()
-        # partials layout: [batch*split][M][N]; batch b owns partials b*S .. b*S+S-1.
+        # partials layout: [batch*split][M][N]
         first_partial_offset = (batch_idx * split_k_slices * m + row) * n + col
 
-        # A single accumulator serializes S dependent gmem round-trips; a few
-        # independent chains hide that latency. split_k_slices is a compile-time
-        # constant, so these loops unroll at trace time; large S keeps one
-        # dynamic loop to bound register pressure and code size.
         chain_0 = (partials_ptr + first_partial_offset).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-        if cutlass.const_expr(split_k_slices == 16 or split_k_slices == 32):
-            # Eight chains shorten the dependent gmem path for the two split
-            # counts where the generated schedule benefits; S=8/24 regress.
-            chain_1 = (partials_ptr + first_partial_offset + elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_2 = (partials_ptr + first_partial_offset + 2 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_3 = (partials_ptr + first_partial_offset + 3 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_4 = (partials_ptr + first_partial_offset + 4 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_5 = (partials_ptr + first_partial_offset + 5 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_6 = (partials_ptr + first_partial_offset + 6 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            chain_7 = (partials_ptr + first_partial_offset + 7 * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            for s in cutlass.range_constexpr(8, split_k_slices):
-                _p = (partials_ptr + first_partial_offset + s * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-                if cutlass.const_expr(s % 8 == 0):
-                    chain_0 = chain_0 + _p
-                elif cutlass.const_expr(s % 8 == 1):
-                    chain_1 = chain_1 + _p
-                elif cutlass.const_expr(s % 8 == 2):
-                    chain_2 = chain_2 + _p
-                elif cutlass.const_expr(s % 8 == 3):
-                    chain_3 = chain_3 + _p
-                elif cutlass.const_expr(s % 8 == 4):
-                    chain_4 = chain_4 + _p
-                elif cutlass.const_expr(s % 8 == 5):
-                    chain_5 = chain_5 + _p
-                elif cutlass.const_expr(s % 8 == 6):
-                    chain_6 = chain_6 + _p
-                else:
-                    chain_7 = chain_7 + _p
-            acc = ((chain_0 + chain_1) + (chain_2 + chain_3)) + ((chain_4 + chain_5) + (chain_6 + chain_7))
-        else:
-            chain_1 = cutlass.full_like(chain_0, 0.0)
-            chain_2 = cutlass.full_like(chain_0, 0.0)
-            chain_3 = cutlass.full_like(chain_0, 0.0)
-            if cutlass.const_expr(split_k_slices <= 32):
-                # Unrolled at trace time: 4 independent chains round-robin the splits.
-                for s in cutlass.range_constexpr(1, split_k_slices):
-                    _p = (partials_ptr + first_partial_offset + s * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-                    if cutlass.const_expr(s % 4 == 0):
-                        chain_0 = chain_0 + _p
-                    elif cutlass.const_expr(s % 4 == 1):
-                        chain_1 = chain_1 + _p
-                    elif cutlass.const_expr(s % 4 == 2):
-                        chain_2 = chain_2 + _p
-                    else:
-                        chain_3 = chain_3 + _p
+        chain_1 = cutlass.full_like(chain_0, 0.0)
+        chain_2 = cutlass.full_like(chain_0, 0.0)
+        chain_3 = cutlass.full_like(chain_0, 0.0)
+        for s in cutlass.range_constexpr(1, split_k_slices):
+            _p = (partials_ptr + first_partial_offset + s * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
+            if cutlass.const_expr(s % 4 == 0):
+                chain_0 = chain_0 + _p
+            elif cutlass.const_expr(s % 4 == 1):
+                chain_1 = chain_1 + _p
+            elif cutlass.const_expr(s % 4 == 2):
+                chain_2 = chain_2 + _p
             else:
-                # Large S: one dynamic loop bounds register pressure and code size.
-                for s in cutlass.range(split_k_slices - 1, unroll=1):
-                    chain_0 = chain_0 + (partials_ptr + first_partial_offset + (s + 1) * elems_per_partial).load(
-                        count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4
-                    )
-            acc = (chain_0 + chain_1) + (chain_2 + chain_3)
+                chain_3 = chain_3 + _p
+        acc = (chain_0 + chain_1) + (chain_2 + chain_3)
         d_offset = batch_idx * out_stride_l + row * out_stride_m + col * out_stride_n
         (mD.iterator.raw_ptr() + d_offset).store(acc.to(cd_dtype), alignment=splitk_reduce_elems * cd_dtype.width // 8)
 
