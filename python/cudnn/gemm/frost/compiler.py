@@ -445,7 +445,8 @@ def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> st
     strides, box and swizzle, so outputs of different dtypes and different
     layouts can share one epilogue."""
     if cfg.split_k_slices > 1:
-        # workspace: [batch * split][M][N]
+        # workspace: [batch * split][M][N].
+        sw = _EPI_SWIZZLE_BY_ROW_BYTES[_epi_row_bytes("fp32", epi_n)][1]
         return "\n".join(
             [
                 "tma_c_desc_0 = _tma.create_tensor_map_tiled(",
@@ -456,8 +457,8 @@ def _host_tma_c_descs(chain, cfg, tma_slots: "frozenset[int]", epi_n: int) -> st
                 "        n * 32 // 128,",
                 "        m * n * 32 // 128,",
                 "    ],",
-                f"    box_dims=[{epi_n}, epi_tile_mn[0], 1],",
-                "    swizzle=_tma.TensorMapSwizzle.s128b,",
+                f"    box_dims=[{_epi_row_elems('fp32', epi_n)}, epi_tile_mn[0], 1],",
+                f"    swizzle=_tma.TensorMapSwizzle.{sw},",
                 ")",
                 "tma_c_desc_list = [tma_c_desc_0]",
             ]

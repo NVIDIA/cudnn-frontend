@@ -134,6 +134,17 @@ def test_splitk_cta_group1():
 
 
 @requires_sm100
+def test_splitk_narrow_epi_row():
+    from cudnn.gemm.frost.tile_config import by_name
+
+    g, A, Bt, C = _mk_graph(1, 256, 256, 3840)
+    compiled = _jit(g, 8, base_cfg=by_name("CONFIG_sm100_64x32x128_64x32x32_cluster2x4_2ctamma"))
+    a, b, c, ref = _data(1, 256, 256, 3840)
+    _run(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref)
+
+
+@requires_sm100
 def test_splitk_deterministic():
     g, A, Bt, C = _mk_graph(1, 256, 256, 8192)
     compiled = _jit(g, 8)
