@@ -52,7 +52,8 @@ Forces SCHED_DEFAULT (LPT remaps ``kv_tile`` and would break the order); zero
 extra GMEM beyond the small counter; perf-insensitive (gated knob).  dK/dV are
 already deterministic (each CTA owns distinct K rows → no cross-tile atomic).
 All semaphore code folds out under ``const_expr(deterministic)`` → the default
-(non-deterministic) path is byte-identical.
+(non-deterministic) path is byte-identical.  Under a sliding window the relay
+counts turns from a q-tile's first visiting kv-tile (``relay_turn``).
 
 Why two sub-groups: register capacity.  dV_acc + dK_acc + frags at d=128 bust
 the 255-reg/thread Ampere cap in a single group; splitting halves the live
@@ -405,6 +406,19 @@ def _bprop_kernel(
     else:
         q_lo_tile = cutlass.Int32(0)
     n_iters = cutlass.Int32(arith.maxsi((n_q_tiles_eff - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
+    # ---- SWA compute-skip (upper bound): the window keeps kv >= anchor(q) - W
+    #      (anchor = q, or q + causal_diag under bottom-right; see _mask_p), so
+    #      no q >= kv_base + tile_kv + W - diag attends this kv-tile.  Cap the
+    #      q-loop there (the forward trims kv_left the same way).  Fully-masked
+    #      tiles run 0 iters and the epilogue stores dK = dV = 0.
+    if cutlass.const_expr(mask_flags & MASK_SWA):
+        _q_hi_abs = kv_base + cutlass.Int32(tile_kv + swa_window)
+        if cutlass.const_expr(causal_bottom_right):
+            _q_hi_abs = _q_hi_abs - causal_diag
+        _q_hi_abs = cutlass.Int32(arith.maxsi(_q_hi_abs.ir_value(), cutlass.Int32(0).ir_value()))
+        _q_hi_t = (_q_hi_abs + cutlass.Int32(tile_q - 1)) // cutlass.Int32(tile_q)
+        _q_hi_t = cutlass.Int32(arith.minsi(_q_hi_t.ir_value(), n_q_tiles_eff.ir_value()))
+        n_iters = cutlass.Int32(arith.maxsi((_q_hi_t - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
     # THD over-provisioned grid: this CTA's kv-tile may start past the packed
     # sequence's KV length (n_kv_tiles = ceil(max_skv/tile_kv) covers the longest
     # sequence).  Force 0 q-iters for such tiles → no compute, and the dV/dK
@@ -917,17 +931,29 @@ def _bprop_kernel(
             mma_step(dq_acc, adst, bk, k_step=0, M=16 * DQ_M_BLOCKS, N=DQ_N, ab_dtype=io_dtype)
 
         # ---- dQ atomicAdd ---------------------------------------------------
-        # Deterministic relay (acquire): wait until every lower kv-tile has added
-        # its contribution to THIS (seq,head,q_tile) slot, so the fp32 atomicAdds
-        # land in fixed kv order → bitwise-reproducible dQ.  q-skip-safe: q_lo_tile
-        # is monotonic in kv_tile, so every kv' < kv_tile that reaches this q-tile
-        # relays before us → the wait target is exactly kv_tile.  Folds out (byte-
-        # identical fast path) when deterministic=False.
+        # Deterministic relay (acquire): the fp32 dQ atomicAdds of a (seq, head,
+        # q_tile) land in ascending kv_tile order, gated by a per-slot counter.
+        # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
+        # set is contiguous in kv_tile: the causal q_lo skip removes only higher
+        # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
+        # kv_first = max((q_row0 + diag - W) // tile_kv, 0) (the inverse of the
+        # q_hi cap; 0 without a window) and turn = kv_tile - kv_first.  Every
+        # visitor computes the same kv_first, so acquire (== turn) and release
+        # (turn + 1) agree.  Folds out when deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
+            if cutlass.const_expr(mask_flags & MASK_SWA):
+                _q_row0 = q_iter * cutlass.Int32(tile_q)
+                if cutlass.const_expr(causal_bottom_right):
+                    _q_row0 = _q_row0 + causal_diag
+                _kv_first = (_q_row0 - cutlass.Int32(swa_window)) // cutlass.Int32(tile_kv)
+                _kv_first = cutlass.Int32(arith.maxsi(_kv_first.ir_value(), cutlass.Int32(0).ir_value()))
+                relay_turn = kv_tile - _kv_first
+            else:
+                relay_turn = kv_tile
             if tidx == cutlass.Int32(0):
-                _dq_sem_wait(sem_ptr, kv_tile)
+                _dq_sem_wait(sem_ptr, relay_turn)
             nvvm.barrier_cta_sync()
         if cutlass.const_expr(dq_smem_coalesce or has_rope):
             # COALESCED via SMEM staging (sDQ).  Stage the dq_acc C-fragment into
@@ -1015,7 +1041,7 @@ def _bprop_kernel(
             nvvm.barrier_cta_sync()
             cute.arch.fence_acq_rel_gpu()
             if tidx == cutlass.Int32(0):
-                cute.arch.atomic_exch(sem_ptr, kv_tile + cutlass.Int32(1), sem="release", scope="gpu")
+                cute.arch.atomic_exch(sem_ptr, relay_turn + cutlass.Int32(1), sem="release", scope="gpu")
 
         # ---- B3: before next Q-iter overwrites the ring stage ---------------
         nvvm.barrier_cta_sync()
