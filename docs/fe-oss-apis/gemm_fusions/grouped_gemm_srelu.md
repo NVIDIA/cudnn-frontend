@@ -48,6 +48,37 @@ $$
 D[m, n] = \mathrm{prob}[m, 0, 0] \cdot \mathrm{relu}(C[m, n])^2
 $$
 
+#### Tanh soft clamp (`tanh_clamp_scale`)
+
+Passing `tanh_clamp_scale=s` (a positive float; `None`, the default, keeps the equation above)
+soft-clamps the ReLU output before squaring, bounding `D` by $s^2 \cdot \mathrm{prob}$:
+
+$$
+D[m, n] = \mathrm{prob}[m, 0, 0] \cdot \left( s \cdot \tanh\!\left( \frac{\mathrm{relu}(C[m, n])}{s} \right) \right)^2
+$$
+
+`s` is baked into the compiled kernel, so distinct values compile distinct kernels -- it is meant
+to be constant for a whole training job, not a per-call argument.
+
+The epilogue is evaluated in FP32 with the approximate `tanh`. Measured on sm_103 against a
+correctly-rounded reference, over a sweep of $[0, 64]$ plus saturated inputs, its maximum
+absolute error is $7.7\times10^{-6}$ (the exact variant measures $1.0\times10^{-7}$ on the same
+sweep). Since $D = c^2$ with $c \le s$, that propagates to at most $2s^2 \cdot 7.7\times10^{-6}$
+absolutely -- about $1.6\times10^{-2}$ at $s = 32$ -- and to roughly $1.5\times10^{-5}$
+relative in the saturated tail. $t$ is capped at 1 before use, so $c \le s$ and the output bound
+$s^2 \cdot \mathrm{prob}$ hold structurally rather than by relying on the range of the
+approximate instruction.
+
+When `D` is FP8, even that small error is enough to carry a value across an output-format
+rounding boundary, so individual elements can land one ULP away from a reference computed with
+an exact `tanh` (12.5% relative for `e4m3`). Measured incidence on this kernel's test matrix is
+a few elements in $5\times10^{5}$. This does not affect the unclamped path, where the kernel and
+a reference both evaluate $\mathrm{relu}(x)^2$ and therefore quantize identically.
+
+The matching backward kernel takes the same `tanh_clamp_scale` -- see
+[grouped_gemm_dsrelu](grouped_gemm_dsrelu.md). Both must be built with the same `s`, or the saved
+pre-activation is differentiated against the wrong nonlinearity.
+
 `D_col` stores the same logical output in the column-quantized path used by the grouped kernel family. When `D` is FP8, the kernel also emits `SFD_row` and `SFD_col`. When `D` is fp16/bf16, the kernel can emit per-expert `Amax`.
 
 ### Diagram

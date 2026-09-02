@@ -86,6 +86,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     :param epilogue_type: Epilogue activation type (``EpilogueType.NONE`` or ``EpilogueType.SRELU``).
+    :param tanh_clamp_scale: Optional soft-clamp scale ``s`` for the SRELU epilogue. When set,
+        computes ``(s * tanh(relu(x) / s)) ** 2`` in place of plain ``relu(x) ** 2``.
+        Trace-time constant; ``None`` (default) is bit-identical to the unclamped path.
     """
 
     FIX_PAD_SIZE = 256
@@ -145,6 +148,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         epilogue_type: int = EpilogueType.NONE.value,
+        tanh_clamp_scale: Optional[float] = None,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -217,6 +221,8 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
         self.epilogue_use_functor = False
         self.epilogue_type = epilogue_type
+        # Trace-time constant; must key the compile cache (see srelu/api.py).
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
 
         self.num_epilog_warps = len(self.epilog_warp_id)
 
@@ -1968,13 +1974,43 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
                     if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value):
                         acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
-                                (acc_relu[i], acc_relu[i + 1]),
-                                (acc_relu[i], acc_relu[i + 1]),
-                                rnd="rn",
-                                ftz=False,
-                            )
+                        if cutlass.const_expr(self.tanh_clamp_scale is not None):
+                            # Soft-clamped squared ReLU: c = s * tanh(relu(x) / s); out = c**2.
+                            # Plain squared ReLU is the s -> infinity limit. t is capped at 1:
+                            # tanh.approx.f32's range is not assumed (the backward kernel needs
+                            # 1 - t**2 >= 0); the cap makes c <= s structural.
+                            one = cutlass.Float32(1.0)
+                            s = cutlass.Float32(self.tanh_clamp_scale)
+                            s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                    t0 = fmin(cute.math.tanh(acc_relu[i] * s_rcp, fastmath=True), one)
+                                    t1 = fmin(cute.math.tanh(acc_relu[i + 1] * s_rcp, fastmath=True), one)
+                                    c0, c1 = cute.arch.mul_packed_f32x2(
+                                        (t0, t1),
+                                        (s, s),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                                    tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (c0, c1),
+                                        (c0, c1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                    t = fmin(cute.math.tanh(acc_relu[i] * s_rcp, fastmath=True), one)
+                                    c = t * s
+                                    tTR_rAcc[i] = c * c
+                        else:
+                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                    (acc_relu[i], acc_relu[i + 1]),
+                                    (acc_relu[i], acc_relu[i + 1]),
+                                    rnd="rn",
+                                    ftz=False,
+                                )
                         acc_vec = tTR_rAcc.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
