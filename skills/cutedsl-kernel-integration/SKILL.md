@@ -32,6 +32,22 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 8. For grouped/discrete/MoE/SDPA kernels, preserve the source helper and scheduler topology; shared helper modules should be internal package files, not public `cudnn` exports.
 9. When an existing SM100 kernel needs a Rubin (`sm107`) variant, follow the architecture-dispatch pattern in `references/integration-pattern.md` instead of exposing a new public API. Current examples: `grouped_gemm_quant`, `grouped_gemm_glu`, and `grouped_gemm_dglu`.
 
+## Generated Kernel Names
+
+Immediately after every `@cute.kernel` definition, including main, auxiliary,
+and generated-template kernels, add:
+
+```python
+kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+```
+
+Use the decorated function's actual name in place of `kernel` and keep the
+default `keep_mangled_name=True`. Verify the rule with:
+
+```bash
+pytest -q test/python/test_frost_kernel_name_prefix.py
+```
+
 ## Verification
 
 - Run focused formatting or tests for the files changed.
