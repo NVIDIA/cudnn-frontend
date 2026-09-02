@@ -29,7 +29,7 @@ from cudnn.gemm.frost.tile_config import by_name as _by_name
 
 # Config selection
 
-LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
+LABEL_RE = re.compile(r"^CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+_([12])ctamma(?:_splitK\d+)?$")
 
 
 def spec_for(label, spec_map):
@@ -45,10 +45,10 @@ def spec_for(label, spec_map):
     if m is None:
         return None
     try:
-        cfg = _by_name(m.group(1))
+        cfg = _by_name(label)
     except (KeyError, NotImplementedError):
         return None
-    return cfg, int(m.group(2))
+    return cfg, int(m.group(1))
 
 
 def select_configs(arg, spec_map):
