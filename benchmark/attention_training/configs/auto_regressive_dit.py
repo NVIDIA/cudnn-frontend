@@ -30,7 +30,7 @@ Usage:
     python -m benchmark.attention_training.runner --config auto_regressive_dit --dry-run
 """
 
-from ..config_types import ModelPreset, BenchmarkConfig
+from ..config_types import ModelPreset, BenchmarkConfig, fa2_on_ampere
 
 AR_DIT = ModelPreset(
     name="auto_regressive_dit",
@@ -49,7 +49,7 @@ CONFIG = BenchmarkConfig(
         (4096, 62208),
         (8192, 62208),
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["no_mask"],
     profile_pass="fwd",

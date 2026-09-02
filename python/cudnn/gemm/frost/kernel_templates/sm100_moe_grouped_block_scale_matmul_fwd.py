@@ -446,6 +446,8 @@ def _kernel(
         bcast_stage = cutlass.Int32(0)
         bcast_full_phase = cutlass.Int32(0)
         bcast_empty_phase = cutlass.Int32(1)
+        last_bcast_stage = cutlass.Int32(0)
+        last_bcast_empty_done_phase = cutlass.Int32(0)
         linear_idx = cutlass.Int32(0)
         start_linear_idx = cutlass.Int32(0)
         total_tiles = cutlass.Int32(0)
@@ -497,6 +499,12 @@ def _kernel(
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
+            if cutlass.const_expr(cluster_size > 1):
+                # The final invalid broadcast has no next reuse of this stage to
+                # wait for its cluster-wide acknowledgements, so retain its exact
+                # stage and completion parity for the scheduler-warp drain below.
+                last_bcast_stage = bcast_stage
+                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
             bcast_stage += 1
             if bcast_stage == SCHED_BCAST_STAGES:
                 bcast_stage = cutlass.Int32(0)
@@ -688,6 +696,21 @@ def _kernel(
             if sched_stage == SCHED_STAGES:
                 sched_stage = cutlass.Int32(0)
                 sched_empty_phase = sched_empty_phase ^ 1
+
+        # Every multi-CTA cluster emits one invalid scheduler record before
+        # leaving the loop. Keep the leader CTA's DSM alive until every
+        # scheduler warp has consumed that final broadcast and acknowledged the
+        # leader slot. A singleton cluster has no remote DSM lifetime to drain.
+        if cutlass.const_expr(cluster_size > 1):
+            if cta_rank_in_cluster == 0:
+                # Each acknowledgement flips the saved pre-wrap empty phase, so
+                # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
+                while not nvvm.mbarrier_try_wait_parity(
+                    sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
+                    last_bcast_empty_done_phase,
+                    time_limit=10_000_000,
+                ):
+                    pass
 
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -1608,6 +1631,7 @@ def _kernel(
                 is_valid = (_slot.subview(3)).load()
                 group_begin = (_slot.subview(4)).load()
                 group_end = (_slot.subview(5)).load()
+                start_sf_block_m = (_slot.subview(6)).load()
                 group_idx = (_slot.subview(7)).load()
             else:
                 slot = sched_storage.subview(sched_stage * SCHED_SLOT_WORDS)
@@ -1616,6 +1640,7 @@ def _kernel(
                 is_valid = (slot.subview(3)).load()
                 group_begin = (slot.subview(4)).load()
                 group_end = (slot.subview(5)).load()
+                start_sf_block_m = (slot.subview(6)).load()
                 group_idx = (slot.subview(7)).load()
             if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
