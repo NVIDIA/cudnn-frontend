@@ -526,9 +526,9 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     cudnn_otype = cudnn.data_type.HALF if torch_otype == torch.float16 else cudnn.data_type.BFLOAT16
 
     seq_len_q, seq_len_kv = list(cfg.seq_len_q), list(cfg.seq_len_kv)
+    # All-zero sides are legal configs (t_q == 0: nothing to compute; t_kv == 0:
+    # every live row is dead and must come back exact 0) — no skipping.
     t_q, t_kv = sum(seq_len_q), sum(seq_len_kv)
-    if t_q == 0 or t_kv == 0:
-        pytest.skip("degenerate config: all sequences empty on one side")
     max_t_q = cfg.total_q or packed_token_capacity(seq_len_q)
     max_t_kv = cfg.total_kv or packed_token_capacity(seq_len_kv)
 
@@ -567,9 +567,13 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     def _pack_tokens(x8_seqs, h, d, capacity_tokens, dt):
         # [1,h,s,d] per sequence -> packed [T,h,d] tokens in a
         # capacity-tokens buffer whose tail is NaN-poisoned (GitHub #624).
+        # With zero live tokens the whole buffer is poison — legal, since the
+        # clamped descriptors must never read it.
         stor = torch.full((capacity_tokens * h * d,), float("nan"), device="cuda", dtype=torch.float32).to(dt)
-        packed = torch.cat([x.squeeze(0).permute(1, 0, 2).reshape(-1) for x in x8_seqs if x.numel()])
-        stor[: packed.numel()] = packed
+        pieces = [x.squeeze(0).permute(1, 0, 2).reshape(-1) for x in x8_seqs if x.numel()]
+        if pieces:
+            packed = torch.cat(pieces)
+            stor[: packed.numel()] = packed
         return stor
 
     q_stor = _pack_tokens(q8_seqs, h_q, d_qk, max_t_q, torch_itype)
@@ -578,9 +582,17 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     # Packed SF: [h, total_tiles, tile_bytes] — per head, the sequences' tiles
     # in cu_seqlens order. The buffer is EXACTLY the packed layout (the engine
     # derives the packed tile extent from its byte size).
-    sfq_pk = torch.cat(sfq_seqs, dim=1).contiguous()
-    sfk_pk = torch.cat(sfk_seqs, dim=1).contiguous()
-    sfv_pk = torch.cat(sfv_seqs, dim=1).contiguous()
+    def _nonempty_sf(sf, h):
+        # Zero live tiles (all sequences empty on this side) still needs a real
+        # device allocation to bind; one zeroed TILE is never read because the
+        # engine's packed extent follows cu[B] == 0.
+        if sf.shape[1] == 0:
+            return torch.zeros((h, 1, sf.shape[2]), dtype=torch.uint8, device="cuda")
+        return sf
+
+    sfq_pk = _nonempty_sf(torch.cat(sfq_seqs, dim=1).contiguous(), h_q)
+    sfk_pk = _nonempty_sf(torch.cat(sfk_seqs, dim=1).contiguous(), h_k)
+    sfv_pk = _nonempty_sf(torch.cat(sfv_seqs, dim=1).contiguous(), h_v)
 
     o_stor = torch.full((max_t_q * h_q * d_vo,), float("nan"), device="cuda", dtype=torch.float32).to(torch_otype)
     stats_stor = torch.full((max_t_q * h_q,), float("nan"), dtype=torch.float32, device="cuda")
