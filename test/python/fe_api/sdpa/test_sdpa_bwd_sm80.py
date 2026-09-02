@@ -47,8 +47,11 @@ def _bshd_randn(b, h, s, d, **kw):
     return torch.randn((b, s, h, d), **kw).permute(0, 2, 1, 3)
 
 
-def _ref_grads(q, k, v, do, *, is_causal, window_left, scale, causal_bottom_right=False):
-    """fp32 autograd reference; returns (o, dq, dk, dv).
+def _ref_grads(q, k, v, do, *, is_causal, window_left, scale, causal_bottom_right=False, sink=None):
+    """fp32 autograd reference; returns (o, dq, dk, dv) — or (o, dq, dk, dv,
+    dsink) when ``sink`` ((H,) fp32 natural-log logits) is given: one extra
+    softmax column per head that absorbs probability mass and contributes
+    nothing to ``o``.
 
     Mask semantics mirror the kernel's ``_mask_p``: the diagonal anchor is
     ``q`` (top-left) or ``q + (s_kv - s_q)`` (bottom-right); causal keeps
@@ -60,6 +63,7 @@ def _ref_grads(q, k, v, do, *, is_causal, window_left, scale, causal_bottom_righ
     q_ref = q.detach().to(torch.float32).requires_grad_()
     k_ref = k.detach().to(torch.float32).requires_grad_()
     v_ref = v.detach().to(torch.float32).requires_grad_()
+    sink_ref = sink.detach().to(torch.float32).requires_grad_() if sink is not None else None
 
     k_exp = k_ref.repeat_interleave(g, dim=1)
     v_exp = v_ref.repeat_interleave(g, dim=1)
@@ -74,9 +78,15 @@ def _ref_grads(q, k, v, do, *, is_causal, window_left, scale, causal_bottom_righ
         if window_left >= 0:
             keep &= (anchor - j) <= window_left
         scores = scores.masked_fill(~keep, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
+    if sink_ref is not None:
+        col = sink_ref.view(1, h_q, 1, 1).expand(scores.shape[0], h_q, s_q, 1)
+        probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)[..., :s_kv]
+    else:
+        probs = torch.softmax(scores, dim=-1)
     o = torch.matmul(probs, v_exp)
     o.backward(do.to(torch.float32))
+    if sink_ref is not None:
+        return o.detach(), q_ref.grad, k_ref.grad, v_ref.grad, sink_ref.grad
     return o.detach(), q_ref.grad, k_ref.grad, v_ref.grad
 
 
@@ -252,7 +262,7 @@ def test_sdpa_bwd_sm80_d64_fast_path(monkeypatch):
     torch.testing.assert_close(dv_d.float(), dv_g.float(), rtol=2e-2, atol=2e-2)
 
 
-def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1):
+def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1, sinks=None, deterministic=False, max_s_q=None):
     """Run the THD fwd+bwd wrappers on packed random inputs; when
     ``check_grads``, compare each sequence's dQ/dK/dV slice against the dense
     fp32 autograd reference (the existing ``_ref_grads`` pattern)."""
@@ -268,11 +278,27 @@ def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1):
     v = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
     do = torch.randn(1, t, h, d_v, dtype=torch.float16, device="cuda")
     window = (window_left, 0)
-    fwd = sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, window_size=window, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens)))
+    fwd = sdpa_fwd_wrapper_sm80(
+        q, k, v, is_causal=True, window_size=window, sinks=sinks, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu, max_s_q=int(max(lens))
+    )
+    extra = {"max_s_q": max_s_q} if max_s_q is not None else {}
     out = sdpa_bwd_wrapper_sm80(
-        q, k, v, fwd["o_tensor"], do, fwd["lse_tensor"], is_causal=True, window_size=window, cum_seqlen_q_tensor=cu, cum_seqlen_k_tensor=cu
+        q,
+        k,
+        v,
+        fwd["o_tensor"],
+        do,
+        fwd["lse_tensor"],
+        is_causal=True,
+        window_size=window,
+        sinks=sinks,
+        deterministic=deterministic,
+        cum_seqlen_q_tensor=cu,
+        cum_seqlen_k_tensor=cu,
+        **extra,
     )
     if check_grads:
+        dsink_sum = torch.zeros(h, dtype=torch.float32, device="cuda") if sinks is not None else None
         for i in range(len(lens)):
             lo, hi = int(cu[i]), int(cu[i + 1])
 
@@ -280,12 +306,18 @@ def _thd_run_and_check(lens, h, d_qk, d_v, *, check_grads=True, window_left=-1):
             def _bhsd(x, _lo=lo, _hi=hi):
                 return x[0, _lo:_hi].permute(1, 0, 2).unsqueeze(0)
 
-            _, dq_ref, dk_ref, dv_ref = _ref_grads(
-                _bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=window_left, scale=1.0 / math.sqrt(d_qk)
-            )
+            refs = _ref_grads(_bhsd(q), _bhsd(k), _bhsd(v), _bhsd(do), is_causal=True, window_left=window_left, scale=1.0 / math.sqrt(d_qk), sink=sinks)
+            _, dq_ref, dk_ref, dv_ref = refs[:4]
             torch.testing.assert_close(_bhsd(out["dq_tensor"]).to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(_bhsd(out["dk_tensor"]).to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(_bhsd(out["dv_tensor"]).to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+            if sinks is not None:
+                dsink_sum += refs[4]
+        if sinks is not None:
+            # dSink sums over every sequence's tokens; a NONZERO reference is
+            # required so an all-zero kernel result cannot pass.
+            assert dsink_sum.abs().max().item() > 0
+            torch.testing.assert_close(out["dsink_tensor"], dsink_sum, rtol=3e-2, atol=3e-2 * max(1.0, dsink_sum.abs().max().item()))
     return out
 
 
@@ -682,3 +714,109 @@ def test_sm80_bwd_swa_deterministic(bottom_right, s_q, s_kv):
     _, dq_ref, _, _ = _ref_grads(q, k, v, do, is_causal=True, window_left=w, scale=scale, causal_bottom_right=bottom_right)
     torch.testing.assert_close(a["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(a["dq_tensor"].to(torch.float32), nd["dq_tensor"].to(torch.float32), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_sinks():
+    """THD + attention sinks: dQ/dK/dV per sequence against the sink-aware
+    reference, and dSink (H,) against the sum of the per-sequence sink grads
+    (the reduction runs over each packed sequence's own tokens)."""
+    sinks = torch.randn(4, dtype=torch.float32, device="cuda")
+    try:
+        _thd_run_and_check([96, 320, 160], h=4, d_qk=128, d_v=128, sinks=sinks)
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_deterministic():
+    """THD + deterministic dQ: correct against the reference, bitwise
+    repeatable, and identical whether the relay semaphore is sized from an
+    exact max_s_q hint, an over-provisioned one, or (no hint) the packed
+    total."""
+    lens = [96, 640, 160]
+    try:
+        a = _thd_run_and_check(lens, h=4, d_qk=128, d_v=128, deterministic=True)
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    torch.manual_seed(0)
+    b = _thd_run_and_check(lens, h=4, d_qk=128, d_v=128, deterministic=True, check_grads=False, max_s_q=max(lens))
+    torch.manual_seed(0)
+    c = _thd_run_and_check(lens, h=4, d_qk=128, d_v=128, deterministic=True, check_grads=False, max_s_q=sum(lens))
+    for key in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        assert torch.equal(a[key], b[key]), key
+        assert torch.equal(a[key], c[key]), key
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_dense_sinks():
+    """Dense attention sinks through the wrapper -> adapter -> dSink kernel:
+    dQ/dK/dV and dSink (H,) against the sink-aware reference (dSink sums over
+    the batch, as the reference's shared sink leaf does)."""
+    try:
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_sm80
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+
+    b, h, s, d = 2, 4, 512, 128
+    scale = 1.0 / math.sqrt(d)
+    q = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    k = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    v = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    do = _bshd_randn(b, h, s, d, dtype=torch.float16, device="cuda")
+    sinks = torch.randn(h, dtype=torch.float32, device="cuda")
+    fwd = sdpa_fwd_wrapper_sm80(q_tensor=q, k_tensor=k, v_tensor=v, is_causal=True, sinks=sinks, scale_softmax=scale)
+    out = sdpa_bwd_wrapper_sm80(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=fwd["o_tensor"],
+        do_tensor=do,
+        lse_tensor=fwd["lse_tensor"],
+        is_causal=True,
+        sinks=sinks,
+        scale_softmax=scale,
+    )
+    _, dq_ref, dk_ref, dv_ref, dsink_ref = _ref_grads(q, k, v, do, is_causal=True, window_left=-1, scale=scale, sink=sinks)
+    torch.testing.assert_close(out["dq_tensor"].to(torch.float32), dq_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dk_tensor"].to(torch.float32), dk_ref, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(out["dv_tensor"].to(torch.float32), dv_ref, rtol=3e-2, atol=3e-2)
+    assert dsink_ref.abs().max().item() > 0
+    torch.testing.assert_close(out["dsink_tensor"], dsink_ref, rtol=3e-2, atol=3e-2 * max(1.0, dsink_ref.abs().max().item()))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sm80_bwd_thd_sinks_deterministic_compile_key():
+    """Rule 4 for the two new THD specializations: sinks and deterministic each
+    mint exactly one bprop template compile (a new parameter set), and then
+    re-bind across different token totals — and, for deterministic, a
+    different max_s_q — without a new compile: neither T_q nor the relay
+    counter's size is part of the key."""
+    from cudnn.frost import template_loader
+
+    def cache_totals():
+        """(misses, hits) summed over the loaded bprop template modules' compile caches."""
+        mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
+        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        return sum(i.misses for i in infos), sum(i.hits for i in infos)
+
+    sinks = torch.randn(4, dtype=torch.float32, device="cuda")
+    try:
+        _thd_run_and_check([96, 160], h=4, d_qk=128, d_v=128, sinks=sinks, check_grads=False)
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
+    m0, h0 = cache_totals()
+    _thd_run_and_check([64, 256], h=4, d_qk=128, d_v=128, sinks=sinks, check_grads=False)  # same n_seq, other totals
+    m1, h1 = cache_totals()
+    assert m1 == m0 and h1 > h0, "THD+sinks re-bind must be a pure cache hit"
+
+    _thd_run_and_check([96, 160], h=4, d_qk=128, d_v=128, deterministic=True, check_grads=False, max_s_q=160)
+    m2, h2 = cache_totals()
+    _thd_run_and_check([64, 256], h=4, d_qk=128, d_v=128, deterministic=True, check_grads=False, max_s_q=512)  # other totals AND max_s_q
+    m3, h3 = cache_totals()
+    assert m3 == m2 and h3 > h2, "THD+deterministic re-bind (different totals and max_s_q) must be a pure cache hit"

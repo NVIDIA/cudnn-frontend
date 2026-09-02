@@ -976,7 +976,7 @@ def _sm80_bwd_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
 
 
 def _sm80_thd_backward(
-    q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False, max_s_kv=None
+    q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False, max_s_kv=None, max_s_q=None
 ):
     """THD / varlen backward: q/k/v/o/do are PACKED ``[1, T, H, D]`` (BSHD,
     B==1 — no transpose), ``lse`` is packed ``[1, H, T_q]`` (head-major,
@@ -990,12 +990,14 @@ def _sm80_thd_backward(
     The over-provisioned grid needs the longest per-sequence KV length:
     pass ``max_s_kv`` (any upper bound works — short tiles early-out) to keep
     the call fully async; without it the wrapper reads it from ``cu_k`` on
-    the HOST (a D2H sync — the wrapper-only Rule-3 residual).
+    the HOST (a D2H sync — the wrapper-only Rule-3 residual).  ``sinks``
+    ((H,) natural-log logits) adds a ``dsink_tensor`` output.  ``deterministic``
+    sizes the dQ relay counter from ``max_s_q`` (an upper bound on the
+    longest per-sequence Q length, trimmed to the packed total; the packed
+    total when absent — no D2H).  Like ``max_s_kv``, the hint is a caller
+    contract: the wrapper cannot validate it without a D2H read, and an
+    undersized value indexes the relay counter out of bounds.
     """
-    if sinks is not None:
-        raise NotImplementedError("SM80 THD bprop: attention sinks are dense-only")
-    if deterministic:
-        raise NotImplementedError("SM80 THD bprop: deterministic dQ is dense-only (no plan-time semaphore size under sym_int sq)")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
@@ -1037,6 +1039,8 @@ def _sm80_thd_backward(
         is_causal=bool(is_causal),
         has_swa=has_swa,
         causal_bottom_right=bool(causal_bottom_right) and (bool(is_causal) or has_swa),
+        has_sink=sinks is not None,
+        deterministic=bool(deterministic),
         thd_varlen=True,
         sched_policy=_BWD_SCHED_NATURAL,  # LPT+THD is a future tweak
     )
@@ -1071,6 +1075,30 @@ def _sm80_thd_backward(
     dummy_i32 = torch.zeros(1, dtype=torch.int32, device=dev)
     dummy_f32 = torch.zeros(1, dtype=torch.float32, device=dev)
     c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _int32(h_q * t_q), stream)
+    dsink = None
+    if sinks is not None:
+        # Natural-log logits (the kernel applies log2e itself); one warp per
+        # (sequence, head) row over that sequence's tokens; zero-init target.
+        sinks_b = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous()
+        dsink = torch.zeros(h_q, dtype=torch.float32, device=dev)
+        c.dsink(_fd_tvm(lse_t), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink), _fd_tvm(cu_q_t), _int32(n_seq * h_q), stream)
+    # Deterministic relay counter: one int32 per (sequence, head, q-tile),
+    # sized from the max_s_q hint (any upper bound) or, without one, from the
+    # packed total — host shape metadata, so no D2H read.  Fresh zeros every
+    # call: a stale counter deadlocks the relay's equality spin.
+    if deterministic:
+        # The packed total bounds every per-sequence length, so an over-provisioned
+        # hint is trimmed to it; an UNDERSIZED hint is a contract violation the
+        # wrapper cannot detect without a D2H read of cu_q (same contract as
+        # max_s_kv) -- the relay indexes the counter by q-tile, so it would run
+        # off the end of dq_sem.
+        q_bound = min(int(max_s_q), t_q) if max_s_q is not None else t_q
+        assert q_bound > 0, f"max_s_q must be > 0; got {q_bound}"
+        sem_q_stride = (q_bound + params.tile_q - 1) // params.tile_q
+        dq_sem = torch.zeros(n_seq * h_q * sem_q_stride, dtype=torch.int32, device=dev)
+    else:
+        sem_q_stride = 0
+        dq_sem = dummy_i32
     _sm80_bwd_call(
         c.main,
         q=q,
@@ -1089,14 +1117,14 @@ def _sm80_thd_backward(
         cu_q=cu_q_t,
         cu_k=cu_k_t,
         seq_q=dummy_i32,
-        dq_sem=dummy_i32,
+        dq_sem=dq_sem,
         n_q_tiles=(t_q + params.tile_q - 1) // params.tile_q,
         scale_log2=float(scale_softmax) * _BWD_LOG2E,
         attn_scale=float(scale_softmax),
         right_bound=right_bound,
         inv_scale=1.0 / float(scale_softmax),
         bias_bstride=0,
-        sem_q_stride=0,
+        sem_q_stride=sem_q_stride,
         grid_kv_tiles=(max_s_kv + params.tile_kv - 1) // params.tile_kv,
         grid_batch=n_seq,
         stream=stream,
@@ -1114,7 +1142,10 @@ def _sm80_thd_backward(
         dK_k = dK_k[..., :d_qk].contiguous()
     if pad_v:
         dV_k = dV_k[..., :d_v].contiguous()
-    return TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
+    out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
+    if dsink is not None:
+        out["dsink_tensor"] = dsink
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1585,6 +1616,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         dbias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run the compiled SM80 backward on the adapter's carved workspace (Rule 1:
+        no per-call allocation; the dsink launch passes the dense dummy ``cu``).
+        """
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm80 is not compiled")
@@ -1740,7 +1774,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             # --- launch chain: do_dot → (dSink) → main → dQ cast → (GQA reduce)
             c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _int32(b * hq * sq), launch_stream)
             if sink_tensor is not None:
-                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _int32(b * hq), launch_stream)
+                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_dummy), _int32(b * hq), launch_stream)
             _sm80_bwd_call(
                 c.main,
                 q=Q,
@@ -1818,6 +1852,7 @@ def sdpa_bwd_wrapper_sm80(
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     max_s_kv: Optional[int] = None,
+    max_s_q: Optional[int] = None,
 ) -> TupleDict:
     """SM80 (A100) SDPA backward.
 
@@ -1830,7 +1865,13 @@ def sdpa_bwd_wrapper_sm80(
 
     THD (``cum_seqlen_*``): pass ``max_s_kv`` (any upper bound on the
     longest per-sequence KV length) to keep the call fully async; without it
-    the wrapper reads the max from ``cu_k`` on the host (a D2H sync).
+    the wrapper reads the max from ``cu_k`` on the host (a D2H sync).  With
+    ``deterministic=True``, ``max_s_q`` (an upper bound on the longest
+    per-sequence Q length) sizes the dQ relay counter; the packed total is
+    used when absent.  Both hints are caller contracts (validating them
+    would need the D2H read they exist to avoid): an undersized ``max_s_kv``
+    drops KV tiles, an undersized ``max_s_q`` indexes the relay counter out
+    of bounds.
     """
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
@@ -1861,9 +1902,10 @@ def sdpa_bwd_wrapper_sm80(
                 sinks=sinks,
                 deterministic=deterministic,
                 max_s_kv=max_s_kv,
+                max_s_q=max_s_q,
             )
-    if max_s_kv is not None:
-        raise ValueError("max_s_kv is a THD grid hint; it requires cum_seqlen_q_tensor/cum_seqlen_k_tensor")
+    if max_s_kv is not None or max_s_q is not None:
+        raise ValueError("max_s_kv / max_s_q are THD hints; they require cum_seqlen_q_tensor/cum_seqlen_k_tensor")
     for nm, t in (("Q", q_tensor), ("V", v_tensor), ("O", o_tensor), ("dO", do_tensor)):
         if t.ndim != 4:
             raise ValueError(f"{nm} must be rank-4 BHSD; got {t.ndim}D")
