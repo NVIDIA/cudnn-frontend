@@ -53,6 +53,18 @@ alignment contract. The API records the pointer-array tensor on the launch
 stream. The caller must keep every pointed-to expert allocation alive and must
 not modify or free it until that stream completes.
 
+## Using JAX arrays
+
+The tensor parameters are type-erased: torch tensors and JAX arrays are both accepted (torch is imported only when torch tensors are passed, jax only when JAX arrays are passed). Because JAX arrays are always row-major, the JAX contract is narrower than torch's:
+
+- **Discrete weight mode only** (`b_ptrs`): dense mode's `b_tensor` uses an expert-outermost strided layout with no row-major equivalent, and `bias_tensor`'s `(n, experts)` column-major layout is likewise not expressible — both raise clear errors for JAX inputs. Each per-expert weight is a plain k-major `(n, k)` C-contiguous JAX array.
+- **`b_ptrs` from JAX**: build the pointer array from `weight.unsafe_buffer_pointer()` per expert. JAX truncates int64 without x64 mode, so pass the pointers either as an int64 array (with `jax_enable_x64`) or as a **packed uint8 array** (8 little-endian bytes per pointer): `jnp.asarray(np.array(ptrs, dtype=np.int64).view(np.uint8))`. The weight arrays (and `b_ptrs`) must stay alive and un-donated until the kernel completes.
+- A/offsets/alpha/prob are plain C-contiguous JAX arrays of the documented shapes; outputs are allocated as n-major C-contiguous `jnp` arrays. Dtype parameters accept torch dtypes, numpy/ml_dtypes dtypes, dtype name strings, or `cutlass` types.
+- The eager path launches on the **CUDA legacy default stream** (XLA does not track it): `jax.block_until_ready(...)` your inputs before calling, and synchronize the device (or the stream you passed) before reading the outputs.
+- For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_jax_sm100(a_tensor, padded_offsets, alpha_tensor, b_ptrs, n, prob_tensor, ...)` (built on `cudnn.jax.call`; discrete mode, no bias): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, and no manual synchronization is needed. Under tracing the `padded_offsets` *values* cannot be host-validated (shapes/dtypes still are), and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+
+Internal workspaces are allocated in the caller's framework allocator (torch caching allocator or XLA's pool) and written through raw pointers; they are never surfaced as arrays.
+
 ## Wrapper API
 
 Dense mode:

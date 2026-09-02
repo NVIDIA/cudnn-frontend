@@ -65,9 +65,9 @@ def test_constructor_positional_parity():
     params = list(inspect.signature(pygraph.__init__).parameters.values())[1:]  # drop self
     positional = [p.name for p in params if p.kind == p.POSITIONAL_OR_KEYWORD]
     assert positional[: len(classic)] == classic, f"classic constructor order not preserved:\n classic={classic}\n ours    ={positional}"
-    # everything new is keyword-only — it can never shift the classic order
-    keyword_only = {p.name for p in params if p.kind == p.KEYWORD_ONLY}
-    assert {"backends", "router"} <= keyword_only
+    # Nothing pygraph-only may be positional: one added here shifts the classic
+    # order for every caller passing by position. Keyword-only is the way in.
+    assert positional[len(classic) :] == [], f"pygraph-only positional parameters: {positional[len(classic) :]}"
 
 
 def test_tensor_positional_parity():

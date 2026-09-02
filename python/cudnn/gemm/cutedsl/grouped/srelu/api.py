@@ -8,17 +8,27 @@ and discrete weight modes for grouped block-scaled GEMM with output
 SReLU output quantization in MoE (Mixture of Experts) workloads.
 """
 
+from __future__ import annotations
+
 import os
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    allocate_byte_workspace,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_data_ptr,
+)
 
 from .moe_blockscaled_grouped_gemm_srelu_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
@@ -28,8 +38,16 @@ from ..moe_utils import MoEWeightMode
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
+_JAX_SF_LAYOUT_ERROR = (
+    "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
+    "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
+    "(a row-major JAX array of that shape has different memory); pass torch tensors"
+)
+
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    import torch
+
     if tensor.dtype == torch.uint8:
         cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
         cute_tensor.element_type = cutlass.Float4E2M1FN
@@ -75,7 +93,7 @@ class GroupedGemmSreluSm100(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -116,7 +134,15 @@ class GroupedGemmSreluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        framework = detect_framework(sample_a)
+        if framework == "jax":
+            raise ValueError(f"GroupedGemmSreluSm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+        if framework != "torch":
+            raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmSreluSm100; pass torch tensors")
+        if acc_dtype is None:
+            acc_dtype = cutlass.Float32
         super().__init__()
+        self._framework = framework
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
@@ -136,15 +162,15 @@ class GroupedGemmSreluSm100(APIBase):
         self._sample_a_tensor = sample_a
         self._sample_b_tensor = sample_b
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", interpret_uint8_as_fp4x2=False)
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
-        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", interpret_uint8_as_fp4x2=False, canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
+        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets", canonical=True)
+        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha", canonical=True)
 
         self._has_d_col = sample_d_col is not None
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
+        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col", canonical=True)
         if self.d_col_desc is None:
             self.d_col_desc = TensorDesc(
                 dtype=self.d_desc.dtype,
@@ -154,33 +180,33 @@ class GroupedGemmSreluSm100(APIBase):
                 device=self.d_desc.device,
                 name="sample_d_col",
             )
-        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
-        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
-        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
+        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col", canonical=True)
+        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True)
         self.norm_const_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
+            self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True),
             1,
             "norm_const",
         )
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
-        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
+        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False)
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", interpret_uint8_as_fp4x2=False, canonical=True)
+            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
             self.expert_cnt = num_experts
             self.b_shape = b_shape
-            self.b_dtype = b_dtype
+            self.b_dtype = _convert_to_cutlass_data_type(b_dtype)
             self.b_major = b_major
             self._value_error_if(
                 self.padded_offsets_desc.shape[0] != self.expert_cnt,
                 f"padded_offsets length ({self.padded_offsets_desc.shape[0]}) " f"must equal num_experts ({self.expert_cnt})",
             )
 
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         if cluster_shape_mn is None:
@@ -312,10 +338,10 @@ class GroupedGemmSreluSm100(APIBase):
         self.ab_dtype = self._check_dtype(
             self.a_desc,
             dtype=[
-                torch.float4_e2m1fn_x2,
-                torch.uint8,
-                torch.float8_e5m2,
-                torch.float8_e4m3fn,
+                cutlass.Float4E2M1FN,
+                cutlass.Uint8,
+                cutlass.Float8E5M2,
+                cutlass.Float8E4M3FN,
             ],
             name="A/B",
         )
@@ -328,7 +354,7 @@ class GroupedGemmSreluSm100(APIBase):
             )
             self._check_dtype(
                 self.bias_desc,
-                dtype=[torch.bfloat16, torch.float16, torch.float32],
+                dtype=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32],
                 name="bias",
                 extra_error_msg="bias must be fp16, bfloat16, or float32",
             )
@@ -339,14 +365,14 @@ class GroupedGemmSreluSm100(APIBase):
             )
             self._check_dtype(
                 self.bias_desc,
-                dtype=[torch.bfloat16, torch.float16],
+                dtype=[cutlass.BFloat16, cutlass.Float16],
                 name="bias",
                 extra_error_msg="bias must be fp16 or bfloat16 in discrete mode",
             )
 
         self.sf_dtype = self._check_dtype(
             self.sfa_desc,
-            dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
+            dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN],
             name="SFA/SFB/SFD_row/SFD_col",
         )
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -374,7 +400,7 @@ class GroupedGemmSreluSm100(APIBase):
             f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}",
         )
         self._value_error_if(
-            self.sf_dtype in [torch.float8_e4m3fn] and self.sf_vec_size == 32,
+            self.sf_dtype in [cutlass.Float8E4M3FN] and self.sf_vec_size == 32,
             f"sf_dtype {self.sf_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
         self._value_error_if(
@@ -384,19 +410,19 @@ class GroupedGemmSreluSm100(APIBase):
 
         self._check_dtype(
             self.acc_dtype,
-            dtype=torch.float32,
+            dtype=cutlass.Float32,
             name="Accumulator",
             extra_error_msg="Accumulator must be float32",
         )
         self.c_dtype = self._check_dtype(
             self.c_desc,
-            dtype=[torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2],
+            dtype=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
             name="C",
         )
         if self._is_fp4x2(self.ab_dtype):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
-                dtype=[torch.float16, torch.bfloat16, torch.float32],
+                dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32],
                 name="D",
                 extra_error_msg="D must be fp16, bf16, or float32 when ab_dtype is fp4",
             )
@@ -404,11 +430,11 @@ class GroupedGemmSreluSm100(APIBase):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
                 dtype=[
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                    torch.float4_e2m1fn_x2,
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
+                    cutlass.Float4E2M1FN,
                 ],
                 name="D",
             )
@@ -420,7 +446,7 @@ class GroupedGemmSreluSm100(APIBase):
         )
 
         self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,
+            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype is cutlass.Float32,
             "Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. Please use sf_vec_size 32 or d_dtype bf16 instead",
         )
 
@@ -514,13 +540,12 @@ class GroupedGemmSreluSm100(APIBase):
             "Invalid configuration: fp8 ab_dtype and sf_vec_size 32 with mma_tiler_mn[1] == 128 and fp8 d_dtype is not supported. "
             "Please use mma_tiler_mn[1] == 256 instead",
         )
-        if not torch.cuda.is_available():
+        if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmSrelu requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+            raise RuntimeError(f"GroupedGemmSrelu requires SM100+ compute capability, but found SM{compute_capability}")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
@@ -566,7 +591,9 @@ class GroupedGemmSreluSm100(APIBase):
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         workspace_bytes = gemm_srelu.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
+        # Internal scratch in the caller's framework allocator; kernels write through its
+        # raw pointer and it is never surfaced as a framework array.
+        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_srelu, max_active_clusters, fake_stream)
@@ -758,8 +785,8 @@ class GroupedGemmSreluSm100(APIBase):
 
         _compiled_kernel = cute.compile(
             gemm_srelu,
-            a=_reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor) if self.a_desc.dtype == torch.uint8 else a_cute_fake,
-            b=_reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor) if self.b_desc.dtype == torch.uint8 else b_cute_fake,
+            a=_reinterpret_raw_grouped_fp4_tensor(self._sample_a_tensor) if self.a_desc.dtype is cutlass.Uint8 else a_cute_fake,
+            b=_reinterpret_raw_grouped_fp4_tensor(self._sample_b_tensor) if self.b_desc.dtype is cutlass.Uint8 else b_cute_fake,
             sfb=sfb_cute_fake,
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
@@ -909,10 +936,17 @@ class GroupedGemmSreluSm100(APIBase):
         )
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
-        b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        b_ptrs_cute = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
-        sfb_ptrs_cute = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
+        # Compile-time placeholders for the pointer-array arguments: real device bytes
+        # (fake tensors have dummy iterators) allocated in the caller's framework,
+        # retyped to Int64 via the element_type override.
+        self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
+        self._compile_sfb_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
+        b_ptrs_placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
+        b_ptrs_placeholder.element_type = cutlass.Int64
+        b_ptrs_cute = b_ptrs_placeholder.iterator
+        sfb_ptrs_placeholder = from_dlpack(self._compile_sfb_ptrs, assumed_align=8)
+        sfb_ptrs_placeholder.element_type = cutlass.Int64
+        sfb_ptrs_cute = sfb_ptrs_placeholder.iterator
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
         self._logger.debug("Compiling discrete grouped_gemm_srelu kernel")
@@ -968,8 +1002,8 @@ class GroupedGemmSreluSm100(APIBase):
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            b_ptrs_addr = int(b_ptrs_device.data_ptr())
-            sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
+            b_ptrs_addr = int(get_data_ptr(b_ptrs_device))
+            sfb_ptrs_addr = int(get_data_ptr(sfb_ptrs_device))
             _compiled_kernel(
                 a_tensor,
                 b_ptrs_addr,
@@ -1042,7 +1076,10 @@ class GroupedGemmSreluSm100(APIBase):
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
 
         if a_tensor.shape[0] == 0:
             self._logger.debug("execute: valid_m is zero, skipping kernel execution")
@@ -1138,9 +1175,9 @@ def grouped_gemm_srelu_wrapper_sm100(
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1211,7 +1248,19 @@ def grouped_gemm_srelu_wrapper_sm100(
                 c = result[0]  # c_tensor
                 d = result[1]  # d_tensor
     """
-    from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+
+    framework = detect_framework(a_tensor)
+    if framework == "jax":
+        raise ValueError(f"grouped_gemm_srelu_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+    if framework != "torch":
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_srelu_wrapper_sm100; pass torch tensors")
+    import torch
+
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
+    c_dtype = _convert_to_cutlass_data_type(c_dtype) if c_dtype is not None else cutlass.BFloat16
+    d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
+    b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
 
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
@@ -1229,38 +1278,37 @@ def grouped_gemm_srelu_wrapper_sm100(
             raise ValueError(f"bias_tensor must have shape {(n_out, l)}, got {tuple(bias_tensor.shape)}")
     else:
         weight_mode = MoEWeightMode.DISCRETE
-        _require_pointer_tensor(b_ptrs, "b_ptrs")
-        num_experts = b_ptrs.shape[0]
-        _require_pointer_tensor(sfb_ptrs, "sfb_ptrs", num_experts)
+        num_experts = _validate_pointer_tensor(b_ptrs, "b_ptrs")
+        _validate_pointer_tensor(sfb_ptrs, "sfb_ptrs", num_experts)
         if n is None or b_dtype is None:
             raise ValueError("n and b_dtype are required for discrete mode")
-        k_logical = k_physical * 2 if b_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+        k_logical = k_physical * 2 if b_dtype in (cutlass.Float4E2M1FN, cutlass.Uint8) else k_physical
         b_shape = (n, k_logical)
         n_out = n
         l = num_experts
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, num_experts):
             raise ValueError(f"bias_tensor must have shape {(n_out, num_experts)}, got {tuple(bias_tensor.shape)}")
 
-    is_fp8_input_config = a_tensor.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ] and sfa_tensor.dtype in [
-        torch.float8_e8m0fnu,
-        torch.float8_e4m3fn,
-    ]
-    is_low_precision_output_config = d_dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        torch.float4_e2m1fn_x2,
-    ]
+    is_fp8_input_config = _convert_to_cutlass_data_type(a_tensor.dtype) in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+    ) and _convert_to_cutlass_data_type(sfa_tensor.dtype) in (
+        cutlass.Float8E8M0FNU,
+        cutlass.Float8E4M3FN,
+    )
+    is_low_precision_output_config = d_dtype in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
+    )
 
     _logger.debug("grouped_gemm_srelu_wrapper_sm100: Creating output tensors")
 
     if cd_major == "n":
-        c_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=c_dtype, device=a_tensor.device)
-        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+        c_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
         d_col_tensor = (
-            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
             if is_low_precision_output_config
             else None
         )
@@ -1309,7 +1357,7 @@ def grouped_gemm_srelu_wrapper_sm100(
         )
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    if d_dtype in [torch.bfloat16, torch.float16]:
+    if d_dtype in (cutlass.BFloat16, cutlass.Float16):
         _logger.debug("grouped_gemm_srelu_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
         amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 

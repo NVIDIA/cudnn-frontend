@@ -71,12 +71,12 @@ g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws)
 
 Reading that sequence line by line:
 
-- **`create_execution_plans()` is the dispatch stage.** It collects the python
-  engines that claim the graph and the backend's own ranked recommendation,
-  and `engines.heuristics.heuristics_sort` merges them into one list
-  (`graph.plans`, a `list[PlanConfig(engine_id, knobs)]`). Planning is
-  one-shot: a second call raises, because the classic C++ graph never
-  supported re-planning. To plan differently, build a new graph.
+- **`create_execution_plans()` is the dispatch stage.** It hands the graph's
+  family, its engine ids and the backend's own recommendation to
+  `engines.heuristics.rank`, which returns ONE list (`graph.plans`, a
+  `list[PlanConfig(engine_id, knobs)]`). Planning is one-shot: a second call
+  raises, because the classic C++ graph never supported re-planning. To plan
+  differently, build a new graph.
 - **Which plan runs is read through the classic API.** `graph.plans`,
   `get_execution_plan_count()` and `get_plan_name_at_index(i)` all address that
   one list, and so do `build_plan_at_index` / `execute_plan_at_index` /
@@ -85,10 +85,9 @@ Reading that sequence line by line:
   ranking gave it. `graph.selected_engine` is the `BaseEngine` object behind
   the selected entry, or `None` when a backend plan is selected.
 - **`select_plan(i)` is optional and strict.** Without it, the walk starts at
-  index 0; today's placeholder heuristics rank the backend's plans first, so
-  the default selection is the backend, exactly as before this mechanism
-  existed. With it, `build_plans()` starts at `i` and a decline there raises
-  instead of quietly running something else.
+  index 0, at whatever the family's `recommend()` put first. With it,
+  `build_plans()` starts at `i` and a decline there raises instead of quietly
+  running something else.
 - **`build_plans()` walks the list.** It tries the selected entry, and on a
   decline (`NotImplementedError` / `cudnn.cudnnGraphNotSupportedError`, logged
   at info level) moves to the next one. Any other exception is a bug in that
@@ -100,8 +99,9 @@ Reading that sequence line by line:
   still forwarded to the lowered C++ graph.
 - **`get_workspace_size()` is honest.** For a python plan it returns
   `CompiledPlan.get_workspace_size()`, the executor's real requirement (for
-  the graph above: the dummy-LSE scratch `b*h*s*4 = 16384` bytes, because an
-  inference graph has no Stats output). `execute()` forwards the caller's
+  the dense graph above: 0 — every SM100/SM120 adapter is `lse_optional`, so
+  a stats-less inference graph compiles the LSE store out and binds no dummy
+  buffer at any level). `execute()` forwards the caller's
   buffer through `ExecutionContext.workspace` and the executor carves its
   scratch out of it in 128-byte-aligned chunks, never touching bytes at or
   beyond the reported size -- no hidden per-execute allocation, stable
@@ -123,49 +123,60 @@ By being a row in `python/cudnn/engines/manifest.py`. That is the whole
 mechanism:
 
 ```python
-EngineRow(
-    FROST_SDPA_FWD_ID_BASE + 0, "frost_sdpa_fwd",
+EngineFamily(
+    FROST_SDPA_FWD_ID_BASE, "frost_sdpa_fwd",
     "cudnn.sdpa.fwd.engine", "FrostSdpaFwdEngines",
-    _SDPA_FWD, _SDPA_FWD, id_hi=FROST_SDPA_FWD_ID_BASE + 100,
-    sm_lo=100,
+    slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
+    analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+    heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
 ),
 ```
 
-- A row is `(engine_id, name, module, factory, anchors, closed_under,
-  id_hi, sm_lo, sm_hi, factory_args)` -- **pure data**: strings and ints, zero
-  imports of engine code. `import cudnn` must never pay the CuTe-DSL import
-  (~1.2 s) merely to know an engine exists.
-- `anchors` / `closed_under` are node-type NAMES, not an enum, so the manifest
-  imports nothing to express them: the graph must contain at least one anchor
-  type and every node type in the graph must be in the closure.
-- `factory` may return one engine or a list of them. `FrostSdpaFwdEngines()`
-  returns the whole SDPA-forward family (one `BaseEngine` per capability
-  cell), which is why its row reserves an id BLOCK with `id_hi`.
-  `manifest.instantiate()` checks each returned engine's id against the block
-  -- a family cannot leak ids into its neighbour's range.
+- A family is **pure data**: strings and ints, zero imports of engine code.
+  `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
+  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
+  the same reason, resolved only when something needs to rank.
+- **A family is a KIND OF GRAPH**, not a group of engines that ship together.
+  `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
+  kind of graph, so a graph belongs to exactly one family or to none, and
+  engines across families never compete. Node types absent from that table
+  (POINTWISE, REDUCTION) are ignored when classifying, which is what makes
+  `matmul + relu` a gemm graph.
+- `slots` is the single source of every python engine id. `instantiate()` HANDS
+  each engine the id its slot assigns; engines declare none of their own, so an
+  engine cannot claim a number the manifest did not give it, and an id always
+  decodes back to a family and a slot (`engine_for_id`). A shipped slot is fixed
+  forever -- append the next free one, never reorder or reuse.
+- `EngineSlot(opt_in=True)` withholds an engine until it matures. Per engine,
+  not per family, so one implementation can graduate while a sibling waits, and
+  the gate answers without importing anything.
 - An unimportable engine is an ABSENT engine, not an error: `instantiate()`
   logs at info level and returns `[]`, so a missing optional dependency can
   never break planning for everyone else.
-- Out-of-tree engines do not need a row -- `graph.register_backend(engine)`
-  with an id in `OUT_OF_TREE_ID_BASE` (30_000+) is the escape hatch, and
-  registered engines lead the candidate order because bringing your own engine
-  is an explicit act. Candidate order is not rank; `heuristics_sort` ranks.
+- **There is no registration call.** The manifest is the only way a python
+  engine exists. An engine handed over at runtime could never be ranked anyway:
+  it declares no `Capabilities`, so nothing can enumerate its configs or place
+  it against the backend -- it was an entry point into the plan list, not into
+  the decision.
 
 ### The coarse key is a NECESSARY condition, never the verdict
 
-Candidate selection is two-stage. Stage 1 is the row's node-type key plus SM
-range, matched in microseconds with nothing imported -- a GEMM row is not
-imported for an SDPA graph, an SM100 row is not imported on SM90. Stage 2 is
-the engine's own `check_support()` / `propose_plans()`, reached only now, and
-that is the only thing that decides.
+Candidate selection is two-stage. Stage 1 is the family's node-type key,
+matched in microseconds with nothing imported -- a GEMM family is not imported
+for an SDPA graph. Stage 2 is the engine's own `check_support()`, reached only
+now, and that is the only thing that decides. Stage 1 deliberately does NOT
+describe what an engine can do; a coarser copy of that judgment here would be a
+second thing to maintain and a place to lie, which is exactly what
+`closed_under` was before it was deleted (it lied about RESHAPE).
 
 Keeping stage 1 a FILTER is the same argument this document makes below
 against a central opset enum (see "Opsets"), and it is the reason the manifest
 is not an authoritative pattern matcher: an authoritative table would be a
 second matcher to maintain, and every time an engine widened its envelope
-someone would have to remember to widen the table too. Two rows may both match
-one graph and both stay in the ranked list -- a python engine's claim is "I
-execute this whole graph", so claims compete rather than conflict.
+someone would have to remember to widen the table too. Several engines of one
+family may all claim a graph and all stay in the ranked list -- a python
+engine's claim is "I execute this whole graph", so claims compete rather than
+conflict.
 
 ### Ids are identity; positions are rank
 
@@ -175,11 +186,8 @@ segmented by provider:
 ```
 [0,      10_000)   cuDNN backend engines (ids assigned by the backend)
 [10_000, 20_000)   C++-side OSS engines -- reserved, not populated
-[20_000, ...)      python engines, one block per family:
-                     LINEAR_ATTENTION_ID_BASE = 20_100
-                     FROST_GEMM_ID_BASE       = 20_200
-                     FROST_SDPA_FWD_ID_BASE   = 20_300
-                     OUT_OF_TREE_ID_BASE      = 30_000   (register_backend)
+[20_000, ...)      python engines, one FAMILY_BLOCK-wide block per family
+                   (engine_ids.py holds the bases; MANIFEST holds the slots)
 ```
 
 An `engine_id` is the engine's stable IDENTITY and the key the build walk
@@ -191,24 +199,20 @@ renumbers anything. That is what makes an autotune result replayable -- it is
 Consequences you must respect when adding engines:
 
 - Ids are append-only. A shipped `engine_id` is never renumbered or reused.
-  Within a family the offset table (`sdpa/fwd/engine._ID_OFFSETS`) is keyed by
-  the engine's shipped NAME rather than by its position in `ENGINE_SPECS`,
-  because that position is preference order and may change.
-- A family that exposes a block of ids declares its upper bound with
-  `id_end`; the interval `[engine_id, id_end)` must sit inside what the
-  manifest reserves for it. Declared intervals are what make disjointness
-  checkable -- an arbitrary predicate is not.
-- The Router refuses identity injection: an engine proposing a `PlanConfig`
-  with a foreign `engine_id` raises.
+  `EngineFamily.slots` is keyed by the engine's shipped NAME rather than by its
+  position in `ENGINE_SPECS`, because that position is preference order and may
+  change.
+- Each family owns `[engine_id, engine_id + FAMILY_BLOCK)`. Declared intervals
+  are what make disjointness checkable -- an arbitrary predicate is not.
+- `create_execution_plans()` validates the final ranked list: an entry naming a
+  python engine this graph cannot dispatch to raises rather than being dropped.
 
 
 ## The engine contract (`cudnn/engines/base.py`)
 
 ```
 check_support(graph)              -> None, or raise to decline
-propose_plans(graph)              -> [PlanConfig(engine_id, knobs), ...]
 build_plan(graph, plan, ctx)      -> CompiledPlan      (the expensive JIT step)
-id_end                            -> int | None        (id block end, see above)
 
 CompiledPlan.get_workspace_size() -> int
 CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
@@ -219,23 +223,46 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
   and propagates. Engines whose internal analyzers raise `ValueError` for
   "cannot express this graph" translate it at the engine boundary -- see
   `FrostGemmEngine.check_support` and `FrostSdpaFwdEngine._decline_reason`.
-- **`propose_plans` is where an engine exposes its configurations.** The
-  default is one plan carrying `default_knobs`. An engine with several viable
-  tile/schedule configurations returns one entry each; every entry's `knobs`
-  reach `build_plan` verbatim, which is what makes routed autotune over FROST
-  configs possible. Today both FROST families propose one knob-less plan per
-  cell.
+- **An engine does not propose its own plans.** Which configs of an engine are
+  worth running, and in what order against the backend's, is a comparison only
+  a party with the whole picture can make -- an engine cannot see its siblings,
+  and neither side of the FROST/backend split can place the other. That
+  judgment lives in the family's `heuristics.recommend`; the engine's job is to
+  say whether a config it is HANDED is servable (`check_support`) and to build
+  it. `PlanConfig.knobs` reaches `build_plan` verbatim, which is what makes an
+  autotune result replayable as `(engine_id, knobs)`.
 - **`build_plan` runs once per (graph, plan)** at `build_plans()` time and the
   compiled artifact lives on the graph, so one engine instance is safely
   reusable across graphs.
+- **What a runtime value cannot change belongs in a build-time table.** An
+  operand's role and major, each output's shape rule and required alignment,
+  which outputs are reductions -- all settled when the kernel compiled, and
+  deciding them again per call is most of what a python execute path costs
+  (measured: 40-50 -> 20-22 us for one gemm, across six flavors).
+  `gemm/frost/recipe.py` is the worked example: one table, captured into a
+  closure that loops over it flat. Even what the kernel's parameter list looks
+  like is a table entry (`arg_plan`), which is why one loop serves every flavor
+  -- a call path per flavor is how two of them disagree. That closure never
+  raises and it is the ONLY thing that launches: what it refuses goes to a
+  checker that reads the same table, names the rule and raises without running
+  anything, and a graph it cannot serve at all is declined at `check_support`.
+  A second executor kept for diagnostics is still a second answer to what the
+  graph computes, and a differential between two readings of one plan cannot
+  catch a misconception they share.
 - **`ExecutionContext` carries handle, stream and workspace explicitly.** No
   engine may hard-code a stream, reach into private graph state, or allocate
   hidden workspace. `uid_to_data` is the caller's variant pack (tensor uid ->
   device buffer), exactly as the classic backend receives it.
+- **The pack's vocabulary is `index` and `OperandBuffer`,** and the two are not
+  the same thing. `pack.index_of(tensor_or_uid)` gives an operand's POSITION in
+  the pack; `pack.operands(indices)` turns positions into `OperandBuffer`s --
+  one caller buffer described (pointer, shape, stride, dtype), non-owning, and
+  itself a DLPack producer. An engine resolves positions once at first execute
+  and asks for buffers per call.
 
 `python/cudnn/gemm/frost/engine.py` is the worked example, deliberately thin:
-`check_support` delegates to `probe_supported`, `propose_plans` returns one
-`PlanConfig`, `build_plan` wraps `build_gemm_plan(graph)` in a `CompiledPlan`
+`check_support` delegates to `probe_supported` and
+`build_plan` wraps `build_gemm_plan(graph)` in a `CompiledPlan`
 whose `execute` keys the kernel's own operands out of the variant pack by uid
 and validates the caller's workspace. All the analysis and codegen stayed in
 `graph_analyzer.py` / `compiler.py`; the engine file is only the contract
@@ -256,9 +283,9 @@ python/cudnn/
     engine_ids.py               the flat id space and its segments
     base.py                     BaseEngine / PlanConfig / CompiledPlan /
                                 ExecutionContext / resolve_node_buffers
-    router.py                   Router.plan(graph, engines); decline_types()
-    heuristics.py               heuristics_sort(graph, python, backend) --
-                                the single ranking seam (placeholder today)
+    heuristics.py               rank(graph, engines, backend_plans, modes) --
+                                the one entry point; delegates to the family's
+                                own recommend() (cudnn/<op>/<pass>/heuristics.py)
 
   frost/                        kernel-authoring framework ONLY
     template_loader.py          (path, TemplateParams) -> uniquely-named
@@ -307,9 +334,10 @@ As a layer stack (each layer talks only to its neighbors):
 | user code             pygraph build, create_execution_plans,    |
 |                       select_plan / deselect_engines, execute   |
 +----------------------------------------------------------------+
-| cudnn/engines/        manifest (what exists) + Router (who      |
-|                       claims) + heuristics_sort (rank) +        |
-|                       BaseEngine / PlanConfig / CompiledPlan    |
+| cudnn/engines/        manifest (what exists, and which family   |
+|                       a graph belongs to) + rank (delegates to  |
+|                       the family) + BaseEngine / PlanConfig /   |
+|                       CompiledPlan                              |
 +----------------------------------------------------------------+
 | engine modules        one per op + pass (cudnn/sdpa/fwd,        |
 |                       cudnn/gemm/frost): facts analyzer,        |
@@ -331,26 +359,29 @@ What each line of the lifecycle actually does, across the layers:
 ```
 user code                       cudnn/engines                    engine module (cudnn/sdpa/fwd)
 ---------                       -------------                    -----------------------------
-import cudnn                    nothing imported: manifest
-                                rows are strings and ints
+import cudnn                    nothing imported: the manifest
+                                is strings and ints
 
 g.sdpa(...)                     (nothing -- graph.nodes
                                 records the op natively)
 
-g.create_execution_plans([A])   coarse key (node types, SM)
-                                  -> matching manifest rows
-                                instantiate(row): import NOW --> FrostSdpaFwdEngines()
-                                Router.python_plans()       --> propose_plans(graph)
-                                                                  check_support:
-                                                                    analyze(graph) -> facts
-                                                                      (parsed once, cached)
-                                                                    mismatch(capabilities,
-                                                                      facts, knobs)
+g.create_execution_plans([A])   family_for(graph): node types
+                                  -> 0 or 1 families
+                                _freeze(); _attach_facts()  --> analyze(graph) -> facts
+                                                                  (parsed once, on the graph)
+                                instantiate(family): import --> FrostSdpaFwdEngines()
+                                  NOW, ids handed in
                                 graph.backend_plan_entries()
                                   -> the backend's own ranked
-                                     (engine_id, knobs)
-                                heuristics_sort(python,
-                                                backend)
+                                     (engine_id, knobs), one
+                                     create_execution_plans
+                                     per heur_mode, tagged
+                                rank(graph, engines,
+                                     backend_plans, modes)
+                                  -> resolve_heuristics()   --> recommend(modes, facts,
+                                                                  offered, backend_plans)
+                                                                  mismatch(capabilities,
+                                                                    facts, knobs) per cell
                                   -> ONE ranked list = graph.plans
 
 g.select_plan(i)   (optional)   pin index i; the walk is strict
@@ -406,9 +437,9 @@ And the same flow as data (which record feeds which decision):
 
 Reading the two diagrams together: everything left of `lower()` is cheap and
 compile-free (facts extraction plus field comparisons -- safe to run on every
-graph, which is why it is what `propose_plans` does); everything right of it is
-the expensive JIT, reached only at `build_plans()` for the entry the walk
-lands on. The records travel one way: facts and the plan's knobs feed
+graph, which is why `recommend()` may run it for every cell); everything right
+of it is the expensive JIT, reached only at `build_plans()` for the entry the
+walk lands on. The records travel one way: facts and the plan's knobs feed
 eligibility; eligibility plus the engine's defaults produce TemplateParams;
 TemplateParams produces exactly one specialized module.
 
@@ -475,8 +506,9 @@ expressible, with one discipline separating them:
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
-  (e.g. `bottom_right_with_swa: bool`). The matcher encodes the SHAPE of the
-  interaction once; each engine's row supplies the VERDICT. When a future
+  (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
+  per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
+  each engine's row supplies the VERDICT. When a future
   kernel supports the conjunction, flip its flag -- never edit the matcher.
   This is what keeps interaction checks from regressing into a per-engine
   if-ladder: shared code may know about kinds of interactions, never about
@@ -496,29 +528,32 @@ levels, with no shared vocabulary at all:
 
 - **Vocabulary per operation.** Each op defines a typed, frozen dataclass:
   `cudnn.sdpa.fwd.engines.SdpaFwdKnobs(sched_policy=None, tile_m=None,
-  tile_n=None, cga=None)`, where `None` means "no preference". SDPA's knobs
-  cannot collide with GEMM's; fields have real types instead of
-  enum-plus-int64.
+  tile_n=None, cga=None, pack_gqa=None)`, where `None` means "no
+  preference". SDPA's knobs cannot collide with GEMM's; fields have real
+  types instead of enum-plus-int64.
 - **Domains per engine.** Each `Capabilities` row advertises the values its
   lowering honors: `sched_policies = {NATURAL}`, `tile_ms = {128}`,
-  `tile_ns = {128}`, `cgas = {2}`. Two engines of the same op may honor
-  different subsets.
+  `tile_ns = {128}`, `cgas = {2}`, `pack_gqas = {False}`. Two engines of the
+  same op may honor different subsets.
 - **Per plan, not per graph.** A knob set rides on `PlanConfig.knobs`, so a
-  tuning choice is part of the plan's identity: an engine that wants several
-  tunings ranked returns several `PlanConfig`s from `propose_plans`, each with
-  its own knobs, and the caller picks one with `select_plan(i)`. The knobs
-  reach `check_support`'s `mismatch()` and then `build_plan` verbatim, and
-  each distinct `TemplateParams` compiles into its own module, so two graphs
-  in one process can run different tunings of the same engine.
+  tuning choice is part of the plan's identity: a family that wants several
+  tunings ranked emits several `PlanConfig`s from `recommend()`, each with its
+  own knobs, and the caller picks one with `select_plan(i)`. The knobs reach
+  `check_support`'s `mismatch()` and then `build_plan` verbatim, and each
+  distinct `TemplateParams` compiles into its own module, so two graphs in one
+  process can run different tunings of the same engine.
 
-**There is no user-facing knob setter in this MR.** The old
+**A recommendation always names a CONCRETE config.** `recommend()` fills every
+knob axis on which the cell declares a domain; `None` means the capability row
+declares no domain at all, so there is nothing for the engine to honour. It
+never means "engine, pick for me" -- that reading is what let the same choice
+be made twice, once in the ranking and once inside the adapter, and drift.
+
+**There is no user-facing knob setter yet.** The old
 `graph.set_engine_knobs(...)` was part of the deleted monkey-patch layer and
-has no replacement yet: nothing proposes a tuning request today, so both FROST
-families propose one knob-less plan per cell and run at their capability row's
-defaults. The plumbing that makes a request expressible is already in place
+has no replacement. The plumbing that makes a request expressible is in place
 (`PlanConfig.knobs` -> `mismatch()` -> `lower()`); what is missing is the
-producer -- either a family that enumerates its domain as several plans, or a
-heuristic/autotuner that proposes one.
+user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
 If a kernel cannot run the requested scheduler policy, the answer is "this
@@ -546,44 +581,49 @@ The engine-to-kernel mapping is many-to-many by design:
 
 ## Heuristics are per operation
 
-`cudnn/engines/heuristics.py` is the single seam where ranking policy lives:
+`cudnn/engines/heuristics.py` is the single entry point, and it decides
+nothing:
 
 ```python
-def heuristics_sort(graph, python_plans, backend_plans) -> List[PlanConfig]:
-    return backend_plans + python_plans
+def rank(graph, engines, backend_plans, modes=None) -> List[PlanConfig]:
+    family = manifest.family_for(graph)
+    recommend = manifest.resolve_heuristics(family)   # the family's own rules
+    facts = graph._facts_for(manifest.resolve_analyzer(family))
+    return recommend(modes, facts, {e.name: e.engine_id for e in engines}, backend_plans)
 ```
 
-That placeholder is deliberate and honest: backend-first means the dispatch
-mechanism lands without changing which engine serves any graph, because no
-cost model exists yet that can compare a CuTe tile config against a cuDNN
-engine. Nothing else in the stack encodes preference -- `manifest.py` is a
-filter, `Router` collects, `build_plans()` walks. Replacing the body of this
-one function is the whole change.
+Ranking knowledge is op-specific -- what makes one SDPA engine beat another
+(seqlen regime, GQA ratio, causal fraction) is meaningless for GEMM -- so it
+lives in `cudnn/<op>/<pass>/heuristics.py`, the analogue of the C++ per-op heur
+files such as `jit_engine_heur_sdpa.cpp`. A family that declares no
+`heuristics` hook falls back to one default plan per accepting engine, ahead of
+the backend's.
 
-Real heuristics (the analogue of the C++ per-op heur files such as
-`jit_engine_heur_sdpa.cpp`) belong next to the op's facts and knobs types,
-because ranking knowledge is op-specific: what makes one SDPA engine beat
-another (seqlen regime, GQA ratio, causal fraction) is meaningless for GEMM.
-The contract, for when a cell has more than one engine or a knob domain has
-more than one value:
+The family is the smallest scope that can rank, and that is the whole reason
+this seam exists rather than an engine-side `propose_plans`:
 
-- Home: `cudnn/<op>/<pass>/heuristics.py`; `heuristics_sort` dispatches to it
-  per operation and merges the results.
-- Signature: `rank(facts, eligible_specs, device) -> ordered list of
-  (EngineSpec, proposed <Op>Knobs)` -- order the eligible engines and propose
-  knob values for each, mirroring the C++ heur returning ordered engine
-  configs with knob choices. Each `(spec, knobs)` pair becomes one
-  `PlanConfig`.
-- Across ops, do NOT resolve by matcher precedence (that is the opset enum
-  reborn); rankers return a common currency -- estimated cost -- and
-  `heuristics_sort` sorts the union.
+- **`recommend(modes, facts, offered, backend_plans) -> [PlanConfig]` returns
+  `graph.plans`, position for position.** Nothing downstream reorders it.
+- **It places BOTH sides.** The backend's entries arrive tagged with the
+  `heur_mode` that produced them, so the family says, per mode, whether its own
+  configs lead or follow. That is a measurement, not a preference: whether a
+  FROST cell beats the backend's kernel on a given arch is a number someone
+  timed.
+- **Each mode contributes a block, and the blocks concatenate** in the caller's
+  order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
+  ahead of every fallback.
+  - **A**: candidates worth running, best guess first, runners-up behind it for
+    a caller that autotunes.
+  - **FALLBACK**: the config expected to build where mode A's choice may not.
+    Nothing here is chosen for speed.
+  - **OPENSOURCE**: mode A without the backend's recommendation -- these cells
+    ARE the open-source implementation. Combine it (`[OPENSOURCE, A, FALLBACK]`)
+    to measure coverage: a graph that ends up on a backend plan is one FROST
+    does not cover.
+  - **B**: answered as A until a family has a wider search to give.
 - Knob precedence: **user request > heuristic proposal > engine default** --
-  with the same rule at every level: a proposal outside the engine's
-  `Capabilities` domain is a heuristic bug; a request outside it makes that
-  plan ineligible.
-
-Do not build the ranker before it has observable behavior to test. The seam is
-documented here so the contract is fixed before anyone needs it.
+  same rule at every level: a proposal outside the engine's `Capabilities`
+  domain is a heuristic bug; a request outside it makes that plan ineligible.
 
 
 ## Opsets: graph-to-operation mapping is implicit and multi-valued
@@ -611,15 +651,15 @@ opset enum here, deliberately -- the same reasoning as the knob enum:
   fused-epilogue op's engines). This is coherent because a FROST engine's
   `build_plan` executes the ENTIRE graph: a claim is a complete alternative
   execution strategy, never a partition -- so claims compete, they cannot
-  conflict. All claims land in the same flat ranked list, and the competition
-  is resolved by `heuristics_sort`, with `select_plan` / `deselect_engines` as
-  the user's overrides.
-- **Ranking composes in two levels.** Within an op: the op's ranker (see
-  "Heuristics are per operation"). Across ops: comparable estimated cost, not
-  precedence. Today's ranking is deliberately simpler than that -- backend
-  first, then claims in candidate order -- so none of the ranker machinery is
-  built yet; the shape (flat manifest, whole-graph claims, per-op rankers with
-  comparable scores) is what must not regress.
+  conflict. All claims land in the same flat ranked list, resolved by the
+  family's `recommend()`, with `select_plan` / `deselect_engines` as the user's
+  overrides.
+- **Today a graph belongs to at most ONE family**, so no cross-op comparison
+  arises: `_ANCHOR_NODE_TO_FAMILY` names one family or none. When two families
+  can claim one graph, they must return a common currency -- estimated cost --
+  rather than resolving by precedence (that is the opset enum reborn). The
+  shape (flat manifest, whole-graph claims, per-family rankers with comparable
+  scores) is what must not regress.
 
 
 ## Engine naming
@@ -647,17 +687,18 @@ sdpa_bwd_sm100_d128                 (future)
   one row serves several compute capabilities. The row's `Capabilities.arches`
   set is the source of truth for exactly which; the name never enumerates
   minors.
-- Head dimensions are omitted when one engine accepts a domain of dimensions,
-  as the SM120 prefill engine does. `Capabilities.d_qk` and `d_v` are the
-  source of truth for that domain.
-- Geometry-specific engines use `d<dqk>` and append `x<dv>` only when the two
-  head dimensions differ.
+- Head dimensions never appear in engine names: one engine per
+  arch x dtype family accepts a DOMAIN of dimensions and its lowering picks
+  the kernel flavor (the smallest native shape covering the graph).
+  `Capabilities.d_shapes` (native flavor shapes) plus `d_pad_multiple`
+  (envelope alignment; 0 = exact shapes only) are the source of truth for
+  that domain.
 - No version counters. If a genuinely distinct second engine ever serves the
   same cell, give it a descriptive variant suffix (e.g. `_cga4`), not a number.
 - Names are for humans; `engine_id` is for machines. Pin by index
   (`select_plan`) or replay by id -- never by parsing a name.
-- `cudnn.sdpa.fwd.engines.engine_name(d)` computes geometry-specific names;
-  omit `d` for dimension-agnostic engines.
+- `cudnn.sdpa.fwd.engines.engine_name(arch=..., fp8=..., mxfp8=...)` computes
+  the family names (test/user convenience).
 
 
 ## Kernel templates and TemplateParams
@@ -701,11 +742,11 @@ Asserts:
 
 1. **New dtype an existing template already handles**: add it to the row's
    `Capabilities.dtypes`. **New geometry**: one new `EngineSpec` row plus its
-   permanent id offset in `engine._ID_OFFSETS`.
+   permanent `EngineSlot` in the family's manifest entry.
 2. **New knob**: add the field to the op's knobs dataclass (`None` default),
    the domain to `Capabilities`, the check line to `mismatch()`, and the merge
-   in `lower`. To make it reachable, have `propose_plans` emit one
-   `PlanConfig` per value. Update the gating tests.
+   in `lower`. To make it reachable, teach the family's `recommend()` which
+   value to name, and emit the runners-up behind it. Update the gating tests.
 3. **New kernel (decode, fp8, new arch)**: write the template in
    `<op>/<pass>/kernels/` following the naming grammar; add its `make_cfg_*`
    to the config module (a new `config_sm90.py` for a new arch); add the spec
@@ -713,13 +754,14 @@ Asserts:
    `graph_analyzer.py` should not need changes.
 4. **New pass (bwd)**: new `<op>/bwd/` with its own `api_dsl.py` (the tensor
    contract differs), reusing the shared analyzer facts and the loader; a new
-   `BaseEngine` subclass and a new manifest row with a fresh family id block
+   `BaseEngine` subclass and a new `EngineFamily` with a fresh id block
    (`FROST_SDPA_BWD_ID_BASE` is already reserved).
 5. **New op**: new `python/cudnn/<op>/` with the same layers (analyzer facts,
-   engines/capabilities, kernels), a `BaseEngine` subclass, and one row in
-   `cudnn/engines/manifest.py` naming its module, factory, node-type anchors,
-   closure and SM range. Out of tree, use `graph.register_backend()` with an
-   id above `OUT_OF_TREE_ID_BASE` instead.
+   engines/capabilities, kernels), a `BaseEngine` subclass, and one
+   `EngineFamily` in `cudnn/engines/manifest.py` naming its module, factory,
+   slots, analyzer and heuristics -- plus its anchor node types in
+   `_ANCHOR_NODE_TO_FAMILY`. There is no out-of-tree route; the manifest is the
+   only way a python engine exists.
 
 
 ## The rules (read before changing anything)
@@ -768,6 +810,6 @@ Asserts:
     frontend-integration test that it appears in `graph.plans` and runs when
     pinned. Mark test modules `pytest.mark.L0` -- the default pytest addopts
     is `-m L0` and unmarked tests silently never run. Run
-    `ci/run_style_check_diff.sh --apply` (black, 160 cols) before pushing.
+    `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.

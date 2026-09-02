@@ -15,7 +15,12 @@ import torch
 from gemm_test_utils import requires_sm100
 from test_matmul import _fp4_quant_ref, _unpack_e2m1, _col_quant_reference
 
+import inspect
+
+from cudnn.gemm.frost import compiler
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.epilogue_codegen import generate
+from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
 
 pytestmark = [pytest.mark.L0, requires_sm100]
@@ -825,3 +830,54 @@ def test_single_moe_grouped_avg_reduction():
         if b < e:
             ref[gi, 0] = csw[b:e].mean(dim=0)
     torch.testing.assert_close(r, ref, atol=5e-2, rtol=2e-2)
+
+
+def test_moe_tma_arm_bounds_extra_outputs_by_the_routed_group() -> None:
+    """The TMA arm carries no row bound of its own, so an extra dense output's
+    store has to reapply the one its STG sibling uses. On MoE that is the routed
+    group's end, NOT the problem M — `row < M` writes rows belonging to the next
+    group and the result is wrong, not merely unclipped."""
+    g, c, _ = _graph()
+    r = g.relu(input=c, name="r")
+    r.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    g.gelu_approx_tanh(input=r, name="ge").set_output(True)
+    chain = analyze(g)
+    assert chain.has_moe and len(chain.output_specs) == 2
+
+    tma = generate(chain, tma_slots=frozenset({0})).epilogue
+    stg = generate(chain, tma_slots=frozenset()).epilogue
+
+    assert "row < group_end" in tma
+    assert "row < M" not in tma
+    # The STG arm is enclosed by the template's own guard and must stay bare.
+    assert "row < group_end" not in stg and "row < M" not in stg
+
+
+def test_per_group_per_col_aux_group_stride_need_not_divide_the_chunk() -> None:
+    """A per-group per-col aux loads at `group_idx * stride[0] + col_j`, and the
+    group stride used to have to be a whole number of epilogue chunks. It does
+    not: `ALIGN_AUX_<name>` is `min(the aux's OWN layout alignment, the chunk)`,
+    and `tensor_alignment` already folds the group stride in — so the alignment
+    promise degrades on its own. The old check predated that and only bit once
+    the TMA arm widened the chunk from the STG width to `epi_n`."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    from cudnn.gemm.frost.dtypes import tensor_alignment
+
+    # 248 * 4 bytes = 992 -> a 32-byte alignment, and 248 % 32 == 24.
+    assert tensor_alignment((_G, 1, 248), (248, 248, 1), 4) == 32
+    assert 248 % 32 != 0
+
+    g, c, _ = _graph()
+    bias = g.tensor(name="bias", dim=[_G, 1, _N], stride=[_N, _N, 1], data_type=cudnn.data_type.FLOAT)
+    g.add(a=c, b=bias, name="bi").set_output(True)
+    chain = analyze(g)
+    aux = chain.aux_tensors[0]
+    assert aux.grouped_by_moe and aux.bcast_mode == "per_col"
+
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    # `_N` is 256 here, so assert on the rule's shape rather than on this N:
+    # nothing in the gate may consult a per-group aux's stride.
+    assert _use_tma_store_epi(chain, cfg, 1) is True
+    src = inspect.getsource(compiler._output_store_mode)
+    for probe in ("grouped_by_moe", "bcast_mode", "aux_tensors"):
+        assert probe not in src, f"{probe}: an aux load's alignment is a pointwise concern, not a store rule"

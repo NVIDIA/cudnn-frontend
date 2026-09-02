@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** in the discrete (b_ptrs) FP8 configurations: pointer arrays as int64 (jax x64 mode) or packed uint8 (8 bytes per pointer), scale-factor tensors in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)` (the kernel rebuilds SF layouts from the GEMM shapes and reads only the base pointer), outputs allocated as C-contiguous `jnp` arrays. Dense weight mode and packed-fp4 A/B are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dsrelu_jax_sm100` (built on `cudnn.jax.call`; discrete FP8 mode, `sf_vec_size=32`): all outputs (d/SFD tensors, `dprob`, and with `generate_dbias=True` `dbias`) are XLA-managed donated zero-initialized buffers — no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the weight/scale buffers behind the pointer arrays must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Grouped GEMM + dsReLU backward fusion**: A grouped block-scaled GEMM fused with a probability-gradient backward epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE-style workloads. The API supports dense contiguous weights and discrete per-expert weight allocations. Groups are contiguous in the `M` dimension and described by `padded_offsets`.
@@ -232,7 +238,11 @@ op.execute(
   - Layout: must match `D_row`
   - Dtype: must match `D_row`
 - Output tensor **dprob**: `result["dprob_tensor"]` (wrapper) or `sample_dprob` / `dprob_tensor` (class)
-  - Shape: `(valid_m, 1, 1)`
+  - Shape (wrapper): `(valid_m, 1, 1)`, whether or not `deterministic` is set — the per-N-tile
+    workspace and the reduction into it are internal
+  - Shape: `(valid_m, 1, 1)` in both modes. Under `deterministic=True` the class API also takes
+    `sample_dprob_workspace` / `dprob_workspace_tensor` (`dprob_workspace_shape(valid_m, n)`,
+    float32) and the caller calls `reduce_dprob_workspace` after `execute()`
   - Dtype: `float32`
 - Output tensors **SFD_row** / **SFD_col**
   - Dtypes: must match `SFA`
@@ -266,6 +276,10 @@ op.execute(
   - Only `"n"` (n-major layout) is supported
 - `discrete_col_sfd: bool`
   - Enables the discrete column-scale-factor path used by grouped FP8
+- `deterministic: bool | None`
+  - Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob)
+  - Wrapper: `None` (default) follows `torch.use_deterministic_algorithms`
+  - Class API: plain `bool`, default `False`
 - CUDA stream (`current_stream` in class API, `current_stream` in wrapper)
 
 ### Wrapper return values
@@ -307,6 +321,95 @@ Tuple unpacking order is: `(d_row_tensor, d_col_tensor, dprob_tensor, dbias_tens
 
 - `m_aligned` must be `256`
 - Requires CUDA with SM100+ compute capability
+
+---
+
+## Deterministic dprob
+
+`dprob` is a float reduction rather than a single write per element, and by default it is not
+reproducible run to run. It is non-deterministic at two levels:
+
+1. **Within a CTA.** The N-subtile loop is traversed forward or reversed depending on the
+   accumulator pipeline phase, which varies between runs. A running fp32 sum over a flipping
+   order is not reproducible, because float addition is not associative.
+2. **Across CTAs.** Every N-tile atomically accumulates into the same `dprob[token]`, so the
+   summation order follows tile scheduling.
+
+`deterministic=True` fixes both. **Neither fix is sufficient on its own** — fixing only the
+cross-CTA atomic still leaves a divergent result.
+
+1. Each subtile's partial goes into a slot indexed by the actual subtile, then the slots are
+   summed in canonical order after the loop.
+2. `dprob` is given one slot per N-tile, so each `(token, tile_n)` pair has exactly one
+   writer, and those slots are reduced with `torch.sum` in fixed order.
+
+Left unset, the flag follows torch:
+
+```python
+# Process-wide, along with every other deterministic algorithm:
+torch.use_deterministic_algorithms(True)
+
+# Or explicitly, per call site, independent of the torch setting:
+result = cudnn.grouped_gemm_dsrelu_wrapper_sm100(..., deterministic=True)
+```
+
+`dprob_tensor` keeps its `(valid_m, 1, 1)` shape either way — the per-N-tile workspace and
+the reduction into it are internal to the wrapper. The class API is lower level: pass
+`sample_dprob` / `dprob_tensor` carrying one slot per N-tile and reduce over dim 1 yourself.
+
+**Cost.** `grid_n ×` the `dprob` workspace, one reduction kernel, and `subtile_cnt` extra
+registers per epilogue thread — and the last of those only for tile shapes that overlap the
+accumulator, since that is what reverses the subtile loop. Deterministic and
+non-deterministic configurations compile and cache separately.
+
+`grid_n` is the number of N-tiles the scheduler can emit, `ceil_div(n, TILE_N × cluster_n) ×
+cluster_n` — which is *not* `ceil_div(n, TILE_N)` unless `cluster_n` is 1, because the
+scheduler counts whole clusters and then expands to CTAs.
+
+**`dbias` is covered too, by a different mechanism.** By default the kernel accumulates it
+across *M*-tiles with bf16 atomics (`red.global.add.noftz.bf16x2`) in an order set by tile
+scheduling — a separate contention axis from `dprob`'s, since every N column is owned outright
+by one `(tile_n, subtile)` pair.
+
+Under `deterministic=True` the kernel instead writes one slot per `(absolute M-block, n)`,
+which has exactly one writer, and the reduction sums those per expert. Groups are padded to a
+multiple of `m_aligned`, so no M-block straddles two experts and each expert owns a contiguous
+block range `[padded_offsets[e-1] / cta_tile_m, padded_offsets[e] / cta_tile_m)`. The workspace
+is `ceil_div(valid_m, cta_tile_m) × n_out` **bf16** — 2 MiB at `valid_m=64k`, `n=2048`.
+
+The slots stay bf16 deliberately. Reproducibility comes from the single writer and the
+fixed-order reduction, not from a wider accumulator, so fp32 slots would double the memory and
+split one packed `bf16x2` store into two scalar ones for no determinism benefit. Accuracy still
+improves over the default: there each M-tile's atomic rounds the *running* sum, here each slot
+rounds once and the segment matmul accumulates them in fp32.
+
+That segment sum is a one-hot matmul rather than `index_add_`/`scatter_add_`, which are
+themselves non-deterministic on CUDA, and rather than a per-expert slice, which would need
+`padded_offsets` on the host — a sync in the training loop.
+
+**The output arguments are identical in both modes.** `dprob` is `(valid_m, 1, 1)` float32 and
+`dbias` is `(expert_cnt, n_out, 1)` bf16 whether or not the flag is set. What the flag adds is
+scratch, and only for the class API: `sample_dprob_workspace` / `dprob_workspace_tensor` and
+`sample_dbias_workspace` / `dbias_workspace_tensor`, sized by `dprob_workspace_shape(valid_m, n)`
+and `dbias_workspace_shape(valid_m, n)`, reduced afterwards by `reduce_dprob_workspace` and
+`reduce_dbias_workspace`. Use those rather than reducing by hand — a plain sum over dim 0 of the
+dbias slots is wrong, and wrong quietly. The wrapper allocates and reduces both for you.
+
+`check_support()` rejects `deterministic=True` with `m_aligned % (cta_tile_m × cluster_m) != 0`:
+the slot index is only single-writer if the scheduler emits no M-tile past an expert's range,
+which needs that division to be exact. Every supported shape satisfies it — `m_aligned` is
+pinned to 256 and `cta_tile_m × cluster_m` is 128 or 256 — but a wider cluster would alias one
+expert's phantom tiles onto the next expert's slots.
+
+Every other output — `d_row`, `d_col`, `d_srelu`, the scale factors — is a single write per
+element and is reproducible either way.
+
+**Streams.** `dprob`, `dbias` and `amax` are accumulated into, so the wrapper initialises them
+on `current_stream` rather than on torch's current stream; otherwise the memset is unordered
+against the kernel and the guarantee is void whenever the caller runs on its own stream. Those
+buffers are therefore allocated on `current_stream` too; the write-only outputs still come from
+torch's stream and are `record_stream`-ed onto `current_stream` instead. A caller driving the class
+API directly owns both of these itself.
 
 ---
 

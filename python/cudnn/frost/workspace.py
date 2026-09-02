@@ -26,6 +26,8 @@ tensor library.
 
 from __future__ import annotations
 
+from cudnn import _pybind_module
+
 from . import buffers
 
 # TMA tensormap patches need their 128-byte slot alignment; every other consumer
@@ -66,6 +68,19 @@ class WorkspaceLayout:
         return self._base_align
 
 
+def carve_plan(owner: str, regions) -> "_pybind_module.WorkspaceCarve":
+    """Compile a build-time carve: ``[(offset, dtype, shape), ...]``.
+
+    The regions are fixed once :class:`WorkspaceLayout` has run; only the base
+    pointer arrives per execute, so one crossing serves them all.
+    """
+    spec = []
+    for offset, dtype, shape in regions:
+        code, bits = buffers.DTYPES[dtype]
+        spec.append((int(offset), code, bits, [int(extent) for extent in shape]))
+    return _pybind_module.WorkspaceCarve(owner, spec)
+
+
 class Workspace:
     """Execute-time view onto the caller's workspace buffer.
 
@@ -90,6 +105,9 @@ class Workspace:
             raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes " "(size it with graph.get_workspace_size())")
         if ptr % align != 0:
             raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
+        self._init(ptr, nbytes, device, owner, align)
+
+    def _init(self, ptr, nbytes, device, owner, align):
         self._ptr = ptr
         self._device = device
         self._nbytes = nbytes
@@ -97,17 +115,48 @@ class Workspace:
         self._align = int(align)
         self._offset = 0
 
+    @classmethod
+    def over(cls, variant_pack, required_bytes: int, owner: str, *, align: int = DEFAULT_ALIGN) -> "Workspace":
+        """The same validated carver, over a workspace the pack already read."""
+        required_bytes = int(required_bytes)
+        ptr, nbytes = variant_pack.workspace, variant_pack.workspace_bytes
+        if not ptr:
+            raise ValueError(
+                f"{owner} requires a {required_bytes}-byte workspace but execute() received "
+                f"none; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
+            )
+        # 0 means the pack could not measure it, not that it is empty: a bare
+        # device address carries no size, and the backend takes one without
+        # checking either. Refusing here would make the same call depend on
+        # which plan ran.
+        if nbytes and nbytes < required_bytes:
+            raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())")
+        if ptr % align != 0:
+            raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
+        self = cls.__new__(cls)
+        self._init(ptr, nbytes, variant_pack.device, owner, align)
+        return self
+
     @property
     def nbytes(self) -> int:
         return self._nbytes
 
-    def view(self, offset: int, dtype: str, shape) -> buffers.DeviceView:
-        """The region a :class:`WorkspaceLayout` reserved at ``offset``."""
+    def view(self, offset: int, dtype: str, shape):
+        """The region a :class:`WorkspaceLayout` reserved at ``offset``.
+
+        A carve is the same kind of buffer a caller operand is, so a graph
+        hands its kernels one buffer type rather than two.
+        """
         count = 1
         for extent in shape:
             count *= int(extent)
         self._check_span(offset, count * buffers.DTYPE_ITEMSIZE[dtype])
-        return buffers.DeviceView(self._ptr + offset, shape, dtype, self._device)
+        code, bits = buffers.DTYPES[dtype]
+        return _pybind_module.make_operand_buffer(self._ptr + offset, list(shape), code, bits, self._device)
+
+    def carve(self, plan):
+        """Every region a :func:`carve_plan` describes, in one crossing."""
+        return plan.carve(self._ptr, self._nbytes, self._device)
 
     def take(self, numel: int, dtype: str) -> buffers.DeviceView:
         """The next region dealt sequentially: a 1-D ``numel``-element view."""
@@ -119,9 +168,14 @@ class Workspace:
 
     def remaining(self) -> buffers.DeviceView:
         """The tail no :meth:`take` has claimed, as uint8 — for a nested carver."""
+        if not self._nbytes:
+            raise ValueError(
+                f"{self._owner}: the workspace was passed as a bare address, so its size is unknown "
+                "and the unclaimed tail cannot be measured; pass a sized buffer to execute()"
+            )
         return buffers.DeviceView(self._ptr + self._offset, (self._nbytes - self._offset,), "uint8", self._device)
 
     def _check_span(self, offset: int, span: int) -> None:
         end = int(offset) + int(span)
-        if end > self._nbytes:
+        if self._nbytes and end > self._nbytes:
             raise ValueError(f"{self._owner}: workspace overrun — region [{offset}, {end}) exceeds the " f"{self._nbytes}-byte buffer (sizing bug)")

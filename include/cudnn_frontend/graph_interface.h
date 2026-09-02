@@ -381,6 +381,9 @@ class Graph : public ICudnn, public INode {
         if (attributes.generate_stats == true) {
             sdpa_outputs.Stats = attributes.outputs[SDPA_attributes::output_names::Stats] =
                 output_tensor(attributes.name + "::Stats");
+            // Stats is always computed and stored in FP32; setting it at creation keeps
+            // fill_from_context from assigning the (possibly narrower) io data type.
+            sdpa_outputs.Stats->set_data_type(DataType_t::FLOAT);
         }
 
         // Dropout mask dump (created conditionally based on dropout parameters)
@@ -1454,6 +1457,17 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        // The driver-API engines read the calling THREAD's context stack, and a
+        // thread that has done no CUDA work yet (a PyTorch autograd worker) has
+        // none. All roads reach here, so every execute is covered; the steady
+        // state is one cuCtxGetCurrent, and the stream query only runs when a
+        // context actually has to be established.
+        if (!detail::has_current_context()) {
+            cudaStream_t stream = nullptr;
+            detail::get_stream(handle, &stream);
+            detail::ensure_current_context(stream);
+        }
+
         // Lazy init: prepare template if not done (e.g. deserialized graphs, build_plan_at_index)
         if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
@@ -1768,6 +1782,42 @@ class Graph : public ICudnn, public INode {
 #endif
     }
 
+    /**
+     * @brief Deserialize an execution plan without a cuDNN handle.
+     *
+     * Requires set_device_properties() to have been called before this method; the plan
+     * is finalized against that descriptor instead of a handle. No warmup is performed —
+     * warmup requires a handle. Execution still requires a handle: execute(handle, ...).
+     *
+     * The data parameter must be a std::vector<uint8_t> blob produced by serialize().
+     * Note that std::vector<char> and std::string forms convert via nlohmann's implicit
+     * constructor and enter the structural-graph deserialize(json) overload instead.
+     *
+     * Requires cuDNN >= 9.8 at compile and runtime; returns GRAPH_NOT_SUPPORTED when
+     * compiled without JSON support. Runtime tests gate at 9.11 (matching the existing
+     * deviceless sample) because this path has not been validated on 9.8–9.10.
+     *
+     * @param data                UBJSON blob previously produced by serialize().
+     * @param enforce_precompiled When true, fail unless the blob carries a precompiled plan.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
+    error_t
+    deserialize(std::vector<uint8_t> const &data, bool const enforce_precompiled = false) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITHOUT HANDLE ");
+        if (device_properties == nullptr) {
+            return {error_code_t::ATTRIBUTE_NOT_SET,
+                    "device_properties is not set; call set_device_properties() before deserialize(), "
+                    "or use deserialize(handle, data) to supply a cuDNN handle"};
+        }
+        return deserialize_plan_impl(nullptr, device_properties, json::from_ubjson(data), enforce_precompiled, false);
+#else
+        CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
+
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     /**
      * @brief Deserialize an execution plan from an already-parsed json.
@@ -1783,11 +1833,21 @@ class Graph : public ICudnn, public INode {
     error_t
     deserialize(cudnnHandle_t handle, json const &j, bool const enforce_precompiled = false, bool run_warmup = true) {
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+        return deserialize_plan_impl(handle, nullptr, j, enforce_precompiled, run_warmup);
+    }
+
+   private:
+    error_t
+    deserialize_plan_impl(cudnnHandle_t handle,
+                          std::shared_ptr<const DeviceProperties> device_prop,
+                          json const &j,
+                          bool const enforce_precompiled,
+                          bool run_warmup) {
         CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
 
         // Clear deserialize-owned containers so a re-deserialize on the same Graph
         // does not feed prepare_variant_pack_template() with stale entries from a
-        // prior deserialize(handle, old_data).
+        // prior deserialize call.
         deserialized_tensor_properties.clear();
         deserialized_pass_by_value.clear();
         deserialized_workspace_modifications.clear();
@@ -1813,7 +1873,11 @@ class Graph : public ICudnn, public INode {
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
         auto serialized_plan = j["cudnn_backend_data"];
-        CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+        if (device_prop != nullptr) {
+            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+        }
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
 
@@ -1870,14 +1934,16 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        if (run_warmup) {
+        if (run_warmup && handle != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
         }
 
-        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE (ALL OK) ");
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN (ALL OK) ");
 
         return {error_code_t::OK, ""};
     }
+
+   public:
 #endif
 
     Type

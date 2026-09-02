@@ -19,6 +19,7 @@ from typing import Any
 
 _LAZY_EXPORTS = {
     "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),
+    "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),
 }
 
 

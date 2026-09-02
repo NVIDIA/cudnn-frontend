@@ -1,302 +1,246 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""KDA (Kimi Delta Attention) execution backend: KDA / KDA_BWD nodes on the
-chunked cuTile kernels (``kernels/kda_chunk_cutile``)."""
+"""cuTile KDA engine: KDA / KDA_BWD nodes on the chunked cuTile kernels
+(``kernels/kda``)."""
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING
 
 from cudnn import behavior_note
-from cudnn.engines.base import BaseEngine, CompiledPlan, resolve_node_buffers
-from cudnn.engines.engine_ids import LINEAR_ATTENTION_ID_BASE
+from cudnn.engines.base import BaseEngine, CompiledPlan, bind_ports
 from cudnn.graph_types import NodeType
+
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace
-from cudnn.linear_attention.engine_utils import _dtype_name
+from cudnn.frost.workspace import Workspace, WorkspaceLayout, carve_plan
+from ..graph_analyzer import analyze, to_buffer_dtype
+from .engine import check_layouts_compact, cutile_la_gate, expect_table
+
+GATE_LOWER_BOUND_RANGE = (-5.0, 0.0)
 
 if TYPE_CHECKING:
-    from cudnn.pygraph import pygraph
-
-_REQUIRED_PORTS = {
-    NodeType.KDA: ("q", "k", "v", "g", "beta", "cu_seqlens"),
-    NodeType.KDA_BWD: ("q", "k", "v", "g", "beta", "cu_seqlens", "dO"),
-}
+    from cudnn._pygraph import pygraph
 
 
-def _node_ws_layout(node):
-    """Static carve plan for one node's ``chunk_kda`` pipeline intermediates:
-    name -> (offset, dtype, shape). The chunk count is data-dependent
-    (varlen), so the 'h'/'dh' entries are SIZED with the upper bound
-    cdiv(total,64)+N and their shape carries None in the NT slot, substituted
-    at execute. A KDA_BWD node carries the union of the forward re-run's
-    intermediates and the backward temporaries, so both live disjointly in
-    one carve.  Terminal pipeline buffers (the forward's ``o``/``fs``; the
-    backward's boundary casts / l2norm outputs, ``dv2`` and ``dh0``) are NOT
-    carved — execute plants the caller's output buffers under those names."""
-    from .kernels.kda_chunk_cutile import _BT as BT, _cdiv, _next_power_of_2
+class KdaCuTilePlan(CompiledPlan):
+    """Carve plan over the caller's workspace, driven from the normalized
+    variant pack: the carve layout, geometry, scale and kernel module are fixed
+    per node at build; between executes only the buffer addresses move."""
 
-    q, v, g, cu = (node.inputs[p] for p in ("q", "v", "g", "cu_seqlens"))
-    total, H, K = q.dim
-    HV, V = v.dim[1], v.dim[2]
-    N = cu.dim[0] - 1
-    io = _dtype_name(q.get_data_type())
-    f32 = "float32"
-    BC = 32 if K >= 64 else 16  # fwd_intra sub-chunk (see chunk_kda_fwd_intra)
-    NK = _cdiv(K, min(64, _next_power_of_2(K)))  # bwd_intra K-split (see chunk_kda_bwd_intra)
-    NT_bound = _cdiv(total, BT) + N
-    l2norm = bool(node.params.get("use_qk_l2norm", False))
+    takes_variant_pack = True
+    plan_name = "KdaCuTileEngine"
 
-    size = 0
-    table = {}
+    def __init__(self, graph):
+        from .kernels import common
+        from .kernels import kda as kernels
 
-    def add(name, dtype, shape):
-        nonlocal size
-        nbytes = buffers.DTYPE_ITEMSIZE[dtype]
-        shape = tuple(NT_bound if s is None else int(s) for s in shape)
-        for s in shape:
-            nbytes *= s
-        table[name] = (size, dtype, shape)
-        size += (nbytes + 127) & ~127  # 128B-aligned sequential carve
+        (node,) = graph.nodes
+        self.kernels = kernels
+        self.common = common
+        self.is_bwd = node.node_type == NodeType.KDA_BWD
 
-    add("chunk_table", "int32", (NT_bound, 2))
-    add("chunk_count", "int32", (1,))
-    add("chunk_offsets", "int32", (N + 1,))
-    add("dummy", "int32", (4,))  # inert stub backing for absent optional kernel args
+        q, v, g, cu = (node.inputs[p] for p in ("q", "v", "g", "cu_seqlens"))
+        total, H, K = (int(d) for d in q.dim)
+        HV, V = int(v.dim[1]), int(v.dim[2])
+        N = int(cu.dim[0]) - 1
+        io = to_buffer_dtype(q.get_data_type())
+        f32 = "float32"
+        isz = buffers.DTYPE_ITEMSIZE[io]
+        BT = kernels.BT_CHUNK
+        BC = 32 if K >= 64 else 16
+        NT_bound = common.cdiv(total, BT) + N
+        l2norm = bool(node.params.get("use_qk_l2norm", False))
 
-    # chunk_kda forward (also re-run inside KDA_BWD)
-    add("g_cum", f32, (total, HV, K))
-    add("Aqk", io, (total, HV, BT))
-    add("Akk", io, (total, HV, BT))
-    add("Akkd", f32, (total, HV, BC))
-    add("w", io, (total, HV, K))
-    add("u", io, (total, HV, V))
-    add("qg", io, (total, HV, K))
-    add("kg", io, (total, HV, K))
-    add("h", io, (None, HV, K, V))
-    add("v_new", io, (total, HV, V))
-    if node.node_type == NodeType.KDA_BWD:
-        add("o", io, (total, HV, V))  # discarded output of the forward re-run
-    if l2norm:
-        add("q_norm", io, (total * H, K))
-        add("q_rstd", f32, (total * H,))
-        add("k_norm", io, (total * H, K))
-        add("k_rstd", f32, (total * H,))
-    if node.node_type == NodeType.KDA_BWD:
-        add("dAqk", f32, (total, HV, BT))
-        add("dv_dAv", io, (total, HV, V))
-        add("dh", io, (None, HV, K, V))
-        add("dv_dhu", io, (total, HV, V))
-        add("dq", f32, (total, HV, K))
-        add("dk", f32, (total, HV, K))
-        add("dg", f32, (total, HV, K))
-        if _dtype_name(node.inputs["beta"].get_data_type()) != f32:
-            add("db", f32, (total, HV))
-        add("dAkk", f32, (total, HV, BT))
-        add("dq2", f32, (total, HV, K))
-        add("dk2", f32, (total, HV, K))
-        if HV != H:
-            add("dq_hred", f32, (total, H, K))
-            add("dk_hred", f32, (total, H, K))
-        add("db2", f32, (NK, total, HV))
-        add("dg2", f32, (total, HV, K))
-        if _dtype_name(g.get_data_type()) != f32:
-            add("dg_cum", f32, (total, HV, K))
-    return size, table
+        layout = WorkspaceLayout()
+        regions = [
+            ("chunk_table", layout.add(NT_bound * 2 * 4), "int32", (NT_bound, 2)),
+            ("chunk_count", layout.add(4), "int32", (1,)),
+            ("chunk_offsets", layout.add((N + 1) * 4), "int32", (N + 1,)),
+            ("dummy", layout.add(16), "int32", (4,)),
+            ("g_cum", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+            ("Aqk", layout.add(total * HV * BT * isz), io, (total, HV, BT)),
+            ("Akk", layout.add(total * HV * BT * isz), io, (total, HV, BT)),
+            ("Akkd", layout.add(total * HV * BC * 4), f32, (total, HV, BC)),
+            ("w", layout.add(total * HV * K * isz), io, (total, HV, K)),
+            ("u", layout.add(total * HV * V * isz), io, (total, HV, V)),
+            ("qg", layout.add(total * HV * K * isz), io, (total, HV, K)),
+            ("kg", layout.add(total * HV * K * isz), io, (total, HV, K)),
+            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
+            ("v_new", layout.add(total * HV * V * isz), io, (total, HV, V)),
+        ]
+        if node.params.get("use_beta_sigmoid", False):
+            regions.append(("beta_sig", layout.add(total * HV * 4), f32, (total, HV)))
+        if self.is_bwd:
+            regions.append(("o", layout.add(total * HV * V * isz), io, (total, HV, V)))
+        if l2norm:
+            regions += [
+                ("q_norm", layout.add(total * H * K * isz), io, (total * H, K)),
+                ("q_rstd", layout.add(total * H * 4), f32, (total * H,)),
+                ("k_norm", layout.add(total * H * K * isz), io, (total * H, K)),
+                ("k_rstd", layout.add(total * H * 4), f32, (total * H,)),
+            ]
+        if self.is_bwd:
+            regions += [
+                ("dAqk", layout.add(total * HV * BT * 4), f32, (total, HV, BT)),
+                ("dv_dAv", layout.add(total * HV * V * isz), io, (total, HV, V)),
+                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
+                ("dv_dstate_u", layout.add(total * HV * V * isz), io, (total, HV, V)),
+                ("dq", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+                ("dk", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+                ("dg", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+            ]
+            if to_buffer_dtype(node.inputs["beta"].get_data_type()) != f32:
+                regions.append(("db", layout.add(total * HV * 4), f32, (total, HV)))
+            regions += [
+                ("dAkk", layout.add(total * HV * BT * 4), f32, (total, HV, BT)),
+                ("dq2", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+                ("dk2", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+            ]
+            if HV != H:
+                regions += [
+                    ("dq_hred", layout.add(total * H * K * 4), f32, (total, H, K)),
+                    ("dk_hred", layout.add(total * H * K * 4), f32, (total, H, K)),
+                ]
+            NK = common.cdiv(K, min(64, common.next_power_of_2(K)))
+            regions += [
+                ("db2", layout.add(NK * total * HV * 4), f32, (NK, total, HV)),
+                ("dg2", layout.add(total * HV * K * 4), f32, (total, HV, K)),
+            ]
+            if to_buffer_dtype(g.get_data_type()) != f32:
+                regions.append(("dg_cum", layout.add(total * HV * K * 4), f32, (total, HV, K)))
 
+        self.workspace_size = layout.size
+        self.carve_names = [name for name, _off, _dtype, _shape in regions]
+        self.carve = carve_plan(self.plan_name, [(off, dtype, shape) for _name, off, dtype, shape in regions])
+        self.expect = expect_table(node)
+        self.n_seqs = N
+        self.bound = NT_bound
+        self.bt_chunk = BT
 
-class _KdaCuTilePlan(CompiledPlan):
-    """Carve plan over the caller's workspace (see GdnCuTileEngine's
-    ``_CuTilePlan``): static per-node layout; the buffer arrives with every
-    execute (the explicit-workspace convention)."""
+        scale = node.params.get("scale")
+        self.scale = float(scale or K**-0.5) if self.is_bwd else scale
+        self.l2norm = l2norm
+        self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.safe_gate = bool(node.params.get("safe_gate", False))
+        self.lower_bound = float(node.params.get("gate_lower_bound") or GATE_LOWER_BOUND_RANGE[0])
+        self.want_state = "final_state" in node.outputs
 
-    def __init__(self, engine, graph):
-        self._engine = engine
-        self._layouts = [(node, *_node_ws_layout(node)) for node in graph.nodes]
-        # nodes execute sequentially, each re-carving the same buffer
-        self._ws_bytes = max(nbytes for _, nbytes, _ in self._layouts)
+        if self.is_bwd:
+            carved = set(self.carve_names)
+            plant = [
+                ("dq_cast", "dQ"),
+                ("dk_cast", "dK"),
+                ("dv2", "dV"),
+                ("dg_cast" if "dg_cum" in carved else "dg_cum", "dG"),
+                ("db_cast" if "db" in carved else "db", "dBeta"),
+            ]
+            if l2norm:
+                plant += [("dq_l2", "dQ"), ("dk_l2", "dK")]
+            if "initial_state" in node.inputs:
+                plant.append(("dstate0", "d_initial_state"))
+        else:
+            plant = [("o", "O")] + ([("final_state", "final_state")] if self.want_state else [])
+        self.plant = tuple(plant)
+
+        self.ports = None
+        self.names = None
+        self.indices = None
 
     def get_workspace_size(self) -> int:
-        return self._ws_bytes
+        return self.workspace_size
 
-    def execute(self, graph, uid_to_data, ctx) -> None:
-        self._engine._execute(resolve_node_buffers(graph, uid_to_data), self, ctx)
+    def execute(self, graph, variant_pack, ctx) -> None:
+        if self.ports is None:
+            self.ports = bind_ports(graph, variant_pack)
+            (slots,) = self.ports.values()
+            self.names = list(slots.inputs) + list(slots.outputs)
+            self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
+        views = variant_pack.operands(self.indices)
+        check_layouts_compact(self.plan_name, self.expect, self.names, views)
+        nb = dict(zip(self.names, views))
+        stream = ctx.stream if ctx.stream is not None else 0
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        self.common.build_chunk_table(
+            region["chunk_table"],
+            region["chunk_count"],
+            region["chunk_offsets"],
+            nb["cu_seqlens"],
+            self.n_seqs,
+            self.bt_chunk,
+            self.bound,
+            stream=stream,
+        )
+        for name, port in self.plant:
+            region[name] = nb[port]
+        if self.is_bwd:
+            self.execute_bwd(nb, region, stream)
+        else:
+            self.execute_fwd(nb, region, stream)
+
+    def execute_fwd(self, nb, region, stream) -> None:
+        gate = {}
+        if self.use_beta_sigmoid:
+            gate["use_beta_sigmoid_in_kernel"] = True
+        if self.safe_gate:
+            gate.update(safe_gate=True, use_gate_in_kernel=True, lower_bound=self.lower_bound, A_log=nb["a_log"], dt_bias=nb["dt_bias"])
+        self.kernels.chunk_kda(
+            nb["q"],
+            nb["k"],
+            nb["v"],
+            nb["g"],
+            nb["beta"],
+            scale=self.scale,
+            initial_state=nb.get("initial_state"),
+            output_final_state=self.want_state,
+            use_qk_l2norm_in_kernel=self.l2norm,
+            cu_seqlens=nb["cu_seqlens"],
+            chunk_indices=region["chunk_table"],
+            bufs=region,
+            state_v_first=True,
+            stream=stream,
+            **gate,
+        )
+
+    def execute_bwd(self, nb, region, stream) -> None:
+        self.kernels.chunk_kda_grad(
+            nb["q"],
+            nb["k"],
+            nb["v"],
+            nb["g"],
+            nb["beta"],
+            nb["dO"],
+            dstate_in=nb.get("d_final_state"),
+            scale=self.scale,
+            initial_state=nb.get("initial_state"),
+            use_qk_l2norm_in_kernel=self.l2norm,
+            cu_seqlens=nb["cu_seqlens"],
+            chunk_indices=region["chunk_table"],
+            bufs=region,
+            state_v_first=True,
+            stream=stream,
+        )
 
 
 class KdaCuTileEngine(BaseEngine):
     """cuTile chunked-kernel backend for single-node KDA graphs (THD layout)."""
 
     name = "kda_cutile"
-    engine_id = LINEAR_ATTENTION_ID_BASE + 4  # stable id (see engine_ids.py); ranked after KdaFrostEngine
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
-        if buffers.current_sm() is None:
-            raise NotImplementedError("KdaCuTileEngine requires a CUDA device")
         try:
-            from cuda.bindings import runtime as _rt
+            from .kernels.kda import chunk_kda  # noqa: F401 — availability probe: ImportError = decline
+        except ImportError as exc:
+            raise NotImplementedError(f"KdaCuTileEngine requires the cuda.tile runtime: {exc}") from exc
 
-            err, _cudart_version = _rt.cudaRuntimeGetVersion()
-            if int(err) != 0:
-                raise NotImplementedError(f"KdaCuTileEngine: cudaRuntimeGetVersion failed ({err})")
-        except ImportError as e:
-            raise NotImplementedError(f"KdaCuTileEngine requires cuda.bindings: {e}")
-        if _cudart_version < 13030:
-            raise NotImplementedError(f"KdaCuTileEngine requires CUDA 13.3+ (found {_cudart_version})")
-        try:
-            from .kernels.kda_chunk_cutile import (  # noqa: F401
-                chunk_kda,
-            )
-        except ImportError as e:
-            raise NotImplementedError(f"KdaCuTileEngine requires the cuda.tile runtime: {e}")
-
-        import cudnn
-
-        supported_dtypes = (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, None)
-        if not graph.nodes:
-            raise NotImplementedError("KdaCuTileEngine: empty graph")
-        for node in graph.nodes:
-            required = _REQUIRED_PORTS.get(node.node_type)
-            if required is None:
-                raise NotImplementedError(f"KdaCuTileEngine only supports KDA/KDA_BWD nodes, got {node.node_type.name}")
-            for port in required:
-                if port not in node.inputs:
-                    raise NotImplementedError(f"KdaCuTileEngine: {node.node_type.name} node '{node.name}' is missing input '{port}'")
-            if int(node.params.get("checkpoint_every_n_tokens", 0) or 0) > 0 or "H" in node.outputs:
-                raise NotImplementedError("KdaCuTileEngine: per-chunk H output is not supported")
-            q, k, v = (node.inputs[p] for p in ("q", "k", "v"))
-            for p in ("q", "k", "v"):
-                t = node.inputs[p]
-                if t.get_data_type() not in supported_dtypes:
-                    raise NotImplementedError(f"KdaCuTileEngine: '{p}' must be fp16/bf16, got {t.get_data_type()}")
-                if t.dim and len(t.dim) != 3:
-                    raise NotImplementedError(f"KdaCuTileEngine: '{p}' must be THD [total_T, heads, dim], got rank {len(t.dim)}")
-            if q.dim and k.dim and q.dim[1] != k.dim[1]:
-                raise NotImplementedError(f"KdaCuTileEngine: q and k head counts differ ({q.dim[1]} vs {k.dim[1]})")
-            if q.dim and v.dim and v.dim[1] % q.dim[1] != 0:
-                raise NotImplementedError(
-                    f"KdaCuTileEngine: v heads ({v.dim[1]}) must be a multiple of q heads ({q.dim[1]}; GQA-style v broadcast is FROST-only)"
-                )
-            if q.dim and q.dim[-1] > 256:
-                raise NotImplementedError(f"KdaCuTileEngine: head dim K must be <= 256, got {q.dim[-1]}")
-            if node.inputs["cu_seqlens"].get_data_type() not in (cudnn.data_type.INT32, None):
-                raise NotImplementedError("KdaCuTileEngine: cu_seqlens must be int32 (the device-side table builder reads it directly)")
-            io = q.get_data_type()
-            f32 = cudnn.data_type.FLOAT
-            if node.node_type == NodeType.KDA:
-                out_dtypes = {"O": io, "final_state": f32}
-                required_out = ("O",)
-            else:
-                out_dtypes = {
-                    "dQ": io,
-                    "dK": io,
-                    "dV": io,
-                    "dG": node.inputs["g"].get_data_type(),
-                    "dBeta": node.inputs["beta"].get_data_type(),
-                    "d_initial_state": f32,
-                }
-                required_out = ("dQ", "dK", "dV", "dG", "dBeta")
-                if ("initial_state" in node.inputs) != ("d_initial_state" in node.outputs):
-                    raise NotImplementedError("KdaCuTileEngine: d_initial_state output must be requested iff initial_state is given")
-            for port in required_out:
-                if port not in node.outputs:
-                    raise NotImplementedError(f"KdaCuTileEngine: {node.node_type.name} node '{node.name}' is missing output '{port}'")
-            for port, want in out_dtypes.items():
-                t = node.outputs.get(port)
-                if t is not None and t.get_data_type() not in (want, None):
-                    raise NotImplementedError(f"KdaCuTileEngine: output '{port}' must be {want} (written in place), got {t.get_data_type()}")
+        facts = graph._facts_for(analyze)
+        cutile_la_gate("KdaCuTileEngine", facts, "KDA", facts.g_dtype if facts is not None else None)
+        if facts.is_bwd and (facts.safe_gate or facts.use_beta_sigmoid):
+            raise NotImplementedError("KdaCuTileEngine: raw-logit gate modes (safe_gate / use_beta_sigmoid) are forward-only")
+        low, high = GATE_LOWER_BOUND_RANGE
+        glb = facts.gate_lower_bound
+        if glb is not None and not (low <= glb < high):
+            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [{low}, {high}) (chunk_kda log-gate floor), got {glb}")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        return _KdaCuTilePlan(self, graph)
-
-    def _execute(self, node_buffers, plan, ctx) -> None:
-        from .kernels.common import build_chunk_table
-        from .kernels.kda_chunk_cutile import _BT
-
-        stream = getattr(ctx, "stream", None)
-        stream = 0 if stream is None else stream
-        ws = Workspace(getattr(ctx, "workspace", None), plan._ws_bytes, "KdaCuTileEngine")
-        for node, _nbytes, table in plan._layouts:
-            nb = node_buffers[node]
-            cu_seqlens = nb.inputs["cu_seqlens"]
-            N = node.inputs["cu_seqlens"].dim[0] - 1
-            bufs = {name: ws.view(off, dt, shape) for name, (off, dt, shape) in table.items()}
-            bound = bufs["chunk_table"].shape[0]
-            build_chunk_table(bufs["chunk_table"], bufs["chunk_count"], bufs["chunk_offsets"], cu_seqlens, N, _BT, bound, stream=stream)
-            if node.node_type == NodeType.KDA:
-                self._execute_fwd(node, nb, bufs, stream)
-            else:
-                self._execute_bwd(node, nb, bufs, stream)
-
-    @staticmethod
-    def _state_f32(s0):
-        # the kernel wants the recurrent state in fp32; callers convert
-        if s0 is not None and not str(s0.dtype).endswith("float32"):
-            raise ValueError("KdaCuTileEngine: state ports must be fp32 (callers convert)")
-        return s0
-
-    def _execute_fwd(self, node, nb, bufs, stream) -> None:
-        from .kernels.kda_chunk_cutile import chunk_kda
-
-        want_state = "final_state" in node.outputs
-        # terminal pipeline buffers = the caller's output buffers
-        bufs["o"] = nb.outputs["O"]
-        if want_state:
-            bufs["fs"] = nb.outputs["final_state"]
-        chunk_kda(
-            nb.inputs["q"],
-            nb.inputs["k"],
-            nb.inputs["v"],
-            nb.inputs["g"],
-            nb.inputs["beta"],
-            scale=node.params.get("scale"),
-            initial_state=self._state_f32(nb.inputs.get("initial_state")),
-            output_final_state=want_state,
-            use_qk_l2norm_in_kernel=bool(node.params.get("use_qk_l2norm", False)),
-            cu_seqlens=nb.inputs["cu_seqlens"],
-            chunk_indices=bufs["chunk_table"],
-            bufs=bufs,
-            stream=stream,
-        )
-
-    def _execute_bwd(self, node, nb, bufs, stream) -> None:
-        from .kernels.common import reshaped
-        from .kernels.kda_chunk_cutile import chunk_kda_grad
-
-        total, H, K = node.inputs["q"].dim
-        cu_seqlens = nb.inputs["cu_seqlens"]
-        initial_state = nb.inputs.get("initial_state")
-        dht = nb.inputs.get("d_final_state")
-        do, q, k, v = nb.inputs["dO"], nb.inputs["q"], nb.inputs["k"], nb.inputs["v"]
-        g, beta = nb.inputs["g"], nb.inputs["beta"]
-        scale = node.params.get("scale") or K**-0.5
-
-        # terminal pipeline buffers = the caller's output buffers
-        dQ_out = nb.outputs["dQ"]
-        dK_out = nb.outputs["dK"]
-        if node.params.get("use_qk_l2norm", False):
-            bufs["dq_l2"] = reshaped(dQ_out, (total * H, K))
-            bufs["dk_l2"] = reshaped(dK_out, (total * H, K))
-        bufs["dq_cast"] = dQ_out
-        bufs["dk_cast"] = dK_out
-        bufs["dv2"] = nb.outputs["dV"]
-        bufs["dg_cast" if "dg_cum" in bufs else "dg_cum"] = nb.outputs["dG"]
-        bufs["db_cast" if "db" in bufs else "db"] = nb.outputs["dBeta"]
-        if initial_state is not None:
-            bufs["dh0"] = nb.outputs["d_initial_state"]
-
-        chunk_kda_grad(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            do,
-            dht=self._state_f32(dht),
-            scale=scale,
-            initial_state=self._state_f32(initial_state),
-            use_qk_l2norm_in_kernel=bool(node.params.get("use_qk_l2norm", False)),
-            cu_seqlens=cu_seqlens,
-            chunk_indices=bufs["chunk_table"],
-            bufs=bufs,
-            stream=stream,
-        )
+        return KdaCuTilePlan(graph)

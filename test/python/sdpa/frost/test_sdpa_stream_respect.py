@@ -18,24 +18,9 @@ import torch
 
 import cudnn
 from cudnn.engines import is_python_engine
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed
 
-
-def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 0)
-
-
-def _dsl_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-pytestmark = [
-    pytest.mark.L0,
-    pytest.mark.skipif(not (_is_sm100() and _dsl_available()), reason="needs an SM100 (Blackwell) GPU with cutlass"),
-]
+pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
 _B, _H, _S = 2, 8, 256
 _HALF, _F32 = cudnn.data_type.HALF, cudnn.data_type.FLOAT

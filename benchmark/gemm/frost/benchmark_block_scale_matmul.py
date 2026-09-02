@@ -10,14 +10,8 @@ in / BF16 out) vs a reference. Perf only, no CPU verify.
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-from typing import Callable
 
 import cudnn  # noqa: F401
 import cudnn.gemm.frost  # noqa: F401
@@ -26,23 +20,38 @@ import torch
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.tile_config import CATALOG as _CATALOG
 
+from benchmark_utils import (
+    add_sweep_args,
+    ceil_div,
+    find_cublas_time,
+    kernel_match_token,
+    nsys_run_and_parse,
+    rand_e8m0,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_configs,
+    set_bytes,
+    spec_for,
+    time_ms_delayed,
+    time_ms_events,
+    to_blocked,
+)
+
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for block-scale
+    """Legacy label -> (geometry cfg, cta_group) for block-scale
     strategies (geometry must satisfy the SF 128x4 swizzle; K-tile bytes are
     arch-keyed: 128 on sm100, 384 on sm103)."""
     m = {}
     for cfg in _CATALOG:
         kb_want = 384 if cfg.pipeline == "sm103" else 128
-        if cfg.cta_tile_m % 128 or cfg.cta_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
+        if cfg.mma_inst_m % 128 or cfg.mma_inst_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
-        # sm103 has 1ctamma + 2ctamma CLC templates (no static variants).
-        scheds = (("clc", ""),) if cfg.pipeline == "sm103" else (("clc", ""), ("static", "_static"))
         for cg in (1, 2):
             if cg == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_m == 64):
                 continue
-            for sched, tok in scheds:
-                m[f"{cfg.name}_{cg}ctamma{tok}"] = (cfg, cg, sched)
+            m[f"{cfg.name}_{cg}ctamma"] = (cfg, cg)
     return m
 
 
@@ -57,7 +66,8 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+    _, cta_group = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 # Combo table (input dtype family + scale dtype + block size)
@@ -102,24 +112,6 @@ def _graph_block_scale(batch: int, M: int, N: int, K: int, combo: str):
     return g, (A, Bt, C, SFA, SFB)
 
 
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _to_blocked(x):
-    """Pack a (rows, cols) scale tensor into the 128x4 blocked layout."""
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _rand_e8m0(shape, dev):
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
-
-
 def _mkdata(batch: int, M: int, N: int, K: int, combo: str):
     """Block-scale runtime tensors: (a, b, c, sfa_blocked, sfb_blocked). a/b are
     packed FP4 or FP8; c is BF16; SFA/SFB are F8_128x4-reordered per batch."""
@@ -141,28 +133,16 @@ def _mkdata(batch: int, M: int, N: int, K: int, combo: str):
         sfa_log = torch.randint(1, 4, (batch, M, sf_k), device=dev).to(torch.float8_e4m3fn)
         sfb_log = torch.randint(1, 4, (batch, N, sf_k), device=dev).to(torch.float8_e4m3fn)
     else:
-        sfa_log = _rand_e8m0((batch, M, sf_k), dev)
-        sfb_log = _rand_e8m0((batch, N, sf_k), dev)
+        sfa_log = rand_e8m0((batch, M, sf_k), dev)
+        sfb_log = rand_e8m0((batch, N, sf_k), dev)
 
     c = torch.empty(batch, M, N, dtype=torch.bfloat16, device=dev)
-    sfa = torch.cat([_to_blocked(sfa_log[i]) for i in range(batch)]).view(batch, M, sf_k)
-    sfb = torch.cat([_to_blocked(sfb_log[i]) for i in range(batch)]).view(batch, N, sf_k)
+    # The blocked blob carries the PADDED dims (whole 128-row x 4-SF-K atoms) —
+    # that is what the kernel reads. The graph keeps the logical [batch, M, sf_k].
+    sf_k_pad = ceil_div(sf_k, 4) * 4
+    sfa = torch.cat([to_blocked(sfa_log[i]) for i in range(batch)]).view(batch, ceil_div(M, 128) * 128, sf_k_pad)
+    sfb = torch.cat([to_blocked(sfb_log[i]) for i in range(batch)]).view(batch, ceil_div(N, 128) * 128, sf_k_pad)
     return a, b, c, sfa, sfb
-
-
-# Buffer rotation defeats the hot-L2 artifact on small shapes: rotate timed
-# launches across a pool of independent tensor sets so a kernel never re-reads the
-# previous launch's inputs from a hot L2 (which inflates TFLOPS). Warmup uses a
-# separate dedicated buffer. A pool smaller than the ~126 MB B200 L2 stays warm
-# after one rotation — warn the user to bump --rotate-buffers.
-_L2_BYTES_B200 = 126 * 1024 * 1024
-_AUTO_POOL_BUDGET_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
-_AUTO_NBUF_CAP = 1024
-
-
-def _set_bytes(tensors) -> int:
-    """GMEM footprint of one tensor set (packed FP4 is 1 byte per pair)."""
-    return sum(t.numel() * t.element_size() for t in tensors)
 
 
 def _mkdata_pool(batch: int, M: int, N: int, K: int, combo: str, nbuf: int):
@@ -174,33 +154,7 @@ def _mkdata_pool(batch: int, M: int, N: int, K: int, combo: str, nbuf: int):
     return pool
 
 
-def _auto_nbuf(per_set_bytes: int) -> int:
-    """Smallest buffer count whose pool exceeds L2 (1.5× margin), clamped to a
-    memory budget. Large shapes → 2; small shapes → scaled up until L2-cold."""
-    target = int(1.5 * _L2_BYTES_B200)
-    nbuf = max(2, -(-target // per_set_bytes))  # ceil-div
-    budget = _AUTO_POOL_BUDGET_BYTES
-    if torch.cuda.is_available():
-        free, _total = torch.cuda.mem_get_info()
-        budget = min(budget, free // 2)
-    max_by_budget = max(1, budget // per_set_bytes)
-    return max(1, min(nbuf, max_by_budget, _AUTO_NBUF_CAP))
-
-
-def _resolve_nbuf(spec: str, per_set_bytes: int) -> int:
-    """Resolve --rotate-buffers: 'auto' → shape-sized count, else the integer."""
-    if str(spec).strip().lower() == "auto":
-        return _auto_nbuf(per_set_bytes)
-    return max(1, int(spec))
-
-
-def _rotating(fn_of_set: Callable, pool: list) -> Callable:
-    """Wrap a `set -> None` callable into `i -> pool[i % len(pool)]`."""
-    n = len(pool)
-    return lambda i: fn_of_set(pool[i % n])
-
-
-def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
+def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str, verbose: bool = True):
     """(label, call) for cuBLAS's OWN block-scaled GEMM of this combo, via
     torch.nn.functional.scaled_mm (cuBLASLt) — the apples-to-apples reference.
     Returns None if the env can't run it (some cuBLASLt builds return no
@@ -217,7 +171,6 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
     is_fp4, bs, _, _ = _COMBOS[combo]
     ru = lambda x, m: ((x + m - 1) // m) * m
     cd = lambda a, b: (a + b - 1) // b
-    sw = [SwizzleType.SWIZZLE_32_4_4]
 
     if is_fp4:
         a = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
@@ -235,11 +188,14 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
         gb = torch.ones(1, device=dev)
         recipe = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
         scA, scB = [sa, ga], [sb, gb]
+        # scaled_mm wants one swizzle PER scale in the recipe.
+        sw = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
     else:  # mxfp4 / mxfp8 — no global scale
         sa = torch.randn(na, device=dev).to(torch.float8_e8m0fnu)
         sb = torch.randn(nb, device=dev).to(torch.float8_e8m0fnu)
         recipe = [ScalingType.BlockWise1x32]
         scA, scB = [sa], [sb]
+        sw = [SwizzleType.SWIZZLE_32_4_4]
 
     # scaled_mm has no batched form, so a batched ref is B back-to-back single-GEMM
     # calls (same operands); FLOPS counts all B so throughput stays comparable.
@@ -252,7 +208,10 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
     try:
         call()
         torch.cuda.synchronize()
-    except Exception:
+    except Exception as e:
+        # Print it — an unrunnable env and an API-shape bug look identical otherwise.
+        if verbose:
+            print(f"  [scaled_mm '{combo}' reference unavailable: {type(e).__name__}: {e}]")
         return None
     suffix = f" ×{batch}" if batch > 1 else ""
     return f"cuBLAS {combo} scaled_mm{suffix}", call
@@ -265,15 +224,15 @@ def _make_reference(batch: int, M: int, N: int, K: int, combo: str, ref_mode: st
     / bf16 (dense BF16) / auto (scaled_mm, falling back to BF16)."""
     dev = "cuda"
     if ref_mode in ("auto", "scaled_mm"):
-        ref = _scaled_mm_ref(batch, M, N, K, combo)
+        ref = _scaled_mm_ref(batch, M, N, K, combo, verbose=verbose)
         if ref is not None:
             return ref
         if ref_mode == "scaled_mm":
             sys.exit(
                 f"--ref scaled_mm: cuBLAS block-scaled GEMM for '{combo}' is not "
-                f"runnable here — torch.nn.functional.scaled_mm raised at the "
-                f"cuBLASLt heuristic (no algorithm for this driver / cuBLASLt "
-                f"build). Use --ref bf16, or --ref auto to fall back automatically."
+                f"runnable here — torch.nn.functional.scaled_mm raised (see the "
+                f"message above). Use --ref bf16, or --ref auto to fall back "
+                f"automatically."
             )
         if verbose:
             print("  [note: scaled_mm reference unavailable in this env — " "falling back to dense BF16 cuBLAS]")
@@ -291,194 +250,6 @@ def _make_reference_pool(batch: int, M: int, N: int, K: int, combo: str, ref_mod
     label, warmup_call = _make_reference(batch, M, N, K, combo, ref_mode, verbose=True)
     timed_calls = [_make_reference(batch, M, N, K, combo, ref_mode, verbose=False)[1] for _ in range(nbuf)]
     return label, warmup_call, timed_calls
-
-
-# Timing (events / delayed) — identical to benchmark_matmul.py
-
-
-def _time_ms_events(
-    timed_fn: Callable,
-    warmup_fn: Callable,
-    *,
-    warmup: int,
-    iters: int,
-) -> float:
-    """`timed_fn(i)` rotates buffers; `warmup_fn()` uses a dedicated buffer."""
-    for _ in range(warmup):
-        warmup_fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for i in range(iters):
-        timed_fn(i)
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def _time_ms_delayed(
-    timed_fn: Callable,
-    warmup_fn: Callable,
-    *,
-    warmup: int,
-    iters: int,
-) -> float:
-    """Kernel-only timing: hide host-launch overhead behind a delay kernel (see
-    benchmark_matmul.py). `timed_fn(i)` rotates buffers; `warmup_fn()` dedicated."""
-    for _ in range(warmup):
-        warmup_fn()
-    torch.cuda.synchronize()
-
-    delay_cycles = max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6))
-    torch.cuda._sleep(delay_cycles)
-
-    post_warmup = max(5, warmup)
-    for _ in range(post_warmup):
-        warmup_fn()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for i in range(iters):
-        timed_fn(i)
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-# nsys mode — mirrors benchmark_matmul.py
-
-
-def _nsys_run_and_parse(shape, combo, configs, warmup, iters, ref_mode, nbuf) -> dict[str, float]:
-    nsys = "/usr/local/bin/nsys" if os.path.exists("/usr/local/bin/nsys") else shutil.which("nsys")
-    if nsys is None:
-        sys.exit("nsys not found — install nsight-systems or use the default events mode.")
-
-    workdir = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"bench_bs_nsys_{os.getpid()}")
-    os.makedirs(workdir, exist_ok=True)
-    report_prefix = os.path.join(workdir, "report")
-
-    nsys_env = os.environ.copy()
-    nsys_env.setdefault("TMPDIR", os.environ.get("TMPDIR", tempfile.gettempdir()))
-
-    inner = [
-        sys.executable,
-        "-u",
-        os.path.abspath(__file__),
-        "--_nsys-worker",
-        "--shape",
-        shape,
-        "--combo",
-        combo,
-        "--ref",
-        ref_mode,
-        "--warmup",
-        str(warmup),
-        "--iters",
-        str(iters),
-        "--rotate-buffers",
-        str(nbuf),
-    ]
-    if configs:
-        inner += ["--configs", ",".join(configs)]
-
-    profile_cmd = [
-        nsys,
-        "profile",
-        "-o",
-        report_prefix,
-        "--force-overwrite=true",
-        "--cuda-um-cpu-page-faults=false",
-        "--cuda-um-gpu-page-faults=false",
-        "--trace=cuda",
-    ] + inner
-
-    print(f"  + {' '.join(profile_cmd)}\n")
-    proc = subprocess.run(profile_cmd, capture_output=True, text=True, env=nsys_env)
-    if proc.returncode != 0:
-        print("nsys stdout:\n" + proc.stdout)
-        print("nsys stderr:\n" + proc.stderr, file=sys.stderr)
-        sys.exit(f"nsys profile exited {proc.returncode}")
-
-    stats_cmd = [
-        nsys,
-        "stats",
-        "--report",
-        "cuda_gpu_kern_sum",
-        "--force-export=true",
-        report_prefix + ".nsys-rep",
-    ]
-    proc = subprocess.run(stats_cmd, capture_output=True, text=True, env=nsys_env)
-    if proc.returncode != 0:
-        print("nsys stats stdout:\n" + proc.stdout)
-        print("nsys stats stderr:\n" + proc.stderr, file=sys.stderr)
-        sys.exit(f"nsys stats exited {proc.returncode}")
-
-    return _parse_nsys_stats(proc.stdout)
-
-
-def _parse_nsys_stats(text: str) -> dict[str, float]:
-    lines = text.splitlines()
-    header_i = None
-    for i, ln in enumerate(lines):
-        if "Med (" in ln and "Name" in ln and ("ns)" in ln or "us)" in ln or "ms)" in ln):
-            header_i = i
-            break
-    if header_i is None:
-        sys.exit("could not find kernel-summary header in nsys stats output:\n  " + "\n  ".join(lines[:60]))
-
-    m_unit = re.search(r"Med \((\w+)\)", lines[header_i])
-    unit = m_unit.group(1) if m_unit else "ns"
-    unit_div = {"ns": 1e6, "us": 1e3, "ms": 1.0, "s": 1e-3}.get(unit, 1e6)
-
-    NUM_NUMERIC_COLS = 8
-    MED_COL = 4
-
-    result: dict[str, float] = {}
-    in_data = False
-    for j in range(header_i + 1, len(lines)):
-        row = lines[j]
-        stripped = row.strip()
-        if not stripped:
-            if in_data:
-                break
-            continue
-        if set(stripped) <= set("- "):
-            in_data = True
-            continue
-        if not in_data:
-            continue
-        if stripped.startswith("**") or stripped.startswith("##"):
-            break
-
-        toks = stripped.split()
-        if len(toks) <= NUM_NUMERIC_COLS:
-            continue
-        try:
-            med = float(toks[MED_COL].replace(",", ""))
-        except ValueError:
-            continue
-        name = " ".join(toks[NUM_NUMERIC_COLS:]).rstrip()
-        if not name:
-            continue
-        result[name] = med / unit_div
-    return result
-
-
-def _match_kernel_name(kern_name: str, config_name: str) -> bool:
-    return config_name in kern_name
-
-
-def _find_cublas_time(kern_times: dict[str, float]) -> tuple[str, float] | None:
-    """The reference kernel in the nsys report: cuBLAS GEMMs show up as `nvjet_*`;
-    if none match, fall back to the heaviest non-tagged kernel."""
-    cands = [(k, v) for k, v in kern_times.items() if k.startswith("nvjet_")]
-    if not cands:
-        cands = [(k, v) for k, v in kern_times.items() if "_kernel_CONFIG_sm100_" not in k]
-    if not cands:
-        return None
-    return max(cands, key=lambda x: x[1])
 
 
 # Worker mode: run the kernels under nsys profile, no Python timing.
@@ -500,10 +271,10 @@ def _nsys_worker(shape, combo, configs, warmup, iters, ref_mode, nbuf) -> None:
     torch.cuda.synchronize()
 
     # 2. each block-scale config.
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
     config_names = configs or list(_SPEC_MAP)
     for name in config_names:
-        cfg = name_to_cfg.get(name)
+        spec = spec_for(name, _SPEC_MAP)
+        cfg = spec[0] if spec else None
         if cfg is None:
             continue
         try:
@@ -534,20 +305,6 @@ def main() -> int:
         default="nvfp4",
         help="block-scale dtype family (default nvfp4: FP4 + E4M3 SF, block16)",
     )
-    parser.add_argument("--warmup", type=int, default=10)
-    # CLAUDE.md: keep iters <= 20 — more just lengthens the run / holds the GPU.
-    parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument(
-        "--configs",
-        default=None,
-        help="comma-separated config names (default: every compatible CATALOG entry)",
-    )
-    parser.add_argument(
-        "--timing",
-        choices=("delayed", "events", "nsys"),
-        default="delayed",
-        help="delayed (default), events, or nsys — see benchmark_matmul.py",
-    )
     parser.add_argument(
         "--ref",
         choices=("auto", "scaled_mm", "bf16"),
@@ -557,23 +314,7 @@ def main() -> int:
         "dense BF16 cuBLAS yardstick; auto (default) = scaled_mm, "
         "falling back to bf16 if this env's cuBLASLt can't run it.",
     )
-    parser.add_argument(
-        "--stream",
-        action="store_true",
-        help="print each config's result as soon as it finishes " "(events/delayed only; the last 'running' line points at a hang).",
-    )
-    parser.add_argument(
-        "--rotate-buffers",
-        default="auto",
-        metavar="N",
-        help="allocate N independent copies of every tensor and rotate the timed "
-        "launches across them so a kernel doesn't re-read the previous "
-        "launch's data from a hot L2 (inflates small-shape TFLOPS). Warmup "
-        "uses a separate dedicated buffer. Default 'auto': size the pool to "
-        "exceed the ~126 MB B200 L2 (large shapes → 2, small → scaled up), "
-        "capped at 4 GB. Pass an integer to override; 1 disables.",
-    )
-    parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
+    add_sweep_args(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -585,31 +326,21 @@ def main() -> int:
     if len(parts) != 4:
         sys.exit("--shape must be B,M,N,K (four values; use B=1 for a single GEMM)")
     B, M, N, K = parts
-    per_set = _set_bytes(_mkdata(B, M, N, K, combo))
-    nbuf = _resolve_nbuf(args.rotate_buffers, per_set)
+    wset = _mkdata(B, M, N, K, combo)  # dedicated warmup buffer, and the pool's size unit
+    per_set = set_bytes(wset)
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
-    if getattr(args, "_nsys_worker"):
-        configs = [c.strip() for c in args.configs.split(",")] if args.configs else []
+    if args._nsys_worker:
+        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, args.combo, configs, args.warmup, args.iters, args.ref, nbuf)
         return 0
 
     flops = 2 * B * M * N * K
-    config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
+    config_names = select_configs(args.configs, _SPEC_MAP)
 
     print(f"\n=== block-scale matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) — " f"{combo} in / BF16 out ===")
 
-    if nbuf > 1:
-        footprint = per_set * nbuf
-        print(f"  [rotate-buffers: {nbuf} copies/tensor, " f"{footprint / 1024 / 1024:.0f} MB pool — defeats hot-L2 on small shapes]")
-        if footprint < _L2_BYTES_B200:
-            print(
-                f"  [WARNING: pool ({footprint / 1024 / 1024:.0f} MB) < B200 L2 "
-                f"(~{_L2_BYTES_B200 / 1024 / 1024:.0f} MB) — it fits in cache, so "
-                f"launches stay warm after one rotation. Bump --rotate-buffers.]"
-            )
-    else:
-        print("  [rotate-buffers: disabled (1) — small-shape TFLOPS may be hot-L2-inflated]")
+    report_pool(nbuf, per_set)
 
     rows: list[tuple[str, float, float, str]] = []  # (name, tflops, ms, note)
     t0 = time.time()
@@ -623,9 +354,25 @@ def main() -> int:
     ref_label = "reference"
     if args.timing == "nsys":
         print(f"  [timing: nsys median kernel duration; ref={args.ref}]\n")
-        kern_times = _nsys_run_and_parse(args.shape, combo, config_names, args.warmup, args.iters, args.ref, nbuf)
+        inner_args = [
+            "--shape",
+            args.shape,
+            "--combo",
+            combo,
+            "--ref",
+            args.ref,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+        ]
+        if config_names:
+            inner_args += ["--configs", ",".join(config_names)]
+        kern_times = nsys_run_and_parse(__file__, inner_args, tag="bench_bs")
 
-        cublas_hit = _find_cublas_time(kern_times)
+        cublas_hit = find_cublas_time(kern_times)
         if cublas_hit:
             cublas_name, cublas_ms = cublas_hit
             cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
@@ -636,30 +383,31 @@ def main() -> int:
             print("  reference kernel: not detected in nsys output")
 
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = spec_for(name, _SPEC_MAP)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            matches = [(k, v) for k, v in kern_times.items() if _match_kernel_name(k, name)]
+            tok = kernel_match_token(cfg, spec[1])
+            matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))
                 continue
             _, ms = max(matches, key=lambda x: x[1])
             rows.append((name, flops / (ms * 1e-3) / 1e12, ms, ""))
     else:
-        timer = _time_ms_delayed if args.timing == "delayed" else _time_ms_events
+        timer = time_ms_delayed if args.timing == "delayed" else time_ms_events
         if args.timing == "delayed":
             print("  [timing: events around delayed back-to-back launches — " "host overhead hidden behind a CUDA _sleep]\n")
         else:
             print("  [timing: torch.cuda.Event wall-clock around python loop — " "includes ~50us/call dispatch overhead]\n")
 
-        wset = _mkdata(B, M, N, K, combo)  # dedicated warmup buffer
         pool = _mkdata_pool(B, M, N, K, combo, nbuf)  # rotation pool
         ref_label, ref_warmup, ref_timed = _make_reference_pool(B, M, N, K, combo, args.ref, nbuf)
         if args.stream:
             print(f"  ▶ running {ref_label} reference ...", flush=True)
         cublas_ms = timer(
-            _rotating(lambda call: call(), ref_timed),
+            rotating(lambda call: call(), ref_timed),
             ref_warmup,
             warmup=args.warmup,
             iters=args.iters,
@@ -679,7 +427,8 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = spec_for(name, _SPEC_MAP)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
             elif ctx_dead:
@@ -692,7 +441,7 @@ def main() -> int:
                     plan = _build_plan(g, cfg, name)
                     wa, wb, wc, wsfa, wsfb = wset
                     ms = timer(
-                        _rotating(
+                        rotating(
                             lambda s, _plan=plan, _h=h: _plan(_vp_bs(_h, s[0], s[1], s[2], s[3], s[4])),
                             pool,
                         ),

@@ -13,12 +13,15 @@ import re
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs recorder)
+import dataclasses
+
 import pytest
 import torch
 
 from gemm_test_utils import (
     _SM,
     requires_sm100,
+    requires_sm107,
     Plan as _plan,
     vp_bs as _vp_bs,
     kw as _kw,
@@ -27,12 +30,15 @@ from gemm_test_utils import (
     to_blocked as _to_blocked,
     unpack_fp4 as _unpack_fp4,
     rand_e8m0 as _rand_e8m0,
+    rand_e5m3 as _rand_e5m3,
+    e5m3_to_float as _e5m3_to_float,
     block_quant_ref as _block_quant_ref,
     reduction_ref as _reduction_ref,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
 )
 
 from cudnn.gemm.frost import compiler as C
+from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import GraphType, TEMPLATES, select_template
@@ -40,6 +46,7 @@ from cudnn.gemm.frost.tile_config import (
     CATALOG,
     ConfigSm100,
     ConfigSm103,
+    ConfigSm107,
     TileConfig,
     by_name,
     validate_block_scale_config,
@@ -261,9 +268,9 @@ def test_block_scale_matmul_gate_rejects_mismatches():
     # Missing F8_128x4 SF reorder layout.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E4M3, reorder=False)), "sm100")
-    # nvfp4 (fp4+e4m3) with block32 — no supported case.
+    # FP8 data at block 16 — the fp8 rows are block-32 only, on every pipeline.
     with pytest.raises(NotImplementedError, match="does not support"):
-        _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=_DT_E4M3)), "sm100")
+        _check_block_scale_supported(analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=_DT_E8M0, a_dt=_DT_E4M3)), "sm100")
     # mixed FP4 A / FP8 B (cross-family) — unsupported.
     with pytest.raises(NotImplementedError, match="does not support"):
         _check_block_scale_supported(
@@ -302,7 +309,7 @@ def test_analyze_detects_nvfp4_block_scale_matmul():
     chain = analyze(_build_nvfp4_graph(128, 256, 256, block_size=16))
     assert chain.has_block_scale
     bs = chain.block_scale
-    assert bs.combo == "nvfp4"
+    assert bs.a_dtype == "fp4_e2m1"
     assert bs.block_size == 16
     assert bs.sf_dtype == "fp8_e4m3"
     assert bs.mma_block_scale_kind == "MXF4NVF4"
@@ -330,7 +337,7 @@ def test_analyze_detects_mxfp8_block_scale_matmul():
         )
     )
     bs = chain.block_scale
-    assert bs.combo == "mxfp8"
+    assert bs.a_dtype == "fp8_e4m3"
     assert bs.block_size == 32 and bs.sf_dtype == "fp8_e8m0"
     assert bs.mma_block_scale_kind == "MXF8F6F4"
     assert bs.scale_vec_size == "BLOCK32"
@@ -340,7 +347,7 @@ def test_analyze_detects_mxfp8_block_scale_matmul():
 def test_analyze_detects_mxfp4_block_scale_matmul():
     chain = analyze(_build_nvfp4_graph(128, 256, 256, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0))
     bs = chain.block_scale
-    assert bs.combo == "mxfp4"
+    assert bs.a_dtype == "fp4_e2m1"
     assert bs.block_size == 32 and bs.sf_dtype == "fp8_e8m0"
     assert bs.mma_block_scale_kind == "MXF4NVF4"
 
@@ -430,7 +437,8 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
     compiled = _plan(g, **_kw(config_name))
-    assert compiled.block_scale and compiled.chain.block_scale.combo == combo
+    assert compiled.block_scale
+    assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
     if out_major == "m":
         c = torch.zeros(1, N, M, dtype=torch.float16, device=dev).transpose(1, 2)
@@ -544,6 +552,30 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             128,
             256,
         ),  # acc_stages=2
+        # CTA tile split across two MMA instructions along M (num_mma_m=2). The SF
+        # words are one per 128-row block, so an M sub-block is exactly one block.
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
+            256,
+            256,
+            512,
+        ),
+        (
+            "mxfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
+            256,
+            256,
+            512,
+        ),
+        # ... and on the pair, where each CTA drains its own half of every M block.
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma",
+            256,
+            256,
+            512,
+        ),
         # mxfp4 (fp4 + e8m0 scale, block32).
         (
             "mxfp4",
@@ -639,50 +671,6 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             512,
             512,
         ),  # mx + A+B pair
-        # Static scheduler (no CLC) — cta_n=128 acc_stages=2, cta_n=256 acc-overlap.
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            128,
-            128,
-            256,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            512,
-        ),  # acc-overlap
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            256,
-        ),
-        # 2-CTA pair static (no CLC, 1 tile/pair). cta_n=128 non-overlap + cta_n=256 overlap.
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_static",
-            256,
-            128,
-            512,
-        ),  # non-overlap
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),  # acc-overlap
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),  # mx + overlap
     ],
 )
 def test_block_scale_matmul_numerics(combo, config_name, M, N, K):
@@ -729,10 +717,13 @@ def _run_bs_quant_numeric(
 
     q = torch.empty(1, M, N, dtype=out_torch_dt, device=dev)
     q_scale_shape = scale_dim if scale_dim is not None else (1, M, N // 32)
+    # torch has no E5M3 dtype; the kernel writes the scale through an int8 byte
+    # carrier (a raw_ptr store to a uint8 tensor is rejected by the DSL).
+    scale_buf_dt = torch.int8 if scale_torch_dt == "e5m3" else scale_torch_dt
     if scale_reorder:
-        q_scale = torch.zeros(*q_scale_shape, dtype=scale_torch_dt, device=dev)
+        q_scale = torch.zeros(*q_scale_shape, dtype=scale_buf_dt, device=dev)
     else:
-        q_scale = torch.empty(*q_scale_shape, dtype=scale_torch_dt, device=dev)
+        q_scale = torch.empty(*q_scale_shape, dtype=scale_buf_dt, device=dev)
     aux = () if global_scale_tensor is None else (global_scale_tensor,)
     sf_k_padded = _ceil_div(K // bs, 4) * 4
     sfa_rows_padded = _ceil_div(M, 128) * 128
@@ -752,8 +743,11 @@ def _run_bs_quant_numeric(
 
     q_ref, scale_ref = _block_quant_ref(ref, 32, out_torch_dt, scale_torch_dt)
     if scale_reorder:
-        scale_ref = _to_blocked(scale_ref[0]).view_as(q_scale)
-    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+        scale_ref = _to_blocked(scale_ref[0]).view_as(q_scale.view(scale_ref.dtype))
+    # E5M3 scales are compared as raw BYTES — the strictest form, and the only
+    # one available since torch cannot interpret the format.
+    got_scale = q_scale.view(torch.uint8) if scale_torch_dt == "e5m3" else q_scale
+    torch.testing.assert_close(got_scale.float(), scale_ref.float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
@@ -855,22 +849,8 @@ def test_block_scale_matmul_quant_epilogue_fp4_input_global_scale_padded_f8_scal
             256,
         ),
         (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma_static",
-            256,
-            256,
-            512,
-        ),
-        (
             "mxfp8",
             "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-            256,
-            256,
-            512,
-        ),
-        (
-            "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
             256,
             256,
             512,
@@ -878,7 +858,7 @@ def test_block_scale_matmul_quant_epilogue_fp4_input_global_scale_padded_f8_scal
     ],
 )
 def test_block_scale_matmul_m_major(combo, config_name, M, N, K):
-    """M-major block-scale output across dynamic/static 1-CTA and 2-CTA."""
+    """M-major block-scale output across 1-CTA and 2-CTA."""
     _run_bs_numeric(combo, config_name, M, N, K, out_major="m")
 
 
@@ -888,11 +868,6 @@ def test_block_scale_matmul_m_major(combo, config_name, M, N, K):
     [
         ("nvfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma", "padded"),
         ("nvfp4", "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", "padded"),
-        (
-            "mxfp8",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            "zero_stride",
-        ),
     ],
 )
 def test_block_scale_matmul_nonpacked_tensors(combo, config_name, mode):
@@ -993,38 +968,6 @@ def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
 
 @_GPU
 @pytest.mark.parametrize(
-    "config_name,M,N,K",
-    [
-        (
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",
-            128,
-            128,
-            256,
-        ),
-        (
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_static",
-            256,
-            256,
-            512,
-        ),
-    ],
-)
-def test_block_scale_matmul_reduction_static_templates(config_name, M, N, K):
-    _run_bs_reduction_numeric(
-        "nvfp4",
-        config_name,
-        M,
-        N,
-        K,
-        cudnn.reduction_mode.ADD,
-        red_dims=[1, 1, 1],
-        red_stride=None,
-        ref_dims=(0, 1, 2),
-    )
-
-
-@_GPU
-@pytest.mark.parametrize(
     "mode,red_dims,red_stride,ref_dims",
     [
         (cudnn.reduction_mode.ADD, [1, 1, 256], [0, 0, 2], (0, 1)),
@@ -1068,7 +1011,6 @@ def test_block_scale_matmul_reduction_rejects_int32():
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_1ctamma",  # M-OOB with cgrp_m > 1
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x2_1ctamma",  # N tile/cluster > N
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # 2-CTA pair + acc-overlap
-        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_static",  # static scheduler + OOB
     ],
 )
 def test_nvfp4_oob_shape(config_name):
@@ -1213,6 +1155,7 @@ def test_mxfp8_m_major_a_n_major_b(config_name, M, N, K):
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
 
 
+@requires_sm100
 def test_fp4_rejects_non_k_major():
     """FP4 must be K-major — sub-byte packing mis-strides an M/N-major
     descriptor, so the compiler rejects it at JIT time."""
@@ -1240,15 +1183,14 @@ _CFG_128 = "CONFIG_sm103_128x128x384_128x128x48_cluster1x1"
 _CFG_256 = "CONFIG_sm103_128x256x384_128x256x48_cluster1x1"
 
 # The kernel compiles on any Blackwell-family GPU (the K=96 mode is an idesc
-# bit, not a mnemonic); it RUNS only on sm103.
 requires_sm103 = pytest.mark.skipif(
-    _SM != 103,
-    reason="sm103 block-scale kernels run only on an SM 103 GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not (103 <= _SM < 110),
+    reason="sm103 block-scale kernels run only on 103 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
 def _sm103_kw(config_name, cta_group=1):
-    return dict(config=by_name(config_name), cta_group=cta_group, scheduler="clc")
+    return dict(config=by_name(config_name), cta_group=cta_group)
 
 
 @pytest.fixture
@@ -1257,6 +1199,19 @@ def _pretend_sm103(monkeypatch):
 
 
 # Config catalog / geometry guards
+
+
+@requires_sm100
+def test_block_scale_sf_rule_is_on_the_instruction_tile() -> None:
+    """The SF 128x4 swizzle rule is "each MMA instruction covers whole SF blocks",
+    so it reads off mma_inst_m/n. The old cta_tile form let mma_inst_m=64 through."""
+    from cudnn.gemm.frost.tile_config import validate_block_scale_config
+
+    validate_block_scale_config(by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1"), 16, 256)
+    with pytest.raises(NotImplementedError) as e:
+        # cta_tile_m % 128 == 0 but each instruction covers only half an SF block
+        validate_block_scale_config(by_name("CONFIG_sm100_128x128x128_64x128x32_cluster1x1"), 16, 256)
+    assert "mma_inst_m % 128" in str(e.value)
 
 
 def test_catalog_has_sm103_geometries():
@@ -1285,6 +1240,11 @@ def test_config_families():
     # A raw-base construction can't bypass the family invariant either.
     with pytest.raises(NotImplementedError, match="fixes cta_tile_k_bytes=384"):
         TileConfig(cta_tile_k_bytes=128, pipeline="sm103", **kw)
+    # The K-tile walks the MMA instruction, so it is a multiple of the PIPELINE's
+    # K width: 96 B is three sm100 instructions but not a whole number of sm107's.
+    ConfigSm100(cta_tile_k_bytes=96, mma_inst_k_bytes=32, pipeline="sm100", **kw)
+    with pytest.raises(NotImplementedError, match="multiple of sm107's mma_inst_k_bytes=64"):
+        ConfigSm107(cta_tile_k_bytes=96, mma_inst_k_bytes=64, pipeline="sm107", **kw)
     # Catalog entries carry their family class (the template-pairing key).
     assert all(isinstance(c, ConfigSm103) for c in CATALOG if c.pipeline == "sm103")
     assert all(isinstance(c, ConfigSm100) for c in CATALOG if c.pipeline == "sm100")
@@ -1321,14 +1281,14 @@ def _bs_chain(combo="nvfp4", M=256, N=256, K=1536):
 
 def test_select_template_dispatches_on_config_arch():
     chain = analyze(_bs_chain())
-    t103 = select_template(chain, by_name(_CFG_128), cta_group=1, scheduler="clc")
+    t103 = select_template(chain, by_name(_CFG_128), cta_group=1)
     assert t103.file == "sm103_block_scale_matmul_1ctamma.py"
     from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
 
-    assert PIPELINE_ARCH_RANGES[t103.pipeline] == ((103, 104),)
-    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), cta_group=1, scheduler="clc")
+    assert PIPELINE_ARCH_RANGES[t103.pipeline] == ((103, 110),)
+    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), cta_group=1)
     assert t100.file == "sm100_block_scale_matmul_1ctamma.py"
-    t103_2 = select_template(chain, by_name(_CFG_128), cta_group=2, scheduler="clc")
+    t103_2 = select_template(chain, by_name(_CFG_128), cta_group=2)
     assert t103_2.file == "sm103_block_scale_matmul_2ctamma.py"
     # Pairing is by config CLASS (from the template's filename arch token):
     # a base TileConfig posing as sm103 matches no template.
@@ -1344,10 +1304,7 @@ def test_select_template_dispatches_on_config_arch():
         mma_inst_k_bytes=48,
     )
     with pytest.raises(ValueError, match="no kernel template"):
-        select_template(chain, imposter, cta_group=1, scheduler="clc")
-    # No sm103 static variants yet.
-    with pytest.raises(ValueError, match="no kernel template"):
-        select_template(chain, by_name(_CFG_128), cta_group=1, scheduler="static")
+        select_template(chain, imposter, cta_group=1)
 
 
 def test_sm103_template_rejects_mxfp8(_pretend_sm103):
@@ -1389,112 +1346,33 @@ def test_mma_gpu_arch_special_cases(monkeypatch):
 
 def test_jit_rejects_wrong_active_arch(monkeypatch):
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    with pytest.raises(NotImplementedError, match=r"103 <= SM < 104.*sm_100"):
+    with pytest.raises(NotImplementedError, match=r"103 <= SM < 110.*sm_100"):
         jit_from_cudnn_graph(_bs_chain(), **_sm103_kw(_CFG_128))
 
 
-# Renderer (no GPU needed beyond graph build)
+def test_sm103_rejects_multi_mma_m():
+    """The sm103 chunk pipeline has NOT been adapted to a CTA tile spanning
+    several MMA instructions along M: it miscomputes (A reads unwritten SMEM in
+    K) and its ab_stages budget under-counts, so cta_tile_m=256 also overruns the
+    SMEM cap. Both are silent-wrong / launch-fail, so the template declines the
+    geometry outright. Drop `supports_multi_mma_m=False` when it is fixed."""
+    wide = by_name("CONFIG_sm103_256x128x384_128x128x48_cluster1x1")
+    assert wide.num_mma_m == 2
+    for t in (t for t in TEMPLATES if t.pipeline == "sm103"):
+        assert not t.supports_multi_mma_m
+        assert "num_mma_m=2" in t.multi_mma_m_reject(wide)
+        assert t.multi_mma_m_reject(by_name(_CFG_128)) is None
+    # The other pipelines DO implement it — the gate is sm103-specific.
+    for f in ("sm100_block_scale_matmul_1ctamma.py", "sm107_block_scale_matmul_1ctamma.py"):
+        t = next(t for t in TEMPLATES if t.file == f)
+        assert t.supports_multi_mma_m and t.multi_mma_m_reject(wide) is None
 
 
-def _render(combo, config_name):
-    g = _bs_chain(combo=combo)
-    chain = analyze(g)
-    vb = C._compute_output_vec_bytes(chain)
-    snip = C.generate(chain, vec_bytes_epi=vb, output_elem_bytes=C.DTYPE_BYTES[chain.output_dtype], use_tma_store=False)
-    return C._render_block_scale_template(chain, snip, by_name(config_name), 1, "clc")
-
-
-def _const(src, name):
-    line = next(l for l in src.splitlines() if l.startswith(f"{name} = "))
-    return eval(line.split(" = ", 1)[1])
-
-
-def test_render_nvfp4_k_walk_tables():
-    src = _render("nvfp4", _CFG_128)
-    compile(src, "generated_kernel.py", "exec")
-    assert "cudnn_frost_sm103_block_scale_matmul_1ctamma_128x128x384_128x128x48_cluster1x1" in src
-    assert _const(src, "cta_tile_k_elems") == 768
-    assert _const(src, "num_kblocks") == 8
-    assert _const(src, "chunks_per_ktile") == 3
-    assert _const(src, "ab_tma_box_k_elems") == 256
-    assert _const(src, "a_chunk_packed_elems") == 128 * 128
-    # CUTLASS-style pipeline: an AB stage is one 128-B chunk (>= 3 = one
-    # K-tile in flight); SF rides its own ring at 12-SF-per-row groups.
-    assert _const(src, "ab_stages") >= 3
-    assert _const(src, "sf_stages") == 6
-    assert _const(src, "sf_groups_per_ktile") == 4
-    assert _const(src, "mmas_per_sf_group") == 2
-    assert _const(src, "sf_atoms_per_group") == 3
-    assert _const(src, "sfa_group_bytes") == 128 * 12
-    # MMA j reads data bytes [48j, 48j+48): chunk walk + in-chunk 16-B phases
-    # (k-blocks 2 and 5 straddle into the next chunk).
-    assert _const(src, "mma_chunk_by_j") == (0, 0, 0, 1, 1, 1, 2, 2)
-    assert _const(src, "mma_next_chunk_by_j") == (0, 0, 1, 1, 1, 2, 2, 2)
-    assert _const(src, "mma_phase16_by_j") == (0, 3, 6, 1, 4, 7, 2, 5)
-    # nvfp4: 6 SF bytes per MMA — word-aligned col + sf_id byte select.
-    assert _const(src, "sf_id_by_j") == (0, 2, 0, 2, 0, 2, 0, 2)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 4, 12, 16, 24, 28, 36, 40)
-    assert _const(src, "num_sf_atoms") == 12
-    assert _const(src, "sf_k") == 48
-
-
-def test_render_mxfp4_k_walk_tables():
-    src = _render("mxfp4", _CFG_128)
-    compile(src, "generated_kernel.py", "exec")
-    # mxfp4: 3 SF bytes per MMA — the sf_id cycles all four byte offsets.
-    assert _const(src, "sf_id_by_j") == (0, 3, 2, 1, 0, 3, 2, 1)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 0, 4, 8, 12, 12, 16, 20)
-    assert _const(src, "num_sf_atoms") == 6
-    assert _const(src, "sf_k") == 24
-    assert _const(src, "sf_groups_per_ktile") == 2
-    assert _const(src, "mmas_per_sf_group") == 4
-    assert _const(src, "sf_atoms_per_group") == 3
-
-
-def test_render_n256_interleaves_sfb_blocks():
-    src = _render("nvfp4", _CFG_256)
-    compile(src, "generated_kernel.py", "exec")
-    # Two 128-col SFB blocks interleave at word granularity: the MMA walk
-    # doubles the word stride (matches the SM103 reference kernel's N=256 walk).
-    assert _const(src, "sfb_mma_col_off_by_j") == (0, 8, 24, 32, 48, 56, 72, 80)
-    assert _const(src, "sfa_mma_col_off_by_j") == (0, 4, 12, 16, 24, 28, 36, 40)
-    assert _const(src, "use_acc_overlap") is True
-    # Chunk-granular staging keeps a real pipeline even at N=256 (the old
-    # monolithic 384-B stage collapsed to 1 here).
-    assert _const(src, "ab_stages") >= 3
-    assert _const(src, "sfb_group_bytes") == 256 * 12
-
-
-def test_render_rejects_mxfp8(_pretend_sm103):
-    with pytest.raises(NotImplementedError, match="sm103.*does not support"):
-        jit_from_cudnn_graph(_bs_chain(combo="mxfp8", K=512), **_sm103_kw(_CFG_128))
-
-
-# cute.compile smoke — the K=96 mode is an idesc bit (same tcgen05 mnemonics),
-# so any Blackwell-family GPU can COMPILE the kernel; only sm103 can run it.
-
-
-@requires_sm100
-@pytest.mark.parametrize(
-    "combo,config_name,cta_group",
-    [
-        ("nvfp4", _CFG_128, 1),
-        ("mxfp4", _CFG_128, 1),
-        ("nvfp4", _CFG_256, 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster2x1", 2),
-        ("mxfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster2x2", 2),
-        ("nvfp4", "CONFIG_sm103_128x256x384_128x256x48_cluster2x1", 2),
-        # Large clusters (the shared sm100 enumeration): A-multicast chain,
-        # B-multicast chain, both, and the 16-CTA max.
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster1x4", 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster8x1", 1),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster4x2", 2),
-        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster16x1", 2),
-    ],
-)
-def test_sm103_compile_smoke(_pretend_sm103, combo, config_name, cta_group):
-    compiled = jit_from_cudnn_graph(_bs_chain(combo=combo), **_sm103_kw(config_name, cta_group))
-    assert compiled.chain.block_scale.combo == combo
+@requires_sm103
+def test_sm103_multi_mma_m_is_declined_not_miscomputed():
+    """The gate reaches the JIT path, so the geometry raises instead of running."""
+    with pytest.raises(NotImplementedError, match="several MMA instructions along M"):
+        jit_from_cudnn_graph(_bs_chain(), **_sm103_kw("CONFIG_sm103_256x128x384_128x128x48_cluster1x1"))
 
 
 def test_tma_alignment_unified():
@@ -1560,7 +1438,8 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1):
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt)
     compiled = _plan(g, **_sm103_kw(config_name, cta_group))
-    assert compiled.block_scale and compiled.chain.block_scale.combo == combo
+    assert compiled.block_scale
+    assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (_DTYPE_FROM_CUDNN[sf_dt], bs)
 
     # The F8_128x4 reorder pads to 128-row × 4-SF blocks; view with the
     # padded dims (matters for M/N not multiples of 128).
@@ -1640,6 +1519,7 @@ def test_sm103_block_scale_matmul_clusters(cluster, M, N):
     _run_sm103_numeric("nvfp4", f"CONFIG_sm103_128x128x384_128x128x48_{cluster}", M, N, 1536)
 
 
+@requires_sm100
 @pytest.mark.parametrize("M,N", [(64, 4096), (4096, 64), (128, 128), (4096, 4096)])
 def test_auto_config_is_accepted_by_the_registry(M, N):
     """``select_config`` is a second decision path that does not consult the
@@ -1648,12 +1528,13 @@ def test_auto_config_is_accepted_by_the_registry(M, N):
     scale is the narrow case: the F8_128x4 SF swizzle needs 128-multiple tiles,
     so the plain 32/64 ladder is illegal. Pin the invariant the funnel owns:
     whatever the heuristic picks must be in ``candidates(chain)``."""
-    from cudnn.gemm.frost.kernel_registry import candidates
-    from cudnn.gemm.frost.tile_config import select_config
+    from cudnn.gemm.frost.kernel_registry import candidates, preferred_pipeline
+    from cudnn.gemm.frost.tile_config import as_pipeline, select_config
 
     chain = analyze(_build_nvfp4_graph(M, N, 512))
     assert chain.has_block_scale
-    cfg, _cta_group, _sched = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
     assert cfg.name in accepted, f"select_config picked {cfg.name!r}, which the registry rejects for this graph"
@@ -1722,3 +1603,609 @@ def test_sf_blob_must_be_packed(M, K, kind, rejected):
     else:
         compiled(vp)
         torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# sm107 block-scale pipeline (the sm100 pipeline on the 64-byte-K MMA)
+# ---------------------------------------------------------------------------
+
+_SM107_128 = "CONFIG_sm107_128x128x128_128x128x64_cluster1x1"
+_SM107_256 = "CONFIG_sm107_128x256x128_128x256x64_cluster1x1"
+
+
+@pytest.fixture
+def _pretend_sm107(monkeypatch):
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+
+
+def _sm107_kw(config_name, cta_group=1):
+    return dict(config=by_name(config_name), cta_group=cta_group)
+
+
+def test_catalog_has_sm107_geometries():
+    sm107 = [c for c in CATALOG if c.pipeline == "sm107"]
+    # num_mma_m {1,2} × 2 cta_n × the shared 15-cluster enumeration.
+    assert len(sm107) == 60
+    pat = re.compile(r"^CONFIG_sm107_(128|256)x(128|256)x128_128x(128|256)x64_cluster\d+x\d+$")
+    for c in sm107:
+        assert pat.match(c.name), c.name
+        assert isinstance(c, ConfigSm107)
+        # mma_inst_m is pinned: the block-scale F8_128x4 SF swizzle needs % 128 == 0.
+        assert c.mma_inst_m == 128 and c.cta_tile_k_bytes == 128
+        assert c.cta_tile_m == 128 * c.num_mma_m
+        assert c.mma_inst_k_bytes == 64
+    assert by_name(_SM107_128).geometry_name == "128x128x128_128x128x64_cluster1x1"
+
+
+def test_sm107_family_fixes_the_mma_k_width():
+    """The 64-byte MMA K is the FAMILY's, not free geometry — while the rest of
+    the geometry axes stay exactly sm100's."""
+    kw = dict(
+        cta_tile_m=128,
+        cta_tile_n=128,
+        cta_tile_k_bytes=128,
+        cgrp_size_m=1,
+        cgrp_size_n=1,
+        epi_tile_mn=(128, 32),
+        threads_per_cta=256,
+        pipeline="sm107",
+    )
+    ConfigSm107(mma_inst_k_bytes=64, **kw)
+    with pytest.raises(NotImplementedError, match="sm107 fixes mma_inst_k_bytes=64"):
+        ConfigSm107(mma_inst_k_bytes=32, **kw)
+    # A raw-base construction can't bypass the family invariant either.
+    with pytest.raises(NotImplementedError, match="sm107 fixes mma_inst_k_bytes=64"):
+        TileConfig(**kw)
+
+
+def test_sm107_template_selection_and_arch_gate(_pretend_sm107):
+    chain = analyze(_bs_chain())
+    for cta_group, want in ((1, "sm107_block_scale_matmul_1ctamma.py"), (2, "sm107_block_scale_matmul_2ctamma.py")):
+        cfg = by_name(_SM107_128 if cta_group == 1 else "CONFIG_sm107_128x128x128_128x128x64_cluster2x1")
+        tmpl = select_template(chain, cfg, cta_group=cta_group)
+        assert tmpl.file == want
+        assert tmpl.accepts(chain, cfg) is None
+    # An sm100 config still pairs with the sm100 templates on the same GPU.
+    sm100_cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    assert select_template(chain, sm100_cfg, cta_group=1).file == "sm100_block_scale_matmul_1ctamma.py"
+
+
+def test_sm107_templates_reject_older_blackwell(monkeypatch):
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    chain = analyze(_bs_chain())
+    tmpl = next(t for t in TEMPLATES if t.file == "sm107_block_scale_matmul_1ctamma.py")
+    assert "107 <= SM < 110" in tmpl.accepts(chain, by_name(_SM107_128))
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name,cta_group",
+    [
+        (_SM107_128 + "_1ctamma", 1),
+        (_SM107_256 + "_1ctamma", 1),
+        ("CONFIG_sm107_128x128x128_128x128x64_cluster1x2_1ctamma", 1),
+        ("CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma", 2),
+        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma", 2),
+        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x2_2ctamma", 2),
+    ],
+    ids=lambda v: v if isinstance(v, str) else f"cta{v}",
+)
+def test_sm107_block_scale_matmul_numerics(combo, config_name, cta_group):
+    _run_bs_numeric(combo, config_name, 256, 256, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("cta_group", [1, 2])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
+    """The CTA tile spanning several MMA instructions along M, on the 64-byte-K
+    pipeline. This is where the two SF regions stop agreeing: at nvfp4 a scale
+    word spans word_atoms=2 atoms, and SFA is indexed per M block (one MMA
+    instruction covers one 128-row block, so its word must be contiguous) while
+    SFB is walked across all N blocks by one instruction. Both layouts collapse
+    to the same addresses at a single block, so only cta_m/cta_n = 256 tells
+    them apart -- 256x256 is the case where both regions split at once."""
+    cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
+    suffix = "1ctamma" if cta_group == 1 else "2ctamma"
+    geometry = f"CONFIG_sm107_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
+    assert by_name(geometry).num_mma_m == cta_m // 128
+    _run_bs_numeric(combo, f"{geometry}_{suffix}", 256, 256, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize(
+    "combo,config_name,M,N,K",
+    [
+        ("nvfp4", _SM107_128 + "_1ctamma", 256, 384, 768),  # multi-tile N
+        ("mxfp4", _SM107_256 + "_1ctamma", 256, 256, 4096),  # many K-tiles
+        ("mxfp8", "CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma", 384, 512, 256),
+        ("nvfp4", "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
+        ("nvfp4", "CONFIG_sm107_128x128x128_128x128x64_cluster1x4_1ctamma", 512, 1024, 512),
+    ],
+    ids=lambda v: v if isinstance(v, str) else str(v),
+)
+def test_sm107_block_scale_matmul_shapes_and_clusters(combo, config_name, M, N, K):
+    _run_bs_numeric(combo, config_name, M, N, K)
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_2ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x2_2ctamma",
+        "CONFIG_sm107_256x256x128_128x256x64_cluster2x4_2ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_1ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster1x4_1ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster2x2_1ctamma",
+    ],
+)
+def test_sm107_block_scale_mixed_cga(combo, config_name):
+    """Mixed CGA rides along with no caller change: any config whose cluster is
+    wider than the MMA mode's minimum launches it as the PREFERRED shape plus that
+    minimum as the fallback. The tile decomposition is the identity map for either
+    cluster shape, so both kinds cover the problem exactly once; only the multicast
+    masks, mbarrier arrival counts and rank math follow the shape the CTA actually
+    landed in. M is large enough that the grid outruns what the preferred clusters
+    hold resident, which is when the device substitutes the fallback shape."""
+    cta_group = 2 if config_name.endswith("_2ctamma") else 1
+    cfg = by_name(config_name.rsplit("_", 1)[0])
+    assert C._mixed_cga_fallback(cfg, cta_group, f"sm107_block_scale_matmul_{cta_group}ctamma.py") == (cta_group, 1)
+    _run_bs_numeric(combo, config_name, 1920, 1920, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_mixed_cga_fallback_is_the_mma_mode_minimum(cta_group):
+    """The fallback shape is derived, never passed: one CTA for a 1-CTA MMA, the
+    pair for a 2-CTA one — and a config already AT that minimum has nothing to
+    fall back to, so it launches as a plain fixed cluster."""
+    tmpl = f"sm107_block_scale_matmul_{cta_group}ctamma.py"
+    assert C.min_fallback_cluster(cta_group) == (cta_group, 1)
+    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
+    assert C._mixed_cga_fallback(wide, cta_group, tmpl) == (cta_group, 1)
+    minimal = by_name(f"CONFIG_sm107_128x128x128_128x128x64_cluster{cta_group}x1")
+    assert C._mixed_cga_fallback(minimal, cta_group, tmpl) is None
+
+
+@requires_sm107
+def test_mixed_cga_is_off_where_it_cannot_be_honored(monkeypatch):
+    """Every gate is a fact, not a knob: the GPU's ability to substitute clusters,
+    whether the template consumes the fallback constant at all (an unported one
+    would hang — its cluster constants are baked to the preferred shape), and
+    whether the config pins the N-super-block walk (not invariant across the two
+    cluster shapes)."""
+    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
+    sm107_tmpl = "sm107_block_scale_matmul_2ctamma.py"
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) == (2, 1)
+
+    # Template that never reads the constant -> no fallback attached. The MoE
+    # ones stay that way: their fixed-grid persistent scheduler strides by a
+    # host-computed cluster count, which mixed clusters invalidate.
+    moe_tmpl = "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    assert not C._template_reads_fallback_cluster(moe_tmpl)
+    assert C._mixed_cga_fallback(wide, 2, moe_tmpl) is None
+
+    # Substitution is a floor, not a range: every part from SM 10.0 up can do it.
+    assert C._mixed_cga_supported(100) and C._mixed_cga_supported(110)
+    # A pre-Blackwell part -> plain fixed cluster, as before.
+    monkeypatch.setattr(C, "_current_arch", lambda: 90)
+    assert not C._mixed_cga_supported()
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+    monkeypatch.undo()
+
+    # A pinned N-super-block walk -> skipped rather than silently mis-tiled.
+    pinned = dataclasses.replace(wide, tile_swizzle_n=8)
+    assert C._mixed_cga_fallback(pinned, 2, sm107_tmpl) is None
+
+    # The escape hatch for A/B measurement.
+    monkeypatch.setenv("CUDNN_FROST_DISABLE_MIXED_CGA", "1")
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+
+
+@requires_sm107
+def test_mixed_cga_ported_templates_attach_a_fallback():
+    """A ported template on a wide-cluster config launches with both shapes and
+    still computes the same result; an unported one renders exactly as it did
+    before mixed CGA existed."""
+    sm100_cfg = "CONFIG_sm100_128x128x128_128x128x32_cluster4x2_2ctamma"
+    _run_bs_numeric("nvfp4", sm100_cfg, 512, 512, 512)
+    g = _build_nvfp4_graph(256, 256, 512)
+    src = _plan(g, **_kw(sm100_cfg)).generated_path.read_text()
+    assert "fallback_cluster=fallback_cluster_shape_mnk" in src
+    assert "fallback_cluster_shape_mnk = (2, 1, 1)" in src
+    # What makes the tile walk the identity map for BOTH shapes: the renderer
+    # pins the N-super-block width, so _auto_swizzle_w const-folds to 1.
+    assert "tile_swizzle_n = 1" in src
+
+    # Already-minimal cluster -> nothing to fall back to, plain fixed launch.
+    minimal_cfg = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
+    src = _plan(_build_nvfp4_graph(256, 256, 512), **_kw(minimal_cfg)).generated_path.read_text()
+    assert "fallback_cluster_shape_mnk = None" in src
+
+
+@requires_sm107
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        _SM107_128 + "_1ctamma",
+        "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_1ctamma",  # M-OOB with cgrp_m > 1
+        "CONFIG_sm107_128x128x128_128x128x64_cluster1x2_1ctamma",  # N tile/cluster > N
+        "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma",  # 2-CTA pair
+    ],
+)
+def test_sm107_nvfp4_oob_shape(config_name):
+    """M=23, N=56, K=736 — ceil-padded SF descriptors + M/N/K OOB, on the
+    64-byte-K MMA (the last K-tile is only 736 % 256 = 224 elements)."""
+    test_nvfp4_oob_shape(config_name)
+
+
+@requires_sm107
+@pytest.mark.parametrize(
+    "combo,config_name",
+    [
+        ("nvfp4", _SM107_128 + "_1ctamma"),
+        ("mxfp8", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"),
+    ],
+)
+def test_sm107_block_scale_matmul_m_major(combo, config_name):
+    _run_bs_numeric(combo, config_name, 256, 256, 512, out_major="m")
+
+
+@requires_sm107
+@pytest.mark.parametrize("scale_reorder", [False, True])
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+def test_e5m3_quant_epilogue(config_name, scale_reorder):
+    """The epilogue can PRODUCE E5M3 scales, bit-exact against the torch
+    reference. The `cvt ... ue5m3x2.f32` this needs exists only on sm_107 —
+    strictly narrower than CONSUMING E5M3 scales, where the format is a
+    descriptor field every pipeline emits."""
+    _run_bs_quant_numeric(
+        config_name,
+        256,
+        256,
+        512,
+        cudnn.data_type.FP8_E4M3,
+        torch.float8_e4m3fn,
+        cudnn.data_type.FP8_E5M3,
+        "e5m3",
+        scale_reorder=scale_reorder,
+    )
+
+
+def test_e5m3_quant_rejects_off_sm107(monkeypatch):
+    """...and off sm_107 it declines cleanly rather than emitting PTX ptxas
+    would reject."""
+    g = _build_block_scale_quant_graph(256, 256, 512, dequant_block_size=32, scale_dt=cudnn.data_type.FP8_E5M3)
+    for arch in (100, 103, 110, 120):
+        monkeypatch.setattr(C, "_current_arch", lambda a=arch: a)
+        with pytest.raises(NotImplementedError, match=f"sm_{arch}"):
+            jit_from_cudnn_graph(g, **_kw(_SM107_128 + "_1ctamma"))
+
+
+@requires_sm107
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+def test_sm107_block_scale_matmul_quant_epilogue(config_name):
+    _run_bs_quant_numeric(
+        config_name,
+        256,
+        256,
+        512,
+        cudnn.data_type.FP8_E4M3,
+        torch.float8_e4m3fn,
+        cudnn.data_type.FP8_E8M0,
+        torch.float8_e8m0fnu,
+    )
+
+
+@requires_sm107
+@pytest.mark.parametrize("mode", [cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX], ids=("add", "amax"))
+def test_sm107_block_scale_matmul_reduction_scalar(mode):
+    _run_bs_reduction_numeric(
+        "nvfp4",
+        _SM107_128 + "_1ctamma",
+        128,
+        128,
+        256,
+        mode,
+        red_dims=[1, 1, 1],
+        red_stride=None,
+        ref_dims=(0, 1, 2),
+    )
+
+
+@requires_sm107
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+def test_sm107_mxfp8_m_major_a_n_major_b(config_name):
+    test_mxfp8_m_major_a_n_major_b(config_name, 256, 256, 512)
+
+
+def test_auto_path_prefers_sm107_where_it_has_a_template(monkeypatch):
+    """On SM 10.7 the auto path builds block-scale graphs with the sm107
+    pipeline; graph types sm107 has no template for (plain matmul, MoE) fall
+    back to sm100 on their own, and so does older Blackwell."""
+    from cudnn.gemm.frost.kernel_registry import preferred_pipeline
+    from cudnn.gemm.frost.tile_config import as_pipeline, select_config
+
+    pg = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    pa = pg.tensor(name="A", dim=[1, 128, 128], stride=[128 * 128, 128, 1])
+    pb = pg.tensor(name="B", dim=[1, 128, 128], stride=[128 * 128, 1, 128])
+    pg.matmul(A=pa, B=pb, name="mm").set_output(True)
+
+    bs_chain = analyze(_bs_chain())
+    plain_chain = analyze(pg)
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    assert preferred_pipeline(bs_chain) == "sm107"
+    assert preferred_pipeline(plain_chain) == "sm100"
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert preferred_pipeline(bs_chain) == "sm100"
+
+    # select_config scores pure geometry (an sm100 config); moving it to another
+    # family touches only that family's fixed MMA-inst K.
+    geo = select_config(4096, 4096, 1, block_scale=True)[0]
+    assert as_pipeline(geo, "sm100") is geo
+    geo107 = as_pipeline(geo, "sm107")
+    assert geo107.pipeline == "sm107" and geo107.mma_inst_k_bytes == 64
+    assert (geo107.cta_tile_mn, geo107.cgrp_size_mn) == (geo.cta_tile_mn, geo.cgrp_size_mn)
+    assert geo107.cta_tile_k_bytes == geo.cta_tile_k_bytes
+    # sm103 fixes a 384-byte K-tile, so a scored geometry cannot become one — the
+    # family invariant lives on the config, not in a second whitelist.
+    with pytest.raises(NotImplementedError, match="cta_tile_k_bytes=384"):
+        as_pipeline(geo, "sm103")
+
+
+# ---------------------------------------------------------------------------
+# FP4 with E5M3 scale factors (SM 10.7+)
+#
+# UTCOMMA's instruction descriptor picks the SF format (0=E4M3, 1=E8M0,
+# 2=E5M3); only SM 10.7 decodes 2, and unlike nvfp4/mxfp4 -- which each fix one
+# K-block -- E5M3 is legal with both 16 and 32. Nothing else moves: the SF is
+# still a byte in the F8_128x4 layout, so the templates are untouched.
+# ---------------------------------------------------------------------------
+
+
+def _e5m3_graph(M, N, K, block_size, **kw):
+    return _build_nvfp4_graph(
+        M,
+        N,
+        K,
+        block_size=block_size,
+        sf_dt=cudnn.data_type.FP8_E5M3,
+        a_dt=cudnn.data_type.FP4_E2M1,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_e5m3_analyzer_reads_the_scale_dtype(block_size):
+    bs = analyze(_e5m3_graph(256, 256, 512, block_size)).block_scale
+    assert bs.sf_dtype_a == "fp8_e5m3" and bs.sf_dtype_b == "fp8_e5m3"
+    assert bs.block_size == block_size
+    assert bs.a_dtype == "fp4_e2m1"
+    assert bs.sf_scale_format == 2
+
+
+@pytest.mark.parametrize(
+    "sf_dt,sf_name", [(cudnn.data_type.FP8_E4M3, "fp8_e4m3"), (cudnn.data_type.FP8_E8M0, "fp8_e8m0"), (cudnn.data_type.FP8_E5M3, "fp8_e5m3")]
+)
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_scale_dtype_and_block_are_orthogonal(sf_dt, sf_name, block_size):
+    """All three FP4 scale-factor dtypes are legal at BOTH K-blocks — nvfp4
+    (e4m3/16) and mxfp4 (e8m0/32) are just the best-known corners, not a
+    coupling. The registry must carry the full 3x2 matrix on every pipeline that
+    has fp4 at all."""
+    from cudnn.gemm.frost.kernel_registry import GraphType as _GT, MMA_TYPE_SUPPORT, _bs_key
+
+    key = _bs_key("fp4_e2m1", sf_name, "fp4_e2m1", sf_name, block_size)
+    for pipeline in ("sm100", "sm103", "sm107"):
+        assert key in MMA_TYPE_SUPPORT[pipeline][_GT.BLOCK_SCALE_MATMUL], f"{pipeline} is missing fp4+{sf_name}/{block_size}"
+    # and the analyzer reads the pair back off a graph built with it
+    bs = analyze(_build_nvfp4_graph(256, 256, 512, block_size=block_size, sf_dt=sf_dt, a_dt=cudnn.data_type.FP4_E2M1)).block_scale
+    assert (bs.a_dtype, bs.sf_dtype, bs.block_size) == ("fp4_e2m1", sf_name, block_size)
+
+
+# Block-scale cases that only some GPUs decode: SM 10.7 added the E5M3 scale
+# format (either K-block) and E4M3 at block 32. Keyed by (SF dtype, K-block).
+_GPU_GATED_FP4_CASES = {("fp8_e5m3", 16), ("fp8_e5m3", 32), ("fp8_e4m3", 32)}
+_DTYPE_GATED_SF_DTYPES = {"fp8_e5m3"}
+_GPU_GATED_RANGES = ((107, 110),)
+
+
+@_GPU
+@pytest.mark.parametrize("sf_dt,sf_name", [(cudnn.data_type.FP8_E4M3, "fp8_e4m3"), (cudnn.data_type.FP8_E8M0, "fp8_e8m0")])
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("config_name", ["CONFIG_sm100_128x128x128_128x128x32_cluster1x1", pytest.param(_SM107_128, marks=requires_sm107)])
+def test_fp4_all_scale_block_corners_numerics(config_name, sf_dt, sf_name, block_size):
+    """Numerics for the whole non-E5M3 fp4 matrix, including the two corners the
+    nvfp4 / mxfp4 pair leaves out: e4m3 at block 32 and e8m0 at block 16.
+
+    e4m3 at block 32 is one of the GPU-gated cases — it is a 10.7 addition on
+    EVERY pipeline, so it runs here only on a 10.7 part."""
+    if (sf_name, block_size) in _GPU_GATED_FP4_CASES and not any(lo <= _SM < hi for lo, hi in _GPU_GATED_RANGES):
+        spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in _GPU_GATED_RANGES)
+        pytest.skip(f"fp4+{sf_name} at block {block_size} decodes only on {spans}, have sm_{_SM}")
+    dev = "cuda"
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 512
+    sf_k = K // block_size
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+    b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+    if sf_name == "fp8_e8m0":
+        sfa, sfb = _rand_e8m0((M, sf_k), dev), _rand_e8m0((N, sf_k), dev)
+    else:
+        sfa = torch.randint(1, 4, (M, sf_k), device=dev).to(torch.float8_e4m3fn)
+        sfb = torch.randint(1, 4, (N, sf_k), device=dev).to(torch.float8_e4m3fn)
+
+    g = _build_nvfp4_graph(M, N, K, block_size=block_size, sf_dt=sf_dt, a_dt=cudnn.data_type.FP4_E2M1)
+    compiled = _plan(g, config=by_name(config_name), cta_group=1)
+    assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == (sf_name, block_size)
+
+    c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
+    compiled(
+        _vp_bs(
+            compiled, a_u8.view(torch.float4_e2m1fn_x2), b_u8.view(torch.float4_e2m1fn_x2), c, _to_blocked(sfa).view(1, 1, -1), _to_blocked(sfb).view(1, 1, -1)
+        )
+    )
+    torch.cuda.synchronize()
+
+    a_s = _unpack_fp4(a_u8, lut).view(M, K) * sfa.float().repeat_interleave(block_size, 1)
+    b_s = _unpack_fp4(b_u8, lut).view(N, K) * sfb.float().repeat_interleave(block_size, 1)
+    torch.testing.assert_close(c[0], (a_s @ b_s.t()).to(torch.float16), atol=2e-1, rtol=2e-2)
+
+
+def test_gpu_gated_cases_are_narrowed_everywhere():
+    """The load-bearing invariant behind putting the GPU-gated fp4 cases in the
+    ordinary case sets: EVERY one of them, on EVERY pipeline that carries it,
+    needs its own MMA_GPU_ARCH_SPECIAL_CASES entry. Miss one — a new K-block, a
+    new family inheriting _BLOCK_SCALE_CASES — and that combo is accepted on a
+    part whose descriptor cannot encode it: silently wrong scales, not a clean
+    rejection. The registry cannot derive this, so it is pinned here."""
+    from cudnn.gemm.frost.kernel_registry import GraphType as _GT, MMA_GPU_ARCH_SPECIAL_CASES, MMA_TYPE_SUPPORT, _bs_key
+
+    gated = [
+        (pipeline, _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk))
+        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        for sf, blk in _GPU_GATED_FP4_CASES
+        if _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ())
+    ]
+    assert len(gated) == 3 * len(_GPU_GATED_FP4_CASES), f"expected every pipeline to carry every gated case, got {len(gated)}"
+    bad = [pk for pk in gated if MMA_GPU_ARCH_SPECIAL_CASES.get(pk) != _GPU_GATED_RANGES]
+    assert not bad, f"GPU-gated cases missing their {_GPU_GATED_RANGES} narrowing: {bad}"
+
+
+def test_dtype_and_mma_arch_gates_are_independent():
+    """A narrow DTYPE and a narrow MMA INSTRUCTION are separate facts that happen
+    to share a range today. Keep both: the dtype's range can widen on a later
+    part (E5M3 elsewhere than a block-scale MMA operand), while this fp4+E5M3
+    instruction's cannot. Collapsing either into the other would let one widen
+    the other silently."""
+    from cudnn.gemm.frost.dtypes import DTYPE_GPU_ARCH_RANGES
+    from cudnn.gemm.frost.kernel_registry import MMA_GPU_ARCH_SPECIAL_CASES, _bs_key
+
+    for sf in _DTYPE_GATED_SF_DTYPES:
+        assert DTYPE_GPU_ARCH_RANGES.get(sf) == _GPU_GATED_RANGES, f"{sf} is not narrowed by the dtype table"
+        for pipeline in ("sm100", "sm103", "sm107"):
+            for blk in (16, 32):
+                key = (pipeline, _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk))
+                assert MMA_GPU_ARCH_SPECIAL_CASES.get(key) == _GPU_GATED_RANGES, f"{key} lost its independent MMA-instruction narrowing"
+
+
+@pytest.mark.parametrize("sf_name,block_size", sorted(_GPU_GATED_FP4_CASES))
+@pytest.mark.parametrize("pipeline", ["sm100", "sm103", "sm107"])
+def test_gpu_gated_cases_reject_off_sm107(pipeline, sf_name, block_size, monkeypatch):
+    """...and the narrowing actually bites: accepted on 10.7/10.9, turned away
+    by the ARCH gate everywhere else, on every pipeline."""
+    from cudnn.gemm.frost.kernel_registry import GraphType as _GT, mma_arch_reject
+
+    sf_dt = {"fp8_e5m3": cudnn.data_type.FP8_E5M3, "fp8_e4m3": cudnn.data_type.FP8_E4M3}[sf_name]
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=block_size, sf_dt=sf_dt, a_dt=cudnn.data_type.FP4_E2M1))
+    for arch in (107, 109):
+        monkeypatch.setattr(C, "_current_arch", lambda a=arch: a)
+        assert mma_arch_reject(chain, _GT.BLOCK_SCALE_MATMUL, pipeline) is None
+    for arch in (100, 103, 120):
+        monkeypatch.setattr(C, "_current_arch", lambda a=arch: a)
+        reason = mma_arch_reject(chain, _GT.BLOCK_SCALE_MATMUL, pipeline)
+        assert reason is not None, f"{pipeline} accepted fp4+{sf_name}/{block_size} on sm_{arch}"
+        assert f"sm_{arch}" in reason and "107 <= SM < 110" in reason, reason
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_dtype_gated_scales_reject_off_sm107(block_size, monkeypatch):
+    """The dtype gate bites wherever the dtype is NAMED — it reads the chain, so
+    it does not care which pipeline, graph shape or code path would have run."""
+    from cudnn.gemm.frost.dtypes import dtype_arch_reject
+
+    chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=block_size, sf_dt=cudnn.data_type.FP8_E5M3, a_dt=cudnn.data_type.FP4_E2M1))
+    assert "fp8_e5m3" in chain.dtypes_used()
+    for arch in (107, 109):
+        assert dtype_arch_reject(chain, arch) is None
+    for arch in (100, 103, 110, 120):
+        reason = dtype_arch_reject(chain, arch)
+        assert reason is not None, f"accepted an E5M3 scale on sm_{arch}"
+        assert f"sm_{arch}" in reason and "107 <= SM < 110" in reason, reason
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    with pytest.raises(NotImplementedError, match="sm_100"):
+        jit_from_cudnn_graph(
+            _build_nvfp4_graph(256, 256, 512, block_size=block_size, sf_dt=cudnn.data_type.FP8_E5M3, a_dt=cudnn.data_type.FP4_E2M1),
+            **_kw(_SM107_128 + "_1ctamma"),
+        )
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_e5m3_runs_on_the_sm100_pipeline(block_size):
+    """The sm100 templates reach scale_format=2 through the MX descriptor rather
+    than the OMMA one, and SM 10.7 decodes it there too — so an sm100-pipeline
+    config is a legitimate way to run E5M3 on this part."""
+    _run_e5m3_numeric("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1, block_size)
+
+
+def _run_e5m3_numeric(config_name, cta_group, block_size, M=256, N=256, K=512):
+    dev = "cuda"
+    torch.manual_seed(0)
+    sf_k = K // block_size
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    a_u8 = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8, device=dev)
+    b_u8 = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8, device=dev)
+    a_deq = _unpack_fp4(a_u8, lut).view(M, K)
+    b_deq = _unpack_fp4(b_u8, lut).view(N, K)
+    sfa, sfb = _rand_e5m3((M, sf_k), dev), _rand_e5m3((N, sf_k), dev)
+
+    g = _e5m3_graph(M, N, K, block_size)
+    compiled = _plan(g, config=by_name(config_name), cta_group=cta_group)
+    assert (compiled.chain.block_scale.sf_dtype, compiled.chain.block_scale.block_size) == ("fp8_e5m3", block_size)
+
+    # The SF blob is read by base pointer and to_blocked() ceil-pads to whole
+    # 128x4 atoms, so its element count is not M*sf_k for a ragged shape — pass
+    # the byte run itself rather than a logical view of it.
+    c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
+    compiled(
+        _vp_bs(
+            compiled,
+            a_u8.view(torch.float4_e2m1fn_x2),
+            b_u8.view(torch.float4_e2m1fn_x2),
+            c,
+            _to_blocked(sfa).view(1, 1, -1),
+            _to_blocked(sfb).view(1, 1, -1),
+        )
+    )
+    torch.cuda.synchronize()
+
+    a_s = a_deq * _e5m3_to_float(sfa).repeat_interleave(block_size, 1)
+    b_s = b_deq * _e5m3_to_float(sfb).repeat_interleave(block_size, 1)
+    torch.testing.assert_close(c[0], (a_s @ b_s.t()).to(torch.float16), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize(
+    "config_name,cta_group",
+    [
+        (_SM107_128, 1),
+        (_SM107_256, 1),
+        ("CONFIG_sm107_128x128x128_128x128x64_cluster1x2", 1),
+        ("CONFIG_sm107_128x128x128_128x128x64_cluster2x1", 2),
+        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x1", 2),
+    ],
+    ids=lambda v: v if isinstance(v, str) else f"cta{v}",
+)
+def test_e5m3_block_scale_matmul_numerics(config_name, cta_group, block_size):
+    _run_e5m3_numeric(config_name, cta_group, block_size)
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_e5m3_block_scale_matmul_oob_shape(block_size):
+    """M-OOB / K past a tile boundary is TMA zero-fill, same as every other
+    block-scale combo."""
+    _run_e5m3_numeric(_SM107_128, 1, block_size, M=255, N=256, K=512 + 4 * block_size)

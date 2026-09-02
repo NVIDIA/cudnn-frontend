@@ -14,6 +14,7 @@ import torch
 
 from gemm_test_utils import (
     requires_sm100,
+    requires_sm107,
     Plan as _plan,
     vp_bs as _vp_bs,
     E2M1 as _E2M1,
@@ -27,6 +28,7 @@ from gemm_test_utils import (
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
 )
 
+from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
@@ -244,7 +246,7 @@ def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd() -> None:
     assert chain.has_moe and chain.has_block_scale
     assert chain.moe.num_experts == E
     assert chain.moe.mode == "none"
-    assert chain.block_scale.combo == "nvfp4"
+    assert (chain.block_scale.sf_dtype, chain.block_scale.block_size) == ("fp8_e4m3", 16)
     assert chain.matmul.a_dtype == "fp4_e2m1"
     assert chain.matmul.b_dtype == "fp4_e2m1"
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (S, N, K)
@@ -361,7 +363,9 @@ def _run_e2e(
         config=cfg,
         cta_group=cta_group,
     )
-    assert compiled.chain.block_scale.combo == combo
+    _blk, _, _sf_dt = _COMBOS[combo]
+    _bs = compiled.chain.block_scale
+    assert (_bs.sf_dtype, _bs.block_size) == (_DTYPE_FROM_CUDNN[_sf_dt], _blk)
 
     # SFA reordered + padded to 128 rows PER GROUP, then concatenated (for
     # 128-aligned groups this equals a single global _to_blocked). SFB per-expert.
@@ -525,6 +529,30 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
 @requires_sm100
 def test_e2e_nvfp4_groups(offsets_list) -> None:
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=offsets_list)
+
+
+@pytest.mark.parametrize(
+    "cfg_name,cta_group",
+    [
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster2x1", 2),
+    ],
+)
+@requires_sm100
+def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
+    """CTA tile spanning two MMA instructions along M. The SF words are one per
+    128-row block, so M block mi reads SF word block mi; the per-routed-group A
+    descriptor patch and the `row < group_end` guard are untouched."""
+    _run_e2e(
+        E=2,
+        S=1024,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384, 512],
+        combo="nvfp4",
+        config_name=cfg_name,
+        cta_group=cta_group,
+    )
 
 
 @pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
@@ -737,17 +765,87 @@ def test_e2e_nonpacked_tensors(combo, config_name, cta_group, mode) -> None:
     _run_nonpacked_e2e(combo, config_name, cta_group, mode)
 
 
+@requires_sm100
 @pytest.mark.parametrize("S,N", [(64, 4096), (4096, 64), (4096, 4096)])
 def test_auto_config_is_accepted_by_the_registry(S, N):
     """Same invariant as the dense block-scale case: the grouped path shares the
     BlockScaleSpec machinery, so its 128-multiple tile constraint applies too and
     ``select_config`` must not pick a geometry the registry rejects."""
-    from cudnn.gemm.frost.kernel_registry import candidates
-    from cudnn.gemm.frost.tile_config import select_config
+    from cudnn.gemm.frost.kernel_registry import candidates, preferred_pipeline
+    from cudnn.gemm.frost.tile_config import as_pipeline, select_config
 
     chain = analyze(_build_graph(8, S, N, 512, 8))
     assert chain.has_block_scale and chain.has_moe
-    cfg, _cta_group, _sched = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
     assert cfg.name in accepted, f"select_config picked {cfg.name!r}, which the registry rejects for this graph"
+
+
+# ---------------------------------------------------------------------------
+# sm107 pipeline (the sm100 grouped pipeline on the 64-byte-K block-scale MMA)
+# ---------------------------------------------------------------------------
+
+_SM107_CFG = "CONFIG_sm107_128x256x128_128x256x64_cluster2x1"
+_SM107_CFG_1CTA = "CONFIG_sm107_128x256x128_128x256x64_cluster1x1"
+
+
+def test_sm107_template_selection_and_arch_gate(monkeypatch) -> None:
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import TEMPLATES, select_template
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    chain = analyze(_build_graph(2, 512, 256, 512, num_groups=2))
+    for cta_group, cfg_name, want in (
+        (1, _SM107_CFG_1CTA, "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py"),
+        (2, _SM107_CFG, "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py"),
+    ):
+        cfg = by_name(cfg_name)
+        tmpl = select_template(chain, cfg, cta_group=cta_group)
+        assert tmpl.file == want
+        assert tmpl.accepts(chain, cfg) is None
+    # An sm100 config still pairs with the sm100 grouped templates on the same GPU.
+    assert select_template(chain, by_name(_CFG), cta_group=2).file == "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    # ... and the sm107 templates are gated off older Blackwell.
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    tmpl = next(t for t in TEMPLATES if t.file == "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py")
+    assert "107 <= SM < 110" in tmpl.accepts(chain, by_name(_SM107_CFG_1CTA))
+
+
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("cfg_name,cta_group", [(_SM107_CFG, 2), (_SM107_CFG_1CTA, 1)])
+@requires_sm107
+def test_e2e_sm107(combo, cfg_name, cta_group) -> None:
+    _run_e2e(
+        E=2,
+        S=1024,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384, 512],
+        combo=combo,
+        config_name=cfg_name,
+        cta_group=cta_group,
+    )
+
+
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("cta_group", [1, 2])
+@pytest.mark.parametrize("cta_m,cta_n", [(128, 256), (256, 128), (256, 256)])
+@requires_sm107
+def test_e2e_sm107_multi_mma_m(combo, cta_group, cta_m, cta_n) -> None:
+    # The grouped pipeline with the CTA tile split along M. The per-group-padded
+    # SF blob is unchanged; what moves is the TMEM side, where SFA is indexed per
+    # M block and SFB is walked across N blocks (they only differ once a block
+    # count exceeds one, i.e. at cta_m/cta_n = 256).
+    cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
+    name = f"CONFIG_sm107_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
+    _run_e2e(E=4, S=512, N=256, K=256, offsets_list=[0, 128, 256, 384], combo=combo, config_name=name, cta_group=cta_group)
+
+
+@pytest.mark.parametrize("cfg_name,cta_group", [(_SM107_CFG, 2), (_SM107_CFG_1CTA, 1)])
+@requires_sm107
+def test_e2e_sm107_unaligned_groups(cfg_name, cta_group) -> None:
+    # Group offsets that are not 128-aligned — the per-group-padded SF blob
+    # layout is the sm100 one, so the 64-byte-K MMA must not disturb it.
+    _run_e2e(E=2, S=512, N=256, K=512, offsets_list=[0, 100, 300], config_name=cfg_name, cta_group=cta_group)

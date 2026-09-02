@@ -8,6 +8,7 @@ from torch import Tensor
 
 _TORCH_DTYPE_TO_CUDNN = {
     torch.float32: 0,  # CUDNN_DATA_FLOAT
+    torch.float64: 1,  # CUDNN_DATA_DOUBLE
     torch.float16: 2,  # CUDNN_DATA_HALF
     torch.bfloat16: 9,  # CUDNN_DATA_BFLOAT16
 }
@@ -20,8 +21,14 @@ _ACTIVATION_TO_INT = {
 
 def _dtype_to_int(dtype: torch.dtype) -> int:
     if dtype not in _TORCH_DTYPE_TO_CUDNN:
-        raise ValueError(f"Unsupported dtype {dtype}. Supported: float32, float16, bfloat16.")
+        raise ValueError(f"Unsupported dtype {dtype}. Supported: float64, float32, float16, bfloat16.")
     return _TORCH_DTYPE_TO_CUDNN[dtype]
+
+
+def _gradient_dtype(dtype: torch.dtype) -> torch.dtype:
+    # Match cuhyena: FP16/BF16 parameter gradients accumulate in FP32,
+    # while FP32 and FP64 parameter gradients accumulate in their input type.
+    return torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
 
 
 def _activation_to_int(activation: str) -> int:
@@ -136,8 +143,9 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
     kernel_size = weight.shape[1]
 
     dx = torch.empty_like(x)
-    dweight = torch.zeros(weight.shape, device=x.device, dtype=torch.float32)
-    dbias = torch.zeros(bias.shape, device=x.device, dtype=torch.float32)
+    grad_dtype = _gradient_dtype(x.dtype)
+    dweight = torch.zeros(weight.shape, device=x.device, dtype=grad_dtype)
+    dbias = torch.zeros(bias.shape, device=x.device, dtype=grad_dtype)
 
     import cudnn
 
@@ -155,7 +163,7 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
         seq_len,
         kernel_size,
         _dtype_to_int(x.dtype),
-        _dtype_to_int(torch.float32),
+        _dtype_to_int(grad_dtype),
         _activation_to_int(activation),
     )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
@@ -217,7 +225,7 @@ def causal_conv1d(
 
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, dim, seq_len)``.
-            Must be BF16, FP16, or FP32 and on CUDA.
+            Must be BF16, FP16, FP32, or FP64. Must be contiguous and on CUDA.
         weight (torch.Tensor): Filter tensor of shape ``(dim, kernel_size)``.
             Same dtype as *x*. ``kernel_size`` must be between 2 and 256,
             inclusive.
@@ -346,8 +354,9 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
     kernel_size = weight.shape[0]
 
     dx = torch.empty_like(x)
-    dweight = torch.zeros(weight.shape, device=x.device, dtype=torch.float32)
-    dbias = torch.zeros(bias.shape, device=x.device, dtype=torch.float32)
+    grad_dtype = _gradient_dtype(x.dtype)
+    dweight = torch.zeros(weight.shape, device=x.device, dtype=grad_dtype)
+    dbias = torch.zeros(bias.shape, device=x.device, dtype=grad_dtype)
 
     import cudnn
 
@@ -365,7 +374,7 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
         seq_len,
         kernel_size,
         _dtype_to_int(x.dtype),
-        _dtype_to_int(torch.float32),
+        _dtype_to_int(grad_dtype),
         _activation_to_int(activation),
     )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
@@ -423,6 +432,7 @@ def causal_conv1d_nwh(
 
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, seq_len, dim)``.
+            Must be BF16, FP16, FP32, or FP64.
         weight (torch.Tensor): Filter tensor of shape ``(kernel_size, dim)``.
             ``kernel_size`` must be between 2 and 128, inclusive.
         bias (torch.Tensor | None): Optional bias of shape ``(dim,)``.
@@ -592,9 +602,10 @@ def _b2b_bwd_primitive(
     kernel_size_mixer = weights_mixer.shape[1]
 
     dx = torch.empty_like(x)
-    dweights_proj = torch.zeros(weights_proj.shape, device=x.device, dtype=torch.float32)
-    dweights_mixer = torch.zeros(weights_mixer.shape, device=x.device, dtype=torch.float32)
-    dskip_bias = torch.zeros(skip_bias.shape, device=x.device, dtype=torch.float32)
+    grad_dtype = _gradient_dtype(x.dtype)
+    dweights_proj = torch.zeros(weights_proj.shape, device=x.device, dtype=grad_dtype)
+    dweights_mixer = torch.zeros(weights_mixer.shape, device=x.device, dtype=grad_dtype)
+    dskip_bias = torch.zeros(skip_bias.shape, device=x.device, dtype=grad_dtype)
 
     import cudnn
 
@@ -616,7 +627,7 @@ def _b2b_bwd_primitive(
         kernel_size_proj,
         kernel_size_mixer,
         _dtype_to_int(x.dtype),
-        _dtype_to_int(torch.float32),
+        _dtype_to_int(grad_dtype),
     )
     return [
         dx,
@@ -696,6 +707,7 @@ def b2b_causal_conv1d(
 
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, 3*dim, seq_len)``.
+            Must be BF16, FP16, FP32, or FP64.
         weights_proj (torch.Tensor): Projection filter ``(3*dim, kernel_size_proj)``.
             ``kernel_size_proj`` must be between 2 and 32, inclusive.
         weights_mixer (torch.Tensor): Mixer filter ``(dim, kernel_size_mixer)``.

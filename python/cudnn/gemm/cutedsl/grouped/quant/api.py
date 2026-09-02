@@ -8,17 +8,28 @@ and discrete weight modes for grouped block-scaled GEMM with output
 quantization in MoE (Mixture of Experts) workloads.
 """
 
+from __future__ import annotations
+
 import os
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, get_device_type, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    allocate_byte_workspace,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_data_ptr,
+    get_device,
+)
 
 from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
@@ -27,6 +38,12 @@ from ..moe_utils import MoEWeightMode
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
+
+_JAX_SF_LAYOUT_ERROR = (
+    "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
+    "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
+    "(a row-major JAX array of that shape has different memory); pass torch tensors"
+)
 
 
 def _get_rubin_kernel():
@@ -75,10 +92,11 @@ class GroupedGemmQuantSm100(APIBase):
         sample_prob: Optional[torch.Tensor] = None,
         sample_row_scale: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
@@ -113,13 +131,27 @@ class GroupedGemmQuantSm100(APIBase):
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
         :param vector_f32: Use vectorized f32 operations
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Enable discrete col-major scale factor tensor
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        framework = detect_framework(sample_a)
+        if framework == "jax":
+            raise ValueError(f"GroupedGemmQuantSm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+        if framework != "torch":
+            raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmQuantSm100; pass torch tensors")
+        if acc_dtype is None:
+            acc_dtype = cutlass.Float32
         super().__init__()
+        self._framework = framework
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
@@ -136,14 +168,14 @@ class GroupedGemmQuantSm100(APIBase):
         else:
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
-        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets", canonical=True)
+        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha", canonical=True)
 
         self._has_d_col = sample_d_col is not None
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
+        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col", canonical=True)
         if self.d_col_desc is None:
             self.d_col_desc = TensorDesc(
                 dtype=self.d_desc.dtype,
@@ -153,38 +185,38 @@ class GroupedGemmQuantSm100(APIBase):
                 device=self.d_desc.device,
                 name="sample_d_col",
             )
-        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
-        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
-        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
+        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col", canonical=True)
+        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True)
         self.norm_const_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
+            self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True),
             1,
             "norm_const",
         )
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
+        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
         self.row_scale_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_row_scale, name="sample_row_scale"),
+            self._make_tensor_desc(sample_row_scale, name="sample_row_scale", canonical=True),
             1,
             "row_scale",
         )
-        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
 
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
+            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+            self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
             self._value_error_if(num_experts == 0, "num_experts must be > 0")
             self.expert_cnt = num_experts
             self.b_shape = b_shape
-            self.b_dtype = b_dtype
+            self.b_dtype = _convert_to_cutlass_data_type(b_dtype)
             self.b_major = b_major
             self._value_error_if(
                 self.padded_offsets_desc.shape[0] != self.expert_cnt,
                 f"padded_offsets length ({self.padded_offsets_desc.shape[0]}) " f"must equal num_experts ({self.expert_cnt})",
             )
 
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         if cluster_shape_mn is None:
@@ -192,6 +224,7 @@ class GroupedGemmQuantSm100(APIBase):
         else:
             self.cluster_shape_mn = cluster_shape_mn
         self.sf_vec_size = sf_vec_size
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
@@ -322,10 +355,10 @@ class GroupedGemmQuantSm100(APIBase):
         self.ab_dtype = self._check_dtype(
             self.a_desc,
             dtype=[
-                torch.float4_e2m1fn_x2,
-                torch.uint8,
-                torch.float8_e5m2,
-                torch.float8_e4m3fn,
+                cutlass.Float4E2M1FN,
+                cutlass.Uint8,
+                cutlass.Float8E5M2,
+                cutlass.Float8E4M3FN,
             ],
             name="A/B",
         )
@@ -338,7 +371,7 @@ class GroupedGemmQuantSm100(APIBase):
             )
             self._check_dtype(
                 self.bias_desc,
-                dtype=[torch.bfloat16, torch.float16, torch.float32],
+                dtype=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32],
                 name="bias",
                 extra_error_msg="bias must be fp16, bfloat16, or float32",
             )
@@ -349,14 +382,14 @@ class GroupedGemmQuantSm100(APIBase):
             )
             self._check_dtype(
                 self.bias_desc,
-                dtype=[torch.bfloat16, torch.float16],
+                dtype=[cutlass.BFloat16, cutlass.Float16],
                 name="bias",
                 extra_error_msg="bias must be fp16 or bfloat16 in discrete mode",
             )
 
         self.sf_dtype = self._check_dtype(
             self.sfa_desc,
-            dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
+            dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN],
             name="SFA/SFB/SFD_row/SFD_col",
         )
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -384,7 +417,7 @@ class GroupedGemmQuantSm100(APIBase):
             f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}",
         )
         self._value_error_if(
-            self.sf_dtype in [torch.float8_e4m3fn] and self.sf_vec_size == 32,
+            self.sf_dtype in [cutlass.Float8E4M3FN] and self.sf_vec_size == 32,
             f"sf_dtype {self.sf_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
         self._value_error_if(
@@ -392,16 +425,40 @@ class GroupedGemmQuantSm100(APIBase):
             f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
 
+        # torch has no e5m3 dtype and TVM-FFI cannot marshal FloatNV8E5M3FNU, so e5m3
+        # scale factors arrive as e4m3 storage of the same width and the Rubin kernel
+        # reinterprets them. That reinterpretation is the only real override; every
+        # other format the kernel reads straight off sfa.element_type.
+
+        # e5m3 is the only override currently supported
+        self._value_error_if(
+            self.sf_fp8_dtype_override not in (None, "e5m3"),
+            f"sf_fp8_dtype_override must be None or 'e5m3', got {self.sf_fp8_dtype_override!r}",
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            # Only allow e5m3 to pretend to be e4m3fn
+            self._value_error_if(
+                self.sf_dtype != cutlass.Float8E4M3FN,
+                f"sf_fp8_dtype_override='e5m3' requires the NVFP4 recipe -- FP4 A/B with "
+                f"torch.float8_e4m3fn scale factors at sf_vec_size 16 -- but got "
+                f"ab_dtype={self.ab_dtype}, sf_dtype={self.sf_dtype}, sf_vec_size={self.sf_vec_size}",
+            )
+            # Only allow e5m3 for rubin kernels
+            self._value_error_if(
+                not self._is_rubin_kernel,
+                f"sf_fp8_dtype_override='e5m3' requires Rubin (SM107), got device type {self._device_type!r}",
+            )
+
         self._check_dtype(
             self.acc_dtype,
-            dtype=torch.float32,
+            dtype=cutlass.Float32,
             name="Accumulator",
             extra_error_msg="Accumulator must be float32",
         )
         if self._is_fp4x2(self.ab_dtype):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
-                dtype=[torch.float16, torch.bfloat16, torch.float32],
+                dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32],
                 name="D",
                 extra_error_msg="D must be fp16, bf16, or float32 when ab_dtype is fp4",
             )
@@ -409,11 +466,11 @@ class GroupedGemmQuantSm100(APIBase):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
                 dtype=[
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                    torch.float4_e2m1fn_x2,
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
+                    cutlass.Float4E2M1FN,
                 ],
                 name="D",
             )
@@ -426,15 +483,10 @@ class GroupedGemmQuantSm100(APIBase):
         if not self._is_rubin_kernel:
             self._check_dtype(
                 self.row_scale_desc,
-                dtype=torch.float32,
+                dtype=cutlass.Float32,
                 name="row_scale",
                 extra_error_msg="row_scale must be float32",
             )
-
-        self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,
-            "Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. Please use sf_vec_size 32 or d_dtype bf16 instead",
-        )
 
         if self.weight_mode == MoEWeightMode.DISCRETE:
             self._value_error_if(
@@ -526,13 +578,12 @@ class GroupedGemmQuantSm100(APIBase):
             "Invalid configuration: fp8 ab_dtype and sf_vec_size 32 with mma_tiler_mn[1] == 128 and fp8 d_dtype is not supported. "
             "Please use mma_tiler_mn[1] == 256 instead",
         )
-        if not torch.cuda.is_available():
+        if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmQuant requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+            raise RuntimeError(f"GroupedGemmQuant requires SM100+ compute capability, but found SM{compute_capability}")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
@@ -565,6 +616,11 @@ class GroupedGemmQuantSm100(APIBase):
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
+            # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
+            # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
+            # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
+            # that internal-only type is never named outside the Rubin module.
+            **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
         )
         if self._is_rubin_kernel:
             # The Rubin quant kernel supports optional C materialization, but
@@ -582,7 +638,9 @@ class GroupedGemmQuantSm100(APIBase):
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         workspace_bytes = gemm_quant.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device="cuda")
+        # Internal scratch in the caller's framework allocator; kernels write through its
+        # raw pointer and it is never surfaced as a framework array.
+        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_quant, max_active_clusters, fake_stream)
@@ -951,13 +1009,27 @@ class GroupedGemmQuantSm100(APIBase):
                 stride=self.prob_desc.stride,
                 assumed_align=16,
             )
-        row_scale_tensor = self._make_fake_cute_tensor_from_desc(self.row_scale_desc, assumed_align=16)
+        row_scale_tensor = None
+        if self.row_scale_desc is not None:
+            row_scale_tensor = self._make_fake_cute_tensor(
+                dtype=self.row_scale_desc.dtype,
+                shape=(valid_m,),
+                stride=self.row_scale_desc.stride,
+                assumed_align=16,
+            )
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
-        b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-        b_ptrs_cute = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
-        sfb_ptrs_cute = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
+        # Compile-time placeholders for the pointer-array arguments: real device bytes
+        # (fake tensors have dummy iterators) allocated in the caller's framework,
+        # retyped to Int64 via the element_type override.
+        self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
+        self._compile_sfb_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
+        b_ptrs_placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
+        b_ptrs_placeholder.element_type = cutlass.Int64
+        b_ptrs_cute = b_ptrs_placeholder.iterator
+        sfb_ptrs_placeholder = from_dlpack(self._compile_sfb_ptrs, assumed_align=8)
+        sfb_ptrs_placeholder.element_type = cutlass.Int64
+        sfb_ptrs_cute = sfb_ptrs_placeholder.iterator
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
         self._logger.debug("Compiling discrete grouped_gemm_quant kernel")
@@ -1016,8 +1088,8 @@ class GroupedGemmQuantSm100(APIBase):
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            b_ptrs_addr = int(b_ptrs_device.data_ptr())
-            sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
+            b_ptrs_addr = int(get_data_ptr(b_ptrs_device))
+            sfb_ptrs_addr = int(get_data_ptr(sfb_ptrs_device))
             if self._is_rubin_kernel:
                 _compiled_kernel(
                     a_tensor,
@@ -1118,7 +1190,10 @@ class GroupedGemmQuantSm100(APIBase):
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
 
         if a_tensor.shape[0] == 0:
             self._logger.debug("execute: valid_m is zero, skipping kernel execution")
@@ -1225,13 +1300,14 @@ def grouped_gemm_quant_wrapper_sm100(
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
     row_scale_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     vector_f32: bool = False,
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
@@ -1277,6 +1353,14 @@ def grouped_gemm_quant_wrapper_sm100(
         mma_tiler_mn: MMA tiler shape
         cluster_shape_mn: Cluster shape
         sf_vec_size: Scale factor vector size
+        sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors as
+            E5M3 instead of the encoding implied by ``sfa_tensor.dtype``. ``None``
+            (default) infers as usual -- E4M3 for NVFP4, E8M0 for MXFP4/MXFP8.
+            ``"e5m3"`` selects an unsigned 5-exponent-bit, 3-mantissa-bit format
+            that trades two mantissa bits for one exponent bit to widen the scale
+            range; it is Rubin-only, requires the NVFP4 recipe, and the scale
+            tensors are still passed as ``torch.float8_e4m3fn`` because torch has
+            no e5m3 dtype.
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Enable discrete col-major scale factor tensor
@@ -1303,7 +1387,18 @@ def grouped_gemm_quant_wrapper_sm100(
                 # Integer indexing
                 d = result[0]  # d_tensor
     """
-    from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+
+    framework = detect_framework(a_tensor)
+    if framework == "jax":
+        raise ValueError(f"grouped_gemm_quant_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+    if framework != "torch":
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_quant_wrapper_sm100; pass torch tensors")
+    import torch
+
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
+    d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
+    b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
 
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
@@ -1321,30 +1416,29 @@ def grouped_gemm_quant_wrapper_sm100(
             raise ValueError(f"bias_tensor must have shape {(n_out, l)}, got {tuple(bias_tensor.shape)}")
     else:
         weight_mode = MoEWeightMode.DISCRETE
-        _require_pointer_tensor(b_ptrs, "b_ptrs")
-        num_experts = b_ptrs.shape[0]
-        _require_pointer_tensor(sfb_ptrs, "sfb_ptrs", num_experts)
+        num_experts = _validate_pointer_tensor(b_ptrs, "b_ptrs")
+        _validate_pointer_tensor(sfb_ptrs, "sfb_ptrs", num_experts)
         if n is None or b_dtype is None:
             raise ValueError("n and b_dtype are required for discrete mode")
-        k_logical = k_physical * 2 if b_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
+        k_logical = k_physical * 2 if b_dtype in (cutlass.Float4E2M1FN, cutlass.Uint8) else k_physical
         b_shape = (n, k_logical)
         n_out = n
         l = num_experts
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, num_experts):
             raise ValueError(f"bias_tensor must have shape {(n_out, num_experts)}, got {tuple(bias_tensor.shape)}")
 
-    is_fp8_input_config = a_tensor.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ] and sfa_tensor.dtype in [
-        torch.float8_e8m0fnu,
-        torch.float8_e4m3fn,
-    ]
-    is_low_precision_output_config = d_dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        torch.float4_e2m1fn_x2,
-    ]
+    is_fp8_input_config = _convert_to_cutlass_data_type(a_tensor.dtype) in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+    ) and _convert_to_cutlass_data_type(sfa_tensor.dtype) in (
+        cutlass.Float8E8M0FNU,
+        cutlass.Float8E4M3FN,
+    )
+    is_low_precision_output_config = d_dtype in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
+    )
 
     _logger.debug("grouped_gemm_quant_wrapper_sm100: Creating output tensors")
 
@@ -1352,12 +1446,12 @@ def grouped_gemm_quant_wrapper_sm100(
         expected_shape = (valid_m, n_out, 1)
         expected_stride = (n_out, 1, valid_m * n_out)
         if d_tensor is None:
-            d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=d_dtype, device=a_tensor.device)
+            d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
         elif (
             tuple(d_tensor.shape) != expected_shape
             or tuple(d_tensor.stride()) != expected_stride
-            or d_tensor.dtype != d_dtype
-            or d_tensor.device != a_tensor.device
+            or _convert_to_cutlass_data_type(d_tensor.dtype) != d_dtype
+            or get_device(d_tensor) != get_device(a_tensor)
         ):
             raise ValueError(
                 f"d_tensor must have shape {expected_shape}, stride {expected_stride}, "
@@ -1365,7 +1459,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 f"stride {tuple(d_tensor.stride())}, dtype {d_tensor.dtype}, device {d_tensor.device}."
             )
         d_col_tensor = (
-            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
             if is_low_precision_output_config
             else None
         )
@@ -1414,7 +1508,7 @@ def grouped_gemm_quant_wrapper_sm100(
         )
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    if d_dtype in [torch.bfloat16, torch.float16]:
+    if d_dtype in (cutlass.BFloat16, cutlass.Float16):
         _logger.debug("grouped_gemm_quant_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
         amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
@@ -1422,7 +1516,7 @@ def grouped_gemm_quant_wrapper_sm100(
     if row_scale_tensor is not None:
         if device_type == "rubin":
             raise NotImplementedError("Rubin grouped GEMM quant does not support row_scale fusion")
-        if row_scale_tensor.dtype != torch.float32:
+        if _convert_to_cutlass_data_type(row_scale_tensor.dtype) is not cutlass.Float32:
             raise ValueError(f"row_scale_tensor must be float32, got {row_scale_tensor.dtype}")
         if tuple(row_scale_tensor.shape) != (valid_m,):
             raise ValueError(f"row_scale_tensor must have shape {(valid_m,)}, got {tuple(row_scale_tensor.shape)}")
@@ -1495,6 +1589,7 @@ def grouped_gemm_quant_wrapper_sm100(
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -1533,6 +1628,7 @@ def grouped_gemm_quant_wrapper_sm100(
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -1568,6 +1664,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
@@ -1596,6 +1693,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,

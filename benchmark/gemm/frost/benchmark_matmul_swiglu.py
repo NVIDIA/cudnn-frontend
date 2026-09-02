@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
-from typing import Callable
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
@@ -24,10 +22,12 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
+from benchmark_utils import add_sweep_args, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms
 
-def _build_plan(g, cfg, cta_group, sched):
+
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_mg(handles, gemm_pairs, outs, *aux):
@@ -93,6 +93,27 @@ def _mkdata(B, M, N, K, in_dt, out_dt):
     return a, b0, b1, out, scale
 
 
+def _mkdata_pool(B, M, N, K, in_dt, out_dt, nbuf):
+    """`nbuf` independent (a, b0, b1, out, scale) sets at distinct GMEM addresses."""
+    base = _mkdata(B, M, N, K, in_dt, out_dt)
+    pool = [base]
+    for _ in range(max(0, nbuf - 1)):
+        pool.append(tuple(t.clone() for t in base))
+    return pool
+
+
+def _unpack(s):
+    """A pooled set is (a, b0, b1, out, scale); _unfused_launch wants scale before out."""
+    a, b0, b1, out, scale = s
+    return a, b0, b1, scale, out
+
+
+def _gemm_args(s):
+    """A pooled set -> _vp_mg's (gemm_pairs, outs, *aux)."""
+    a, b0, b1, out, scale = s
+    return [(a, b0), (a, b1)], out, scale
+
+
 def _reference(a, b0, b1, scale, out_dt):
     """Correctness reference: 2 GEMMs + elementwise chain (einsum 'bmk,bnk->bmn'
     matches the (B,N,K) operands)."""
@@ -108,45 +129,21 @@ def _unfused_launch(a, b0, b1, scale, out):
     out.copy_((torch.nn.functional.silu(c0.float()) * c1.float() * scale.flatten()[0]).to(out.dtype))
 
 
-# Timing (delayed / events) — same pattern as benchmark_matmul.py. delayed hides
-# host-launch overhead behind a CUDA _sleep so kernels run back-to-back.
-
-
-def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
-    for _ in range(warmup):
-        timed_fn()
-    torch.cuda.synchronize()
-    if delayed:
-        delay_cycles = max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6))
-        torch.cuda._sleep(delay_cycles)
-        for _ in range(max(5, warmup)):
-            timed_fn()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        timed_fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every multi-GEMM-
+    """Legacy label -> (geometry cfg, cta_group) for every multi-GEMM-
     capable sm100 matmul strategy. Multi-GEMM TMEM fits num_gemms accumulators
     only for cta_tile_n<=256 (2*256<=512); cta_tile_m=128."""
     chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cgrp_size_n != 1 or cfg.cta_tile_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cgrp_size_n != 1 or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
 _SPEC_MAP = _build_spec_map()
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -157,14 +154,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--shape", default="1,4096,4096,4096", help="B,M,N,K")
     p.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
-    p.add_argument(
-        "--configs",
-        default=None,
-        help="comma-separated CONFIG_..._Nctamma[_static] labels " "(same form as benchmark_matmul.py; default: sweep all)",
-    )
-    p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
+    add_sweep_args(p, nsys=False)
     p.add_argument("--rtol", type=float, default=2e-2)
     p.add_argument("--atol", type=float, default=2e-1)
     args = p.parse_args()
@@ -178,59 +168,70 @@ def main() -> int:
         sys.exit("--shape must be B,M,N,K (four values; B=1 = a single SwiGLU block)")
     B, M, N, K = parts
     in_dt = out_dt = args.dtype
-    delayed = args.timing == "delayed"
 
     # 2 GEMMs, each 2*B*M*N*K flops.
     flops = 2 * (2 * B * M * N * K)
     print(f"\n=== SwiGLU dual-matmul  B={B} {M}x{N}x{K}  " f"(~{flops / 1e9:.1f} GFLOP, 2 GEMMs) — {in_dt} in / {out_dt} out ===")
-    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]\n")
+    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]")
 
-    a, b0, b1, out, scale = _mkdata(B, M, N, K, in_dt, out_dt)
-    ref = _reference(a, b0, b1, scale, out_dt)
+    wa, wb0, wb1, w_out, wscale = _mkdata(B, M, N, K, in_dt, out_dt)
+    per_set = set_bytes((wa, wb0, wb1, w_out, wscale))
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
+    report_pool(nbuf, per_set)
+    print()
+    pool = _mkdata_pool(B, M, N, K, in_dt, out_dt, nbuf)
+    ref = _reference(wa, wb0, wb1, wscale, out_dt)
 
     # --- baseline: unfused 2×cuBLAS + pointwise ---
-    out_bl = torch.empty_like(out)
-    bl_ms = _time_ms(
-        lambda: _unfused_launch(a, b0, b1, scale, out_bl),
+    out_bl = torch.empty_like(w_out)
+    if args.stream:
+        print("  ▶ running unfused baseline ...", flush=True)
+    bl_ms = time_ms(
+        rotating(lambda s: _unfused_launch(*_unpack(s)), pool),
+        lambda: _unfused_launch(wa, wb0, wb1, wscale, out_bl),
         warmup=args.warmup,
         iters=args.iters,
-        delayed=delayed,
+        timing=args.timing,
     )
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS + pointwise':52s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    # --- candidate (config, cta_group, scheduler) strategies ---
-    config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
+    # --- candidate (config, cta_group) strategies ---
+    config_names = select_configs(args.configs, _SPEC_MAP)
 
     best = None
     for label in config_names:
-        if label not in _SPEC_MAP:
+        spec = spec_for(label, _SPEC_MAP)
+        if spec is None:
             print(f"  {label:62s} UNKNOWN (not a sweepable swiglu strategy)")
             continue
-        cfg, cta_group, sched = _SPEC_MAP[label]
+        cfg, cta_group = spec
+        if args.stream:
+            print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph_swiglu(B, M, N, K, in_dt, out_dt)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue  # geometry/strategy can't run this shape/dtype — skip
         try:
-            plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale))
+            plan(_vp_mg(h, [(wa, wb0), (wa, wb1)], w_out, wscale))
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {label:62s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
-        err = (out.float() - ref.float()).abs().max().item()
-        ok = torch.allclose(out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
-        ms = _time_ms(
-            lambda: plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale)),
+        err = (w_out.float() - ref.float()).abs().max().item()
+        ok = torch.allclose(w_out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
+        ms = time_ms(
+            rotating(lambda s, _plan=plan, _h=h: _plan(_vp_mg(_h, *_gemm_args(s))), pool),
+            lambda _plan=plan, _h=h: _plan(_vp_mg(_h, [(wa, wb0), (wa, wb1)], w_out, wscale)),
             warmup=args.warmup,
             iters=args.iters,
-            delayed=delayed,
+            timing=args.timing,
         )
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"
-        print(f"  {label:62s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms   " f"{ratio:>7.2f}×{flag}")
+        print(f"  {label:62s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms   " f"{ratio:>7.2f}×{flag}", flush=True)
         if ok and (best is None or ms < best[1]):
             best = (label, ms, tflops, ratio)
 

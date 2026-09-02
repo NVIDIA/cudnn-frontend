@@ -1074,7 +1074,7 @@ class IndexerBackwardSm100:
         s_full_1_phase = Int32(0)
 
         dw_accum = cute.make_rmem_tensor(tSrS_shape, Float32)
-        for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
+        for ei in cutlass.range_constexpr(cute.size(dw_accum)):
             dw_accum[ei] = Float32(0.0)
 
         tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
@@ -1129,16 +1129,16 @@ class IndexerBackwardSm100:
 
             # Phase 2: Convert dS f32→bf16, write to sdS via coordinate mapping.
             tSrS_f16 = cute.make_rmem_tensor(tSrS.shape, self.q_dtype)
-            for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
+            for ei in cutlass.range_constexpr(cute.size(tSrS)):
                 tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
             if bi % 2 == 0:
-                for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
+                for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
                     h = cute.get(tCcS[ei], mode=[0, 0])
                     n = cute.get(tCcS[ei], mode=[0, 1])
                     sdS_gemm_view_0[h, n] = tSrS_f16[ei]
             else:
-                for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
+                for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
                     h = cute.get(tCcS[ei], mode=[0, 0])
                     n = cute.get(tCcS[ei], mode=[0, 1])
                     sdS_gemm_view_1[h, n] = tSrS_f16[ei]
@@ -1159,7 +1159,7 @@ class IndexerBackwardSm100:
         cute.copy(tiled_tmem_load_dq, tDqDq_t2r, tDQrDQ)
 
         tDQrDQ_bf16 = cute.make_rmem_tensor(tDQrDQ.shape, self.q_dtype)
-        for ei in cutlass.range(cute.size(tDQrDQ), unroll_full=True):
+        for ei in cutlass.range_constexpr(cute.size(tDQrDQ)):
             tDQrDQ_bf16[ei] = self.q_dtype(tDQrDQ[ei] * Float32(sm_scale))
 
         cute.arch.fence_view_async_tmem_load()
@@ -1169,7 +1169,7 @@ class IndexerBackwardSm100:
             sdQ_epi_slice,
             cute.make_layout((self.heads_padded, self.head_dim_padded)),
         )
-        for ei in cutlass.range(cute.size(tDQrDQ_bf16), unroll_full=True):
+        for ei in cutlass.range_constexpr(cute.size(tDQrDQ_bf16)):
             h = cute.get(tCcDQ[ei], mode=[0, 0])
             d = cute.get(tCcDQ[ei], mode=[0, 1])
             sdQ_gemm_view[h, d] = tDQrDQ_bf16[ei]
@@ -1188,7 +1188,7 @@ class IndexerBackwardSm100:
         for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
             h = warp_base_h + h_local
             my_partial = Float32(0.0)
-            for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
+            for ei in cutlass.range_constexpr(cute.size(dw_accum)):
                 if cute.get(tCcS[ei], mode=[0, 0]) == h:
                     my_partial = my_partial + dw_accum[ei]
             total = cute.arch.warp_reduction_sum(my_partial)
@@ -1257,7 +1257,7 @@ class IndexerBackwardSm100:
             # local→global when topk_indices_global=False); gmem fallback
             # mirrors that conversion via const_expr branch.
             batch_offset_l2g = Int32(0) if const_expr(self.topk_indices_global) else batch_idx * (seqlen_k // batch_size)
-            for pair in cutlass.range(cute.size(tDKrDK) // 2, unroll_full=True):
+            for pair in cutlass.range_constexpr(cute.size(tDKrDK) // 2):
                 ei = pair * 2
                 n = cute.get(tCcDK[ei], mode=[0, 0])
                 d = cute.get(tCcDK[ei], mode=[0, 1])
@@ -1666,8 +1666,15 @@ def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_glo
         score_grad(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=current_stream)
 
         if dIndexK.dtype == torch.float32:
-            # Caller provided a pre-zeroed f32 buffer; write directly (no extra
-            # alloc + cast). This matches the SM90 _run fast path.
+            # fp32 output: the dK epilogue atomic-adds into this buffer, so it
+            # must start zeroed. Zero it internally on the selected stream
+            # (cheap; removes the fragile caller pre-zero contract) rather than
+            # trusting the caller. This zero-init is a promised stage of the
+            # execute pipeline (see the IndexerBackward docstring) and mirrors
+            # the SM90 backend and the DenseIndexerBackward fp32 paths, which
+            # zero their fp32 dK buffer the same way.
+            with _torch_stream_context(current_stream):
+                dIndexK.zero_()
             _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, TopkIndices, current_stream=current_stream)
         else:
             # Need a separate f32 buffer for atomicAdd, then cast back to output dtype.

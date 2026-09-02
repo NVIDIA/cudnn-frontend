@@ -522,22 +522,32 @@ class TestReviewSemantics:
         A.set_uid(1000)
         assert d[A] == "x"
 
-    def test_identity_mutation_frozen_after_planning(self):
-        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
+    def test_identity_mutation_frozen_after_planning(self, monkeypatch):
+        from cudnn.engines import BaseEngine
+
+        from test_dispatch import _FAKE, _offer
 
         class Dummy(BaseEngine):
-            engine_id = OUT_OF_TREE_ID_BASE + 90
+            engine_id = _FAKE + 90
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
+        _offer(monkeypatch, Dummy())  # keeps planning python-side (no C++ needed)
+
         g = pygraph()
-        g.register_backend(Dummy())  # keeps planning python-side (no C++ needed)
         A = g.tensor(dim=[1, 2, 2], name="A")
         g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
         g.create_execution_plans()
         with pytest.raises(RuntimeError, match="frozen"):
             A.set_uid(500)
+        # A name is a variant-pack key, so it is identity too: renaming a
+        # planned graph would leave the lowered graph and any compiled binding
+        # holding the old label while the IR reports the new one.
+        with pytest.raises(RuntimeError, match="frozen"):
+            A.set_name("renamed")
+        assert A.get_name() == "A"
+        A.set_name("A")  # a no-op rename stays legal, as a no-op re-uid does
 
     def test_mxfp8_dsink_is_output(self):
         """Follow-up item 4: mxfp8_backward dSink_token is an output port."""
@@ -549,16 +559,20 @@ class TestReviewSemantics:
         (node,) = g.nodes
         assert "dSink_token" in node.outputs and "dSink_token" not in node.inputs
 
-    def test_semantic_setters_frozen_after_planning(self):
-        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
+    def test_semantic_setters_frozen_after_planning(self, monkeypatch):
+        from cudnn.engines import BaseEngine
+
+        from test_dispatch import _FAKE, _offer
 
         class Dummy(BaseEngine):
-            engine_id = OUT_OF_TREE_ID_BASE + 91
+            engine_id = _FAKE + 91
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
-        g = pygraph(backends=[Dummy()])
+        _offer(monkeypatch, Dummy())
+
+        g = pygraph()
         A = g.tensor(dim=[1, 2, 2], name="A")
         g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
         g.create_execution_plans()
@@ -566,36 +580,51 @@ class TestReviewSemantics:
             with pytest.raises(RuntimeError, match="frozen"):
                 mutate()
 
-    def test_freeze_covers_public_surface(self):
-        """Review round 5: the freeze must close EVERY public mutation path,
-        not only the fluent API — attribute writes, live containers, in-place
-        list edits, node params, and graph context."""
-        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
+    def test_freeze_covers_public_surface(self, monkeypatch):
+        """Freezing is ONE flag, on the graph.
+
+        Every mutation route the public API offers runs through _check_mutable,
+        so the flag alone guards them. What the caller could otherwise change
+        behind the API's back is made immutable in its own right — dim/stride
+        become tuples, the port and param dicts become MappingProxy views —
+        rather than watched by a per-object __setattr__ guard.
+
+        Those guards used to exist on Tensor, Node and GraphContext. They cost
+        a python-level call per field on EVERY construction (measured 2.1 us of
+        a 2.8 us Tensor, and a graph builds one per tensor and per node) to
+        catch a write that bypasses the setters anyway. Assigning
+        `t.dim = [...]` directly on a frozen graph is therefore no longer an
+        error; it is also not something the API asks anyone to do."""
+        from cudnn.engines import BaseEngine
+
+        from test_dispatch import _FAKE, _offer
 
         class Dummy(BaseEngine):
-            engine_id = OUT_OF_TREE_ID_BASE + 92
+            engine_id = _FAKE + 92
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
-        g = pygraph(backends=[Dummy()])
+        _offer(monkeypatch, Dummy())
+
+        g = pygraph()
         A = g.tensor(dim=[1, 2, 2], name="A")
         C = g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
         g.create_execution_plans()
         node = g.nodes[0]
 
+        # the setters and op builders — every mutation route the API offers — are closed
         with pytest.raises(RuntimeError, match="frozen"):
-            A.dim = [9, 9]  # direct attribute write
+            A.set_dim([9, 9])
+        with pytest.raises(RuntimeError, match="frozen"):
+            g.matmul(A, C)
+        # and the containers are immutable in their own right, at no per-call cost
         with pytest.raises(TypeError):
             A.dim[:] = [9]  # sealed to a tuple: no in-place edits
         with pytest.raises(TypeError):
             node.params["padding"] = 123  # MappingProxy
         with pytest.raises(TypeError):
             node.inputs["A"] = C  # MappingProxy
-        with pytest.raises(RuntimeError, match="frozen"):
-            node.inputs = {}  # attribute write on the node
-        with pytest.raises(RuntimeError, match="frozen"):
-            g.context.compute_data_type = "HALF"  # graph context
         # live-container laundering: the public views are copies
         g.nodes.clear()
         g.tensors.clear()
@@ -603,24 +632,42 @@ class TestReviewSemantics:
         # the inspection surface stays readable for engines
         assert list(node.inputs) == ["A", "B"] and list(C.dim) == [1, 2, 2]
 
-    def test_mutation_after_validate_revalidates(self):
-        """Review round 5: python-engine graphs stay mutable until planning —
-        but a mutation after validate() must invalidate _is_validated so stale
-        inference never reaches planning."""
-        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
+    def test_mutation_after_validate_revalidates(self, monkeypatch):
+        """Review round 5: a graph that is still mutable after validate() must
+        have _is_validated cleared by a mutation, so stale inference never
+        reaches planning.
+
+        The mutable window is exactly the graphs the backend has no node for
+        (GDN/KDA/...): anything it CAN lower is lowered by validate() and frozen
+        there, which is classic error timing."""
+        import cudnn as _cudnn
+        from cudnn.engines import BaseEngine
+
+        from test_dispatch import _FAKE, _offer
 
         class Dummy(BaseEngine):
-            engine_id = OUT_OF_TREE_ID_BASE + 93
+            engine_id = _FAKE + 93
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
-        g = pygraph(backends=[Dummy()])
-        A = g.tensor(dim=[1, 2, 2], name="A")
-        g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
+        _offer(monkeypatch, Dummy(), node_type="GDN")
+
+        T, N, H, K, V = 8, 1, 2, 4, 4
+        g = pygraph()
+        q = g.tensor([T, H, K], name="q")
+        g.gdn(
+            q=q,
+            k=g.tensor([T, H, K], name="k"),
+            v=g.tensor([T, H, V], name="v"),
+            g=g.tensor([T, H], name="g"),
+            beta=g.tensor([T, H], name="beta"),
+            cu_seqlens=g.tensor([N + 1], data_type=_cudnn.data_type.INT32, name="cu_seqlens"),
+            name="gdn",
+        )
         g.validate()
         assert g._is_validated and not g._frozen  # mutable until planning
-        A.set_data_type("HALF")  # allowed — and must force re-validation
+        q.set_data_type("HALF")  # allowed — and must force re-validation
         assert not g._is_validated
         g.create_execution_plans()
         assert g._frozen

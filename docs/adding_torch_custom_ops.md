@@ -77,25 +77,25 @@ graph.check_support()
 graph.build_plans()  # also prepares variant pack template
 ```
 
-## Execute: use sorted_ptrs path
+## Execute
 
-Cache `uid_order` alongside the graph. Use `_execute_with_ptrs` instead of dict-based execute:
+`graph.execute(uid_to_tensor, workspace, handle=handle)` is the only form you need.
+It already caches the backend's operand order and reuses one pointer array, so the
+sorted-pointer path is what runs underneath — there is nothing faster to reach for,
+and hand-rolling it costs you the dynamic-shape overrides and the python-engine
+dispatch that `execute()` handles.
 
 ```python
 if cache_key not in _cache:
-    graph, ws_size = _build_graph(...)
-    uid_order = graph._get_variant_pack_uids_sorted()
-    _cache[cache_key] = (graph, ws_size, uid_order)
+    _cache[cache_key] = _build_graph(...)          # (graph, ws_size)
 
-graph, ws_size, uid_order = _cache[cache_key]
+graph, ws_size = _cache[cache_key]
 
 # Allocate workspace per-call (PyTorch's caching allocator recycles efficiently)
 workspace = torch.empty(max(ws_size, 1), device=x.device, dtype=torch.uint8)
 
-# Build uid→tensor map, extract sorted ptrs
 uid_to_tensor = {X.get_uid(): x, W.get_uid(): w, Y.get_uid(): y_out}
-ptrs = [uid_to_tensor[uid].data_ptr() for uid in uid_order]
-graph._execute_with_ptrs(ptrs, workspace.data_ptr(), int(handle))
+graph.execute(uid_to_tensor, workspace, handle=handle)
 ```
 
 **Do NOT cache workspace tensors** — they can race on different CUDA streams.
@@ -175,7 +175,7 @@ def my_op(x, w, eps=1e-5, bias=None):
 
 - [ ] Use `torch.Library.define/impl`, not `@torch.library.custom_op`
 - [ ] Cache graph + uid_order + workspace in module-level dict
-- [ ] Use `graph._execute_with_ptrs(sorted_ptrs)` not `graph.execute(dict)`
+- [ ] Use `graph.execute(uid_to_tensor, workspace, handle=handle)` — it takes the sorted-pointer path internally
 - [ ] Use explicit UIDs (IntEnum) for stable cache keys
 - [ ] Cache cuDNN handle per device
 - [ ] Allocate workspace per-call (do NOT cache — stream safety)
@@ -192,7 +192,7 @@ def my_op(x, w, eps=1e-5, bias=None):
 | `torch.empty` per output tensor | ~2 each | consider `out=` or pre-alloc |
 | cache key build + lookup | ~1.5 | tuple construction + dict hash |
 | uid→tensor dict + list comp | ~1 | Python overhead |
-| `graph._execute_with_ptrs` | ~19 | 1.7 us FE + 0.8 us varpack + 5.6 us backend |
+| `graph.execute` | ~19 | 1.7 us FE + 0.8 us varpack + 5.6 us backend |
 | **Total (well-optimized)** | **~52** | vs ~18 us for native ATen ops |
 
 The ~34 us gap vs native ATen is torch.ops dispatcher + autograd overhead.

@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import sys
 from types import SimpleNamespace
-from typing import Callable
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
@@ -42,22 +41,22 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
+from benchmark_utils import (
+    add_sweep_args,
+    ceil_div,
+    even_offsets,
+    rand_e8m0,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_configs,
+    set_bytes,
+    spec_for,
+    time_ms,
+    to_blocked,
+)
+
 # Model cases
-
-
-def _even_offsets(S: int, E: int) -> list[int]:
-    """Routed-group start offsets for ``S`` tokens spread as evenly as possible
-    over ``E`` experts — the first ``S % E`` groups take one extra token.
-    ``S=10, E=3`` -> group sizes 4, 3, 3 -> ``[0, 4, 7]``."""
-    if E < 1:
-        raise ValueError(f"expert count must be >= 1, got {E}")
-    base, rem = divmod(S, E)
-    offsets, start = [], 0
-    for i in range(E):
-        offsets.append(start)
-        start += base + (1 if i < rem else 0)
-    return offsets
-
 
 MODELS: dict[str, dict] = {
     "dsv4_pro": dict(
@@ -113,7 +112,7 @@ def _sf_rows(offsets: list[int], S: int) -> int:
     """SFA height: every routed group is padded to 128 rows in the F8_128x4 blob,
     so it is Σ ceil(group_m/128)*128 — equal to S only when every group size is a
     multiple of 128 (Kimi K3's 585/586-token groups are not: 14*640 = 8960)."""
-    return sum(_ceil_div(hi - lo, 128) * 128 for lo, hi in _group_ranges(offsets, S))
+    return sum(ceil_div(hi - lo, 128) * 128 for lo, hi in _group_ranges(offsets, S))
 
 
 def _operands(g, S: int, N: int, K: int, E: int, dtype: str, offsets: list[int]):
@@ -151,7 +150,7 @@ def _graph(S: int, N: int, K: int, E: int, variant: str, dtype: str = "bf16", of
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    offsets = offsets if offsets is not None else _even_offsets(S, E)
+    offsets = offsets if offsets is not None else even_offsets(S, E)
     (a, b0, b1), a_ops, b_ops, sfa_ops, sfb_ops = _operands(g, S, N, K, E, dtype, offsets)
     # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
     fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
@@ -234,25 +233,6 @@ def _vp(handles, d, fto, out, aux_bufs):
 # Data + reference
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _to_blocked(x: torch.Tensor) -> torch.Tensor:
-    """(rows, cols) scale factors -> the F8_128x4 reordered blob, rows padded to
-    128 and cols to 4."""
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _rand_e8m0(shape, dev):
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
-
-
 def _dequant_bf16(data: torch.Tensor, sf_log: torch.Tensor) -> torch.Tensor:
     """E4M3 x per-32-block E8M0 -> BF16, exactly (3-bit mantissa, power-of-two
     scale), so the BF16 reference sees the kernel's true operand values.
@@ -285,14 +265,14 @@ def _mkdata(S: int, N: int, K: int, E: int, offsets: list[int], dtype: str, need
     tok = (torch.randn(1, S, K, device=dev) * 0.4).to(torch.float8_e4m3fn)
     w0 = (torch.randn(E, N, K, device=dev) * 0.4).to(torch.float8_e4m3fn)
     w1 = (torch.randn(E, N, K, device=dev) * 0.4).to(torch.float8_e4m3fn)
-    sfa_log = _rand_e8m0((S, sf_k), dev)
-    sfb0_log = _rand_e8m0((E, N, sf_k), dev)
-    sfb1_log = _rand_e8m0((E, N, sf_k), dev)
+    sfa_log = rand_e8m0((S, sf_k), dev)
+    sfb0_log = rand_e8m0((E, N, sf_k), dev)
+    sfb1_log = rand_e8m0((E, N, sf_k), dev)
     # SFA is blocked PER routed group (each padded to 128 rows) then concatenated —
     # the kernel walks the same ceil(group_m/128) SF-block prefix. SFB is per expert.
-    sfa = torch.cat([_to_blocked(sfa_log[lo:hi]) for lo, hi in _group_ranges(offsets, S)]).view(1, -1, 1)
-    sfb0 = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
-    sfb1 = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfa = torch.cat([to_blocked(sfa_log[lo:hi]) for lo, hi in _group_ranges(offsets, S)]).view(1, -1, 1)
+    sfb0 = torch.cat([to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfb1 = torch.cat([to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     return SimpleNamespace(
         tok=tok,
         w0=w0,
@@ -305,6 +285,12 @@ def _mkdata(S: int, N: int, K: int, E: int, offsets: list[int], dtype: str, need
         w1_ref=_dequant_bf16(w1, sfb1_log) if need_ref else None,
         out=out,
     )
+
+
+def _mkdata_pool(S: int, N: int, K: int, E: int, offsets: list[int], dtype: str, nbuf: int):
+    """``nbuf`` independent operand sets at distinct GMEM addresses. They feed only
+    the timed launches, so they skip the widened reference copies."""
+    return [_mkdata(S, N, K, E, offsets, dtype, need_ref=False) for _ in range(nbuf)]
 
 
 def _epilogue_ref(gate: torch.Tensor, up: torch.Tensor, variant: str) -> torch.Tensor:
@@ -359,29 +345,6 @@ def _unfused_launch(tok, w0, w1, out, offsets, S, N, K, E, variant) -> None:
         out2[lo:hi] = _epilogue_ref(gate, up, variant).to(out.dtype)
 
 
-# Timing. delayed mode queues a torch.cuda._sleep first so the host can enqueue
-# every launch behind it -> kernels run back-to-back (kernel-only, matches nsys).
-
-
-def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
-    for _ in range(warmup):
-        timed_fn()
-    torch.cuda.synchronize()
-    if delayed:
-        delay_cycles = max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6))
-        torch.cuda._sleep(delay_cycles)
-        for _ in range(max(5, warmup)):
-            timed_fn()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        timed_fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 # Config candidates — MoE templates only, dual-GEMM TMEM fits two accumulators
 # only for cta_tile_n <= 256 (2*256 <= 512), and only <= 128 under mxfp8 where the
 # per-operand SF shares those TMEM columns; cta_tile_m=128.
@@ -392,10 +355,10 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.cta_tile_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -405,9 +368,8 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
 def _run_model(key: str, spec: dict, args) -> tuple | None:
     N, K = spec["N"], spec["K"]
     S, E = args.tokens, args.experts
-    offsets = _even_offsets(S, E)
+    offsets = even_offsets(S, E)
     variant = spec["variant"]
-    delayed = args.timing == "delayed"
 
     flops = 2 * (2 * S * N * K)  # 2 grouped GEMMs, each 2*S*N*K
     group_sizes = [hi - lo for lo, hi in _group_ranges(offsets, S)]
@@ -419,32 +381,46 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
     out = d.out
     fto = torch.tensor(offsets, dtype=torch.int32, device="cuda")
 
+    per_set = set_bytes([t for t in (d.tok, d.w0, d.w1, d.sfa, d.sfb0, d.sfb1, d.out) if t is not None])
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
+    report_pool(nbuf, per_set)
+    pool = _mkdata_pool(S, N, K, E, offsets, args.dtype, nbuf)
+
     ref = None if args.no_verify else _reference(d.tok_ref, d.w0_ref, d.w1_ref, offsets, S, N, K, E, variant)
 
     bl_ms = None
     if not args.no_baseline:
         out_bl = torch.empty_like(out)
-        bl_ms = _time_ms(
+        # An mxfp8 pool set holds no widened copy, so the bf16 baseline stays on the verify set.
+        bl_sets = pool if args.dtype == "bf16" else [d]
+        if args.stream:
+            print("  ▶ running unfused per-group cuBLAS baseline ...", flush=True)
+        bl_ms = time_ms(
+            rotating(lambda s: _unfused_launch(s.tok_ref, s.w0_ref, s.w1_ref, out_bl, offsets, S, N, K, E, variant), bl_sets),
             lambda: _unfused_launch(d.tok_ref, d.w0_ref, d.w1_ref, out_bl, offsets, S, N, K, E, variant),
             warmup=args.warmup,
             iters=args.iters,
-            delayed=delayed,
+            timing=args.timing,
         )
-        print(f"  {'unfused per-group cuBLAS bf16 + pointwise':64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
+        bl_label = "unfused per-group cuBLAS bf16 + pointwise" + ("" if bl_sets is pool else " [no rotation]")
+        print(f"  {bl_label:64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
 
     spec_map = _build_spec_map(variant, args.dtype)
-    labels = [c.strip() for c in args.configs.split(",")] if args.configs else list(spec_map)
+    labels = select_configs(args.configs, spec_map)
     print(f"  sweeping {len(labels)} configs (each JITs once, ~15-25 s)", flush=True)
 
     best = None
     for label in labels:
-        if label not in spec_map:
+        sel = spec_for(label, spec_map)
+        if sel is None:
             print(f"  {label:64s} UNKNOWN (not a sweepable MoE dual-GEMM strategy)", flush=True)
             continue
-        cfg, cta_group, sched = spec_map[label]
+        cfg, cta_group = sel
+        if args.stream:
+            print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph(S, N, K, E, variant, args.dtype, offsets)
-            plan = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+            plan = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
         except (NotImplementedError, ValueError) as e:
             print(f"  {label:64s} SKIP: {type(e).__name__}: {str(e)[:40]}", flush=True)
             continue
@@ -463,7 +439,8 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             ok = torch.allclose(got, ref.float(), rtol=args.rtol, atol=args.atol)
             if not ok:
                 flag = f"  !! maxerr={(got - ref.float()).abs().max().item():.3g}"
-        ms = _time_ms(lambda: plan(vp), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        vps = [_vp(h, s, fto, s.out, aux_bufs) for s in pool]
+        ms = time_ms(rotating(plan, vps), lambda _plan=plan, _vp=vp: _plan(_vp), warmup=args.warmup, iters=args.iters, timing=args.timing)
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = f"{bl_ms / ms:>7.2f}x" if bl_ms else " " * 8
         print(f"  {label:64s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms  {ratio}{flag}", flush=True)
@@ -483,10 +460,7 @@ def main() -> int:
     p.add_argument("--dtype", choices=DTYPES, default="bf16", help="operand precision: bf16, or mxfp8 (e4m3 + per-32-block e8m0)")
     p.add_argument("-S", "--tokens", type=int, default=None, help="token count (required)")
     p.add_argument("-E", "--experts", type=int, default=None, help="expert count (required)")
-    p.add_argument("--configs", default=None, help="comma-separated CONFIG_..._Nctamma labels (default: sweep all)")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
-    p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
+    add_sweep_args(p, nsys=False)
     p.add_argument("--no-verify", action="store_true", help="skip the torch reference check")
     p.add_argument("--no-baseline", action="store_true", help="skip the unfused per-group cuBLAS baseline")
     p.add_argument("--list-models", action="store_true")

@@ -38,10 +38,10 @@ class Cfg:
     # --- warp assignments (16 warps = 512 threads) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)  # decay/beta-operand materialize
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # value-side TMEM (w*v - erase) / epilogue
-    SUPER_MMA_WARP_ID: int = 12  # register-MMA kk/qk + Neumann inverse
+    SUPER_MMA_WARP_ID: int = 12  # register-MMA KK/A + Neumann T_inv
     TCGEN05_MMA_WARP_ID: int = 13  # tcgen05 state GEMMs
     TMA_WARP_ID: int = 14  # q/k/v/gate/beta/w TMA loads
-    EPILOGUE_WARP_ID: int = 15  # qk register-MMA + O store
+    EPILOGUE_WARP_ID: int = 15  # A register-MMA + O store
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 160
@@ -54,12 +54,12 @@ class Cfg:
 
     # --- SMEM / TMEM ring stage counts ---
     SMEM_RAW_STAGES: int = 5
-    SMEM_SCHED_STAGES: int = 8
+    SMEM_SCHEDULER_STAGES: int = 8
     SMEM_O_STAGES: int = 2
     SMEM_DECAY_STAGES: int = 2
-    SMEM_PAIRWISE_STAGES: int = 2
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 3
-    QK_SCALE_READY_STAGES: int = 3
+    SMEM_INTERMEDIATE_STAGES: int = 2
+    SMEM_STATE_SCALE_DIAG_STAGES: int = 4
+    QK_SCALE_READY_STAGES: int = 4
     TMEM_Q_STATE_ACC_STAGES: int = 2
 
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)

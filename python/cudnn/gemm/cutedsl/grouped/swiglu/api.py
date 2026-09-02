@@ -7,12 +7,13 @@ This module provides the API class for contiguous grouped block-scaled GEMM
 with SwiGLU activation for MoE (Mixture of Experts) workloads.
 """
 
+from __future__ import annotations
+
 from .grouped_gemm_swiglu_quant import (
     BlockScaledContiguousGroupedGemmKernel,
 )
 from cuda.bindings import driver as cuda
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -21,6 +22,19 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.tensor_adapter import (
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+)
+
+_JAX_SF_LAYOUT_ERROR = (
+    "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
+    "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
+    "(a row-major JAX array of that shape has different memory); pass torch tensors"
+)
 
 
 class GroupedGemmSwigluSm100(APIBase):
@@ -63,7 +77,7 @@ class GroupedGemmSwigluSm100(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -95,38 +109,46 @@ class GroupedGemmSwigluSm100(APIBase):
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor. Only applies when already output scale factor tensors are provided.
         """
+        framework = detect_framework(sample_a)
+        if framework == "jax":
+            raise ValueError(f"GroupedGemmSwigluSm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+        if framework != "torch":
+            raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmSwigluSm100; pass torch tensors")
+        if acc_dtype is None:
+            acc_dtype = cutlass.Float32
         super().__init__()
+        self._framework = framework
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
         # Store sample tensor descriptors
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
-        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
-        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
+        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
+        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets", canonical=True)
+        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha", canonical=True)
 
         # Optional quantization outputs
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
-        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
-        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
-        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
+        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col", canonical=True)
+        self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
+        self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col", canonical=True)
+        self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True)
         self.norm_const_desc = self._unpad_tensor_to_ndim(
-            self._make_tensor_desc(sample_norm_const, name="sample_norm_const"),
+            self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True),
             1,
             "norm_const",
         )
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
+        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
 
         # expert_cnt derived from padded_offsets shape
         self.expert_cnt = self.padded_offsets_desc.shape[0]
 
         # Configuration
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         if cluster_shape_mn is None:
@@ -224,10 +246,10 @@ class GroupedGemmSwigluSm100(APIBase):
         self.ab_dtype = self._check_dtype(
             self.a_desc,
             dtype=[
-                torch.float4_e2m1fn_x2,
-                torch.uint8,
-                torch.float8_e5m2,
-                torch.float8_e4m3fn,
+                cutlass.Float4E2M1FN,
+                cutlass.Uint8,
+                cutlass.Float8E5M2,
+                cutlass.Float8E4M3FN,
             ],
             name="A/B",
         )
@@ -240,7 +262,7 @@ class GroupedGemmSwigluSm100(APIBase):
 
         self.sf_dtype = self._check_dtype(
             self.sfa_desc,
-            dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
+            dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN],
             name="SFA/SFB/SFD_row/SFD_col",
         )
         self._check_dtype(
@@ -267,7 +289,7 @@ class GroupedGemmSwigluSm100(APIBase):
             f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}",
         )
         self._value_error_if(
-            self.sf_dtype in [torch.float8_e4m3fn] and self.sf_vec_size == 32,
+            self.sf_dtype in [cutlass.Float8E4M3FN] and self.sf_vec_size == 32,
             f"sf_dtype {self.sf_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
         self._value_error_if(
@@ -277,19 +299,19 @@ class GroupedGemmSwigluSm100(APIBase):
 
         self._check_dtype(
             self.acc_dtype,
-            dtype=torch.float32,
+            dtype=cutlass.Float32,
             name="Accumulator",
             extra_error_msg="Accumulator must be float32",
         )
         self.c_dtype = self._check_dtype(
             self.c_desc,
             dtype=[
-                torch.float32,
-                torch.float16,
-                torch.bfloat16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-                torch.float4_e2m1fn_x2,
+                cutlass.Float32,
+                cutlass.Float16,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E5M2,
+                cutlass.Float4E2M1FN,
             ],
             name="C",
         )
@@ -297,7 +319,7 @@ class GroupedGemmSwigluSm100(APIBase):
         if self._is_fp4x2(self.ab_dtype):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
-                dtype=[torch.float16, torch.bfloat16, torch.float32],
+                dtype=[cutlass.Float16, cutlass.BFloat16, cutlass.Float32],
                 name="D",
                 extra_error_msg="D must be fp16, bf16, or float32 when ab_dtype is fp4",
             )
@@ -305,12 +327,12 @@ class GroupedGemmSwigluSm100(APIBase):
             self.d_dtype = self._check_dtype(
                 self.d_desc,
                 dtype=[
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                    torch.float4_e2m1fn_x2,
-                ],  # torch.float32 fails non-deterministicly
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
+                    cutlass.Float4E2M1FN,
+                ],  # float32 fails non-deterministicly
                 name="D",
             )
         self._check_dtype(
@@ -321,7 +343,7 @@ class GroupedGemmSwigluSm100(APIBase):
         )
 
         self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,  # Fails to compile
+            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype is cutlass.Float32,  # Fails to compile
             f"Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. Please use sf_vec_size 32 or d_dtype bf16 instead",
         )
 
@@ -405,18 +427,17 @@ class GroupedGemmSwigluSm100(APIBase):
             "Please use mma_tiler_mn[1] == 256 instead",
         )
         self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and (self.c_dtype not in [torch.float16, torch.bfloat16]),
+            self._is_fp4x2(self.ab_dtype) and (self.c_dtype not in [cutlass.Float16, cutlass.BFloat16]),
             f"Invalid configuration: for fp4 ab_dtype, c_dtype must be float16 or bfloat16, got {self.c_dtype}",
         )
 
         # Check environment
-        if not torch.cuda.is_available():
+        if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmSwiglu requires SM100+ compute capability, " f"but found SM{compute_capability} on device {device}")
+            raise RuntimeError(f"GroupedGemmSwiglu requires SM100+ compute capability, " f"but found SM{compute_capability}")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
@@ -714,7 +735,10 @@ class GroupedGemmSwigluSm100(APIBase):
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
 
         if a_tensor.shape[0] == 0:
             self._logger.debug("execute: valid_m is zero, skipping kernel execution")
@@ -760,9 +784,9 @@ def grouped_gemm_swiglu_wrapper_sm100(
     alpha_tensor: torch.Tensor,
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -823,6 +847,16 @@ def grouped_gemm_swiglu_wrapper_sm100(
                 # Integer indexing
                 c = result[0]  # c_tensor
     """
+    framework = detect_framework(a_tensor)
+    if framework == "jax":
+        raise ValueError(f"grouped_gemm_swiglu_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
+    if framework != "torch":
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_swiglu_wrapper_sm100; pass torch tensors")
+    import torch
+
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
+    c_dtype = _convert_to_cutlass_data_type(c_dtype) if c_dtype is not None else cutlass.BFloat16
+    d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
     valid_m, k, _ = a_tensor.shape
     n, _, l = b_tensor.shape
     n_out = n // 2  # After SwiGLU
@@ -831,17 +865,17 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
     if cd_major == "n":
         # 1, m, n, permute (1, 2, 0) -> (m, n, 1)
-        c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=c_dtype, device=a_tensor.device)
+        c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
         d_tensor = torch.empty_strided(
             (valid_m, n_out, 1),
             (n_out, 1, valid_m * n_out),
-            dtype=d_dtype,
+            dtype=framework_dtype(d_dtype, "torch"),
             device=a_tensor.device,
         )
         d_col_tensor = torch.empty_strided(
             (valid_m, n_out, 1),
             (n_out, 1, valid_m * n_out),
-            dtype=d_dtype,
+            dtype=framework_dtype(d_dtype, "torch"),
             device=a_tensor.device,
         )
     else:
@@ -851,10 +885,12 @@ def grouped_gemm_swiglu_wrapper_sm100(
     sfd_col_tensor = None
     amax_tensor = None
 
-    if a_tensor.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
+    if _convert_to_cutlass_data_type(a_tensor.dtype) in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+    ) and _convert_to_cutlass_data_type(
+        sfa_tensor.dtype
+    ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
 
         sf_dtype = sfa_tensor.dtype
@@ -885,7 +921,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
     if valid_m == 0:
-        if d_dtype in [torch.bfloat16, torch.float16]:
+        if d_dtype in (cutlass.BFloat16, cutlass.Float16):
             amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
@@ -960,7 +996,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         _logger.debug("group_gemm_swiglu_wrapper_sm100: No previously cached GroupedGemmSwigluSm100 object found, creating new GroupedGemmSwigluSm100 object")
         # Allocate amax_tensor once here; cache-hit calls reuse this buffer so
         # the FillFunctor (torch.full) only fires during warmup, not every step.
-        if d_dtype in [torch.bfloat16, torch.float16]:
+        if d_dtype in (cutlass.BFloat16, cutlass.Float16):
             amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
         grouped_gemm_swiglu = GroupedGemmSwigluSm100(
             sample_a=a_tensor,

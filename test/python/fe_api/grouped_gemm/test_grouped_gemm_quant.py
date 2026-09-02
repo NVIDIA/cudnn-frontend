@@ -19,6 +19,8 @@ from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import (
     allocate_discrete_input_tensors,
 )
+from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_quant_utils import (
     grouped_gemm_quant_init,
     with_grouped_gemm_quant_params_fp4,
@@ -126,6 +128,7 @@ def test_grouped_gemm_quant_compile_execute_fp4(
     discrete_col_sfd,
     use_dynamic_sched,
     request,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_quant_compile_execute(
         ab_dtype=ab_dtype,
@@ -137,6 +140,7 @@ def test_grouped_gemm_quant_compile_execute_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=vector_f32,
         discrete_col_sfd=discrete_col_sfd,
         use_dynamic_sched=use_dynamic_sched,
@@ -198,6 +202,7 @@ def test_grouped_gemm_quant_wrapper_fp4(
     discrete_col_sfd,
     use_dynamic_sched,
     request,
+    sf_fp8_dtype_override,
 ):
     _test_grouped_gemm_quant_wrapper(
         ab_dtype=ab_dtype,
@@ -209,6 +214,7 @@ def test_grouped_gemm_quant_wrapper_fp4(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=vector_f32,
         discrete_col_sfd=discrete_col_sfd,
         use_dynamic_sched=use_dynamic_sched,
@@ -294,6 +300,33 @@ def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_smoke(request, monk
     compile_count, cache_entries = _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
         request=request,
         monkeypatch=monkeypatch,
+    )
+
+    assert compile_count == 1
+    assert cache_entries == 1
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_row_scale(request, monkeypatch):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("Row-scale fusion is not supported on SM107.")
+
+    compile_count, cache_entries = _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
+        request=request,
+        monkeypatch=monkeypatch,
+        d_dtype=torch.float32,
+        sf_dtype=torch.float8_e4m3fn,
+        row_scale=True,
+        use_dynamic_sched=True,
+        cfg_overrides={"n": 256, "k": 64, "l": 4},
+        group_m_lists=[
+            [0, 512, 512, 512],
+            [0, 1024, 1024, 1024],
+        ],
+        skip_unsupported=False,
     )
 
     assert compile_count == 1
@@ -515,6 +548,42 @@ def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
         discrete_col_sfd=False,
         request=request,
         row_scale=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+@pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("enable_bias", [False, True], ids=["no_bias", "bias"])
+def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale_small_k(d_dtype, enable_bias, request):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("Row-scale fusion is not supported on SM107.")
+
+    _test_grouped_gemm_quant_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        use_dynamic_sched=True,
+        row_scale=True,
+        cfg_overrides={
+            "n": 256,
+            "k": 64,
+            "group_m_list": [0, 512, 512, 512],
+        },
+        enable_bias=enable_bias,
+        skip_unsupported=False,
     )
 
 
@@ -899,6 +968,13 @@ def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
 def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
     request,
     monkeypatch,
+    d_dtype=torch.bfloat16,
+    sf_dtype=torch.float8_e8m0fnu,
+    row_scale=False,
+    use_dynamic_sched=False,
+    cfg_overrides=None,
+    group_m_lists=None,
+    skip_unsupported=True,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -923,33 +999,38 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
         request=request,
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
-        d_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
         cd_major="n",
         acc_dtype=torch.float32,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=16,
-        sf_dtype=torch.float8_e8m0fnu,
+        sf_dtype=sf_dtype,
         vector_f32=False,
         discrete_col_sfd=False,
         b_major="k",
     )
+    cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if group_m_lists is None:
+        group_m_lists = [[group_m] * cfg["l"] for group_m in DYNAMIC_SHAPES_M_VALUES]
 
     try:
-        for group_m in DYNAMIC_SHAPES_M_VALUES:
+        for group_m_list in group_m_lists:
             inputs = allocate_discrete_input_tensors(
                 n=cfg["n"],
                 k=cfg["k"],
                 num_experts=cfg["l"],
-                group_m_list=[group_m] * cfg["l"],
+                group_m_list=group_m_list,
                 ab_dtype=cfg["ab_dtype"],
                 sf_dtype=cfg["sf_dtype"],
                 sf_vec_size=cfg["sf_vec_size"],
                 m_aligned=cfg["m_aligned"],
                 b_major=cfg["b_major"],
             )
+            if row_scale:
+                _add_row_scale(inputs)
 
             grouped_gemm_quant_wrapper_sm100(
                 a_tensor=inputs["a_tensor"],
@@ -963,6 +1044,7 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
                 b_major=cfg["b_major"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],
@@ -972,11 +1054,14 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
                 vector_f32=cfg["vector_f32"],
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
+                use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
             torch.cuda.synchronize()
     except (ValueError, NotImplementedError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+        if skip_unsupported:
+            pytest.skip(f"Unsupported testcase: {e}")
+        raise
     finally:
         cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
         grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
@@ -1000,6 +1085,7 @@ def _test_grouped_gemm_quant_compile_execute(
     cfg_overrides=None,
     input_mutator=None,
     use_dynamic_sched=False,
+    sf_fp8_dtype_override=None,
 ):
     """Test GroupedGemmQuant API with explicit check_support, compile, and execute paths."""
     try:
@@ -1052,6 +1138,12 @@ def _test_grouped_gemm_quant_compile_execute(
     if input_mutator is not None:
         input_mutator(inputs, cfg)
 
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so the fp32 reference stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
+
     api = GroupedGemmQuantSm100(
         sample_a=inputs["a_tensor"],
         sample_b=inputs["b_tensor"],
@@ -1071,6 +1163,7 @@ def _test_grouped_gemm_quant_compile_execute(
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=cfg["vector_f32"],
         m_aligned=cfg["m_aligned"],
         discrete_col_sfd=cfg["discrete_col_sfd"],
@@ -1129,6 +1222,7 @@ def _test_grouped_gemm_quant_wrapper(
     enable_bias=False,
     provide_d_tensor=False,
     use_single_group_runtime_offsets=False,
+    sf_fp8_dtype_override=None,
 ):
     """Test GroupedGemmQuant API via the wrapper function (with caching)."""
     try:
@@ -1180,6 +1274,12 @@ def _test_grouped_gemm_quant_wrapper(
             device=inputs["a_tensor"].device,
         )
 
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so the fp32 reference stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
+
     try:
         for _ in range(2):  # Run twice to test caching path
             outputs = grouped_gemm_quant_wrapper_sm100(
@@ -1200,6 +1300,7 @@ def _test_grouped_gemm_quant_wrapper(
                 mma_tiler_mn=cfg["mma_tiler_mn"],
                 cluster_shape_mn=cfg["cluster_shape_mn"],
                 sf_vec_size=cfg["sf_vec_size"],
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=cfg["vector_f32"],
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
@@ -1392,6 +1493,9 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     request,
     use_dynamic_sched=False,
     row_scale=False,
+    cfg_overrides=None,
+    enable_bias=False,
+    skip_unsupported=True,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -1414,6 +1518,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         discrete_col_sfd,
         b_major,
     )
+    cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1427,9 +1532,12 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         sf_vec_size=cfg["sf_vec_size"],
         m_aligned=cfg["m_aligned"],
         b_major=cfg["b_major"],
+        enable_bias=enable_bias,
     )
     if row_scale:
         _add_row_scale(inputs)
+    if enable_bias:
+        inputs["bias_ref"] = inputs["bias_tensor"]
 
     try:
         for _ in range(2):
@@ -1440,6 +1548,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 alpha_tensor=inputs["alpha_tensor"],
                 b_ptrs=inputs["b_ptrs_tensor"],
                 sfb_ptrs=inputs["sfb_ptrs_tensor"],
+                bias_tensor=inputs["bias_tensor"],
                 n=cfg["n"],
                 b_dtype=cfg["ab_dtype"],
                 b_major=cfg["b_major"],
@@ -1459,7 +1568,9 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+        if skip_unsupported:
+            pytest.skip(f"Unsupported testcase: {e}")
+        raise
 
     _check_ref_grouped_gemm_quant_discrete(
         inputs,
@@ -1468,3 +1579,100 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         skip_ref=cfg["skip_ref"],
     )
     return inputs, outputs, cfg
+
+
+def _quant_nvfp4_inputs(request, sf_vec_size=16, sf_dtype=torch.float8_e4m3fn, ab_dtype=torch.float4_e2m1fn_x2):
+    cfg = grouped_gemm_quant_init(
+        request,
+        ab_dtype=ab_dtype,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=False,
+        discrete_col_sfd=False,
+    )
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+    )
+    return cfg, inputs
+
+
+def _run_quant_wrapper(cfg, inputs, sf_fp8_dtype_override):
+    """Call the wrapper directly; the harnesses turn ValueError into a skip."""
+    from cudnn import grouped_gemm_quant_wrapper_sm100
+
+    return grouped_gemm_quant_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "sf_fp8_dtype_override,overrides,expected",
+    [
+        pytest.param("e5m3", dict(sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu), "requires the NVFP4 recipe", id="mxfp4_e8m0_carrier"),
+        pytest.param(
+            "e5m3",
+            dict(ab_dtype=torch.float8_e4m3fn, sf_vec_size=32, sf_dtype=torch.float8_e8m0fnu),
+            "requires the NVFP4 recipe",
+            id="fp8_ab",
+        ),
+        pytest.param("e4m3", {}, "sf_fp8_dtype_override must be", id="e4m3_is_not_an_override"),
+        pytest.param("e5m2", {}, "sf_fp8_dtype_override must be", id="unknown_format"),
+    ],
+)
+def test_grouped_gemm_quant_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype_override, overrides, expected):
+    """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
+    cfg, inputs = _quant_nvfp4_inputs(request, **overrides)
+    with pytest.raises(ValueError, match=expected):
+        _run_quant_wrapper(cfg, inputs, sf_fp8_dtype_override)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_quant_e5m3_is_not_cached_as_e4m3(request):
+    """sf_fp8_dtype_override must take part in the compile cache key.
+
+    Identical scale-factor bytes decode differently under E4M3 and UE5M3, so if
+    the override were missing from the key the second call would reuse the first
+    kernel and silently return E4M3 results.
+    """
+    _skip_unless_e5m3_supported()
+    cfg, inputs = _quant_nvfp4_inputs(request)
+    d_e4m3 = _run_quant_wrapper(cfg, inputs, None)["d_tensor"].float().clone()
+    d_e5m3 = _run_quant_wrapper(cfg, inputs, "e5m3")["d_tensor"].float().clone()
+    torch.cuda.synchronize()
+    assert not torch.equal(
+        d_e4m3, d_e5m3
+    ), "e5m3 and e4m3 produced identical output from identical scale-factor bytes; sf_fp8_dtype_override is likely missing from the compile cache key"

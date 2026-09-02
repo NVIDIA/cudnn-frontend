@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Callable
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs hook)
@@ -22,10 +21,24 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
+from benchmark_utils import (
+    add_sweep_args,
+    group_offsets,
+    rand_e8m0,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_configs,
+    set_bytes,
+    spec_for,
+    time_ms,
+    to_blocked,
+)
 
-def _build_plan(g, cfg, cta_group, sched):
+
+def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -57,23 +70,6 @@ _COMBOS = {
     "mxfp4": (32, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E8M0),
     "mxfp8": (32, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0),
 }
-
-
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _to_blocked(x: torch.Tensor) -> torch.Tensor:
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _rand_e8m0(shape, dev):
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
 
 
 def _graph_swiglu(S, N, K, E, combo):
@@ -154,11 +150,6 @@ def _graph_swiglu(S, N, K, E, combo):
     )
 
 
-def _offsets(S, E):
-    group_m = S // E
-    return torch.arange(E, dtype=torch.int32, device="cuda") * group_m
-
-
 def _mkdata(S, N, K, E, combo):
     """Packed FP4/FP8 token+weights + F8_128x4-blocked SFs (even split)."""
     dev = "cuda"
@@ -180,15 +171,34 @@ def _mkdata(S, N, K, E, combo):
         sfb0_log = torch.randint(1, 4, (E, N, sf_k), device=dev).to(torch.float8_e4m3fn)
         sfb1_log = torch.randint(1, 4, (E, N, sf_k), device=dev).to(torch.float8_e4m3fn)
     else:
-        sfa_log = _rand_e8m0((S, sf_k), dev)
-        sfb0_log = _rand_e8m0((E, N, sf_k), dev)
-        sfb1_log = _rand_e8m0((E, N, sf_k), dev)
-    sfa = torch.cat([_to_blocked(sfa_log[g * group_m : (g + 1) * group_m]) for g in range(E)]).view(1, -1, 1)
-    sfb0 = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).reshape(E, sf_k, N)
-    sfb1 = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).reshape(E, sf_k, N)
+        sfa_log = rand_e8m0((S, sf_k), dev)
+        sfb0_log = rand_e8m0((E, N, sf_k), dev)
+        sfb1_log = rand_e8m0((E, N, sf_k), dev)
+    sfa = torch.cat([to_blocked(sfa_log[g * group_m : (g + 1) * group_m]) for g in range(E)]).view(1, -1, 1)
+    sfb0 = torch.cat([to_blocked(sfb0_log[e]) for e in range(E)]).reshape(E, sf_k, N)
+    sfb1 = torch.cat([to_blocked(sfb1_log[e]) for e in range(E)]).reshape(E, sf_k, N)
     out = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
     return tok, w0, w1, sfa, sfb0, sfb1, out, scale
+
+
+def _mkdata_pool(S, N, K, E, combo, nbuf):
+    """`nbuf` independent token/weight/SF sets at distinct GMEM addresses."""
+    base = _mkdata(S, N, K, E, combo)
+    pool = [base]
+    for _ in range(max(0, nbuf - 1)):
+        pool.append(tuple(t.clone() for t in base))
+    return pool
+
+
+def _gemm_pairs(s):
+    """((token, SFA), (weight_g, SFB_g)) per GEMM — token+SFA shared."""
+    tok, w0, w1, sfa, sfb0, sfb1 = s[:6]
+    return [((tok, sfa), (w0, sfb0)), ((tok, sfa), (w1, sfb1))]
+
+
+def _fused_launch(plan, handles, s, offsets):
+    plan(_vp_moe_bs_mg(handles, _gemm_pairs(s), offsets, s[6], s[7]))
 
 
 def _mkdata_bf16(S, N, K, E):
@@ -198,6 +208,14 @@ def _mkdata_bf16(S, N, K, E):
     w1 = torch.empty(E, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device=dev)
     out = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
     return tok, w0, w1, out
+
+
+def _mkdata_bf16_pool(S, N, K, E, nbuf):
+    base = _mkdata_bf16(S, N, K, E)
+    pool = [base]
+    for _ in range(max(0, nbuf - 1)):
+        pool.append(tuple(t.clone() for t in base))
+    return pool
 
 
 def _unfused_launch(tok, w0, w1, out, S, N, K, E):
@@ -210,35 +228,16 @@ def _unfused_launch(tok, w0, w1, out, S, N, K, E):
     out.view(E, group_m, N).copy_(res.to(out.dtype))
 
 
-def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
-    for _ in range(warmup):
-        timed_fn()
-    torch.cuda.synchronize()
-    if delayed:
-        delay_cycles = max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6))
-        torch.cuda._sleep(delay_cycles)
-        for _ in range(max(5, warmup)):
-            timed_fn()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        timed_fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 def _build_spec_map():
-    """Label -> (geometry cfg, cta_group, scheduler) for multi-GEMM MoE
+    """Label -> (geometry cfg, cta_group) for multi-GEMM MoE
     block-scale strategies. Dual TMEM fits two accs + SF only at cta_tile_n<=128."""
     chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 128 or cfg.cta_tile_m != 128:
+        if cfg.pipeline not in ("sm100", "sm107") or cfg.cta_tile_n > 128 or cfg.mma_inst_m != 128:
             continue
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -249,19 +248,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (even split)")
     p.add_argument("--combo", choices=tuple(_COMBOS), default="nvfp4")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
-    p.add_argument(
-        "--configs",
-        default=None,
-        help="comma-separated CONFIG_..._Nctamma labels (default: sweep all)",
-    )
-    p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
-    p.add_argument(
-        "--stream",
-        action="store_true",
-        help="accepted for CLI parity; results already print inline",
-    )
+    add_sweep_args(p, nsys=False)
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -274,55 +261,70 @@ def main() -> int:
     G, M, N, K = parts
     E, S = G, G * M
     combo = args.combo
-    delayed = args.timing == "delayed"
+
+    config_names = select_configs(args.configs, _SPEC_MAP)
+    per_set = set_bytes(_mkdata(S, N, K, E, combo))
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
     flops = 2 * (2 * S * N * K)  # 2 grouped GEMMs
     print(f"\n=== MoE dual block-scale ({combo}) grouped-matmul SwiGLU  " f"G={G} × M={M} (S={S}) {N}x{K}  (~{flops / 1e9:.1f} GFLOP, 2 GEMMs) ===")
-    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]\n")
+    print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]")
+    report_pool(nbuf, per_set)
+    print()
 
-    tok, w0, w1, sfa, sfb0, sfb1, out, scale = _mkdata(S, N, K, E, combo)
-    offsets = _offsets(S, E)
+    offsets = group_offsets(S, E)
 
     # --- baseline: unfused 2×cuBLAS batched BF16 GEMM + pointwise ---
-    btok, bw0, bw1, bout = _mkdata_bf16(S, N, K, E)
-    bl_ms = _time_ms(
-        lambda: _unfused_launch(btok, bw0, bw1, bout, S, N, K, E),
+    wbf = _mkdata_bf16(S, N, K, E)
+    bf_pool = _mkdata_bf16_pool(S, N, K, E, nbuf)
+    if args.stream:
+        print("  ▶ running unfused 2xcuBLAS batched bf16 baseline ...", flush=True)
+    bl_ms = time_ms(
+        rotating(lambda t: _unfused_launch(t[0], t[1], t[2], t[3], S, N, K, E), bf_pool),
+        lambda: _unfused_launch(wbf[0], wbf[1], wbf[2], wbf[3], S, N, K, E),
         warmup=args.warmup,
         iters=args.iters,
-        delayed=delayed,
+        timing=args.timing,
     )
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS batched bf16 + pointwise':56s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
+    # Freed before the block-scale pool: on large shapes the BF16 sets dominate.
+    del wbf, bf_pool
+    torch.cuda.empty_cache()
 
-    config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
+    wset = _mkdata(S, N, K, E, combo)  # dedicated warmup set, never rotated
+    pool = _mkdata_pool(S, N, K, E, combo, nbuf)
 
     best = None
     for label in config_names:
-        if label not in _SPEC_MAP:
+        spec = spec_for(label, _SPEC_MAP)
+        if spec is None:
             print(f"  {label:66s} UNKNOWN (not a sweepable MoE block-scale swiglu strategy)")
             continue
-        cfg, cta_group, sched = _SPEC_MAP[label]
+        cfg, cta_group = spec
+        if args.stream:
+            print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph_swiglu(S, N, K, E, combo)
-            plan = _build_plan(g, cfg, cta_group, sched)
+            plan = _build_plan(g, cfg, cta_group)
         except (NotImplementedError, ValueError):
             continue
-        gemm = [((tok, sfa), (w0, sfb0)), ((tok, sfa), (w1, sfb1))]
         try:
-            plan(_vp_moe_bs_mg(h, gemm, offsets, out, scale))
+            _fused_launch(plan, h, wset, offsets)
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {label:66s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
-        ms = _time_ms(
-            lambda: plan(_vp_moe_bs_mg(h, gemm, offsets, out, scale)),
+        ms = time_ms(
+            rotating(lambda s, _plan=plan, _h=h: _fused_launch(_plan, _h, s, offsets), pool),
+            lambda _plan=plan, _h=h: _fused_launch(_plan, _h, wset, offsets),
             warmup=args.warmup,
             iters=args.iters,
-            delayed=delayed,
+            timing=args.timing,
         )
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
-        print(f"  {label:66s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms   {ratio:>7.2f}×")
+        print(f"  {label:66s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms   {ratio:>7.2f}×", flush=True)
         if best is None or ms < best[1]:
             best = (label, ms, tflops, ratio)
 

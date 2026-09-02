@@ -15,6 +15,7 @@ the same order callers pass."""
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -27,6 +28,7 @@ Dtype = Literal[
     "fp8_e4m3",
     "fp8_e5m2",
     "fp8_e8m0",
+    "fp8_e5m3",
     "fp4_e2m1",
     "int8",
     "uint8",
@@ -40,6 +42,7 @@ SUPPORTED_DTYPES: tuple[Dtype, ...] = (
     "fp8_e4m3",
     "fp8_e5m2",
     "fp8_e8m0",
+    "fp8_e5m3",
     "fp4_e2m1",
     "int8",
     "uint8",
@@ -49,10 +52,6 @@ COMPUTE_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 AMajor = Literal["k", "m"]
 BMajor = Literal["k", "n"]
 OutMajor = Literal["n", "m"]
-
-# Block-scaled-matmul scale-factor dtypes (SFA/SFB): nvfp4 = FP4 data + E4M3
-# scale block16; mxfp4 = FP4 + E8M0 block32; mxfp8 = FP8 + E8M0 block32.
-BLOCK_SCALE_SF_DTYPES: tuple[Dtype, ...] = ("fp8_e4m3", "fp8_e8m0")
 
 # Aux broadcast onto the (M, N) tile: scalar / per_row (len M) / per_col
 # (len N) / per_elem (full M×N).
@@ -153,6 +152,22 @@ ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
 )
 
 
+def out_major_of(stride: "tuple[int, ...] | None") -> "OutMajor":
+    """A dense output's layout, read off its STRIDE alone.
+
+    Not off `dim`: cuDNN fills a derived tensor's extents only at
+    `build_operation_graph()` time, while its stride is there from the start, so
+    the extents are not available to disambiguate a degenerate N == 1. An unset
+    stride is the default layout."""
+    if not stride:
+        return "n"
+    if stride[-1] == 1:
+        return "n"
+    if stride[-2] == 1:
+        return "m"
+    raise ValueError(f"output must be N-major or M-major in the inner (M,N) plane; got stride={stride!r}")
+
+
 @dataclass(frozen=True)
 class ChainOutput:
     """One materialized GMEM output. ``source`` = where the value is taken from:
@@ -163,10 +178,15 @@ class ChainOutput:
     source: str
     dtype: Dtype
     dim: "tuple[int, int, int] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    stride: "tuple[int, int, int] | None" = None
     is_reduction: bool = False
     is_quant_scale: bool = False
     quant_block_size: int | None = None
+
+    @property
+    def major(self) -> "OutMajor":
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -181,18 +201,22 @@ class OutputSpec:
 
     source_ref: int
     dtype: Dtype
-    major: OutMajor = "n"
     quant_idx: int | None = None
-    dim: "tuple[int, ...] | None" = None
-    stride: "tuple[int, ...] | None" = None
+    dim: "tuple[int, int, int] | None" = None
+    stride: "tuple[int, int, int] | None" = None
 
     def __post_init__(self) -> None:
+        for _f, _v in (("dim", self.dim), ("stride", self.stride)):
+            if _v is not None and len(_v) != 3:
+                raise ValueError(f"output {_f} must be rank-3 (got {_v!r})")
         if self.dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported output dtype {self.dtype!r}")
-        if self.major not in ("n", "m"):
-            raise ValueError(f"output major must be 'n' or 'm' (got {self.major!r})")
-        if self.quant_idx is not None and self.dtype not in ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1"):
-            raise ValueError(f"block quantize output dtype {self.dtype!r} is not supported; " "expected fp8_e4m3, fp8_e5m2, or fp4_e2m1")
+        self.major  # noqa: B018 -- reject an unsupported layout at construction
+
+    @property
+    def major(self) -> OutMajor:
+        """Derived, not stored -- see `out_major_of`."""
+        return out_major_of(self.stride)
 
 
 @dataclass(frozen=True)
@@ -221,6 +245,16 @@ class ReductionSpec:
             raise ValueError(f"reduction compute_dtype {self.compute_dtype!r} is not supported; " f"expected one of {REDUCTION_DTYPES}")
         if self.dtype != self.compute_dtype:
             raise ValueError(f"reduction output dtype {self.dtype!r} must match compute_dtype " f"{self.compute_dtype!r} for direct atomic reduction")
+
+
+# What a block_scale_quantize may emit as DATA. The SCALE half has its own set on
+# `BlockQuantizeSpec.scale_dtype` -- ue5m3 lives there, not here: it is a scale
+# format, carried end to end as an opaque byte.
+QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
+
+# A sub-byte dtype packs two adjacent M rows into one byte, and those rows are
+# held by different lanes -- a read-modify-write race, not an implementation gap.
+M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
 @dataclass(frozen=True)
@@ -257,8 +291,8 @@ class BlockQuantizeSpec:
             raise NotImplementedError(f"block quantize supports the N axis (-1/2) or the M axis (1) in " f"cudnn.gemm.frost; got axis={self.axis}")
         if self.transpose and self.axis != 1:
             raise ValueError("block quantize transpose=True requires the M axis (axis=1)")
-        if self.scale_dtype not in ("fp8_e8m0", "fp8_e4m3"):
-            raise ValueError(f"block quantize scale dtype {self.scale_dtype!r} is not supported; " "expected fp8_e8m0 or fp8_e4m3")
+        if self.scale_dtype not in ("fp8_e8m0", "fp8_e4m3", "fp8_e5m3"):
+            raise ValueError(f"block quantize scale dtype {self.scale_dtype!r} is not supported; " "expected fp8_e8m0, fp8_e4m3 or fp8_e5m3")
         if self.scale_reorder not in (None, "F8_128x4"):
             raise ValueError(f"block quantize scale reordering {self.scale_reorder!r} is not supported; " "expected None or F8_128x4")
         if self.compute_dtype != "fp32":
@@ -440,8 +474,10 @@ class BlockScaleSpec:
     one block-scale matmul (three shapes: dequant(A)@B, A@dequant(B),
     dequant(A)@dequant(B); ``sfa``/``sfb`` present only for the scaled side(s)).
     No dtype/block/arch rules here — runnability is decided at compile time.
-    Currently runs (both sides): nvfp4 (fp4+e4m3, block16), mxfp4 (fp4+e8m0,
-    block32), mxfp8 (fp8+e8m0, block32).
+    Currently runs (both sides): fp4 with any of e4m3 / e8m0 / e5m3 scales at
+    either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
+    are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
+    at block 32. E5M3 scales additionally require SM 10.7+.
 
     SF tensors are runtime-positional (not ``TensorRef``s), fully described here
     by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
@@ -498,13 +534,6 @@ class BlockScaleSpec:
         return self.sf_dtype_a if self.sf_dtype_a is not None else self.sf_dtype_b
 
     @property
-    def combo(self) -> str:
-        """One of 'nvfp4', 'mxfp4', 'mxfp8' — the dtype/block family."""
-        if self.a_dtype == "fp4_e2m1":
-            return "nvfp4" if self.sf_dtype == "fp8_e4m3" else "mxfp4"
-        return "mxfp8"
-
-    @property
     def is_fp4(self) -> bool:
         return self.a_dtype == "fp4_e2m1"
 
@@ -521,9 +550,16 @@ class BlockScaleSpec:
 
     @property
     def sf_scale_format(self) -> int:
-        """``Tcgen05MxInstrDesc`` ``scale_format`` field: 0 for E4M3 scale
-        (nvfp4), 1 for E8M0 scale (mx)."""
-        return 0 if self.sf_dtype == "fp8_e4m3" else 1
+        """``Tcgen05MxInstrDesc`` ``scale_format`` field (idesc bits 24-23);
+        E5M3 (2) needs SM 10.7+ silicon. Unlike :attr:`combo` this one is BAKED
+        INTO THE KERNEL, so an unregistered SF dtype must not fall back to some
+        other format's bits — that would miscompute silently. Declines instead
+        (``NotImplementedError`` is what the engine router treats as "does not
+        serve this graph"; a ``KeyError`` would escape as an engine bug)."""
+        fmt = {"fp8_e4m3": 0, "fp8_e8m0": 1, "fp8_e5m3": 2}.get(self.sf_dtype)
+        if fmt is None:
+            raise NotImplementedError(f"no MMA scale_format encoding for block-scale SF dtype {self.sf_dtype!r}")
+        return fmt
 
 
 @dataclass(frozen=True)
@@ -553,6 +589,23 @@ class MoeSpec:
             raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
+
+
+def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
+    """Recursive half of :meth:`FusionChain.dtypes_used`. A field counts when its
+    declared type mentions ``Dtype``; containers inherit that from their field."""
+    if isinstance(obj, str):
+        if in_dtype_field:
+            found.add(obj)
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for f in dataclasses.fields(obj):
+            _walk_dtype_fields(getattr(obj, f.name), found, in_dtype_field="Dtype" in str(f.type))
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            _walk_dtype_fields(item, found, in_dtype_field=in_dtype_field)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for item in obj:
+            _walk_dtype_fields(item, found, in_dtype_field=in_dtype_field)
 
 
 @dataclass
@@ -642,6 +695,9 @@ class FusionChain:
                     raise ValueError(f"quants[{qi}] source GEMM {g} out of range for " f"{self.num_gemms} GEMM(s)")
             elif not (0 <= q.source_ref < len(self.ops)):
                 raise ValueError(f"quants[{qi}] source op index {q.source_ref} out of range " f"for {len(self.ops)} op(s)")
+        for i, spec in enumerate(self.output_specs):
+            if spec.major == "m" and spec.dtype not in M_MAJOR_OUT_DTYPES:
+                raise ValueError(f"output_specs[{i}] is M-major, so its dtype must be one of " f"{M_MAJOR_OUT_DTYPES}; got {spec.dtype!r}.")
         quant_refs = []
         for i, spec in enumerate(self.output_specs):
             if spec.quant_idx is None:
@@ -652,6 +708,13 @@ class FusionChain:
                 raise ValueError(
                     f"output_specs[{i}] source ref {spec.source_ref} does not match "
                     f"quants[{spec.quant_idx}] source ref {self.quants[spec.quant_idx].source_ref}"
+                )
+            if spec.dtype not in QUANT_DATA_DTYPES:
+                raise ValueError(
+                    f"output_specs[{i}] carries quants[{spec.quant_idx}], so its value is that "
+                    f"node's quantized DATA and its dtype must be one of {QUANT_DATA_DTYPES}; got "
+                    f"{spec.dtype!r}. The SCALE half is a separate output and its dtype is "
+                    f"`BlockQuantizeSpec.scale_dtype`."
                 )
             quant_refs.append(spec.quant_idx)
         if sorted(quant_refs) != list(range(len(self.quants))):
@@ -784,6 +847,14 @@ class FusionChain:
         """Every output beyond the primary ABI slot (all of them when no dense
         output exists — reductions/scale still ride the tap plumbing)."""
         return self.outputs[1:] if self.output_specs else list(self.outputs)
+
+    def dtypes_used(self) -> frozenset[Dtype]:
+        """Every dtype this chain names, anywhere. Found by walking the IR's
+        ``Dtype``-annotated fields rather than listing the dtype-bearing specs,
+        so a gate built on this cannot be bypassed by a field added later."""
+        found: set[Dtype] = set()
+        _walk_dtype_fields(self, found)
+        return frozenset(found)
 
     def summary(self) -> str:
         """One-line human-readable summary for logs / error messages."""

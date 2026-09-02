@@ -1,309 +1,216 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GDN (Gated DeltaNet) execution backend: GDN / GDN_BWD nodes on the
-chunked cuTile kernels (``kernels/gdn_chunk_cutile``)."""
+"""cuTile GDN engine: GDN / GDN_BWD nodes on the chunked cuTile kernels
+(``kernels/gdn``)."""
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING
 
 from cudnn import behavior_note
-from cudnn.engines.base import BaseEngine, CompiledPlan, resolve_node_buffers
-from cudnn.engines.engine_ids import LINEAR_ATTENTION_ID_BASE
+from cudnn.engines.base import BaseEngine, CompiledPlan, bind_ports
 from cudnn.graph_types import NodeType
+
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace
-from cudnn.linear_attention.engine_utils import _dtype_name
+from cudnn.frost.workspace import Workspace, WorkspaceLayout, carve_plan
+from ..graph_analyzer import analyze, to_buffer_dtype
+from .engine import check_layouts_compact, cutile_la_gate, expect_table
 
 if TYPE_CHECKING:
-    from cudnn.pygraph import pygraph
-
-_REQUIRED_PORTS = {
-    NodeType.GDN: ("q", "k", "v", "g", "beta", "cu_seqlens"),
-    NodeType.GDN_BWD: ("q", "k", "v", "g", "beta", "cu_seqlens", "dO"),
-}
+    from cudnn._pygraph import pygraph
 
 
-def _node_ws_layout(node):
-    """Static carve plan for one node's pipeline intermediates: name ->
-    (offset, dtype-name, shape). The chunk count is data-dependent (varlen),
-    so chunk-indexed entries are sized and SHAPED at the bound
-    ``cdiv(total, 64) + N`` — the device-built table's sentinel tail keeps
-    bound-gridded launches inert past the real count.  Terminal pipeline
-    buffers (``o``/``final_state``; the backward's ``dq``/``dk`` finals,
-    ``wy_dv``, ``dg_cum``, ``db``, ``dh0``) are NOT carved — execute plants
-    the caller's output buffers under those names."""
-    from .kernels.gdn_chunk_cutile import _BT, _cdiv, _next_power_of_2
+class GdnCuTilePlan(CompiledPlan):
+    """Carve plan over the caller's workspace, driven from the normalized
+    variant pack: the carve layout, geometry, scale and kernel module are fixed
+    per node at build; between executes only the buffer addresses move."""
 
-    q, v, cu = (node.inputs[p] for p in ("q", "v", "cu_seqlens"))
-    total, H, K = q.dim
-    HV, V = v.dim[1], v.dim[2]
-    N = cu.dim[0] - 1
-    io = _dtype_name(q.get_data_type())
-    f32 = "float32"
-    NT_bound = _cdiv(total, _BT) + N
-    l2norm = bool(node.params.get("use_qk_l2norm", False))
+    takes_variant_pack = True
+    plan_name = "GdnCuTileEngine"
 
-    size = 0
-    table = {}
+    def __init__(self, graph):
+        from .kernels import common
+        from .kernels import gdn as kernels
 
-    def add(name, dtype, shape):
-        nonlocal size
-        nbytes = buffers.DTYPE_ITEMSIZE[dtype]
-        for s in shape:
-            nbytes *= int(s)
-        table[name] = (size, dtype, tuple(int(s) for s in shape))
-        size += (nbytes + 127) & ~127  # 128B-aligned sequential carve
+        (node,) = graph.nodes
+        self.kernels = kernels
+        self.common = common
+        self.is_bwd = node.node_type == NodeType.GDN_BWD
 
-    add("chunk_table", "int32", (NT_bound, 2))
-    add("chunk_count", "int32", (1,))
-    add("chunk_offsets", "int32", (N + 1,))
-    add("dummy", "int32", (4,))  # inert stub backing for absent optional kernel args
-    add("g_cum", f32, (total, HV))
-    add("A", io, (total, HV, _BT))
-    add("w", io, (total, HV, K))
-    add("u", io, (total, HV, V))
-    add("h", io, (NT_bound, HV, K, V))
-    add("v_new", io, (total, HV, V))
-    if l2norm:
-        add("q_norm", io, (total * H, K))
-        add("q_rstd", f32, (total * H,))
-        add("k_norm", io, (total * H, K))
-        add("k_rstd", f32, (total * H,))
-    if node.node_type == NodeType.GDN_BWD:
-        add("dv", io, (total, HV, V))
-        add("dh", io, (NT_bound, HV, K, V))
-        add("dv2", io, (total, HV, V))
-        NK = _cdiv(K, min(max(_next_power_of_2(K), 16), 64))
-        add("dg_nk", f32, (NK, total, HV))
-        add("dw", io, (total, HV, K))
-        if HV != H or l2norm:
-            # dq/dk are finals only without l2norm on an MHA config; every
-            # other combination keeps them (or their head-reduced pair) as
-            # pipeline intermediates
-            add("dq", io, (total, HV, K))
-            add("dk", io, (total, HV, K))
-        if HV != H:
-            add("wy_dk_hred", io, (total, H, K))
-            if l2norm:
-                add("dq_hred", io, (total, H, K))
-                add("dk_hred", io, (total, H, K))
-        add("dg", f32, (total, HV))
-        add("wy_dk", io, (total, HV, K))
-        add("wy_dg", f32, (total, HV))
-    return size, table
+        q, v, cu = (node.inputs[p] for p in ("q", "v", "cu_seqlens"))
+        total, H, K = (int(d) for d in q.dim)
+        HV, V = int(v.dim[1]), int(v.dim[2])
+        N = int(cu.dim[0]) - 1
+        io = to_buffer_dtype(q.get_data_type())
+        f32 = "float32"
+        isz = buffers.DTYPE_ITEMSIZE[io]
+        BT = kernels.BT_CHUNK
+        NT_bound = common.cdiv(total, BT) + N
+        l2norm = bool(node.params.get("use_qk_l2norm", False))
 
+        layout = WorkspaceLayout()
+        regions = [
+            ("chunk_table", layout.add(NT_bound * 2 * 4), "int32", (NT_bound, 2)),
+            ("chunk_count", layout.add(4), "int32", (1,)),
+            ("chunk_offsets", layout.add((N + 1) * 4), "int32", (N + 1,)),
+            ("dummy", layout.add(16), "int32", (4,)),
+            ("g_cum", layout.add(total * HV * 4), f32, (total, HV)),
+            ("A", layout.add(total * HV * BT * isz), io, (total, HV, BT)),
+            ("w", layout.add(total * HV * K * isz), io, (total, HV, K)),
+            ("u", layout.add(total * HV * V * isz), io, (total, HV, V)),
+            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
+            ("v_new", layout.add(total * HV * V * isz), io, (total, HV, V)),
+        ]
+        if l2norm:
+            regions += [
+                ("q_norm", layout.add(total * H * K * isz), io, (total * H, K)),
+                ("q_rstd", layout.add(total * H * 4), f32, (total * H,)),
+                ("k_norm", layout.add(total * H * K * isz), io, (total * H, K)),
+                ("k_rstd", layout.add(total * H * 4), f32, (total * H,)),
+            ]
+        if self.is_bwd:
+            NK = common.cdiv(K, min(max(common.next_power_of_2(K), 16), 64))
+            regions += [
+                ("dv", layout.add(total * HV * V * isz), io, (total, HV, V)),
+                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
+                ("dv2", layout.add(total * HV * V * isz), io, (total, HV, V)),
+                ("dg_nk", layout.add(NK * total * HV * 4), f32, (NK, total, HV)),
+                ("dw", layout.add(total * HV * K * isz), io, (total, HV, K)),
+            ]
+            if HV != H or l2norm:
+                regions += [
+                    ("dq", layout.add(total * HV * K * isz), io, (total, HV, K)),
+                    ("dk", layout.add(total * HV * K * isz), io, (total, HV, K)),
+                ]
+            if HV != H:
+                regions.append(("wy_dk_hred", layout.add(total * H * K * isz), io, (total, H, K)))
+                if l2norm:
+                    regions += [
+                        ("dq_hred", layout.add(total * H * K * isz), io, (total, H, K)),
+                        ("dk_hred", layout.add(total * H * K * isz), io, (total, H, K)),
+                    ]
+            regions += [
+                ("dg", layout.add(total * HV * 4), f32, (total, HV)),
+                ("wy_dk", layout.add(total * HV * K * isz), io, (total, HV, K)),
+                ("wy_dg", layout.add(total * HV * 4), f32, (total, HV)),
+            ]
 
-class _CuTilePlan(CompiledPlan):
-    """Carve plan over the caller's workspace: the layout is static per node;
-    the buffer arrives with every execute (the explicit-workspace convention)."""
+        self.workspace_size = layout.size
+        self.carve_names = [name for name, _off, _dtype, _shape in regions]
+        self.carve = carve_plan(self.plan_name, [(off, dtype, shape) for _name, off, dtype, shape in regions])
+        self.expect = expect_table(node)
+        self.n_seqs = N
+        self.bound = NT_bound
+        self.bt_chunk = BT
+        self.scale = float(node.params.get("scale") or K**-0.5)
+        self.l2norm = l2norm
+        self.safe_gate = bool(node.params.get("safe_gate", False))
+        self.want_state = "final_state" in node.outputs
 
-    def __init__(self, engine, graph):
-        self._engine = engine
-        self._layouts = [(node, *_node_ws_layout(node)) for node in graph.nodes]
-        # nodes execute sequentially, each re-carving the same buffer
-        self._ws_bytes = max(nbytes for _, nbytes, _ in self._layouts)
+        if self.is_bwd:
+            plant = [("dq_l2", "dQ"), ("dk_l2", "dK")] if l2norm else [("dq" if HV == H else "dq_hred", "dQ"), ("dk" if HV == H else "dk_hred", "dK")]
+            plant += [("wy_dv", "dV"), ("dg_cum", "dG"), ("db", "dBeta")]
+            if "initial_state" in node.inputs:
+                plant.append(("dstate0", "d_initial_state"))
+        else:
+            plant = [("o", "O")] + ([("final_state", "final_state")] if self.want_state else [])
+        self.plant = tuple(plant)
+
+        self.ports = None
+        self.names = None
+        self.indices = None
 
     def get_workspace_size(self) -> int:
-        return self._ws_bytes
+        return self.workspace_size
 
-    def execute(self, graph, uid_to_data, ctx) -> None:
-        self._engine._execute(resolve_node_buffers(graph, uid_to_data), self, ctx)
+    def execute(self, graph, variant_pack, ctx) -> None:
+        if self.ports is None:
+            self.ports = bind_ports(graph, variant_pack)
+            (slots,) = self.ports.values()
+            self.names = list(slots.inputs) + list(slots.outputs)
+            self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
+        views = variant_pack.operands(self.indices)
+        check_layouts_compact(self.plan_name, self.expect, self.names, views)
+        nb = dict(zip(self.names, views))
+        stream = ctx.stream if ctx.stream is not None else 0
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        self.common.build_chunk_table(
+            region["chunk_table"],
+            region["chunk_count"],
+            region["chunk_offsets"],
+            nb["cu_seqlens"],
+            self.n_seqs,
+            self.bt_chunk,
+            self.bound,
+            stream=stream,
+        )
+        for name, port in self.plant:
+            region[name] = nb[port]
+        if self.is_bwd:
+            self.execute_bwd(nb, region, stream)
+        else:
+            self.execute_fwd(nb, region, stream)
+
+    def execute_fwd(self, nb, region, stream) -> None:
+        gate = dict(use_gate_in_kernel=True, A_log=nb["a_log"], dt_bias=nb["dt_bias"]) if self.safe_gate else {}
+        self.kernels.chunk_gated_delta_rule(
+            nb["q"],
+            nb["k"],
+            nb["v"],
+            nb["g"],
+            nb["beta"],
+            scale=self.scale,
+            initial_state=nb.get("initial_state"),
+            output_final_state=self.want_state,
+            use_qk_l2norm_in_kernel=self.l2norm,
+            cu_seqlens=nb["cu_seqlens"],
+            chunk_indices=region["chunk_table"],
+            bufs=region,
+            state_v_first=True,
+            stream=stream,
+            **gate,
+        )
+
+    def execute_bwd(self, nb, region, stream) -> None:
+        self.kernels.chunk_gated_delta_rule_grad(
+            nb["q"],
+            nb["k"],
+            nb["v"],
+            nb["g"],
+            nb["beta"],
+            nb["dO"],
+            dstate_in=nb.get("d_final_state"),
+            scale=self.scale,
+            initial_state=nb.get("initial_state"),
+            use_qk_l2norm_in_kernel=self.l2norm,
+            cu_seqlens=nb["cu_seqlens"],
+            chunk_indices=region["chunk_table"],
+            bufs=region,
+            state_v_first=True,
+            stream=stream,
+        )
 
 
 class GdnCuTileEngine(BaseEngine):
     """cuTile chunked-kernel backend for single-node GDN graphs (THD layout)."""
 
     name = "gdn_cutile"
-    engine_id = LINEAR_ATTENTION_ID_BASE + 2  # stable id (see engine_ids.py); ranked after GdnFrostEngine
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
-        if buffers.current_sm() is None:
-            raise NotImplementedError("GdnCuTileEngine requires a CUDA device")
-        try:
-            from cuda.bindings import runtime as _rt
-
-            err, _cudart_version = _rt.cudaRuntimeGetVersion()
-            if int(err) != 0:
-                raise NotImplementedError(f"GdnCuTileEngine: cudaRuntimeGetVersion failed ({err})")
-        except ImportError as e:
-            raise NotImplementedError(f"GdnCuTileEngine requires cuda.bindings: {e}")
-        if _cudart_version < 13030:
-            raise NotImplementedError(f"GdnCuTileEngine requires CUDA 13.3+ (found {_cudart_version})")
-        try:
-            from .kernels.gdn_chunk_cutile import (  # noqa: F401
-                chunk_gated_delta_rule,
-            )
-        except ImportError as e:
-            raise NotImplementedError(f"GdnCuTileEngine requires the cuda.tile runtime: {e}")
-
         import cudnn
 
-        supported_dtypes = (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, None)
-        if not graph.nodes:
-            raise NotImplementedError("GdnCuTileEngine: empty graph")
-        for node in graph.nodes:
-            required = _REQUIRED_PORTS.get(node.node_type)
-            if required is None:
-                raise NotImplementedError(f"GdnCuTileEngine only supports GDN/GDN_BWD nodes, got {node.node_type.name}")
-            for port in required:
-                if port not in node.inputs:
-                    raise NotImplementedError(f"GdnCuTileEngine: {node.node_type.name} node '{node.name}' is missing input '{port}'")
-            if int(node.params.get("checkpoint_every_n_tokens", 0) or 0) > 0 or "H" in node.outputs:
-                raise NotImplementedError("GdnCuTileEngine: per-chunk H output is not supported")
-            q, k, v = (node.inputs[p] for p in ("q", "k", "v"))
-            for p in ("q", "k", "v"):
-                t = node.inputs[p]
-                if t.get_data_type() not in supported_dtypes:
-                    raise NotImplementedError(f"GdnCuTileEngine: '{p}' must be fp16/bf16, got {t.get_data_type()}")
-                if t.dim and len(t.dim) != 3:
-                    raise NotImplementedError(f"GdnCuTileEngine: '{p}' must be THD [total_T, heads, dim], got rank {len(t.dim)}")
-            if q.dim and k.dim and q.dim[1] != k.dim[1]:
-                raise NotImplementedError(f"GdnCuTileEngine: q and k head counts differ ({q.dim[1]} vs {k.dim[1]})")
-            if q.dim and v.dim and v.dim[1] % q.dim[1] != 0:
-                raise NotImplementedError(
-                    f"GdnCuTileEngine: v heads ({v.dim[1]}) must be a multiple of q heads ({q.dim[1]}; GQA-style v broadcast is FROST-only)"
-                )
-            if q.dim and q.dim[-1] > 256:
-                raise NotImplementedError(f"GdnCuTileEngine: head dim K must be <= 256, got {q.dim[-1]}")
-            if node.inputs["cu_seqlens"].get_data_type() not in (cudnn.data_type.INT32, None):
-                raise NotImplementedError("GdnCuTileEngine: cu_seqlens must be int32 (the device-side table builder reads it directly)")
-            io = q.get_data_type()
-            f32 = cudnn.data_type.FLOAT
-            if node.node_type == NodeType.GDN:
-                out_dtypes = {"O": io, "final_state": f32}
-                required_out = ("O",)
-            else:
-                beta_dt = node.inputs["beta"].get_data_type()
-                out_dtypes = {"dQ": io, "dK": io, "dV": io, "dG": f32, "dBeta": beta_dt, "d_initial_state": f32}
-                required_out = ("dQ", "dK", "dV", "dG", "dBeta")
-                if ("initial_state" in node.inputs) != ("d_initial_state" in node.outputs):
-                    raise NotImplementedError("GdnCuTileEngine: d_initial_state output must be requested iff initial_state is given")
-            for port in required_out:
-                if port not in node.outputs:
-                    raise NotImplementedError(f"GdnCuTileEngine: {node.node_type.name} node '{node.name}' is missing output '{port}'")
-            for port, want in out_dtypes.items():
-                t = node.outputs.get(port)
-                if t is not None and t.get_data_type() not in (want, None):
-                    raise NotImplementedError(f"GdnCuTileEngine: output '{port}' must be {want} (written in place), got {t.get_data_type()}")
+        try:
+            from .kernels.gdn import chunk_gated_delta_rule  # noqa: F401 — availability probe: ImportError = decline
+        except ImportError as exc:
+            raise NotImplementedError(f"GdnCuTileEngine requires the cuda.tile runtime: {exc}") from exc
+
+        facts = graph._facts_for(analyze)
+        cutile_la_gate("GdnCuTileEngine", facts, "GDN", cudnn.data_type.FLOAT)
+        if facts.is_bwd and facts.safe_gate:
+            raise NotImplementedError("GdnCuTileEngine: safe_gate is forward-only")
+        if facts.use_beta_sigmoid:
+            raise NotImplementedError("GdnCuTileEngine: use_beta_sigmoid has no cuTile path (the FROST GDN engine serves it)")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        return _CuTilePlan(self, graph)
-
-    def _execute(self, node_buffers, plan, ctx) -> None:
-        from .kernels.common import build_chunk_table
-        from .kernels.gdn_chunk_cutile import _BT
-
-        stream = getattr(ctx, "stream", None)
-        stream = 0 if stream is None else stream
-        ws = Workspace(getattr(ctx, "workspace", None), plan._ws_bytes, "GdnCuTileEngine")
-        for node, _nbytes, table in plan._layouts:
-            nb = node_buffers[node]
-            cu_seqlens = nb.inputs["cu_seqlens"]
-            N = node.inputs["cu_seqlens"].dim[0] - 1
-            bufs = {name: ws.view(off, dt, shape) for name, (off, dt, shape) in table.items()}
-            bound = bufs["chunk_table"].shape[0]
-            build_chunk_table(bufs["chunk_table"], bufs["chunk_count"], bufs["chunk_offsets"], cu_seqlens, N, _BT, bound, stream=stream)
-            if node.node_type == NodeType.GDN:
-                self._execute_fwd(node, nb, bufs, stream)
-            else:
-                self._execute_bwd(node, nb, bufs, stream)
-
-    def _execute_fwd(self, node, nb, bufs, stream) -> None:
-        from .kernels.gdn_chunk_cutile import chunk_gated_delta_rule_fwd, l2norm_fwd
-
-        want_state = "final_state" in node.outputs
-        K = node.inputs["q"].dim[-1]
-        q, k, v = nb.inputs["q"], nb.inputs["k"], nb.inputs["v"]
-        g, beta = nb.inputs["g"], nb.inputs["beta"]
-        scale = node.params.get("scale") or K**-0.5
-        if node.params.get("use_qk_l2norm", False):
-            q, _ = l2norm_fwd(q, out=bufs["q_norm"], rstd_out=bufs["q_rstd"], stream=stream)
-            k, _ = l2norm_fwd(k, out=bufs["k_norm"], rstd_out=bufs["k_rstd"], stream=stream)
-        # terminal pipeline buffers = the caller's output buffers
-        bufs["o"] = nb.outputs["O"]
-        if want_state:
-            bufs["final_state"] = nb.outputs["final_state"]
-        chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=nb.inputs.get("initial_state"),
-            output_final_state=want_state,
-            cu_seqlens=nb.inputs["cu_seqlens"],
-            chunk_indices=bufs["chunk_table"],
-            bufs=bufs,
-            stream=stream,
-        )
-
-    def _execute_bwd(self, node, nb, bufs, stream) -> None:
-        from .kernels.gdn_chunk_cutile import (
-            RCP_LN2,
-            _BT,
-            chunk_gated_delta_rule_bwd,
-            chunk_gated_delta_rule_fwd_intra,
-            chunk_local_cumsum,
-            l2norm_bwd,
-            l2norm_fwd,
-        )
-        from .kernels.common import add_inplace, reshaped
-
-        H, K = node.inputs["q"].dim[1], node.inputs["q"].dim[-1]
-        HV = node.inputs["v"].dim[1]
-        q, k, v = nb.inputs["q"], nb.inputs["k"], nb.inputs["v"]
-        g, beta, do = nb.inputs["g"], nb.inputs["beta"], nb.inputs["dO"]
-        cu_seqlens = nb.inputs["cu_seqlens"]
-        initial_state = nb.inputs.get("initial_state")
-        dht = nb.inputs.get("d_final_state")
-        chunk_indices = bufs["chunk_table"]
-        scale = node.params.get("scale") or K**-0.5
-        l2norm = bool(node.params.get("use_qk_l2norm", False))
-        if l2norm:
-            q, q_rstd = l2norm_fwd(q, out=bufs["q_norm"], rstd_out=bufs["q_rstd"], stream=stream)
-            k, k_rstd = l2norm_fwd(k, out=bufs["k_norm"], rstd_out=bufs["k_rstd"], stream=stream)
-
-        # terminal pipeline buffers = the caller's output buffers (with
-        # l2norm, dq/dk stay carves and l2norm_bwd writes the caller's)
-        if not l2norm:
-            bufs["dq" if HV == H else "dq_hred"] = nb.outputs["dQ"]
-            bufs["dk" if HV == H else "dk_hred"] = nb.outputs["dK"]
-        bufs["wy_dv"] = nb.outputs["dV"]
-        bufs["dg_cum"] = nb.outputs["dG"]
-        bufs["db"] = nb.outputs["dBeta"]
-        if initial_state is not None:
-            bufs["dh0"] = nb.outputs["d_initial_state"]
-
-        # recompute the forward's cumulative gate and intra-chunk WY matrix
-        # (the backward entry expects them)
-        g_cum = chunk_local_cumsum(g, chunk_size=_BT, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, out=bufs["g_cum"], stream=stream)
-        _, _, A = chunk_gated_delta_rule_fwd_intra(
-            k=k, v=v, g=g_cum, beta=beta, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, compute_wu=False, stream=stream
-        )
-        dq, dk, dk2, _, _, _, _, _, _ = chunk_gated_delta_rule_bwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g_cum,
-            beta=beta,
-            A=A,
-            scale=scale,
-            initial_state=initial_state,
-            do=do,
-            dht=dht,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            bufs=bufs,
-            stream=stream,
-        )
-        if l2norm:
-            l2norm_bwd(q, q_rstd, dq, out=nb.outputs["dQ"], bufs=bufs, stream=stream)
-            l2norm_bwd(k, k_rstd, dk, dy2=dk2, out=nb.outputs["dK"], bufs=bufs, stream=stream)
-        else:
-            # dk/dk2 are the head-reduced finals for GVA, HV-head for MHA
-            n_dk = 1
-            for s_ in dk.shape:
-                n_dk *= int(s_)
-            add_inplace(reshaped(dk, (n_dk,)), reshaped(dk2, (n_dk,)), n_dk, stream=stream)
+        return GdnCuTilePlan(graph)

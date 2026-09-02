@@ -63,7 +63,11 @@ The backward kernel (``_compressor_bwd_r128_kernel``) stages each row's window i
 shared memory chunk-parallel, accumulates per-chunk partial ``den`` / ``S`` sums
 inside the e-pass (the approved ratio=128 deterministic tolerance contract), merges
 them per column in a FIXED chunk order, and stores gradients with a hoisted ``1/den``
-multiply — no serial sweeps, no per-element division. dKV/dScore are deterministic
+multiply — no serial sweeps, no per-element division. Most schedule buckets load
+``grad_out`` once per row and hold the register vec across the phase barriers (the
+``goreuse`` schedule field — adopted per bucket on measured pure-kernel wins and
+bitwise-neutral for dKV/dScore; see ``_bwd_schedule_r128``). dKV/dScore are
+deterministic
 (fixed orders, no atomics) and match the fp32-intermediate eager autograd within the
 r128 tolerance contract (same values within the gate tolerances — absolute thresholds
 calibrated on the gate's documented input distribution — the eager reference's NaN/Inf
@@ -655,6 +659,7 @@ def _compressor_bwd_r128_kernel(
     tchunks: cutlass.Constexpr,
     threads_x: cutlass.Constexpr,
     fastexp: cutlass.Constexpr,
+    goreuse: cutlass.Constexpr,
 ):
     """Backward: staged-smem chunk-parallel phases with fused reductions.
 
@@ -865,12 +870,15 @@ def _compressor_bwd_r128_kernel(
 
             # ---- phase 2: chunk-parallel e-pass (mx merge + exp + den/S' partials) ----
             # This pass ALSO accumulates the chunk's partial den / S' sums
-            # (registers, then one smem slot per (chunk, column)).
+            # (registers, then one smem slot per (chunk, column)). grad_out is loaded
+            # once here; in ``goreuse`` buckets the register vec stays live for
+            # phase 4 (mGO is read-only), the others reload it there (see
+            # ``_bwd_schedule_r128`` for the measured per-bucket decision).
+            fr_go = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
             if col < ncol:
                 sbase = k0 * cols_pc + tidx * vec
-                fr_go2 = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                gooff2 = cute.assume(bb * d + cvec, divby=vec)
-                cute.autovec_copy(cute.make_tensor(mGO.iterator + gooff2, cute.make_layout(vec)), fr_go2)
+                gooff = cute.assume(bb * d + cvec, divby=vec)
+                cute.autovec_copy(cute.make_tensor(mGO.iterator + gooff, cute.make_layout(vec)), fr_go)
                 for j in cutlass.range_constexpr(vec):
                     # Chunk-max merge: max is order-independent, so the chunked max
                     # equals the ratio=4 kernel's serial scan bitwise. Redundant per
@@ -883,7 +891,7 @@ def _compressor_bwd_r128_kernel(
                             mx = v
                     # Invalid slots become exp(-inf - mx) == 0 exactly, the value the
                     # ratio=4 kernel's serial window feeds its den sum.
-                    go2 = cutlass.Float32(fr_go2[j])
+                    go2 = cutlass.Float32(fr_go[j])
                     den_p = cutlass.Float32(0.0)
                     sp_p = cutlass.Float32(0.0)
                     for kk in cutlass.range(C, unroll=8):
@@ -921,11 +929,13 @@ def _compressor_bwd_r128_kernel(
             cute.arch.barrier()
 
             # ---- phase 4: chunk-parallel gradient stores + dAPE accumulation ----
+            # ``goreuse`` buckets: fr_go still holds this row's grad_out vec from
+            # phase 2; the others reload it (baseline dataflow).
             if col < ncol:
                 sbase = k0 * cols_pc + tidx * vec
-                fr_go = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                gooff = cute.assume(bb * d + cvec, divby=vec)
-                cute.autovec_copy(cute.make_tensor(mGO.iterator + gooff, cute.make_layout(vec)), fr_go)
+                if cutlass.const_expr(not goreuse):
+                    gooff4 = cute.assume(bb * d + cvec, divby=vec)
+                    cute.autovec_copy(cute.make_tensor(mGO.iterator + gooff4, cute.make_layout(vec)), fr_go)
                 if run_chunk:
                     for kk in cutlass.range_constexpr(C):
                         off = cute.assume((tok_row0 + kk) * W + colbase, divby=vec)
@@ -1000,6 +1010,7 @@ def _compressor_bwd_r128_launch(
     tchunks: cutlass.Constexpr,
     threads_x: cutlass.Constexpr,
     fastexp: cutlass.Constexpr,
+    goreuse: cutlass.Constexpr,
 ):
     """JIT entry point that wraps raw pointers into tensors and launches backward."""
     lay = cute.make_layout(_EXT)
@@ -1036,6 +1047,7 @@ def _compressor_bwd_r128_launch(
         tchunks,
         threads_x,
         fastexp,
+        goreuse,
     ).launch(grid=(gx, gy, 1), block=(threads_x, tchunks, 1), stream=stream)
 
 
@@ -1048,12 +1060,25 @@ def _compressor_bwd_r128_launch(
 # boundary measured at 192 (win) / 256 (loss). The vec=1 buckets keep the exact exp:
 # fastexp measured 0.905x (c1) / 1.003x (c2) on top of them.
 _BWD_SMALL_NB_MAX = 192
-# (coff, d) -> (vec, tchunks, fastexp); threads_x is always derived (one warp per
-# chunk-row).
+# (coff, d) -> (vec, tchunks, fastexp, goreuse); threads_x is always derived (one warp
+# per chunk-row).
 _BWD_SMALL_SCHEDULES = {
-    (1, 128): (1, 8, False),
-    (2, 128): (1, 8, False),
+    (1, 128): (1, 8, False, True),
+    (2, 128): (1, 8, False, True),
 }
+
+# grad_out register reuse (the ``goreuse`` schedule field): phase 2 loads grad_out
+# once and keeps the register vec live across the phase 2->4 barriers instead of
+# re-reading the L1-resident line in phase 4. Decided per bucket by measured
+# pure-kernel time (interleaved A/B, B200, median-100; ptxas may only veto on actual
+# spill — none anywhere, sm_100a): the vec=1 small buckets win big (c1d128 1x8192
+# 8.45 -> 6.27 us, 3x8192 16.1 -> 11.7, c2d128 1x8192 11.3 -> 10.7 despite the
+# 48 -> 64 / 77 -> 78 register growth — their small grids underfill the machine, so
+# residency is not the binding constraint), the defaults win ~1.5-2.1% at their
+# short-context shapes and tie at 64k+ — EXCEPT the c1d128 default, which measured
+# 63.9 -> 64.7 us (-1.3%, reproduced order-swapped) at 131k and keeps the phase-4
+# reload. Default-bucket membership:
+_DEFAULT_GOREUSE = {(2, 128), (1, 512), (2, 512)}
 
 _SM_COUNT_CACHE = {}
 
@@ -1068,8 +1093,8 @@ def _sm_count(dev):
 
 
 def _bwd_schedule_r128(ratio, d, coff, nb_total=None):
-    """Launch schedule ``(vec, tchunks, threads_x, fastexp)`` for the ratio=128
-    backward.
+    """Launch schedule ``(vec, tchunks, threads_x, fastexp, goreuse)`` for the
+    ratio=128 backward.
 
     ``vec = 2`` (32-bit paired bf16 accesses) for even ``d``, scalar ``vec = 1`` for
     odd ``d`` — no ``vec = 4`` variant: it doubles the smem tiles and registers
@@ -1083,15 +1108,19 @@ def _bwd_schedule_r128(ratio, d, coff, nb_total=None):
     wins ~25% at long context. ``coff == 2`` additionally requires chunks not to
     straddle the half-window boundary. ``fastexp`` (see ``_exp_fast``) measured a
     uniform +3-8% everywhere EXCEPT the vec=1 small buckets — the default is True
-    outside them.
+    outside them. ``goreuse`` (single grad_out load held across the phase barriers;
+    see ``_DEFAULT_GOREUSE``) is on everywhere EXCEPT the c1d128 default bucket,
+    which measured slower with it; dKV/dScore are bitwise-identical either way (the
+    same read-only values move into registers).
     """
     W = coff * d
     vec = 2 if d % 2 == 0 else 1
     tchunks = 4 if coff == 1 and d >= 512 else 8
     fastexp = True
+    goreuse = (coff, d) in _DEFAULT_GOREUSE
     if nb_total is not None:
         if nb_total <= _BWD_SMALL_NB_MAX and (coff, d) in _BWD_SMALL_SCHEDULES:
-            vec, tchunks, fastexp = _BWD_SMALL_SCHEDULES[(coff, d)]
+            vec, tchunks, fastexp, goreuse = _BWD_SMALL_SCHEDULES[(coff, d)]
     if d % vec != 0:
         raise ValueError(f"vec={vec} must divide head_dim ({d})")
     ncol = d // vec
@@ -1108,7 +1137,7 @@ def _bwd_schedule_r128(ratio, d, coff, nb_total=None):
     smem_bytes = win * threads_x * vec * 6 + 3 * tchunks * threads_x * vec * 4 + 2 * threads_x * vec * 4 + 64
     if smem_bytes > 227 * 1024:
         raise ValueError(f"backward smem tile too large ({smem_bytes} B) for W={W}")
-    return vec, tchunks, threads_x, fastexp
+    return vec, tchunks, threads_x, fastexp, goreuse
 
 
 def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):

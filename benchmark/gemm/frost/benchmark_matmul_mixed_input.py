@@ -13,14 +13,8 @@ benchmark_matmul.py.
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-from typing import Callable
 
 import cudnn  # noqa: F401
 import cudnn.gemm.frost  # noqa: F401
@@ -29,6 +23,20 @@ import torch
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
+
+from benchmark_utils import (
+    add_sweep_args,
+    find_cublas_time,
+    kernel_match_token,
+    nsys_run_and_parse,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_configs,
+    spec_for,
+    time_ms_delayed,
+    time_ms_events,
+)
 
 # name -> (cudnn enum, torch dtype, element bytes, is_integer). load = narrow A
 # storage; tin = MMA / B dtype; tout = output.
@@ -70,12 +78,12 @@ def _enum_chain():
 
 
 def _build_spec_map():
-    """Label -> (cfg, cta_group, scheduler) for every mainloop strategy the funnel accepts."""
+    """Label -> (cfg, cta_group) for every mainloop strategy the funnel accepts."""
     chain = _enum_chain()
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
-        m[label] = (cfg, t.cta_group, t.scheduler)
+        label = f"{cfg.name}_{t.cta_group}ctamma"
+        m[label] = (cfg, t.cta_group)
     return m
 
 
@@ -90,7 +98,8 @@ def _vp(handles, a, b, c):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the graph with a forced tile config -> callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+    _, cta_group = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +146,6 @@ def _cublas_ref(a, b, c, tin_dt: str):
     torch.matmul(a.to(t_tin), b.to(t_tin).transpose(-1, -2), out=c)
 
 
-# Buffer rotation — rotate timed launches across independent tensor copies so a
-# kernel doesn't re-read the prior launch's data from a hot L2 (inflates
-# small-shape TFLOPS). See benchmark_matmul.py.
-_L2_BYTES_B200 = 126 * 1024 * 1024
-
-
 def _mkdata_pool(batch, M, N, K, load_dt, tin_dt, tout_dt, nbuf):
     a, b, c = _mkdata(batch, M, N, K, load_dt, tin_dt, tout_dt)
     pool = [(a, b, c)]
@@ -156,202 +159,6 @@ def _per_set_bytes(batch, M, N, K, load_dt, tin_dt, tout_dt) -> int:
     bin_ = _dt(tin_dt)[2]
     bout = _dt(tout_dt)[2]
     return batch * (bl * M * K + bin_ * N * K + bout * M * N)
-
-
-_AUTO_POOL_BUDGET_BYTES = 4 * 1024 * 1024 * 1024
-_AUTO_NBUF_CAP = 1024
-
-
-def _auto_nbuf(batch, M, N, K, load_dt, tin_dt, tout_dt) -> int:
-    per_set = _per_set_bytes(batch, M, N, K, load_dt, tin_dt, tout_dt)
-    target = int(1.5 * _L2_BYTES_B200)
-    nbuf = max(2, -(-target // per_set))
-    budget = _AUTO_POOL_BUDGET_BYTES
-    if torch.cuda.is_available():
-        free, _total = torch.cuda.mem_get_info()
-        budget = min(budget, free // 2)
-    max_by_budget = max(1, budget // per_set)
-    return max(1, min(nbuf, max_by_budget, _AUTO_NBUF_CAP))
-
-
-def _resolve_nbuf(spec, batch, M, N, K, load_dt, tin_dt, tout_dt) -> int:
-    if spec.strip().lower() == "auto":
-        return _auto_nbuf(batch, M, N, K, load_dt, tin_dt, tout_dt)
-    return max(1, int(spec))
-
-
-def _rotating(fn_of_buf: Callable, pool: list) -> Callable:
-    n = len(pool)
-    return lambda i: fn_of_buf(pool[i % n])
-
-
-# Timing (events / delayed) — identical to benchmark_matmul.py.
-
-
-def _time_ms_events(timed_fn, warmup_fn, *, warmup, iters) -> float:
-    for _ in range(warmup):
-        warmup_fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for i in range(iters):
-        timed_fn(i)
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def _time_ms_delayed(timed_fn, warmup_fn, *, warmup, iters) -> float:
-    for _ in range(warmup):
-        warmup_fn()
-    torch.cuda.synchronize()
-    delay_cycles = max(int(1e8), int((iters * 0.05 + 20.0) * 1.7e6))
-    torch.cuda._sleep(delay_cycles)
-    post_warmup = max(5, warmup)
-    for _ in range(post_warmup):
-        warmup_fn()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for i in range(iters):
-        timed_fn(i)
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-# ---------------------------------------------------------------------------
-# nsys mode
-# ---------------------------------------------------------------------------
-
-
-def _nsys_run_and_parse(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) -> dict[str, float]:
-    nsys = "/usr/local/bin/nsys" if os.path.exists("/usr/local/bin/nsys") else shutil.which("nsys")
-    if nsys is None:
-        sys.exit("nsys not found — install nsight-systems or use the default events mode.")
-
-    workdir = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"benchmark_mixed_nsys_{os.getpid()}")
-    os.makedirs(workdir, exist_ok=True)
-    report_prefix = os.path.join(workdir, "report")
-
-    nsys_env = os.environ.copy()
-    nsys_env.setdefault("TMPDIR", os.environ.get("TMPDIR", tempfile.gettempdir()))
-
-    inner = [
-        sys.executable,
-        "-u",
-        os.path.abspath(__file__),
-        "--_nsys-worker",
-        "--shape",
-        shape,
-        "--warmup",
-        str(warmup),
-        "--iters",
-        str(iters),
-        "--rotate-buffers",
-        str(nbuf),
-        "--load-dtype",
-        load_dt,
-        "--tin",
-        tin_dt,
-        "--tout",
-        tout_dt,
-    ]
-    if configs:
-        inner += ["--configs", ",".join(configs)]
-
-    profile_cmd = [
-        nsys,
-        "profile",
-        "-o",
-        report_prefix,
-        "--force-overwrite=true",
-        "--cuda-um-cpu-page-faults=false",
-        "--cuda-um-gpu-page-faults=false",
-        "--trace=cuda",
-    ] + inner
-
-    print(f"  + {' '.join(profile_cmd)}\n")
-    proc = subprocess.run(profile_cmd, capture_output=True, text=True, env=nsys_env)
-    if proc.returncode != 0:
-        print("nsys stdout:\n" + proc.stdout)
-        print("nsys stderr:\n" + proc.stderr, file=sys.stderr)
-        sys.exit(f"nsys profile exited {proc.returncode}")
-
-    stats_cmd = [
-        nsys,
-        "stats",
-        "--report",
-        "cuda_gpu_kern_sum",
-        "--force-export=true",
-        report_prefix + ".nsys-rep",
-    ]
-    proc = subprocess.run(stats_cmd, capture_output=True, text=True, env=nsys_env)
-    if proc.returncode != 0:
-        print("nsys stats stdout:\n" + proc.stdout)
-        print("nsys stats stderr:\n" + proc.stderr, file=sys.stderr)
-        sys.exit(f"nsys stats exited {proc.returncode}")
-
-    return _parse_nsys_stats(proc.stdout)
-
-
-def _parse_nsys_stats(text: str) -> dict[str, float]:
-    lines = text.splitlines()
-    header_i = None
-    for i, ln in enumerate(lines):
-        if "Med (" in ln and "Name" in ln and ("ns)" in ln or "us)" in ln or "ms)" in ln):
-            header_i = i
-            break
-    if header_i is None:
-        sys.exit("could not find kernel-summary header in nsys stats output:\n  " + "\n  ".join(lines[:60]))
-
-    m_unit = re.search(r"Med \((\w+)\)", lines[header_i])
-    unit = m_unit.group(1) if m_unit else "ns"
-    unit_div = {"ns": 1e6, "us": 1e3, "ms": 1.0, "s": 1e-3}.get(unit, 1e6)
-
-    NUM_NUMERIC_COLS = 8
-    MED_COL = 4
-
-    result: dict[str, float] = {}
-    in_data = False
-    for j in range(header_i + 1, len(lines)):
-        row = lines[j]
-        stripped = row.strip()
-        if not stripped:
-            if in_data:
-                break
-            continue
-        if set(stripped) <= set("- "):
-            in_data = True
-            continue
-        if not in_data:
-            continue
-        if stripped.startswith("**") or stripped.startswith("##"):
-            break
-        toks = stripped.split()
-        if len(toks) <= NUM_NUMERIC_COLS:
-            continue
-        try:
-            med = float(toks[MED_COL].replace(",", ""))
-        except ValueError:
-            continue
-        name = " ".join(toks[NUM_NUMERIC_COLS:]).rstrip()
-        if not name:
-            continue
-        result[name] = med / unit_div
-    return result
-
-
-def _match_kernel_name(kern_name: str, config_name: str) -> bool:
-    return config_name in kern_name
-
-
-def _find_cublas_time(kern_times: dict[str, float]):
-    cands = [(k, v) for k, v in kern_times.items() if k.startswith("nvjet_")]
-    if not cands:
-        return None
-    return max(cands, key=lambda x: x[1])
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +185,10 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) 
     torch.cuda.synchronize()
 
     # 2. each GEMM config.
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
     config_names = configs or list(_SPEC_MAP)
     for name in config_names:
-        cfg = name_to_cfg.get(name)
+        spec = spec_for(name, _SPEC_MAP)
+        cfg = spec[0] if spec else None
         if cfg is None:
             continue
         try:
@@ -406,29 +213,10 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", default="1,4096,4096,4096", help="B,M,N,K")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--load-dtype", default="int8", help="A storage dtype (default int8)")
     parser.add_argument("--tin", default="bf16", help="compute / B dtype (default bf16)")
     parser.add_argument("--tout", default="bf16", help="output dtype (default bf16)")
-    parser.add_argument(
-        "--configs",
-        default=None,
-        help="comma-separated config names (default: every mainloop CATALOG entry)",
-    )
-    parser.add_argument("--timing", choices=("delayed", "events", "nsys"), default="delayed")
-    parser.add_argument(
-        "--stream",
-        action="store_true",
-        help="print each config's result as it finishes (events/delayed only)",
-    )
-    parser.add_argument(
-        "--rotate-buffers",
-        default="auto",
-        metavar="N",
-        help="independent tensor copies to rotate timed launches across " "(default 'auto'; 1 disables).",
-    )
-    parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
+    add_sweep_args(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -440,26 +228,20 @@ def main() -> int:
         sys.exit("--shape must be B,M,N,K (four values; use B=1 for a plain matmul)")
     B, M, N, K = parts
     load_dt, tin_dt, tout_dt = args.load_dtype, args.tin, args.tout
-    nbuf = _resolve_nbuf(args.rotate_buffers, B, M, N, K, load_dt, tin_dt, tout_dt)
+    per_set = _per_set_bytes(B, M, N, K, load_dt, tin_dt, tout_dt)
+    nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
-    if getattr(args, "_nsys_worker"):
-        configs = [c.strip() for c in args.configs.split(",")] if args.configs else []
+    if args._nsys_worker:
+        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, load_dt, tin_dt, tout_dt)
         return 0
 
     flops = 2 * B * M * N * K
-    config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
+    config_names = select_configs(args.configs, _SPEC_MAP)
 
     print(f"\n=== mixed-input matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) " f"— A={load_dt} -> {tin_dt} @ {tin_dt} -> {tout_dt} ===")
 
-    if nbuf > 1:
-        footprint = _per_set_bytes(B, M, N, K, load_dt, tin_dt, tout_dt) * nbuf
-        print(f"  [rotate-buffers: {nbuf} copies/tensor, " f"{footprint / 1024 / 1024:.0f} MB pool]")
-        if footprint < _L2_BYTES_B200:
-            print(f"  [WARNING: pool ({footprint / 1024 / 1024:.0f} MB) < B200 L2 " f"(~{_L2_BYTES_B200 / 1024 / 1024:.0f} MB) — bump --rotate-buffers.]")
-    else:
-        print("  [rotate-buffers: disabled (1) — small-shape TFLOPS may be hot-L2-inflated]")
+    report_pool(nbuf, per_set)
 
     rows: list[tuple[str, float, float, str]] = []
     t0 = time.time()
@@ -472,18 +254,27 @@ def main() -> int:
 
     if args.timing == "nsys":
         print("  [timing: nsys median kernel duration]\n")
-        kern_times = _nsys_run_and_parse(
+        inner_args = [
+            "--shape",
             args.shape,
-            config_names,
-            args.warmup,
-            args.iters,
-            nbuf,
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--rotate-buffers",
+            str(nbuf),
+            "--load-dtype",
             load_dt,
+            "--tin",
             tin_dt,
+            "--tout",
             tout_dt,
-        )
+        ]
+        if config_names:
+            inner_args += ["--configs", ",".join(config_names)]
+        kern_times = nsys_run_and_parse(__file__, inner_args, tag="benchmark_mixed")
 
-        cublas_hit = _find_cublas_time(kern_times)
+        cublas_hit = find_cublas_time(kern_times)
         if cublas_hit:
             cublas_name, cublas_ms = cublas_hit
             cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
@@ -493,18 +284,19 @@ def main() -> int:
             print("  cuBLAS kernel: not detected in nsys output")
 
         for name in config_names:
-            cfg = name_to_cfg.get(name)
-            if cfg is None:
+            spec = spec_for(name, _SPEC_MAP)
+            if spec is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            matches = [(k, v) for k, v in kern_times.items() if _match_kernel_name(k, name)]
+            tok = kernel_match_token(spec[0], spec[1])
+            matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))
                 continue
             _, ms = max(matches, key=lambda x: x[1])
             rows.append((name, flops / (ms * 1e-3) / 1e12, ms, ""))
     else:
-        timer = _time_ms_delayed if args.timing == "delayed" else _time_ms_events
+        timer = time_ms_delayed if args.timing == "delayed" else time_ms_events
         if args.timing == "delayed":
             print("  [timing: events bracketed around delayed back-to-back launches]\n")
         else:
@@ -514,7 +306,7 @@ def main() -> int:
         if args.stream:
             print("  ▶ running cuBLAS reference ...", flush=True)
         cublas_ms = timer(
-            _rotating(lambda t: _cublas_ref(t[0], t[1], t[2], tin_dt), pool),
+            rotating(lambda t: _cublas_ref(t[0], t[1], t[2], tin_dt), pool),
             lambda: _cublas_ref(wa, wb, wc, tin_dt),
             warmup=args.warmup,
             iters=args.iters,
@@ -528,7 +320,8 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = spec_for(name, _SPEC_MAP)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
             elif ctx_dead:
@@ -540,7 +333,7 @@ def main() -> int:
                     g, h = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(
+                        rotating(
                             lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])),
                             pool,
                         ),

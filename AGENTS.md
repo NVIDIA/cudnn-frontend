@@ -44,7 +44,10 @@ Python (editable; compiles the pybind11 extension via CMake):
 
 ```bash
 pip install -e .              # core graph API only
-pip install -e ".[cutedsl]"   # + OSS CuTeDSL kernels (torch, nvidia-cutlass-dsl, cuda-python)
+pip install -e ".[cutedsl]"   # + OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
+pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
+pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
+pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
 ```
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.
@@ -61,7 +64,7 @@ cd test/python
 pytest                        # default is -m L0 (smoke level) per pytest.ini
 pytest -m L1                  # deeper levels: L0..L4
 pytest test_conv_fprop.py     # one file (still filtered by -m L0 — pass -m "L0 or L1" to widen)
-pytest fe_api/                # OSS kernel tests; require ".[cutedsl]" install + SM90/SM100 GPU
+pytest fe_api/                # OSS kernel tests; require ".[cutedsl]" + `--group torch` (and `--group jax` for the *_jax tests) + SM90/SM100 GPU
 ```
 
 Read [test/AGENTS.md](test/AGENTS.md) before touching tests — `test/python/conftest.py` has import-order and env-var requirements that are easy to break.

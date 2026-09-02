@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Backend (engine) contract for the Python graph: plan -> compile -> execute.
+"""Backend (engine) contract for the Python graph: claim -> compile -> execute.
 
-A backend is one of the interchangeable implementations the Router dispatches
-to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
+A backend is one of the interchangeable implementations the ranked plan list
+dispatches to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
 lifecycle mirrors a real JIT/DSL engine:
 
-  1. ``propose_plans(graph)``  -> candidate ``PlanConfig`` entries (one per
-     configuration the engine wants ranked; decline the whole graph by raising
-     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``).
+  1. ``check_support(graph)`` -> accept, or decline the whole graph by raising
+     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``. An engine
+     does NOT propose its own plans: which configs to try, in what order, and
+     where the backend's own entries belong is one comparison across every
+     candidate, which no engine can make from the inside. That lives in
+     ``engines/heuristics.py`` and the family hook it dispatches to.
   2. ``build_plan(graph, plan)`` -> a ``CompiledPlan`` — the expensive JIT step,
      run ONCE per (graph, selected plan) at ``graph.build_plans()`` time; the
      compiled artifact lives on the graph, so one engine instance is safely
@@ -17,9 +20,9 @@ lifecycle mirrors a real JIT/DSL engine:
   3. ``CompiledPlan.execute(graph, uid_to_data, ctx)`` — hot path.
      ``uid_to_data`` is the caller's variant pack (tensor uid -> device
      buffer, exactly as the classic backend receives it); the
-     ``ExecutionContext`` carries the caller's handle / stream / workspace /
-     dynamic-shape overrides explicitly; engines must not hard-code a stream
-     or silently allocate hidden workspace. Engines that address buffers by
+     ``ExecutionContext`` carries the caller's handle / stream / workspace
+     explicitly; engines must not hard-code a stream or silently allocate
+     hidden workspace. Engines that address buffers by
      port name call ``resolve_node_buffers(graph, uid_to_data)`` (see below).
 
 Simple eager engines only implement ``execute()`` — the default ``build_plan``
@@ -42,12 +45,24 @@ Example:
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph
+
+
+def decline_types():
+    """The exception types that mean "this engine does not serve this graph".
+
+    ImportError counts: an engine whose optional dependency is absent cannot
+    serve the graph, and since lowering imports are deferred past check_support
+    that only becomes visible at build time.
+    """
+    import cudnn
+
+    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
 @dataclass(frozen=True)
@@ -63,42 +78,201 @@ class PlanConfig:
     ``cpp_index`` is set only on backend entries: the position this plan holds
     in the lowered graph's own plan list, so building it is one
     ``build_plan_at_index`` instead of a rebuild from (engine_id, knobs).
+
+    ``mode`` is the heuristic mode that produced the entry. Ranking needs it:
+    "the backend's mode-A entries ahead of ours, its fallbacks behind" cannot
+    be said about a list whose entries do not remember where they came from.
     """
 
     engine_id: int
     knobs: Any = None
     cpp_index: Any = None
+    mode: Any = None
 
 
-@dataclass(frozen=True)
-class ExecutionContext:
+class ExecutionContext(NamedTuple):
     """Runtime context passed to a compiled plan at execute time.
 
     Everything an engine may need is explicit here — no engine should reach
     into private graph state, hard-code a stream, or allocate hidden workspace.
     ``stream`` is resolved from the handle when available (classic
     ``cudnn.set_stream(handle, ...)`` semantics).
+
+    A ``NamedTuple`` (not a frozen dataclass): both immutable, but built on every
+    execute, where the NamedTuple is ~220 ns/execute cheaper.
     """
 
     handle: Any = None
     stream: Any = None
     workspace: Any = None
-    override_uids: Any = None
-    override_shapes: Any = None
-    override_strides: Any = None
+
+
+class VariantPack:
+    """The caller's variant pack, normalized ONCE at the top of execute().
+
+    Whatever the caller passed — a torch tensor, a DeviceView, any
+    ``__dlpack__`` / ``__cuda_array_interface__`` producer, or a bare device
+    address — is converted here and then dropped. Below this point the cuDNN
+    backend and every python engine see the same two index-aligned sequences
+    and nothing else, so neither can behave differently on account of what the
+    caller happened to hold.
+
+    The operands live in ``native``, a C container holding one ``DLTensor``
+    each, read through the producer's ``__dlpack_c_exchange_api__`` vtable and
+    handed to kernels through the same one.
+
+    ``uids`` is ASCENDING, matching the backend's own operand order
+    (``get_variant_pack_uids_sorted()``), so ``address`` goes straight to
+    ``_execute_with_raw_ptrs`` with no copy and no per-operand hash lookup.
+
+    What the caller ACTUALLY passed is what is recorded, which need not be what
+    the graph declared: an engine reads the IR port for the shape the plan was
+    built for and this pack for the shape about to run. frost_gemm takes its
+    M/N/K from here; the backend takes only the pointer.
+
+    Allocated per call. Two threads may execute one graph concurrently with
+    different buffers, and a shared pack would hand each thread the other's
+    pointers — silently, because every pointer in it is individually valid.
+    """
+
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
+
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
+        self.uids = uids
+        self.native = native
+        self.workspace = workspace_ptr
+        self.workspace_bytes = workspace_bytes
+        # Slots whose dim/stride were lent by the graph because the caller
+        # passed a bare address. Usually empty. An engine that reads extents by
+        # axis position needs this: the graph and the caller order a matmul's B
+        # differently, and the description does not say which one it is.
+        self.graph_described = graph_described
+        self._index_of = None  # built on first lookup: the backend never does one
+        self._device = None
+
+    @property
+    def address(self) -> int:
+        """The ``void*[]`` in operand order, for ``_execute_with_raw_ptrs``."""
+        return self.native.address
+
+    def all_contiguous(self):
+        """``(ok, index)`` over every filled operand, decided from the strides
+        the native pack already holds."""
+        ok, offender = self.native.all_contiguous()
+        return ok, (int(offender) if offender else -1)
+
+    def all_dense_layout(self):
+        """``(ok, slot)`` over every filled operand: the innermost size>1 dim
+        must be stride-1. Padded or permuted outer strides pass."""
+        ok, offender = self.native.all_dense_layout()
+        return ok, (int(offender) if offender else -1)
+
+    @property
+    def index_of_uid(self):
+        if self._index_of is None:
+            self._index_of = {u: i for i, u in enumerate(self.uids)}
+        return self._index_of
+
+    @property
+    def device(self) -> int:
+        """The GPU this execute is going to, for the views handed to kernels.
+
+        One per pack, not one per operand: cuDNN's own variant pack carries no
+        device at all. Read on demand; the backend path never asks.
+        """
+        if self._device is None:
+            from ..frost.device import current_device
+
+            self._device = current_device()
+        return self._device
+
+    def index_of(self, tensor_or_uid) -> int:
+        """Index of a tensor's operand. KeyError when it is not caller-filled
+        (a virtual intermediate, or a value the graph itself supplies)."""
+        uid = tensor_or_uid if isinstance(tensor_or_uid, int) else tensor_or_uid.uid
+        return self.index_of_uid[uid]
+
+    def ptr(self, tensor_or_uid) -> int:
+        return self.native.pointer(self.index_of(tensor_or_uid))
+
+    def operands(self, indices):
+        """The buffers for ``indices``, in one crossing."""
+        return self.native.operands(list(indices), self.device)
+
+    def operand(self, index: int):
+        """A DLPack producer over one operand, for a kernel that needs an
+        object rather than an address.
+
+        This is the whole reason an engine never sees the caller's buffer: the
+        kernel gets ours, built from the pointer and the geometry recorded at
+        normalization. It costs more than handing the torch tensor straight
+        through (measured +1.6 us per operand, because tvm-ffi reads a torch
+        tensor through a C vtable and any python producer through a capsule) —
+        which is an argument for making the producer a C type, not for keeping
+        the caller's object.
+        """
+        return self.native.operand(index, self.device)
+
+    def __len__(self) -> int:
+        return len(self.uids)
+
+
+@dataclass(frozen=True)
+class PortIndices:
+    """Per-node ``{port_name: operand index}``. A port with no caller operand — a
+    virtual intermediate — is ABSENT, so ``.get(port) is None`` keeps meaning
+    what it meant when these were buffers."""
+
+    inputs: Dict[str, int]
+    outputs: Dict[str, int]
+
+
+def bind_ports(graph: "pygraph", variant_pack: VariantPack) -> Dict[Any, PortIndices]:
+    """Join each node's wired ports with the operand layout. Strict: every
+    non-virtual port must have an operand."""
+
+    def resolve(node, ports, direction):
+        indices = {}
+        for port, t in ports.items():
+            if t is None:
+                continue
+            index = variant_pack.index_of_uid.get(t.uid)
+            if index is None:
+                if t.is_virtual:
+                    continue  # engine-internal intermediate
+                raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
+            indices[port] = index
+        return indices
+
+    return {node: PortIndices(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
+
+
+def _view_over_address(address: int, tensor, node, port: str):
+    """A DLPack view over a caller-supplied bare address, shaped by the IR.
+
+    Only reachable when the caller passed an int for this port. Requires the
+    graph to declare a dim and a dtype for it — an address carries neither, so
+    if the graph does not say, nobody can.
+    """
+    from ..datatypes import _cudnn_to_frost_dtype_name
+    from ..frost import buffers
+
+    dtype = _cudnn_to_frost_dtype_name(tensor.data_type)
+    if not tensor.dim or dtype is None:
+        raise ValueError(
+            f"node {node.name!r}: port {port!r} was given a bare device address, "
+            f"but the graph declares no {'dim' if not tensor.dim else 'data_type'} for tensor "
+            f"{tensor.name!r} — pass a buffer that carries its own shape and dtype, or declare them"
+        )
+    return buffers.DeviceView(address, tuple(tensor.dim), dtype, buffers.current_device_id())
 
 
 @dataclass(frozen=True)
 class NodeBuffers:
-    """Per-node ``{port_name: caller buffer}`` maps, the result of
-    ``resolve_node_buffers``. Only WIRED, NON-VIRTUAL ports
-    appear, and every one is guaranteed a buffer (a missing buffer raises at
-    resolution). Torch tensors arrive detached — both DLPack and
-    ``__cuda_array_interface__`` refuse to export ``requires_grad`` tensors,
-    and graph-level gradients are the backward nodes' contract, never
-    autograd tracing through an engine. Virtual intermediates carry no
-    caller buffers; engines that chain them across nodes key their own
-    scratch by ``node.inputs[port].uid``."""
+    """DEPRECATED, kept until every engine takes ``VariantPack``.
+
+    Per-node ``{port_name: caller buffer}`` maps, the result of
+    ``resolve_node_buffers``."""
 
     inputs: Dict[str, Any]
     outputs: Dict[str, Any]
@@ -122,6 +296,13 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
                 if t.is_virtual:
                     continue  # engine-internal intermediate
                 raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
+            if type(b) is int:
+                # A bare device address. The backend has always taken one
+                # (_pygraph._describe), so a python engine must too, or the
+                # same graph.execute() call succeeds or fails depending on
+                # which plan the heuristics happened to pick. The geometry is
+                # the one the graph declares for this port.
+                b = _view_over_address(b, t, node, port)
             bufs[port] = b.detach() if hasattr(b, "detach") else b
         return bufs
 
@@ -131,11 +312,16 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
 class CompiledPlan:
     """A compiled (graph, plan) artifact. Subclass for real JIT engines."""
 
+    # Set True once execute() takes VariantPack. Until then execute() is handed the
+    # caller's raw {uid: buffer} map, as before. Migration flag; it goes away
+    # with the last engine that does not set it.
+    takes_variant_pack: bool = False
+
     def get_workspace_size(self) -> int:
         """Workspace bytes this plan needs at execute time (default 0)."""
         return 0
 
-    def execute(self, graph: "pygraph", uid_to_data: Dict[int, Any], ctx: ExecutionContext) -> None:
+    def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
 
@@ -160,8 +346,7 @@ class BaseEngine(ABC):
         name: Human-readable identifier.
         engine_id: Stable id in the shared flat engine-id space, in the reserved
             Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
-            the base default (None) is rejected at register_backend().
-        default_knobs: Optional default tuning knobs for this engine's plan.
+            the base default (None) is rejected when the manifest builds it.
         behavior_notes / numerical_notes: what this engine's plans are, in the
             same vocabulary the backend's plans answer in, so
             deselect_behavior_notes(...) and friends mean one thing across the
@@ -174,36 +359,15 @@ class BaseEngine(ABC):
     # base intentionally has none so a forgotten override fails at registration
     # instead of silently colliding with another engine.
     engine_id: Any = None
-    default_knobs: Any = None
     behavior_notes: tuple = ()
     numerical_notes: tuple = ()
 
     def __init__(self):
         pass
 
-    # Exclusive end of the id block this engine owns; the default block is the
-    # single id. DECLARE a range rather than override a predicate: registration
-    # has to prove two engines' blocks are disjoint, and an arbitrary predicate
-    # cannot be intersected — two engines could each answer True for some third
-    # id and both be accepted, leaving _engine_for() with two owners.
-    id_end: Any = None
-
-    @property
-    def owned_id_range(self) -> "tuple[int, int]":
-        """``[start, end)`` of the ids this engine answers for."""
-        end = self.id_end if self.id_end is not None else self.engine_id + 1
-        if end <= self.engine_id:
-            raise ValueError(f"engine {self.name!r} declares id_end={self.id_end} at or below its engine_id={self.engine_id}")
-        return (self.engine_id, end)
-
-    def owns_id(self, engine_id: int) -> bool:
-        """Whether ``engine_id`` falls in this engine's declared block.
-
-        Convenience only — dispatch and registration read ``owned_id_range``
-        directly, so overriding this cannot make an engine answer for an id it
-        did not declare."""
-        lo, hi = self.owned_id_range
-        return lo <= engine_id < hi
+    # An engine answers for exactly ONE id: the one its manifest slot handed it.
+    # (The id_end / owned_id_range block this used to declare was for engines
+    # registered at runtime, which no longer exist.)
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.
@@ -214,16 +378,6 @@ class BaseEngine(ABC):
         Default: accept everything (subclasses should narrow this).
         """
         _ = graph
-
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        """Candidate plans for ``graph``, in this engine's preference order.
-
-        Default: one plan with ``default_knobs`` when ``check_support`` accepts.
-        Engines with several viable configurations override this to expose them
-        to ranking/autotune (each entry's knobs reach ``build_plan`` verbatim).
-        """
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, self.default_knobs)]
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: "ExecutionContext" = None) -> CompiledPlan:
         """Compile ``graph`` for ``plan`` (the expensive step; run once per

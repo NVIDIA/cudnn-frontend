@@ -5,7 +5,7 @@ Unified API for Grouped GEMM GLU Forward Kernel (SM100+)
 
 This module provides a single API class that supports both contiguous (dense)
 and discrete weight modes for block-scaled grouped GEMM with GLU activation
-(SwiGLU / GeGLU) in MoE (Mixture of Experts) workloads.
+(SwiGLU / GeGLU / SiTU-GLU) in MoE (Mixture of Experts) workloads.
 
 Dense mode
     All expert weights are packed contiguously in a 3-D tensor (N, K, L).
@@ -17,7 +17,10 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
+import math
 
 from ..backend_utils import (
     GroupedGemmBackend,
@@ -28,20 +31,49 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
-from typing import Any, Tuple, Optional, overload
+from typing import Any, Literal, Tuple, Optional, overload
+
+import cutlass
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    cuda_is_available,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_device,
+    get_shape,
+    get_strides,
+)
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+_JAX_DENSE_B_ERROR = (
+    "Dense weight mode (b_tensor) is not expressible as JAX arrays "
+    "(the expert-outermost strided B layout has no row-major equivalent); "
+    "use discrete mode (b_ptrs) with per-expert weight pointers"
+)
+_JAX_BIAS_ERROR = (
+    "bias_tensor is not expressible as a JAX array (its (n, experts) column-major layout has no row-major equivalent); " "omit bias for JAX inputs"
+)
+_JAX_BLOCK_SCALED_ERROR = (
+    "The block-scaled grouped GEMM GLU backend is not expressible as JAX arrays "
+    "(its scale-factor tensors use an MMA-interleaved layout with no row-major equivalent); "
+    "only the BF16 backend supports JAX inputs"
+)
+
+
+def _block_scaled_dtype_pairs():
+    # Canonical (cutlass) dtype vocabulary; select_grouped_gemm_backend canonicalizes
+    # the caller's dtypes so torch/jax/numpy/str dtypes all compare against these.
+    return {
+        (dtype, dtype)
+        for dtype in (
+            cutlass.Float4E2M1FN,
+            cutlass.Uint8,
+            cutlass.Float8E5M2,
+            cutlass.Float8E4M3FN,
+        )
+    }
 
 
 from ._bf16_api import GroupedGemmGluBf16API
@@ -69,13 +101,14 @@ class GluCall:
     b_major: str = "k"
     norm_const_tensor: Optional[torch.Tensor] = None
     prob_tensor: Optional[torch.Tensor] = None
-    acc_dtype: torch.dtype = torch.float32
-    c_dtype: torch.dtype = torch.bfloat16
-    d_dtype: torch.dtype = torch.bfloat16
+    acc_dtype: Optional[torch.dtype] = None
+    c_dtype: Optional[torch.dtype] = None
+    d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
     vector_f32: bool = False
     m_aligned: int = 256
     discrete_col_sfd: bool = False
@@ -84,6 +117,8 @@ class GluCall:
     geglu_alpha: float = 1.702
     glu_clamp_max: float = 7.0
     glu_clamp_min: float = -7.0
+    situ_beta1: float = 4.0
+    situ_beta2: float = 25.0
     use_dynamic_sched: bool = False
     use_single_group_runtime_offsets: bool = False
     current_stream: Optional[cuda.CUstream] = None
@@ -146,14 +181,16 @@ class GroupedGemmGluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
@@ -163,6 +200,11 @@ class GroupedGemmGluSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
+        framework = detect_framework(sample_a)
+        if sample_a is not None and framework not in ("torch", "jax"):
+            raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
+        if acc_dtype is None:
+            self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -182,9 +224,10 @@ class GroupedGemmGluSm100(APIBase):
                     ("sample_amax", kwargs["sample_amax"]),
                     ("sample_norm_const", kwargs["sample_norm_const"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                    ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
@@ -215,8 +258,14 @@ class GroupedGemmGluSm100(APIBase):
                     use_dynamic_sched=kwargs["use_dynamic_sched"],
                 )
             else:
+                if detect_framework(kwargs["sample_a"]) == "jax":
+                    raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
                 block_kwargs.pop("generate_c", None)
+                # The block-scaled implementation is torch-native: hand it torch dtypes.
+                block_kwargs["acc_dtype"] = framework_dtype(block_kwargs["acc_dtype"], "torch")
+                if block_kwargs.get("b_dtype") is not None:
+                    block_kwargs["b_dtype"] = framework_dtype(block_kwargs["b_dtype"], "torch")
                 self._implementation = GroupedGemmGluBlockScaledAPI(**block_kwargs)
             self._kernel = self._implementation._kernel
             self.weight_mode = self._implementation.weight_mode
@@ -300,6 +349,8 @@ class GroupedGemmGluSm100(APIBase):
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         if self._implementation is None:
@@ -365,6 +416,8 @@ class GroupedGemmGluSm100(APIBase):
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
                 glu_clamp_min=glu_clamp_min,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 current_stream=current_stream,
             )
         self._is_supported = self._implementation._is_supported
@@ -412,10 +465,19 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         mma_tiler_mn: MMA tiler shape
         cluster_shape_mn: Cluster shape
         sf_vec_size: Scale factor vector size
+        sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors as
+            E5M3 instead of the encoding implied by ``sfa_tensor.dtype``. ``None``
+            (default) infers as usual -- E4M3 for NVFP4, E8M0 for MXFP4/MXFP8 --
+            and is the only accepted value on the BF16 backend, which has no
+            scale factors. ``"e5m3"`` selects an unsigned 5-exponent-bit,
+            3-mantissa-bit format that trades two mantissa bits for one exponent
+            bit to widen the scale range; it is Rubin-only, requires the NVFP4
+            recipe, and the scale tensors are still passed as
+            ``torch.float8_e4m3fn`` because torch has no e5m3 dtype.
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
-        act_func: Activation function ("swiglu" or "geglu")
+        act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu")
         linear_offset: Linear offset applied to the up branch in the
             ``act_func == "geglu"`` activation, i.e.
             ``out = (up + linear_offset) * silu(geglu_alpha * gate)``. Ignored
@@ -439,6 +501,11 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             kernel never lower-clamps the gate). Default ``-7.0``. Runtime
             parameter, intentionally not part of the cache key. Ignored when
             ``act_func == "swiglu"``.
+        situ_beta1: Positive finite gate tanh scale for SiTU-GLU. Default
+            ``4.0``. This value specializes the compiled kernel and is part of
+            the cache key.
+        situ_beta2: Positive finite up-branch tanh scale for SiTU-GLU. Default
+            ``25.0``. Runtime parameter, intentionally not part of the cache key.
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         current_stream: CUDA stream
 
@@ -446,6 +513,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         TupleDict with keys: c_tensor, d_tensor, d_col_tensor, amax_tensor,
             sfd_row_tensor, sfd_col_tensor
     """
+    import torch
+
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
 
     a_tensor = call.a_tensor
@@ -458,17 +527,20 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
     b_ptrs = call.b_ptrs
     sfb_ptrs = call.sfb_ptrs
     n = call.n
-    b_dtype = call.b_dtype
     b_major = call.b_major
     norm_const_tensor = call.norm_const_tensor
     prob_tensor = call.prob_tensor
-    acc_dtype = call.acc_dtype
-    c_dtype = call.c_dtype
-    d_dtype = call.d_dtype
     cd_major = call.cd_major
+    # The block-scaled path is torch-native (torch-only allocations and kernels);
+    # the normalized call carries canonical (cutlass) dtypes, so map them back.
+    acc_dtype = framework_dtype(call.acc_dtype, "torch")
+    c_dtype = framework_dtype(call.c_dtype, "torch")
+    d_dtype = framework_dtype(call.d_dtype, "torch")
+    b_dtype = framework_dtype(call.b_dtype, "torch") if call.b_dtype is not None else None
     mma_tiler_mn = call.mma_tiler_mn
     cluster_shape_mn = call.cluster_shape_mn
     sf_vec_size = call.sf_vec_size
+    sf_fp8_dtype_override = call.sf_fp8_dtype_override
     vector_f32 = call.vector_f32
     m_aligned = call.m_aligned
     discrete_col_sfd = call.discrete_col_sfd
@@ -477,6 +549,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
     geglu_alpha = call.geglu_alpha
     glu_clamp_max = call.glu_clamp_max
     glu_clamp_min = call.glu_clamp_min
+    situ_beta1 = call.situ_beta1
+    situ_beta2 = call.situ_beta2
     use_dynamic_sched = call.use_dynamic_sched
     use_single_group_runtime_offsets = call.use_single_group_runtime_offsets
     current_stream = call.current_stream
@@ -587,6 +661,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         return static_shape_suffix, stride_signature, tensor.dtype
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
+    situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
 
     device_type = get_device_type()
 
@@ -595,6 +670,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             device_type,
             weight_mode,
             act_func,
+            situ_beta1_cache_signature,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
             b_tensor.shape[2] if use_full_dynamic else tuple(b_tensor.shape),
@@ -626,6 +702,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -638,6 +715,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             device_type,
             weight_mode,
             act_func,
+            situ_beta1_cache_signature,
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
@@ -667,6 +745,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -705,10 +784,12 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
+                situ_beta1=situ_beta1,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
@@ -734,10 +815,12 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
+                situ_beta1=situ_beta1,
                 b_major=b_major,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
@@ -770,6 +853,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             geglu_alpha=geglu_alpha,
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
     else:
@@ -793,6 +878,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             geglu_alpha=geglu_alpha,
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
 
@@ -807,7 +894,25 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
 
 
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
-    from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+
+    call = replace(
+        call,
+        acc_dtype=_convert_to_cutlass_data_type(call.acc_dtype) if call.acc_dtype is not None else cutlass.Float32,
+        c_dtype=_convert_to_cutlass_data_type(call.c_dtype) if call.c_dtype is not None else cutlass.BFloat16,
+        d_dtype=_convert_to_cutlass_data_type(call.d_dtype) if call.d_dtype is not None else cutlass.BFloat16,
+        b_dtype=_convert_to_cutlass_data_type(call.b_dtype) if call.b_dtype is not None else None,
+    )
+
+    if call.act_func not in ("swiglu", "geglu", "situglu"):
+        raise ValueError(f"act_func must be 'swiglu', 'geglu', or 'situglu', got {call.act_func}")
+    if call.act_func == "situglu":
+        if not math.isfinite(call.situ_beta1) or call.situ_beta1 <= 0.0:
+            raise ValueError(f"situ_beta1 must be finite and positive, got {call.situ_beta1}")
+        if not math.isfinite(call.situ_beta2) or call.situ_beta2 <= 0.0:
+            raise ValueError(f"situ_beta2 must be finite and positive, got {call.situ_beta2}")
+        if get_device_type() == "rubin":
+            raise NotImplementedError("Rubin grouped GEMM GLU does not support situglu")
 
     is_dense = call.b_tensor is not None
     is_discrete = call.b_ptrs is not None
@@ -815,14 +920,16 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise ValueError("Provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs), not both")
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
-    if call.a_tensor.ndim != 3 or call.a_tensor.shape[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {tuple(call.a_tensor.shape)}")
+    a_shape = get_shape(call.a_tensor)
+    if len(a_shape) != 3 or a_shape[2] != 1:
+        raise ValueError(f"a_tensor must have shape (m, k, 1), got {a_shape}")
 
-    valid_m, k, _ = call.a_tensor.shape
+    valid_m, k, _ = a_shape
     if is_dense:
-        if call.b_tensor.ndim != 3:
-            raise ValueError(f"b_tensor must have shape (n, k, experts), got " f"{tuple(call.b_tensor.shape)}")
-        n_full, b_k, num_experts = call.b_tensor.shape
+        b_full_shape = get_shape(call.b_tensor)
+        if len(b_full_shape) != 3:
+            raise ValueError(f"b_tensor must have shape (n, k, experts), got " f"{b_full_shape}")
+        n_full, b_k, num_experts = b_full_shape
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
         defining_b_dtype = call.b_tensor.dtype
@@ -831,8 +938,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         if call.n is not None or call.b_dtype is not None:
             raise ValueError("Dense mode forbids n and b_dtype")
     else:
-        _require_pointer_tensor(call.b_ptrs, "b_ptrs")
-        num_experts = call.b_ptrs.numel()
+        num_experts = _validate_pointer_tensor(call.b_ptrs, "b_ptrs")
         if call.n is None or call.b_dtype is None:
             raise ValueError("n and b_dtype are required for discrete mode")
         n_full = call.n
@@ -850,6 +956,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
             ("sfb_ptrs", call.sfb_ptrs),
             ("norm_const_tensor", call.norm_const_tensor),
             ("sf_vec_size", call.sf_vec_size if call.sf_vec_size != 16 else None),
+            ("sf_fp8_dtype_override", call.sf_fp8_dtype_override),
             (
                 "discrete_col_sfd",
                 call.discrete_col_sfd if call.discrete_col_sfd else None,
@@ -867,7 +974,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
                 call.glu_clamp_min if call.glu_clamp_min != -7.0 else None,
             ),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
 
     linear_offset = call.linear_offset
@@ -891,32 +998,33 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if call.cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {call.cd_major}")
     if call.act_func not in ("swiglu", "geglu"):
-        raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {call.act_func}")
-    if call.c_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(f"c_dtype must be BF16, FP16, or FP32, got {call.c_dtype}")
-    if call.d_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(f"d_dtype must be BF16, FP16, or FP32, got {call.d_dtype}")
+        raise ValueError(f"BF16 act_func must be 'swiglu' or 'geglu'; situglu is block-scaled only, got {call.act_func}")
+    if normalized.c_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
+        raise ValueError(f"c_dtype must be BF16, FP16, or FP32, got {normalized.c_dtype}")
+    if normalized.d_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
+        raise ValueError(f"d_dtype must be BF16, FP16, or FP32, got {normalized.d_dtype}")
     if call.m_aligned != 256:
         raise ValueError(f"m_aligned must be 256, got {call.m_aligned}")
     if valid_m % 256 != 0:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {valid_m}")
     if n_full <= 0 or n_full % 64 != 0:
         raise ValueError(f"N must be positive and divisible by 64, got {n_full}")
-    if tuple(call.prob_tensor.shape) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got " f"{tuple(call.prob_tensor.shape)}")
-    if call.bias_tensor is not None and tuple(call.bias_tensor.shape) != (
+    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
+        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got " f"{get_shape(call.prob_tensor)}")
+    if call.bias_tensor is not None and get_shape(call.bias_tensor) != (
         n_full,
         num_experts,
     ):
-        raise ValueError(f"bias_tensor must have shape {(n_full, num_experts)}, got " f"{tuple(call.bias_tensor.shape)}")
+        raise ValueError(f"bias_tensor must have shape {(n_full, num_experts)}, got " f"{get_shape(call.bias_tensor)}")
     if is_discrete:
-        if call.b_ptrs.device != call.a_tensor.device:
-            raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({call.a_tensor.device}), got {call.b_ptrs.device}")
-        if call.b_ptrs.numel() != call.padded_offsets.numel():
-            raise ValueError(f"b_ptrs length mismatch: expected {call.padded_offsets.numel()}, " f"got {call.b_ptrs.numel()}")
-    if not torch.cuda.is_available():
+        if get_device(call.b_ptrs) != get_device(call.a_tensor):
+            raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({get_device(call.a_tensor)}), got {get_device(call.b_ptrs)}")
+        offsets_shape = get_shape(call.padded_offsets)
+        if len(offsets_shape) == 1 and num_experts != offsets_shape[0]:
+            raise ValueError(f"b_ptrs length mismatch: expected {offsets_shape[0]}, " f"got {num_experts}")
+    if not cuda_is_available():
         raise RuntimeError("CUDA is not available")
-    major, minor = torch.cuda.get_device_capability(call.a_tensor.device)
+    major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
     if compute_capability < 100:
         raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+, found SM{compute_capability}")
@@ -924,47 +1032,76 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
 
 
 def _glu_stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
+    strides = get_strides(tensor)
+    shape = get_shape(tensor)
     return tuple(
         index
         for index, _ in sorted(
-            enumerate(tensor.stride()),
-            key=lambda item: (item[1], tensor.shape[item[0]]),
+            enumerate(strides),
+            key=lambda item: (item[1], shape[item[0]]),
         )
     )
+
+
+def _glu_allocate_output(framework: str, shape: tuple, stride: tuple, dtype, device):
+    if framework == "torch":
+        import torch
+
+        return torch.empty_strided(shape, stride, dtype=framework_dtype(dtype, "torch"), device=device)
+    import jax
+    import jax.numpy as jnp
+
+    # n-major C-contiguous; the extent-1 batch dim's stride is unobservable.
+    # The kernel writes into this buffer on the launch stream; materialize it first.
+    return jax.block_until_ready(jnp.empty(shape, dtype=framework_dtype(dtype, "jax"), device=device))
+
+
+def _glu_operand_meta(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
+    """Everything the wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: a tensor's address is recycled by CPython
+    as soon as it is freed, so an id-keyed memo answers for tensors it never saw.
+    Data pointers are excluded because they vary per call and nothing derived here
+    depends on them -- their alignment is re-checked inside execute().
+    """
+    if tensor is None:
+        return None
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+# Operand-metadata key -> the BF16 path's derived result. One entry per distinct
+# (operand metadata, config), the same growth as _cache_of_GroupedGemmGluSm100Objects.
+_glu_wrapper_memo: dict = {}
 
 
 def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = False) -> tuple:
     if tensor is None:
         return (None, None, None, None)
-    shape = (None, *tuple(tensor.shape[1:])) if dynamic_m else tuple(tensor.shape)
+    device = get_device(tensor)
+    shape = (None, *get_shape(tensor)[1:]) if dynamic_m else get_shape(tensor)
     return (
         shape,
         _glu_stride_order(tensor),
-        tensor.dtype,
-        (tensor.device.type, tensor.device.index),
+        _convert_to_cutlass_data_type(tensor.dtype),
+        (device.type, device.index),
     )
 
 
-def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
-    valid_m, k, _ = call.a_tensor.shape
+def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None) -> TupleDict:
+    framework = detect_framework(call.a_tensor)
+    valid_m, k, _ = get_shape(call.a_tensor)
     if call.weight_mode == MoEWeightMode.DENSE:
-        n_full = call.b_tensor.shape[0]
+        n_full = get_shape(call.b_tensor)[0]
     else:
         n_full = call.n
     n_out = n_full // 2
 
-    c_tensor = torch.empty_strided(
-        (valid_m, n_full, 1),
-        (n_full, 1, valid_m * n_full),
-        dtype=call.c_dtype,
-        device=call.a_tensor.device,
-    )
-    d_tensor = torch.empty_strided(
-        (valid_m, n_out, 1),
-        (n_out, 1, valid_m * n_out),
-        dtype=call.d_dtype,
-        device=call.a_tensor.device,
-    )
+    def _allocate_output(shape, stride, dtype):
+        return _glu_allocate_output(framework, shape, stride, dtype, call.a_tensor.device)
+
+    c_tensor = _allocate_output((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), call.c_dtype)
+    d_tensor = _allocate_output((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), call.d_dtype)
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
@@ -982,16 +1119,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
         _glu_tensor_signature(call.bias_tensor),
         _glu_tensor_signature(call.padded_offsets),
         _glu_tensor_signature(call.prob_tensor, dynamic_m=True),
-        (
-            (
-                tuple(call.b_ptrs.shape),
-                tuple(call.b_ptrs.stride()),
-                call.b_ptrs.dtype,
-                (call.b_ptrs.device.type, call.b_ptrs.device.index),
-            )
-            if call.b_ptrs is not None
-            else None
-        ),
+        (_glu_tensor_signature(call.b_ptrs) if call.b_ptrs is not None else None),
         call.acc_dtype,
         call.c_dtype,
         call.d_dtype,
@@ -1003,7 +1131,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
         call.b_major,
         call.use_dynamic_sched,
         workspace_bytes,
-        (call.a_tensor.device.type, call.a_tensor.device.index),
+        ((get_device(call.a_tensor).type, get_device(call.a_tensor).index)),
         overlap_margin,
     )
 
@@ -1045,6 +1173,9 @@ def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
             raise RuntimeError("Unsupported BF16 configuration")
         api.compile()
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
+
+    if memo_key is not None:
+        _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
 
     api.execute(
         a_tensor=call.a_tensor,
@@ -1095,9 +1226,9 @@ def grouped_gemm_glu_wrapper_sm100(
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1110,12 +1241,110 @@ def grouped_gemm_glu_wrapper_sm100(
     geglu_alpha: float = 1.702,
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
     use_dynamic_sched: bool = False,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
     generate_c: bool = False,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU once from an immutable normalized call."""
+    # Hot-loop memo; see _operand_meta in the unfused API for the rationale. Everything
+    # from here to api.execute() is derivation -- dtype resolution, GluCall construction,
+    # normalization, and the op cache-key rebuild -- and is a pure function of the
+    # operands' metadata plus the scalar config, both of which are in the key below.
+    # A hit skips the derivation, never a check: api.execute() still validates every
+    # operand, including the data pointers the key deliberately omits. linear_offset is
+    # excluded on purpose (it is not part of the op cache key either) and passed through.
+    memo_key = (
+        type(a_tensor),
+        _glu_operand_meta(a_tensor),
+        _glu_operand_meta(sfa_tensor),
+        _glu_operand_meta(padded_offsets),
+        _glu_operand_meta(alpha_tensor),
+        _glu_operand_meta(b_tensor),
+        _glu_operand_meta(sfb_tensor),
+        _glu_operand_meta(bias_tensor),
+        _glu_operand_meta(b_ptrs),
+        _glu_operand_meta(sfb_ptrs),
+        _glu_operand_meta(norm_const_tensor),
+        _glu_operand_meta(prob_tensor),
+        n,
+        b_dtype,
+        b_major,
+        acc_dtype,
+        c_dtype,
+        d_dtype,
+        cd_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        sf_vec_size,
+        sf_fp8_dtype_override,
+        vector_f32,
+        m_aligned,
+        discrete_col_sfd,
+        act_func,
+        geglu_alpha,
+        glu_clamp_max,
+        glu_clamp_min,
+        situ_beta1,
+        situ_beta2,
+        use_dynamic_sched,
+        use_single_group_runtime_offsets,
+        generate_c,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _glu_wrapper_memo.get(memo_key)
+    if memo is not None:
+        api, framework, valid_m, n_full, n_out, memo_c_dtype, memo_d_dtype = memo
+        c_out = _glu_allocate_output(framework, (valid_m, n_full, 1), (n_full, 1, valid_m * n_full), memo_c_dtype, a_tensor.device)
+        d_out = _glu_allocate_output(framework, (valid_m, n_out, 1), (n_out, 1, valid_m * n_out), memo_d_dtype, a_tensor.device)
+        api.execute(
+            a_tensor=a_tensor,
+            c_tensor=c_out,
+            d_tensor=d_out,
+            sfa_tensor=None,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=None,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=None,
+            d_col_tensor=None,
+            sfd_row_tensor=None,
+            sfd_col_tensor=None,
+            amax_tensor=None,
+            norm_const_tensor=None,
+            prob_tensor=prob_tensor,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            current_stream=current_stream,
+        )
+        return TupleDict(
+            c_tensor=c_out if generate_c else None,
+            d_tensor=d_out,
+            d_col_tensor=None,
+            amax_tensor=None,
+            sfd_row_tensor=None,
+            sfd_col_tensor=None,
+        )
+
+    framework = detect_framework(a_tensor)
+    if framework not in ("torch", "jax"):
+        raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_glu_wrapper_sm100; pass torch tensors or JAX arrays")
+    if framework == "jax":
+        if b_tensor is not None:
+            raise ValueError(_JAX_DENSE_B_ERROR)
+        if bias_tensor is not None:
+            raise ValueError(_JAX_BIAS_ERROR)
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
+    c_dtype = _convert_to_cutlass_data_type(c_dtype) if c_dtype is not None else cutlass.BFloat16
+    d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
+    b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
     _reject_unsupported_rubin_glu_tune_params(
         get_device_type() == "rubin",
         geglu_alpha,
@@ -1144,6 +1373,7 @@ def grouped_gemm_glu_wrapper_sm100(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=vector_f32,
         m_aligned=m_aligned,
         discrete_col_sfd=discrete_col_sfd,
@@ -1152,6 +1382,8 @@ def grouped_gemm_glu_wrapper_sm100(
         geglu_alpha=geglu_alpha,
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
         use_dynamic_sched=use_dynamic_sched,
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
@@ -1159,7 +1391,9 @@ def grouped_gemm_glu_wrapper_sm100(
     )
     call, backend = _normalize_glu_call(call)
     if backend is GroupedGemmBackend.BF16:
-        return _grouped_gemm_glu_bf16_call(call)
+        return _grouped_gemm_glu_bf16_call(call, memo_key)
+    if framework == "jax":
+        raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_glu_block_scaled_call(call)
 
 

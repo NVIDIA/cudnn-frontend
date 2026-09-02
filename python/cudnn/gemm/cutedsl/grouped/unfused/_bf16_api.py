@@ -3,11 +3,12 @@
 
 """Private APIBase API for the source-close unfused BF16 MoE kernel."""
 
+from __future__ import annotations
+
 import os
 import weakref
 from typing import Optional, Tuple
 
-import torch
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -16,12 +17,69 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+from cudnn.tensor_adapter import (
+    allocate_byte_workspace,
+    canonicalize_unit_dim_strides,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    get_compute_capability,
+    get_data_ptr,
+    get_device,
+    get_shape,
+    get_strides,
+    get_version,
+    is_torch_tensor,
+    to_host_list,
+)
 
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
 
-_OUTPUT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+
+def _output_dtypes():
+    return [cutlass.BFloat16, cutlass.Float16, cutlass.Float32]
+
+
+def _validate_pointer_tensor(ptrs, name: str, expected_len: int | None = None) -> int:
+    """Framework-neutral check of a device pointer-array tensor; returns the pointer count.
+
+    torch: a contiguous 1-D CUDA int64 tensor (unchanged contract). JAX: a 1-D int64
+    array (requires jax x64 mode) or, since JAX truncates int64 without x64 mode, a
+    1-D uint8 array of length 8*count holding the packed little-endian pointers.
+    """
+    import math
+
+    shape = get_shape(ptrs)
+    if len(shape) != 1:
+        raise ValueError(f"{name} must be 1-D, got shape={shape}")
+    numel = math.prod(shape)
+    dtype = _convert_to_cutlass_data_type(ptrs.dtype)
+    if dtype is cutlass.Int64:
+        count = numel
+    elif dtype is cutlass.Uint8 and not is_torch_tensor(ptrs):
+        if numel % 8 != 0:
+            raise ValueError(f"{name} packed uint8 length must be a multiple of 8, got {numel}")
+        count = numel // 8
+    else:
+        raise ValueError(f"{name} must be int64 (or, for JAX without x64 mode, packed uint8), got {ptrs.dtype}")
+    if expected_len is not None and count != expected_len:
+        raise ValueError(f"{name} length mismatch: expected {expected_len}, got {count}")
+    if is_torch_tensor(ptrs):
+        if not ptrs.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got device={ptrs.device}")
+        if not ptrs.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    return count
+
+
+def _pointer_values(ptrs) -> tuple:
+    """Host copy of the pointer values, decoding the packed-uint8 JAX form if needed."""
+    if not is_torch_tensor(ptrs) and _convert_to_cutlass_data_type(ptrs.dtype) is cutlass.Uint8:
+        import numpy as np
+
+        return tuple(int(v) for v in np.asarray(ptrs).view(np.int64))
+    return tuple(int(v) for v in to_host_list(ptrs))
 
 
 class GroupedGemmBf16API(APIBase):
@@ -40,7 +98,7 @@ class GroupedGemmBf16API(APIBase):
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
@@ -49,8 +107,11 @@ class GroupedGemmBf16API(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
     ) -> None:
+        if acc_dtype is None:
+            acc_dtype = cutlass.Float32
         super().__init__()
         self._warn_experimental_api()
+        self._framework = detect_framework(sample_a)
 
         if sample_b is not None and num_experts is None:
             self.weight_mode = MoEWeightMode.DENSE
@@ -61,19 +122,23 @@ class GroupedGemmBf16API(APIBase):
         else:
             raise ValueError("Provide sample_b for dense mode or (num_experts, b_shape, b_dtype) " "for discrete mode, but not both")
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
-        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
-        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
+        # A canonical TensorDesc is rebuilt and re-checked for every operand on every
+        # launch, which is the largest single cost in execute(). See _validate_live_tensor.
+        self._live_desc_cache: dict = {}
+        self._launch_stream_cache: dict = {}
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
+        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d", canonical=True)
+        self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets", canonical=True)
+        self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha", canonical=True)
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
+        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
         self._sample_offset_values = self._copy_values_to_host(sample_padded_offsets)
         self._sample_offsets_ref = weakref.ref(sample_padded_offsets)
-        self._sample_offsets_version = int(sample_padded_offsets._version)
+        self._sample_offsets_version = get_version(sample_padded_offsets)
         self._sample_data_ptrs = {
-            name: tensor.data_ptr()
+            name: get_data_ptr(tensor)
             for name, tensor in (
                 ("sample_a", sample_a),
                 ("sample_b", sample_b),
@@ -89,8 +154,8 @@ class GroupedGemmBf16API(APIBase):
 
         self.expert_cnt = self.b_desc.shape[2] if self.weight_mode == MoEWeightMode.DENSE and self.b_desc.ndim == 3 else int(num_experts or 0)
         self.b_shape = tuple(b_shape) if b_shape is not None else None
-        self.b_dtype = b_dtype if b_dtype is not None else self.b_desc.dtype
-        self.acc_dtype = acc_dtype
+        self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = tuple(mma_tiler_mn)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
@@ -102,7 +167,8 @@ class GroupedGemmBf16API(APIBase):
         self._has_bias = self.bias_desc is not None
         self._kernel = MoEGroupedGemmBf16Kernel
         self._workspace: Optional[torch.Tensor] = None
-        self._compile_b_ptrs: Optional[torch.Tensor] = None
+        self._live_b_ptrs = None
+        self._compile_b_ptrs = None
         self._validated_offsets: dict[int, tuple] = {}
         self._validated_pointer_values: dict[int, tuple] = {}
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -124,12 +190,12 @@ class GroupedGemmBf16API(APIBase):
 
     @staticmethod
     def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in tensor.detach().cpu().tolist())
+        return tuple(int(value) for value in to_host_list(tensor))
 
     @staticmethod
     def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
         cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == int(tensor._version) and cached[2] == extra)
+        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
 
     @staticmethod
     def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
@@ -140,7 +206,7 @@ class GroupedGemmBf16API(APIBase):
 
         cache[key] = (
             weakref.ref(tensor, discard),
-            int(tensor._version),
+            get_version(tensor),
             extra,
         )
 
@@ -155,7 +221,7 @@ class GroupedGemmBf16API(APIBase):
     def _validate_pointer_values_once(self, b_ptrs: torch.Tensor) -> None:
         if self._is_validation_cached(self._validated_pointer_values, b_ptrs, self.expert_cnt):
             return
-        pointer_values = self._copy_values_to_host(b_ptrs)
+        pointer_values = _pointer_values(b_ptrs)
         if any(value == 0 or value % 16 != 0 for value in pointer_values):
             raise ValueError("b_ptrs entries must be non-null and 16-byte aligned")
         self._remember_validation(self._validated_pointer_values, b_ptrs, self.expert_cnt)
@@ -176,25 +242,39 @@ class GroupedGemmBf16API(APIBase):
 
     @staticmethod
     def _validate_data_alignment(tensor: torch.Tensor, name: str) -> None:
-        if tensor.data_ptr() % 16 != 0:
+        if get_data_ptr(tensor) % 16 != 0:
             raise ValueError(f"{name} data pointer must be 16-byte aligned")
 
     @staticmethod
     def _validate_pointer_array_alignment(tensor: torch.Tensor) -> None:
-        if tensor.data_ptr() % 8 != 0:
+        if get_data_ptr(tensor) % 8 != 0:
             raise ValueError("b_ptrs data pointer must be 8-byte aligned")
 
-    @staticmethod
-    def _record_pointer_stream(b_ptrs: torch.Tensor, current_stream: cuda.CUstream) -> None:
-        handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(b_ptrs.device)
-        torch_default = torch.cuda.default_stream(b_ptrs.device)
-        if handle == torch_current.cuda_stream:
-            launch_stream = torch_current
-        elif handle == torch_default.cuda_stream:
-            launch_stream = torch_default
-        else:
-            launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+    def _record_pointer_stream(self, b_ptrs: torch.Tensor, current_stream: cuda.CUstream) -> None:
+        if not is_torch_tensor(b_ptrs):
+            # No record_stream equivalent for immutable frameworks (e.g. JAX): keep the
+            # array referenced until the next execute so its buffer outlives the launch.
+            self._live_b_ptrs = b_ptrs
+            return
+        import torch
+
+        # record_stream only ever reads launch_stream.cuda_stream, which equals the handle
+        # we keyed on, so any Stream object wrapping that handle behaves identically here
+        # -- that is what makes caching by (device, handle) safe even though which branch
+        # produced it can change. Without it every launch pays two torch stream queries.
+        key = (b_ptrs.device, int(current_stream))
+        launch_stream = self._launch_stream_cache.get(key)
+        if launch_stream is None:
+            handle = int(current_stream)
+            torch_current = torch.cuda.current_stream(b_ptrs.device)
+            torch_default = torch.cuda.default_stream(b_ptrs.device)
+            if handle == torch_current.cuda_stream:
+                launch_stream = torch_current
+            elif handle == torch_default.cuda_stream:
+                launch_stream = torch_default
+            else:
+                launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+            self._launch_stream_cache[key] = launch_stream
         b_ptrs.record_stream(launch_stream)
 
     def check_support(self) -> bool:
@@ -235,17 +315,17 @@ class GroupedGemmBf16API(APIBase):
         self._expect_stride(self.d_desc, (n, 1, tensor_m * n), "sample_d")
         self._expect_stride(self.padded_offsets_desc, (1,), "sample_padded_offsets")
         self._expect_stride(self.alpha_desc, (1,), "sample_alpha")
-        self._expect_stride(self.prob_desc, (1, 1, 1), "sample_prob")
+        self._expect_stride(self.prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "sample_prob")
 
-        self._check_dtype(self.a_desc, torch.bfloat16, "sample_a")
+        self._check_dtype(self.a_desc, cutlass.BFloat16, "sample_a")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_dtype(self.b_desc, torch.bfloat16, "sample_b")
-        self._check_dtype(self.b_dtype, torch.bfloat16, "b_dtype")
-        self._check_dtype(self.c_desc, _OUTPUT_DTYPES, "sample_c")
-        self._check_dtype(self.d_desc, _OUTPUT_DTYPES, "sample_d")
-        self._check_dtype(self.padded_offsets_desc, torch.int32, "sample_padded_offsets")
-        self._check_dtype(self.alpha_desc, torch.float32, "sample_alpha")
-        self._check_dtype(self.prob_desc, torch.float32, "sample_prob")
+            self._check_dtype(self.b_desc, cutlass.BFloat16, "sample_b")
+        self._check_dtype(self.b_dtype, cutlass.BFloat16, "b_dtype")
+        self._check_dtype(self.c_desc, _output_dtypes(), "sample_c")
+        self._check_dtype(self.d_desc, _output_dtypes(), "sample_d")
+        self._check_dtype(self.padded_offsets_desc, cutlass.Int32, "sample_padded_offsets")
+        self._check_dtype(self.alpha_desc, cutlass.Float32, "sample_alpha")
+        self._check_dtype(self.prob_desc, cutlass.Float32, "sample_prob")
 
         device = self.a_desc.device
         for desc, name in (
@@ -262,14 +342,14 @@ class GroupedGemmBf16API(APIBase):
         if self.bias_desc is not None:
             self._expect_shape(self.bias_desc, (n, self.expert_cnt), "sample_bias")
             self._expect_stride(self.bias_desc, (1, n), "sample_bias")
-            self._check_dtype(self.bias_desc, _OUTPUT_DTYPES, "sample_bias")
+            self._check_dtype(self.bias_desc, _output_dtypes(), "sample_bias")
             self._expect_device(self.bias_desc, device, "sample_bias")
 
         for name, data_ptr in self._sample_data_ptrs.items():
             if data_ptr % 16 != 0:
                 raise ValueError(f"{name} data pointer must be 16-byte aligned")
 
-        if self.acc_dtype != torch.float32:
+        if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
         if self.m_aligned != MoEGroupedGemmBf16Kernel.FIX_PAD_SIZE:
             raise ValueError(f"m_aligned must be 256, got {self.m_aligned}")
@@ -286,7 +366,7 @@ class GroupedGemmBf16API(APIBase):
             tensor_m=tensor_m,
         )
         sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and int(sample_offsets._version) == self._sample_offsets_version:
+        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
             self._remember_validation(
                 self._validated_offsets,
                 sample_offsets,
@@ -296,7 +376,7 @@ class GroupedGemmBf16API(APIBase):
             self._validate_offsets_once(sample_offsets, tensor_m=tensor_m)
 
         if not self._kernel.can_implement(
-            _convert_to_cutlass_data_type(torch.bfloat16),
+            cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.c_desc.dtype),
             _convert_to_cutlass_data_type(self.d_desc.dtype),
             _convert_to_cutlass_data_type(self.acc_dtype),
@@ -314,12 +394,12 @@ class GroupedGemmBf16API(APIBase):
         ):
             raise ValueError("Unsupported BF16 grouped GEMM tile, cluster, alignment, or layout configuration")
 
-        if not torch.cuda.is_available():
+        if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
-        major, minor = torch.cuda.get_device_capability(self.a_desc.device)
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability} " f"on {self.a_desc.device}")
+            raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
 
         self._is_supported = True
         return True
@@ -348,8 +428,10 @@ class GroupedGemmBf16API(APIBase):
             raise ValueError("max_active_clusters must be > 0 after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
 
         workspace_bytes = kernel.get_workspace_bytes()
-        self._workspace = torch.empty(max(workspace_bytes, 1), dtype=torch.uint8, device=self.a_desc.device)
-        if self._workspace.data_ptr() % 128 != 0:
+        # Internal scratch in the caller's framework allocator; kernels write through its
+        # raw pointer and it is never surfaced as a framework array.
+        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
+        if get_data_ptr(self._workspace) % 128 != 0:
             raise RuntimeError("workspace allocation must be 128-byte aligned")
         workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
@@ -388,9 +470,14 @@ class GroupedGemmBf16API(APIBase):
             k_value = cutlass.Int32(0)
             b_stride = cutlass.Int64(0)
         else:
-            self._compile_b_ptrs = torch.empty((self.expert_cnt,), dtype=torch.int64, device=self.a_desc.device)
+            # Compile-time placeholder for the pointer-array argument: real device bytes
+            # (fake tensors have dummy iterators) allocated in the caller's framework,
+            # retyped to Int64 via the element_type override.
+            self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
             self._validate_pointer_array_alignment(self._compile_b_ptrs)
-            b_fake = from_dlpack(self._compile_b_ptrs, assumed_align=8).iterator
+            placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
+            placeholder.element_type = cutlass.Int64
+            b_fake = placeholder.iterator
             n, k = self.b_shape[:2]
             n_value = cutlass.Int32(n)
             k_value = cutlass.Int32(k)
@@ -432,7 +519,7 @@ class GroupedGemmBf16API(APIBase):
             prob_tensor: torch.Tensor,
             stream: cuda.CUstream,
         ) -> None:
-            b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(b_ptrs.data_ptr())
+            b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
             raw_compiled(
                 a_tensor,
                 b_arg,
@@ -459,7 +546,15 @@ class GroupedGemmBf16API(APIBase):
         *,
         dynamic_m: bool = False,
     ) -> TensorDesc:
-        desc = self._make_tensor_desc(tensor, name=name)
+        # The outcome of this check is decided entirely by (shape, stride, dtype, device),
+        # so memoize on exactly that. An operand differing in any of them takes a different
+        # key, misses, and is checked in full; nothing is skipped on the strength of a
+        # tensor's identity. Data-pointer alignment is checked by the caller, not here.
+        key = (name, dynamic_m, get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+        hit = self._live_desc_cache.get(key)
+        if hit is not None:
+            return hit
+        desc = self._make_tensor_desc(tensor, name=name, canonical=True)
         if desc.dtype != sample.dtype:
             raise ValueError(f"{name} dtype mismatch: expected {sample.dtype}, got {desc.dtype}")
         if desc.device != sample.device:
@@ -471,6 +566,7 @@ class GroupedGemmBf16API(APIBase):
                 raise ValueError(f"{name} layout mismatch: expected stride order {sample.stride_order}, " f"got {desc.stride_order}")
         elif desc.shape != sample.shape or desc.stride != sample.stride:
             raise ValueError(f"{name} descriptor mismatch: expected shape/stride " f"{sample.shape}/{sample.stride}, got {desc.shape}/{desc.stride}")
+        self._live_desc_cache[key] = desc
         return desc
 
     def execute(
@@ -486,7 +582,10 @@ class GroupedGemmBf16API(APIBase):
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
         if prob_tensor is None:
@@ -509,7 +608,7 @@ class GroupedGemmBf16API(APIBase):
         self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
         self._expect_stride(c_desc, (n, 1, tensor_m * n), "c_tensor")
         self._expect_stride(d_desc, (n, 1, tensor_m * n), "d_tensor")
-        self._expect_stride(prob_desc, (1, 1, 1), "prob_tensor")
+        self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
         self._validate_offsets_once(padded_offsets, tensor_m=tensor_m)
 
         for tensor, name in (
@@ -538,9 +637,9 @@ class GroupedGemmBf16API(APIBase):
         else:
             if b_tensor is not None or b_ptrs is None:
                 raise ValueError("Discrete execution requires b_ptrs and forbids b_tensor")
-            _require_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
-            if b_ptrs.device != self.a_desc.device:
-                raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {b_ptrs.device}")
+            _validate_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
+            if get_device(b_ptrs) != self.a_desc.device:
+                raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {get_device(b_ptrs)}")
             self._validate_pointer_array_alignment(b_ptrs)
             self._validate_pointer_values_once(b_ptrs)
             self._record_pointer_stream(b_ptrs, current_stream)

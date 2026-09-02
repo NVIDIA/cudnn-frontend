@@ -23,19 +23,9 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
-
-def _is_sm100() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return (major, minor) == (10, 0)
-
-
-pytestmark = pytest.mark.skipif(
-    not _is_sm100(),
-    reason="SM100 DSL SDPA engine requires an SM100 (Blackwell) device.",
-)
+pytestmark = requires_pre_rubin_blackwell
 
 # ~0.5-1 s of spin: long enough that an unordered kernel launch on the
 # default stream reliably overtakes the side-stream mutation.

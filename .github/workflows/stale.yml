@@ -1,0 +1,33 @@
+name: Mark and close stale PRs
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  # PR labels and comments go through the issues API
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          # PRs only — leave issues untouched
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 21
+          days-before-pr-close: 21
+          stale-pr-label: stale
+          close-pr-label: closed-stale
+          stale-pr-message: >
+            This PR has been inactive for 3 weeks and is now marked stale.
+            It will be closed in 3 more weeks unless there is new activity
+            (a comment, a push, or removal of the stale label).
+          close-pr-message: >
+            Closing this PR after 6 weeks of inactivity. Feel free to reopen
+            or open a new PR when you're ready to continue.
+          remove-stale-when-updated: true

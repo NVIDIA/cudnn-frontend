@@ -105,13 +105,16 @@ GROUPED_GEMM_QUANT_PARAM_MARKS_FP4 = [
             (1, 1),
         ],
     ),
-    pytest.mark.parametrize("sf_vec_size", [16, 32]),
     pytest.mark.parametrize(
-        "sf_dtype",
+        "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
         [
-            torch.float8_e8m0fnu,
-            torch.float8_e4m3fn,
+            (16, torch.float8_e8m0fnu, None),
+            (16, torch.float8_e4m3fn, None),
+            (32, torch.float8_e8m0fnu, None),
+            (32, torch.float8_e4m3fn, None),
+            (16, torch.float8_e4m3fn, "e5m3"),
         ],
+        ids=["v16_e8m0", "v16_e4m3", "v32_e8m0", "v32_e4m3", "v16_e5m3"],
     ),
     pytest.mark.parametrize("vector_f32", [True, False]),
     pytest.mark.parametrize("discrete_col_sfd", [False]),
@@ -346,7 +349,10 @@ def run_grouped_gemm_quant_ref(
         start = 0
         for i, group_m in enumerate(aligned_group_m_list):
             end = start + group_m
-            amax_ref[i] = compute_reference_amax(ref[start:end, :, 0].clone())
+            if group_m == 0:
+                amax_ref[i] = float("-inf")
+            else:
+                amax_ref[i] = compute_reference_amax(ref[start:end, :, 0].clone())
             start = end
         ref_tensors["amax_ref"] = amax_ref
 

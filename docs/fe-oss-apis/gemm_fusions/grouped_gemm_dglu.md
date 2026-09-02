@@ -2,11 +2,17 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Unified Grouped GEMM + dGLU fusion**: one public class and wrapper select a
 plain BF16 or legacy block-scaled grouped GEMM fused with a dGLU backward
-epilogue (dSwiGLU or dGeGLU) on NVIDIA Blackwell GPUs (SM100+). The operation
+epilogue (dSwiGLU, dGeGLU, or block-scaled dSiTU-GLU) on NVIDIA Blackwell GPUs (SM100+). The operation
 is implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
@@ -16,6 +22,7 @@ This is a **unified API** that supports both weight layout modes:
 And both backward activation functions:
 - **dSwiGLU**: `act_func="dswiglu"` (default)
 - **dGeGLU**: `act_func="dgeglu"`
+- **dSiTU-GLU**: `act_func="dsituglu"` (block-scaled SM100/SM103 only)
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
@@ -28,6 +35,7 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
+`dsituglu` is not available on the BF16 or Rubin backends.
 
 ## BF16 contract
 
@@ -118,6 +126,32 @@ The block-scaled backend performs:
 ### Shapes
 
 ### Equations
+
+For dSiTU-GLU, define
+
+$$
+T_g=\beta_1\tanh(G/\beta_1)\sigma(G),\qquad
+T_u=\beta_2\tanh(U/\beta_2).
+$$
+
+The fused backward computes
+
+$$
+\frac{\partial T_g}{\partial G}=
+(1-\tanh^2(G/\beta_1))\sigma(G)+
+\beta_1\tanh(G/\beta_1)\sigma(G)(1-\sigma(G)),
+$$
+
+$$
+\frac{\partial T_u}{\partial U}=1-\tanh^2(U/\beta_2),
+$$
+
+and returns `ref * prob * T_u * dT_g/dG` and
+`ref * prob * T_g * dT_u/dU`. `dprob` accumulates the reduction of
+`ref * T_g * T_u` across the output columns in 32-column chunks, producing
+shape `(valid_m, 1, 1)`.
+The beta values are compile-time specialization values and therefore belong to
+the dGLU compiled-kernel cache key.
 
 - **Inputs**
   - `A`: contiguous activation tensor across all groups, shape `(valid_m, K, 1)`
@@ -486,10 +520,14 @@ Providing both or neither raises `ValueError`.
   - `TILE_N = 256`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
-- `vector_f32`: Enable packed f32 operations. Default: `False`
+- `vector_f32`: Enable packed f32 operations for dSwiGLU and dGeGLU. Default:
+  `False`. K3-default dSiTU-GLU (`situ_beta1=4.0`) always uses its packed FP32x2
+  specialization; non-default dSiTU-GLU uses scalar FP32.
 - `m_aligned`: Must be `256`. Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
-- `act_func`: Backward activation function. `"dswiglu"` (default) or `"dgeglu"`
+- `act_func`: Backward activation function. `"dswiglu"` (default), `"dgeglu"`, or block-scaled `"dsituglu"`
+- `situ_beta1`: Positive finite gate tanh scale for dSiTU-GLU. Default: `4.0`
+- `situ_beta2`: Positive finite up-branch tanh scale for dSiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
 - `epilogue_op`: Optional post-processing. `None` (default), `"identity"`, `"relu"`, or `"srelu"`
 

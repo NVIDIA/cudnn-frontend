@@ -131,7 +131,7 @@ class Tensor_attributes {
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
     int64_t ragged_offset_multiplier = 1;
-    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t alignment                = default_alignment;
     int64_t vector_count             = 1;   // Default to 1 (no vectorization)
     int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
@@ -412,6 +412,9 @@ class Tensor_attributes {
         reordering_type = value;
         return *this;
     }
+
+    // Pointer alignment assumed by the backend when selecting engines, in bytes.
+    static constexpr int64_t default_alignment = 16;
 
     int64_t
     get_alignment() const {
@@ -2001,6 +2004,16 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
     std::optional<int> max_seq_len_kv;
+
+    // Packed (ragged) token totals, mirroring SDPA_backward_attributes. A
+    // frontend-side hint only: never lowered to a backend attribute. Ragged
+    // layouts describe extents as (B, H, S_max, D) plus a device ragged-offset
+    // tensor, so the packed total is not otherwise expressible -- consumers
+    // that must bound the token axis have to infer it from buffer geometry
+    // instead. See docs/operations/Attention.md.
+    std::optional<int64_t> max_total_seq_len_q;
+    std::optional<int64_t> max_total_seq_len_kv;
+
     AttentionScoreModifier_t attention_score_modifier = nullptr;
     DataType_t mma_core_mode                          = DataType_t::NOT_SET;
 
@@ -2080,6 +2093,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    dropout_probability,
                                    attn_scale_value,
                                    max_seq_len_kv,
+                                   max_total_seq_len_q,
+                                   max_total_seq_len_kv,
                                    mma_core_mode,
                                    left_bound,
                                    right_bound,
@@ -2118,6 +2133,21 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_attn_scale(float const value) {
         attn_scale_value = value;
+        return *this;
+    }
+
+    // Packed token total of the ragged Q (and O/Stats, which share its token
+    // axis). Only meaningful on a ragged/packed layout; ignored otherwise.
+    SDPA_attributes&
+    set_max_total_seq_len_q(int64_t const value) {
+        max_total_seq_len_q = value;
+        return *this;
+    }
+
+    // Packed token total of the ragged K/V.
+    SDPA_attributes&
+    set_max_total_seq_len_kv(int64_t const value) {
+        max_total_seq_len_kv = value;
         return *this;
     }
 

@@ -9,7 +9,8 @@ head_dim {128, 512} (16 kernels) — then runs ``ptxas -v`` on each kernel's PTX
 prints a table of registers / spill bytes / stack bytes / ex2.approx count. This
 reproduces the register table published in docs/fe-oss-apis/csa.md.
 
-Exits nonzero if any kernel spills, uses stack, or fails ptxas.
+Exits nonzero if any kernel spills, uses stack, fails ptxas, or exposes no PTX
+(PTX retention off).
 
 Requires a CC 10.0 GPU (the JIT needs a device), ``ptxas`` on PATH, and the
 ``cudnn[cutedsl]`` install. Not collected by pytest. Run, e.g.::
@@ -25,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 
-os.environ.setdefault("CUTE_DSL_KEEP", "ptx")  # keep PTX artifacts on the compiled handles
+os.environ.setdefault("CUTE_DSL_KEEP", "ptx")  # PTX retention: exposes each kernel's PTX via the handle's __ptx__ property
 
 import torch  # noqa: E402
 
@@ -73,23 +74,35 @@ def main():
 
     all_clean = True
     n = 0
+    n_skipped = 0
     for key, fn in sorted(M._COMPILED.items(), key=str):
         kind, _ratio, d, coff, sched, _dev = key
         if kind == "r128fwd":
             vec, tchunks, threads_x, twophase, fastexp = sched
             tag = f"fwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_2ph" if twophase else "") + ("_fexp" if fastexp else "")
         else:
-            vec, tchunks, threads_x, fastexp = sched
-            tag = f"bwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_fexp" if fastexp else "")
-        all_clean = ptxas_one(tag, fn.artifacts.PTX, args.arch, out_dir) and all_clean
+            vec, tchunks, threads_x, fastexp, goreuse = sched
+            tag = f"bwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_fexp" if fastexp else "") + ("_gor" if goreuse else "")
+        # __ptx__ is the DSL's documented PTX accessor (a JitCompiledFunction
+        # property); it is None when PTX retention is off, and can be a stale dump
+        # path (no newline) if the dump file vanished before the handle read it.
+        ptx = fn.__ptx__
+        if not ptx or "\n" not in ptx:
+            print(f"{tag:36} SKIPPED: no PTX retained on the compiled handle (need CUTE_DSL_KEEP=ptx)", flush=True)
+            n_skipped += 1
+            continue
+        all_clean = ptxas_one(tag, ptx, args.arch, out_dir) and all_clean
         n += 1
-    print(f"{n} kernels probed ({args.arch}); {'ALL 0 spill / 0 stack' if all_clean else 'SPILL/STACK OR PTXAS FAILURE DETECTED'}", flush=True)
+    verdict = "ALL 0 spill / 0 stack" if all_clean else "SPILL/STACK OR PTXAS FAILURE DETECTED"
+    if n_skipped:
+        verdict += f"; {n_skipped} kernel(s) skipped with no PTX -- nothing verified for them"
+    print(f"{n} kernels probed ({args.arch}); {verdict}", flush=True)
     if args.keep_ptx:
         print(f"PTX kept in {out_dir}", flush=True)
     else:
         os.chdir(tempfile.gettempdir())
         shutil.rmtree(out_dir, ignore_errors=True)
-    sys.exit(0 if all_clean else 1)
+    sys.exit(0 if all_clean and not n_skipped else 1)
 
 
 if __name__ == "__main__":
