@@ -32,6 +32,7 @@ from .fusion_ir import (
     ReductionSpec,
     TensorRef,
     gemm_source,
+    segmented_row_scale_capacity_rows,
 )
 
 # Dtype + op tables
@@ -648,6 +649,7 @@ def _collect_quants(
     N: int,
     err_ctx: str,
     fto_id: int | None = None,
+    num_groups: int | None = None,
 ) -> tuple[list[BlockQuantizeSpec], list["_RecordedOp"], list[Dtype], list[Any]]:
     """Fold every reachable ``block_scale_quantize`` whose data output is
     materialized into a :class:`BlockQuantizeSpec`. Returns (specs, recorded
@@ -685,12 +687,6 @@ def _collect_quants(
         if qop.group_offset is not None:
             if fto_id is None or qop.group_offset != fto_id:
                 raise ValueError(f"block_scale_quantize {qop.op_name!r} groupOffset must be the MoE " "first_token_offset tensor")
-            if axis != 1:
-                raise ValueError(
-                    f"block_scale_quantize {qop.op_name!r} with groupOffset supports only "
-                    "the M axis (axis=1, col quant); row scales are already per-group "
-                    "contiguous in the global layout"
-                )
             if scale_reorder != "F8_128x4":
                 raise ValueError(f"block_scale_quantize {qop.op_name!r} with groupOffset requires " "F8_128x4 scale reordering")
             grouped_by_moe = True
@@ -724,7 +720,33 @@ def _collect_quants(
             scale_dim = expected_scale_dim
         if len(scale_dim) != 3:
             raise ValueError(f"block_scale_quantize scale output must be rank-3; got {scale_dim}")
-        if tuple(scale_dim) != expected_scale_dim:
+        grouped_row = grouped_by_moe and axis != 1
+        if grouped_row:
+            # Runtime fto values live on device. Size for the exact worst-case
+            # partition at graph time rather than synchronizing fto or relying
+            # on an execute-time caller precondition.
+            if num_groups is None:
+                raise AssertionError("grouped row block quantize recorded without a MoE group count")
+            if qop.scale_output not in _TENSOR_DIM_OVERRIDE:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale output " "requires an explicit scale dim [1, segmented_rows, padded_N_blocks]"
+                )
+            padded_n_blocks = _round_up(int(N) // bs, 4)
+            required_rows = segmented_row_scale_capacity_rows(int(M), num_groups)
+            if int(batch) != 1 or int(scale_dim[0]) != 1:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scales require " f"batch=1 and scale_dim[0]=1; got batch={batch}, scale_dim={scale_dim}"
+                )
+            if int(scale_dim[1]) < required_rows or int(scale_dim[1]) % 128:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale_dim[1] "
+                    f"must be a 128-row-aligned static worst-case capacity >= {required_rows}; got {scale_dim[1]}"
+                )
+            if int(scale_dim[2]) != padded_n_blocks:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale_dim[2] " f"must be padded N/block_size = {padded_n_blocks}; got {scale_dim[2]}"
+                )
+        elif tuple(scale_dim) != expected_scale_dim:
             raise ValueError(f"block_scale_quantize scale dim must be {expected_scale_dim}; got {scale_dim}")
         compute = qop.compute_dtype if qop.compute_dtype is not None else compute_dtype
         quants.append(
@@ -1124,6 +1146,7 @@ def _build_multi_moe_chain(
         N,
         "multi-MoE",
         fto_id=fto_id,
+        num_groups=num_groups,
     )
 
     # Dense outputs in plain recorder (set_output) order — no output position

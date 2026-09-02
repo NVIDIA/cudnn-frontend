@@ -58,7 +58,12 @@ from .dtypes import (
     tensor_alignment,
 )
 from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
-from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
+from .fusion_ir import (
+    ZERO_PRESERVING_OPS,
+    FusionChain,
+    TensorRef,
+    segmented_row_scale_capacity_rows,
+)
 from .recipe import (
     CONST,
     FROM_M,
@@ -799,10 +804,9 @@ def _render_tile_constants(
         # SMEM extent) to be a whole number of swizzle groups.
         mn_slice = mn_extent // num_mma
         if mn_slice < mn_group_elems or mn_slice % mn_group_elems != 0:
+            what = f"per-MMA SMEM extent {mn_slice}" if num_mma > 1 else f"SMEM extent {mn_slice}"
             raise ValueError(
-                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: "
-                f"per-MMA SMEM extent {mn_slice} is not a multiple of the "
-                f"{mn_group_elems}-element swizzle group"
+                f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: " f"{what} is not a multiple of the " f"{mn_group_elems}-element swizzle group"
             )
         group_elems = mn_group_elems
         return (
@@ -812,7 +816,8 @@ def _render_tile_constants(
             group_elems,
         )
 
-    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", cfg.mma_size_m)
+    _desc_num_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", _desc_num_mma)
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
     # Byte step from one MMA sub-block to the next inside the SMEM tile. Same
     # formula for both majors: a K-major tile is (MN x K) rows of
@@ -2889,18 +2894,22 @@ def _check_dtype_config_compat(
                 f"in one box per operand"
             )
     mn_group_elems = config.cta_tile_k_bytes // elem_bytes
-    # Each MMA instruction's operand descriptor starts at its own MN sub-block,
-    # so the check is on the PER-MMA slice (== the whole extent at num_mma == 1).
+    # Each tcgen05 MMA instruction's operand descriptor starts at its own MN
+    # sub-block, so the check is on the PER-MMA slice. A warp-scoped family
+    # (fixed mma tile, e.g. sm120) has no per-MMA descriptors -- only the whole
+    # extent must cut into whole groups (the TMA group walk) -- so num_mma == 1.
+    _per_mma = 1 if getattr(type(config), "FIXED_MMA_TILE_MN", None) is not None else config.mma_size_m
     if chain.matmul.a_major == "m":
-        slice_m = config.cta_tile_m // config.mma_size_m
+        slice_m = config.cta_tile_m // _per_mma
+        what = f"per-MMA M={slice_m}" if _per_mma > 1 else f"M={slice_m}"
         if slice_m < mn_group_elems:
             raise ValueError(
                 f"TileConfig {config.name!r} cannot use M-major A for "
-                f"dtype={chain.matmul.a_dtype!r}: per-MMA M={slice_m} "
+                f"dtype={chain.matmul.a_dtype!r}: {what} "
                 f"is smaller than the {mn_group_elems}-element swizzle group"
             )
         if slice_m % mn_group_elems != 0:
-            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"per-MMA M={slice_m} is not divisible by " f"swizzle group {mn_group_elems}")
+            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"{what} is not divisible by " f"swizzle group {mn_group_elems}")
     if chain.matmul.b_major == "n":
         slice_n = config.cta_smem_tile_mnk(elem_bytes)[1]
         if slice_n < mn_group_elems:
@@ -3005,6 +3014,34 @@ def _sf_blob_reject(named_blobs) -> "str | None":
     if bad:
         return "block-scale F8_128x4 scale factors must be a packed blob: " + "; ".join(bad)
     return None
+
+
+def _grouped_row_quant_scale_blob_reject(
+    chain: FusionChain,
+    outputs,
+    total_rows: int,
+    runtime_n: int,
+    num_groups: int,
+) -> str | None:
+    """Reject a strided view where grouped-row quant stores raw blob offsets.
+
+    The F8_128x4 epilogue deliberately addresses the physical atom stream and
+    does not apply the runtime tensor strides. Reuse the input-SF packed-blob
+    contract so every accepted destination is one dense byte run.
+    """
+    blobs = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        quant_idx = int(spec.source.rsplit("_", 1)[1])
+        quant = chain.quants[quant_idx]
+        if not quant.grouped_by_moe or quant.axis == 1:
+            continue
+        padded_n_blocks = ((runtime_n // quant.block_size + 3) // 4) * 4
+        required_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
+        required = required_rows * padded_n_blocks * DTYPE_BYTES[quant.scale_dtype]
+        blobs.append((f"grouped row quant scale output[{quant_idx}]", buf, required))
+    return _sf_blob_reject(blobs) if blobs else None
 
 
 def _check_input_alignment(chain: FusionChain) -> None:
@@ -3282,6 +3319,14 @@ def _check_block_quant_supported(
                 f"cols_per_acc_stage={cols_per_acc_stage} and to {MAX_EPI_CHUNK_ELEMS} "
                 f"elements); got block_size={q.block_size}, vsize={vsize}"
             )
+        if q.grouped_by_moe and q.axis != 1:
+            if not chain.has_moe:
+                raise NotImplementedError("grouped row block_scale_quantize requires a MoE grouped matmul graph")
+            if not chain.has_block_scale:
+                raise NotImplementedError(
+                    "grouped row block_scale_quantize currently requires a block-scaled MoE "
+                    "matmul whose scheduler supplies the per-group 128-row scale prefix"
+                )
         if q.axis == 1:
             # Col quant: a warp (block 32) or half-warp (block 16) of rows is
             # one M block; the redux needs every row guard uniform across the
@@ -3323,13 +3368,26 @@ def _check_block_quant_supported(
                 f"config={config.name}"
             )
         if q.scale_reorder == "F8_128x4":
-            expected_scale_dim = (
-                chain.matmul.batch,
-                ((chain.matmul.M + 127) // 128) * 128,
-                (((chain.matmul.N // q.block_size) + 3) // 4) * 4,
-            )
-            if q.scale_dim != expected_scale_dim:
-                raise NotImplementedError("F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}")
+            padded_n_blocks = (((chain.matmul.N // q.block_size) + 3) // 4) * 4
+            if q.grouped_by_moe and q.axis != 1:
+                required_rows = segmented_row_scale_capacity_rows(chain.matmul.M, chain.moe.num_groups)
+                if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_n_blocks:
+                    raise NotImplementedError(
+                        "grouped F8_128x4 row block_scale_quantize requires "
+                        "scale_dim=(1, segmented_rows, padded_N_blocks), with "
+                        f"segmented_rows a multiple of 128 and >= the static worst-case {required_rows}, and "
+                        f"padded_N_blocks={padded_n_blocks}; got {q.scale_dim}"
+                    )
+            else:
+                expected_scale_dim = (
+                    chain.matmul.batch,
+                    ((chain.matmul.M + 127) // 128) * 128,
+                    padded_n_blocks,
+                )
+                if q.scale_dim != expected_scale_dim:
+                    raise NotImplementedError(
+                        "F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}"
+                    )
 
 
 _FORCE_STG_EPI = False
@@ -3376,13 +3434,29 @@ def _check_executable(chain: FusionChain) -> None:
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
 
 
+_TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
+
+
 def plan_config(chain: FusionChain) -> TileConfig:
+    """Choose the automatic tile strategy for one analyzed fusion chain."""
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
         tile_m = (chain.matmul.M + chain.moe.num_groups - 1) // chain.moe.num_groups
+    declared_rows = chain.matmul.M if chain.moe is not None else chain.matmul.M * chain.matmul.batch
+    force_cta_group = None
+    if chain.num_gemms == 1 and chain.has_block_scale and chain.quants and declared_rows <= _TERMINAL_QUANT_ONE_CTA_MAX_M:
+        # A terminal block-scale quantizer adds a substantial epilogue drain.
+        # Keep both M tiles independently scheduled over the measured row
+        # envelope instead of coupling them in a 2-CTA MMA pair. For dense
+        # batches, every batch contributes M rows; for MoE, total M is the only
+        # plan-time upper bound on a runtime expert group -- the average in
+        # tile_m cannot bound device-resident offsets.
+        # select_config still scores the cluster after this strategy choice;
+        # no cluster shape is pinned here.
+        force_cta_group = 1
     config = select_config(
         tile_m,
         chain.matmul.N,
@@ -3391,6 +3465,7 @@ def plan_config(chain: FusionChain) -> TileConfig:
         block_scale=chain.has_block_scale,
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
+        force_cta_group=force_cta_group,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
@@ -4209,6 +4284,15 @@ class CompiledMoeBlockScaleGemm:
                     f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
                     f"got {tuple(t.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            self.chain,
+            outputs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
         # num_experts = weight batch (E); num_groups = first_token_offset len
         # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
@@ -4278,8 +4362,9 @@ class CompiledMoeBlockScaleGemm:
         if sfa or sfb:
             _S, _N, _K = snk[0], snk[1], snk[2]
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
+            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), int(fto.shape[0]))
             _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 512 * _sf_k4 * ((_S + 127) // 128)) for i, x in enumerate(sfa or [])]
+                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(sfa or [])]
                 + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(b_bufs[j].shape[0])) for j, x in enumerate(sfb or [])]
             )
             if _r_sf is not None:
@@ -4346,6 +4431,15 @@ class CompiledMoeBlockScaleGemm:
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
                     f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
+        scale_blob_reason = _grouped_row_quant_scale_blob_reject(
+            chain,
+            outs,
+            S,
+            N,
+            int(first_token_offset.shape[0]),
+        )
+        if scale_blob_reason is not None:
+            raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = int(first_token_offset.shape[0])

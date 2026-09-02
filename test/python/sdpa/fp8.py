@@ -27,6 +27,7 @@ from .helpers import (
     profile_execution,
     note_frost_routing,
 )
+from .random_config import packed_token_capacity
 
 # fmt: off
 
@@ -361,10 +362,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
-        # Honor first-class total_q/total_kv capacities when set; fall back to
-        # the minimal packed capacity.
-        max_t_q = getattr(cfg, "total_q", None) or max(64, ((seq_len_q_gpu.sum().item() + 63) // 64) * 64)
-        max_t_kv = getattr(cfg, "total_kv", None) or max(64, ((seq_len_kv_gpu.sum().item() + 63) // 64) * 64)
+        # Guaranteed capacity tail (> total tokens); convert_uniform_to_packed
+        # NaN-fills it, so engines that read past the last ragged offset fail
+        # deterministically (GitHub #624). First-class total_q/total_kv widen
+        # the capacity further when set.
+        max_t_q = getattr(cfg, "total_q", None) or packed_token_capacity(seq_len_q_list)
+        max_t_kv = getattr(cfg, "total_kv", None) or packed_token_capacity(seq_len_kv_list)
 
         # With the ragged offset multiplier, offsets are stored in coarser units
         # (divided by the per-tensor multiplier; always divides evenly) and the

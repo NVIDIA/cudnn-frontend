@@ -654,7 +654,11 @@ def mxfp8_fwd():
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 3}),
+        # Full-only: the sdpa_mxfp8 python API has no seq_len/padding
+        # arguments and exec_sdpa_mxfp8 never reads cfg.seq_len_q/kv, so a
+        # "padded" draw would silently run dense-full (see GitHub #646).
+        # Re-add padded/ragged once the API grows seq-len support.
+        is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
     )
 

@@ -917,6 +917,12 @@ def _scale_store_dtype(scale_dtype: Dtype) -> str:
     return "cutlass.Int8" if scale_dtype == "fp8_e5m3" else DTYPE_TO_CUTLASS[scale_dtype]
 
 
+def _f8_128x4_row_scale_index_expr(row: str, scale_col: str, n_col_quads: str, *, atom_base: str | None = None) -> str:
+    """Physical byte index for one logical row scale in an F8_128x4 blob."""
+    prefix = f"{atom_base} + " if atom_base is not None else ""
+    return f"{prefix}(({row} // 128) * {n_col_quads} + ({scale_col} // 4)) * 512 + " f"({row} % 32) * 16 + (({row} % 128) // 32) * 4 + ({scale_col} % 4)"
+
+
 def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
     """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
     value back as fp32 — the data is divided by what was actually written, not
@@ -1194,19 +1200,34 @@ def _emit_block_quant(
             ),
         ]
     )
+    if quant.grouped_by_moe:
+        # Slot 6 is the block-scaled MoE scheduler's prefix sum of preceding
+        # groups' ceil(group_rows/128) scale atoms. Restart the row address at
+        # the group-local row and that atom base.
+        lines.extend(
+            [
+                f"{p}_local_row = row - group_begin",
+                f"{p}_ncb = ((N // {bs}) + 3) // 4",
+                f"{p}_base = start_sf_block_m * {p}_ncb * 512",
+            ]
+        )
     for k in range(n_sub):
         lines.append(f"{p}_scol{k} = col_j // {bs} + {k}")
         if quant.scale_reorder == "F8_128x4":
-            lines.extend(
-                [
-                    f"{p}_ncb{k} = ((N // {bs}) + 3) // 4",
-                    (
-                        f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
-                        f"((row // 128) * {p}_ncb{k} + ({p}_scol{k} // 4)) * 512 + "
-                        f"(row % 32) * 16 + ((row % 128) // 32) * 4 + ({p}_scol{k} % 4)"
-                    ),
-                ]
-            )
+            if quant.grouped_by_moe:
+                sidx = _f8_128x4_row_scale_index_expr(f"{p}_local_row", f"{p}_scol{k}", f"{p}_ncb", atom_base=f"{p}_base")
+                lines.append(f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + {sidx}")
+            else:
+                lines.extend(
+                    [
+                        f"{p}_ncb{k} = ((N // {bs}) + 3) // 4",
+                        (
+                            f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
+                            f"((row // 128) * {p}_ncb{k} + ({p}_scol{k} // 4)) * 512 + "
+                            f"(row % 32) * 16 + ((row % 128) // 32) * 4 + ({p}_scol{k} % 4)"
+                        ),
+                    ]
+                )
         else:
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "

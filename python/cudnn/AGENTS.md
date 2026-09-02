@@ -38,6 +38,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   launches, and a second copy of the semantics that can drift). If a packed
   extent would be zero, bind a never-dereferenced dummy view over storage
   the contract already guarantees.
+- **Overlapping optional declarations are validated as a set, not one by
+  one.** When two mechanisms can declare the same thing (ragged offsets vs
+  `cu_seqlen` vs plain `seq_len` tensors), each combination is either
+  defined or explicitly rejected — an unhandled overlap is an untested code
+  path with unspecified semantics, and "both supplied" is exactly the case
+  no per-argument check catches (raised in review on PR #266).
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -168,6 +174,15 @@ not become a compile key.
   (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
   token extents like the SM100/SM120 THD compiles rather than copying its
   pattern.
+- **Key on exactly the contract-relevant set — no more, no less.** Both
+  failure modes shipped on PR #553 and were caught in review: *under-keying*
+  (the cache keyed only `x.shape`/`w.shape` while `check_support()`
+  validated weight, RoPE, and scale descriptors — a hit can return an
+  artifact compiled for a different contract, i.e. wrong results) and
+  *over-keying* (`alpha` passed at launch, `m`/`n`/`k` on a shape-generic
+  kernel — every miss is a spurious multi-second recompile). Enumerate what
+  `check_support()` validates and what the kernel specializes on; the key
+  is that set.
 
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
@@ -192,6 +207,17 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **The device is implicit state exactly like the stream.** A `torch.empty`
+  (or any allocator call) without a device context silently allocates on the
+  *current* GPU, not the input tensor's — wrap execute-path allocations in
+  the right device context as well as the stream context. And a raw pointer
+  argument is a contract: validate device-residency and dtype (a CUDA int64
+  tensor, not a host tensor) before handing its address to a kernel — both
+  flagged in review on PR #517.
+
+SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
+[sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
+`python/cudnn/sdpa/`.
 
 
 ## Frontend-only kernel package layout
@@ -217,6 +243,30 @@ python/cudnn/gemm/
 ```
 
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
+
+## CuTeDSL kernel bodies
+
+**Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
+The DSL AST-transforms only the decorated function's own source: `for` becomes
+an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
+not transformed, so the ops it emits can land outside the enclosing region.
+
+Hoisting an 11-line block that ran correctly inline into a
+`write_clamped_kv_descs(...)` helper — called from inside
+`if nvvm.elect_sync() and tidx < 32:` — turned 212 passing forward tests into
+31 failures (`Error building ...`, traceback through `ir_loop` →
+`scf_execute_dynamic`). Unrolling the helper's own loop did not help; the
+helper *call* was the problem. Duplicating the block across flavors is the
+correct trade here. Factor only host-side code, or code you can mark
+`@cute.jit`.
+
+Related: inside a kernel body, `for x in (a, b)` over a Python tuple is
+rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
+(e.g. `GridConstant[TensorMap]`). Unroll it, or use `cutlass.range_constexpr`.
+
+**Detector.** These break at `compile()`, not at import — `python -c "import ..."`
+and `pytest --collect-only` both stay green. After any refactor of a kernel
+body, run that flavor's own tests.
 
 ## The APIBase contract (`api_base.py`)
 

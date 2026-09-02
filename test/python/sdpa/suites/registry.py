@@ -225,12 +225,11 @@ _SPECS = [
         + (
             "e4m3/e5m2 in",
             "out fp16/bf16",
-            "layout padded/full",
             "sink",
             "unfuse_fma",
             "rescale 0/2/4 (SM100)",
         ),
-        pinned=("infer", "impl AUTO", "SM100+"),
+        pinned=("infer", "impl AUTO", "SM100+", "layout full (mxfp8 API has no seq-len args, #646)"),
     ),
     # ---- generation (decode / small-s_q forward) ----
     SuiteSpec(

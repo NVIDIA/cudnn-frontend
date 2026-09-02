@@ -25,6 +25,7 @@ from gemm_test_utils import (
     unpack_fp4 as _unpack_fp4,
     rand_e8m0 as _rand_e8m0,
     block_quant_ref as _block_quant_ref,
+    with_static_segmented_capacity as _with_static_segmented_capacity,
 )
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -299,7 +300,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu(combo, cfg_name, cta_gro
 
     # SFA padded to 128 rows PER GROUP, then concatenated; SFB per-expert.
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
@@ -369,7 +370,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_quant_epilogue(combo, cf
     assert compiled.chain.quants
 
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
@@ -448,7 +449,7 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_reduction_scalar() -> No
     )
 
     sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < num_groups else S]) for gi in range(num_groups)]
-    sfa_blk = torch.cat(sfa_parts).view(1, -1, 1)
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts), S, num_groups, sf_k)
     sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
