@@ -3392,7 +3392,7 @@ def test_sm120_render_smoke() -> None:
                 combo = (a_major, b_major, out_major)
                 assert "@@" not in src, f"leftover injection markers {combo}"
                 ast.parse(src)
-                assert "cudnn_frost_sm120_matmul_" in src
+                assert "frost_sm120_matmul_" in src
                 assert "threads_per_cta = 384" in src
                 assert f"vec_bytes_epi = {vec}" in src
                 assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"

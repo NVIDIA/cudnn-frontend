@@ -2017,7 +2017,7 @@ def _render_template(
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
-    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"cudnn_frost_{tag}", src)
+    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
 
@@ -2215,7 +2215,7 @@ def _render_block_scale_template(
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
-    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"cudnn_frost_{tag}", src)
+    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
     return src
 
 

@@ -22,7 +22,7 @@ def _dotted_name(node: ast.AST) -> str:
 
 
 def _is_cute_kernel(node: ast.FunctionDef) -> bool:
-    return any(_dotted_name(decorator) == "cute.kernel" for decorator in node.decorator_list)
+    return any(_dotted_name(decorator.func if isinstance(decorator, ast.Call) else decorator) == "cute.kernel" for decorator in node.decorator_list)
 
 
 def _is_cudnn_name_prefix(statement: ast.stmt, kernel_name: str) -> bool:
@@ -39,26 +39,20 @@ def _is_cudnn_name_prefix(statement: ast.stmt, kernel_name: str) -> bool:
     return isinstance(remove_cutlass_symbol, ast.Constant) and remove_cutlass_symbol.value is True
 
 
-def _is_any_cudnn_name_prefix(statement: ast.AST) -> bool:
-    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
-        return False
-    function = statement.value.func
-    if not isinstance(function, ast.Attribute) or function.attr != "set_name_prefix":
-        return False
-    return _is_cudnn_name_prefix(statement, _dotted_name(function.value))
-
-
-def _missing_prefixes(statements: list[ast.stmt], scope: tuple[str, ...] = ()) -> list[str]:
+def _missing_prefixes(node: ast.AST, scope: tuple[str, ...] = ()) -> list[str]:
     missing = []
-    for index, statement in enumerate(statements):
-        if isinstance(statement, ast.FunctionDef) and _is_cute_kernel(statement):
-            next_statement = statements[index + 1] if index + 1 < len(statements) else None
-            if next_statement is None or not _is_cudnn_name_prefix(next_statement, statement.name):
-                qualified_name = ".".join((*scope, statement.name))
-                missing.append(f"{statement.lineno}:{qualified_name}")
-
-        if isinstance(statement, ast.ClassDef):
-            missing.extend(_missing_prefixes(statement.body, (*scope, statement.name)))
+    for _, value in ast.iter_fields(node):
+        children = value if isinstance(value, list) else [value] if isinstance(value, ast.AST) else []
+        if isinstance(value, list):
+            for index, statement in enumerate(value):
+                if isinstance(statement, ast.FunctionDef) and _is_cute_kernel(statement):
+                    next_statement = value[index + 1] if index + 1 < len(value) else None
+                    if next_statement is None or not _is_cudnn_name_prefix(next_statement, statement.name):
+                        missing.append(f"{statement.lineno}:{'.'.join((*scope, statement.name))}")
+        for child in children:
+            if isinstance(child, ast.AST):
+                child_scope = (*scope, child.name) if isinstance(child, (ast.ClassDef, ast.FunctionDef)) else scope
+                missing.extend(_missing_prefixes(child, child_scope))
 
     return missing
 
@@ -68,15 +62,19 @@ def test_gemm_and_sdpa_kernels_have_cudnn_name_prefix():
     missing = []
     counts = {}
     for root in _KERNEL_ROOTS:
-        kernel_count = prefix_count = 0
+        kernel_count = 0
         for path in sorted(root.rglob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             kernel_count += sum(isinstance(node, ast.FunctionDef) and _is_cute_kernel(node) for node in ast.walk(tree))
-            prefix_count += sum(_is_any_cudnn_name_prefix(node) for node in ast.walk(tree))
-            offenders = _missing_prefixes(tree.body)
+            offenders = _missing_prefixes(tree)
             missing.extend(f"{path.relative_to(_REPO_ROOT)}:{offender}" for offender in offenders)
-        counts[root.name] = (kernel_count, prefix_count)
+        counts[root.name] = kernel_count
 
-    assert all(kernel_count for kernel_count, _ in counts.values()), f"expected Frost kernels under every scanned root, got {counts}"
-    assert all(kernel_count == prefix_count for kernel_count, prefix_count in counts.values()), f"kernel/prefix count mismatch: {counts}"
+    assert all(counts.values()), f"expected Frost kernels under every scanned root, got {counts}"
     assert not missing, "Frost @cute.kernel definitions missing the required cuDNN name prefix:\n" + "\n".join(missing)
+
+
+@pytest.mark.L0
+def test_prefix_guard_covers_called_decorator_and_nested_kernel():
+    tree = ast.parse("def outer():\n    @cute.kernel()\n    def missing():\n        pass\n")
+    assert _missing_prefixes(tree) == ["3:outer.missing"]
