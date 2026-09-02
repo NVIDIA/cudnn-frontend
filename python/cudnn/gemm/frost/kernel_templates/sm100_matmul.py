@@ -149,6 +149,7 @@ def _splitk_reduce_kernel(
         (mD.iterator.raw_ptr() + d_offset).store(acc.to(cd_dtype), alignment=splitk_reduce_elems * cd_dtype.width // 8)
 
 
+_splitk_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # @@SPLITK_ONLY:END@@
 
 
