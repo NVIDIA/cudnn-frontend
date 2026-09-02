@@ -4,9 +4,10 @@
 """End-to-end tests for the FROST SM100 DSL block-scale MXFP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_mxfp8`` (FP8 E4M3/E5M2 Q/K/V + per-32-block E8M0 scale factors)
-routed to the native D128/D128 or D192/D128 MXFP8 engine, and validates the output
-against an fp32-dequant reference. Inputs are quantized with the torch-only
-MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py`` (TE-equivalent semantics
+routed to the exact D128/D128, D192/D128, or D256/D256 MXFP8 engine, and
+validates the output against an fp32-dequant reference. Inputs are quantized
+with the torch-only MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py``
+(TE-equivalent semantics
 — the same layout cuDNN's own mxfp8 path uses), so the scale-factor tensors
 reach the engine in cuDNN's F8_128x4 reordering. TransformerEngine is NOT
 required.
@@ -89,7 +90,21 @@ def _quantize(t, b, h, s, d, fp8, *, columnwise):
     return data_d, swz_d, dq, (s_pad, d_scale_pad)
 
 
-def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=None, sinks=None, seq_lens_kv=None, return_stats=False):
+def _ref(
+    qd,
+    kd,
+    vd,
+    *,
+    scale,
+    is_causal=False,
+    bottom_right=False,
+    swa_window=None,
+    right_bound=0,
+    sinks=None,
+    seq_lens_q=None,
+    seq_lens_kv=None,
+    return_stats=False,
+):
     """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware)."""
     b, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = vd.shape
@@ -103,29 +118,36 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     masked = torch.zeros(1, 1, s_q, s_kv, dtype=torch.bool, device=dev)
     if is_causal:
         lim = i + (s_kv - s_q) if bottom_right else i
-        masked = masked | (j > lim)
+        masked = masked | (j > lim + right_bound)
     if swa_window is not None:
-        masked = masked | (j < i - swa_window)
+        swa_base = i + (s_kv - s_q) if bottom_right else i
+        masked = masked | (j < swa_base - swa_window)
     if seq_lens_kv is not None:
         # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
         slk = torch.as_tensor(seq_lens_kv, device=dev, dtype=torch.long).view(b, 1, 1, 1)
         masked = masked | (j >= slk)
     scores = scores.masked_fill(masked, float("-inf"))
+
+    def finalize(o, lse=None):
+        if seq_lens_q is not None:
+            slq = torch.as_tensor(seq_lens_q, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+            valid_q = i < slq
+            o = torch.where(valid_q, o, torch.zeros_like(o))
+            if lse is not None:
+                lse = torch.where(valid_q.squeeze(-1), lse, torch.full_like(lse, float("-inf")))
+        return _ReferenceWithStats(o, lse) if lse is not None else o
+
     if sinks is not None:
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
         ext = torch.cat([scores, col], dim=-1)
         probs = torch.softmax(ext, dim=-1)
         o = torch.matmul(probs[..., :s_kv], v_e)
-        if return_stats:
-            return _ReferenceWithStats(o, torch.logsumexp(ext, dim=-1))
-        return o
+        return finalize(o, torch.logsumexp(ext, dim=-1) if return_stats else None)
     row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
     probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
     o = torch.matmul(probs, v_e)
-    if return_stats:
-        return _ReferenceWithStats(o, torch.logsumexp(scores, dim=-1))
-    return o
+    return finalize(o, torch.logsumexp(scores, dim=-1) if return_stats else None)
 
 
 def _run(
@@ -140,6 +162,7 @@ def _run(
     sdpa_kwargs,
     sink=None,
     stats=True,
+    seq_lens_q=None,
     seq_lens_kv=None,
     d_qk=128,
     d_v=128,
@@ -198,11 +221,9 @@ def _run(
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
-    if seq_lens_kv is not None:
-        # KV padding (frontend extension on sdpa_mxfp8): full (unpadded) query
-        # lengths + per-batch valid KV lengths.
-        slq = torch.full((B, 1, 1, 1), S, dtype=torch.int32, device=dev)
-        slk = torch.tensor(seq_lens_kv, dtype=torch.int32, device=dev).reshape(B, 1, 1, 1)
+    if seq_lens_q is not None or seq_lens_kv is not None:
+        slq = torch.tensor(seq_lens_q if seq_lens_q is not None else [S] * B, dtype=torch.int32, device=dev).reshape(B, 1, 1, 1)
+        slk = torch.tensor(seq_lens_kv if seq_lens_kv is not None else [S] * B, dtype=torch.int32, device=dev).reshape(B, 1, 1, 1)
         sq_h = g.tensor(dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
         skv_h = g.tensor(dim=[B, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
         kw.update(use_padding_mask=True, seq_len_q=sq_h, seq_len_kv=skv_h)
@@ -250,12 +271,13 @@ def _run(
             K8.float() * dqk,
             V8.float() * dqv,
             scale=scale,
+            seq_lens_q=seq_lens_q,
             seq_lens_kv=seq_lens_kv,
             return_stats=True,
             **ref_kwargs,
         )
         return _RunWithStatsResult(Ob, o_ref, amax, lse.squeeze(-1), lse_ref)
-    o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kwargs)
+    o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kwargs)
     return _RunResult(Ob, o_ref, amax)
 
 
@@ -267,6 +289,15 @@ def _ref_from_sdpa(sdpa_kwargs):
     if sdpa_kwargs.get("use_causal_mask_bottom_right"):
         out["is_causal"] = True
         out["bottom_right"] = True
+    right_bound = sdpa_kwargs.get("diagonal_band_right_bound")
+    if right_bound is not None:
+        out["is_causal"] = True
+        out["right_bound"] = right_bound
+    diagonal_alignment = sdpa_kwargs.get("diagonal_alignment")
+    if diagonal_alignment is not None:
+        import cudnn
+
+        out["bottom_right"] = diagonal_alignment == cudnn.diagonal_alignment.BOTTOM_RIGHT
     lb = sdpa_kwargs.get("diagonal_band_left_bound")
     if lb is not None:
         out["swa_window"] = lb - 1  # cuDNN length - 1
@@ -346,6 +377,209 @@ def test_mxfp8_strided_stats():
 def test_mxfp8_strided_stats_other_flavors(d_qk, d_v, in_key):
     """The remaining block-scaled FP8 flavors preserve dense Stats strides."""
     _check_mxfp8_strided_stats(d_qk, d_v, in_key)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_masks(in_key, mask):
+    O, O_ref, amax = _run(
+        1,
+        8,
+        8,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(256),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=256,
+        d_v=256,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=256)
+    assert amax.item() > 0.0
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_output_dtypes(in_key, out_key):
+    """D256 supports both MXFP8 encodings and every declared output dtype."""
+    d = 256
+    O, O_ref, amax = _run(
+        1,
+        8,
+        8,
+        256,
+        in_key,
+        _OUT[out_key],
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, _OUT[out_key], in_key, d_qk=d)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=59)
+def test_mxfp8_d256_strided_stats(in_key):
+    """D256 preserves the caller's non-contiguous Stats layout."""
+    _check_mxfp8_strided_stats(256, 256, in_key)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_bottom_right_rectangular(in_key):
+    """D256 bottom-right causal differs from top-left when S_q != S_kv."""
+    d = 256
+    O, O_ref, _ = _run_rect(
+        2,
+        8,
+        128,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=d)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_right_band():
+    """Pin the MX-specific right-band lowering; shared combinations run in PT."""
+    d = 256
+    out, out_ref, _ = _run(
+        1,
+        4,
+        4,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(diagonal_band_right_bound=40),
+        d_qk=d,
+        d_v=d,
+    )
+    _check(out, out_ref, torch.float16, "e4m3", d_qk=d)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_dense_padding(in_key, causal):
+    """D256 masks a per-batch partial KV tile in dense storage."""
+    d = 256
+    sdpa_kwargs = dict(use_causal_mask=True) if causal else {}
+    O, O_ref, amax = _run(
+        2,
+        8,
+        8,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=sdpa_kwargs,
+        seq_lens_kv=[256, 192],
+        stats=False,
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=d)
+    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_dense_q_trim_stats_sink():
+    """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
+    d = 256
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    result = _run(
+        2,
+        8,
+        8,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs={},
+        sink=sink,
+        seq_lens_q=[129, 0],
+        seq_lens_kv=[200, 256],
+        d_qk=d,
+        d_v=d,
+        return_lse=True,
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", d_qk=d)
+    assert (result.output[0, :, 129:] == 0).all() and (result.output[1] == 0).all()
+    assert torch.isneginf(result.stats[0, :, 129:]).all() and torch.isneginf(result.stats[1]).all()
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=5e-2, rtol=3e-2)
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_gqa_sink(in_key):
+    """D256 GQA composes with a per-query-head attention sink."""
+    d = 256
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    O, O_ref, _ = _run(
+        2,
+        8,
+        2,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs=dict(use_causal_mask=True),
+        sink=sink,
+        d_qk=d,
+        d_v=d,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=d)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("out_key", "with_sink"),
+    [("fp16", False), ("e4m3", True)],
+    ids=["fp16-nosink", "fp8-sink"],
+)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_leading_zero_length_kv(out_key: str, with_sink: bool):
+    """A leading zero-length KV batch must produce zero O and a finite amax."""
+    d = 256
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    result = _run(
+        2,
+        8,
+        8,
+        256,
+        "e4m3",
+        _OUT[out_key],
+        scale=1.0 / math.sqrt(d),
+        sdpa_kwargs={},
+        sink=sink,
+        seq_lens_kv=[0, 256],
+        stats=False,
+        d_qk=d,
+        d_v=d,
+        poison_tmem_before_execute=True,
+    )
+    _check(result.output, result.reference, _OUT[out_key], "e4m3", d_qk=d)
+    assert (result.output[0] == 0).all()
+    assert abs(result.amax.item() - result.reference.abs().max().item()) <= 0.03
 
 
 @pytest.mark.L0
@@ -621,7 +855,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
         torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8),
     )
     torch.cuda.synchronize()
-    o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, is_causal=True, bottom_right=True)
+    o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, **_ref_from_sdpa(sdpa_kwargs))
     return Ob, o_ref, amax
 
 
@@ -658,7 +892,13 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(t_1hsd, 1, h, s, d, _BLOCK, fp8, with_ref=True)
     n_tiles = _cdiv(s, 128)
     if columnwise:
-        return data_s, dq_s.reshape(1, h, s, d), swz_s.view(torch.uint8).reshape(h, n_tiles, -1)
+        # Columnwise F8_128x4 is plane-major for D > 128. THD's packed
+        # contract keeps every sequence tile contiguous, so transpose
+        # [D/128, H, tile, 512] into [H, tile, D/128, 512] before sequences
+        # are concatenated in cu_seqlens order.
+        planes = d // 128
+        sf = swz_s.view(torch.uint8).reshape(planes, h, n_tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(h, n_tiles, -1)
+        return data_s, dq_s.reshape(1, h, s, d), sf
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
 
 
@@ -807,7 +1047,7 @@ def _run_thd(
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    assert not (bottom_right and (causal or swa_window is not None))
+    assert not (bottom_right and causal)
     if bottom_right:
         kw["use_causal_mask_bottom_right"] = True
     elif causal or swa_window is not None:
@@ -922,7 +1162,7 @@ def test_mxfp8_thd(in_key, causal):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
@@ -942,52 +1182,121 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_cross_gqa():
-    """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+def test_mxfp8_d256_thd(in_key, causal):
+    """D256 MXFP8 THD uses packed per-sequence SF tiles."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, _ = _run_thd(
+        [160, 96],
+        [160, 96],
+        8,
+        8,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=causal,
+        d_qk=256,
+        d_v=256,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_sink():
-    """THD causal + attention sink."""
-    scale = 1.0 / math.sqrt(128)
-    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
-    o_out, o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink)
-    _check(o_out, o_ref, torch.float16, "e4m3")
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_stats():
-    """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+def test_mxfp8_thd_sliding_window(d, in_key, bottom_right):
+    """MXFP8 THD sliding window uses each sequence's local causal diagonal."""
+    q_lens = [173, 97] if bottom_right else [257, 193]
+    kv_lens = [257, 193] if bottom_right else q_lens
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, amax, lse = _run_thd(
+        q_lens,
+        kv_lens,
+        8,
+        2,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=not bottom_right,
+        bottom_right=bottom_right,
+        swa_window=73,
+        stats=True,
+        d_qk=d,
+        d_v=d,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=d)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
     assert lse is not None and torch.isfinite(lse).all()
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_zero_len_kv():
-    """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
-    zero-KV sequence's rows are dead — the epilogue must come back O := 0,
-    not the unwritten O TMEM (garbage survives `* inv_sum(=0)` when NaN)."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+def test_mxfp8_thd_cross_gqa(d):
+    """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale, d_qk=d, d_v=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_cu_seq_len():
+def test_mxfp8_thd_sink(d):
+    """THD causal + attention sink."""
+    scale = 1.0 / math.sqrt(d)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    o_out, o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink, d_qk=d, d_v=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_stats(d):
+    """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True, d_qk=d, d_v=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
+    assert lse is not None and torch.isfinite(lse).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_zero_len_kv(d):
+    """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
+    zero-KV sequence's rows are dead — the epilogue must come back O := 0,
+    not the unwritten O TMEM (garbage survives `* inv_sum(=0)` when NaN)."""
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, d_qk=d, d_v=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd(
+        [200, 150],
+        [180, 120],
+        8,
+        8,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        cu_lens=True,
+        d_qk=d,
+        d_v=d,
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
 @pytest.mark.L0

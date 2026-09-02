@@ -56,12 +56,13 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_advertises_only_d128():
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
 
 def test_per_tensor_fp8_rows_split_per_arch_line():
     """The per-tensor FP8 rows are split at the Rubin boundary — each row
     declares exactly what its own lowering carries, with no knob x arch
-    notches: the HALF softmax arm and the d192 flavor are row DATA."""
+    notches: kernel flavors, HALF softmax, and split/LPT capabilities are row DATA."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines
@@ -73,8 +74,8 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA: Rubin has no d192 or d512 sibling.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (512, 512)})
+    # Kernel flavors are row DATA: Rubin has no d192, d256, or d512 sibling.
+    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert sm107.d_shapes == frozenset({(128, 128)})
     # d512 carries an envelope FLOOR: it serves (256, 512] on both head dims,
     # so a smaller graph is declined rather than routed onto the d512 kernel at
@@ -333,9 +334,9 @@ def test_fp8_rows_serve_dense_envelope():
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
     # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
-    # d192 and d512 flavors' THD legs.
+    # d192, d256, and d512 flavors' THD legs.
     assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
-    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (512, 512)})
+    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 
@@ -373,12 +374,16 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
     # The d192xd128 flavor serves its envelope too (kernel takes d_qk/d_v).
     assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=96)) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160))
+    # D256xD256 extends that envelope in both dimensions.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
-    # SM100 carries THD at both native per-tensor FP8 shapes.
+    # SM100 carries THD at each native per-tensor FP8 shape.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256)) is None
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256, thd=True, padded=True)) is None
     # d512 is a NATIVE shape (accepted exactly, dense and THD) and serves the
     # (256, 512] envelope band on BOTH head dims -- at most 2x zero-padding.
     assert engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=512)) is None
@@ -386,9 +391,7 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448)) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=464, d_v=368)) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=272)) is None
-    # Below the floor, or straddling it, the row declines rather than routing a
-    # much smaller graph onto the d512 kernel.
-    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=256, d_v=256))
+    # Straddling the d512 floor declines rather than routing onto that kernel.
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=128))
     # THD stays native-tile: the (256, 512] envelope band is dense-only.
