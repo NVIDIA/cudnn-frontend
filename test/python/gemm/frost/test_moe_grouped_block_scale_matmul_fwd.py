@@ -271,6 +271,7 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.moe.offset_dtype == "int64"
 
 
+@pytest.mark.L0
 def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
     """The block-scale MoE template shares the flat (S, N) TMA output surface
     with plain MoE; neither descriptor nor store coordinates carry batch=1."""

@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import re
-
 import cudnn
 from dataclasses import replace
 
