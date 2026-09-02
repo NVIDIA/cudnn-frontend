@@ -119,11 +119,11 @@ def _splitk_reduce_kernel(
     mD: cute.Tensor,
     mSplitK_partials: cute.Tensor,
 ) -> None:
-    if cutlass.const_expr(USE_PDL):
-        nvvm.griddepcontrol("wait")
     row = cutlass.Int64(cute.arch.block_idx()[0])
     col = (cutlass.Int64(cute.arch.block_idx()[1]) * SPLITK_REDUCE_THREADS + cute.arch.thread_idx()[0]) * splitk_reduce_elems
     batch_idx = cutlass.Int64(cute.arch.block_idx()[2])
+    if cutlass.const_expr(USE_PDL):
+        nvvm.griddepcontrol("wait")
     if col < n:
         elems_per_partial = m * n
         partials_ptr = mSplitK_partials.iterator.raw_ptr()
@@ -566,6 +566,11 @@ def _kernel(
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
             sched_iter += 1
+
+        if cutlass.const_expr(USE_PDL and split_k_slices > 1):
+            # Fire launch_dependents when the CLC scheduler runs dry, one tile
+            # earlier than the MMA-warp signal
+            nvvm.griddepcontrol("launch_dependents")
 
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             if is_cluster_leader_cta:
