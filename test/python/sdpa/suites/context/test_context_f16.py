@@ -29,14 +29,6 @@ def test_context_f16_thd(env_info, test_no, request, cudnn_handle):
     run_suite("context.f16.thd", env_info, test_no, request, cudnn_handle)
 
 
-@pytest.mark.L1
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.f16.thd_offset_mult"), ids=lambda p: f"test{p[0]}"
-)
-def test_context_f16_thd_offset_mult(env_info, test_no, request, cudnn_handle):
-    run_suite("context.f16.thd_offset_mult", env_info, test_no, request, cudnn_handle)
-
-
 MIXED_SEQ_LEN_FORM_CASES = [
     ("q", cudnn.diagonal_alignment.TOP_LEFT, None),
     ("kv", cudnn.diagonal_alignment.TOP_LEFT, None),

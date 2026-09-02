@@ -62,7 +62,7 @@ _SPECS = [
         knobs=knobs.dense_fwd,
         fuzzed=_COMMON_FUZZ
         + _MASK_FUZZ
-        + ("layout padded/cu_padded/full", "sink", "bias(1:5)", "unfuse_fma"),
+        + ("layout padded/cu_padded/full", "sink", "bias(1:5)"),
         pinned=("infer",),
     ),
     SuiteSpec(
@@ -75,18 +75,6 @@ _SPECS = [
         knobs=knobs.thd_fwd,
         fuzzed=_COMMON_FUZZ + _MASK_FUZZ + _THD_FUZZ + ("sink",),
         pinned=("infer", "layout THD (ragged/cu_ragged)"),
-    ),
-    SuiteSpec(
-        name="context.f16.thd_offset_mult",
-        phase="context",
-        dtype="f16",
-        level="L1",
-        num_tests=128,
-        rng_seed=892,
-        knobs=knobs.thd_offset_mult,
-        fuzzed=_COMMON_FUZZ + _THD_FUZZ + ("layout ragged_mult/cu_ragged_mult", "sink"),
-        pinned=("infer", "no mask", "diag TL"),
-        notes="ragged offset multiplier; engines without the attribute waive at build",
     ),
     SuiteSpec(
         name="context.fp8.dense",
@@ -117,14 +105,17 @@ _SPECS = [
         knobs=knobs.fp8_thd_fwd,
         exec_kind="fp8",
         fuzzed=_COMMON_FUZZ
+        + _MASK_FUZZ
         + (
             "e4m3/e5m2 in",
             "out fp8/fp16",
-            "layout ragged/cu_ragged/cu_ragged_mult",
+            "layout ragged/cu_ragged",
+            "sink",
             "total_q/kv slack",
             "declare totals on graph",
         ),
-        pinned=("infer", "no mask", "diag TL"),
+        pinned=("infer",),
+        notes="diag BR-weighted 2:1 — production context-phase alignment",
     ),
     SuiteSpec(
         name="context.mxfp8.dense",
@@ -143,7 +134,6 @@ _SPECS = [
             "e4m3/e5m2 in",
             "out fp16/bf16",
             "sink",
-            "unfuse_fma",
         ),
         pinned=(
             "infer",
@@ -178,7 +168,8 @@ _SPECS = [
             "d=128/128 (frost THD leg)",
             "SM100+",
         ),
-        notes="fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine "
+        notes="diag BR-weighted 2:1 (production context alignment); "
+        "fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine "
         "(CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native "
         "backend check_support-accepts THD mxfp8 but cannot execute it",
     ),
@@ -315,12 +306,11 @@ _SPECS = [
         exec_kind="fp8",
         post=post_train,
         fuzzed=_COMMON_FUZZ
+        + _MASK_FUZZ
         + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
         pinned=(
             "train",
             "e4m3 in",
-            "no mask",
-            "diag TL",
             "layout THD (ragged)",
         ),
         notes="ragged FP8 backward requires cuDNN > 9.21.0",

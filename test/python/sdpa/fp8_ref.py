@@ -60,20 +60,27 @@ def compute_ref(q, k, v, attn_scale,
     combined_bias = torch.zeros((b, h_q, s_q, s_kv), dtype=torch.float32, device=q.device)
     if bias is not None:
         combined_bias = combined_bias + bias.float()
+    # BOTTOM_RIGHT alignment under padding/varlen anchors to each sequence's
+    # OWN lengths (offset_b = seq_len_kv[b] - seq_len_q[b]), matching
+    # fp16_ref; the padded maxima are only correct for the dense-full case.
+    idx_q = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
+    idx_k = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+    if padding is not None:
+        br_offs = (torch.as_tensor(padding[1], device=q.device) - torch.as_tensor(padding[0], device=q.device)).view(b, 1, 1, 1)
+    else:
+        br_offs = torch.tensor(s_kv - s_q, device=q.device).view(1, 1, 1, 1)
     if right_bound is not None and diag_align is not None:
-        causal = torch.full((s_q, s_kv), float('-inf'), dtype=torch.float32, device=q.device)
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            causal = torch.triu(causal, diagonal=1 + right_bound)
+            causal_sel = (idx_k - idx_q) >= (1 + right_bound)
         else:
-            causal = torch.triu(causal, diagonal=s_kv - s_q + 1 + right_bound)
-        combined_bias = combined_bias + causal
+            causal_sel = (idx_k - idx_q) >= (br_offs + 1 + right_bound)
+        combined_bias = combined_bias.masked_fill(causal_sel, float('-inf'))
     if left_bound is not None and diag_align is not None:
-        swa = torch.full((s_q, s_kv), float('-inf'), dtype=torch.float32, device=q.device)
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            swa = torch.tril(swa, diagonal=-1 * left_bound)
+            swa_sel = (idx_k - idx_q) <= (-1 * left_bound)
         else:
-            swa = torch.tril(swa, diagonal=-1 * left_bound + (s_kv - s_q))
-        combined_bias = combined_bias + swa
+            swa_sel = (idx_k - idx_q) <= (br_offs - left_bound)
+        combined_bias = combined_bias.masked_fill(swa_sel, float('-inf'))
 
     block_size = 128
     num_blocks = (s_kv + block_size - 1) // block_size
@@ -195,22 +202,25 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
 
     if bias is not None:
         s = s + bias.float()
+    # Per-batch BOTTOM_RIGHT offsets under padding/varlen (see compute_ref).
+    idx_q = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
+    idx_k = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+    if padding is not None:
+        br_offs = (torch.as_tensor(padding[1], device=q.device) - torch.as_tensor(padding[0], device=q.device)).view(b, 1, 1, 1)
+    else:
+        br_offs = torch.tensor(s_kv - s_q, device=q.device).view(1, 1, 1, 1)
     if right_bound is not None and diag_align is not None:
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            causal_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=q.device)
-            causal_mask.triu_(diagonal=1 + right_bound)
+            causal_sel = (idx_k - idx_q) >= (1 + right_bound)
         else:
-            causal_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=q.device)
-            causal_mask.triu_(diagonal=s_kv - s_q + 1 + right_bound)
-        s = s.masked_fill(causal_mask, float('-inf'))
+            causal_sel = (idx_k - idx_q) >= (br_offs + 1 + right_bound)
+        s = s.masked_fill(causal_sel, float('-inf'))
     if left_bound is not None and diag_align is not None:
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=q.device)
-            swa_mask.tril_(diagonal=-1 * left_bound)
+            swa_sel = (idx_k - idx_q) <= (-1 * left_bound)
         else:
-            swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=q.device)
-            swa_mask.tril_(diagonal=-1 * left_bound + (s_kv - s_q))
-        s = s.masked_fill(swa_mask, float('-inf'))
+            swa_sel = (idx_k - idx_q) <= (br_offs - left_bound)
+        s = s.masked_fill(swa_sel, float('-inf'))
 
     # The backward kernel does not renormalize: it recomputes P = exp(S - stats)
     # from the forward's log-sum-exp, which already accounts for the sink.

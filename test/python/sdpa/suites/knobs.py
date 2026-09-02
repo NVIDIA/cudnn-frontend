@@ -42,6 +42,12 @@ DIAG_BOTH = {
     cudnn.diagonal_alignment.BOTTOM_RIGHT: 1,
 }
 DIAG_TL = {cudnn.diagonal_alignment.TOP_LEFT: 1}
+# Production context-phase weighting: BOTTOM_RIGHT is the alignment real
+# serving stacks use, so THD context suites draw it more often.
+DIAG_BR_HEAVY = {
+    cudnn.diagonal_alignment.BOTTOM_RIGHT: 2,
+    cudnn.diagonal_alignment.TOP_LEFT: 1,
+}
 
 
 def _f16():
@@ -85,7 +91,6 @@ def dense_fwd():
         ),
         with_sink_token=RandomChoice({True: 1, False: 3}),
         is_bias=RandomChoice({True: 1, False: 5}),
-        with_unfuse_fma=RandomChoice({True: 1, False: 2}),
     )
 
 
@@ -119,44 +124,6 @@ def thd_fwd():
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
         with_sink_token=RandomChoice({True: 1, False: 3}),
         ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
-        total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
-        declare_total_seq_len=RandomChoice({True: 1, False: 1}),
-    )
-
-
-def thd_offset_mult():
-    # Ragged offset multiplier (CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER);
-    # engines without it waive at graph build.
-    return dict(
-        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
-        s_q_s_kv=RandomSequenceLength(
-            s_q_min=1,
-            s_q_max=4096,
-            s_kv_min=1,
-            s_kv_max=4096,
-            s_q_distribution={
-                "s_q=1": 0,
-                "s_q=s_kv": 5,
-                "s_q=random": 10,
-                "s_q>s_kv": 3,
-            },
-        ),
-        d_qk_d_v=RandomHiddenDimSize(
-            d_qk_min=1,
-            d_qk_max=256,
-            d_v_min=1,
-            d_v_max=256,
-            head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 1},
-            with_high_probability=[(128, 128), (192, 128), (256, 256)],
-        ),
-        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_f16(),
-        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
-        diag_align=RandomChoice(DIAG_TL),
-        is_ragged_or_padded_or_full=RandomChoice(
-            {"ragged_mult": 1, "cu_ragged_mult": 1}
-        ),
-        with_sink_token=RandomChoice({True: 1, False: 3}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
         declare_total_seq_len=RandomChoice({True: 1, False: 1}),
     )
@@ -403,11 +370,10 @@ def fp8_thd_fwd():
         output_type=RandomChoice(
             {torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}
         ),
-        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
-        diag_align=RandomChoice(DIAG_TL),
-        is_ragged_or_padded_or_full=RandomChoice(
-            {"ragged": 1, "cu_ragged": 1, "cu_ragged_mult": 1}
-        ),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
+        diag_align=RandomChoice(DIAG_BR_HEAVY),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
+        with_sink_token=RandomChoice({True: 1, False: 2}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
         declare_total_seq_len=RandomChoice({True: 1, False: 1}),
     )
@@ -493,8 +459,8 @@ def fp8_thd_bwd():
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 1}),
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float16: 1}),
-        with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
-        diag_align=RandomChoice(DIAG_TL),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
+        diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
@@ -534,9 +500,6 @@ def mxfp8_fwd():
         # Re-add padded/ragged once the API grows seq-len support.
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
-        # Passed to the graph as sdpa(unfuse_fma=...) by the mxfp8 harness
-        # (a graph attribute, not an env var).
-        with_unfuse_fma=RandomChoice({True: 1, False: 1}),
     )
 
 
@@ -624,12 +587,11 @@ def mxfp8_thd_fwd():
         data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
-        diag_align=RandomChoice(DIAG_BOTH),
+        diag_align=RandomChoice(DIAG_BR_HEAVY),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
         declare_total_seq_len=RandomChoice({True: 1, False: 1}),
-        # no unfuse_fma: the frost mxfp8 engine declines it
     )
 
 

@@ -17,13 +17,12 @@ Conventions:
 
 | suite | dtype | level | N | fuzzed | pinned | gates / notes |
 |---|---|---|---|---|---|---|
-| context.f16.dense | f16 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/cu_padded/full, sink, bias(1:5), unfuse_fma | infer |  |
+| context.f16.dense | f16 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/cu_padded/full, sink, bias(1:5) | infer |  |
 | context.f16.thd | f16 | L0 | 512 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, stats token/head-major, total_q/kv slack, declare totals on graph, ragged token gaps, sink | infer, layout THD (ragged/cu_ragged) |  |
-| context.f16.thd_offset_mult | f16 | L1 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, stats token/head-major, total_q/kv slack, declare totals on graph, ragged token gaps, layout ragged_mult/cu_ragged_mult, sink | infer, no mask, diag TL | ragged offset multiplier; engines without the attribute waive at build |
 | context.fp8.dense | fp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp8/fp16, layout padded/full, sink | infer |  |
-| context.fp8.thd | fp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, e4m3/e5m2 in, out fp8/fp16, layout ragged/cu_ragged/cu_ragged_mult, total_q/kv slack, declare totals on graph | infer, no mask, diag TL |  |
-| context.mxfp8.dense | mxfp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, sink, unfuse_fma | infer, SM100+, layout full (mxfp8 API has no seq-len args, #646) | SM>=100 |
-| context.mxfp8.thd | mxfp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, layout ragged/cu_ragged, sink, total_q/kv slack, declare totals on graph | infer, stats token-major TH1, d=128/128 (frost THD leg), SM100+ | SM>=100; fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native backend check_support-accepts THD mxfp8 but cannot execute it |
+| context.fp8.thd | fp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp8/fp16, layout ragged/cu_ragged, sink, total_q/kv slack, declare totals on graph | infer | diag BR-weighted 2:1 — production context-phase alignment |
+| context.mxfp8.dense | mxfp8 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, sink | infer, SM100+, layout full (mxfp8 API has no seq-len args, #646) | SM>=100 |
+| context.mxfp8.thd | mxfp8 | L0 | 128 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, e4m3/e5m2 in, out fp16/bf16, layout ragged/cu_ragged, sink, total_q/kv slack, declare totals on graph | infer, stats token-major TH1, d=128/128 (frost THD leg), SM100+ | SM>=100; diag BR-weighted 2:1 (production context alignment); fwd only (no THD mxfp8 bwd engine); needs opt-in FROST engine (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) — skips otherwise: the native backend check_support-accepts THD mxfp8 but cannot execute it |
 | models.llama31.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
 | models.qwen35.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
 | models.gpt_oss.context | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=64, d_v=64, sink=fuzzed | gpt_oss full/global attention layers |
@@ -53,7 +52,7 @@ Conventions:
 | bprop.f16.dense | f16 | L0 | 384 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, layout padded/full, deterministic, sink, bias(1:7) | t, r, a, i, n |  |
 | bprop.f16.thd | f16 | L0 | 512 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, stats token/head-major, total_q/kv slack, declare totals on graph, ragged token gaps, deterministic, sink | train, layout THD (ragged) |  |
 | bprop.fp8.dense | fp8 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, out fp8/fp16, deterministic, sink | train, e4m3 in, layout full |  |
-| bprop.fp8.thd | fp8 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, out fp8/fp16, deterministic, sink, total_q/kv slack | train, e4m3 in, no mask, diag TL, layout THD (ragged) | ragged FP8 backward requires cuDNN > 9.21.0 |
+| bprop.fp8.thd | fp8 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, out fp8/fp16, deterministic, sink, total_q/kv slack | train, e4m3 in, layout THD (ragged) | ragged FP8 backward requires cuDNN > 9.21.0 |
 | bprop.mxfp8.dense | mxfp8 | L0 | 256 | batch, s_q/s_kv, d_qk/d_v, heads (MHA/GQA/MQA), strides+gaps, data, mask: causal/left/right/band/none, diag TL/BR, out fp16/bf16, sink | train, e4m3 in, deterministic, layout full, SM100+ | SM>=100 |
 | models.llama31.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=64, h_kv=8, d_qk=128, d_v=128, sink=off | llama31 full/global attention layers |
 | models.qwen35.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=32, h_kv=2, d_qk=256, d_v=256, sink=off | qwen35 full/global attention layers |
@@ -61,4 +60,4 @@ Conventions:
 | models.dsv3.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=128, h_kv=128, d_qk=192, d_v=128, sink=off | dsv3 full/global attention layers |
 | models.kimi_k3.bprop | f16 | L0 | 8 | batch, seq lens, layout, mask flavor, data | h_q=96, h_kv=96, d_qk=192, d_v=128, sink=off | kimi_k3 full/global attention layers |
 
-**Total configs: 4888 across 33 suites.**
+**Total configs: 4760 across 32 suites.**
