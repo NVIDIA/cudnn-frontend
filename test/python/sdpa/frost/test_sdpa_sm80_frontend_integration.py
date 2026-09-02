@@ -187,34 +187,33 @@ def test_fwd_engine_strided_stats_d256():
     _check_fwd_engine_strided_stats(256)
 
 
-@_SM80
-@pytest.mark.L0
-def test_bwd_engine_end_to_end():
+def _check_bwd_engine_end_to_end(d):
+    scale = 1.0 / math.sqrt(d)
     # Forward via the SM80 engine to produce O / stats.
-    g, q, k, v, o, stats = _build_fwd_graph()
+    g, q, k, v, o, stats = _build_fwd_graph(d=d)
     _native_then_pin(g, _FWD)
     torch.manual_seed(0)
-    q_buf, k_buf, v_buf = _buf(), _buf(), _buf()
+    q_buf, k_buf, v_buf = _buf(d), _buf(d), _buf(d)
     o_buf = torch.empty_like(q_buf)
     stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
     g.execute({q: q_buf, k: k_buf, v: v_buf, o: o_buf, stats: stats_buf}, _ws(g))
 
     gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    st = _bshd_stride(B, H, S, D)
-    qb = gb.tensor(name="q", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    kb = gb.tensor(name="k", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    vb = gb.tensor(name="v", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    ob = gb.tensor(name="o", dim=(B, H, S, D), stride=st, data_type=_HALF)
-    dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
+    st = _bshd_stride(B, H, S, d)
+    qb = gb.tensor(name="q", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    kb = gb.tensor(name="k", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    vb = gb.tensor(name="v", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    ob = gb.tensor(name="o", dim=(B, H, S, d), stride=st, data_type=_HALF)
+    dob = gb.tensor(name="dO", dim=(B, H, S, d), stride=st, data_type=_HALF)
     statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT)
-    dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
+    dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=scale, use_causal_mask=True)
     # Output layout is honored only when DECLARED (the graph invariant:
     # IR-inferred output strides are provisional) — bind BSHD-physical.
     for t in (dq, dk, dv):
         t.set_output(True).set_data_type(_HALF).set_stride(st)
     _native_then_pin(gb, _BWD)
 
-    do_buf = _buf()
+    do_buf = _buf(d)
     dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
     gb.execute(
         {qb: q_buf, kb: k_buf, vb: v_buf, ob: o_buf, dob: do_buf, statsb: stats_buf, dq: dq_buf, dk: dk_buf, dv: dv_buf},
@@ -225,12 +224,32 @@ def test_bwd_engine_end_to_end():
     q_ref = q_buf.detach().float().requires_grad_()
     k_ref = k_buf.detach().float().requires_grad_()
     v_ref = v_buf.detach().float().requires_grad_()
-    o_ref = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=True, scale=_SCALE)
+    o_ref = torch.nn.functional.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=True, scale=scale)
     o_ref.backward(do_buf.float())
 
     torch.testing.assert_close(dq_buf.float(), q_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dk_buf.float(), k_ref.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(dv_buf.float(), v_ref.grad, rtol=3e-2, atol=3e-2)
+
+
+@_SM80
+@pytest.mark.L0
+def test_bwd_engine_end_to_end():
+    _check_bwd_engine_end_to_end(D)
+
+
+@_SM80
+@pytest.mark.L0
+def test_bwd_engine_end_to_end_d256():
+    """d=256 backward through the GRAPH API on SM80 (issues #704 / #864).
+
+    Invariant: validate() must not apply the native backward node's Ampere
+    ``hidden_dim <= 128`` gate to a graph a python engine is a candidate for;
+    the SM80 backward row advertises d <= 256 and serves it. Without the
+    python-native validate() this raised cudnnGraphNotSupportedError from
+    g.validate() and the row was unreachable from the graph API / torch provider.
+    """
+    _check_bwd_engine_end_to_end(256)
 
 
 @_SM80
