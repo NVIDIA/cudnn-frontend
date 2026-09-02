@@ -1768,34 +1768,23 @@ def _host(
     def _tma_swz(byte_w: int):
         return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
 
-    tma_q_desc = tmap.create_tensor_map_tiled_from_view(
-        q_tensor,
-        box_dims=qk_box_q,
-        stride_order=stride_order,
-        swizzle=_tma_swz(CFG.Q_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-    )
-    tma_k_desc = tmap.create_tensor_map_tiled_from_view(
-        k_tensor,
-        box_dims=qk_box_k,
-        stride_order=stride_order,
-        swizzle=_tma_swz(CFG.K_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-    )
-    tma_v_desc = tmap.create_tensor_map_tiled_from_view(
-        v_tensor,
-        box_dims=vo_box_v,
-        stride_order=stride_order,
-        swizzle=_tma_swz(CFG.V_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-    )
-    tma_o_desc = tmap.create_tensor_map_tiled_from_view(
-        o_tensor,
-        box_dims=vo_box_o,
-        stride_order=stride_order,
-        swizzle=_tma_swz(CFG.O_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-    )
+    def _create_tma_desc(tensor: cute.Tensor, box_dims, swizzle):
+        # CUTLASS DSL 4.8's `create_tensor_map_tiled_from_view` scales dynamic strides in i32.
+        # Explicitly widen the strides to 64-bit integers to avoid overflow.
+        return tmap.create_tensor_map_tiled(
+            global_address=tensor.iterator.toint(),
+            dtype=tensor.element_type,
+            global_dims=tuple(tensor.shape[i] for i in stride_order),
+            global_strides=tuple(cutlass.Int64(tensor.stride[i]) * tensor.element_type.width // 128 for i in stride_order[1:]),
+            box_dims=tuple(box_dims[i] for i in stride_order),
+            swizzle=swizzle,
+            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        )
+
+    tma_q_desc = _create_tma_desc(q_tensor, qk_box_q, _tma_swz(CFG.Q_SWZ_BYTES))
+    tma_k_desc = _create_tma_desc(k_tensor, qk_box_k, _tma_swz(CFG.K_SWZ_BYTES))
+    tma_v_desc = _create_tma_desc(v_tensor, vo_box_v, _tma_swz(CFG.V_SWZ_BYTES))
+    tma_o_desc = _create_tma_desc(o_tensor, vo_box_o, _tma_swz(CFG.O_SWZ_BYTES))
 
     # PackGQA: SQ*G packed rows per packed head, and QH/G packed heads.
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
