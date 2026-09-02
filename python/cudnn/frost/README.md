@@ -813,3 +813,12 @@ Asserts:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
+14. **Coverage changes update the support matrix.** A change to any SDPA
+    `Capabilities` row -- dtypes, head-dim shapes/envelope, mask and feature
+    booleans, THD, layouts -- or adding/retiring an `EngineSpec` updates
+    `docs/frost/SDPA_SUPPORT_MATRIX.md` in the same commit. That table is
+    the only arch x pass x head-dim x dtype view of what FROST serves, it is
+    maintained by hand from these rows, and it silently rots otherwise.
+    Knob-domain-only changes are exempt (the matrix does not track knobs).
+    Stated as a citable review rule in `python/cudnn/sdpa/AGENTS.md`
+    (Rule S2).
