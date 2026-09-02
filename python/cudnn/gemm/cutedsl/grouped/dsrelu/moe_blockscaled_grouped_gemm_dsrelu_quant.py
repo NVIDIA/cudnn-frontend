@@ -600,6 +600,8 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                 )
                 sched_counter[0] = cutlass.Int32(0)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     # ------------------------------------------------------------------
     # __call__
     # ------------------------------------------------------------------
@@ -2432,6 +2434,8 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             d_pipeline.producer_tail()
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     # ------------------------------------------------------------------
     # Internal: create extension based on weight_mode

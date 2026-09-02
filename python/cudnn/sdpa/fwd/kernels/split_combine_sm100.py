@@ -128,6 +128,9 @@ def _combine_kernel(
             lo[batch, head, q_row] = lse_val
 
 
+_combine_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     o_partial: cute.Tensor,

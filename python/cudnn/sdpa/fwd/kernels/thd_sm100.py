@@ -216,6 +216,9 @@ def build_thd_meta_kernel(
         meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
 
 
+build_thd_meta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def build_thd_meta_o_kv_descs_kernel(
     o_tensor: cute.Tensor,
@@ -324,6 +327,9 @@ def build_thd_meta_o_kv_descs_kernel(
             live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+
+
+build_thd_meta_o_kv_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.kernel
@@ -440,3 +446,6 @@ def build_thd_meta_o_descs_kernel(
             live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+
+
+build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

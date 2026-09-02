@@ -1629,6 +1629,8 @@ class SM120FusedMultiHeadAttentionForward:
         else:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
