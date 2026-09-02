@@ -700,6 +700,10 @@ def test_sdpa_fp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        # KNOWN GAP: a dense "padded" draw currently runs as full — exec_sdpa_fp8
+        # binds seq_len tensors only for the paged and ragged paths, so the
+        # padding mask is never applied here (only the ragged fp8 suites below
+        # exercise real padding).
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
     ) as randomization_ctx:
@@ -949,7 +953,13 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),  # FP16 more often for tighter tolerance testing
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 1, "full": 3}),
+        # full-only: the sdpa_mxfp8 API has no seq_len/padding arguments, so a
+        # "padded" draw would silently run dense-full (exec_sdpa_mxfp8 never
+        # reads seq_len_q/kv) and inflate padded coverage. When the API grows
+        # seq-len support, re-add padded/ragged draws — the shared
+        # packed_token_capacity / convert_uniform_to_packed helpers then give
+        # the NaN-poisoned capacity tails that catch the GitHub #624 class.
+        is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)

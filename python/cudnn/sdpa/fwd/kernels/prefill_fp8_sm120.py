@@ -80,6 +80,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_Q_TILES as _SEQ_Q_TILES,
     SUPPORTED_HEAD_TILES_FP8 as _SUPPORTED_HEAD_TILES_FP8,
     TemplateParams,
+    register_budgets,
     validate_params,
 )
 
@@ -351,6 +352,7 @@ class SM120FusedMultiHeadAttentionForward:
             self.num_warps = 8
         self.num_compute_warps = len(self.compute_warp_ids)
         self.num_load_warps = 1
+        self.load_regs, self.compute_regs = register_budgets(self.q_tile)
 
         self.bar_compute_sync = 1
         self.bar_k_consumed = 2
@@ -1193,7 +1195,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  LOAD K/V
         # /////////////////////////////////////////////////////////////////////////////
         if warp == self.load_warp_id:
-            prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
+            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
             # THD collapses the packed view's batch coordinate to 0; the
             # per-sequence token base rides the seq coordinate instead. Every
@@ -1264,7 +1266,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  COMPUTE
         # /////////////////////////////////////////////////////////////////////////////
         elif warp < self.load_warp_id:
-            prims.setmaxregister(232, prims.SetMaxRegisterAction.INCREASE)
+            prims.setmaxregister(self.compute_regs, prims.SetMaxRegisterAction.INCREASE)
 
             compute_warp_idx = warp
             q_warp_row0 = compute_warp_idx * self.MMA_TILER[0]
@@ -1625,7 +1627,7 @@ class SM120FusedMultiHeadAttentionForward:
         #  EMPTY
         # /////////////////////////////////////////////////////////////////////////////
         else:
-            prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
+            prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
     @cute.jit
     def __call__(

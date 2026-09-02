@@ -31,6 +31,11 @@ from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
+if __package__:
+    from .flops import count_causal_nonmasked_elems
+else:
+    from flops import count_causal_nonmasked_elems
+
 # torch.profiler measures through CUPTI. If CUPTI cannot attach -- for any
 # reason: a device it does not recognise, a driver mismatch, missing profiling
 # permissions, or simply not being present -- it records no events at all, and
@@ -688,7 +693,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -767,7 +771,11 @@ else:
             scale_s_fwd = graph_fwd.tensor_like(scale_s_gpu)
             scale_o_fwd = graph_fwd.tensor_like(scale_o_gpu)
 
-            o_fwd, stats_fwd, amax_s_fwd, amax_o_fwd = graph_fwd.sdpa_fp8(
+            # Amax_S is returned unconditionally but never requested: it only becomes a
+            # real graph output if set_output(True) is called on it, and nothing here
+            # consumes it. Leaving it virtual also keeps the graph servable by engines
+            # that do not produce Amax_S.
+            o_fwd, stats_fwd, _amax_s_unused, amax_o_fwd = graph_fwd.sdpa_fp8(
                 q=q_fwd,
                 k=k_fwd,
                 v=v_fwd,
@@ -866,7 +874,6 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
 
         if args.data_type == "fp8":
-            amax_s_fwd.set_output(True).set_dim(amax_s_gpu.size()).set_stride(amax_s_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
         elif args.data_type == "mxfp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
@@ -1170,7 +1177,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
 
@@ -1296,7 +1302,6 @@ else:
                     descale_s_fwd: descale_s_gpu,
                     scale_s_fwd: scale_s_gpu,
                     scale_o_fwd: scale_o_gpu,
-                    amax_s_fwd: amax_s_gpu,
                     amax_o_fwd: amax_o_gpu,
                 }
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -1477,21 +1482,7 @@ else:
         if attn_mask == "no_mask":
             num_nonmasked_elems = q_seqlen * kv_seqlen
         elif attn_mask in ("top_left", "bottom_right"):
-            if sliding_window_size is not None:
-                # With sliding window: each query attends to at most W keys
-                # (left_bound is exclusive, right_bound is inclusive)
-                # For positions 0 to W-1: 1, 2, ..., W keys (partial window)
-                # For positions W to S-1: W keys each (full window)
-                W = sliding_window_size
-                S = min(q_seqlen, kv_seqlen)
-                if S <= W:
-                    # Sequence shorter than window, use full causal
-                    num_nonmasked_elems = S * (S + 1) // 2
-                else:
-                    # Partial window (first W positions) + full window (remaining positions)
-                    num_nonmasked_elems = W * (W + 1) // 2 + (S - W) * W
-            else:
-                num_nonmasked_elems = torch.tril(torch.ones((q_seqlen, kv_seqlen), dtype=torch.bool)).sum()
+            num_nonmasked_elems = count_causal_nonmasked_elems(q_seqlen, kv_seqlen, attn_mask, sliding_window_size)
         else:
             raise ValueError(f"Unknown attn_mask: {attn_mask}")
         # BMM FLOPs: 2 * M * N * K.
@@ -1592,7 +1583,6 @@ else:
             scale_dK_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dV_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             scale_dP_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
-            amax_s_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dQ_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
             amax_dK_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -1634,7 +1624,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                     variant_pack_bwd = {
@@ -1746,7 +1735,6 @@ else:
                         descale_s_fwd: descale_s_gpu,
                         scale_s_fwd: scale_s_gpu,
                         scale_o_fwd: scale_o_gpu,
-                        amax_s_fwd: amax_s_gpu,
                         amax_o_fwd: amax_o_gpu,
                     }
                 elif args.data_type == "mxfp8":
@@ -1817,7 +1805,10 @@ else:
             # below instead of being silently re-timed as a wider region.
             device_events = [item for item in prof.key_averages() if item.device_time > 0]
             if len(matched_kernels) >= 1:
-                fwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                fwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
             elif not device_events:
@@ -1883,7 +1874,10 @@ else:
                 or item.key.startswith("fmha_")
             ]
             if len(matched_kernels) >= 1:
-                bwd_time = sum(item.device_time for item in matched_kernels) / 1000
+                # device_time_total, NOT device_time: key_averages() aggregates by
+                # kernel name and device_time is the per-occurrence MEAN, so a
+                # kernel launched n times per pass was being counted once.
+                bwd_time = sum(item.device_time_total for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
             elif not prof.key_averages():
