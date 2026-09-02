@@ -653,10 +653,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       (the SM107 sibling carries the same plumbing as its SM100 twin), so both
       rows advertise the split; the d192x128 file forks its own scheduler and
       has none, which is what split_d_shapes pins.
-    - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
-      sibling (issue #653); {NATURAL} keeps requests honest AND routes the
-      graph path around the un-ported derivation (place() hands the adapter
-      an explicit policy from this domain).
+    - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
+      (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
+      every decode call site, which is what the shared LPT_L2 decode requires,
+      so its remap is in lockstep with the SM100 twin (place() hands the
+      adapter an explicit policy from this domain).
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
@@ -712,9 +713,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            # LPT/LPT_L2 remap is not yet ported to the SM107 sibling (issue
-            # #653) — its row serves NATURAL only until the port lands.
-            sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            # LPT/LPT_L2 remap is in lockstep with the SM100 sibling (issue
+            # #653): every decode call site threads qh_per_kh/seqlen_kv, which
+            # is what the shared _common_sm100 LPT_L2 decode demands.  The L2
+            # figure the remap blocks against (CFG.L2_SIZE_MIB) is a tuning
+            # hint for the grouping, not a chip capacity, so the SM100 number
+            # carries to Rubin unchanged.
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
