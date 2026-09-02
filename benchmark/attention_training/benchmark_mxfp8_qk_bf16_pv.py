@@ -8,8 +8,13 @@ with ordinary MXFP8 QKV and native BF16 using identical logical shapes. The
 hybrid and ordinary MXFP8 paths share Q/K quantization; their V inputs differ
 by design (BF16 versus columnwise-MXFP8).
 
-Example (GB200):
+Examples (GB200):
     python benchmark/attention_training/benchmark_mxfp8_qk_bf16_pv.py
+    python benchmark/attention_training/benchmark_mxfp8_qk_bf16_pv.py --sweep
+
+The full sweep is the Cartesian product B={1,2,4,8,16,32,64,128} and
+Sq=Sk={1024,2048,4096,8192,16384}. It intentionally takes a long time:
+every row is a 100-launch warmup followed by a 1,000-launch CUDA-event average.
 """
 
 import argparse
@@ -17,6 +22,12 @@ import math
 from collections.abc import Callable
 
 import torch
+
+SWEEP_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
+SWEEP_SEQLENS = (1024, 2048, 4096, 8192, 16384)
+HYBRID_NAME = "Hybrid QK MXFP8 / PV BF16 (no Amax)"
+MXFP8_NAME = "QKV MXFP8"
+BF16_NAME = "QKV BF16"
 
 
 def _quantize_mxfp8(
@@ -29,6 +40,23 @@ def _quantize_mxfp8(
     data_d, _dq_d, sf_d, data_s, _dq_s, sf_s = quantize_to_mxfp8(x.float(), b, h, s, d)
     data, sf = (data_s, sf_s) if columnwise else (data_d, sf_d)
     return data.reshape_as(x), sf
+
+
+def _parse_positive_ints(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated positive-integer list for sweep sharding."""
+    try:
+        values = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of positive integers"
+        ) from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError(
+            "expected a non-empty list of positive integers"
+        )
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("values must not repeat")
+    return values
 
 
 def _time_cuda_events(fn: Callable[[], None], *, warmup: int, iters: int) -> float:
@@ -62,6 +90,151 @@ def _capture_cuda_graph(fn: Callable[[], None]) -> Callable[[], None]:
     return graph.replay
 
 
+def _time_variant(
+    api_cls,
+    *,
+    shape_q: tuple[int, int, int, int],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    pv_bf16: bool,
+    sf_q: torch.Tensor | None,
+    sf_k: torch.Tensor | None,
+    sf_v: torch.Tensor | None,
+    warmup: int,
+    iters: int,
+    execution: str,
+) -> dict[str, float]:
+    """Compile and time one variant; retain only one output buffer at a time."""
+    o = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16)
+    api = api_cls(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        is_causal=True,
+        scale_softmax=scale,
+        dtype_o=torch.bfloat16,
+        split_kv=1,
+        pv_bf16=pv_bf16,
+    )
+    assert api.check_support()
+    api.compile()
+
+    if pv_bf16:
+        launch = lambda: api.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=o,
+            sf_q=sf_q,
+            sf_k=sf_k,
+        )
+    elif sf_q is not None:
+        launch = lambda: api.execute(
+            q_tensor=q,
+            k_tensor=k,
+            v_tensor=v,
+            o_tensor=o,
+            sf_q=sf_q,
+            sf_k=sf_k,
+            sf_v=sf_v,
+        )
+    else:
+        launch = lambda: api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
+
+    timings: dict[str, float] = {}
+    if execution in ("eager", "both"):
+        timings["eager"] = _time_cuda_events(launch, warmup=warmup, iters=iters)
+    if execution in ("graph", "both"):
+        try:
+            graph_replay = _capture_cuda_graph(launch)
+        except RuntimeError as exc:
+            raise RuntimeError("variant is not CUDA-graph capturable") from exc
+        timings["cuda graph"] = _time_cuda_events(
+            graph_replay, warmup=warmup, iters=iters
+        )
+
+    # The launch closure owns the output buffer, so release it before moving to
+    # the next variant. This is essential at the high-B/high-Sq sweep points.
+    del launch, api, o
+    torch.cuda.synchronize()
+    return timings
+
+
+def _benchmark_shape(
+    api_cls,
+    *,
+    batch: int,
+    seqlen: int,
+    q_heads: int,
+    kv_heads: int,
+    dim: int,
+    warmup: int,
+    iters: int,
+    execution: str,
+) -> dict[str, dict[str, float]]:
+    """Run the three-way comparison at one B, Sq=Sk point."""
+    shape_q = (batch, q_heads, seqlen, dim)
+    shape_kv = (batch, kv_heads, seqlen, dim)
+    q_bf16 = (torch.randn(shape_q, device="cuda") * 0.5).to(torch.bfloat16)
+    k_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
+    v_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
+    q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
+    k_mx, sf_k = _quantize_mxfp8(k_bf16, columnwise=False)
+    v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
+    scale = 1.0 / math.sqrt(dim)
+
+    return {
+        HYBRID_NAME: _time_variant(
+            api_cls,
+            shape_q=shape_q,
+            q=q_mx,
+            k=k_mx,
+            v=v_bf16,
+            scale=scale,
+            pv_bf16=True,
+            sf_q=sf_q,
+            sf_k=sf_k,
+            sf_v=None,
+            warmup=warmup,
+            iters=iters,
+            execution=execution,
+        ),
+        MXFP8_NAME: _time_variant(
+            api_cls,
+            shape_q=shape_q,
+            q=q_mx,
+            k=k_mx,
+            v=v_mx,
+            scale=scale,
+            pv_bf16=False,
+            sf_q=sf_q,
+            sf_k=sf_k,
+            sf_v=sf_v,
+            warmup=warmup,
+            iters=iters,
+            execution=execution,
+        ),
+        BF16_NAME: _time_variant(
+            api_cls,
+            shape_q=shape_q,
+            q=q_bf16,
+            k=k_bf16,
+            v=v_bf16,
+            scale=scale,
+            pv_bf16=False,
+            sf_q=None,
+            sf_k=None,
+            sf_v=None,
+            warmup=warmup,
+            iters=iters,
+            execution=execution,
+        ),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=1)
@@ -79,12 +252,32 @@ def main() -> None:
     parser.add_argument(
         "--execution", choices=("both", "eager", "graph"), default="both"
     )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="run the B x Sq Cartesian product selected by --batches and --seqlens",
+    )
+    parser.add_argument(
+        "--batches",
+        type=_parse_positive_ints,
+        default=SWEEP_BATCHES,
+        help="comma-separated B values for --sweep (default: 1,2,4,8,16,32,64,128)",
+    )
+    parser.add_argument(
+        "--seqlens",
+        type=_parse_positive_ints,
+        default=SWEEP_SEQLENS,
+        help="comma-separated Sq=Sk values for --sweep (default: 1024,2048,4096,8192,16384)",
+    )
     args = parser.parse_args()
+
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
     ):
         raise RuntimeError("the MXFP8 experiment requires an SM100/SM103 GPU")
+    if args.batch <= 0 or args.seqlen <= 0:
+        raise ValueError("batch and seqlen must be positive")
     if args.q_heads % args.kv_heads:
         raise ValueError("q-heads must be divisible by kv-heads")
     if args.dim != 128:
@@ -92,102 +285,59 @@ def main() -> None:
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
+    shapes = (
+        tuple((batch, seqlen) for batch in args.batches for seqlen in args.seqlens)
+        if args.sweep
+        else ((args.batch, args.seqlen),)
+    )
     torch.manual_seed(17)
-    shape_q = (args.batch, args.q_heads, args.seqlen, args.dim)
-    shape_kv = (args.batch, args.kv_heads, args.seqlen, args.dim)
-    q_bf16 = (torch.randn(shape_q, device="cuda") * 0.5).to(torch.bfloat16)
-    k_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
-    v_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
-    q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
-    k_mx, sf_k = _quantize_mxfp8(k_bf16, columnwise=False)
-    v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
-    scale = 1.0 / math.sqrt(args.dim)
 
-    def build(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, pv_bf16: bool):
-        o = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16)
-        api = SdpaFwdDslSm100(
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_o=o,
-            is_causal=True,
-            scale_softmax=scale,
-            dtype_o=torch.bfloat16,
-            split_kv=1,
-            pv_bf16=pv_bf16,
-        )
-        assert api.check_support()
-        api.compile()
-        return api, o
-
-    entries: list[tuple[str, Callable[[], None]]] = []
-    hybrid, o_hybrid = build(q_mx, k_mx, v_bf16, pv_bf16=True)
-    entries.append(
-        (
-            "Hybrid QK MXFP8 / PV BF16 (no Amax)",
-            lambda: hybrid.execute(
-                q_tensor=q_mx,
-                k_tensor=k_mx,
-                v_tensor=v_bf16,
-                o_tensor=o_hybrid,
-                sf_q=sf_q,
-                sf_k=sf_k,
-            ),
-        )
+    scope = (
+        "full B x Sq sweep"
+        if args.sweep
+        and args.batches == SWEEP_BATCHES
+        and args.seqlens == SWEEP_SEQLENS
+        else "selected B x Sq sweep" if args.sweep else "single shape"
     )
-    baseline_mx, o_mx = build(q_mx, k_mx, v_mx, pv_bf16=False)
-    entries.append(
-        (
-            "QKV MXFP8",
-            lambda: baseline_mx.execute(
-                q_tensor=q_mx,
-                k_tensor=k_mx,
-                v_tensor=v_mx,
-                o_tensor=o_mx,
-                sf_q=sf_q,
-                sf_k=sf_k,
-                sf_v=sf_v,
-            ),
-        )
-    )
-    baseline_bf16, o_bf16 = build(q_bf16, k_bf16, v_bf16, pv_bf16=False)
-    entries.append(
-        (
-            "QKV BF16",
-            lambda: baseline_bf16.execute(
-                q_tensor=q_bf16, k_tensor=k_bf16, v_tensor=v_bf16, o_tensor=o_bf16
-            ),
-        )
-    )
-
     print(
-        f"shape: B={args.batch} Hq={args.q_heads} Hkv={args.kv_heads} S={args.seqlen} D={args.dim}; causal; "
+        f"{scope}: Hq={args.q_heads} Hkv={args.kv_heads} D={args.dim}; causal; "
         f"{args.warmup} warmup launches; average of {args.iters} CUDA-event timed launches per row"
     )
-    results: dict[tuple[str, str], float] = {}
-    for name, fn in entries:
-        if args.execution in ("eager", "both"):
-            results[(name, "eager")] = _time_cuda_events(
-                fn, warmup=args.warmup, iters=args.iters
-            )
-        if args.execution in ("graph", "both"):
-            try:
-                graph_replay = _capture_cuda_graph(fn)
-            except RuntimeError as exc:
-                raise RuntimeError(f"{name} is not CUDA-graph capturable") from exc
-            results[(name, "cuda graph")] = _time_cuda_events(
-                graph_replay, warmup=args.warmup, iters=args.iters
-            )
+    print(
+        f"{'B':>4s} {'Sq=Sk':>7s} {'kernel':38s} {'execution':11s} "
+        f"{'avg us/launch':>14s} {'vs BF16':>9s}"
+    )
 
-    print(f"{'kernel':38s} {'execution':11s} {'avg us/launch':>14s} {'vs BF16':>9s}")
-    for name, _fn in entries:
-        for execution in ("eager", "cuda graph"):
-            average_us = results.get((name, execution))
-            if average_us is None:
-                continue
-            bf16_us = results.get(("QKV BF16", execution))
-            relative = "n/a" if bf16_us is None else f"{average_us / bf16_us:.3f}x"
-            print(f"{name:38s} {execution:11s} {average_us:14.2f} {relative:>9s}")
+    for batch, seqlen in shapes:
+        try:
+            results = _benchmark_shape(
+                SdpaFwdDslSm100,
+                batch=batch,
+                seqlen=seqlen,
+                q_heads=args.q_heads,
+                kv_heads=args.kv_heads,
+                dim=args.dim,
+                warmup=args.warmup,
+                iters=args.iters,
+                execution=args.execution,
+            )
+        except torch.OutOfMemoryError:
+            print(f"{batch:4d} {seqlen:7d} {'OOM':38s} {'-':11s} {'-':>14s} {'-':>9s}")
+        else:
+            for name in (HYBRID_NAME, MXFP8_NAME, BF16_NAME):
+                for execution in ("eager", "cuda graph"):
+                    average_us = results[name].get(execution)
+                    if average_us is None:
+                        continue
+                    bf16_us = results[BF16_NAME][execution]
+                    relative = f"{average_us / bf16_us:.3f}x"
+                    print(
+                        f"{batch:4d} {seqlen:7d} {name:38s} {execution:11s} "
+                        f"{average_us:14.2f} {relative:>9s}"
+                    )
+        finally:
+            # Drop tensors, API objects, and graph pools before the next point.
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
