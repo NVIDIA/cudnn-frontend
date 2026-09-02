@@ -23,7 +23,7 @@ def render():
         "",
         "- One suite = one deterministic seed sweep (`num_tests` configs from `rng_seed`);",
         "  every config prints a `test_repro_suite.py::test_repro --repro ...` command.",
-        "- fp16/bf16 sibling suites share seed + knob set: identical geometry, both dtypes.",
+        "- 16-bit is one family: f16 suites draw fp16 or bf16 per config, like fp8 draws e4m3/e5m2.",
         "- Sliding-window/causal masks and bias are fuzz axes inside suites, never separate suites.",
         "- THD suites fuzz first-class packed capacities: `total_q`/`total_kv` slack and",
         "  declaring them on the graph (`sdpa(max_total_seq_len_q/kv=...)`).",

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Context (prefill forward) suites, bf16 — same rng seeds and knob sets as the
-fp16 siblings, so both dtypes sweep identical geometry. Also hosts the
-deterministic mixed seq-len form cases (bf16)."""
+"""Context (prefill forward) suites, f16 — the 16-bit family: each config
+draws fp16 or bf16 (data_type fuzz), like fp8 draws e4m3/e5m2. Also hosts
+the deterministic mixed seq-len form cases."""
 
 import cudnn
 import pytest
@@ -15,18 +15,26 @@ from sdpa.suites.common import run_suite, suite_seeds
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "test_no", suite_seeds("context.bf16.dense"), ids=lambda p: f"test{p[0]}"
+    "test_no", suite_seeds("context.f16.dense"), ids=lambda p: f"test{p[0]}"
 )
-def test_context_bf16_dense(env_info, test_no, request, cudnn_handle):
-    run_suite("context.bf16.dense", env_info, test_no, request, cudnn_handle)
+def test_context_f16_dense(env_info, test_no, request, cudnn_handle):
+    run_suite("context.f16.dense", env_info, test_no, request, cudnn_handle)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "test_no", suite_seeds("context.bf16.thd"), ids=lambda p: f"test{p[0]}"
+    "test_no", suite_seeds("context.f16.thd"), ids=lambda p: f"test{p[0]}"
 )
-def test_context_bf16_thd(env_info, test_no, request, cudnn_handle):
-    run_suite("context.bf16.thd", env_info, test_no, request, cudnn_handle)
+def test_context_f16_thd(env_info, test_no, request, cudnn_handle):
+    run_suite("context.f16.thd", env_info, test_no, request, cudnn_handle)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "test_no", suite_seeds("context.f16.thd_offset_mult"), ids=lambda p: f"test{p[0]}"
+)
+def test_context_f16_thd_offset_mult(env_info, test_no, request, cudnn_handle):
+    run_suite("context.f16.thd_offset_mult", env_info, test_no, request, cudnn_handle)
 
 
 MIXED_SEQ_LEN_FORM_CASES = [
@@ -80,7 +88,6 @@ def test_context_mixed_seq_len_forms(
         right_bound=right_bound,
         seq_len_q=[128, 100, 256, 37],
         seq_len_kv=[96, 64, 512, 200],
-        implementation=cudnn.attention_implementation.UNIFIED,
     )
     cfg.fill_derived_fields()
     exec_sdpa(cfg, request, cudnn_handle)

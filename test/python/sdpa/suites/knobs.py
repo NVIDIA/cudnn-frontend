@@ -5,9 +5,8 @@
 
 Each factory returns the kwargs for a RandomizationContext. Conventions:
 
-  - dtype is pinned per suite (dtype specialization); the same rng_seed used
-    for a fp16 and a bf16 suite yields the same geometry sweep, so the two
-    dtypes cover identical shapes.
+  - 16-bit is ONE family: f16 suites draw torch.float16 or torch.bfloat16
+    per config (data_type fuzz), exactly like the fp8 suites draw e4m3/e5m2.
   - the sliding-window / causal mask flavor is a fuzz axis of every knob set
     that supports it (there is no separate mask suite).
   - bias is a low-weight fuzz axis of the dense knob sets (no separate bias
@@ -45,14 +44,16 @@ DIAG_BOTH = {
 DIAG_TL = {cudnn.diagonal_alignment.TOP_LEFT: 1}
 
 
-def _dt(dtype):
-    return RandomChoice({dtype: 1})
+def _f16():
+    # One 16-bit family: each config draws fp16 or bf16, like fp8 draws
+    # e4m3/e5m2.
+    return RandomChoice({torch.float16: 1, torch.bfloat16: 1})
 
 
 # ---- fp16 / bf16 -----------------------------------------------------------
 
 
-def dense_fwd(dtype):
+def dense_fwd():
     return dict(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
@@ -76,7 +77,7 @@ def dense_fwd(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice(
@@ -88,7 +89,7 @@ def dense_fwd(dtype):
     )
 
 
-def thd_fwd(dtype):
+def thd_fwd():
     return dict(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
@@ -112,7 +113,7 @@ def thd_fwd(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
@@ -123,7 +124,7 @@ def thd_fwd(dtype):
     )
 
 
-def thd_offset_mult(dtype):
+def thd_offset_mult():
     # Ragged offset multiplier (CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER);
     # engines without it waive at graph build.
     return dict(
@@ -149,7 +150,7 @@ def thd_offset_mult(dtype):
             with_high_probability=[(128, 128), (192, 128), (256, 256)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_TL),
         is_ragged_or_padded_or_full=RandomChoice(
@@ -161,7 +162,7 @@ def thd_offset_mult(dtype):
     )
 
 
-def dense_bwd(dtype):
+def dense_bwd():
     return dict(
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv=RandomSequenceLength(
@@ -185,7 +186,7 @@ def dense_bwd(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 4, "full": 1}),
@@ -195,7 +196,7 @@ def dense_bwd(dtype):
     )
 
 
-def thd_bwd(dtype):
+def thd_bwd():
     return dict(
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv=RandomSequenceLength(
@@ -219,7 +220,7 @@ def thd_bwd(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128), (256, 256)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1}),
@@ -231,7 +232,7 @@ def thd_bwd(dtype):
     )
 
 
-def decode(dtype):
+def decode():
     # s_q == 1 generation step against a long KV history.
     return dict(
         batches=RandomBatchSize(min=1, max=32),
@@ -251,7 +252,7 @@ def decode(dtype):
             with_high_probability=[(128, 128), (192, 128)],
         ),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
@@ -259,7 +260,7 @@ def decode(dtype):
     )
 
 
-def lean_attn(dtype):
+def lean_attn():
     # Decode against a long KV (513..4096): the lean-attention split regime.
     return dict(
         batches=RandomBatchSize(min=1, max=32),
@@ -279,14 +280,14 @@ def lean_attn(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128)],
         ),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
     )
 
 
-def paged(dtype):
+def paged():
     # Chunked generation (s_q <= 64) against a paged KV cache.
     return dict(
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
@@ -311,7 +312,7 @@ def paged(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128)],
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 2, "cu_padded": 1}),
@@ -568,7 +569,7 @@ def mxfp8_bwd():
     )
 
 
-def thd_chunked(dtype):
+def thd_chunked():
     # Ragged (THD) chunked generation: short query chunks (s_q <= 64) against a
     # long KV history, packed varlen on both sides — the varlen continuation /
     # chunked-prefill shape. Not covered by test_mhas_v2 (its THD suites are
@@ -591,7 +592,7 @@ def thd_chunked(dtype):
             with_high_probability=[(64, 64), (128, 128), (192, 128)],
         ),
         head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1}),
@@ -635,7 +636,7 @@ def mxfp8_thd_fwd():
 # ---- model presets ----------------------------------------------------------
 
 
-def model_knobs(preset, phase, dtype):
+def model_knobs(preset, phase):
     """Knob set for a popular-model preset: heads/dims pinned to the model,
     everything else (batch, seq lens, layout, mask flavor, data) fuzzed.
     ``phase``: context (prefill fwd), generation (decode fwd), bprop (training)."""
@@ -659,7 +660,7 @@ def model_knobs(preset, phase, dtype):
             head_count=Fixed(
                 (preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)
             ),
-            data_type=_dt(dtype),
+            data_type=_f16(),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
             is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
@@ -686,7 +687,7 @@ def model_knobs(preset, phase, dtype):
         head_count=Fixed(
             (preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)
         ),
-        data_type=_dt(dtype),
+        data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**preset.mask_weights),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "padded": 1, "full": 1}),
