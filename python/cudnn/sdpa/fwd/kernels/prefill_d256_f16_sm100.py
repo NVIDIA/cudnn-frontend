@@ -45,6 +45,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -110,6 +111,10 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+CTA_MMA = CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). The adapter reads both this flag and CTA_MMA to size the launch.
+THD_PERSISTENT = True
 
 _sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 _decode_initial = _sdpa_h.decode_initial
@@ -125,8 +130,12 @@ from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _b
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
-# caller's length tensors and the adapter launches the plan-time envelope
-# grid (issue #552) — no length ever reaches the host.
+# caller's length tensors (issue #552) — no length ever reaches the host — and
+# also publishes the live unit total + claim counter the persistent scheduler
+# reads, so the adapter launches a MACHINE-sized grid rather than the plan-time
+# envelope (issue #618). Metadata layout, in int32 words:
+#   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
+#   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
@@ -474,7 +483,24 @@ def _kernel(
     else:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
 
 
 @cute.jit
@@ -702,9 +728,9 @@ def _tmastg_warp_group(
         o_batch = _partial_batch(batch_idx, split_idx, n_batch)
 
         if cutlass.const_expr(CFG.THD_VARLEN):
-            # DEAD unit (batch == n_batch, envelope grid — issue #552): no O
-            # rows exist and descriptor slot n_batch is never built, so skip
-            # the store; the barrier protocol below still runs.
+            # DEAD unit (batch == n_batch, over-launched grid — issue #552):
+            # no O rows exist and descriptor slot n_batch is never built, so
+            # skip the store; the barrier protocol below still runs.
             if batch_idx < n_batch:
                 o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                 o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), q_head_idx, q_row_coord, cutlass.Int32(0))
@@ -1777,6 +1803,17 @@ def _host(
     grid_q_supers = q_clusters * CFG.CTA_MMA
     q_supers = grid_q_supers
     if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD setup launch: build the [kv|cu_q|cu_k|remap|live|ctr] metadata
+        # buffer DEVICE-side from the caller's length tensors (no host cumsum,
+        # no H2D — issue #552), then the per-batch O descriptor array. Main
+        # grid: the PERSISTENT cluster count — the adapter hands down
+        # n_thd_units already capped to what the device holds resident,
+        # min(plan-time envelope, SMs / CTA_MMA), NOT the envelope itself
+        # (issue #618). It doubles as the claim counter's seed: cluster c runs
+        # unit c off its blockIdx, then pulls from the counter, so the grid and
+        # the seed must be the same number. Dispatching past the live total
+        # stays safe either way — such a unit decodes the batch == n_batch
+        # sentinel and drains without loads or stores.
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.
@@ -1794,7 +1831,7 @@ def _host(
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
             cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
-            n_thd_units,  # CLC path: envelope units; the counter goes unused
+            n_thd_units,  # persistent cluster count; also seeds the claim counter
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

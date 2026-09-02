@@ -1715,7 +1715,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
         # The PLAN-TIME envelope grid — dead units exit by kernel contract.
         # PERSISTENT THD grid: cap the launch at what the device can hold
-        # resident (one cluster per CTA_MMA SMs) instead of the plan-time
+        # resident (one cluster per CGA_SIZE SMs) instead of the plan-time
         # envelope. The kernel pulls units from a device-bounded counter, so
         # the grid no longer has to cover the work list -- which is what made
         # 38-84% of clusters dead.
@@ -1723,8 +1723,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             # Resolved here, not above: the CLC path below never reads it, and
             # this runs per execute.
-            _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
-            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cta_mma)))
+            #
+            # CGA_SIZE (= CGA_M * CGA_N) is the CTA count of ONE cluster, which
+            # is what the grid is laid out in: grid_x = units * CGA_M. It equals
+            # CTA_MMA on the cga2 flavors (d128/d192/d256) but NOT on d512,
+            # which pairs CGA_M=4 with CTA_MMA=2 — capping on CTA_MMA there
+            # would launch 2x the CTAs the device holds resident. CTA_MMA stays
+            # as the fallback so a module predating CGA_SIZE still caps.
+            _cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
+            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cluster_ctas)))
             _dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if _dbg > 0:
                 units = min(_env, _dbg)
