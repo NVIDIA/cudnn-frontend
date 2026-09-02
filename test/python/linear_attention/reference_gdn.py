@@ -151,3 +151,40 @@ def gdn_reference(
     else:
         o = qf.new_zeros(1, 0, HV, V)
     return o, torch.cat(states, dim=0).transpose(-1, -2).contiguous()
+
+
+def gdp_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    num_householder: int,
+    scale: Optional[float] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    use_beta_sigmoid: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GDP as GDN on the expanded sub-token sequence: the gate acts on
+    sub-token 0, the readout on sub-token ``n - 1``. q/g are ``[B, T, ...]``,
+    k/v/beta ``[B, T * n, ...]``."""
+    n = num_householder
+    B, T, H, K = q.shape
+    HO = g.shape[2]
+    q_e = q.new_zeros(B, T, n, H, K)
+    q_e[:, :, n - 1] = q
+    g_e = g.new_zeros(B, T, n, HO)
+    g_e[:, :, 0] = g
+    o, state = gdn_reference(
+        q_e.reshape(B, T * n, H, K),
+        k,
+        v,
+        g_e.reshape(B, T * n, HO),
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens * n if cu_seqlens is not None else None,
+        use_beta_sigmoid=use_beta_sigmoid,
+    )
+    return o.reshape(B, T, n, *o.shape[2:])[:, :, n - 1], state
