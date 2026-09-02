@@ -2916,23 +2916,30 @@ def test_epi_n_divides_the_drain_width() -> None:
     assert seen_non_pow2_tile, "the catalog no longer carries a non-power-of-2 drain width — the test is vacuous"
 
 
-def test_the_auto_path_never_picks_a_non_power_of_two_tile() -> None:
-    """`select_config` scores N only over {32,64,128,256}, so the widths the
-    divisor rule newly admits are reachable through a forced config, not through
-    the engine's own choice."""
-    from cudnn.gemm.frost.tile_config import select_config
+def test_the_auto_path_only_picks_catalog_widths() -> None:
+    """`select_config` now scans every hardware-legal N width (multiples of 32
+    up to 256) on the plain single-GEMM path — the widths the epilogue divisor
+    rule admits are the engine's own choices there, not just forced configs.
+    The CONSTRAINED paths keep the power-of-two ladder: block-scale needs
+    cta_n % 128 == 0 and multi-GEMM squeezes a shared power-of-two budget."""
+    from cudnn.gemm.frost.tile_config import by_name, select_config
 
-    widths = set()
+    widths, constrained_widths = set(), set()
     for M in (64, 128, 512, 4096, 16384):
         for N in (64, 128, 512, 4096, 11008):
             for num_gemms in (1, 2, 3):
                 for block_scale in (False, True):
                     try:
-                        widths.add(select_config(M, N, num_gemms=num_gemms, block_scale=block_scale).cta_tile_n)
+                        cfg = select_config(M, N, num_gemms=num_gemms, block_scale=block_scale)
                     except NotImplementedError:
-                        pass
+                        continue
+                    by_name(cfg.name)  # every auto pick must resolve in the catalog
+                    widths.add(cfg.cta_tile_n)
+                    if num_gemms > 1 or block_scale:
+                        constrained_widths.add(cfg.cta_tile_n)
     assert widths, "select_config produced nothing — the sweep is vacuous"
-    assert all(w & (w - 1) == 0 for w in widths), sorted(widths)
+    assert all(32 <= w <= 256 and w % 32 == 0 for w in widths), sorted(widths)
+    assert all(w & (w - 1) == 0 for w in constrained_widths), sorted(constrained_widths)
 
 
 def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
