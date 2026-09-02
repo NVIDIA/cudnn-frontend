@@ -3788,6 +3788,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("packed fp4 output")
     if chain.matmul.accum_dtype != "fp32":
         reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    if chain.matmul.batch * config.split_k_slices > 65535:
+        reasons.append(f"grid.z={chain.matmul.batch * config.split_k_slices} exceeds CUDA's 65535 limit")
     if config.split_k_slices > 32:
         # The reducer unrolls its accumulation at trace time; 32 bounds the
         # unroll and is where the auto-selector caps S anyway.

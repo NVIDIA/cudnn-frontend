@@ -173,7 +173,6 @@ def _b_collector_op(mi):
     return nvvm.Tcgen05MMACollectorOp.USE
 
 
-
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
