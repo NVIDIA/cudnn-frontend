@@ -253,12 +253,18 @@ def test_d256_direct_aten_op():
     torch.manual_seed(0)
     q = torch.randn(2, 4, 384, 256, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     k, v = torch.randn_like(q, requires_grad=True), torch.randn_like(q, requires_grad=True)
+    # Both directions must be servable: the forward may build while the
+    # BACKWARD graph is rejected at validate() (e.g. Ampere's native support
+    # surface caps the backward at d<=128 and runs before FROST routing, so
+    # the graph never reaches an OSS engine that could serve d=256). The
+    # frontend raises cudnnGraphNotSupportedError (a plain Exception, not a
+    # RuntimeError) for that, so catch both.
     try:
         out = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, None, True, 0.0, False)
-    except RuntimeError as e:
-        pytest.skip(f"no engine serves d=256 on this arch: {str(e).splitlines()[0][:80]}")
-    o = out[0]
-    o.backward(torch.ones_like(o))
+        o = out[0]
+        o.backward(torch.ones_like(o))
+    except (RuntimeError, cudnn.cudnnGraphNotSupportedError) as e:
+        pytest.skip(f"no engine serves d=256 fwd+bwd on this arch: {str(e).splitlines()[0][:80]}")
     o_ref, q_ref, _, _ = math_ref(q, k, v, False, None)
     o_ref.backward(torch.ones_like(o_ref))
     assert (o.float() - o_ref).abs().max().item() < 0.05
