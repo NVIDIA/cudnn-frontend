@@ -254,8 +254,7 @@ class TileConfig:
             f"_cluster{self.cga_size_m}x{self.cga_size_n}"
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
-            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
-            + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "") + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
         )
 
     @property
