@@ -1546,7 +1546,7 @@ def generate(
     # the reduce kernel (template-owned) applies the store cast to D.
     if split_k_slices > 1:
         if tma_slots:
-            body_lines = ["vec_out = vec_f32"]
+            body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
         else:
             body_lines = _splitk_partial_store_lines(vsize)
 
