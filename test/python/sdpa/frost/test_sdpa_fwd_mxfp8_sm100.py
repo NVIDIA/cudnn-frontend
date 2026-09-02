@@ -922,8 +922,10 @@ def test_mxfp8_thd(in_key, causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_multi_unit_per_cta(monkeypatch):
+def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
 
     The persistent grid is machine-sized, so a cluster pulls units repeatedly
@@ -932,10 +934,10 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch):
     tile bases for a second range). FROST_THD_CLUSTERS pins the grid to 4
     clusters so the claim loop runs deep on any device."""
     monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d_qk)
     lens = [1024, 768, 512, 256]
-    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=True)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, in_key, torch.float16, scale=scale, causal=True, d_qk=d_qk, d_v=d_v)
+    _check(o_out, o_ref, torch.float16, in_key)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
@@ -1053,11 +1055,7 @@ def test_mxfp8_thd_nonfinite_v_sf_padding(d_qk, in_key, monkeypatch):
         if kwargs["columnwise"]:
             # S=129: block 0 of the second F8_128x4 tile is partially valid;
             # blocks 1..3 are physical padding. Each lane-group is 16 bytes.
-            offsets = [
-                (row % 32) * 16 + (row // 32) * 4 + col
-                for row in range(128)
-                for col in (1, 2, 3)
-            ]
+            offsets = [(row % 32) * 16 + (row // 32) * 4 + col for row in range(128) for col in (1, 2, 3)]
             sf[:, 1, torch.tensor(offsets, device=sf.device)] = 0xFF
         return data, dequant, sf
 

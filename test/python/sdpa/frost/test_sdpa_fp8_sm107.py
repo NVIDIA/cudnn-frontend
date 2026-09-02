@@ -335,9 +335,7 @@ def test_fp8_rows_serve_dense_envelope():
     # The d128 kernel carries the THD leg on both arch lines; sm100 adds the
     # d192 and d512 flavors' THD legs.
     assert caps[engines.engine_name(arch="sm107", fp8=True)].thd_d_shapes == frozenset({(128, 128)})
-    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset(
-        {(128, 128), (192, 128), (512, 512)}
-    )
+    assert caps[engines.engine_name(arch="sm100", fp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (512, 512)})
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 

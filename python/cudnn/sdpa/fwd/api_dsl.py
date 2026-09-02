@@ -1157,15 +1157,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         # Keep direct construction aligned with each quantized family's THD
         # kernels; graph routing enforces the same per-family shape domain.
-        _thd_fp8_shapes = (
-            {(128, 128), (192, 128), (512, 512)}
-            if self._pertensor
-            else {(128, 128), (192, 128)}
-        )
+        _thd_fp8_shapes = {(128, 128), (192, 128), (512, 512)} if self._pertensor else {(128, 128), (192, 128)}
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
-            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; "
-            f"got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1735,8 +1730,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # them now, not just FP8/MXFP8 (issue #624).
             o_desc_slots = b + 3
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
-        # The PLAN-TIME envelope grid — dead units exit by kernel contract.
-        # PERSISTENT THD grid: cap the launch at what the device can hold
+        # The plan-time envelope bounds the possible unit count. Persistent THD
+        # kernels cap the launch at what the device can hold
         # resident (one cluster per CGA_SIZE SMs) instead of the plan-time
         # envelope. The kernel pulls units from a device-bounded counter, so
         # the grid no longer has to cover the work list -- which is what made

@@ -241,9 +241,9 @@ def build_thd_meta_o_kv_descs_kernel(
     """THD setup for the FP8/MXFP8 flavors: metadata, per-batch O descriptors
     and the packed-total-clamped K/V descriptors.
 
-    Same body as ``build_thd_meta_o_descs_kernel`` minus the persistent
-    scheduler's live-unit total and claim counter, which these flavors do not
-    launch with. Both kernels clamp K/V (issue #624).
+    Like ``build_thd_meta_o_descs_kernel``, this publishes the persistent
+    scheduler's live-unit total and claim counter. Both kernels also clamp K/V
+    (issue #624).
 
     The K/V loads tile in TILE_N rows, so the LAST sequence's tile steps past
     the packed KV total into the buffer's capacity tail — caller-owned bytes

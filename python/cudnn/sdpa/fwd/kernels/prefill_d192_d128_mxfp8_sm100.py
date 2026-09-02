@@ -4,7 +4,7 @@
 """DSL prefill SDPA kernel - block-scale MXFP8, d_qk=192/d_v=128, SM100.
 
 Classic 2-sub-tile pipeline (TILES_Q=2, two softmax warpgroups, four correction
-warps, persistent try_cancel scheduler); combines the production SM100 MXFP8
+warps, persistent tile scheduler); combines the production SM100 MXFP8
 scale-factor pipeline with the native D192/D128 geometry:
 plus the MXFP8 TMEM scale-factor (SF) relayout:
   1. **cga2-only, STAGES_KV=4** (config).
@@ -51,8 +51,8 @@ Cfg = type(CFG)
 # row_max_reduction_64 (default 0). api_dsl sets this from the device capability at
 # compile time; a distinct value yields a distinct kernel specialization (cache key).
 FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
-# THD / varlen follows the device-built-metadata + plan-time-envelope design
-# used by the sibling FP8-family kernels. Q/K/V/O are packed with dynamic token
+# THD / varlen follows the device-built-metadata + persistent-grid design used
+# by the sibling FP8-family kernels. Q/K/V/O are packed with dynamic token
 # extents; MXFP8 scale factors are packed per-sequence and tile-padded.
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -80,6 +80,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
 )
@@ -363,6 +364,9 @@ kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
 vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# The adapter uses a machine-sized THD grid; the setup kernel publishes the
+# live work-unit total and the first unit not covered by the initial grid.
+THD_PERSISTENT = True
 _SWA_ONE_SIDED_GEOMETRY = bool(
     (CFG.MASK_FLAGS & MASK_SWA)
     and (CFG.MASK_FLAGS & MASK_CAUSAL)
@@ -471,7 +475,7 @@ _bounds_for_tile_split = _split_h.bounds_for_tile_split
 _nomask_range_split = _split_h.nomask_range_split
 _partial_batch = _split_h.partial_batch
 
-# CLC writes four words. E4M3 THD's scheduler warp decodes that payload once and
+# E4M3 THD's scheduler warp decodes each four-word work payload once and
 # publishes coordinates beside it so every pipeline role does not rescan the
 # packed batch metadata. E5M2 keeps the original role-local decode because
 # scheduler-side decode lengthens its measured critical path. Split-KV needs
@@ -503,6 +507,9 @@ def _scheduler_warp_loop_thd_predecode(
     seq_kv_lens_tensor,
     seqlen_kv,
 ):
+    meta = cutlass.make_array_view(seq_kv_lens_tensor)
+    ctr_ptr = Pointer(seq_kv_lens_tensor.iterator.raw_ptr(), dtype=cutlass.Int32) + cutlass.Int32(4) * n_batch + cutlass.Int32(3)
+    live_off = cutlass.Int32(4) * n_batch + cutlass.Int32(2)
     state = PipelineState.start()
     is_valid = cutlass.Int32(1)
 
@@ -513,12 +520,31 @@ def _scheduler_warp_loop_thd_predecode(
             arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
 
         if nvvm.elect_sync() and is_cga_first_cta:
-            nvvm.clusterlaunchcontrol_try_cancel(
-                sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
-                sched.mb_scheduler.subview(state.idx),
-                multicast=1,
+            uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
+            live = cutlass.Int32(meta[live_off])
+            valid = cutlass.Int32(
+                arith.select(
+                    (uid < live).ir_value(),
+                    cutlass.Int32(1).ir_value(),
+                    cutlass.Int32(0).ir_value(),
+                )
             )
-        nvvm.fence_proxy("async.shared", space="cta")
+            tile_ptr = cute.make_ptr(
+                cutlass.Int32,
+                sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=16,
+            )
+            mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                sched.mb_scheduler.subview(state.idx).data_ptr().toint(cutlass.Int32),
+                cutlass.AddressSpace.smem,
+                assumed_align=8,
+            )
+            payload = (uid * cutlass.Int32(CFG.CGA_M), cutlass.Int32(0), valid, cutlass.Int32(0))
+            for cta_rank in cutlass.range_constexpr(CGA_SIZE):
+                for word in cutlass.range_constexpr(4):
+                    cute.arch.store_async_dsmem(tile_ptr + word, payload[word], mbar_ptr, cta_rank)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
@@ -1162,6 +1188,17 @@ def _kernel(
                 n_batch,
                 seq_kv_lens_tensor,
                 seqlen_kv,
+            )
+        elif cutlass.const_expr(CFG.THD_VARLEN):
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
             )
         else:
             scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
@@ -3207,6 +3244,8 @@ def _host(
             cutlass.Int32(QH),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
             1,
             2,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)

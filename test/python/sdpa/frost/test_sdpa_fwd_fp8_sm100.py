@@ -12,8 +12,8 @@ and checked.
 cuDNN's ``sdpa_fp8`` op exposes causal / bottom-right / sliding-window masks, attention
 sink, a padding mask (per-batch ``seq_len_kv`` → KV-side masking, tested here), and THD /
 ragged inputs (packed Q/K/V/O + per-operand ragged_offset + seq_len_q/kv or the
-cu_seq_len prefix-sum form, tested here — write_thd_meta envelope design, issue #552;
-ragged Stats in the packed token-major TH1 layout).
+cu_seq_len prefix-sum form, tested here — device-built metadata plus a persistent
+grid, issue #552; ragged Stats in the packed token-major TH1 layout).
 
 Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (fp8 SDPA). Skips otherwise.
 """
@@ -1080,8 +1080,9 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_multi_unit_per_cta(monkeypatch):
+def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
 
     The persistent grid is machine-sized, so a cluster pulls units repeatedly
@@ -1089,9 +1090,9 @@ def test_fp8_thd_multi_unit_per_cta(monkeypatch):
     cluster and never re-enters the K/V pipeline. FROST_THD_CLUSTERS pins the
     grid to 4 clusters so the claim loop runs deep on any device."""
     monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d_qk)
     lens = [1024, 768, 512, 256]
-    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(lens, lens, 8, 8, "e4m3", scale=scale, causal=True)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(lens, lens, 8, 8, "e4m3", scale=scale, causal=True, d_qk=d_qk, d_v=d_v)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
