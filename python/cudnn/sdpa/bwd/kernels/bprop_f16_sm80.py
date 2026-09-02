@@ -24,7 +24,8 @@ Two sub-groups of ``WARPS_PER_SG`` warps each (256 threads at the 4+4 default):
     both: dQ += dSᵀ · K   (sg0 = d-cols 0:d/2, sg1 = d/2:d)  → atomicAdd dQ_acc
 
 All S/dP/P/dS tiles are ``[TILE_KV, TILE_Q]``.  P and dS are exchanged through
-SMEM (``sP`` sg0→sg1; ``sdS`` for dK, ``sdSᵀ`` transposed for dQ's A operand).
+SMEM (``sP`` sg0→sg1 in fp32, so dS sees the unrounded P; ``sdSᵀ`` transposed
+for dQ's A operand).
 ``dV``/``dK`` accumulate in registers across the Q-loop and are written ONCE at
 CTA end (the CTA owns its KV slice → no atomics).  ``dQ`` is ``atomicAdd``-ed
 into a FP32 GMEM accumulator (every KV-tile contributes to every Q-row's dQ);
@@ -61,7 +62,7 @@ accumulator footprint (sg0 holds dV, sg1 holds dK — one shared LOCAL array).
 
 Named-"barrier" table (all ``nvvm.barrier_cta_sync()`` — full 256-thread CTA):
   * B0  after Q/dO ``cp.async`` load          (top of each Q-iter)
-  * B1  after sg0 writes ``sP``               (sg1's dS + sg0's dV both read sP)
+  * B1  after sg0 writes ``sP``               (sg1's dS reads it; dV's P operand is in regs)
   * B2  after sg1 writes ``sdS``/``sdSᵀ``     (dQ reads sdSᵀ; sP/sdO read done)
   * B2b after both sg stage ``sDQ``           (before the coalesced dQ atomicAdd)
   * B3  after dQ atomicAdds                    (before next Q-iter reloads Q/dO)
@@ -468,7 +469,10 @@ def _bprop_kernel(
     sV = cutlass.Array(io_dtype, tile_kv * d_v, alignment=128, space=cutlass.AddressSpace.smem)
     sQ = cutlass.Array(io_dtype, qo_stages * QSTAGE_Q, alignment=128, space=cutlass.AddressSpace.smem)
     sdO = cutlass.Array(io_dtype, qo_stages * QSTAGE_O, alignment=128, space=cutlass.AddressSpace.smem)
-    sP = cutlass.Array(io_dtype, PT, alignment=128, space=cutlass.AddressSpace.smem)  # sg0→sg1
+    # sP carries P sg0→sg1 in fp32: dS = (dP − do_dot)·P is formed from the
+    # unrounded softmax so only the MMA operands (bmm2_a / sdSᵀ) see a bf16
+    # rounding.  +PT*2 B of SMEM over the bf16 copy (fits every flavor).
+    sP = cutlass.Array(cutlass.Float32, PT, alignment=128, space=cutlass.AddressSpace.smem)
     sdST = cutlass.Array(io_dtype, tile_q * tile_kv, alignment=128, space=cutlass.AddressSpace.smem)
     # dQ atomicAdd-coalescing staging buffer (FP32 [tile_q, d_qk]).  The dQ MMA
     # C-fragment scatters across 8 rows per warp → 8 L2 sectors per atomic
@@ -793,12 +797,15 @@ def _bprop_kernel(
                 # BMM2 (dV) A-fragment, in registers (no ldmatrix round-trip).
                 bmm2_a[nf * 2 + 0] = h01
                 bmm2_a[nf * 2 + 1] = h23
-                # sP write — sg1 still reads P here to form dS.
+                # sP write (fp32 P; sg1 forms dS from it).  col is even, so the
+                # pair stays inside one 16 B swizzle chunk.
                 col = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-                a_top = sP.subview(kv_row_g * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g, col, elem_bytes=_ELEM_BYTES))
-                a_bot = sP.subview(kv_row_g8 * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g8, col, elem_bytes=_ELEM_BYTES))
-                Pointer(a_top.data_ptr(), dtype=cutlass.Int32).store(h01, alignment=4)
-                Pointer(a_bot.data_ptr(), dtype=cutlass.Int32).store(h23, alignment=4)
+                i_top = kv_row_g * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g, col, elem_bytes=4)
+                i_bot = kv_row_g8 * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g8, col, elem_bytes=4)
+                Pointer(sP.subview(i_top).data_ptr(), dtype=cutlass.Float32).store(p0)
+                Pointer(sP.subview(i_top + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Float32).store(p1)
+                Pointer(sP.subview(i_bot).data_ptr(), dtype=cutlass.Float32).store(p2)
+                Pointer(sP.subview(i_bot + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Float32).store(p3)
 
         # ---- B1: sP ready ---------------------------------------------------
         nvvm.barrier_cta_sync()
@@ -820,16 +827,16 @@ def _bprop_kernel(
                 dd0 = Pointer(DOT_view.data_ptr() + dot_head_base + qr0, dtype=cutlass.Float32).load()
                 dd1 = Pointer(DOT_view.data_ptr() + dot_head_base + qr1, dtype=cutlass.Float32).load()
                 col = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-                swz_top = swizzle_xor_128b(kv_row_g, col, elem_bytes=_ELEM_BYTES)
-                swz_bot = swizzle_xor_128b(kv_row_g8, col, elem_bytes=_ELEM_BYTES)
+                swz_top = swizzle_xor_128b(kv_row_g, col, elem_bytes=4)
+                swz_bot = swizzle_xor_128b(kv_row_g8, col, elem_bytes=4)
                 a_top = sP.subview(kv_row_g * cutlass.Int32(tile_q) + swz_top)
                 a_bot = sP.subview(kv_row_g8 * cutlass.Int32(tile_q) + swz_bot)
-                ptop = Pointer(a_top.data_ptr(), dtype=io_dtype).load(count=2)
-                pbot = Pointer(a_bot.data_ptr(), dtype=io_dtype).load(count=2)
-                p0 = ptop[0].to(cutlass.Float32)
-                p1 = ptop[1].to(cutlass.Float32)
-                p2 = pbot[0].to(cutlass.Float32)
-                p3 = pbot[1].to(cutlass.Float32)
+                ptop = Pointer(a_top.data_ptr(), dtype=cutlass.Float32).load(count=2)
+                pbot = Pointer(a_bot.data_ptr(), dtype=cutlass.Float32).load(count=2)
+                p0 = ptop[0]
+                p1 = ptop[1]
+                p2 = pbot[0]
+                p3 = pbot[1]
                 off = nf * 4
                 # Un-scaled softmax-input gradient = (dP − do_dot)·P.  This IS
                 # dBias (bias adds post-scale → dBias = dS').  dS for dQ/dK folds
