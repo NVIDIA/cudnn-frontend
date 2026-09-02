@@ -1181,6 +1181,10 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
+    from cudnn.gemm.frost.epilogue_codegen import generate
+
+    dual_epi = generate(chain, vec_bytes_epi=64, output_elem_bytes=1, tma_slots=frozenset({0, 1})).epilogue
+    assert dual_epi.index("_q1_lane") < dual_epi.index("_q0_frg"), "retire the register-heavy col quant before row quant"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q_row = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")

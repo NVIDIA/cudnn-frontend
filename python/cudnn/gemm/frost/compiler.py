@@ -708,7 +708,7 @@ def _epi_vec_bytes(
 def _epi_chunk_elems(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
     if not use_tma_store:
         return _epi_vec_bytes(chain, config) // DTYPE_BYTES[chain.output_dtype]
-    return _epi_n(config, chain.output_dtype)
+    return _epi_n_for_chain(config, chain)
 
 
 def _epi_chunk_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
@@ -834,7 +834,7 @@ def _render_tile_constants(
         # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
         # 2-CTA MMA), NOT the logical per-CTA tile from TileConfig.
         f"cta_tile_mnk = {cfg.cta_smem_tile_mnk(elem_bytes)}",
-        f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n(cfg, out_dt))}",
+        f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n_for_chain(cfg, chain))}",
         f"threads_per_cta = {cfg.threads_per_cta}",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
         f"matmul_a_batch = {chain.matmul.a_batch}",
@@ -881,7 +881,7 @@ def _render_tile_constants(
         # only cares about element byte width, identical across an a/b pair).
         f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
         f"mma_kind = {DTYPE_TO_MMA_KIND[mma_a_dt]}",
-        *_epi_swizzle_lines(cfg, out_dt),
+        *_epi_swizzle_lines(cfg, out_dt, chain),
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     # (acc_stages is emitted below, once the TMEM budget is known.)
@@ -1521,7 +1521,7 @@ def _render_block_scale_tile_constants(
         acc_stages = 2  # full per-GEMM double-buffer
     else:
         acc_stages = 1
-        gran = _epi_n(cfg, chain.output_dtype)  # epilogue TMEM-load drain unit (cols)
+        gran = _epi_n_for_chain(cfg, chain)  # epilogue TMEM-load drain unit (cols)
         ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
         if ov < acc_cols_per_stage:  # else no room -> plain 1-stage
             acc_overlap_cols = ov
@@ -1534,7 +1534,7 @@ def _render_block_scale_tile_constants(
         acc_gemm_stride = 2 * acc_cols_per_stage - acc_overlap_cols
     else:
         acc_gemm_stride = acc_cols_per_stage
-    acc_overlap_subtiles = acc_overlap_cols // _epi_n(cfg, chain.output_dtype)
+    acc_overlap_subtiles = acc_overlap_cols // _epi_n_for_chain(cfg, chain)
     acc_region_cols = acc_cols_per_stage  # per-stage stride WITHIN a GEMM
 
     sf_region_base = num_gemms * acc_gemm_stride
@@ -1619,7 +1619,7 @@ def _render_block_scale_tile_constants(
         f"cgrp_tile_mnk = ({cta_m * cfg.cga_size_m}, {cta_n * cfg.cga_size_n}, {cta_k_elems})",
         f"cgrp_tile_m = {cta_m * cfg.cga_size_m}",
         f"cgrp_tile_n = {cta_n * cfg.cga_size_n}",
-        f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n(cfg, out_dt))}",
+        f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n_for_chain(cfg, chain))}",
         f"threads_per_cta = {cfg.threads_per_cta}",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
         f"matmul_a_batch = {chain.matmul.a_batch}",
@@ -1702,7 +1702,7 @@ def _render_block_scale_tile_constants(
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
-        *_epi_swizzle_lines(cfg, out_dt),
+        *_epi_swizzle_lines(cfg, out_dt, chain),
         "",
         f"# block-scale MMA",
         f"mma_block_scale_kind = nvvm.MMABlockScaleKind.{bs.mma_block_scale_kind}",
@@ -1986,7 +1986,7 @@ def _render_template(
     if "@@INJECT_KERNEL_TMA_C_PARAMS@@" in src:
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
-        _epi = _epi_n(config, chain.output_dtype)
+        _epi = _epi_n_for_chain(config, chain)
         replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
     # Per-GEMM STG vector bindings — on every STG-epilogue template (mainloop
@@ -2196,7 +2196,7 @@ def _render_block_scale_template(
     if "@@INJECT_KERNEL_TMA_C_PARAMS@@" in src:
         replacements.update(_tma_c_plumbing(chain, tma_slots))
     if "@@INJECT_TMA_STORE_SEQUENCE@@" in src:
-        _epi = _epi_n(config, chain.output_dtype)
+        _epi = _epi_n_for_chain(config, chain)
         replacements["INJECT_EPILOGUE"], replacements["INJECT_TMA_STORE_SEQUENCE"] = _place_tma_stores(snippets.epilogue, chain, config, tma_slots, _epi)
         replacements["INJECT_HOST_TMA_C_DESCS"] = _host_tma_c_descs(chain, tma_slots, _epi)
     # MoE block-scale raw-A-tensor plumbing (per-routed-group descriptor patch).
@@ -3114,8 +3114,26 @@ def _epi_n(cfg, out_dt: str) -> int:
     return min(_EPI_ROW_BYTES_MAX * 8 // DTYPE_BITS[out_dt], cap, _pow2_floor(cols, cap=cols))
 
 
-def _epi_swizzle_lines(cfg, out_dt: str) -> list[str]:
-    epi_n = _epi_n(cfg, out_dt)
+def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
+    """Chain-aware drain width.
+
+    Column block quantization pays one warp reduction per column regardless of
+    subtile width.  A 64-column drain therefore keeps the same reduction work
+    while halving subtile-loop and output-store overhead.  Other epilogues keep
+    the measured 32-column default and its lower register footprint.
+    """
+    if not any(q.axis == 1 for q in chain.quants):
+        return _epi_n(cfg, chain.output_dtype)
+    cols = _epi_tile_cols(cfg)
+    return min(
+        _EPI_ROW_BYTES_MAX * 8 // DTYPE_BITS[chain.output_dtype],
+        _EPI_N_MAX,
+        _pow2_floor(cols, cap=cols),
+    )
+
+
+def _epi_swizzle_lines(cfg, out_dt: str, chain: FusionChain | None = None) -> list[str]:
+    epi_n = _epi_n_for_chain(cfg, chain) if chain is not None else _epi_n(cfg, out_dt)
     return [
         f"epi_n = {epi_n}",
         f"epi_row_elems = {_epi_row_elems(out_dt, epi_n)}",
@@ -3128,7 +3146,7 @@ def _epi_slot_widen(
 ) -> int:
     """One shared slot spans the widest TMA-stored row. An STG output never
     touches the ring, so it must not widen it."""
-    epi_n = _epi_n(cfg, chain.output_dtype)
+    epi_n = _epi_n_for_chain(cfg, chain)
     tma = _tma_slots_for(chain, cfg)
     widths = [_epi_row_bytes(chain.output_specs[i].dtype, epi_n) for i in sorted(tma) if i < len(chain.output_specs)]
     if not widths:
@@ -3173,7 +3191,7 @@ def _smem_d_bytes(
     mma_size_m > 1 the M blocks reuse the same slots. epi_n MUST be the same value
     the kernel renders, or the reserve under-counts and the launch is rejected."""
     out_dt = chain.output_dtype
-    row_bytes = _epi_row_bytes(out_dt, _epi_n(cfg, out_dt))
+    row_bytes = _epi_row_bytes(out_dt, _epi_n_for_chain(cfg, chain))
     return _EPI_SMEM_STAGES * _epi_stage_rows(cfg) * row_bytes * _epi_slot_widen(chain, cfg) + 16
 
 
@@ -3190,7 +3208,7 @@ def _output_store_mode(
         return "stg"
     # TMA addresses its contiguous dim in 16-byte units, and truncates. The next
     # two rejections are that granule at a different extent.
-    epi_n = _epi_n(cfg, chain.output_dtype)
+    epi_n = _epi_n_for_chain(cfg, chain)
 
     # The staged SMEM row; transposed stages the 128-byte M column instead. The
     # ceiling is the widest swizzle, not the granule.
