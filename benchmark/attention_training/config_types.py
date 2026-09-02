@@ -201,6 +201,7 @@ def fa2_on_ampere():
     combos record as failed rows per the usual convention.
     """
     import torch
+
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
         return ["flash_attention"]
     return []
