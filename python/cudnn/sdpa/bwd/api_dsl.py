@@ -992,8 +992,11 @@ def _sm80_thd_backward(
     the call fully async; without it the wrapper reads it from ``cu_k`` on
     the HOST (a D2H sync — the wrapper-only Rule-3 residual).  ``sinks``
     ((H,) natural-log logits) adds a ``dsink_tensor`` output.  ``deterministic``
-    sizes the dQ relay counter from ``max_s_q`` (any upper bound on the
-    longest per-sequence Q length; the packed total when absent — no D2H).
+    sizes the dQ relay counter from ``max_s_q`` (an upper bound on the
+    longest per-sequence Q length, trimmed to the packed total; the packed
+    total when absent — no D2H).  Like ``max_s_kv``, the hint is a caller
+    contract: the wrapper cannot validate it without a D2H read, and an
+    undersized value indexes the relay counter out of bounds.
     """
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
@@ -1084,7 +1087,12 @@ def _sm80_thd_backward(
     # packed total — host shape metadata, so no D2H read.  Fresh zeros every
     # call: a stale counter deadlocks the relay's equality spin.
     if deterministic:
-        q_bound = int(max_s_q) if max_s_q is not None else t_q
+        # The packed total bounds every per-sequence length, so an over-provisioned
+        # hint is trimmed to it; an UNDERSIZED hint is a contract violation the
+        # wrapper cannot detect without a D2H read of cu_q (same contract as
+        # max_s_kv) -- the relay indexes the counter by q-tile, so it would run
+        # off the end of dq_sem.
+        q_bound = min(int(max_s_q), t_q) if max_s_q is not None else t_q
         assert q_bound > 0, f"max_s_q must be > 0; got {q_bound}"
         sem_q_stride = (q_bound + params.tile_q - 1) // params.tile_q
         dq_sem = torch.zeros(n_seq * h_q * sem_q_stride, dtype=torch.int32, device=dev)
@@ -1608,6 +1616,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         dbias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run the compiled SM80 backward on the adapter's carved workspace (Rule 1:
+        no per-call allocation; the dsink launch passes the dense dummy ``cu``).
+        """
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm80 is not compiled")
@@ -1857,7 +1868,10 @@ def sdpa_bwd_wrapper_sm80(
     the wrapper reads the max from ``cu_k`` on the host (a D2H sync).  With
     ``deterministic=True``, ``max_s_q`` (an upper bound on the longest
     per-sequence Q length) sizes the dQ relay counter; the packed total is
-    used when absent.
+    used when absent.  Both hints are caller contracts (validating them
+    would need the D2H read they exist to avoid): an undersized ``max_s_kv``
+    drops KV tiles, an undersized ``max_s_q`` indexes the relay counter out
+    of bounds.
     """
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD

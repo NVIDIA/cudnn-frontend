@@ -1258,6 +1258,10 @@ def _dsink_kernel(
     thd: cutlass.Constexpr[bool],
     n_rows: cutlass.Int32,  # (B or n_seq) * H
 ):
+    """dSink[h] = -sum_rows exp(sink[h] - LSE) * (dO . O), one warp per (batch|sequence, head)
+    row.  Dense rows span ``SQ``; THD rows span ``[cu_q[b], cu_q[b+1])`` of the packed
+    ``[1, H, T_q]`` buffers with a runtime trip count.  ``-inf`` LSE rows contribute 0.
+    """
     bx, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
@@ -1532,6 +1536,7 @@ def _dsink_host(
     n_rows: cutlass.Int32,
     stream: cuda.CUstream,
 ):
+    """Host launcher for :func:`_dsink_kernel`: ``n_rows`` = (batch|n_seq) * H warps."""
     n_blocks = (n_rows + _DODOT_WARPS - 1) // _DODOT_WARPS
     _dsink_kernel(LSE, DO_DOT, SINKS, DSINK, CU_Q, thd, n_rows).launch(grid=(n_blocks, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream)
 

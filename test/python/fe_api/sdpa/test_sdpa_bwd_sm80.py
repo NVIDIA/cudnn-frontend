@@ -800,6 +800,7 @@ def test_sm80_bwd_thd_sinks_deterministic_compile_key():
     from cudnn.frost import template_loader
 
     def cache_totals():
+        """(misses, hits) summed over the loaded bprop template modules' compile caches."""
         mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
         infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
