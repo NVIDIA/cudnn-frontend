@@ -221,24 +221,16 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 
 **Rule 6 — every Frost-generated kernel has a cuDNN-attributable symbol.**
 
-- Immediately after every ``@cute.kernel`` definition, configure the public
-  CuTe DSL naming API:
+- Immediately after every ``@cute.kernel`` definition, including auxiliary and
+  generated-template kernels, call the public naming API:
 
   ```python
   kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
   ```
 
-  Use the decorated function's actual name in place of ``kernel``. This is
-  required for main compute kernels and every auxiliary kernel (setup,
-  descriptor initialization, reduction, conversion, split/combine, and
-  similar helpers), including kernels in generated template bodies.
-- Keep the default ``keep_mangled_name=True`` behavior. The mangled function
-  name and per-trace suffix preserve readability and uniqueness; the prefix
-  identifies the symbol as originating from cuDNN instead of CUTLASS in
-  profilers and debug traces.
-- Do not replace this with an undocumented compiler option or a post-build
-  symbol rewrite. The source-level ``set_name_prefix`` call is the supported
-  contract and must be present before the kernel is traced or compiled.
+- Use the decorated function's actual name, keep the default
+  ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
+  instead.
 
 
 ## Frontend-only kernel package layout
