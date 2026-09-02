@@ -73,7 +73,6 @@ def _to_native(
 
     # A_log/dt_bias describe the gate over the H key/query heads (matching g's [B,T,H,K]),
     # not the value heads; a mismatched element count means we cannot adapt -> decline.
-    g = g.float()
     native_safe_gate = False
     a_log_t = dt_bias_t = gate_lb = None
     if safe_gate:
@@ -98,13 +97,14 @@ def _to_native(
         b = dt_bias.float().reshape(H, K)
         g = -a.exp() * F.softplus(g + b)
 
-    # beta is io-dtype logits when the kernel applies the sigmoid, else fp32 post-activation.
-    beta = beta.to(q.dtype) if use_beta_sigmoid_in_kernel else beta.float()
+    # beta is io-dtype logits when the kernel applies the sigmoid; post-activation beta rides as given.
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.to(q.dtype)
 
     def thd(t):
         return t.reshape(-1, *t.shape[2:])
 
-    h0 = None if initial_state is None else initial_state.float().contiguous()
+    h0 = None if initial_state is None else initial_state.contiguous()
     o, fs = kimi_delta_attention(
         thd(q),
         thd(k),

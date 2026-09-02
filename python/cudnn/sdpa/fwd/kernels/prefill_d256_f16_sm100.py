@@ -447,6 +447,7 @@ def _kernel(
             n_q_supers=n_q_supers,
             n_qh=n_qh,
             n_batch=n_batch,
+            o_desc_words=o_desc_words,
             qh_per_kh=qh_per_kh,
             is_leader=is_leader,
             cta_in_pair=cta_in_pair,
@@ -493,6 +494,7 @@ def _tmaldg_warp_group(
     n_q_supers,
     n_qh,
     n_batch,
+    o_desc_words,
     qh_per_kh,
     is_leader,
     cta_in_pair,
@@ -502,8 +504,19 @@ def _tmaldg_warp_group(
     kv_state = PipelineState.start(phase=1)
 
     tma_q = GmemTileTma(tma_q_desc)
-    tma_k = GmemTileTma(tma_k_desc)
-    tma_v = GmemTileTma(tma_v_desc)
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD: K/V ride the setup kernel's packed-total-clamped runtime
+        # descriptors (o_desc_words slots n_batch+1 / n_batch+2), so the last
+        # sequence's tile-tail lands as exact zeros instead of reading the
+        # buffer's capacity tail (issue #624). Same closure shape as the dense
+        # GmemTileTma, so every load site below stays branch-free.
+        _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
+        tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
+    else:
+        tma_k = GmemTileTma(tma_k_desc)
+        tma_v = GmemTileTma(tma_v_desc)
 
     q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init,
@@ -1770,6 +1783,8 @@ def _host(
         _build_thd_meta_o_descs_kernel(
             o_tensor,
             tma_o_desc,
+            tma_k_desc,
+            tma_v_desc,
             o_desc_words,
             seq_kv_lens_tensor,
             thd_q_lens_tensor,
@@ -1960,7 +1975,9 @@ def compile(  # noqa: A001
         if CFG.SEQ_Q_LENS_PRESENT
         else None
     )
-    _odesc_len = (b * _TENSOR_MAP_QWORDS + _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
+    # +2 slots beyond the pad: the packed-total-clamped K/V runtime
+    # descriptors the setup kernel writes (issue #624).
+    _odesc_len = (b * _TENSOR_MAP_QWORDS + 3 * _TENSOR_MAP_QWORDS) if CFG.THD_VARLEN else 1
     fake_o_desc = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
         (_odesc_len,),

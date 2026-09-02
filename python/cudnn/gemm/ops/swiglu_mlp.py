@@ -1,14 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dense bf16 SwiGLU-MLP as a cuDNN autograd op.
+"""Dense bf16 gated MLP as a cuDNN autograd op.
 
-``out = (silu(x @ Wg^T) * (x @ Wu^T)) @ Wd^T`` — the Qwen/LLaMA-style gated MLP,
-with all GEMMs and the SwiGLU running on cuDNN.
+``swiglu_mlp`` keeps the Qwen/LLaMA contract:
 
-The forward fuses the gate GEMM, the up GEMM, ``SiLU`` and the multiply into ONE
-cuDNN kernel (the FORT-native runtime-fusion engine on SM100), which beats two
-cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on the Qwen3.5-27B MLP shape;
+``out = (silu(x @ Wg^T) * (x @ Wu^T)) @ Wd^T``
+
+``situ_mlp`` is the separate semantic entry point for Kimi K3's bounded variant:
+
+``gate_act = beta * tanh(gate / beta) * sigmoid(gate)``
+
+``up_act = linear_beta * tanh(up / linear_beta)``
+
+``out = (gate_act * up_act) @ Wd^T``
+
+The two entry points share private plan/autograd machinery. Its internal
+activation tag and both SiTU betas are semantic plan inputs: they are snapshotted
+by autograd and included in every activation-plan cache key, so a plan built for
+ordinary SwiGLU, or for different SiTU betas, is never reused.
+
+For ``swiglu_mlp``, the forward fuses the gate GEMM, the up GEMM, ``SiLU`` and
+the multiply into ONE cuDNN kernel (the FORT-native runtime-fusion engine on
+SM100), which beats two cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on
+the Qwen3.5-27B MLP shape;
 the down projection is a separate GEMM (a three-GEMM single graph does not
 compile). That fused kernel also emits the two pre-activations ``gate = x@Wg^T``
 and ``up = x@Wu^T`` (the GEMM accumulators it already computes) as extra outputs,
@@ -18,8 +33,9 @@ saved-activation policy; an earlier revision that
 recomputed gate/up paid two extra GEMMs and ran ~1.3x slower on the backward,
 ~1.17-1.19x on the full fwd+bwd step. Saving ``{h, gate, up}`` costs ~3x[M,I] of
 activation memory, less than the ~4x[M,I] torch autograd already keeps. The
-pointwise fallback computes ``dup`` and ``dgate`` in one two-output graph, reading
-the inputs once and running ~2x faster than two single-output kernels. By default,
+SwiGLU pointwise fallback computes ``dup`` and ``dgate`` in one two-output graph,
+reading the inputs once and running ~2x faster than two single-output kernels.
+For ``swiglu_mlp`` only, by default,
 ``dh = dout @ Wd`` dgrad GEMM and the dSwiGLU are fused into one FROST (cuTeDSL)
 kernel that never materialises ``dh`` to HBM (set
 ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` for the separate nvjet GEMM + one-kernel
@@ -35,8 +51,8 @@ At the public call boundary the op snapshots GradMode and each input's
 ``requires_grad`` into a small mask. Inference and Wd-only training use an h-only
 forward graph; partial-gradient training retains only the tensors its requested
 input gradients consume and skips unrelated backward GEMMs. Full all-gradient
-training takes the same kernels as above. The mask follows ``requires_grad`` at
-forward time; it cannot infer a narrower target list passed later to
+training takes the selected activation route's complete kernel set. The mask
+follows ``requires_grad`` at forward time; it cannot infer a narrower target list passed later to
 ``torch.autograd.grad``.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
@@ -47,6 +63,7 @@ Requires an SM100 (Blackwell) device for the fused runtime-fusion engine; on
 other architectures the graph build declines and the op raises.
 """
 
+import math
 import os
 
 import torch
@@ -72,6 +89,48 @@ _GRAD_WG = 1 << 1
 _GRAD_WU = 1 << 2
 _GRAD_WD = 1 << 3
 _GRAD_FC1 = _GRAD_X | _GRAD_WG | _GRAD_WU
+
+_ACTIVATION_SILU = "silu"
+_ACTIVATION_SITU = "situ"
+_KIMI_SITU_BETA = 4.0
+_KIMI_SITU_LINEAR_BETA = 25.0
+
+
+def _normalize_activation_config(activation, situ_beta, situ_linear_beta, *, op_name="gated_mlp"):
+    """Return the canonical gated-activation contract used by plans/autograd.
+
+    The activation tag is private; public callers select it by choosing
+    :func:`swiglu_mlp` or :func:`situ_mlp`. SiTU requires explicit canonical
+    beta values here (the public wrapper supplies its published 4/25 defaults).
+    """
+    prefix = f"cudnn.gemm.{op_name}"
+    if activation not in (_ACTIVATION_SILU, _ACTIVATION_SITU):
+        raise ValueError(f"{prefix}: internal activation must be 'silu' or 'situ'; got {activation!r}")
+    if activation == _ACTIVATION_SILU:
+        if situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError(f"{prefix}: internal SiTU betas are invalid on the SiLU route")
+        return activation, None, None
+
+    def positive_finite(name, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{prefix}: {name} must be a positive finite Python number; got {value!r}")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{prefix}: {name} must be positive and finite; got {value!r}")
+        return value
+
+    return (
+        activation,
+        positive_finite("beta", situ_beta),
+        positive_finite("linear_beta", situ_linear_beta),
+    )
+
+
+def _graph_scalar(g, value, name):
+    # Runtime-param scalars work with the op's cuDNN 9.x floor; compile-time
+    # constants need cuDNN >= 9.22. The graph owns the value, and the cache key
+    # owns its identity, so execute() has no extra tensor/scalar argument.
+    return g.tensor_scalar(float(value), cudnn.scalar_type.RUNTIME_PARAM, name=name)
 
 
 def _handle(device):
@@ -151,21 +210,44 @@ def _mm(a2, b2):
     return out.squeeze(0)
 
 
-def _swiglu_act(x, Wg, Wu, *, save_preacts=True):
-    """Fused ``h = silu(x@Wg^T) * (x@Wu^T)`` in ONE cuDNN kernel, also emitting the
-    two pre-activations ``gate = x@Wg^T`` and ``up = x@Wu^T`` when
-    ``save_preacts=True``. All requested outputs come from the single fused plan;
-    their cost is plan/runtime dependent, but they drop the two recompute GEMMs
-    from a full backward. In inference or a Wd-only backward,
-    ``save_preacts=False`` selects an h-only graph and avoids those side stores.
-    ``x:[M,H]``, ``Wg,Wu:[I,H]`` are bound as strided ``.t()`` views (no transpose
-    copy). Returns ``(h, gate, up)`` ``:[M,I]``; gate/up are ``None`` for h-only."""
+def _swiglu_act(
+    x,
+    Wg,
+    Wu,
+    *,
+    save_preacts=True,
+    activation=_ACTIVATION_SILU,
+    situ_beta=None,
+    situ_linear_beta=None,
+):
+    """Fused gated activation in ONE cuDNN kernel, optionally emitting preacts.
+
+    ``activation='silu'`` computes ``silu(gate) * up``. ``activation='situ'``
+    computes Kimi's bounded gate and bounded up branch with the supplied betas.
+    ``x:[M,H]``, ``Wg,Wu:[I,H]`` are bound as strided ``.t()`` views (no copy).
+    Returns ``(h, gate, up):[M,I]``; gate/up are ``None`` for h-only.
+    """
+    activation, situ_beta, situ_linear_beta = _normalize_activation_config(activation, situ_beta, situ_linear_beta)
     h, stream = _handle(x.device)
     M, H = x.shape
     interm = Wg.shape[0]
     xv = x.unsqueeze(0)
     wg, wu = Wg.t().unsqueeze(0), Wu.t().unsqueeze(0)  # [1,H,interm] column-major views, no copy
-    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), bool(save_preacts), x.device.index, stream)
+    key = (
+        M,
+        H,
+        interm,
+        x.dtype,
+        xv.stride(),
+        wg.stride(),
+        wu.stride(),
+        bool(save_preacts),
+        x.device.index,
+        stream,
+        activation,
+        situ_beta,
+        situ_linear_beta,
+    )
     e = _SWIGLU_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
@@ -173,15 +255,22 @@ def _swiglu_act(x, Wg, Wu, *, save_preacts=True):
         WG = g.tensor(dim=[1, H, interm], stride=list(wg.stride()), data_type=_BF16)
         WU = g.tensor(dim=[1, H, interm], stride=list(wu.stride()), data_type=_BF16)
         gate = g.matmul(name="gate", A=X, B=WG, compute_data_type=_FP32)
-        sg = g.mul(a=gate, b=g.sigmoid(input=gate))  # SiLU = gate * sigmoid(gate)
         up = g.matmul(name="up", A=X, B=WU, compute_data_type=_FP32)
-        hh = g.mul(a=sg, b=up)
-        hh.set_output(True).set_data_type(_BF16)
         # Keep h numerically independent of whether the pre-activations are exposed:
-        # the full-training graph consumes BF16-rounded gate/up, so the h-only graph
-        # must retain those intermediate dtypes even though it does not store them.
+        # Kimi explicitly casts the two Linear outputs to fp32 inside SiTU, so both
+        # activation variants first consume the same BF16-rounded Linear results.
         gate.set_data_type(_BF16)
         up.set_data_type(_BF16)
+        if activation == _ACTIVATION_SILU:
+            gate_act = g.mul(a=gate, b=g.sigmoid(input=gate))
+            up_act = up
+        else:
+            beta = _graph_scalar(g, situ_beta, "situ_beta")
+            linear_beta = _graph_scalar(g, situ_linear_beta, "situ_linear_beta")
+            gate_act = g.mul(a=g.mul(a=beta, b=g.tanh(input=g.div(a=gate, b=beta))), b=g.sigmoid(input=gate))
+            up_act = g.mul(a=linear_beta, b=g.tanh(input=g.div(a=up, b=linear_beta)))
+        hh = g.mul(a=gate_act, b=up_act)
+        hh.set_output(True).set_data_type(_BF16)
         if save_preacts:
             gate.set_output(True)  # saved for backward -> no recompute GEMM
             up.set_output(True)
@@ -210,18 +299,25 @@ def _swiglu_act(x, Wg, Wu, *, save_preacts=True):
     return hb, gb, ub
 
 
-def _dswiglu(dh, gate, up):
-    """Fused dSwiGLU in ONE cuDNN kernel: ``dup = dh*silu(gate)`` and
-    ``dgate = dh*up*silu'(gate)`` (``silu'(g) = s + silu*(1-s)``, ``s=sigmoid(g)``)
-    as the two outputs of a single multi-output pointwise graph. ``dh,gate,up:[M,I]``
-    are dense and same-shape (elementwise, no broadcast). cuDNN's tensor-ir engine
-    declines multi-output (it logs ``unsupported multi-output fusion``), but another
-    engine serves the graph as one kernel that reads the inputs once -- ~2x the two
-    single-output kernels it replaces, which re-read the inputs and recompute the
-    sigmoid. Returns ``(dgate, dup)``."""
+def _dswiglu(
+    dh,
+    gate,
+    up,
+    *,
+    activation=_ACTIVATION_SILU,
+    situ_beta=None,
+    situ_linear_beta=None,
+):
+    """Fused two-output derivative for ordinary SwiGLU or bounded SiTU.
+
+    For SiTU, both derivatives are activation-specific: the gate includes the
+    derivative of ``beta*tanh(gate/beta)*sigmoid(gate)``, while the up branch
+    includes ``1-tanh(up/linear_beta)^2``. Returns ``(dgate, dup)``.
+    """
+    activation, situ_beta, situ_linear_beta = _normalize_activation_config(activation, situ_beta, situ_linear_beta)
     h, stream = _handle(dh.device)
     M, interm = dh.shape
-    key = (M, interm, dh.dtype, dh.device.index, stream)
+    key = (M, interm, dh.dtype, dh.device.index, stream, activation, situ_beta, situ_linear_beta)
     e = _DSWIGLU_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
@@ -229,10 +325,28 @@ def _dswiglu(dh, gate, up):
         GATE = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
         UP = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=_BF16)
         s = g.sigmoid(input=GATE)
-        silu = g.mul(a=GATE, b=s)
-        dup = g.mul(a=DH, b=silu)  # dh*silu(gate)
-        silup = g.add(a=s, b=g.sub(a=silu, b=g.mul(a=silu, b=s)))  # silu' = s + silu*(1-s)
-        dgate = g.mul(a=g.mul(a=DH, b=UP), b=silup)  # dh*up*silu'
+        if activation == _ACTIVATION_SILU:
+            gate_act = g.mul(a=GATE, b=s)
+            gate_grad = g.add(a=s, b=g.sub(a=gate_act, b=g.mul(a=gate_act, b=s)))
+            up_act = UP
+            up_grad = None
+        else:
+            one = _graph_scalar(g, 1.0, "one")
+            beta = _graph_scalar(g, situ_beta, "situ_beta")
+            linear_beta = _graph_scalar(g, situ_linear_beta, "situ_linear_beta")
+            gate_tanh = g.tanh(input=g.div(a=GATE, b=beta))
+            up_tanh = g.tanh(input=g.div(a=UP, b=linear_beta))
+            gate_act = g.mul(a=g.mul(a=beta, b=gate_tanh), b=s)
+            up_act = g.mul(a=linear_beta, b=up_tanh)
+            gate_grad = g.add(
+                a=g.mul(a=g.sub(a=one, b=g.mul(a=gate_tanh, b=gate_tanh)), b=s),
+                b=g.mul(a=g.mul(a=beta, b=gate_tanh), b=g.mul(a=s, b=g.sub(a=one, b=s))),
+            )
+            up_grad = g.sub(a=one, b=g.mul(a=up_tanh, b=up_tanh))
+        dup = g.mul(a=DH, b=gate_act)
+        if up_grad is not None:
+            dup = g.mul(a=dup, b=up_grad)
+        dgate = g.mul(a=g.mul(a=DH, b=up_act), b=gate_grad)
         dup.set_output(True).set_data_type(_BF16)
         dgate.set_output(True).set_data_type(_BF16)
         g.validate()
@@ -266,7 +380,16 @@ _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
 _FROST_DECLINE_ERRORS = (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
-def _frost_dswiglu(dout2, Wd, gate, up):
+def _frost_dswiglu(
+    dout2,
+    Wd,
+    gate,
+    up,
+    *,
+    activation=_ACTIVATION_SILU,
+    situ_beta=None,
+    situ_linear_beta=None,
+):
     """Fused backward dgrad + dSwiGLU in ONE FROST kernel: ``dh = dout2 @ Wd`` with
     ``dup = dh*silu(gate)`` and ``dgate = dh*silu'(gate)*up`` as the GEMM epilogue,
     so the separate dh GEMM + two dSwiGLU pointwise kernels of :func:`_dswiglu`
@@ -283,7 +406,16 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     strategy win. Small M retains the 1CTAMMA/cluster1x1 strategy. Not a transpose
     problem (dense bf16 needs none; ``dg.t()`` is a free view) and not a host-
     overhead one (host is ~1% of these compute-bound GEMMs, and #612 already cut
-    it)."""
+    it). SiTU is deliberately unsupported here: this FROST graph contains
+    ``swish``/``swish_backward`` nodes, so accepting SiTU would silently compute
+    the wrong derivative. The caller must use the exact cuDNN pointwise graph.
+    """
+    activation, situ_beta, situ_linear_beta = _normalize_activation_config(activation, situ_beta, situ_linear_beta)
+    if activation != _ACTIVATION_SILU:
+        raise NotImplementedError(
+            "cudnn.gemm.swiglu_mlp: FROST backward only implements activation='silu'; "
+            f"activation={activation!r}, situ_beta={situ_beta}, situ_linear_beta={situ_linear_beta} must use the exact cuDNN fallback"
+        )
     operands = (("dout", dout2), ("Wd", Wd), ("gate", gate), ("up", up))
     if any(t.dim() != 2 for _, t in operands):
         raise NotImplementedError("cudnn.gemm.swiglu_mlp: FROST backward requires rank-2 dout/Wd/gate/up operands")
@@ -338,7 +470,12 @@ def _frost_dswiglu(dout2, Wd, gate, up):
             tn = 256 if interm >= 256 else 128
             cta_group = 2 if M > 128 else 1
             cluster_m = 2 if cta_group == 2 else 1
-            cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, cluster_m, 1))
+            cfg = next(
+                c
+                for c in CATALOG
+                if (c.pipeline, c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cga_size_m, c.cga_size_n, c.cta_group)
+                == ("sm100", 128, tn, 128, cluster_m, 1, cta_group)
+            )
             g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
             DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
             # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
@@ -349,7 +486,7 @@ def _frost_dswiglu(dout2, Wd, gate, up):
             dh = g.matmul(A=DY, B=WD, name="dgrad")
             g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
             g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+            compiled = jit_from_cudnn_graph(g, config=cfg)
             bd = compiled.binding
             out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
             aux_by = {a.get_name(): a for a in bd.aux}
@@ -372,9 +509,9 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     return dgate.squeeze(0), dup.squeeze(0)
 
 
-class _SwigluMLP(torch.autograd.Function):
+class _GatedMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, Wg, Wu, Wd, grad_mask):
+    def forward(ctx, x, Wg, Wu, Wd, grad_mask, activation, situ_beta, situ_linear_beta):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
         need_fc1_grad = bool(grad_mask & _GRAD_FC1)
@@ -383,6 +520,9 @@ class _SwigluMLP(torch.autograd.Function):
             Wg,
             Wu,
             save_preacts=need_fc1_grad,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )  # fused: h-only unless an FC1-related backward needs gate/up
         out = _mm(h, Wd.t())  # transposed weight view; cuDNN reads it column-major, no copy
 
@@ -411,6 +551,9 @@ class _SwigluMLP(torch.autograd.Function):
         ctx.save_for_backward(*saved_tensors)
         ctx.saved_names = tuple(saved_names)
         ctx.grad_mask = grad_mask
+        ctx.activation = activation
+        ctx.situ_beta = situ_beta
+        ctx.situ_linear_beta = situ_linear_beta
         ctx.shp = shp
         ctx.out_features = Wd.shape[0]
         return out.reshape(*shp[:-1], Wd.shape[0])
@@ -435,13 +578,26 @@ class _SwigluMLP(torch.autograd.Function):
             gate, up = gate.contiguous(), up.contiguous()
             # P1 retains the existing dual-output dSwiGLU whenever either output
             # is needed. It still skips the whole stage for a Wd-only backward.
-            if _FROST_BWD:
-                try:
-                    dgate, dup = _frost_dswiglu(dout2, Wd, gate, up)
-                except _FROST_DECLINE_ERRORS:
+            # The current FROST epilogue is exactly SwiGLU-specific. SiTU goes
+            # directly to its exact cuDNN derivative graph; never launch swish
+            # backward and hope the beta contract is close enough.
+            if ctx.activation == _ACTIVATION_SILU:
+                if _FROST_BWD:
+                    try:
+                        dgate, dup = _frost_dswiglu(dout2, Wd, gate, up, activation=ctx.activation)
+                    except _FROST_DECLINE_ERRORS:
+                        dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
+                else:
                     dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
             else:
-                dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
+                dgate, dup = _dswiglu(
+                    _mm(dout2, Wd),
+                    gate,
+                    up,
+                    activation=ctx.activation,
+                    situ_beta=ctx.situ_beta,
+                    situ_linear_beta=ctx.situ_linear_beta,
+                )
         else:
             dgate = dup = None
 
@@ -452,7 +608,44 @@ class _SwigluMLP(torch.autograd.Function):
             dx = None
         dWg = _mm(dgate.t(), saved["x2"]) if grad_mask & _GRAD_WG else None
         dWu = _mm(dup.t(), saved["x2"]) if grad_mask & _GRAD_WU else None
-        return dx, dWg, dWu, dWd, None
+        return dx, dWg, dWu, dWd, None, None, None, None
+
+
+def _gated_mlp(x, Wg, Wu, Wd, *, activation, situ_beta, situ_linear_beta, op_name):
+    activation, situ_beta, situ_linear_beta = _normalize_activation_config(
+        activation,
+        situ_beta,
+        situ_linear_beta,
+        op_name=op_name,
+    )
+    prefix = f"cudnn.gemm.{op_name}"
+    for name, t in (("x", x), ("Wg", Wg), ("Wu", Wu), ("Wd", Wd)):
+        if t.dtype != torch.bfloat16:
+            raise TypeError(f"{prefix}: {name} must be bfloat16, got {t.dtype}")
+        if t.device.type != "cuda":
+            raise ValueError(f"{prefix}: {name} must be a CUDA tensor, got device {t.device}")
+    if any(t.device != x.device for t in (Wg, Wu, Wd)):
+        raise ValueError(f"{prefix}: x, Wg, Wu, and Wd must be on the same CUDA device; " f"got x={x.device}, Wg={Wg.device}, Wu={Wu.device}, Wd={Wd.device}")
+    if x.dim() < 2 or Wg.dim() != 2 or Wu.dim() != 2 or Wd.dim() != 2:
+        raise ValueError(
+            f"{prefix}: expected x[...,H] and 2-D Wg/Wu[I,H], Wd[H,I]; " f"got x{tuple(x.shape)} Wg{tuple(Wg.shape)} Wu{tuple(Wu.shape)} Wd{tuple(Wd.shape)}"
+        )
+    H = x.shape[-1]
+    if Wg.shape != Wu.shape or Wg.shape[1] != H or Wd.shape[0] != H or Wd.shape[1] != Wg.shape[0]:
+        raise ValueError(
+            f"{prefix}: shape mismatch — x[...,{H}], Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}; "
+            f"expected Wg/Wu = [I, {H}] and Wd = [{H}, I]"
+        )
+    # A custom Function's forward always runs with GradMode disabled, while
+    # ctx.needs_input_grad still mirrors the inputs' requires_grad flags even under
+    # an outer no_grad()/inference_mode(). Capture the outer state here so inference
+    # selects the h-only graph even when model parameters remain trainable.
+    grad_mask = 0
+    if torch.is_grad_enabled():
+        for bit, tensor in ((_GRAD_X, x), (_GRAD_WG, Wg), (_GRAD_WU, Wu), (_GRAD_WD, Wd)):
+            if tensor.requires_grad:
+                grad_mask |= bit
+    return _GatedMLP.apply(x, Wg, Wu, Wd, grad_mask, activation, situ_beta, situ_linear_beta)
 
 
 def swiglu_mlp(x, Wg, Wu, Wd):
@@ -470,32 +663,46 @@ def swiglu_mlp(x, Wg, Wu, Wd):
     or a shape mismatch (the kernels are bf16-only; other dtypes are not silently
     reinterpreted).
     """
-    for name, t in (("x", x), ("Wg", Wg), ("Wu", Wu), ("Wd", Wd)):
-        if t.dtype != torch.bfloat16:
-            raise TypeError(f"cudnn.gemm.swiglu_mlp: {name} must be bfloat16, got {t.dtype}")
-        if t.device.type != "cuda":
-            raise ValueError(f"cudnn.gemm.swiglu_mlp: {name} must be a CUDA tensor, got device {t.device}")
-    if any(t.device != x.device for t in (Wg, Wu, Wd)):
-        raise ValueError(
-            "cudnn.gemm.swiglu_mlp: x, Wg, Wu, and Wd must be on the same CUDA device; " f"got x={x.device}, Wg={Wg.device}, Wu={Wu.device}, Wd={Wd.device}"
-        )
-    if x.dim() < 2 or Wg.dim() != 2 or Wu.dim() != 2 or Wd.dim() != 2:
-        raise ValueError(
-            f"cudnn.gemm.swiglu_mlp: expected x[...,H] and 2-D Wg/Wu[I,H], Wd[H,I]; got x{tuple(x.shape)} Wg{tuple(Wg.shape)} Wu{tuple(Wu.shape)} Wd{tuple(Wd.shape)}"
-        )
-    H = x.shape[-1]
-    if Wg.shape != Wu.shape or Wg.shape[1] != H or Wd.shape[0] != H or Wd.shape[1] != Wg.shape[0]:
-        raise ValueError(
-            f"cudnn.gemm.swiglu_mlp: shape mismatch — x[...,{H}], Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}; "
-            f"expected Wg/Wu = [I, {H}] and Wd = [{H}, I]"
-        )
-    # A custom Function's forward always runs with GradMode disabled, while
-    # ctx.needs_input_grad still mirrors the inputs' requires_grad flags even under
-    # an outer no_grad()/inference_mode(). Capture the outer state here so inference
-    # selects the h-only graph even when model parameters remain trainable.
-    grad_mask = 0
-    if torch.is_grad_enabled():
-        for bit, tensor in ((_GRAD_X, x), (_GRAD_WG, Wg), (_GRAD_WU, Wu), (_GRAD_WD, Wd)):
-            if tensor.requires_grad:
-                grad_mask |= bit
-    return _SwigluMLP.apply(x, Wg, Wu, Wd, grad_mask)
+    return _gated_mlp(
+        x,
+        Wg,
+        Wu,
+        Wd,
+        activation=_ACTIVATION_SILU,
+        situ_beta=None,
+        situ_linear_beta=None,
+        op_name="swiglu_mlp",
+    )
+
+
+def situ_mlp(x, Wg, Wu, Wd, *, beta=_KIMI_SITU_BETA, linear_beta=_KIMI_SITU_LINEAR_BETA):
+    """Dense bf16 Kimi SiTU-MLP with bounded gate and up branches on cuDNN.
+
+    ``gate_act = beta * tanh(gate / beta) * sigmoid(gate)``
+
+    ``up_act = linear_beta * tanh(up / linear_beta)``
+
+    ``out = (gate_act * up_act) @ Wd^T``
+
+    Args:
+        x: input activations ``[..., H]`` (bf16).
+        Wg, Wu: gate / up ``nn.Linear`` weights ``[I, H]`` (bf16).
+        Wd: down ``nn.Linear`` weight ``[H, I]`` (bf16).
+        beta: positive finite gate-tanh scale. Defaults to Kimi K3's 4.0.
+        linear_beta: positive finite up-branch tanh scale. Defaults to Kimi K3's 25.0.
+
+    Returns:
+        ``[..., H]`` (bf16). Differentiable w.r.t. all four inputs. The current
+        FROST backward is SwiGLU-only, so SiTU uses the exact cuDNN derivative
+        graph rather than substituting a swish derivative.
+    """
+    return _gated_mlp(
+        x,
+        Wg,
+        Wu,
+        Wd,
+        activation=_ACTIVATION_SITU,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+        op_name="situ_mlp",
+    )

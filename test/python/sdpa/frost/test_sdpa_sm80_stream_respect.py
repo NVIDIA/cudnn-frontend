@@ -146,8 +146,10 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     dob = gb.tensor(dim=dims, stride=_STRIDES, data_type=_HALF, name="dO")
     statsb = gb.tensor(dim=(_B, _H, _S, 1), stride=(_H * _S, _S, 1, 1), data_type=_F32, name="stats")
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=1.0 / math.sqrt(_D), use_causal_mask=True)
+    # Output layout is honored only when DECLARED (IR-inferred strides are
+    # provisional) — bind BSHD-physical to match the buffers below.
     for x in (dq, dk, dv):
-        x.set_output(True).set_data_type(_HALF)
+        x.set_output(True).set_data_type(_HALF).set_stride(_STRIDES)
     _build_and_pin(gb, "sdpa_bwd_sm80")
 
     do_gpu = _mk_buf()

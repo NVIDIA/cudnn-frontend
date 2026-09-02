@@ -37,7 +37,7 @@ the tile to ``sDQ`` and then atomicAdd-ing in row-major order (consecutive lanes
 traffic.  This is what closes the gap to cuDNN (whose dQ atomic also coalesces):
 +18 % @ B2H16S4096 (75→89 TFLOPS, ~1.0× cuDNN), +16 % @ B1H16S2048 (1.08×).
 
-**Deterministic dQ** (``backward(deterministic=True)``): the cross-KV-tile dQ
+**Deterministic dQ** (``TemplateParams.deterministic``): the cross-KV-tile dQ
 atomicAdd is order-non-deterministic (fp32 add is non-associative → bitwise
 varies run-to-run once a sequence spans >1 KV-tile).  The deterministic path
 orders the adds by ``kv_tile`` via a per-(seq,head,q_tile) int32 GMEM semaphore
@@ -122,6 +122,14 @@ _COPY_ELEMS = 8  # 16-byte cp.async chunk (8 fp16)
 # tiles land in the last wave, minimizing the makespan tail).
 SCHED_DEFAULT = 0  # 3-D grid (kv_tile, head, batch); no reorder (byte-identical)
 SCHED_LPT = 1  # 1-D kv-major grid for causal load-balance
+
+# TemplateParams injection seam (frost.template_loader): one uniquely named
+# module per parameter set, specialized below via cutlass.const_expr folding.
+# The shared tile_dsl scheduler vocabulary maps IDENTITY onto the internal
+# grid decode (SCHED_NATURAL == SCHED_DEFAULT == 0, SCHED_LPT == 1).
+from cudnn.sdpa.bwd.config_sm80 import TemplateParams  # noqa: E402
+
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 
 
 def _mask_p(p, kv_abs, q_abs, *, mask_flags: int, swa_window: int, causal_bottom_right: int, causal_diag, eff_skv, right_bound):
@@ -261,8 +269,12 @@ def _bprop_kernel(
     #      LSE/do_dot/bias reads are clamped to <SQ/<SKV, and the dV/dK/dQ/dBias
     #      GMEM stores are row-gated so no OOB write lands.  Both False ⇒ every
     #      branch folds out ⇒ the dense (tile-multiple) path is byte-identical.
-    PARTIAL_Q = (SQ % tile_q) != 0
-    PARTIAL_KV = (SKV % tile_kv) != 0
+    # THD compiles SQ/SKV as sym_int DYNAMICS (issue #604) so the modulus is
+    # not a compile-time value there; force the static gates False — THD's
+    # per-sequence bounds ride GATE_Q/GATE_KV via THD_VARLEN instead (and the
+    # only pure PARTIAL_* consumer, the dBias store gate, is dense-only).
+    PARTIAL_Q = False if cutlass.const_expr(THD_VARLEN) else ((SQ % tile_q) != 0)
+    PARTIAL_KV = False if cutlass.const_expr(THD_VARLEN) else ((SKV % tile_kv) != 0)
 
     # Grid decode.  SCHED_DEFAULT: plain 3-D (kv_tile, head, batch).  SCHED_LPT:
     # 1-D kv-major flat grid — bx = kv_tile*(H*B) + head*B... no: kv-major means
@@ -1459,180 +1471,12 @@ def _dsink_host(
 # Compile cache.
 # ===========================================================================
 @lru_cache(maxsize=None)
-def _compile_main(
-    B,
-    H,
-    SQ,
-    SKV,
-    d_qk,
-    d_v,
-    tile_kv,
-    tile_q,
-    warps_per_sg,
-    io_is_bf16,
-    qo_stages=2,
-    dq_smem_coalesce=True,
-    Hk=None,
-    mask_flags=MASK_NONE,
-    swa_window=0,
-    causal_bottom_right=0,
-    has_seq_kv_lens=False,
-    has_bias=False,
-    bias_is_fp32=True,
-    bias_batch=1,
-    has_rope=False,
-    rope_max_s=1,
-    has_seq_len_q=False,
-    thd_varlen=False,
-    n_seq=1,
-    deterministic=False,
-    sem_units=1,
-    sched_policy=SCHED_DEFAULT,
-):
-    io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
-    if Hk is None:
-        Hk = H
-    # Q/dO/dQ + dK/dV WORKSPACE carry H_q heads; K/V READ at H_kv heads (GQA).
-    fq = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fk = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, Hk, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fv = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, Hk, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdo = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdq = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, SQ, H, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdk = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, H, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fdv = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fl = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    fdt = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    # seq_kv_lens [B] int32 — a real tensor only when PADDED; a 1-elem dummy
-    # otherwise (the kernel never reads it when has_seq_kv_lens is False).
-    fsk = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (B if has_seq_kv_lens else 1,), stride_order=(0,), assumed_align=16)
-    # BIAS / DBIAS [bias_batch, H, SQ, SKV] (bias_batch ∈ {1 (broadcast), B}); a
-    # 1-elem dummy when has_bias is False.  bias_dt = fp32 or io_dtype.
-    bias_dt = cutlass.Float32 if bias_is_fp32 else io_dtype
-    if has_bias:
-        fbias = cute.runtime.make_fake_compact_tensor(bias_dt, (bias_batch, H, SQ, SKV), stride_order=(3, 2, 1, 0), assumed_align=16)
-        fdbias = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (bias_batch, H, SQ, SKV), stride_order=(3, 2, 1, 0), assumed_align=16)
-    else:
-        fbias = cute.runtime.make_fake_compact_tensor(bias_dt, (1,), stride_order=(0,), assumed_align=16)
-        fdbias = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
-    # rope_cs [max_s, d_qk//2, 2] fp32 (cos,sin) — 1-elem dummy when no rope.
-    if has_rope:
-        frope = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (rope_max_s, d_qk // 2, 2), stride_order=(2, 1, 0), assumed_align=16)
-    else:
-        frope = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
-    # cu_q / cu_k [n_seq+1] int32 (THD packed cumulative seqlens); 1-elem dummy
-    # otherwise (the kernel reads them only when thd_varlen).
-    _cu_n = (n_seq + 1) if thd_varlen else 1
-    fcuq = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_n,), stride_order=(0,), assumed_align=16)
-    fcuk = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (_cu_n,), stride_order=(0,), assumed_align=16)
-    # seq_len_q [B] int32 — real only for dense PADDED (per-batch q-pad); 1-elem
-    # dummy otherwise (the kernel reads it only when has_seq_len_q).
-    fsq = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (B if has_seq_len_q else 1,), stride_order=(0,), assumed_align=16)
-    # DQ_SEM [n_seq*H*sem_q_stride] int32 deterministic-dQ relay counter; 1-elem
-    # dummy when !deterministic (the kernel touches it only under deterministic).
-    fsem = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sem_units if deterministic else 1,), stride_order=(0,), assumed_align=16)
-    return cute.compile(
-        _bprop_host,
-        fq,
-        fk,
-        fv,
-        fdo,
-        fdq,
-        fdk,
-        fdv,
-        fl,
-        fdt,
-        fsk,
-        fbias,
-        fdbias,
-        frope,
-        fcuq,
-        fcuk,
-        fsq,
-        fsem,
-        d_qk,
-        d_v,
-        tile_kv,
-        tile_q,
-        warps_per_sg,
-        int(qo_stages),
-        bool(dq_smem_coalesce),
-        io_dtype,
-        int(mask_flags),
-        int(swa_window),
-        int(causal_bottom_right),
-        bool(has_seq_kv_lens),
-        bool(has_bias),
-        bool(bias_is_fp32),
-        bool(has_rope),
-        bool(has_seq_len_q),
-        bool(thd_varlen),
-        bool(deterministic),
-        int(sched_policy),
-        cutlass.Int32(0),
-        cutlass.Float32(0.0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        cuda.CUstream(0),
-        options="--enable-tvm-ffi",
-    )
-
-
-@lru_cache(maxsize=None)
 def _compile_do_dot(B, H, SQ, d_v, io_is_bf16):
     io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
     fo = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fdo = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fdt = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
     return cute.compile(_do_dot_host, fo, fdo, fdt, d_v, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
-
-
-@lru_cache(maxsize=None)
-def _compile_cast(B, H, SQ, d_qk, io_is_bf16):
-    io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
-    fdq = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, SQ, H, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fout = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SQ, H, d_qk), stride_order=(3, 2, 1, 0), assumed_align=16)
-    return cute.compile(_cast_host, fdq, fout, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
-
-
-@lru_cache(maxsize=None)
-def _compile_dkv_reduce(B, SKV, H, Hk, d, io_is_bf16):
-    io_dtype = cutlass.BFloat16 if io_is_bf16 else cutlass.Float16
-    fin = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, H, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fout = cute.runtime.make_fake_compact_tensor(io_dtype, (B, SKV, Hk, d), stride_order=(3, 2, 1, 0), assumed_align=16)
-    return cute.compile(_dkv_reduce_host, fin, fout, d, H, Hk, io_dtype, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
-
-
-@lru_cache(maxsize=None)
-def _compile_dsink(B, H, SQ):
-    fl = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    fdt = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (B, H, SQ), stride_order=(2, 1, 0), assumed_align=16)
-    fsk = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (H,), stride_order=(0,), assumed_align=16)
-    fds = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (H,), stride_order=(0,), assumed_align=16)
-    return cute.compile(_dsink_host, fl, fdt, fsk, fds, SQ, cutlass.Int32(0), cuda.CUstream(0), options="--enable-tvm-ffi")
-
-
-# ===========================================================================
-# Python entry point.
-# ===========================================================================
-
-# One-time cached 1-element zero dummies for absent optional operands (Rule 1
-# in python/cudnn/AGENTS.md permits a cached ``_dummy`` for a dead ABI slot; a
-# fresh ``torch.zeros(1)`` per call is a per-execute allocation). Never read —
-# the matching has_* Constexpr is False, so the slot is compiled out.
-_DUMMY_CACHE: dict = {}
-
-
-def _dummy1z(dtype, device):
-    key = (dtype, str(device))
-    t = _DUMMY_CACHE.get(key)
-    if t is None:
-        t = _DUMMY_CACHE[key] = torch.zeros(1, dtype=dtype, device=device)
-    return t
 
 
 def scratch_bytes(
@@ -1675,368 +1519,167 @@ def scratch_bytes(
     return total
 
 
-def backward(
-    Q: torch.Tensor,  # [B, SQ,  H, D] io_dtype (BSHD)
-    K: torch.Tensor,  # [B, SKV, H, D]
-    V: torch.Tensor,  # [B, SKV, H, D]
-    dO: torch.Tensor,  # [B, SQ,  H, D]
-    O: torch.Tensor,  # [B, SQ,  H, D] forward output (for on-device do_dot)
-    lse: torch.Tensor,  # [B, H, SQ] fp32 (forward log-sum-exp, natural-log)
-    *,
-    scale: Optional[float] = None,
-    do_dot: Optional[torch.Tensor] = None,  # [B,H,SQ] fp32 — pass to skip the
-    # on-device do_dot kernel (debug).
-    mask: str = "none",  # none / causal / swa / causal_swa
-    deterministic: bool = False,  # bitwise-reproducible dQ via a kv-ordered gmem-semaphore relay (forces SCHED_DEFAULT; perf-insensitive)
-    sched: str = "auto",  # auto / default / lpt — kv-major LPT grid
-    swa_window: int = 0,  # SWA window W (compile-time)
-    right_bound: int = 0,  # causal right-band widening (k <= q+rb)
-    causal_bottom_right: bool = False,  # bottom-right causal alignment
-    seq_kv_lens: Optional[torch.Tensor] = None,  # [B] int32 per-batch KV length
-    seq_len_q: Optional[torch.Tensor] = None,  # [B] int32 per-batch Q length (dense PADDED)
-    bias: Optional[torch.Tensor] = None,  # [1|B, H, SQ, SKV] additive bias
-    rope_freqs: Optional[torch.Tensor] = None,  # [max_s, .., d_qk] RoPE angles
-    sinks: Optional[torch.Tensor] = None,  # [H] fp32 sink logits → dSink output
-    cu_seqlens_q: Optional[torch.Tensor] = None,  # [n_seq+1] int32 cumulative Q seqlens (THD)
-    cu_seqlens_k: Optional[torch.Tensor] = None,  # [n_seq+1] int32 cumulative KV seqlens (THD)
-    tile_kv: int = _LLAMA_CFG.TILE_KV,
-    tile_q: int = _LLAMA_CFG.TILE_Q,
-    warps_per_sg: int = _LLAMA_CFG.WARPS_PER_SG,
-    workspace: Optional[torch.Tensor] = None,  # caller scratch, sized by
-    # scratch_bytes() — every internal buffer is carved from it instead of
-    # allocated (issue #514). Dense-only; None → allocate (wrapper paths).
+# ===========================================================================
+# Template entry point (the #689 contract, backward flavor): one call per
+# shape compiles (or fetches) the FULL kernel chain for this module's PARAMS
+# specialization. THD packed token totals compile DYNAMIC (``cute.sym_int``)
+# and are never part of the key (issue #604) — callers pass ``sq = skv = 0``
+# there; ``n_batch_logical`` (the logical sequence count) sizes the
+# ``cu_seqlens`` ABI and IS plan-time. Launch marshaling lives in the adapter
+# (``api_dsl._sm80_bwd_call``); this module holds no host runtime logic.
+# The stats input is READ as a packed (B, H, SQ) LSE (raw-pointer packed
+# addressing in the device code) — a strided graph stats input is gathered
+# into carved staging by the adapter, unlike the forward's #712-style native
+# strided WRITES.
+# ===========================================================================
+from typing import NamedTuple  # noqa: E402
+
+
+class CompiledBwd(NamedTuple):
+    """The compiled artifacts of one backward specialization + shape."""
+
+    main: object
+    do_dot: object
+    cast: object
+    reduce_k: object  # None unless GQA (h != h_kv)
+    reduce_v: object  # None unless GQA
+    dsink: object  # None unless PARAMS.has_sink
+    sem_q_stride: int  # deterministic-dQ semaphore stride (0 when off)
+
+
+@lru_cache(maxsize=None)
+def compile(  # noqa: A001 — the template contract's entry point
+    b: int,
+    h: int,
+    h_kv: int,
+    sq: int,
+    skv: int,
+    swa_window: int = 0,
+    rope_max_s: int = 0,
+    n_batch_logical: int = 0,
 ):
-    """Full SDPA backward — only ``O`` and ``lse`` (forward outputs) + ``dO`` are
-    needed beyond Q/K/V.  ``do_dot`` is computed on-device from O·dO unless
-    supplied.  ``mask`` / ``swa_window`` / ``right_bound`` / ``causal_bottom_right``
-    / ``seq_kv_lens`` mirror the forward kernel's masking (P=0 on masked cells →
-    dQ/dK/dV inherit it).  Returns (dQ, dK, dV) as io_dtype BSHD tensors."""
-    assert Q.dtype in (torch.float16, torch.bfloat16)
-    assert K.dtype == Q.dtype and V.dtype == Q.dtype and dO.dtype == Q.dtype and O.dtype == Q.dtype
-    io_is_bf16 = Q.dtype == torch.bfloat16
-    B, SQ, H, D = Q.shape
-    _, SKV, Hk, D_K = K.shape
-    _, _, Hv, _ = V.shape
-    assert D_K == D, f"K head dim ({D_K}) must match Q head dim ({D}); every K offset is computed from Q's"
-    d_qk, d_v = D, V.shape[3]
-    # GQA / MQA: H query heads share Hk KV heads (H % Hk == 0).  Each query head
-    # is processed by its own CTA; dK/dV are written per-query-head then summed
-    # over the query-head group by a reduction kernel.  K and V must share the
-    # same KV-head count (standard GQA).
-    assert Hk == Hv, f"K/V head counts must match for GQA (got Hk={Hk}, Hv={Hv})"
-    assert H % Hk == 0, f"H ({H}) must be divisible by KV heads ({Hk}) for GQA/MQA"
-    gqa_ratio = H // Hk
-    # d_qk may exceed d_v (dsv3 192/128); the two sub-groups are specialized per d.
-    # Envelope: d_qk in {64,128,192,256}, d_v <= d_qk, both multiples of 16.
-    assert d_qk >= d_v, f"bprop: d_qk ({d_qk}) must be >= d_v ({d_v})"
-    assert d_qk % 16 == 0 and d_v % 16 == 0, f"bprop: d_qk/d_v must be mult of 16 (got {d_qk}/{d_v})"
-    # SMEM fit on A100 (164 KiB): drop the dQ-coalescing sDQ staging once d_qk>128,
-    # and the Q/dO double-buffer (qo_stages 2→1) once d_qk>=256 (qwen).  d<=128
-    # (llama/gptoss) keeps both (byte-identical fast path).
-    dq_smem_coalesce = d_qk <= 128
-    qo_stages = 1 if d_qk >= 256 else 2
-    # ---- THD / varlen: packed [1,T,H,D] Q/K/V/dO/O + cu_seqlens.  B==1 packed;
-    #      n_seq logical sequences drive the grid + cu_* sizing.  Q.shape[1]/
-    #      K.shape[1] are the packed totals T_q/T_kv (== the kernel's SQ/SKV). ---
-    thd = cu_seqlens_q is not None
-    _carver = None
-    if workspace is not None:
-        assert not thd, "workspace carving is dense-only (the engine path; THD comes via the wrappers)"
-        from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver
+    """Compile (or fetch) this template specialization for one shape.
 
-        _carver = WorkspaceCarver(
-            workspace,
-            scratch_bytes(
-                B=B,
-                SQ=SQ,
-                SKV=SKV,
-                H=H,
-                Hk=Hk,
-                d_qk=d_qk,
-                d_v=d_v,
-                io_bytes=Q.element_size(),
-                deterministic=bool(deterministic),
-                has_bias=bias is not None,
-                bias_batch=(bias.shape[0] if bias is not None else 1),
-                has_sink=sinks is not None,
-                need_do_dot=do_dot is None,
-                tile_q=tile_q,
-            ),
-            "bprop_f16_sm80",
-        )
+    The head dims are PARAMS.d_qk / PARAMS.d_v — the flavor box; the host pads
+    operands to it, so unlike the forward there is no narrower runtime ``d``.
+    Dense: ``sq``/``skv`` are the physical extents. THD (PARAMS.thd_varlen):
+    pass ``b = 1``, ``sq = skv = 0`` — the packed token extents compile as one
+    ``cute.sym_int`` per ragged group (Q/dO/dQ/LSE/do_dot share t_q; K/V and
+    the per-query-head dK/dV write buffers share t_kv), so one artifact
+    re-binds any totals.
+    """
+    p = PARAMS
+    io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
+    mask_flags = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0) | (MASK_PADDED if p.has_seq_kv_lens else 0)
+    # SMEM budget derivations (see the assertions in the device code): drop
+    # the dQ-coalescing sDQ staging past d_qk 128; single Q/dO buffer at 256.
+    dq_smem_coalesce = p.d_qk <= 128
+    qo_stages = 1 if p.d_qk >= 256 else 2
+    gqa = h != h_kv
+    if p.thd_varlen:
+        t_q = cute.sym_int(divisibility=1)
+        t_kv = cute.sym_int(divisibility=1)
+        _b, _sq, _skv = 1, t_q, t_kv
+        n_seq = n_batch_logical
+    else:
+        _b, _sq, _skv = b, sq, skv
+        n_seq = b
+    # Deterministic-dQ relay counter stride: ceil(max_SQ / tile_q). THD +
+    # deterministic is rejected upstream (the FE support surface), so the
+    # dense sq is always real here when deterministic is on.
+    sem_q_stride = ((sq + p.tile_q - 1) // p.tile_q) if p.deterministic else 0
+    sem_units = max(n_seq * h * sem_q_stride, 1)
 
-    def _scratch(numel, dtype, zero):
-        if _carver is None:
-            return (torch.zeros if zero else torch.empty)(numel, dtype=dtype, device=Q.device)
-        t = _carver.take(numel, dtype)
-        if zero:
-            t.zero_()
-        return t
+    def _fake(dtype, shape, order, align=16):
+        return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=order, assumed_align=align)
 
-    if thd:
-        assert cu_seqlens_k is not None, "THD needs both cu_seqlens_q and cu_seqlens_k"
-        assert B == 1, f"THD: Q/K/V/dO/O must be packed [1,T,H,D]; got batch dim {B}"
-        # GQA/MQA work under THD: the per-query-head dK_ws/dV_ws workspace
-        # ([1,T_kv,H,d]) + the _dkv_reduce over the query-head group are
-        # layout-agnostic (B=1, SKV=T_kv packed); the kv-tile CTA reads the
-        # GQA-mapped kv_head and writes its query-head slice exactly as in the
-        # dense path.  (Was conservatively asserted MHA-only.)
-        cu_q_host = cu_seqlens_q.to(dtype=torch.int32, device="cpu")
-        cu_k_host = cu_seqlens_k.to(dtype=torch.int32, device="cpu")
-        n_seq = cu_q_host.numel() - 1
-        assert cu_k_host.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
-        max_skv = int((cu_k_host[1:] - cu_k_host[:-1]).max())
-        max_sq = int((cu_q_host[1:] - cu_q_host[:-1]).max())
-    else:
-        n_seq = B
-        max_sq = SQ
-    # ---- mask string → compile-time bitmask -------------------------------
-    _MASK_TOK = {
-        "none": MASK_NONE,
-        "causal": MASK_CAUSAL,
-        "swa": MASK_SWA,
-        "causal_swa": MASK_CAUSAL | MASK_SWA,
-    }
-    assert mask in _MASK_TOK, f"backward: mask must be one of {list(_MASK_TOK)}; got {mask!r}"
-    mask_flags = _MASK_TOK[mask]
-    # Scheduler: kv-major LPT grid balances the causal load (light high-kv tiles
-    # land in the last wave).  'auto' uses LPT only when causal (where the q-skip
-    # makes work uneven); non-causal work is uniform so DEFAULT is fine.
-    assert sched in ("auto", "default", "natural", "lpt"), f"backward: bad sched {sched!r}"
-    if sched == "lpt":
-        sched_policy = SCHED_LPT
-    elif sched in ("default", "natural"):
-        sched_policy = SCHED_DEFAULT
-    else:  # auto
-        sched_policy = SCHED_LPT if (mask_flags & MASK_CAUSAL) else SCHED_DEFAULT
-    # Deterministic dQ orders the per-(seq,head,q_tile) atomicAdd by kv_tile == the
-    # 3-D grid's blockIdx.x — so it REQUIRES the SCHED_DEFAULT decode (kv_tile=bx).
-    # The kv-major LPT 1-D flat grid would remap kv_tile and break both the order
-    # and the deadlock-freedom (predecessor = lower blockIdx).  Force it off.
-    if deterministic:
-        sched_policy = SCHED_DEFAULT
-    has_seq_kv_lens = seq_kv_lens is not None
-    has_seq_len_q = seq_len_q is not None
-    if has_seq_kv_lens:
-        mask_flags |= MASK_PADDED
-    cbr = 1 if causal_bottom_right else 0
-    has_bias = bias is not None
-    if has_bias:
-        assert bias.dim() == 4 and bias.shape[1] == H, f"bias must be [1|B, H, SQ, SKV]; got {tuple(bias.shape)}"
-        bias_is_fp32 = bias.dtype == torch.float32
-        bias_batch = bias.shape[0]  # 1 (broadcast over B) or B
-        assert bias_batch in (1, B), f"bias batch dim must be 1 or B={B}; got {bias_batch}"
-        bias_bstride = 0 if bias_batch == 1 else H * SQ * SKV
-    else:
-        bias_is_fp32, bias_batch, bias_bstride = True, 1, 0
-    # RoPE: build the [max_s, d_qk//2, 2] (cos,sin) table from the angles
-    # (mirrors the forward).  Backward rotates Q/K on load + un-rotates dQ/dK.
-    has_rope = rope_freqs is not None
-    if has_rope:
-        assert seq_kv_lens is None, "RoPE is dense-only (no THD/padded) on SM80 bprop"
-        d2 = d_qk // 2
-        rf = rope_freqs.to(dtype=torch.float32, device=Q.device).reshape(rope_freqs.shape[0], -1)
-        rope_max_s = rf.shape[0]
-        assert rf.shape[1] >= d2, f"rope_freqs last dim ({rf.shape[1]}) must be >= d_qk//2 ({d2})"
-        assert rope_max_s >= max(SQ, SKV), f"rope_freqs max_s ({rope_max_s}) must cover max(SQ={SQ}, SKV={SKV})"
-        angles = rf[:, :d2]
-        rope_cs_t = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
-    else:
-        rope_max_s = 1
-        rope_cs_t = _dummy1z(torch.float32, Q.device)
-    # Attention sink: dQ/dK/dV need NO kernel change (P recomputed from the
-    # sink-aware LSE the caller passes); only dSink is computed (standalone).
-    has_sink = sinks is not None
-    if has_sink:
-        sinks_t = sinks.to(dtype=torch.float32, device=Q.device).reshape(H).contiguous()
-        dsink_t = _scratch(H, torch.float32, True)
-    # THD is dense-feature-only for now (bias/rope/sink/seq_kv_lens are
-    # dense-only); per-sequence padding is handled by the packed bounds, not
-    # the PADDED mask.  THD uses SCHED_DEFAULT (LPT+THD is a future tweak).
-    if thd:
-        assert not (
-            has_bias or has_rope or has_sink or has_seq_kv_lens or has_seq_len_q
-        ), "THD/varlen bprop: bias/rope/sink/seq_kv_lens/seq_len_q not supported yet"
-        sched_policy = SCHED_DEFAULT
-    # RoPE staging reuses the sDQ SMEM buffer, which the d_qk > 128 configs
-    # drop (dq_smem_coalesce) to stay under the 164 KiB dynamic-SMEM cap —
-    # re-enabling it via has_rope would exceed the budget at launch
-    # (~48-64 KiB over at d=192/256).
-    assert not (has_rope and d_qk > 128), "RoPE bprop requires d_qk <= 128 (the sDQ SMEM staging exceeds the A100 budget beyond that)"
-    # seq_len_q [B] int32 — per-batch live Q length (dense PADDED).  Dummy 1-elem
-    # when unused (kernel never reads it at has_seq_len_q=False).
-    if has_seq_len_q:
-        seqq_t = seq_len_q.to(dtype=torch.int32, device=Q.device).contiguous()
-    else:
-        seqq_t = _dummy1z(torch.int32, Q.device)
-    assert d_qk % 2 == 0
-    # dQ splits d-cols across the two sub-groups → each reads a DQ_N = d_qk//2
-    # column slice of sK.  load_b_smem_x4 takes the d-col offset as `col_base`
-    # (swizzle computed on the TRUE column), so the Swz128B half-column read is
-    # correct for ANY d — no longer requires d_qk//2 % 64 == 0.  The only
-    # remaining shape constraint is DQ_N % 16 == 0 (load_b_smem_x4 N//8 even):
-    # d=128→64 ✓, d=64→32 ✓.
-    assert (d_qk // 2) % 16 == 0, f"d_qk//2 ({d_qk//2}) must be a multiple of 16 (ldmatrix.x4 N//8 even)"
-    assert d_v % 32 == 0, f"d_v ({d_v}) must be a multiple of 32 (do_dot warp reduce)"
-    # Partial-tile (arbitrary seqlen): SQ/SKV need NOT be tile multiples.  The
-    # last straddling tile zero-fills OOB rows on load, masks P=0 for kv>=SKV /
-    # q>=SQ, clamps LSE/do_dot/bias reads, and row-gates the dV/dK/dQ/dBias
-    # stores (all compile-time gated on SQ%tile_q / SKV%tile_kv → dense path is
-    # byte-identical).  RoPE still requires alignment (see below).
-    if has_rope and (SQ % tile_q or SKV % tile_kv):
-        raise NotImplementedError("SM80 bprop: RoPE requires SQ/SKV tile-aligned")
-    # dQ M-tiling: tile_q rows are covered by warps_per_sg warps × 16 × M_BLOCKS,
-    # so tile_q must be an exact multiple of warps_per_sg*16 (llama 64→1 block,
-    # gptoss 128→2).  dV/dK/BMM1 keep M=tile_kv=warps_per_sg*16 (1 block).
-    assert tile_q % (warps_per_sg * 16) == 0, f"tile_q ({tile_q}) must be a multiple of warps_per_sg*16 ({warps_per_sg*16})"
-    assert tile_kv == warps_per_sg * 16, f"tile_kv ({tile_kv}) must equal warps_per_sg*16 ({warps_per_sg*16})"
-    if scale is None:
-        scale = 1.0 / (d_qk**0.5)
-    scale_log2 = scale * math.log2(math.e)
-    inv_scale = 1.0 / float(scale)
+    r4 = (3, 2, 1, 0)
+    fq = _fake(io_dtype, (_b, _sq, h, p.d_qk), r4)
+    fk = _fake(io_dtype, (_b, _skv, h_kv, p.d_qk), r4)
+    fv = _fake(io_dtype, (_b, _skv, h_kv, p.d_v), r4)
+    fdo = _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
+    fdq_acc = _fake(cutlass.Float32, (_b, _sq, h, p.d_qk), r4)
+    # dK/dV WRITE buffers carry H_q heads (per-query-head; GQA reduces after).
+    fdk_ws = _fake(io_dtype, (_b, _skv, h, p.d_qk), r4)
+    fdv_ws = _fake(io_dtype, (_b, _skv, h, p.d_v), r4)
+    fl = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    fdt = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    fsk = _fake(cutlass.Int32, (b if p.has_seq_kv_lens else 1,), (0,), align=4)
+    bias_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype
+    bias_b = 1 if p.bias_broadcast else b
+    fbias = _fake(bias_dtype, ((bias_b, h, sq, skv) if p.has_bias else (1,)), (r4 if p.has_bias else (0,)))
+    fdbias = _fake(cutlass.Float32, ((bias_b, h, sq, skv) if p.has_bias else (1,)), (r4 if p.has_bias else (0,)))
+    frope = _fake(cutlass.Float32, ((rope_max_s, p.d_qk // 2, 2) if p.has_rope else (1,)), ((2, 1, 0) if p.has_rope else (0,)))
+    _cu_len = (n_batch_logical + 1) if p.thd_varlen else 1
+    fcuq = _fake(cutlass.Int32, (_cu_len,), (0,), align=4)
+    fcuk = _fake(cutlass.Int32, (_cu_len,), (0,), align=4)
+    fsq = _fake(cutlass.Int32, (b if p.has_seq_q_lens else 1,), (0,), align=4)
+    fsem = _fake(cutlass.Int32, (sem_units,), (0,), align=4)
+    fstream = cuda.CUstream(0)
 
-    dQ_acc = _scratch(B * SQ * H * d_qk, torch.float32, True).view(B, SQ, H, d_qk)
-    dQ = _scratch(B * SQ * H * d_qk, Q.dtype, False).view(B, SQ, H, d_qk)
-    # Deterministic-dQ relay counter: one int32 per (seq, head, q_tile), zeroed
-    # per launch.  Stride = ceil(max_SQ/tile_q) so the per-seq q_iter (THD) or the
-    # dense q_iter both index in-bounds; n_seq sequences (= B dense).  1-elem dummy
-    # (never touched) on the fast path so it costs nothing.
-    sem_q_stride = (max_sq + tile_q - 1) // tile_q if deterministic else 0
-    sem_units = n_seq * H * sem_q_stride if deterministic else 1
-    dq_sem = _scratch(max(sem_units, 1), torch.int32, True) if deterministic else _dummy1z(torch.int32, Q.device)
-    # dK/dV write buffers have H_q heads (one slice per query head — no atomics).
-    # MHA (gqa_ratio==1): they ARE the outputs.  GQA: a per-query-head workspace
-    # that a reduction kernel sums over the group → [B,SKV,Hk,d] outputs.
-    dK_ws = _scratch(B * SKV * H * d_qk, Q.dtype, False).view(B, SKV, H, d_qk)
-    dV_ws = _scratch(B * SKV * H * d_v, Q.dtype, False).view(B, SKV, H, d_v)
-    if gqa_ratio == 1:
-        dK, dV = dK_ws, dV_ws
-    else:
-        dK = _scratch(B * SKV * Hk * d_qk, Q.dtype, False).view(B, SKV, Hk, d_qk)
-        dV = _scratch(B * SKV * Hk * d_v, Q.dtype, False).view(B, SKV, Hk, d_v)
-
-    lse_t = lse.to(dtype=torch.float32, device=Q.device).contiguous()
-    # seq_kv_lens [B] int32 (or 1-elem dummy when not padded — never read).
-    if has_seq_kv_lens:
-        seqk_t = seq_kv_lens.to(dtype=torch.int32, device=Q.device).contiguous()
-    else:
-        seqk_t = _dummy1z(torch.int32, Q.device)
-    # cu_seqlens [n_seq+1] int32 (THD) or 1-elem dummy (dense — never read).  The
-    # over-provisioned THD grid covers the longest sequence (ceil(max_skv/tile_kv)
-    # kv-tiles) × H × n_seq; short sequences early-out per kv-tile.
-    if thd:
-        cu_q_t = cu_seqlens_q.to(dtype=torch.int32, device=Q.device).contiguous()
-        cu_k_t = cu_seqlens_k.to(dtype=torch.int32, device=Q.device).contiguous()
-        grid_kv_tiles = (max_skv + tile_kv - 1) // tile_kv
-        grid_batch = n_seq
-    else:
-        cu_q_t = _dummy1z(torch.int32, Q.device)
-        cu_k_t = _dummy1z(torch.int32, Q.device)
-        grid_kv_tiles = 0
-        grid_batch = 0
-    # Bias + dBias (fp32 accumulator, same shape as bias; atomicAdd reduces over
-    # batch when bias is broadcast [1,H,SQ,SKV]).
-    if has_bias:
-        bias_t = bias.contiguous()
-        dbias_t = _scratch(bias_batch * H * SQ * SKV, torch.float32, True).view(bias_batch, H, SQ, SKV)
-    else:
-        # Dummy must match the fake tensor _compile_main builds at has_bias=False
-        # (bias_is_fp32 defaults True → fp32).
-        bias_t = _dummy1z(torch.float32, Q.device)
-        dbias_t = _dummy1z(torch.float32, Q.device)
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # ---- do_dot: on-device (default) or caller-supplied ------------------
-    if do_dot is None:
-        dot_t = _scratch(B * H * SQ, torch.float32, False).view(B, H, SQ)
-        dd_fn = _compile_do_dot(B, H, SQ, d_v, io_is_bf16)
-        dd_fn(from_dlpack(O), from_dlpack(dO), from_dlpack(dot_t), cutlass.Int32(B * H * SQ), stream)
-    else:
-        dot_t = do_dot.to(dtype=torch.float32, device=Q.device).contiguous()
-
-    # dSink (standalone reduction; dQ/dK/dV are already sink-correct via LSE).
-    if has_sink:
-        ds_fn = _compile_dsink(B, H, SQ)
-        ds_fn(from_dlpack(lse_t), from_dlpack(dot_t), from_dlpack(sinks_t), from_dlpack(dsink_t), cutlass.Int32(B * H), stream)
-
-    fn = _compile_main(
-        B,
-        H,
-        SQ,
-        SKV,
-        d_qk,
-        d_v,
-        tile_kv,
-        tile_q,
-        warps_per_sg,
-        io_is_bf16,
-        qo_stages=qo_stages,
-        dq_smem_coalesce=dq_smem_coalesce,
-        Hk=Hk,
-        mask_flags=mask_flags,
-        swa_window=swa_window,
-        causal_bottom_right=cbr,
-        has_seq_kv_lens=has_seq_kv_lens,
-        has_bias=has_bias,
-        bias_is_fp32=bias_is_fp32,
-        bias_batch=bias_batch,
-        has_rope=has_rope,
-        rope_max_s=rope_max_s,
-        has_seq_len_q=has_seq_len_q,
-        thd_varlen=thd,
-        n_seq=n_seq,
-        deterministic=deterministic,
-        sem_units=max(sem_units, 1),
-        sched_policy=sched_policy,
+    main = cute.compile(
+        _bprop_host,
+        fq,
+        fk,
+        fv,
+        fdo,
+        fdq_acc,
+        fdk_ws,
+        fdv_ws,
+        fl,
+        fdt,
+        fsk,
+        fbias,
+        fdbias,
+        frope,
+        fcuq,
+        fcuk,
+        fsq,
+        fsem,
+        p.d_qk,
+        p.d_v,
+        p.tile_kv,
+        p.tile_q,
+        p.warps_per_sg,
+        int(qo_stages),
+        bool(dq_smem_coalesce),
+        io_dtype,
+        int(mask_flags),
+        int(swa_window),
+        int(1 if p.causal_bottom_right else 0),
+        bool(p.has_seq_kv_lens),
+        bool(p.has_bias),
+        bool(p.bias_is_fp32),
+        bool(p.has_rope),
+        bool(p.has_seq_q_lens),
+        bool(p.thd_varlen),
+        bool(p.deterministic),
+        int(p.sched_policy),
+        cutlass.Int32(0),
+        cutlass.Float32(0.0),
+        cutlass.Float32(0.0),
+        cutlass.Int32(0),
+        cutlass.Float32(0.0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        fstream,
+        options="--enable-tvm-ffi",
     )
-    fn(
-        from_dlpack(Q),
-        from_dlpack(K),
-        from_dlpack(V),
-        from_dlpack(dO),
-        from_dlpack(dQ_acc),
-        from_dlpack(dK_ws),
-        from_dlpack(dV_ws),
-        from_dlpack(lse_t),
-        from_dlpack(dot_t),
-        from_dlpack(seqk_t),
-        from_dlpack(bias_t),
-        from_dlpack(dbias_t),
-        from_dlpack(rope_cs_t),
-        from_dlpack(cu_q_t),
-        from_dlpack(cu_k_t),
-        from_dlpack(seqq_t),
-        from_dlpack(dq_sem),
-        cutlass.Int32((SQ + tile_q - 1) // tile_q),
-        cutlass.Float32(scale_log2),
-        cutlass.Float32(scale),
-        cutlass.Int32(right_bound),
-        cutlass.Float32(inv_scale),
-        cutlass.Int32(bias_bstride),
-        cutlass.Int32(sem_q_stride),
-        cutlass.Int32(grid_kv_tiles),
-        cutlass.Int32(grid_batch),
-        stream,
-    )
-
-    cast_fn = _compile_cast(B, H, SQ, d_qk, io_is_bf16)
-    n_vecs = (B * SQ * H * d_qk) // 2
-    cast_fn(from_dlpack(dQ_acc), from_dlpack(dQ), cutlass.Int32(n_vecs), stream)
-
-    # GQA: sum dK_ws/dV_ws over each query-head group → [B,SKV,Hk,d] outputs.
-    if gqa_ratio > 1:
-        rk_fn = _compile_dkv_reduce(B, SKV, H, Hk, d_qk, io_is_bf16)
-        rk_fn(from_dlpack(dK_ws), from_dlpack(dK), cutlass.Int32(B * SKV * Hk * d_qk), stream)
-        rv_fn = _compile_dkv_reduce(B, SKV, H, Hk, d_v, io_is_bf16)
-        rv_fn(from_dlpack(dV_ws), from_dlpack(dV), cutlass.Int32(B * SKV * Hk * d_v), stream)
-
-    # Optional grads appended in a FIXED order (dBias, then dSink); the caller
-    # reconstructs positions from has_bias / has_sink (which it passed in).
-    outs = [dQ, dK, dV]
-    if has_bias:
-        outs.append(dbias_t)  # fp32 [1|B, H, SQ, SKV]
-    if has_sink:
-        outs.append(dsink_t)  # fp32 [H]
-    return tuple(outs)
+    fo = _fake(io_dtype, (_b, _sq, h, p.d_v), r4)
+    do_dot = cute.compile(_do_dot_host, fo, fdo, fdt, p.d_v, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    fdq_out = _fake(io_dtype, (_b, _sq, h, p.d_qk), r4)
+    cast = cute.compile(_cast_host, fdq_acc, fdq_out, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    reduce_k = reduce_v = None
+    if gqa:
+        fdk_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_qk), r4)
+        fdv_out = _fake(io_dtype, (_b, _skv, h_kv, p.d_v), r4)
+        reduce_k = cute.compile(_dkv_reduce_host, fdk_ws, fdk_out, p.d_qk, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        reduce_v = cute.compile(_dkv_reduce_host, fdv_ws, fdv_out, p.d_v, h, h_kv, io_dtype, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    dsink = None
+    if p.has_sink:
+        fsinks = _fake(cutlass.Float32, (h,), (0,), align=4)
+        fdsink = _fake(cutlass.Float32, (h,), (0,), align=4)
+        dsink = cute.compile(_dsink_host, fl, fdt, fsinks, fdsink, sq, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+    return CompiledBwd(main=main, do_dot=do_dot, cast=cast, reduce_k=reduce_k, reduce_v=reduce_v, dsink=dsink, sem_q_stride=sem_q_stride)
