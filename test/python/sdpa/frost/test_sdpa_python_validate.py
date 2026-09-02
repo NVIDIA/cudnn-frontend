@@ -82,6 +82,18 @@ def test_mixed_graph_still_lowers(frost_candidate):
     assert g._lowered_graph is not None, "a graph with an uncovered node must keep the classic eager lowering"
 
 
+def test_rejected_graph_stays_unvalidated(frost_candidate):
+    """A native-validation rejection leaves the graph unvalidated: the flag is set
+    only after every check passes, so build_operation_graph() re-validates and
+    raises the same error rather than planning a rejected graph."""
+    g, _ = _sdpa_graph(h_q=3, h_kv=2)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="group-query attention"):
+        g.validate()
+    assert g._is_validated is False
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="group-query attention"):
+        g.build_operation_graph()
+
+
 def test_gqa_head_divisibility(frost_candidate):
     """h_q not a multiple of h_kv is rejected with the classic error type, without lowering."""
     g, _ = _sdpa_graph(h_q=3, h_kv=2)

@@ -824,7 +824,6 @@ class pygraph:
                 t.stride = _row_major_stride(t.dim)
             if not t.is_pass_by_value:
                 t.validate()
-        self._is_validated = True
         # Classic parity: C++ validation happens HERE, so a config the backend
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
@@ -848,6 +847,10 @@ class pygraph:
                 self._lowered_graph = self._lower_to_cpp()
                 self._lowered_graph.validate()
                 self._verify_uid_ownership()
+        # Only a graph that passed EVERY check above is validated: a rejection
+        # (python-native or C++) leaves the flag False so build()/plan() re-run
+        # validate() and raise again instead of planning a rejected graph.
+        self._is_validated = True
 
     def _python_native_validation(self) -> bool:
         """Whether validate() may skip the eager C++ lowering: every node has a
