@@ -90,7 +90,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 - Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
 - Never delete an existing log or diagnostic statement in a cleanup/refactor — several were added after repeated hard-to-repro failures and are the only tripwire for a recurrence (review on PR #280). If one looks redundant, ask before removing.
 - Every new source file needs the repo's SPDX/license header (flagged in review on PR #747) — enforced by the `spdx-license-header` pre-commit hook.
-- Changing a FROST SDPA `Capabilities` row (dtype, head dim, mask, THD, layout) or adding/retiring an `EngineSpec` updates [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md) in the same commit — it is maintained by hand and has no other tripwire. Cite as SDPA Rule S2.
+- Changing any FROST SDPA `Capabilities` field that affects graph eligibility, or adding/retiring an `EngineSpec`, updates [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md) in the same commit — it is maintained by hand and has no other tripwire. A change confined to knob domains (`tile_ms`, `sched_policies`, ...) is exempt. [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) **Rule S2** is canonical for the exact scope; cite it in review.
 
 ## Agent skills
 
