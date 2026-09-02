@@ -24,6 +24,8 @@ def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
     """Return the tuned SM100 kernel variant and its sparse-row tile size."""
     if num_heads == 16 and head_dim == 576:
         return "h16_m128", 128
+    if num_heads == 32 and head_dim == 576:
+        return "h32_m64", 64
     return "generic_m64", 64
 
 
@@ -197,6 +199,16 @@ def flash_attn_bwd_sm100(
             from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
             kernel_obj = FlashAttentionDSABackwardSm100H16(
+                element_dtype=dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                block_tile=block_tile,
+                max_topk=max_topk,
+            )
+        elif backend == "h32_m64":
+            from .dsa_bwd_sm100_h32 import FlashAttentionDSABackwardSm100H32
+
+            kernel_obj = FlashAttentionDSABackwardSm100H32(
                 element_dtype=dtype,
                 head_dim=head_dim,
                 head_dim_v=head_dim_v,

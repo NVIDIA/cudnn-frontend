@@ -57,7 +57,7 @@ def _allocate(cfg, has_topk_length: bool):
     [
         (16, 576, "h16_m128", 128),
         (16, 512, "generic_m64", 64),
-        (32, 576, "generic_m64", 64),
+        (32, 576, "h32_m64", 64),
         (64, 576, "generic_m64", 64),
     ],
 )
@@ -245,7 +245,7 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
     [
         pytest.param(512, 64, (-3, 0, 1, 63, 64, 65, 128), id="d512-mixed"),
         pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
-        pytest.param(576, 32, None, id="d576-all-empty"),
+        pytest.param(576, 32, (0, 1, 63, 64, 65, 127, 128), id="d576-h32-m64-boundaries"),
     ],
 )
 def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_heads, topk_length_values):
@@ -274,8 +274,8 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
 
     # D512 covers defensive negative handling around the 64-row tile boundary.
     # D576/H16 covers both sides of the dedicated kernel's 128-row boundary and
-    # its final feature/top-k tails. The all-empty cases make every expected
-    # gradient exactly zero; D576/H32 also covers a partial 64-head CTA.
+    # its final feature/top-k tails. D576/H32 covers the corresponding M64
+    # boundary, and every case also exercises the all-empty fast path.
     topk_length_cases = [torch.zeros(s_q, dtype=torch.int32, device=device)]
     if topk_length_values is not None:
         topk_length_cases.insert(0, torch.tensor(topk_length_values, dtype=torch.int32, device=device))
@@ -354,13 +354,20 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=434)
-def test_DSA_sparse_attention_backward_sm100_h16_partial_max_topk():
-    """H16 M128 handles a maximum top-k ending in a partial sparse tile."""
+@pytest.mark.parametrize(
+    "num_heads,s_kv,topk",
+    [
+        pytest.param(16, 640, 513, id="h16-m128"),
+        pytest.param(32, 4096, 2047, id="h32-m64"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_partial_max_topk(num_heads, s_kv, topk):
+    """Dedicated SM100 kernels handle a maximum top-k ending in a partial tile."""
     if not torch.cuda.is_available():
         pytest.skip("SM100 GPU required")
     major, minor = torch.cuda.get_device_capability()
     if major * 10 + minor < 100:
-        pytest.skip("H16 M128 regression test targets the SM100 kernel")
+        pytest.skip("dedicated H16/H32 regression test targets the SM100 kernel")
 
     try:
         from cudnn import DSA
@@ -368,8 +375,8 @@ def test_DSA_sparse_attention_backward_sm100_h16_partial_max_topk():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, num_heads = 2, 640, 16
-    head_dim, topk = 576, 513
+    s_q = 2
+    head_dim = 576
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
@@ -666,7 +673,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("head_dim,num_heads", [(512, 64), (576, 16)])
+@pytest.mark.parametrize("head_dim,num_heads", [(512, 64), (576, 16), (576, 32)])
 @torch_fork_set_rng(seed=16)
 def test_DSA_sparse_attention_backward_fp16_sm100_numerics(head_dim, num_heads):
     """SM100 must compile FP16 inputs with FP16 MMA/storage semantics."""
