@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 # SPDX-License-Identifier: MIT
 import math
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Protocol, Tuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -10,7 +10,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Float32, Int32, Int64, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -42,12 +42,50 @@ from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
 
 from cudnn.block_sparse_attention.csrc.utils.named_barrier import NamedBarrierBwdSm100
 
+MASK_R2P_CHUNK_SIZE = 32
+
+
+class MaskGenFn(Protocol):
+    def __call__(self, chunk_idx: int) -> Uint32: ...
+
+
+@cute.jit
+def r2p_bitmask_below(limit: Int32, chunk_idx: int) -> Uint32:
+    shift = max((chunk_idx + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
+    return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(shift))
+
+
+@cute.jit
+def r2p_bitmask_above(limit: Int32, chunk_idx: int) -> Uint32:
+    return r2p_bitmask_below(limit, chunk_idx) ^ Uint32(0xFFFFFFFF)
+
+
+@cute.jit
+def row_to_r2p_idx(row: Int32, num_rep: int, num_wg: int) -> Int32:
+    return row // (num_rep * num_wg) * num_rep + min(row % (num_rep * num_wg), num_rep)
+
+
+@cute.jit
+def mask_r2p_lambda(
+    values: cute.Tensor,
+    mask_gen_fn: cutlass.Constexpr[MaskGenFn],
+) -> None:
+    size = const_expr(cute.size(values))
+    for chunk_idx in cutlass.range_constexpr(cute.ceil_div(size, MASK_R2P_CHUNK_SIZE)):
+        mask = mask_gen_fn(chunk_idx)
+        for bit in cutlass.range_constexpr(min(MASK_R2P_CHUNK_SIZE, size - chunk_idx * MASK_R2P_CHUNK_SIZE)):
+            index = chunk_idx * MASK_R2P_CHUNK_SIZE + bit
+            keep = cutlass.Boolean(mask & (Uint32(1) << bit))
+            values[index] = values[index] if keep else -Float32.inf
+
 
 class BsaK2qCsrTensors(NamedTuple):
     """BSA bucketed k2q CSR tensors for the blk128 backward path."""
 
     bucketed_k2q_offsets: cute.Tensor
     bucketed_k2q_indices: cute.Tensor
+    token_mask_bounds: cute.Tensor
+    token_mask_flags: cute.Tensor
 
     def __new_from_mlir_values__(self, values):
         return BsaK2qCsrTensors(*values)
@@ -62,7 +100,7 @@ def get_total_q_block_count_bsa_k2q_csr(
     n_block,
 ):
     """Return the number of Q tiles contributing to one KV tile."""
-    bucketed_k2q_offsets, _ = bsa_k2q_csr_tensors
+    bucketed_k2q_offsets = bsa_k2q_csr_tensors.bucketed_k2q_offsets
     begin = bucketed_k2q_offsets[batch_idx, head_idx, q_group, n_block]
     end = bucketed_k2q_offsets[batch_idx, head_idx, q_group, n_block + 1]
     return end - begin
@@ -74,7 +112,7 @@ def get_bsa_k2q_csr_tile_coord(
     bsa_k2q_csr_tensors: BsaK2qCsrTensors,
 ):
     """Map scheduler N tile to (q_group, kv_block) for BSA k2q CSR."""
-    bucketed_k2q_offsets, _ = bsa_k2q_csr_tensors
+    bucketed_k2q_offsets = bsa_k2q_csr_tensors.bucketed_k2q_offsets
     num_kv_blocks = cute.size(bucketed_k2q_offsets.shape[3]) - 1
     q_group = sched_n_block // num_kv_blocks
     n_block = sched_n_block - q_group * num_kv_blocks
@@ -94,7 +132,8 @@ def get_bsa_k2q_csr_iteration_info_bwd(
     For BSA CSR, curr_q_cnt carries the CSR begin offset and curr_q_idx is the
     full per-head edge vector.
     """
-    bucketed_k2q_offsets, bucketed_k2q_indices = bsa_k2q_csr_tensors
+    bucketed_k2q_offsets = bsa_k2q_csr_tensors.bucketed_k2q_offsets
+    bucketed_k2q_indices = bsa_k2q_csr_tensors.bucketed_k2q_indices
     begin = bucketed_k2q_offsets[batch_idx, head_idx, q_group, n_block]
     end = bucketed_k2q_offsets[batch_idx, head_idx, q_group, n_block + 1]
     curr_q_idx = bucketed_k2q_indices[batch_idx, head_idx, None]
@@ -157,6 +196,9 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
             m_block_safe = cutlass.min(m_block, m_block_max - 1)
 
         if iter_idx == 0:
+            # Q/LSE has two stages while dO/dPsum is single-buffered. Issue
+            # Q first so a busy dO stage cannot serialize the independent Q
+            # prefetch behind its producer_acquire.
             pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
             load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
             load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
@@ -182,6 +224,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
                     mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                 )
             producer_state_dO_dPsum.advance()
+
         else:
             pipeline_Q.producer_acquire(producer_state_Q_LSE)
             load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
@@ -217,6 +260,8 @@ class BlockSparseAttnBackwardSm100Blk128:
         self,
         head_dim: int,
         force_dkv_postprocess: cutlass.Constexpr = False,
+        has_token_mask: cutlass.Constexpr = False,
+        inverse_token_mask: cutlass.Constexpr = False,
     ):
         assert head_dim in (64, 128), f"SM100 blk128 bwd supports head_dim in {{64, 128}}, got {head_dim}"
         # tile_hdim drives the K reduction of S/P/dV/dK mma's and the dQ accumulator
@@ -244,6 +289,8 @@ class BlockSparseAttnBackwardSm100Blk128:
         self.acc_dtype = Float32
 
         self.force_dkv_postprocess = force_dkv_postprocess
+        self.has_token_mask = has_token_mask
+        self.inverse_token_mask = inverse_token_mask
 
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -637,7 +684,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
 
         TileScheduler = SingleTileScheduler
-        bucketed_k2q_offsets, _ = bsa_k2q_csr_tensors
+        bucketed_k2q_offsets = bsa_k2q_csr_tensors.bucketed_k2q_offsets
         num_sched_n_blocks = (cute.size(bucketed_k2q_offsets.shape[3]) - 1) * cute.size(bucketed_k2q_offsets.shape[2])
         tile_sched_args = TileSchedulerArguments(
             num_sched_n_blocks,  # num_blocks
@@ -1594,19 +1641,71 @@ class BlockSparseAttnBackwardSm100Blk128:
         return t[coord]
 
     @cute.jit
-    def apply_seqlen_k_mask(
+    def apply_score_mask(
         self,
         acc_S: cute.Tensor,
         tScS_t2r: cute.Tensor,
+        bsa_k2q_csr_tensors: BsaK2qCsrTensors,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
         n_block: Int32,
         seqlen,
     ):
-        col = 0
-        thr_col_offset = tScS_t2r[0][col]
-        seqlenk_col_limit = seqlen.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if seqlenk_col_limit <= 0:
-            for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                acc_S[i] = -cutlass.Float32.inf
+        """Mask the native K tail and optional exact per-Q-row interval."""
+        if const_expr(self.has_token_mask):
+            partial_index = cute.arch.make_warp_uniform(Int32(bsa_k2q_csr_tensors.token_mask_flags[batch_idx, head_idx, m_block, n_block]))
+            if partial_index >= Int32(0):
+                if const_expr(self.inverse_token_mask):
+                    k_row = Int32(tScS_t2r[0][0])
+                    packed1 = Uint32(bsa_k2q_csr_tensors.token_mask_bounds[partial_index, Int32(2) * k_row])
+                    packed2 = Uint32(bsa_k2q_csr_tensors.token_mask_bounds[partial_index, Int32(2) * k_row + Int32(1)])
+                    band1_left = Int32(packed1 & Uint32(0xFFFF))
+                    band1_right = Int32(utils.shr_u32(packed1, Uint32(16)))
+                    band2_left = Int32(packed2 & Uint32(0xFFFF))
+                    band2_right = Int32(utils.shr_u32(packed2, Uint32(16)))
+                    if n_block * self.tile_n + k_row >= seqlen.seqlen_k:
+                        band1_left, band1_right = Int32(0), Int32(0)
+                        band2_left, band2_right = Int32(0), Int32(0)
+
+                    q_thread_origin = Int32(tScS_t2r[0][1])
+                    band1_left = cutlass.min(cutlass.max(band1_left - q_thread_origin, Int32(0)), Int32(self.tile_m))
+                    band1_right = cutlass.max(cutlass.min(band1_right - q_thread_origin, Int32(self.tile_m)), Int32(0))
+                    band2_left = cutlass.min(cutlass.max(band2_left - q_thread_origin, Int32(0)), Int32(self.tile_m))
+                    band2_right = cutlass.max(cutlass.min(band2_right - q_thread_origin, Int32(self.tile_m)), Int32(0))
+
+                    num_rep = cute.size(tScS_t2r, mode=[0])
+                    num_wg = 2
+                    band1_left = row_to_r2p_idx(band1_left, num_rep, num_wg)
+                    band1_right = row_to_r2p_idx(band1_right, num_rep, num_wg)
+                    band2_left = row_to_r2p_idx(band2_left, num_rep, num_wg)
+                    band2_right = row_to_r2p_idx(band2_right, num_rep, num_wg)
+
+                    def inverse_mask_gen_fn(chunk_idx: int) -> Uint32:
+                        band1 = r2p_bitmask_above(band1_left, chunk_idx) & r2p_bitmask_below(band1_right, chunk_idx)
+                        band2 = r2p_bitmask_above(band2_left, chunk_idx) & r2p_bitmask_below(band2_right, chunk_idx)
+                        return band1 | band2
+
+                    mask_r2p_lambda(acc_S, inverse_mask_gen_fn)
+                else:
+                    for i in cutlass.range_constexpr(cute.size(acc_S.shape)):
+                        k_row = Int32(tScS_t2r[i][0])
+                        q_row = Int32(tScS_t2r[i][1])
+                        packed = Uint32(bsa_k2q_csr_tensors.token_mask_bounds[partial_index, q_row])
+                        lo = Int32(packed & Uint32(0xFFFF))
+                        hi = Int32(utils.shr_u32(packed, Uint32(16)))
+                        valid = n_block * self.tile_n + k_row < seqlen.seqlen_k and k_row >= lo and k_row < hi
+                        acc_S[i] = acc_S[i] if valid else -cutlass.Float32.inf
+            else:
+                k_row = Int32(tScS_t2r[0][0])
+                if n_block * self.tile_n + k_row >= seqlen.seqlen_k:
+                    for i in cutlass.range_constexpr(cute.size(acc_S.shape)):
+                        acc_S[i] = -cutlass.Float32.inf
+        else:
+            k_row = Int32(tScS_t2r[0][0])
+            if n_block * self.tile_n + k_row >= seqlen.seqlen_k:
+                for i in cutlass.range_constexpr(cute.size(acc_S.shape)):
+                    acc_S[i] = -cutlass.Float32.inf
 
     @cute.jit
     def compute_loop(
@@ -1749,12 +1848,21 @@ class BlockSparseAttnBackwardSm100Blk128:
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block, seqlen)
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                    self.apply_score_mask(
+                        tSrS_cur,
+                        tScS_t2r[None, stage, 0, 0],
+                        bsa_k2q_csr_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        n_block,
+                        seqlen,
+                    )
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                     cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
                     tSrLSE = tSrLSE_s2r
@@ -2192,6 +2300,8 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
+    token_mask_bounds: Optional[torch.Tensor] = None,
+    token_mask_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
     assert q.dtype == torch.bfloat16, "SM100 blk128 bwd only supports bfloat16"
@@ -2200,6 +2310,13 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     assert _get_device_arch() // 10 in [10, 11]
     assert bucketed_k2q_offsets.dtype == torch.int32
     assert bucketed_k2q_indices.dtype == torch.int32
+    has_token_mask = token_mask_bounds is not None
+    assert has_token_mask == (token_mask_flags is not None)
+    if has_token_mask:
+        assert token_mask_bounds.dtype == torch.int32 and token_mask_bounds.ndim == 2
+        assert token_mask_bounds.shape[1] in (SM100_BLK128_BWD_SPARSE_BLOCK_SIZE, 2 * SM100_BLK128_BWD_SPARSE_BLOCK_SIZE)
+        assert token_mask_flags.dtype == torch.int32 and token_mask_flags.ndim == 4
+        assert token_mask_bounds.is_cuda and token_mask_flags.is_cuda
 
     batch_size, num_heads, seqlen_q, head_dim = q.shape
     seqlen_k = k.shape[2]
@@ -2216,6 +2333,11 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     assert bucketed_k2q_indices.shape[:2] == (batch_size, num_heads)
     num_q_groups = bucketed_k2q_offsets.shape[2]
     use_dkv_postprocess = num_q_groups > 1
+    if has_token_mask:
+        assert token_mask_flags.shape == (batch_size, num_heads, num_q_blocks, num_kv_blocks)
+    else:
+        token_mask_bounds = torch.empty((1, SM100_BLK128_BWD_SPARSE_BLOCK_SIZE), dtype=torch.int32, device=q.device)
+        token_mask_flags = torch.empty((1, 1, 1, 1), dtype=torch.int32, device=q.device)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -2300,6 +2422,8 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         get_broadcast_dims(v_bshd),
         get_broadcast_dims(dout_bshd),
         use_dkv_postprocess,
+        has_token_mask,
+        token_mask_bounds.shape[1] if has_token_mask else 0,
     )
     cache = bsa_sm100_blk128_bwd_bucketed_k2q_csr.compile_cache
     if compile_key not in cache:
@@ -2311,10 +2435,14 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         bsa_csr_tensors = BsaK2qCsrTensors(
             to_cute_tensor(bucketed_k2q_offsets, assumed_align=4),
             to_cute_tensor(bucketed_k2q_indices, assumed_align=4),
+            to_cute_tensor(token_mask_bounds, assumed_align=4),
+            to_cute_tensor(token_mask_flags, assumed_align=4),
         )
         bwd_kernel = BlockSparseAttnBackwardSm100Blk128(
             head_dim,
             force_dkv_postprocess=use_dkv_postprocess,
+            has_token_mask=has_token_mask,
+            inverse_token_mask=has_token_mask and token_mask_bounds.shape[1] == 256,
         )
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cache[compile_key] = cute.compile(
@@ -2345,7 +2473,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         dk_accum if use_dkv_postprocess else dk_bshd,
         dv_accum if use_dkv_postprocess else dv_bshd,
         float(softmax_scale),
-        (bucketed_k2q_offsets, bucketed_k2q_indices),
+        (bucketed_k2q_offsets, bucketed_k2q_indices, token_mask_bounds, token_mask_flags),
     )
 
     _bwd_postprocess_convert(

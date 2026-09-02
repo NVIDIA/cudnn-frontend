@@ -208,3 +208,117 @@ def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_
     torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=11)
+def test_bsa_attention_backward_blk128_exact_intervals_native_tail():
+    """Exact per-row intervals mask partial tiles and the physical K tail."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major not in {10, 11}:
+        pytest.skip("blk128 backward is specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 1, 256, 230, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    do = torch.randn_like(q)
+
+    q2k = torch.tensor([0, 1], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, 1, 2, 2).contiguous()
+    q2k_nums = torch.full((1, 1, 2), 2, dtype=torch.int32, device="cuda")
+    block_sizes = torch.tensor([128, seqlen_k - 128], dtype=torch.int32, device="cuda")
+    bounds = torch.zeros((4, block_size), dtype=torch.int32, device="cuda")
+    sparse_flags = torch.empty((1, 2, 2), dtype=torch.int32, device="cuda")
+    dense_flags = torch.full((1, 1, 2, 2), -1, dtype=torch.int32, device="cuda")
+    mask = torch.full((seqlen_q, seqlen_k), float("-inf"), dtype=torch.float32, device="cuda")
+    for qb in range(2):
+        for kb in range(2):
+            partial = qb * 2 + kb
+            sparse_flags[0, qb, kb] = partial
+            dense_flags[0, 0, qb, kb] = partial
+            for row in range(block_size):
+                q_row = qb * block_size + row
+                hi_global = min(seqlen_k, 80 + q_row)
+                lo = 0
+                hi = max(0, min(block_size, hi_global - kb * block_size))
+                bounds[partial, row] = lo | (hi << 16)
+                if hi:
+                    mask[q_row, kb * block_size : kb * block_size + hi] = 0.0
+    mask = mask.view(1, 1, seqlen_q, seqlen_k)
+    _, _, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask)
+
+    forward = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        2,
+        block_sizes,
+        q2k_block_nums=q2k_nums,
+        sparse_block_size=block_size,
+        token_mask_bounds=bounds,
+        token_mask_flags=sparse_flags,
+        q_stage=1,
+    )
+    backward = BSA.block_sparse_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        forward["o_tensor"],
+        forward["lse_tensor"],
+        q2k,
+        2,
+        None,
+        q2k_block_nums=q2k_nums,
+        sparse_block_size=block_size,
+        token_mask_bounds=bounds,
+        token_mask_flags=dense_flags,
+    )
+    torch.testing.assert_close(backward["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+    bounds_cpu = bounds.cpu()
+    inverse_cpu = torch.zeros((4, 2 * block_size), dtype=torch.int32)
+    for partial in range(4):
+        for k_row in range(block_size):
+            rows = []
+            for q_row in range(block_size):
+                packed = int(bounds_cpu[partial, q_row])
+                lo = packed & 0xFFFF
+                hi = (packed >> 16) & 0xFFFF
+                if lo <= k_row < hi:
+                    rows.append(q_row)
+            ranges = []
+            for row in rows:
+                if not ranges or row != ranges[-1][1]:
+                    ranges.append([row, row + 1])
+                else:
+                    ranges[-1][1] += 1
+            assert len(ranges) <= 2
+            for band, (lo, hi) in enumerate(ranges):
+                inverse_cpu[partial, 2 * k_row + band] = lo | (hi << 16)
+    inverse = inverse_cpu.cuda()
+    backward_inverse = BSA.block_sparse_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        forward["o_tensor"],
+        forward["lse_tensor"],
+        q2k,
+        2,
+        None,
+        q2k_block_nums=q2k_nums,
+        sparse_block_size=block_size,
+        token_mask_bounds=inverse,
+        token_mask_flags=dense_flags,
+    )
+    torch.testing.assert_close(backward_inverse["dq_tensor"].float(), dq_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward_inverse["dk_tensor"].float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(backward_inverse["dv_tensor"].float(), dv_ref, atol=3e-2, rtol=3e-2)
