@@ -511,9 +511,9 @@ def fp8_thd_fwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=256,
+            s_q_max=4096,
             s_kv_min=64,
-            s_kv_max=512,
+            s_kv_max=4096,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -688,6 +688,39 @@ def mxfp8_bwd():
     )
 
 
+def thd_chunked(dtype):
+    # Ragged (THD) chunked generation: short query chunks (s_q <= 64) against a
+    # long KV history, packed varlen on both sides — the varlen continuation /
+    # chunked-prefill shape. Not covered by test_mhas_v2 (its THD suites are
+    # prefill-sized, its decode suites dense-only).
+    return dict(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[1, 4]),
+        s_q_s_kv=RandomSequenceLength(
+            s_q_min=1,
+            s_q_max=64,
+            s_kv_min=1,
+            s_kv_max=4096,
+            s_q_distribution={"s_q=1": 3, "s_q=s_kv": 1, "s_q=random": 10},
+        ),
+        d_qk_d_v=RandomHiddenDimSize(
+            d_qk_min=1,
+            d_qk_max=128,
+            d_v_min=1,
+            d_v_max=128,
+            head_dim_distribution={"d_qk=d_v": 1, "d_qk=random": 1},
+            with_high_probability=[(64, 64), (128, 128), (192, 128)],
+        ),
+        head_count=RandomHeadGenerator(min=1, max=32, head_group_options=(1, 4, 1)),
+        data_type=_dt(dtype),
+        with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
+        diag_align=RandomChoice(DIAG_BOTH),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1}),
+        ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
+        total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
+        declare_total_seq_len=RandomChoice({True: 1, False: 1}),
+    )
+
+
 # ---- model presets ----------------------------------------------------------
 
 
@@ -745,7 +778,7 @@ def model_knobs(preset, phase, dtype):
         data_type=_dt(dtype),
         with_sliding_mask=SlidingWindowMaskGenerator(**preset.mask_weights),
         diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "padded": 1, "full": 1}),
         with_sink_token=sink,
         ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
         total_token_slack=RandomChoice({"packed": 1, "slack": 1}),

@@ -38,6 +38,14 @@ def test_generation_fp16_lean(env_info, test_no, request, cudnn_handle):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
+    "test_no", suite_seeds("generation.fp16.thd_chunked"), ids=lambda p: f"test{p[0]}"
+)
+def test_generation_fp16_thd_chunked(env_info, test_no, request, cudnn_handle):
+    run_suite("generation.fp16.thd_chunked", env_info, test_no, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
     "test_no", suite_seeds("generation.fp16.paged"), ids=lambda p: f"test{p[0]}"
 )
 def test_generation_fp16_paged(env_info, test_no, request, cudnn_handle):
