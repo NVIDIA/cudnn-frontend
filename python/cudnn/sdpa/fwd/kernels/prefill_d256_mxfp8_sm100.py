@@ -197,7 +197,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
     thd_decode_unit,
     TENSOR_MAP_QWORDS,
