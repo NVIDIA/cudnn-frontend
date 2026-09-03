@@ -10,7 +10,11 @@ serves is rejected at validate() because the *backend* is too old to know an
 attribute it will never execute. This module is the replacement for the SDPA
 family: the graph-SEMANTIC subset of the classic C++ pre-validation (shape and
 stride invariants, ill-formed attribute combinations), expressed on the python
-IR with the classic error types and messages.
+IR with the classic error types and messages. It is wired in through the
+manifest -- ``EngineFamily.validator`` on the frost_sdpa families resolves to
+``validate_graph`` here (``cudnn._gemm_validate`` is the GEMM family's
+counterpart); ``pygraph.validate()`` consults it only when the manifest also
+offers a python engine for the graph.
 
 Deliberately absent: every backend-version gate (``get_backend_version() < X``)
 and device-arch gate (``prop_major == Y``) from the C++ surface. Those are
@@ -111,6 +115,19 @@ def _is_ragged(*tensors) -> bool:
 def _has(node, port: str) -> bool:
     """Whether an input port is bound."""
     return node.inputs.get(port) is not None
+
+
+def validate_graph(graph) -> bool:
+    """The frost_sdpa families' native validator (engines.manifest.EngineFamily.validator):
+    validate every node when all of them are SDPA-family; return False without
+    raising when the graph holds a node this module does not cover, so the caller
+    falls back to the classic eager C++ lowering."""
+    nodes = list(graph._nodes)
+    if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
+        return False
+    for node in nodes:
+        validate_node(node)
+    return True
 
 
 def validate_node(node) -> None:

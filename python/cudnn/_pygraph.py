@@ -829,21 +829,19 @@ class pygraph:
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
         # the caller registered its own engine — the pre-existing exemption.
         #
-        # SDPA-family graphs with a python engine candidate validate natively in
-        # python instead (issue #704): the eager C++ round-trip couples a graph
-        # a FROST engine fully serves to the installed backend's version (an
-        # attribute the backend is too old to *validate* but will never
-        # execute). Semantic validity is checked here by _sdpa_validate with
-        # classic error types; the backend's own verdict is deferred to
-        # planning, where a decline is recorded (backend_plan_entries) and
-        # surfaced by plan() only if no python engine proposes a plan either.
+        # A graph whose engine family declares a python-native validator, and for
+        # which the manifest offers a python engine, validates natively instead
+        # (issue #704): the eager C++ round-trip couples a graph a FROST engine
+        # fully serves to the installed backend's version (an attribute the
+        # backend is too old to *validate* but will never execute). The family's
+        # validator runs its version- and arch-agnostic semantic rules with the
+        # classic error types and returns False -- classic lowering -- when the
+        # graph holds a node it does not cover. The backend's own verdict is
+        # deferred to planning, where a decline is recorded (backend_plan_entries)
+        # and surfaced by plan() only if no python engine proposes a plan either.
         if self._backend_lowerable() and self._lowered_graph is None:
-            if self._python_native_validation():
-                from . import _sdpa_validate
-
-                for node in self._nodes:
-                    _sdpa_validate.validate_node(node)
-            else:
+            validator = self._python_native_validator()
+            if not (validator is not None and validator(self)):
                 self._lowered_graph = self._lower_to_cpp()
                 try:
                     self._lowered_graph.validate()
@@ -859,17 +857,26 @@ class pygraph:
         # validate() and raise again instead of planning a rejected graph.
         self._is_validated = True
 
-    def _python_native_validation(self) -> bool:
-        """Whether validate() may skip the eager C++ lowering: every node has a
-        python-native validator AND the manifest offers a python engine for this
-        graph (frost engines available and enabled). Without a candidate the
-        backend is the only possible server, so classic timing — raise its
-        rejection from validate() — must hold."""
-        from . import _sdpa_validate
+    def _python_native_validator(self):
+        """The graph's family validator when validate() may skip the eager C++
+        lowering: the graph belongs to one engine family, that family declares a
+        python-native validator (manifest.EngineFamily.validator), AND the manifest
+        offers a python engine for it (frost engines available and enabled).
+        None otherwise: without a candidate the backend is the only possible
+        server, so classic timing -- raise its rejection from validate() -- must
+        hold. The validator itself still returns False for a graph holding a node
+        it does not cover, which also means classic lowering."""
+        from .engines import manifest
 
-        if not self._nodes or any(n.node_type not in _sdpa_validate.COVERED_NODE_TYPES for n in self._nodes):
-            return False
-        return bool(self._candidate_engines())
+        if not self._nodes:
+            return None
+        family = manifest.family_for(self)
+        if family is None:
+            return None
+        validator = manifest.resolve_validator(family)
+        if validator is None or not self._candidate_engines():
+            return None
+        return validator
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
