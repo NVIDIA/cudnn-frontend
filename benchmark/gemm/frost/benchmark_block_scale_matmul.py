@@ -46,10 +46,10 @@ def _build_spec_map():
     m = {}
     for cfg in _CATALOG:
         kb_want = 384 if cfg.pipeline == "sm103" else 128
-        if cfg.mma_inst_m % 128 or cfg.mma_inst_n % 128 or cfg.cta_tile_k_bytes != kb_want:
+        if cfg.mma_tile_m % 128 or cfg.mma_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
         for cg in (1, 2):
-            if cg == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_m == 64):
+            if cg == 2 and (cfg.cga_size_m % 2 or cfg.cta_tile_m == 64):
                 continue
             m[f"{cfg.name}_{cg}ctamma"] = (cfg, cg)
     return m
@@ -67,7 +67,7 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
     _, cta_group = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 # Combo table (input dtype family + scale dtype + block size)
@@ -169,8 +169,12 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str, verbose: bool
 
     dev = "cuda"
     is_fp4, bs, _, _ = _COMBOS[combo]
-    ru = lambda x, m: ((x + m - 1) // m) * m
-    cd = lambda a, b: (a + b - 1) // b
+
+    def ru(x, m):
+        return ((x + m - 1) // m) * m
+
+    def cd(a, b):
+        return (a + b - 1) // b
 
     if is_fp4:
         a = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)

@@ -10,7 +10,7 @@ import math
 import os
 from abc import abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
 
@@ -28,7 +28,12 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams, pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm100 import (
+    TemplateParams as Sm100TemplateParams,
+    canonicalize_d192_lowering,
+    derive_d192_internal_params,
+    pack_gqa_supported,
+)
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
@@ -84,13 +89,33 @@ _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
+    (512, 512): "prefill_d512_fp8_sm100.py",
 }
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
+    """NATIVE (exact) FP8 kernel-flavor shapes for the device line."""
     if device_cc == (10, 7):
         return frozenset({(128, 128)})
+    # d512 is per-tensor only: there is no d512 block-scale (MXFP8) kernel.
+    if pertensor:
+        return frozenset({(128, 128), (192, 128), (512, 512)})
     return frozenset({(128, 128), (192, 128)})
+
+
+# Per-native-shape ENVELOPE FLOOR (see engines.Capabilities.d_envelope_floors,
+# which MUST agree — test_fp8_envelope_floor_matches_engine_row pins it). The
+# d512 flavor serves the (256, 512] band on both head dims: the range no
+# smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
+# declined rather than routed onto a kernel whose cga4x1 role-split geometry is
+# tuned for d = 512.
+_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+
+
+def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
+    """Does some native FP8 shape cover ``(d_qk, d_v)`` as an envelope bound,
+    respecting that shape's floor?"""
+    return any(d_qk <= sq and d_v <= sv and min(d_qk, d_v) > _SM100_FP8_ENVELOPE_FLOORS.get((sq, sv), 0) for sq, sv in shapes)
 
 
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
@@ -255,8 +280,12 @@ def _flavor_tag(flavor: tuple[int, int]) -> str:
     return f"d{d_qk}" if d_qk == d_v else f"d{d_qk}_d{d_v}"
 
 
-def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
-    """Smallest flavor whose envelope covers ``(d_qk, d_v)`` (f16/bf16 only).
+def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int], ...]] = None) -> tuple[int, int]:
+    """Smallest flavor whose envelope covers ``(d_qk, d_v)``.
+
+    ``candidates`` restricts the walk to the flavors that have a kernel for the
+    caller's quantization (the FP8 family has no d256 file, so an FP8 graph must
+    not land on it); ``None`` = the full f16/bf16 list.
 
     ENVELOPE (zero-padding) semantics: one flavor covers ``d_qk`` and ``d_v``
     with its own max extents — e.g. (192, 128) runs on the d192/d128 kernel. The
@@ -270,14 +299,12 @@ def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     including the f16 alignment rule (d % 8, the TMA 16-byte global-stride
     rule at 2 bytes/elem).
     """
-    for flavor in _SM100_FLAVORS:
+    pool = candidates if candidates is not None else _SM100_FLAVORS
+    for flavor in pool:
         fdqk, fdv = flavor
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
-    raise ValueError(
-        f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); "
-        f"largest supported: {_SM100_FLAVORS[-1]} (d128/d192-d128/d256/d512 envelopes)."
-    )
+    raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
 def _load_kernel_template(filename: str, params: Hashable, tag: str):
@@ -421,6 +448,8 @@ class SdpaFwdDsl(APIBase):
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
         self.cga = None if cga is None else int(cga)
+        # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
+        # graph heuristics pass an explicit split count when splitting wins.
         self.split_kv = 1 if split_kv is None else int(split_kv)
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
@@ -1017,12 +1046,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # stays exact (SF plumbing not audited for zero-padding).
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         _fp8_envelope_ok = (
-            self._pertensor and not self.thd and any(int(d_qk) <= sq and int(d_v) <= sv for sq, sv in fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
+            self._pertensor and not self.thd and _fp8_envelope_covers(int(d_qk), int(d_v), fp8_shapes) and int(d_qk) % 16 == 0 and int(d_v) % 16 == 0
         )
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
             f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
-            + (" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16)" if self._pertensor else " (no envelope padding)")
+            + (
+                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; " f"floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
+                if self._pertensor
+                else " (no envelope padding)"
+            )
             + f"; got (D_QK={d_qk}, D_V={d_v})",
         )
         # Envelope alignment gate: the TMA descriptors are built from the
@@ -1036,7 +1069,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"(TMA 16-byte global-stride constraint at 2 bytes/elem); got "
             f"(D_QK={d_qk}, D_V={d_v})",
         )
-        self.flavor = _pick_flavor(d_qk, d_v)
+        # An FP8 graph must only land on a flavor that HAS an fp8 kernel: the
+        # quantized family has no d256 file, so the f16 flavor list would send a
+        # d256 fp8 graph to a kernel that does not exist.
+        self.flavor = _pick_flavor(d_qk, d_v, tuple(f for f in _SM100_FLAVORS if f in fp8_shapes) if self._fp8 else None)
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -1044,12 +1080,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
             (self.tile_n, 128, "tile_n"),
-            (self.cga, 2, "cga"),
         ):
             self._value_error_if(
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
+        supported_cgas = (1, 2) if self.flavor == (192, 128) else (2,)
+        self._value_error_if(
+            self.cga is not None and self.cga not in supported_cgas,
+            f"SM100 DSL SDPA only supports cga in {supported_cgas}",
+        )
+        self._value_error_if(
+            self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1,
+            "D192 split_kv > 1 is validated only with cga=2",
+        )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -1111,13 +1155,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
-        # Of the FP8/MXFP8 flavors only d128/d128 carries the write_thd_meta
-        # THD leg; the d192/d128 siblings are dense-only. The engine specs
-        # already route this (their d192 rows declare thd=False); the gate
-        # covers direct construction.
+        # Keep direct construction aligned with each quantized family's THD
+        # kernels; graph routing enforces the same per-family shape domain.
+        _thd_fp8_shapes = {(128, 128), (192, 128), (512, 512)} if self._pertensor else {(128, 128), (192, 128)}
         self._not_implemented_error_if(
-            self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
+            self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1197,47 +1240,54 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     d_v=d_v_sched,
                     elem_bytes=1 if self._fp8 else 2,
                 )
-        _pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
-        lpt_head_group = 1
-        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q // _pack_g) % 8 == 0:
-            lpt_head_group = 8
-        lpt_q_tiles = 0
-        if self._fp8 and self.flavor == (192, 128) and not self.thd:
-            lpt_q_tiles = (self.s_q_max * _pack_g + 511) // 512
-        template_window_right = self.window_right
-        if (
-            self._fp8
-            and self._pertensor
-            and self.flavor == (192, 128)
-            and self.window_left is None
-            and self.window_right is None
-            and not self.seq_kv_lens_present
-        ):
-            # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-            # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
-            # selects the equivalent masked-interior lowering.
-            template_window_right = self.s_k_max
         from cudnn import data_type as _cudnn_dtype
 
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
-            window_right=template_window_right,
+            window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
-            lpt_head_group=lpt_head_group,
-            lpt_q_tiles=lpt_q_tiles,
             thd_varlen=self.thd,
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            cta_mma=2 if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
+        if self.flavor == (192, 128):
+            from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+            auto_sched, auto_cga = select_d192_auto_knobs(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d192_lowering(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = derive_d192_internal_params(
+                params,
+                pertensor=self._pertensor,
+                batch_size=self.batch_size,
+                h_q=self.h_q,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
@@ -1333,13 +1383,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # head-major (H, head_stride)); without one it compiles with
             # has_lse=False and no LSE buffer exists at all. No slq/slk
             # copies either: the metadata is built DEVICE-side by the setup
-            # kernel (issue #552). o_desc: 16 int64 per
-            # sequence + 16 spare, the per-sequence O TMA descriptors the
-            # builder kernel fills.
-            # o_desc: 16 int64 per sequence + the dead-unit pad slot; the
-            # FP8/MXFP8 flavors carry two more slots for the packed-total-
-            # clamped K/V runtime descriptors (see the kernels' THD closures).
-            o_desc_slots = b + (3 if self._fp8 else 1)
+            # kernel (issue #552).
+            # o_desc: 16 int64 per sequence + the dead-unit pad slot + two
+            # slots for the packed-total-clamped K/V runtime descriptors the
+            # setup kernel writes (see the kernels' THD closures). Every THD
+            # flavor carries those two now, not just FP8/MXFP8 (issue #624).
+            o_desc_slots = b + 3
             return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8 and self.split_kv == 1:
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
@@ -1599,8 +1648,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
         )
         if self._fp8:
-            # The FP8/MXFP8 cells serve only the packed contract at exact
-            # d128 (check_support) — no stride/head-dim keys.
+            # FP8/MXFP8 THD serves only native packed contracts. Flavor
+            # selection chooses the exact kernel module, so no stride or
+            # head-dim entries are needed in this per-module compile key.
             return kwargs
         kwargs.update(
             d_qk=self.head_dim_qk,
@@ -1675,13 +1725,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # before any consumer read, so stale bytes never survive — a fill
         # here is a wasted kernel launch on the execute hot path (Rule 1).
         with _torch_stream_context(current_stream, dev):
-            # +2 slots on the FP8/MXFP8 flavors: the packed-total-clamped K/V
-            # runtime descriptors the setup kernel writes after the pad slot.
-            o_desc_slots = b + (3 if self._fp8 else 1)
+            # +2 past the pad slot: the packed-total-clamped K/V runtime
+            # descriptors the setup kernel writes. Every THD flavor carries
+            # them now, not just FP8/MXFP8 (issue #624).
+            o_desc_slots = b + 3
             o_desc = carver.take(o_desc_slots * 16, torch.int64) if carver is not None else torch.empty(o_desc_slots * 16, dtype=torch.int64, device=dev)
-        # The PLAN-TIME envelope grid — dead units exit by kernel contract.
-        # PERSISTENT THD grid: cap the launch at what the device can hold
-        # resident (one cluster per CTA_MMA SMs) instead of the plan-time
+        # The plan-time envelope bounds the possible unit count. Persistent THD
+        # kernels cap the launch at what the device can hold
+        # resident (one cluster per CGA_SIZE SMs) instead of the plan-time
         # envelope. The kernel pulls units from a device-bounded counter, so
         # the grid no longer has to cover the work list -- which is what made
         # 38-84% of clusters dead.
@@ -1689,8 +1740,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             # Resolved here, not above: the CLC path below never reads it, and
             # this runs per execute.
-            _cta_mma = int(getattr(self._k_mod, "CTA_MMA", 1))
-            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cta_mma)))
+            #
+            # CGA_SIZE (= CGA_M * CGA_N) is the CTA count of ONE cluster, which
+            # is what the grid is laid out in: grid_x = units * CGA_M. It equals
+            # CTA_MMA on the cga2 flavors (d128/d192/d256) but NOT on d512,
+            # which pairs CGA_M=4 with CTA_MMA=2 — capping on CTA_MMA there
+            # would launch 2x the CTAs the device holds resident. CTA_MMA stays
+            # as the fallback so a module predating CGA_SIZE still caps.
+            _cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
+            units = min(_env, max(1, _device_sm_count(q_buf.device) // max(1, _cluster_ctas)))
             _dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if _dbg > 0:
                 units = min(_env, _dbg)
@@ -1881,7 +1939,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``T_sf * sf_smem_size``, so a larger allocation could not be
         addressed anyway). A zero-sized buffer (zero-capacity KV storage —
         the one-token K/V clamp) binds a one-tile stub: the KV range of
-        every tile is empty there, so no SF byte is ever loaded."""
+        every tile is empty there, so no SF byte is ever loaded.
+
+        Scale bytes for valid or partially valid 32-element blocks must be
+        finite. Fully padded V blocks are sanitized in shared memory before
+        BMM2, so arbitrary bytes in the physical tail cannot turn TMA-zeroed
+        data into NaNs through ``0 * NaN``."""
         flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
@@ -3964,8 +4027,45 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
         self._logger.debug("compile completed")
 
+    def _bshd_gather_bytes(self, desc) -> int:
+        """Bytes to gather ``desc`` into a compact BSHD buffer, or 0 when its
+        BSHD transpose is already contiguous (the common, engine-normalized
+        case)."""
+        b, h, s, d = desc.shape
+        if tuple(desc.stride) == (s * h * d, d, h * d, 1):
+            return 0
+        return ws_align(b * h * s * d * 2)  # fp16/bf16 only on this row
+
     def scratch_workspace_bytes(self) -> int:
-        return 0
+        """Per-execute scratch (issue #514): dense_flex gathers, the GQA head
+        expansion, the V head-dim pad, the kernel-layout O staging those need,
+        strided-LSE staging, and the sinks log2 rescale — everything execute()
+        would otherwise allocate. Sized in execute()'s carve order."""
+        self._ensure_support_checked()
+        if self.thd:
+            return 0  # engine rows never lower THD; the wrapper path allocates
+        elem = 2  # fp16/bf16 — check_support admits no other input dtype
+        b, hq, sq, skv = self.batch_size, self.h_q, self.s_q_max, self.s_k_max
+        gqa = self.h_kv != self.h_q
+        pad_v = self.head_dim_v < self.flavor_d_v
+        total = self._bshd_gather_bytes(self.q_desc)
+        # K/V: layout gather, GQA expansion, and the V pad share ONE carved
+        # buffer each (expanded heads at the padded flavor width).
+        if gqa or self._bshd_gather_bytes(self.k_desc):
+            total += ws_align(b * skv * hq * self.head_dim_qk * elem)
+        if pad_v:
+            total += ws_align(b * skv * hq * self.flavor_d_v * elem)
+        elif gqa or self._bshd_gather_bytes(self.v_desc):
+            total += ws_align(b * skv * hq * self.head_dim_v * elem)
+        # O: the compiled ABI is (B, SQ, H, flavor_d_v) — staged for the padded
+        # envelope or a non-BSHD (dense_flex) caller buffer.
+        if pad_v:
+            total += ws_align(b * sq * hq * self.flavor_d_v * elem)
+        elif self._bshd_gather_bytes(self.o_desc):
+            total += ws_align(b * sq * hq * self.head_dim_v * elem)
+        if self.has_sink:
+            total += ws_align(hq * 4)  # sinks * log2(e) product
+        return total
 
     # ------------------------------------------------------------------
     def execute(
@@ -4007,39 +4107,79 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         device = q_tensor.device
         launch_stream = self._get_default_stream(current_stream)
 
-        with _torch_stream_context(current_stream, device):
-            # BHSD → BSHD views; a dense_flex layout that is not BSHD-physical
-            # normalizes with one copy — the same grandfathered normalization
-            # the SM100 dense path applies (open cleanup, Hard Rule 2).
-            Q = self._to_bshd(q_tensor)
-            K = self._to_bshd(k_tensor)
-            V = self._to_bshd(v_tensor)
-            if self.h_kv != self.h_q:
-                # Dense GQA: expand K/V heads until the kernels' native dense
-                # GQA path is qualified (see class docstring). BSHD head dim is 2.
-                reps = self.h_q // self.h_kv
-                K = K.repeat_interleave(reps, dim=2)
-                V = V.repeat_interleave(reps, dim=2)
+        # Per-execute scratch: carved from the caller's workspace when one is
+        # provided (the engine lowering passes one sized by
+        # scratch_workspace_bytes(); issue #514), otherwise allocated (the
+        # standalone wrapper path). Carve order mirrors the sizing order.
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm80") if workspace is not None else None
 
+        with _torch_stream_context(current_stream, device):
             pad_v = self.head_dim_v < self.flavor_d_v
-            if pad_v:
-                V = _sm80_pad_last_dim(V, self.flavor_d_v)
+            gqa = self.h_kv != self.h_q
+            reps = self.h_q // self.h_kv
+
+            def _gather_bshd(t: torch.Tensor) -> torch.Tensor:
+                """Compact BSHD view/gather of logical BHSD ``t`` (dense_flex)."""
+                view = t.transpose(1, 2)
+                if view.is_contiguous():
+                    return view
+                if carver is None:
+                    return view.contiguous()
+                dst = carver.take(t.numel(), t.dtype).view(view.shape)
+                dst.copy_(view)
+                return dst
+
+            def _kv_operand(t: torch.Tensor, fd: Optional[int]) -> torch.Tensor:
+                """K/V kernel operand: layout gather, GQA head expansion, and
+                the head-dim pad in ONE carved buffer (allocating fallbacks on
+                the wrapper path)."""
+                view = t.transpose(1, 2)  # (b, s, h_kv, d)
+                bb, ss, hh, dd = view.shape
+                fd = dd if fd is None else fd
+                if not gqa and fd == dd:
+                    return _gather_bshd(t)
+                if carver is not None:
+                    dst = carver.take(bb * ss * self.h_q * fd, t.dtype).view(bb, ss, hh, reps, fd)
+                    if fd != dd:
+                        dst[..., dd:].zero_()
+                    dst[..., :dd].copy_(view.unsqueeze(3))
+                    return dst.view(bb, ss, self.h_q, fd)
+                out = view.repeat_interleave(reps, dim=2) if gqa else view
+                if fd != dd:
+                    out = _sm80_pad_last_dim(out, fd)
+                elif not out.is_contiguous():
+                    out = out.contiguous()
+                return out
+
+            Q = _gather_bshd(q_tensor)
+            K = _kv_operand(k_tensor, None)
+            V = _kv_operand(v_tensor, self.flavor_d_v if pad_v else None)
 
             # Output binding: the compiled O ABI is (B, SQ, H, flavor_d_v).
             # Direct-bind the caller's BSHD view when it matches; the padded-V
-            # envelope and dense_flex cases go through a scratch + copy-back
-            # (both pre-existing normalizations).
-            o_view, o_needs_copyback, o_scratch = self._to_bshd_writable(o_tensor)
+            # envelope and dense_flex cases go through carved staging +
+            # copy-back.
+            o_view = o_tensor.transpose(1, 2)
+            o_needs_copyback = pad_v or not o_view.is_contiguous()
             if pad_v:
-                o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
+                if carver is not None:
+                    o_kernel = carver.take(self.batch_size * self.s_q_max * self.h_q * self.flavor_d_v, q_tensor.dtype)
+                    o_kernel = o_kernel.view(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v)
+                    o_kernel.zero_()
+                else:
+                    o_kernel = torch.zeros(self.batch_size, self.s_q_max, self.h_q, self.flavor_d_v, dtype=q_tensor.dtype, device=device)
             elif o_needs_copyback:
-                o_kernel = o_scratch
+                if carver is not None:
+                    o_kernel = carver.take(o_tensor.numel(), o_tensor.dtype).view(o_view.shape)
+                else:
+                    o_kernel = torch.empty_like(o_view, memory_format=torch.contiguous_format)
             else:
                 o_kernel = o_view
+
             # DEFENSIVE zero-fill, not load-bearing: the dense epilogue stores
             # every in-bounds row unconditionally; kept so a bound buffer can
             # never surface uninitialized memory if a future path skips rows.
-            # (The pad_v scratch above is allocated zeroed already.)
+            # (The pad_v staging above is zeroed already.)
             if (seq_q_lens is not None or seq_kv_lens is not None) and not pad_v:
                 o_kernel.zero_()
                 if lse_tensor is not None:
@@ -4059,8 +4199,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             )
             if sinks is not None:
                 # log2-unit rescale: one (H,)-element multiply per execute
-                # (pre-existing SM80 contract; the kernels consume log2 units).
-                sinks_b = (self._checked_sinks_1d(sinks) * _LOG2E).contiguous()
+                # (the kernels consume log2 units), into carved scratch.
+                checked_sinks = self._checked_sinks_1d(sinks)
+                if carver is not None:
+                    sinks_b = carver.take(self.h_q, torch.float32)
+                    torch.mul(checked_sinks, _LOG2E, out=sinks_b)
+                else:
+                    sinks_b = (checked_sinks * _LOG2E).contiguous()
             else:
                 sinks_b = self._dummy("one_f32", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
             if bias_tensor is not None:
@@ -4122,7 +4267,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             if pad_v:
                 o_view.copy_(o_kernel[..., : self.head_dim_v])
             elif o_needs_copyback:
-                o_view.copy_(o_scratch)
+                o_view.copy_(o_kernel)
         self._logger.debug("execute completed")
 
 

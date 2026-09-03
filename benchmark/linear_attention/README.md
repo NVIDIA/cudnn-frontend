@@ -45,6 +45,14 @@ python benchmark_single_linear_attention.py \
     --la_backend cudnn --variant gdn2 --data_type bfloat16 \
     --skip_ref --profile_pass fwd
 
+# cuDNN Frontend (GDP, n Householder sub-tokens per token; k/v/beta carry
+# seqlen * num_householder rows)
+python benchmark_single_linear_attention.py \
+    --batch_size 1 --seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --la_backend cudnn --variant gdp --num_householder 3 --data_type bfloat16 \
+    --skip_ref --fwd_bwd
+
 # GQA (q-heads grouped over v-heads, backward pass only)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
@@ -83,18 +91,20 @@ python benchmark_single_linear_attention.py \
 
 Run `python benchmark_single_linear_attention.py --help` for all options.
 
-The `kda` and `gdn2` variants fuse q/k L2 normalization in-kernel on every backend; `gdn` runs unfused.
+Every variant and backend applies the q/k L2 normalization; pass `--no_qk_l2norm` to opt out.
 
 ## Supported Backends
 
 | Backend | Description |
 |---------|-------------|
 | `cudnn` | cuDNN (native, via the cuDNN Frontend torch custom ops) |
-| `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, and `gdn2`) |
+| `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, `gdn2`, and `gdp`) |
 | `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 | `flash_kda` | FlashKDA (`kda` forward variant only) |
 
-The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-class devices, the cuTile engines elsewhere.
+The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2` and `gdp` are FROST-only.
+
+Default head counts are per variant: `kda` 96, `gdp` 40, `gdn`/`gdn2` 16/8 (the tracked sweeps run `gdn`/`gdn2` at 64/64).
 
 ## Results
 
@@ -110,8 +120,12 @@ pass. Runs were captured on GB200 and GB300 (GB300 results shown below).
 
 ### GB300 - KDA
 ![KDA on GB300](results/kda/gb300/kda_fixed_batch_flops.png)
-- `batch=4; num_q_heads=64; num_kv_heads=64; head_dim=128; seqlen 2048-32768; bf16`
+- `batch=4; num_q_heads=96; num_kv_heads=96; head_dim=128; seqlen 2048-32768; bf16`
 
 ### GB300 - GDN-2
 ![GDN-2 on GB300](results/gdn2/gb300/gdn2_fixed_batch_flops.png)
 - `batch=4; num_q_heads=64; num_kv_heads=64; head_dim=128; seqlen 2048-32768; bf16`
+
+### GB300 - GDP
+![GDP on GB300](results/gdp/gb300/gdp_fixed_batch_flops.png)
+- `batch=4; num_q_heads=40; num_kv_heads=40; head_dim_qk=128; head_dim_vo=64; num_householder=3; seqlen 2048-32768; bf16` (FLA is the only third-party GDP backend)

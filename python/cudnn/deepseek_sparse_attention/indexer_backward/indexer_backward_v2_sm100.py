@@ -1722,8 +1722,8 @@ def indexer_backward_v2_sm100(
 
         # One plan serves one device: the per-plan ticket counter is
         # device-resident, so bind the plan to the device of its first
-        # execute and reject any other device BEFORE kernel 1 mutates the
-        # score buffers. api.py keys its plan cache on the device; this
+        # execute and reject any other device BEFORE kernel 1 overwrites
+        # AttnScore. api.py keys its plan cache on the device; this
         # check keeps direct users of the factory safe independently of
         # that cache.
         plan_device = plan_ws.get("device")
@@ -1735,7 +1735,7 @@ def indexer_backward_v2_sm100(
         )
 
         # Kernel 1: shared in-place score-grad precompute.
-        #   AttnScore  <- grad_signal, IndexScore <- sum_grad
+        #   AttnScore <- grad_signal; IndexScore is read-only and preserved.
         _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=block_I, current_stream=current_stream)
 
         # true views (validated contiguous above — cannot copy)

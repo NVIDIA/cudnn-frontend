@@ -20,19 +20,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
-
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
 # importing them here would drag the CuTe DSL into every support check.
-def _adapter_sm120():
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+_SM120 = "SdpaBwdDslSm120"
+_SM80 = "SdpaBwdDslSm80"
 
-    return SdpaBwdDslSm120
+
+def _adapter(name: str):
+    from cudnn.sdpa.bwd import api_dsl
+
+    return getattr(api_dsl, name)
 
 
 def _cuda_driver():
@@ -340,13 +344,17 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaBwdKnobs] = None):
     return spec.lower(spec, facts, knobs)
 
 
-def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
+def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None, api_type: str = _SM120):
     """Lower the selected SDPA backward engine through its DSL adapter.
 
     Descriptor conversion, adapter lifecycle, variant-pack binding, and launch
-    construction live here; the adapter owns compilation and the three-kernel
-    execute chain.
+    construction live here; the adapter owns compilation and the kernel
+    execute chain. ``EngineSpec.lower`` binds the implementation through
+    ``api_type`` (mirrors ``lower_dsl_prefill``); SM80-only operands (bias →
+    dBias, plan-time bias facts) flow only to adapters declaring the matching
+    constructor / execute keywords.
     """
+    import inspect
 
     # Per-port geometry from facts.port_layouts, NOT the live IR tensors:
     # build_operation_graph rewrites the backward node's K/V ports to
@@ -383,7 +391,16 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    api = _adapter_sm120()(
+    adapter_cls = _adapter(api_type)
+    # SM80-only plan-time facts, forwarded only to adapters declaring them.
+    _extra_ctor = {
+        "has_bias": facts.has_bias,
+        "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
+        "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
+        "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
+    }
+    _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
+    api = adapter_cls(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(k_geom, facts.dtype, "k"),
         sample_v=_desc(v_geom, facts.dtype, "v"),
@@ -407,6 +424,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         tile_n=requested.tile_n if requested is not None else None,
         seq_kv_lens_present=seq_kv_t is not None,
         seq_q_lens_present=seq_q_t is not None,
+        **_extra_ctor,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -497,8 +515,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
 
 def _sm80_spec() -> EngineSpec:
-    """SM80 (A100) backward row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``bwd/api.py``), which owns kernel-flavor selection
+    """SM80 (A100) backward row: lowers through the shared ``lower_dsl_bwd``
+    onto ``SdpaBwdDslSm80`` (``bwd/api_dsl.py``), which owns kernel-flavor selection
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
     host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
     kernel caching, and the dedicated plain-dense d=64 fast path.  The
@@ -529,78 +547,13 @@ def _sm80_spec() -> EngineSpec:
             sink=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
+            # The kernels READ the declared stats strides natively (the
+            # #712 analogue for the backward's loads), same as sm120 — no
+            # gather staging.
+            strided_stats=True,
         ),
-        lower=lower_sm80_bwd,
+        lower=partial(lower_dsl_bwd, api_type=_SM80),
     )
-
-
-def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
-    """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter."""
-    from .api import sdpa_bwd_wrapper_sm80
-
-    binding = ga.SdpaBinding(
-        q=facts.q_t,
-        k=facts.k_t,
-        v=facts.v_t,
-        o=facts.o_t,
-        stats=facts.stats_t,
-        bias=facts.bias_t,
-        sink_token=facts.sink_t,
-        seq_len_kv=facts.seq_kv_t,
-        seq_len_q=facts.seq_q_t,
-        do=facts.do_t,
-        dq=facts.dq_t,
-        dk=facts.dk_t,
-        dv=facts.dv_t,
-        dbias=facts.dbias_t,
-        dsink=facts.dsink_t,
-    )
-    mask_args = ga.adapter_mask_args(facts)
-
-    def _execute(variant_pack, stream=None):
-        resolved = ga.resolve_variant_pack(variant_pack, binding)
-        # mismatch() admits only the contiguous (B, H_q, S_q, 1) stats layout,
-        # so this is a pure view (a copying reshape would violate the
-        # execute() contract and hide the -inf padded-row trim semantics).
-        lse = resolved[id(facts.stats_t)].view(facts.b, facts.h_q, facts.s_q)
-
-        out = sdpa_bwd_wrapper_sm80(
-            # dense_flex delivery: normalize to the BSHD-physical order the
-            # adapter requires (zero-copy when already BSHD).
-            ga.to_bshd_physical(resolved[id(facts.q_t)]),
-            ga.to_bshd_physical(resolved[id(facts.k_t)]),
-            ga.to_bshd_physical(resolved[id(facts.v_t)]),
-            ga.to_bshd_physical(resolved[id(facts.o_t)]),
-            ga.to_bshd_physical(resolved[id(facts.do_t)]),
-            lse,
-            scale_softmax=facts.scale,
-            deterministic=facts.deterministic,
-            # Stream from the caller's handle (ExecutionContext.stream);
-            # None keeps the current stream.
-            current_stream=stream,
-            **mask_args,
-            **ga.adapter_feature_buffers(facts, resolved),
-        )
-
-        # copy_ casts in place; no .to() (which would allocate a staging
-        # tensor per execute).
-        for t_ref, key in ((facts.dq_t, "dq_tensor"), (facts.dk_t, "dk_tensor"), (facts.dv_t, "dv_tensor")):
-            resolved[id(t_ref)].copy_(out[key])
-        if facts.has_dbias and "dbias_tensor" in out:
-            buf = resolved.get(id(facts.dbias_t))
-            if buf is not None:
-                buf.copy_(out["dbias_tensor"].view(buf.shape))
-        if facts.has_dsink and "dsink_tensor" in out:
-            buf = resolved.get(id(facts.dsink_t))
-            if buf is not None:
-                buf.view(-1).copy_(out["dsink_tensor"])
-        return None
-
-    # Executor contract (engine._FrostSdpaBwdPlan): torch-native host code,
-    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
-    _execute.workspace_bytes = 0
-    _execute.binding = binding
-    return _execute
 
 
 def engine_name(arch: str = "sm120") -> str:

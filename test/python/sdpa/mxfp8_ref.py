@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import torch
 import cudnn
 
@@ -97,12 +98,14 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
 
         NEG_INF = float('-inf')
         is_first = (m_old == NEG_INF)
-        exceeds_threshold = (m_block - m_old > rescale_threshold)
+        # The kernel's online softmax runs in the log2 domain, so the rescale
+        # threshold is in log2 units.
+        exceeds_threshold = (m_block - m_old > rescale_threshold * math.log(2))
         should_update = is_first | exceeds_threshold
         m_new = torch.where(should_update, m_block, m_old)
 
         exp_input = m_old - m_new
-        needs_correction = (exp_input < -rescale_threshold)
+        needs_correction = (exp_input < -rescale_threshold * math.log(2))
         correction = torch.where(needs_correction, torch.exp(exp_input), torch.ones_like(exp_input))
         correction = correction.nan_to_num()
 
@@ -135,7 +138,8 @@ def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, t
 def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, dO_fp8, dO_t_fp8, attn_scale,
                          sf_q_ref, sf_q_t_ref, sf_k_ref, sf_k_t_ref, sf_v_ref, sf_dO_ref, sf_dO_t_ref,
                          torch_itype=torch.float8_e4m3fn, torch_otype=torch.bfloat16,
-                         left_bound=None, right_bound=None, diag_align=None, sink_token=None):
+                         left_bound=None, right_bound=None, diag_align=None, sink_token=None,
+                         stats=None):
     """
     Compute backward pass reference for MXFP8 SDPA.
 
@@ -213,9 +217,16 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).tril(diagonal=-1 * left_bound + (s_kv - s_q))
         s = s.masked_fill(swa_mask.unsqueeze(0), float('-inf'))
 
-    # If sink_token is present, prepend it as a virtual attention score
+    # The backward kernel does not renormalize: it recomputes P = exp(S - stats)
+    # from the forward's log-sum-exp, which already accounts for the sink.
     p_sink = None
-    if sink_token is not None:
+    if stats is not None:
+        stats_3d = stats.float().reshape(b * h_q, s_q, 1)
+        p = torch.exp(s - stats_3d).nan_to_num().float()
+        if sink_token is not None:
+            sink_3d = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1).reshape(b * h_q, s_q, 1)
+            p_sink = torch.exp(sink_3d - stats_3d).nan_to_num().float()
+    elif sink_token is not None:
         # sink_token shape: (1, h_q, 1, 1) -> expand to (b * h_q, s_q, 1)
         sink_expanded = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1)
         sink_3d = sink_expanded.reshape(b * h_q, s_q, 1)

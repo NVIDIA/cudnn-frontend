@@ -82,8 +82,8 @@ def _build_spec_map():
     chain = _enum_chain()
     m = {}
     for t, cfg in _candidates(chain):
-        label = f"{cfg.name}_{t.cta_group}ctamma"
-        m[label] = (cfg, t.cta_group)
+        label = cfg.name
+        m[label] = (cfg, cfg.cta_group)
     return m
 
 
@@ -99,7 +99,7 @@ def _vp(handles, a, b, c):
 def _build_plan(g, cfg, name):
     """JIT-compile the graph with a forced tile config -> callable kernel."""
     _, cta_group = spec_for(name, _SPEC_MAP)
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group)
+    return jit_from_cudnn_graph(g, config=cfg)
 
 
 # ---------------------------------------------------------------------------

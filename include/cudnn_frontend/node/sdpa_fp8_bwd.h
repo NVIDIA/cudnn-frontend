@@ -132,6 +132,10 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
         CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
 
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
+
 #undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
 
         // validate backend limitations for the operation
@@ -174,6 +178,15 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF((prop_major == 9) && is_ragged,
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "sdpa fp8 backward with THD is not supported on Hopper architecture.");
+
+        // Pre-9.26 backward bug on ragged graphs with a sink token
+        auto const& sink_it  = attributes.inputs.find(input_names::SINK_TOKEN);
+        bool const has_sink  = (sink_it != attributes.inputs.end() && sink_it->second != nullptr);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            is_ragged && has_sink && detail::get_backend_version() < 92600,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "SDPA backward with ragged offsets and a sink token requires cuDNN 9.26.0 or newer "
+            "(older versions hit an out-of-bounds read in the compute_dot_do_o pre-pass).");
 
         // validate basic dimension requirements
         if(prop_major >= 10) {

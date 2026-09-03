@@ -309,6 +309,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-fron
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
+    "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
@@ -356,6 +357,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
     "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
     "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "HSTUFwdSm100": (".hstu_attention", "HSTUFwdSm100"),
+    "HSTUBwdSm100": (".hstu_attention", "HSTUBwdSm100"),
+    "hstu_attention_forward": (".hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": (".hstu_attention", "hstu_attention_backward"),
     "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
     "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
     "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
@@ -420,6 +425,17 @@ def __getattr__(name: str) -> Any:
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
+
+    if name == "torch":
+        # `import cudnn; cudnn.torch.install()` works like `import cudnn.torch`,
+        # mirroring the `jax` branch above. Deferred so `import cudnn` never
+        # eagerly imports torch; the submodule raises its own descriptive error
+        # when torch (or the 2.13+ flash-impl registry) is unavailable — which
+        # is why this is NOT a _LAZY_OPTIONAL_IMPORTS entry: that path would
+        # blame the `[cutedsl]` extra for a missing framework.
+        _torch_mod = importlib.import_module(".torch", __name__)
+        globals()["torch"] = _torch_mod
+        return _torch_mod
 
     if name == "fla":
         # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.

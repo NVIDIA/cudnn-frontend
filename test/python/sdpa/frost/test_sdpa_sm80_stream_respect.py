@@ -134,7 +134,8 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     q_gpu, k_gpu, v_gpu = _mk_buf(), _mk_buf(), _mk_buf()
     o_gpu = torch.empty_like(q_gpu)
     stats_gpu = torch.empty(_B, _H, _S, 1, device="cuda", dtype=torch.float32)
-    gf.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, stats: stats_gpu}, None)
+    wsf = torch.empty(gf.get_workspace_size(), device="cuda", dtype=torch.uint8) if gf.get_workspace_size() else None
+    gf.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, stats: stats_gpu}, wsf)
     torch.cuda.synchronize()
 
     gb = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=_F32, compute_data_type=_F32)
@@ -145,8 +146,10 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     dob = gb.tensor(dim=dims, stride=_STRIDES, data_type=_HALF, name="dO")
     statsb = gb.tensor(dim=(_B, _H, _S, 1), stride=(_H * _S, _S, 1, 1), data_type=_F32, name="stats")
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=1.0 / math.sqrt(_D), use_causal_mask=True)
+    # Output layout is honored only when DECLARED (IR-inferred strides are
+    # provisional) — bind BSHD-physical to match the buffers below.
     for x in (dq, dk, dv):
-        x.set_output(True).set_data_type(_HALF)
+        x.set_output(True).set_data_type(_HALF).set_stride(_STRIDES)
     _build_and_pin(gb, "sdpa_bwd_sm80")
 
     do_gpu = _mk_buf()
@@ -154,4 +157,5 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     h = cudnn.create_handle()
     vp = {qb: q_gpu, kb: k_gpu, vb: v_gpu, ob: o_gpu, dob: do_gpu, statsb: stats_gpu, dq: dq_gpu, dk: dk_gpu, dv: dv_gpu}
 
-    _assert_stream_respect(lambda: gb.execute(vp, None, handle=h), [dq_gpu, dk_gpu, dv_gpu], h)
+    wsb = torch.empty(gb.get_workspace_size(), device="cuda", dtype=torch.uint8) if gb.get_workspace_size() else None
+    _assert_stream_respect(lambda: gb.execute(vp, wsb, handle=h), [dq_gpu, dk_gpu, dv_gpu], h)

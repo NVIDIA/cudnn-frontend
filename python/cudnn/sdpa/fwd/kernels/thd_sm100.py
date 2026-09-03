@@ -216,6 +216,9 @@ def build_thd_meta_kernel(
         meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
 
 
+build_thd_meta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def build_thd_meta_o_kv_descs_kernel(
     o_tensor: cute.Tensor,
@@ -230,9 +233,17 @@ def build_thd_meta_o_kv_descs_kernel(
     n_qh: cutlass.Int32,
     n_batch: cutlass.Int32,
     o_row_stride: cutlass.Int32,
+    cga_tile_m: cutlass.Int32,
+    n_clusters: cutlass.Int32,
+    k_seq_dim: cutlass.Constexpr[int] = 2,
+    v_seq_dim: cutlass.Constexpr[int] = 2,
 ) -> None:
-    """``build_thd_meta_o_descs_kernel`` + packed-total-clamped K/V descriptors
-    (the FP8/MXFP8 THD flavors).
+    """THD setup for the FP8/MXFP8 flavors: metadata, per-batch O descriptors
+    and the packed-total-clamped K/V descriptors.
+
+    Like ``build_thd_meta_o_descs_kernel``, this publishes the persistent
+    scheduler's live-unit total and claim counter. Both kernels also clamp K/V
+    (issue #624).
 
     The K/V loads tile in TILE_N rows, so the LAST sequence's tile steps past
     the packed KV total into the buffer's capacity tail — caller-owned bytes
@@ -241,7 +252,7 @@ def build_thd_meta_o_kv_descs_kernel(
     (``0 · NaN == NaN`` wipes every valid row of the tile), and on cc10.3 the
     fused-LDTM row-max reduces S BEFORE the mask. So the setup thread also
     copies the K and V base descriptors into ``o_desc_words`` slots
-    ``n_batch+1`` / ``n_batch+2`` with their seq extent (GLOBAL_DIM ord=2)
+    ``n_batch+1`` / ``n_batch+2`` with each descriptor's sequence extent
     patched to the packed total ``cu_k[B]`` — tile-tail loads past it become
     TMA-OOB and land as EXACT ZEROS in SMEM (zero V nulls the masked P·V
     terms; zero K keeps the pre-mask row-max finite). Slot ``n_batch`` stays
@@ -282,12 +293,12 @@ def build_thd_meta_o_kv_descs_kernel(
         k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (k_dptr + i).store((k_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=k_seq_dim)
         v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
         v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (v_dptr + i).store((v_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=v_seq_dim)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -299,12 +310,36 @@ def build_thd_meta_o_kv_descs_kernel(
     # it leaves the region uninitialized and units decode garbage batches.
     cute.arch.barrier()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
+    # Live unit total + claim counter for the persistent scheduler, exactly as
+    # build_thd_meta_o_descs_kernel writes them. The scheduler reads meta[4B+2]
+    # as its bound, so leaving these two words unwritten hands out units off
+    # uninitialized workspace (an illegal-instruction fault, not a silent
+    # wrong answer). The counter starts at n_clusters: cluster c takes unit c
+    # from its blockIdx, then pulls from the counter.
+    cute.arch.barrier()
+    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
+    # implementation-defined lane, so conjoining it with tidx == 0 can select
+    # no thread at all and leave these words unwritten.
+    if tidx == cutlass.Int32(0):
+        meta_w = cutlass.make_array_view(meta_t)
+        cuq0 = n_batch
+        live = cutlass.Int32(0)
+        for b in cutlass.range(0, n_batch, 1, unroll=1):
+            s_b = cutlass.Int32(meta_w[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta_w[cuq0 + b])
+            live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
+        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+
+
+build_thd_meta_o_kv_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.kernel
 def build_thd_meta_o_descs_kernel(
     o_tensor: cute.Tensor,
     base_o_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_v_desc: cutlass.GridConstant[tmap.TensorMap],
     o_desc_words: cute.Tensor,
     meta_t: cute.Tensor,
     q_lens_t: cute.Tensor,
@@ -316,7 +351,9 @@ def build_thd_meta_o_descs_kernel(
     cga_tile_m: cutlass.Int32,
     n_clusters: cutlass.Int32,
 ) -> None:
-    """Per-execute THD setup, one elected thread (issue #552, D2H removal):
+    """Per-execute THD setup for the f16/bf16 flavors, one elected thread —
+    ``build_thd_meta_o_kv_descs_kernel`` plus the persistent scheduler's
+    live-unit total and claim counter (issue #552, D2H removal):
     build the [seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)] metadata
     buffer DEVICE-side from the caller's length tensors — ``(B,)`` per-batch
     lengths (serial cumsum; B is small) or the ``(B+1,)`` cu prefix-sum form
@@ -364,6 +401,27 @@ def build_thd_meta_o_descs_kernel(
                 new_value=s_i,
                 ord=2,
             )
+        # Packed-total-clamped K/V runtime descriptors (issue #624). K/V load
+        # in TILE_N rows, so the LAST sequence's tile steps past the packed KV
+        # total into the buffer's capacity tail — caller-owned bytes that may
+        # never have been written. Masked S columns are NaN-safe (the mask is
+        # a select), but BMM2's P·V is not: 0 · NaN == NaN wipes every valid
+        # row of the tile. Patching the seq extent (GLOBAL_DIM ord=2) to
+        # cu_k[B] makes those rows TMA-OOB, so they land as EXACT ZEROS
+        # without touching memory — no fill kernel, and nothing written into
+        # the caller's buffer. Mirrors build_thd_meta_o_kv_descs_kernel, which
+        # the FP8/MXFP8 flavors have used for this since they were written.
+        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+        k_dptr = desc_base + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (k_dptr + i).store((k_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+        v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
+        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
+            (v_dptr + i).store((v_src + i).load())
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -390,3 +448,6 @@ def build_thd_meta_o_descs_kernel(
             live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
         meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+
+
+build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

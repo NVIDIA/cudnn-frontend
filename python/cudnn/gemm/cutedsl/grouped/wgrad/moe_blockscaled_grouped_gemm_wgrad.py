@@ -733,6 +733,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         expert_idx = cute.arch.block_idx()[0]
         ctor.construct_and_write(expert_idx)
 
+    helper_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     # ------------------------------------------------------------------
     # kernel (GPU device kernel)
     # ------------------------------------------------------------------
@@ -1593,3 +1595,5 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             tmem.relinquish_alloc_permit()
             epilog_sync_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

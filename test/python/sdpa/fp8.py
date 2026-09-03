@@ -17,6 +17,7 @@ from .helpers import (
     get_fp8_descale_factor,
     convert_to_cudnn_type,
     create_sparse_int_tensor,
+    inject_negative_score_rows,
     print_tensor_stats,
     exact_equal,
     prefix_sum,
@@ -26,6 +27,7 @@ from .helpers import (
     profile_execution,
     note_frost_routing,
 )
+from .random_config import packed_token_capacity
 
 # fmt: off
 
@@ -358,8 +360,11 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
-        max_t_q = max(64, ((seq_len_q_gpu.sum().item() + 63) // 64) * 64)
-        max_t_kv = max(64, ((seq_len_kv_gpu.sum().item() + 63) // 64) * 64)
+        # Guaranteed capacity tail (> total tokens); convert_uniform_to_packed
+        # NaN-fills it, so engines that read past the last ragged offset fail
+        # deterministically (GitHub #624).
+        max_t_q = packed_token_capacity(seq_len_q_list)
+        max_t_kv = packed_token_capacity(seq_len_kv_list)
 
         # With the ragged offset multiplier, offsets are stored in coarser units
         # (divided by the per-tensor multiplier; always divides evenly) and the
@@ -397,6 +402,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     q_gen = create_sparse_int_tensor((b, s_qo, h_q, d_qk), torch.float, rng_data)
     k_gen = create_sparse_int_tensor((b, s_kv, h_k, d_qk), torch.float, rng_data)
     v_gen = create_sparse_int_tensor((b, s_kv, h_v, d_vo), torch.float, rng_data)
+    if not perf:
+        # keep at least a few q rows in the deeply-negative-score regime (see
+        # inject_negative_score_rows); must run before the amax/descale computation.
+        # for ragged, sample only rows the packing step keeps (s >= seq_len is dropped)
+        valid_q_rows = (torch.arange(s_qo, device="cuda")[None, :, None] < seq_len_q_gpu[:, None, None]).expand(b, s_qo, h_q) if is_ragged else None
+        inject_negative_score_rows(q_gen, k_gen, rng_data, attn_scale=attn_scale, head_axis=2, valid_rows=valid_q_rows)  # bshd
 
     q_amax = q_gen.abs().max().item()
     k_amax = k_gen.abs().max().item()
@@ -526,7 +537,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             o_gpu_float[t_idx:] = 0
             o_ref_float[t_idx:] = 0
 
-        atol, rtol = 0.08, 0.2
+        # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
+        atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
         torch.testing.assert_close(o_gpu_float, o_ref_float, atol=atol, rtol=rtol)
 
     # Backward pass
@@ -566,7 +578,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                 o_descale=o_descale_gpu, dO_descale=dO_descale_gpu,
                 torch_otype=torch_otype, padding=padding_bwd,
                 left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                sink_token=sink_token_gpu
+                sink_token=sink_token_gpu,
+                # Ragged packs stats differently, so keep softmax there.
+                stats=(None if is_ragged else stats_gpu),
             )
 
         dP_descale_gpu = torch.tensor([get_fp8_descale_factor(dP_amax, torch_itype)], dtype=torch.float, device="cuda")
@@ -691,7 +705,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                 dV_out[t_idx_kv:] = 0
                 dV_ref_float[t_idx_kv:] = 0
 
-            atol, rtol = 0.04, 0.2
+            # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
+            atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2
             torch.testing.assert_close(dQ_out, dQ_ref_float, atol=atol, rtol=rtol)
             torch.testing.assert_close(dK_out, dK_ref_float, atol=atol, rtol=rtol)
             torch.testing.assert_close(dV_out, dV_ref_float, atol=atol, rtol=rtol)

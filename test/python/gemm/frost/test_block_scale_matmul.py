@@ -46,7 +46,6 @@ from cudnn.gemm.frost.tile_config import (
     CATALOG,
     ConfigSm100,
     ConfigSm103,
-    ConfigSm107,
     TileConfig,
     by_name,
     validate_block_scale_config,
@@ -552,7 +551,7 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             128,
             256,
         ),  # acc_stages=2
-        # CTA tile split across two MMA instructions along M (num_mma_m=2). The SF
+        # CTA tile split across two MMA instructions along M (mma_size_m=2). The SF
         # words are one per 128-row block, so an M sub-block is exactly one block.
         (
             "nvfp4",
@@ -1190,7 +1189,7 @@ requires_sm103 = pytest.mark.skipif(
 
 
 def _sm103_kw(config_name, cta_group=1):
-    return dict(config=by_name(config_name), cta_group=cta_group)
+    return dict(config=dataclasses.replace(by_name(config_name), cta_group=cta_group))
 
 
 @pytest.fixture
@@ -1211,40 +1210,68 @@ def test_block_scale_sf_rule_is_on_the_instruction_tile() -> None:
     with pytest.raises(NotImplementedError) as e:
         # cta_tile_m % 128 == 0 but each instruction covers only half an SF block
         validate_block_scale_config(by_name("CONFIG_sm100_128x128x128_64x128x32_cluster1x1"), 16, 256)
-    assert "mma_inst_m % 128" in str(e.value)
+    assert "mma_tile_m % 128" in str(e.value)
 
 
 def test_catalog_has_sm103_geometries():
     sm103 = [c for c in CATALOG if c.pipeline == "sm103"]
-    # 2 cta_n × the shared 15-cluster enumeration.
-    assert len(sm103) == 30
-    pat = re.compile(r"^CONFIG_sm103_128x(128|256)x384_128x(128|256)x48_cluster\d+x\d+$")
+    # 2 cta_n × the shared 15-cluster enumeration × the 2 MMA modes.
+    assert len(sm103) == 60
+    pat = re.compile(r"^CONFIG_sm103_128x(128|256)x384_128x(128|256)x48_cluster\d+x\d+_[12]ctamma$")
     for c in sm103:
         assert pat.match(c.name), c.name
         assert c.cta_tile_m == 128 and c.cta_tile_k_bytes == 384
-        assert c.mma_inst_k_bytes == 48
-    assert by_name(_CFG_128).geometry_name == "128x128x384_128x128x48_cluster1x1"
+        assert c.mma_tile_k_bytes == 48
+    assert by_name(_CFG_128).geometry_name == "128x128x384_128x128x48_cluster1x1_1ctamma"
 
 
 def test_config_families():
-    kw = dict(cta_tile_m=128, cta_tile_n=128, cgrp_size_m=1, cgrp_size_n=1, epi_tile_mn=(128, 32), threads_per_cta=256)
+    def cfg(cls, pipeline, cta_tile_k_bytes, mma_tile_k_bytes):
+        # The pair families pin the warp tile to the CTA tile; the K axes are
+        # what this test varies, so the derived counts follow them.
+        return cls(
+            pipeline=pipeline,
+            cta_tile_m=128,
+            cta_tile_n=128,
+            cta_tile_k_bytes=cta_tile_k_bytes,
+            warp_tile_m=128,
+            warp_tile_n=128,
+            warp_tile_k_bytes=cta_tile_k_bytes,
+            mma_tile_m=128,
+            mma_tile_n=128,
+            mma_tile_k_bytes=mma_tile_k_bytes,
+            mma_size_m=1,
+            mma_size_n=1,
+            mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
+            cga_size_m=1,
+            cga_size_n=1,
+            cga_size_k=1,
+            warps_per_cta=8,
+            split_k_slices=1,
+            **({"cta_group": 1} if "cta_group" in cls.__dataclass_fields__ else {}),
+        )
+
     # 384-B K-tile is sm103-only; sm100 keeps the 128-B SWIZZLE_128B cap.
     with pytest.raises(NotImplementedError, match="cta_tile_k_bytes=384"):
-        ConfigSm100(cta_tile_k_bytes=384, mma_inst_k_bytes=48, pipeline="sm100", **kw)
-    ConfigSm103(cta_tile_k_bytes=384, mma_inst_k_bytes=48, pipeline="sm103", **kw)
-    with pytest.raises(NotImplementedError, match="cta_tile_k_bytes=512"):
-        ConfigSm103(cta_tile_k_bytes=512, mma_inst_k_bytes=48, pipeline="sm103", **kw)
-    # The sm103 K axes are the FAMILY's, not free geometry.
-    with pytest.raises(NotImplementedError, match="fixes cta_tile_k_bytes=384"):
-        ConfigSm103(cta_tile_k_bytes=128, mma_inst_k_bytes=32, pipeline="sm103", **kw)
-    # A raw-base construction can't bypass the family invariant either.
-    with pytest.raises(NotImplementedError, match="fixes cta_tile_k_bytes=384"):
-        TileConfig(cta_tile_k_bytes=128, pipeline="sm103", **kw)
-    # The K-tile walks the MMA instruction, so it is a multiple of the PIPELINE's
-    # K width: 96 B is three sm100 instructions but not a whole number of sm107's.
-    ConfigSm100(cta_tile_k_bytes=96, mma_inst_k_bytes=32, pipeline="sm100", **kw)
-    with pytest.raises(NotImplementedError, match="multiple of sm107's mma_inst_k_bytes=64"):
-        ConfigSm107(cta_tile_k_bytes=96, mma_inst_k_bytes=64, pipeline="sm107", **kw)
+        cfg(ConfigSm100, "sm100", 384, 48)
+    cfg(ConfigSm103, "sm103", 384, 48)
+    # The sm103 K axes are the FAMILY's, not free geometry -- wider or narrower
+    # are the same rejection.
+    for kb, mkb in ((512, 48), (128, 32)):
+        with pytest.raises(NotImplementedError, match="fixes cta_tile_k_bytes=384"):
+            cfg(ConfigSm103, "sm103", kb, mkb)
+    # A raw base does NOT inherit the pin by naming the pipeline -- family facts
+    # are ClassVars on the family class. It does not need to: the base is not the
+    # family, so no template pairs with it (see the imposter in
+    # test_select_template_dispatches_on_config_arch).
+    assert not hasattr(TileConfig, "CTA_TILE_K_BYTES_FIXED")
+    assert ConfigSm103.CTA_TILE_K_BYTES_FIXED == 384
+    # The K-tile walks the MMA instruction, so it is a multiple of the CONFIG's
+    # own K width: 96 B is three 32-byte instructions but not a whole number of
+    # 64-byte ones.
+    cfg(ConfigSm100, "sm100", 96, 32)
+    with pytest.raises(NotImplementedError, match="mma_tile_k_bytes=64 must divide warp_tile_k_bytes=96"):
+        cfg(ConfigSm100, "sm100", 96, 64)
     # Catalog entries carry their family class (the template-pairing key).
     assert all(isinstance(c, ConfigSm103) for c in CATALOG if c.pipeline == "sm103")
     assert all(isinstance(c, ConfigSm100) for c in CATALOG if c.pipeline == "sm100")
@@ -1260,10 +1287,21 @@ def test_validate_block_scale_config_arch_fork():
             cta_tile_m=128,
             cta_tile_n=128,
             cta_tile_k_bytes=128,
-            cgrp_size_m=1,
-            cgrp_size_n=1,
-            epi_tile_mn=(128, 32),
-            threads_per_cta=256,
+            warp_tile_m=128,
+            warp_tile_n=128,
+            warp_tile_k_bytes=128,
+            mma_tile_m=128,
+            mma_tile_n=128,
+            mma_tile_k_bytes=48,
+            mma_size_m=1,
+            mma_size_n=1,
+            mma_size_k=128 // 48,
+            cga_size_m=1,
+            cga_size_n=1,
+            cga_size_k=1,
+            warps_per_cta=8,
+            split_k_slices=1,
+            cta_group=1,
             pipeline="sm103",
         )
 
@@ -1281,30 +1319,45 @@ def _bs_chain(combo="nvfp4", M=256, N=256, K=1536):
 
 def test_select_template_dispatches_on_config_arch():
     chain = analyze(_bs_chain())
-    t103 = select_template(chain, by_name(_CFG_128), cta_group=1)
-    assert t103.file == "sm103_block_scale_matmul_1ctamma.py"
+    t103 = select_template(chain, by_name(_CFG_128))
+    assert t103.file == "sm103_block_scale_matmul.py"
     from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
 
     assert PIPELINE_ARCH_RANGES[t103.pipeline] == ((103, 110),)
-    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), cta_group=1)
-    assert t100.file == "sm100_block_scale_matmul_1ctamma.py"
-    t103_2 = select_template(chain, by_name(_CFG_128), cta_group=2)
-    assert t103_2.file == "sm103_block_scale_matmul_2ctamma.py"
-    # Pairing is by config CLASS (from the template's filename arch token):
-    # a base TileConfig posing as sm103 matches no template.
-    imposter = TileConfig(
+    t100 = select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"))
+    assert t100.file == "sm100_block_scale_matmul.py"
+    t103_2 = select_template(chain, by_name(_CFG_128))
+    assert t103_2.file == "sm103_block_scale_matmul.py"
+    # Pairing is by config CLASS (from the template's filename arch token): a
+    # base TileConfig posing as sm103 matches no template. It also cannot even
+    # spell sm103's K axes -- those are ClassVars on ConfigSm103, not facts
+    # imported by writing the pipeline string.
+    base_kw = dict(
+        pipeline="sm103",
         cta_tile_m=128,
         cta_tile_n=128,
-        cta_tile_k_bytes=384,
-        cgrp_size_m=1,
-        cgrp_size_n=1,
-        epi_tile_mn=(128, 32),
-        threads_per_cta=256,
-        pipeline="sm103",
-        mma_inst_k_bytes=48,
+        cta_tile_k_bytes=128,
+        warp_tile_m=128,
+        warp_tile_n=128,
+        warp_tile_k_bytes=128,
+        mma_tile_m=128,
+        mma_tile_n=128,
+        mma_tile_k_bytes=32,
+        mma_size_m=1,
+        mma_size_n=1,
+        mma_size_k=4,
+        cga_size_m=1,
+        cga_size_n=1,
+        cga_size_k=1,
+        warps_per_cta=8,
+        split_k_slices=1,
     )
+    imposter = TileConfig(**base_kw)
+    # It could not even be asked for sm103's fixed K width: that is a ClassVar
+    # on ConfigSm103, and the base declares none.
+    assert not hasattr(TileConfig, "MMA_TILE_K_BYTES") and ConfigSm103.MMA_TILE_K_BYTES == (48,)
     with pytest.raises(ValueError, match="no kernel template"):
-        select_template(chain, imposter, cta_group=1)
+        select_template(chain, imposter)
 
 
 def test_sm103_template_rejects_mxfp8(_pretend_sm103):
@@ -1354,24 +1407,27 @@ def test_sm103_rejects_multi_mma_m():
     """The sm103 chunk pipeline has NOT been adapted to a CTA tile spanning
     several MMA instructions along M: it miscomputes (A reads unwritten SMEM in
     K) and its ab_stages budget under-counts, so cta_tile_m=256 also overruns the
-    SMEM cap. Both are silent-wrong / launch-fail, so the template declines the
-    geometry outright. Drop `supports_multi_mma_m=False` when it is fixed."""
-    wide = by_name("CONFIG_sm103_256x128x384_128x128x48_cluster1x1")
-    assert wide.num_mma_m == 2
-    for t in (t for t in TEMPLATES if t.pipeline == "sm103"):
-        assert not t.supports_multi_mma_m
-        assert "num_mma_m=2" in t.multi_mma_m_reject(wide)
-        assert t.multi_mma_m_reject(by_name(_CFG_128)) is None
-    # The other pipelines DO implement it — the gate is sm103-specific.
-    for f in ("sm100_block_scale_matmul_1ctamma.py", "sm107_block_scale_matmul_1ctamma.py"):
-        t = next(t for t in TEMPLATES if t.file == f)
-        assert t.supports_multi_mma_m and t.multi_mma_m_reject(wide) is None
+    SMEM cap. Both are silent-wrong / launch-fail.
+
+    How many MMA instructions a CTA tile may span is GEOMETRY, so the bound is a
+    family fact on the config class -- the split geometry cannot be built at all,
+    the way sm103's fixed K axes cannot. Raise `MMA_SIZE_M_MAX` when it is fixed."""
+    from cudnn.gemm.frost.tile_config import ConfigSm100, ConfigSm103
+
+    assert ConfigSm103.MMA_SIZE_M_MAX == 1
+    with pytest.raises(NotImplementedError, match="MMA instruction"):
+        by_name("CONFIG_sm103_256x128x384_128x128x48_cluster1x1")
+    assert by_name(_CFG_128).mma_size_m == 1
+    # The other pipelines DO implement it — the bound is sm103-specific.
+    assert ConfigSm100.MMA_SIZE_M_MAX == 2
+    assert by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma").mma_size_m == 2
 
 
 @requires_sm103
 def test_sm103_multi_mma_m_is_declined_not_miscomputed():
-    """The gate reaches the JIT path, so the geometry raises instead of running."""
-    with pytest.raises(NotImplementedError, match="several MMA instructions along M"):
+    """The bound reaches the JIT path, so the geometry raises instead of running
+    -- it raises while the config is being BUILT, before any template is picked."""
+    with pytest.raises(NotImplementedError, match="MMA instruction"):
         jit_from_cudnn_graph(_bs_chain(), **_sm103_kw("CONFIG_sm103_256x128x384_128x128x48_cluster1x1"))
 
 
@@ -1533,7 +1589,7 @@ def test_auto_config_is_accepted_by_the_registry(M, N):
 
     chain = analyze(_build_nvfp4_graph(M, N, 512))
     assert chain.has_block_scale
-    cfg, _cta_group = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
+    cfg = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms, block_scale=chain.has_block_scale)
     cfg = as_pipeline(cfg, preferred_pipeline(chain))  # the config build_gemm_plan actually builds
     accepted = {c.name for _t, c in candidates(chain)}
     assert accepted, "the registry accepts no geometry at all for this chain"
@@ -1609,8 +1665,8 @@ def test_sf_blob_must_be_packed(M, K, kind, rejected):
 # sm107 block-scale pipeline (the sm100 pipeline on the 64-byte-K MMA)
 # ---------------------------------------------------------------------------
 
-_SM107_128 = "CONFIG_sm107_128x128x128_128x128x64_cluster1x1"
-_SM107_256 = "CONFIG_sm107_128x256x128_128x256x64_cluster1x1"
+_SM107_128 = "CONFIG_sm100_128x128x128_128x128x64_cluster1x1"
+_SM107_256 = "CONFIG_sm100_128x256x128_128x256x64_cluster1x1"
 
 
 @pytest.fixture
@@ -1619,62 +1675,88 @@ def _pretend_sm107(monkeypatch):
 
 
 def _sm107_kw(config_name, cta_group=1):
-    return dict(config=by_name(config_name), cta_group=cta_group)
+    return dict(config=dataclasses.replace(by_name(config_name), cta_group=cta_group))
 
 
-def test_catalog_has_sm107_geometries():
-    sm107 = [c for c in CATALOG if c.pipeline == "sm107"]
-    # num_mma_m {1,2} × 2 cta_n × the shared 15-cluster enumeration.
-    assert len(sm107) == 60
-    pat = re.compile(r"^CONFIG_sm107_(128|256)x(128|256)x128_128x(128|256)x64_cluster\d+x\d+$")
-    for c in sm107:
-        assert pat.match(c.name), c.name
-        assert isinstance(c, ConfigSm107)
-        # mma_inst_m is pinned: the block-scale F8_128x4 SF swizzle needs % 128 == 0.
-        assert c.mma_inst_m == 128 and c.cta_tile_k_bytes == 128
-        assert c.cta_tile_m == 128 * c.num_mma_m
-        assert c.mma_inst_k_bytes == 64
-    assert by_name(_SM107_128).geometry_name == "128x128x128_128x128x64_cluster1x1"
+def test_catalog_carries_both_mma_k_widths():
+    """The 64-byte MMA K is a geometry AXIS of the sm100 family, crossed over the
+    same M / N / cluster enumeration as the 32-byte one — not a family of its own."""
+    sm100 = [c for c in CATALOG if c.pipeline == "sm100"]
+    by_width = {32: [], 64: []}
+    for c in sm100:
+        by_width[c.mma_tile_k_bytes].append(c)
+    assert len(by_width[32]) == len(by_width[64]) > 0
+
+    # Same geometry, different width -> same name modulo the MMA-inst K token.
+    def strip(c):
+        return (c.cta_tile_mn, c.cga_size_mn, c.cta_tile_k_bytes, c.mma_tile_m, c.mma_size_m)
+
+    assert {strip(c) for c in by_width[32]} == {strip(c) for c in by_width[64]}
+    assert all(isinstance(c, ConfigSm100) for c in sm100)
+    assert by_name(_SM107_128).geometry_name == "128x128x128_128x128x64_cluster1x1_1ctamma"
+    assert by_name(_SM107_128).mma_tile_k_bytes == 64
+    # The K-tile walks the instruction, so it is always a multiple of the width.
+    assert all(c.cta_tile_k_bytes % c.mma_tile_k_bytes == 0 for c in CATALOG)
 
 
-def test_sm107_family_fixes_the_mma_k_width():
-    """The 64-byte MMA K is the FAMILY's, not free geometry — while the rest of
-    the geometry axes stay exactly sm100's."""
-    kw = dict(
-        cta_tile_m=128,
-        cta_tile_n=128,
-        cta_tile_k_bytes=128,
-        cgrp_size_m=1,
-        cgrp_size_n=1,
-        epi_tile_mn=(128, 32),
-        threads_per_cta=256,
-        pipeline="sm107",
-    )
-    ConfigSm107(mma_inst_k_bytes=64, **kw)
-    with pytest.raises(NotImplementedError, match="sm107 fixes mma_inst_k_bytes=64"):
-        ConfigSm107(mma_inst_k_bytes=32, **kw)
-    # A raw-base construction can't bypass the family invariant either.
-    with pytest.raises(NotImplementedError, match="sm107 fixes mma_inst_k_bytes=64"):
-        TileConfig(**kw)
+def test_a_pipeline_that_fixes_its_k_width_still_does():
+    """Folding sm107 in widened sm100 to {32, 64}; it did not make the axis free
+    for families whose MMA instruction dictates it."""
+
+    def cfg(cls, pipeline, cta_tile_k_bytes, mma_tile_k_bytes):
+        return cls(
+            pipeline=pipeline,
+            cta_tile_m=128,
+            cta_tile_n=128,
+            cta_tile_k_bytes=cta_tile_k_bytes,
+            warp_tile_m=128,
+            warp_tile_n=128,
+            warp_tile_k_bytes=cta_tile_k_bytes,
+            mma_tile_m=128,
+            mma_tile_n=128,
+            mma_tile_k_bytes=mma_tile_k_bytes,
+            mma_size_m=1,
+            mma_size_n=1,
+            mma_size_k=cta_tile_k_bytes // mma_tile_k_bytes,
+            cga_size_m=1,
+            cga_size_n=1,
+            cga_size_k=1,
+            warps_per_cta=8,
+            split_k_slices=1,
+            cta_group=1,
+        )
+
+    cfg(ConfigSm103, "sm103", 384, 48)
+    for bad in (32, 64):
+        with pytest.raises(NotImplementedError, match=r"sm103 issues mma_tile_k_bytes \[48\]"):
+            cfg(ConfigSm103, "sm103", 384, bad)
+    # sm100 takes either width, and nothing else.
+    cfg(ConfigSm100, "sm100", 128, 32)
+    cfg(ConfigSm100, "sm100", 128, 64)
+    with pytest.raises(NotImplementedError, match=r"sm100 issues mma_tile_k_bytes \[32, 64\]"):
+        cfg(ConfigSm100, "sm100", 128, 48)
 
 
-def test_sm107_template_selection_and_arch_gate(_pretend_sm107):
+def test_k64_geometry_pairs_with_the_sm100_template(_pretend_sm107):
+    """The 64-byte MMA-inst K is a geometry axis of the sm100 family, not a
+    family of its own — both widths render from the same template."""
     chain = analyze(_bs_chain())
-    for cta_group, want in ((1, "sm107_block_scale_matmul_1ctamma.py"), (2, "sm107_block_scale_matmul_2ctamma.py")):
-        cfg = by_name(_SM107_128 if cta_group == 1 else "CONFIG_sm107_128x128x128_128x128x64_cluster2x1")
-        tmpl = select_template(chain, cfg, cta_group=cta_group)
-        assert tmpl.file == want
+    for cta_group in (1, 2):
+        cfg = by_name(_SM107_128 if cta_group == 1 else "CONFIG_sm100_128x128x128_128x128x64_cluster2x1")
+        tmpl = select_template(chain, cfg)
+        assert tmpl.file == "sm100_block_scale_matmul.py"
         assert tmpl.accepts(chain, cfg) is None
-    # An sm100 config still pairs with the sm100 templates on the same GPU.
     sm100_cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
-    assert select_template(chain, sm100_cfg, cta_group=1).file == "sm100_block_scale_matmul_1ctamma.py"
+    assert select_template(chain, sm100_cfg).file == "sm100_block_scale_matmul.py"
 
 
-def test_sm107_templates_reject_older_blackwell(monkeypatch):
+def test_k64_is_rejected_on_older_blackwell(monkeypatch):
+    """The width is SILICON: the gate reads the ACTIVE arch, not the family."""
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    chain = analyze(_bs_chain())
-    tmpl = next(t for t in TEMPLATES if t.file == "sm107_block_scale_matmul_1ctamma.py")
-    assert "107 <= SM < 110" in tmpl.accepts(chain, by_name(_SM107_128))
+    with pytest.raises(NotImplementedError, match="107 <= SM < 110"):
+        validate_block_scale_config(by_name(_SM107_128), 16, 256)
+    # the 32-byte width is unaffected on the same GPU
+    validate_block_scale_config(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), 16, 256)
 
 
 @requires_sm107
@@ -1684,10 +1766,10 @@ def test_sm107_templates_reject_older_blackwell(monkeypatch):
     [
         (_SM107_128 + "_1ctamma", 1),
         (_SM107_256 + "_1ctamma", 1),
-        ("CONFIG_sm107_128x128x128_128x128x64_cluster1x2_1ctamma", 1),
-        ("CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma", 2),
-        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma", 2),
-        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x2_2ctamma", 2),
+        ("CONFIG_sm100_128x128x128_128x128x64_cluster1x2_1ctamma", 1),
+        ("CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma", 2),
+        ("CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma", 2),
+        ("CONFIG_sm100_128x256x128_128x256x64_cluster2x2_2ctamma", 2),
     ],
     ids=lambda v: v if isinstance(v, str) else f"cta{v}",
 )
@@ -1709,8 +1791,8 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     them apart -- 256x256 is the case where both regions split at once."""
     cluster = "cluster1x1" if cta_group == 1 else "cluster2x1"
     suffix = "1ctamma" if cta_group == 1 else "2ctamma"
-    geometry = f"CONFIG_sm107_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
-    assert by_name(geometry).num_mma_m == cta_m // 128
+    geometry = f"CONFIG_sm100_{cta_m}x{cta_n}x128_128x{cta_n}x64_{cluster}"
+    assert by_name(geometry).mma_size_m == cta_m // 128
     _run_bs_numeric(combo, f"{geometry}_{suffix}", 256, 256, 512)
 
 
@@ -1720,9 +1802,9 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
     [
         ("nvfp4", _SM107_128 + "_1ctamma", 256, 384, 768),  # multi-tile N
         ("mxfp4", _SM107_256 + "_1ctamma", 256, 256, 4096),  # many K-tiles
-        ("mxfp8", "CONFIG_sm107_128x128x128_128x128x64_cluster2x1_2ctamma", 384, 512, 256),
-        ("nvfp4", "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
-        ("nvfp4", "CONFIG_sm107_128x128x128_128x128x64_cluster1x4_1ctamma", 512, 1024, 512),
+        ("mxfp8", "CONFIG_sm100_128x128x128_128x128x64_cluster2x1_2ctamma", 384, 512, 256),
+        ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma", 1024, 512, 512),
+        ("nvfp4", "CONFIG_sm100_128x128x128_128x128x64_cluster1x4_1ctamma", 512, 1024, 512),
     ],
     ids=lambda v: v if isinstance(v, str) else str(v),
 )
@@ -1735,12 +1817,12 @@ def test_sm107_block_scale_matmul_shapes_and_clusters(combo, config_name, M, N, 
 @pytest.mark.parametrize(
     "config_name",
     [
-        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_2ctamma",
-        "CONFIG_sm107_128x128x128_128x128x64_cluster4x2_2ctamma",
-        "CONFIG_sm107_256x256x128_128x256x64_cluster2x4_2ctamma",
-        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_1ctamma",
-        "CONFIG_sm107_128x128x128_128x128x64_cluster1x4_1ctamma",
-        "CONFIG_sm107_128x128x128_128x128x64_cluster2x2_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_2ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster4x2_2ctamma",
+        "CONFIG_sm100_256x256x128_128x256x64_cluster2x4_2ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster4x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster1x4_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x64_cluster2x2_1ctamma",
     ],
 )
 def test_sm107_block_scale_mixed_cga(combo, config_name):
@@ -1752,8 +1834,8 @@ def test_sm107_block_scale_mixed_cga(combo, config_name):
     landed in. M is large enough that the grid outruns what the preferred clusters
     hold resident, which is when the device substitutes the fallback shape."""
     cta_group = 2 if config_name.endswith("_2ctamma") else 1
-    cfg = by_name(config_name.rsplit("_", 1)[0])
-    assert C._mixed_cga_fallback(cfg, cta_group, f"sm107_block_scale_matmul_{cta_group}ctamma.py") == (cta_group, 1)
+    cfg = by_name(config_name)
+    assert C._mixed_cga_fallback(cfg, "sm100_block_scale_matmul.py") == (cta_group, 1, 1)
     _run_bs_numeric(combo, config_name, 1920, 1920, 512)
 
 
@@ -1763,12 +1845,11 @@ def test_mixed_cga_fallback_is_the_mma_mode_minimum(cta_group):
     """The fallback shape is derived, never passed: one CTA for a 1-CTA MMA, the
     pair for a 2-CTA one — and a config already AT that minimum has nothing to
     fall back to, so it launches as a plain fixed cluster."""
-    tmpl = f"sm107_block_scale_matmul_{cta_group}ctamma.py"
-    assert C.min_fallback_cluster(cta_group) == (cta_group, 1)
-    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
-    assert C._mixed_cga_fallback(wide, cta_group, tmpl) == (cta_group, 1)
-    minimal = by_name(f"CONFIG_sm107_128x128x128_128x128x64_cluster{cta_group}x1")
-    assert C._mixed_cga_fallback(minimal, cta_group, tmpl) is None
+    tmpl = "sm100_block_scale_matmul.py"
+    wide = by_name(f"CONFIG_sm100_128x128x128_128x128x64_cluster4x2_{cta_group}ctamma")
+    assert C._mixed_cga_fallback(wide, tmpl) == (cta_group, 1, 1)
+    minimal = by_name(f"CONFIG_sm100_128x128x128_128x128x64_cluster{cta_group}x1_{cta_group}ctamma")
+    assert C._mixed_cga_fallback(minimal, tmpl) is None
 
 
 @requires_sm107
@@ -1778,32 +1859,28 @@ def test_mixed_cga_is_off_where_it_cannot_be_honored(monkeypatch):
     would hang — its cluster constants are baked to the preferred shape), and
     whether the config pins the N-super-block walk (not invariant across the two
     cluster shapes)."""
-    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
-    sm107_tmpl = "sm107_block_scale_matmul_2ctamma.py"
-    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) == (2, 1)
+    wide = by_name("CONFIG_sm100_128x128x128_128x128x64_cluster4x2_2ctamma")
+    sm107_tmpl = "sm100_block_scale_matmul.py"
+    assert C._mixed_cga_fallback(wide, sm107_tmpl) == (2, 1, 1)
 
     # Template that never reads the constant -> no fallback attached. The MoE
     # ones stay that way: their fixed-grid persistent scheduler strides by a
     # host-computed cluster count, which mixed clusters invalidate.
-    moe_tmpl = "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    moe_tmpl = "sm100_moe_grouped_block_scale_matmul_fwd.py"
     assert not C._template_reads_fallback_cluster(moe_tmpl)
-    assert C._mixed_cga_fallback(wide, 2, moe_tmpl) is None
+    assert C._mixed_cga_fallback(wide, moe_tmpl) is None
 
     # Substitution is a floor, not a range: every part from SM 10.0 up can do it.
     assert C._mixed_cga_supported(100) and C._mixed_cga_supported(110)
     # A pre-Blackwell part -> plain fixed cluster, as before.
     monkeypatch.setattr(C, "_current_arch", lambda: 90)
     assert not C._mixed_cga_supported()
-    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+    assert C._mixed_cga_fallback(wide, sm107_tmpl) is None
     monkeypatch.undo()
-
-    # A pinned N-super-block walk -> skipped rather than silently mis-tiled.
-    pinned = dataclasses.replace(wide, tile_swizzle_n=8)
-    assert C._mixed_cga_fallback(pinned, 2, sm107_tmpl) is None
 
     # The escape hatch for A/B measurement.
     monkeypatch.setenv("CUDNN_FROST_DISABLE_MIXED_CGA", "1")
-    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+    assert C._mixed_cga_fallback(wide, sm107_tmpl) is None
 
 
 @requires_sm107
@@ -1832,9 +1909,9 @@ def test_mixed_cga_ported_templates_attach_a_fallback():
     "config_name",
     [
         _SM107_128 + "_1ctamma",
-        "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_1ctamma",  # M-OOB with cgrp_m > 1
-        "CONFIG_sm107_128x128x128_128x128x64_cluster1x2_1ctamma",  # N tile/cluster > N
-        "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma",  # 2-CTA pair
+        "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_1ctamma",  # M-OOB with cgrp_m > 1
+        "CONFIG_sm100_128x128x128_128x128x64_cluster1x2_1ctamma",  # N tile/cluster > N
+        "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma",  # 2-CTA pair
     ],
 )
 def test_sm107_nvfp4_oob_shape(config_name):
@@ -1848,7 +1925,7 @@ def test_sm107_nvfp4_oob_shape(config_name):
     "combo,config_name",
     [
         ("nvfp4", _SM107_128 + "_1ctamma"),
-        ("mxfp8", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"),
+        ("mxfp8", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"),
     ],
 )
 def test_sm107_block_scale_matmul_m_major(combo, config_name):
@@ -1857,7 +1934,7 @@ def test_sm107_block_scale_matmul_m_major(combo, config_name):
 
 @requires_sm107
 @pytest.mark.parametrize("scale_reorder", [False, True])
-@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"])
 def test_e5m3_quant_epilogue(config_name, scale_reorder):
     """The epilogue can PRODUCE E5M3 scales, bit-exact against the torch
     reference. The `cvt ... ue5m3x2.f32` this needs exists only on sm_107 —
@@ -1887,7 +1964,7 @@ def test_e5m3_quant_rejects_off_sm107(monkeypatch):
 
 
 @requires_sm107
-@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"])
 def test_sm107_block_scale_matmul_quant_epilogue(config_name):
     _run_bs_quant_numeric(
         config_name,
@@ -1918,17 +1995,17 @@ def test_sm107_block_scale_matmul_reduction_scalar(mode):
 
 
 @requires_sm107
-@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm107_128x256x128_128x256x64_cluster2x1_2ctamma"])
+@pytest.mark.parametrize("config_name", [_SM107_128 + "_1ctamma", "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"])
 def test_sm107_mxfp8_m_major_a_n_major_b(config_name):
     test_mxfp8_m_major_a_n_major_b(config_name, 256, 256, 512)
 
 
-def test_auto_path_prefers_sm107_where_it_has_a_template(monkeypatch):
-    """On SM 10.7 the auto path builds block-scale graphs with the sm107
-    pipeline; graph types sm107 has no template for (plain matmul, MoE) fall
-    back to sm100 on their own, and so does older Blackwell."""
-    from cudnn.gemm.frost.kernel_registry import preferred_pipeline
-    from cudnn.gemm.frost.tile_config import as_pipeline, select_config
+def test_auto_path_takes_the_64_byte_mma_k_on_10_7(monkeypatch):
+    """The auto path picks the 64-byte block-scale MMA on the silicon that
+    issues it. It is a K-WIDTH choice inside one pipeline, not a family choice:
+    plain matmul keeps 32 everywhere, and older Blackwell keeps 32 outright."""
+    from cudnn.gemm.frost.kernel_registry import preferred_mma_tile_k_bytes, preferred_pipeline
+    from cudnn.gemm.frost.tile_config import as_mma_tile_k, as_pipeline, select_config
 
     pg = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1941,22 +2018,23 @@ def test_auto_path_prefers_sm107_where_it_has_a_template(monkeypatch):
 
     bs_chain = analyze(_bs_chain())
     plain_chain = analyze(pg)
+    geo = select_config(4096, 4096, 1, block_scale=True)
 
     monkeypatch.setattr(C, "_current_arch", lambda: 107)
-    assert preferred_pipeline(bs_chain) == "sm107"
-    assert preferred_pipeline(plain_chain) == "sm100"
+    assert preferred_pipeline(bs_chain) == "sm100"
+    assert preferred_mma_tile_k_bytes(bs_chain) == 64
+    assert preferred_mma_tile_k_bytes(plain_chain) == 32
 
     monkeypatch.setattr(C, "_current_arch", lambda: 100)
-    assert preferred_pipeline(bs_chain) == "sm100"
+    assert preferred_mma_tile_k_bytes(bs_chain) == 32
 
-    # select_config scores pure geometry (an sm100 config); moving it to another
-    # family touches only that family's fixed MMA-inst K.
-    geo = select_config(4096, 4096, 1, block_scale=True)[0]
-    assert as_pipeline(geo, "sm100") is geo
-    geo107 = as_pipeline(geo, "sm107")
-    assert geo107.pipeline == "sm107" and geo107.mma_inst_k_bytes == 64
-    assert (geo107.cta_tile_mn, geo107.cgrp_size_mn) == (geo.cta_tile_mn, geo.cgrp_size_mn)
-    assert geo107.cta_tile_k_bytes == geo.cta_tile_k_bytes
+    # Re-stamping the width keeps every other axis, and is a no-op for a family
+    # that cannot issue it.
+    wide = as_mma_tile_k(geo, 64)
+    assert wide.pipeline == "sm100" and wide.mma_tile_k_bytes == 64
+    assert (wide.cta_tile_mn, wide.cga_size_mn) == (geo.cta_tile_mn, geo.cga_size_mn)
+    assert wide.cta_tile_k_bytes == geo.cta_tile_k_bytes
+    assert as_mma_tile_k(geo, 32) is geo
     # sm103 fixes a 384-byte K-tile, so a scored geometry cannot become one — the
     # family invariant lives on the config, not in a second whitelist.
     with pytest.raises(NotImplementedError, match="cta_tile_k_bytes=384"):
@@ -2006,7 +2084,7 @@ def test_fp4_scale_dtype_and_block_are_orthogonal(sf_dt, sf_name, block_size):
     from cudnn.gemm.frost.kernel_registry import GraphType as _GT, MMA_TYPE_SUPPORT, _bs_key
 
     key = _bs_key("fp4_e2m1", sf_name, "fp4_e2m1", sf_name, block_size)
-    for pipeline in ("sm100", "sm103", "sm107"):
+    for pipeline in ("sm100", "sm103"):
         assert key in MMA_TYPE_SUPPORT[pipeline][_GT.BLOCK_SCALE_MATMUL], f"{pipeline} is missing fp4+{sf_name}/{block_size}"
     # and the analyzer reads the pair back off a graph built with it
     bs = analyze(_build_nvfp4_graph(256, 256, 512, block_size=block_size, sf_dt=sf_dt, a_dt=cudnn.data_type.FP4_E2M1)).block_scale
@@ -2078,7 +2156,15 @@ def test_gpu_gated_cases_are_narrowed_everywhere():
         for sf, blk in _GPU_GATED_FP4_CASES
         if _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ())
     ]
-    assert len(gated) == 3 * len(_GPU_GATED_FP4_CASES), f"expected every pipeline to carry every gated case, got {len(gated)}"
+    carriers = [
+        pipeline
+        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        if any(_bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ()) for sf, blk in _GPU_GATED_FP4_CASES)
+    ]
+    assert carriers, "no pipeline carries the GPU-gated fp4 cases — the invariant lost its subject"
+    assert len(gated) == len(carriers) * len(
+        _GPU_GATED_FP4_CASES
+    ), f"expected every carrying pipeline to carry EVERY gated case, got {len(gated)} over {carriers}"
     bad = [pk for pk in gated if MMA_GPU_ARCH_SPECIAL_CASES.get(pk) != _GPU_GATED_RANGES]
     assert not bad, f"GPU-gated cases missing their {_GPU_GATED_RANGES} narrowing: {bad}"
 
@@ -2094,14 +2180,14 @@ def test_dtype_and_mma_arch_gates_are_independent():
 
     for sf in _DTYPE_GATED_SF_DTYPES:
         assert DTYPE_GPU_ARCH_RANGES.get(sf) == _GPU_GATED_RANGES, f"{sf} is not narrowed by the dtype table"
-        for pipeline in ("sm100", "sm103", "sm107"):
+        for pipeline in ("sm100", "sm103"):
             for blk in (16, 32):
                 key = (pipeline, _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk))
                 assert MMA_GPU_ARCH_SPECIAL_CASES.get(key) == _GPU_GATED_RANGES, f"{key} lost its independent MMA-instruction narrowing"
 
 
 @pytest.mark.parametrize("sf_name,block_size", sorted(_GPU_GATED_FP4_CASES))
-@pytest.mark.parametrize("pipeline", ["sm100", "sm103", "sm107"])
+@pytest.mark.parametrize("pipeline", ["sm100", "sm103"])
 def test_gpu_gated_cases_reject_off_sm107(pipeline, sf_name, block_size, monkeypatch):
     """...and the narrowing actually bites: accepted on 10.7/10.9, turned away
     by the ARCH gate everywhere else, on every pipeline."""
@@ -2193,9 +2279,9 @@ def _run_e5m3_numeric(config_name, cta_group, block_size, M=256, N=256, K=512):
     [
         (_SM107_128, 1),
         (_SM107_256, 1),
-        ("CONFIG_sm107_128x128x128_128x128x64_cluster1x2", 1),
-        ("CONFIG_sm107_128x128x128_128x128x64_cluster2x1", 2),
-        ("CONFIG_sm107_128x256x128_128x256x64_cluster2x1", 2),
+        ("CONFIG_sm100_128x128x128_128x128x64_cluster1x2", 1),
+        ("CONFIG_sm100_128x128x128_128x128x64_cluster2x1", 2),
+        ("CONFIG_sm100_128x256x128_128x256x64_cluster2x1", 2),
     ],
     ids=lambda v: v if isinstance(v, str) else f"cta{v}",
 )

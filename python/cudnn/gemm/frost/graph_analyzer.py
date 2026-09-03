@@ -32,6 +32,7 @@ from .fusion_ir import (
     ReductionSpec,
     TensorRef,
     gemm_source,
+    segmented_row_scale_capacity_rows,
 )
 
 # Dtype + op tables
@@ -141,6 +142,7 @@ class _TensorMeta:
     is_input: bool = False
     # SF reorder layout name (e.g. "F8_128x4") or None for the default (NONE).
     reordering: str | None = None
+    alignment_value: int = 1
     # Strong ref to the cuDNN tensor object, used to bind each role for the
     # variant-pack dict (uid / name / object) instead of positional args.
     tensor: Any = None
@@ -468,6 +470,7 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
             dtype=_map_dtype(t.get_data_type()),
             is_input=id(t) not in produced,
             reordering=reordering,
+            alignment_value=max(1, int(getattr(t, "alignment_value", 1) or 1)),
             tensor=t,
         )
         if getattr(t, "data_type", None) is not None:
@@ -564,8 +567,8 @@ def build_gemm_plan(graph: cudnn.pygraph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import jit_from_cudnn_graph, plan_config
 
-    config, cta_group = plan_config(analyze(graph))
-    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group)
+    config = plan_config(analyze(graph))
+    return jit_from_cudnn_graph(graph, config=config)
 
 
 # Analyzer
@@ -646,6 +649,7 @@ def _collect_quants(
     N: int,
     err_ctx: str,
     fto_id: int | None = None,
+    num_groups: int | None = None,
 ) -> tuple[list[BlockQuantizeSpec], list["_RecordedOp"], list[Dtype], list[Any]]:
     """Fold every reachable ``block_scale_quantize`` whose data output is
     materialized into a :class:`BlockQuantizeSpec`. Returns (specs, recorded
@@ -683,12 +687,6 @@ def _collect_quants(
         if qop.group_offset is not None:
             if fto_id is None or qop.group_offset != fto_id:
                 raise ValueError(f"block_scale_quantize {qop.op_name!r} groupOffset must be the MoE " "first_token_offset tensor")
-            if axis != 1:
-                raise ValueError(
-                    f"block_scale_quantize {qop.op_name!r} with groupOffset supports only "
-                    "the M axis (axis=1, col quant); row scales are already per-group "
-                    "contiguous in the global layout"
-                )
             if scale_reorder != "F8_128x4":
                 raise ValueError(f"block_scale_quantize {qop.op_name!r} with groupOffset requires " "F8_128x4 scale reordering")
             grouped_by_moe = True
@@ -722,7 +720,33 @@ def _collect_quants(
             scale_dim = expected_scale_dim
         if len(scale_dim) != 3:
             raise ValueError(f"block_scale_quantize scale output must be rank-3; got {scale_dim}")
-        if tuple(scale_dim) != expected_scale_dim:
+        grouped_row = grouped_by_moe and axis != 1
+        if grouped_row:
+            # Runtime fto values live on device. Size for the exact worst-case
+            # partition at graph time rather than synchronizing fto or relying
+            # on an execute-time caller precondition.
+            if num_groups is None:
+                raise AssertionError("grouped row block quantize recorded without a MoE group count")
+            if qop.scale_output not in _TENSOR_DIM_OVERRIDE:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale output " "requires an explicit scale dim [1, segmented_rows, padded_N_blocks]"
+                )
+            padded_n_blocks = _round_up(int(N) // bs, 4)
+            required_rows = segmented_row_scale_capacity_rows(int(M), num_groups)
+            if int(batch) != 1 or int(scale_dim[0]) != 1:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scales require " f"batch=1 and scale_dim[0]=1; got batch={batch}, scale_dim={scale_dim}"
+                )
+            if int(scale_dim[1]) < required_rows or int(scale_dim[1]) % 128:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale_dim[1] "
+                    f"must be a 128-row-aligned static worst-case capacity >= {required_rows}; got {scale_dim[1]}"
+                )
+            if int(scale_dim[2]) != padded_n_blocks:
+                raise ValueError(
+                    f"block_scale_quantize {qop.op_name!r} grouped row scale_dim[2] " f"must be padded N/block_size = {padded_n_blocks}; got {scale_dim[2]}"
+                )
+        elif tuple(scale_dim) != expected_scale_dim:
             raise ValueError(f"block_scale_quantize scale dim must be {expected_scale_dim}; got {scale_dim}")
         compute = qop.compute_dtype if qop.compute_dtype is not None else compute_dtype
         quants.append(
@@ -746,6 +770,34 @@ def _collect_quants(
         data_dtypes.append(dt)
         scale_objs.append(qop.scale_output_tensor)
     return quants, recs, data_dtypes, scale_objs
+
+
+def _dedup_operand(pid: int, cap: dict, ids: list[int], caps: dict[int, dict], side: str, meta: "dict[int, _TensorMeta]") -> int:
+    """Index of this operand among the distinct ones, registering it on first sight.
+
+    Dedup is by the packed-DATA tensor and the scale factor travels with it, so a
+    second capture of the same data must describe the SAME dequantize. Two
+    dequantizes over one packed tensor -- different SF, block size, or declared
+    output dtype -- would otherwise collapse onto the first capture and run every
+    GEMM with it, which is a wrong answer the variant pack cannot even express
+    (the dropped SF is not a graph input)."""
+    prev = caps.get(pid)
+    if prev is None:
+        ids.append(pid)
+        caps[pid] = cap
+        return len(ids) - 1
+    if prev != cap:
+
+        def _show(key, val):
+            return repr(meta[val].name) if key.endswith("_id") and val in meta else repr(val)
+
+        differing = ", ".join(f"{k} {_show(k, prev[k])} vs {_show(k, cap[k])}" for k in sorted(cap) if prev[k] != cap[k])
+        raise ValueError(
+            f"{side} operand {meta[pid].name!r} is dequantized more than once with different "
+            f"parameters ({differing}); one packed tensor carries one scale factor. Give each "
+            f"dequantize its own data tensor so they become distinct operands."
+        )
+    return ids.index(pid)
 
 
 def _build_multi_moe_chain(
@@ -785,6 +837,7 @@ def _build_multi_moe_chain(
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
     num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
+    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
 
     # Resolve each moe operand through any dequant, then dedup by PACKED data
     # tensor id (shared dequant → one distinct operand; SF travels with its data).
@@ -826,14 +879,12 @@ def _build_multi_moe_chain(
     for moe in moe_ops:
         a_cap = _capture_side(moe.inputs[0])
         b_cap = _capture_side(moe.inputs[1])
-        a_pid, b_pid = a_cap["data_id"], b_cap["data_id"]
-        if a_pid not in a_ids:
-            a_ids.append(a_pid)
-            a_caps[a_pid] = a_cap
-        if b_pid not in b_ids:
-            b_ids.append(b_pid)
-            b_caps[b_pid] = b_cap
-        gemm_operands.append((a_ids.index(a_pid), b_ids.index(b_pid)))
+        gemm_operands.append(
+            (
+                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
+                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
+            )
+        )
 
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 
@@ -1095,6 +1146,7 @@ def _build_multi_moe_chain(
         N,
         "multi-MoE",
         fto_id=fto_id,
+        num_groups=num_groups,
     )
 
     # Dense outputs in plain recorder (set_output) order — no output position
@@ -1243,7 +1295,13 @@ def _build_multi_moe_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
-        moe=MoeSpec(num_experts=int(E), mode=moe_ops[0].moe_mode, offset_dtype=offset_dtype, num_groups=num_groups),
+        moe=MoeSpec(
+            num_experts=int(E),
+            mode=moe_ops[0].moe_mode,
+            offset_dtype=offset_dtype,
+            num_groups=num_groups,
+            offset_multiple=offset_multiple,
+        ),
         block_scale=block_scale_spec,
         reductions=reductions,
         quants=quants,
@@ -1446,14 +1504,12 @@ def _build_multi_gemm_chain(
         mm_a_id, mm_b_id = operand_ids_by_mm[mm.output]
         a_cap = _capture_side(mm_a_id)
         b_cap = _capture_side(mm_b_id)
-        a_pid, b_pid = a_cap["data_id"], b_cap["data_id"]
-        if a_pid not in a_ids:
-            a_ids.append(a_pid)
-            a_caps[a_pid] = a_cap
-        if b_pid not in b_ids:
-            b_ids.append(b_pid)
-            b_caps[b_pid] = b_cap
-        gemm_operands.append((a_ids.index(a_pid), b_ids.index(b_pid)))
+        gemm_operands.append(
+            (
+                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
+                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
+            )
+        )
 
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 

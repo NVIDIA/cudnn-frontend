@@ -24,6 +24,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from .host import get_dtype
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+
+USE_PDL = True
 
 BLOCK = 256
 
@@ -40,6 +43,8 @@ def frost_head_reduce(
     inner_words: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
 ) -> None:
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
     gw = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
@@ -66,6 +71,8 @@ def frost_head_reduce(
                 acc_lo = acc_lo + lo
                 acc_hi = acc_hi + hi
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
+    if cutlass.const_expr(USE_PDL):
+        launch_dependent_grids()
 
 
 @cute.jit
@@ -86,6 +93,7 @@ def launch(
         grid=(grid_x, 1, 1),
         block=(BLOCK, 1, 1),
         stream=stream,
+        use_pdl=USE_PDL,
     )
 
 
@@ -106,21 +114,11 @@ def head_group_reduce(src, dst, *, stream) -> None:
         total, HO = src.shape
         D = 1
         H = dst.shape[1]
-        shape_ok = len(dst.shape) == 2 and dst.shape[0] == total
     else:
         total, HO, D = src.shape
         H = dst.shape[1]
-        shape_ok = len(dst.shape) == 3 and dst.shape[0] == total and dst.shape[2] == D
-    if not shape_ok:
-        raise ValueError(f"head_group_reduce: shape mismatch {tuple(src.shape)} -> {tuple(dst.shape)}")
-    if H <= 0 or HO % H != 0 or HO <= H:
-        raise ValueError(f"head_group_reduce: bad head group HO={HO} H={H}")
     io_dtype = get_dtype(src.dtype)
-    if str(src.dtype).split(".")[-1] != str(dst.dtype).split(".")[-1]:
-        raise ValueError(f"head_group_reduce: dtype mismatch {src.dtype} vs {dst.dtype}")
     is_fp32 = io_dtype == cutlass.Float32
-    if not is_fp32 and D % 2 != 0:
-        raise ValueError(f"head_group_reduce: D={D} must be even for f16/bf16")
     r = HO // H
     inner_words = D if is_fp32 else D // 2
     total_words = total * H * inner_words
@@ -128,10 +126,6 @@ def head_group_reduce(src, dst, *, stream) -> None:
     cu_stream = cuda.CUstream(int(stream))
 
     dst_strides = tuple(dst.stride())
-    if not is_fp32 and any(st % 2 != 0 for st, sz in zip(dst_strides[:-1], dst.shape[:-1]) if sz != 1):
-        raise ValueError(f"head_group_reduce: f16/bf16 dst outer strides must be even (word-pair stores), got {dst_strides}")
-    if dst.shape[-1] != 1 and dst_strides[-1] != 1:
-        raise ValueError(f"head_group_reduce: dst innermost dim must be stride-1, got strides {dst_strides}")
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
     out_head_words = (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
 

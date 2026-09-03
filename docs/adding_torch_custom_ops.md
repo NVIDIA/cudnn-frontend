@@ -5,7 +5,7 @@ Best practices for wrapping cuDNN graph ops as PyTorch custom ops with minimal C
 ## File location
 
 Custom ops live in `python/cudnn/experimental/ops/`. Each op gets its own file
-(e.g., `sdpa.py`, `rmsnorm.py`, `layernorm.py`, `moe.py`). Export from
+(e.g., `rmsnorm.py`, `layernorm.py`, `moe.py`). Export from
 `python/cudnn/experimental/ops/__init__.py`.
 
 ## Registration: use torch.Library, NOT @torch.library.custom_op
