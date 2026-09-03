@@ -178,9 +178,15 @@ def _benchmark_shape(
     """Run the three-way comparison at one B, Sq=Sk point."""
     shape_q = (batch, q_heads, seqlen, dim)
     shape_kv = (batch, kv_heads, seqlen, dim)
-    q_bf16 = (torch.randn(shape_q, device="cuda") * 0.5).to(torch.bfloat16)
-    k_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
-    v_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
+    q_bf16 = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16).normal_(
+        0.0, 0.5
+    )
+    k_bf16 = torch.empty(shape_kv, device="cuda", dtype=torch.bfloat16).normal_(
+        0.0, 0.5
+    )
+    v_bf16 = torch.empty(shape_kv, device="cuda", dtype=torch.bfloat16).normal_(
+        0.0, 0.5
+    )
     torch.cuda.empty_cache()
     q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
     torch.cuda.empty_cache()
