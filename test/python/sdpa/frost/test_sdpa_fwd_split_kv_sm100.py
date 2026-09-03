@@ -532,11 +532,17 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx, *, d_qk=128, d_v=12
 
     if not mx:
         fp8_dtype = torch.float8_e5m2 if dtype_qkv == DTYPE_E5M2 else torch.float8_e4m3fn
-        mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(fp8_dtype)
+
+        def mk(*sh):
+            return (torch.randn(*sh, device=dev) * 0.5).to(fp8_dtype)
+
         q, k, v = mk(B, SQ, H, d_qk), mk(B, SKV, H, d_qk), mk(B, SKV, H, d_v)
+
         # The FP8 entry takes four 1-element fp32 DEVICE scale tensors
         # (descale_q/k/v, scale_o) — the scales fold in-kernel — and no Amax_S.
-        one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
+        def one():
+            return torch.ones(1, dtype=torch.float32, device=dev)
+
         # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
         o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
         fn(q, k, v, o_p, lse_p, zH, zB, o_desc, ps, log2e, cutlass.Float32(1.0), cutlass.Int32(0), one(), one(), one(), one(), amax_o, stream=stream)
@@ -1204,13 +1210,22 @@ def _api_fp8_case(
 
     _, o_one, _, _ = build(True)
     split, o_split, amax, ref_inputs = build(False)
-    if d_qk == 256:
-        q_ref, k_ref, v_ref = (t.permute(0, 2, 1, 3) for t in ref_inputs)
-        reference = _ref_sdpa(q_ref, k_ref, v_ref, 1.0 / math.sqrt(d_qk), causal, h_kv).permute(0, 2, 1, 3)
-        atol = 8e-2 if fp8_dtype == torch.float8_e5m2 else 5e-2
-        for name, output in (("split", o_split), ("unsplit", o_one)):
-            diff = (output - reference).abs().max().item()
-            assert diff <= atol, f"D256 {name} max|O-ref|={diff:.4f} > {atol:.4f}"
+    # Check BOTH executions against an independent fp32 oracle, not just each
+    # other: they share the inputs, the scales and the whole attention setup, so
+    # a defect in that shared part moves them together and a split-vs-unsplit
+    # comparison alone would pass. Only the final cast differs by construction
+    # (split_combine for the split, the kernel epilogue otherwise).
+    q_ref, k_ref, v_ref = (t.permute(0, 2, 1, 3) for t in ref_inputs)
+    reference = _ref_sdpa(q_ref, k_ref, v_ref, 1.0 / math.sqrt(d_qk), causal, h_kv).permute(0, 2, 1, 3)
+    reference = reference * scale_o
+    atol = 8e-2 if fp8_dtype == torch.float8_e5m2 else 5e-2
+    if out_dtype in _FP8_OUT:
+        # A quantized O lands on its own lattice, so the oracle has to allow the
+        # rounding step the store itself introduces.
+        atol = max(atol, 3.0 * (reference - reference.to(out_dtype).float()).abs().max().item())
+    for name, output in (("split", o_split), ("unsplit", o_one)):
+        diff = (output - reference).abs().max().item()
+        assert diff <= atol, f"D{d_qk} {name} max|O-ref|={diff:.4f} > {atol:.4f}"
     return split, o_split, o_one, amax
 
 
@@ -1344,7 +1359,10 @@ def test_quantized_split_reduces_in_half_not_in_the_output_type(out_dtype):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("per-tensor FP8 prefill requires cc10.0 / cc10.3 / cc10.7")
     b, h, s_q, s_kv, d, dev = 1, 8, 512, 16384, 128, "cuda"
-    mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+    def mk(*sh):
+        return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
     q, k, v = mk(b, h, s_q, d), mk(b, 1, s_kv, d), mk(b, 1, s_kv, d)
 
     def carved(o_dtype):

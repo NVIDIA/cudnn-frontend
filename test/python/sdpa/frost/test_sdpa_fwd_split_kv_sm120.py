@@ -196,11 +196,16 @@ def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0):
         pytest.skip("SM120 part required")
     b, d, dev = 1, 128, "cuda"
     torch.manual_seed(0)
-    mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+    def mk(*sh):
+        return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
     q, k, v = mk(b, h_q, s_q, d), mk(b, h_kv, s_kv, d), mk(b, h_kv, s_kv, d)
     o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=out_dtype)
     amax = torch.zeros(1, dtype=torch.float32, device=dev)
-    one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
+
+    def one():
+        return torch.ones(1, dtype=torch.float32, device=dev)
 
     kw = dict(pertensor_fp8=True, dtype_o=out_dtype)
     if split_kv > 1:
@@ -223,6 +228,22 @@ def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0):
         scale_o=one() * scale_o,
     )
     torch.cuda.synchronize()
+
+    # Independent fp32 oracle. Comparing a split run against an unsplit one only
+    # proves they agree -- they share the inputs, the scales and the attention
+    # math, so a defect there moves both. descale_* are 1.0, so the dequantized
+    # inputs are just the fp8 values.
+    qf, kf, vf = q.float(), k.float(), v.float()
+    if h_q != h_kv:
+        rep = h_q // h_kv
+        kf, vf = kf.repeat_interleave(rep, dim=1), vf.repeat_interleave(rep, dim=1)
+    reference = (torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf) * scale_o
+    atol = 5e-2
+    if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        # A quantized O lands on its own lattice; allow the store's own step.
+        atol = max(atol, 3.0 * (reference - reference.to(out_dtype).float()).abs().max().item())
+    diff = (o.float() - reference).abs().max().item()
+    assert diff <= atol, f"SM120 split={api.split_kv} max|O-ref|={diff:.4f} > {atol:.4f}"
     return api.split_kv, o.float().clone(), amax.item(), ws_bytes
 
 
