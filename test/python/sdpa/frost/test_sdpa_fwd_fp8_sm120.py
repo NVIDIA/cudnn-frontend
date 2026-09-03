@@ -1197,7 +1197,7 @@ def test_fp8_sm120_thd():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=61)
-def test_fp8_sm120_thd_multi_unit_per_cta():
+def test_fp8_sm120_thd_multi_unit_per_cta(monkeypatch):
     """THD with more live units than the machine has CTAs (issue #618).
 
     The grid is machine-sized, so a CTA pulls units repeatedly off the
@@ -1205,7 +1205,21 @@ def test_fp8_sm120_thd_multi_unit_per_cta():
     and never re-enters the K/V pipeline for a second one -- the regime where an
     unmatched consumer arrival on bar_k/v_consumed desynchronises the next
     unit's producer handshake, and where the K/V mbarrier parity has to continue
-    across units instead of restarting."""
+    across units instead of restarting.
+
+    FROST_THD_CTAS pins the grid to 4 CTAs so the claim loop runs deep on ANY
+    device: these lengths give 160 units, so the default one-CTA-per-SM grid
+    would hand every CTA exactly one unit on a big enough part and quietly stop
+    covering the reuse path. The SM100 sibling pins its cluster count for the
+    same reason."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setenv("FROST_THD_CTAS", "4")
+    # The resolved count is memoised per device, and the env var is only read
+    # on a miss -- so a THD test that ran earlier in this session would leave
+    # the pin above with no effect. Swap in a fresh dict (restored on teardown,
+    # which also keeps the pinned 4 from leaking into later tests).
+    monkeypatch.setattr(api_dsl, "_THD_CTAS_CACHE", {})
     _run_thd_fp8(
         seq_q_lens=[1024, 768, 512, 256],
         seq_kv_lens=[1024, 768, 512, 256],
