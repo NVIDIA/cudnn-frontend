@@ -29,7 +29,6 @@ from cutlass.cute.runtime import from_dlpack
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, load_cu, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_recompute_config import CFG
 
@@ -861,9 +860,11 @@ def compute0_warp_group(
         )
         head_o = head_idx
         num_chunks_tile = write_end - compute_start
-        if cutlass.const_expr(cfg.safe_gate):
+        if cutlass.const_expr(mA_log is not None):
             if num_chunks_tile > 0:
                 cg0_a_log_exp = cute.math.exp2(mA_log[head_o].to(cutlass.Float32) * LOG2_E, fastmath=True)
+        if cutlass.const_expr(mDt_bias is not None):
+            if num_chunks_tile > 0:
                 cg0_dt_bias_value = mDt_bias[head_o, channel_dim].to(cutlass.Float32)
         nvvm.barrier_cta_sync(cfg.cg0_tile_entry_barrier_id, thread_count=cfg.cg0_group_count * cfg.cg0_threads_per_group)
         group_cum_chunk_start = cum_chunk_base + cutlass.Int32(cg0_group_id)
@@ -2349,6 +2350,8 @@ def get_compiled_cache(
     dt_bias_dtype_str: str,
     cu_dtype_str: str,
     beta_dtype_str: str,
+    device: int,
+    num_sm: int,
     HO: int,
     HK: int,
     HV: int,
@@ -2485,6 +2488,8 @@ def chunk_kda_recompute_sm100(
     order_in_prologue: bool = False,
     *,
     tensormap_workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell BT=16 chunked KDA recompute (state/checkpoints-only)
@@ -2517,8 +2522,8 @@ def chunk_kda_recompute_sm100(
             prefix-summed), so there is no cu_checkpoints array
         use_qk_l2norm_in_kernel: L2-normalize k rows inside the kernel
         safe_gate: interpret ``gate`` through the safe-gate transform
-        a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
-        dt_bias: ``(HO, DK)`` float32, safe-gate channel bias (None = 0)
+        a_log: ``(HO,)`` float32/bf16/fp16 safe-gate per-head log-amplitude, or None for unit amplitude
+        dt_bias: ``(HO, DK)`` float32/bf16/fp16 safe-gate channel bias, or None for zero bias
         use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         work_items: ``(max_items, 8)`` int32 work-item table from
             ``common/split_k.py`` (REQUIRED; an uncut table row is the whole
@@ -2577,6 +2582,8 @@ def chunk_kda_recompute_sm100(
         str(dt_bias.dtype) if dt_bias is not None else "none",
         str(cu_seqlens.dtype),
         str(beta.dtype),
+        device,
+        num_sm,
         HO,
         HK,
         HV,
@@ -2649,7 +2656,7 @@ def chunk_kda_recompute_sm100(
             dynamic_scheduling,
             d_k=DK,
             d_v=DV,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             k_cute=k_cute,
             v_cute=v_cute,
             gate_cute=gate_cute,

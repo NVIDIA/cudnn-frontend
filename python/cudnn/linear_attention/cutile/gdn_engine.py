@@ -152,7 +152,7 @@ class GdnCuTilePlan(CompiledPlan):
             self.execute_fwd(nb, region, stream)
 
     def execute_fwd(self, nb, region, stream) -> None:
-        gate = dict(use_gate_in_kernel=True, A_log=nb["a_log"], dt_bias=nb["dt_bias"]) if self.safe_gate else {}
+        gate = dict(use_gate_in_kernel=True, A_log=nb.get("a_log"), dt_bias=nb.get("dt_bias")) if self.safe_gate else {}
         self.kernels.chunk_gated_delta_rule(
             nb["q"],
             nb["k"],

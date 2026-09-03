@@ -39,11 +39,7 @@ def build_gdn(graph):
             from .kernel import gdn_bprop_f16 as bwd_module
 
         return CompiledGdnBwd(node, bwd_module, recompute_module)
-    gdp_v64_fwd = node.node_type.name == "GDP" and int(node.inputs["v"].dim[-1]) == 64 and int(node.params.get("num_householder", 1) or 1) > 1
-    if gdp_v64_fwd:
-        from .kernel import gdp_prefill_v64_f16 as kernel_module
-    else:
-        from .kernel import gdn_prefill_f16 as kernel_module
+    from .kernel import gdn_prefill_f16 as kernel_module
 
     return CompiledGdn(node, kernel_module)
 
@@ -59,7 +55,7 @@ def gdn_support_gates(engine: str, facts) -> None:
         raise NotImplementedError(f"{engine}: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
     io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
-    beta_wants = (facts.io_dtype,) if facts.use_beta_sigmoid else (cudnn.data_type.FLOAT, facts.io_dtype)
+    beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
     if facts.beta_dtype not in beta_wants + (None,):
         raise NotImplementedError(f"{engine}: 'beta' must be {' or '.join(str(w) for w in beta_wants)}, got {facts.beta_dtype}")
     gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
@@ -131,6 +127,7 @@ class CompiledGdn:
         self.table = None
         self.kcache = None
         self.plan_name = "GdpFrostEngine (GDP)" if node.node_type.name == "GDP" else "GdnFrostEngine (GDN)"
+        self.device = current_device()
         from .common.l2norm import build_l2norm_qk, run_l2norm_qk
 
         self.build_l2norm_qk = build_l2norm_qk
@@ -138,13 +135,6 @@ class CompiledGdn:
         self.l2norm = None
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
-        self.compact_q = self.num_householder > 1 and int(node.inputs["v"].dim[-1]) == 64
-        if self.num_householder > 1 and not self.use_qk_l2norm and not self.compact_q:
-            from .common.expand import build_pack_fwd, run_pack_fwd
-
-            self.build_pack_fwd = build_pack_fwd
-            self.run_pack_fwd = run_pack_fwd
-            self.pack_fwd = None
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -172,7 +162,7 @@ class CompiledGdn:
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
         self.off_scheduler = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.n_tiles = B * HO
         self.n_heads_out = HO
         if self.split:
@@ -187,17 +177,12 @@ class CompiledGdn:
             self.off_item_scratch = layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4)
             self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
-        self.q_rows = total // self.num_householder if self.compact_q else total
+        self.q_rows = total // self.num_householder
         if self.use_qk_l2norm:
             self.off_q_n = layout.add(self.q_rows * HQ * K * 2)
             self.off_inv_q = layout.add(self.q_rows * HQ * 4)
             self.off_k_n = layout.add(total * HK * K * 2)
             self.off_inv_k = layout.add(total * HK * 4)
-        self.pack_expands_q = False
-        if self.num_householder > 1 and not self.compact_q:
-            self.pack_expands_q = not self.use_qk_l2norm
-            if self.pack_expands_q:
-                self.off_q_x = layout.add(total * HQ * K * 2)
         self.needs_table = self.split
         self.workspace_size = layout.size
         regions = [
@@ -218,8 +203,6 @@ class CompiledGdn:
                 (self.off_inv_q, "float32", (self.q_rows, HQ)),
                 (self.off_inv_k, "float32", (total, HK)),
             ]
-        if self.pack_expands_q:
-            regions += [(self.off_q_x, self.io_name, (total, HQ, K))]
         self.carve = carve_plan(self.plan_name, regions)
 
     def workspace_bytes(self) -> int:
@@ -260,24 +243,7 @@ class CompiledGdn:
         else:
             tensormaps, scheduler_counter, work_items, work_count, *rest = carved
             item_scratch = chunk_scratch = None
-        if self.num_householder > 1:
-            if self.pack_expands_q:
-                *rest, q_x = rest
-            if self.use_qk_l2norm:
-                q_n, k_n, inv_q, inv_k = rest
-                l2norm_kw = {} if self.compact_q else dict(expand_num=self.num_householder, expand_phase=self.num_householder - 1)
-                if self.l2norm is None:
-                    self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, **l2norm_kw, stream=stream)
-                else:
-                    self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
-                q, k = q_n, k_n
-            elif not self.compact_q:
-                if self.pack_fwd is None:
-                    self.pack_fwd = self.build_pack_fwd(q, q_x, self.num_householder, stream)
-                else:
-                    self.run_pack_fwd(self.pack_fwd, q, q_x, stream)
-                q = q_x
-        elif self.use_qk_l2norm:
+        if self.use_qk_l2norm:
             q_n, k_n, inv_q, inv_k = rest
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, stream=stream)
@@ -375,6 +341,8 @@ class CompiledGdn:
             work_item_scratch=item_scratch,
             expand_num=self.num_householder,
             workspace=tensormaps,
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         return None
@@ -399,6 +367,7 @@ class CompiledGdnBwd:
         self.kcache = None
         self.recompute_cache = None
         self.plan_name = "GdpFrostEngine (GDP_BWD)" if node.node_type.name == "GDP_BWD" else "GdnFrostEngine (GDN_BWD)"
+        self.device = current_device()
         from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
@@ -424,6 +393,8 @@ class CompiledGdnBwd:
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
+        self.wants_d_a_log = "d_a_log" in node.outputs
+        self.wants_d_dt_bias = "d_dt_bias" in node.outputs
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
         self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
 
@@ -442,7 +413,7 @@ class CompiledGdnBwd:
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
         self.cu_name = "int32" if node.inputs["cu_seqlens"].get_data_type().name == "INT32" else "int64"
 
-        self.num_sm = multiprocessor_count(current_device())
+        self.num_sm = multiprocessor_count(self.device)
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.split = not self.batch_invariant
@@ -482,8 +453,9 @@ class CompiledGdnBwd:
             self.off_k_n = layout.add(total * HK * K * 2)
             self.off_inv_q = layout.add(self.q_rows * HQ * 4)
             self.off_inv_k = layout.add(total * HK * 4)
-        if self.safe_gate:
+        if self.wants_d_a_log:
             self.off_gate_part_a = layout.add(self.gate_bwd_blocks * HO * 4)
+        if self.wants_d_dt_bias:
             self.off_gate_part_dt = layout.add(self.gate_bwd_blocks * HO * 4)
         self.pack_expands_q = False
         if self.num_householder > 1 and not self.compact_qdo:
@@ -538,8 +510,9 @@ class CompiledGdnBwd:
             regions.append(("k_n", self.off_k_n, self.io_name, (total, HK, K)))
             regions.append(("inv_q", self.off_inv_q, "float32", (self.q_rows, HQ)))
             regions.append(("inv_k", self.off_inv_k, "float32", (total, HK)))
-        if self.safe_gate:
+        if self.wants_d_a_log:
             regions.append(("gate_part_a", self.off_gate_part_a, "float32", (self.gate_bwd_blocks * HO,)))
+        if self.wants_d_dt_bias:
             regions.append(("gate_part_dt", self.off_gate_part_dt, "float32", (self.gate_bwd_blocks * HO,)))
         if self.num_householder > 1 and not self.compact_qdo:
             if self.pack_expands_q:
@@ -704,7 +677,7 @@ class CompiledGdnBwd:
                 inv_k=region["inv_k"] if self.use_qk_l2norm else None,
             )
             if self.safe_gate:
-                self.scalar_gate_bwd(dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region["gate_part_a"], region["gate_part_dt"], stream=stream)
+                self.scalar_gate_bwd(dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), stream=stream)
             if self.fold_dq or self.fold_dk or self.fold_dv:
                 for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):
                     if src_ho is not dst:
@@ -771,6 +744,8 @@ class CompiledGdnBwd:
                 log_gate=True,
                 expand_num=self.num_householder,
                 workspace=region["recompute_tensormaps"],
+                device=self.device,
+                num_sm=self.num_sm,
                 stream=stream,
             )
 
@@ -815,10 +790,12 @@ class CompiledGdnBwd:
             inv_k=region["inv_k"] if self.use_qk_l2norm else None,
             expand_num=self.num_householder,
             workspace=region["tensormaps"],
+            device=self.device,
+            num_sm=self.num_sm,
             stream=stream,
         )
         if self.safe_gate:
-            self.scalar_gate_bwd(dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region["gate_part_a"], region["gate_part_dt"], stream=stream)
+            self.scalar_gate_bwd(dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), stream=stream)
         if dq_out is not dq or dk_out is not dk or dv_out is not dv:
             for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):
                 if src_ho is not dst:

@@ -121,7 +121,6 @@ from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_Q
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -674,7 +673,10 @@ def gate_beta_warp(
     lane_idx = tidx % cfg.threads_per_warp
 
     n_cols = cfg.b_t // cfg.threads_per_warp
-    a = cutlass.Float32(0.0)
+    if cutlass.const_expr(cfg.safe_gate and mA_log is None):
+        a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
+    else:
+        a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     tile_idx = cutlass.Int32(bidx)
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
@@ -683,9 +685,11 @@ def gate_beta_warp(
             cfg, tile_idx, mWorkItems
         )
         num_item_chunks = compute_end - write_start
-        if cutlass.const_expr(cfg.safe_gate):
+        if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
             if num_item_chunks > 0:
                 a = -cute.math.exp2(mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
+            if num_item_chunks > 0:
                 bias = mDt_bias[head_idx].to(cutlass.Float32)
         write_end_token = batch_start + write_end * cfg.b_t
         write_end_token = write_end_token if write_end_token < batch_end else batch_end
@@ -712,7 +716,10 @@ def gate_beta_warp(
                     ]
                 else:
                     gate_valid = pos_valid
-                    gate_vals = [gGate[lane_idx + col * cfg.threads_per_warp].to(cutlass.Float32) if pos_valid[col] else oob_neutral for col in range(n_cols)]
+                    gate_vals = [
+                        gGate[min(lane_idx + col * cfg.threads_per_warp, batch_end - chunk_offset - 1)].to(cutlass.Float32) if pos_valid[col] else oob_neutral
+                        for col in range(n_cols)
+                    ]
 
                 if cutlass.const_expr(cfg.safe_gate):
                     for col in cutlass.range_constexpr(0, n_cols, 2):
@@ -2719,7 +2726,7 @@ def compute1_warp_group(
             if cutlass.const_expr(cfg.fused_l2norm):
                 gInvQ = cute.domain_offset((batch_start + chunk_idx * cfg.b_t,), mInvQ[None, head_idx])
                 pos_valid_q = batch_start + chunk_idx * cfg.b_t + cg1_tidx < batch_end
-                fused_inv_q = gInvQ[cg1_tidx] if pos_valid_q else cutlass.Float32(1.0)
+                fused_inv_q = gInvQ[min(cg1_tidx, batch_end - (batch_start + chunk_idx * cfg.b_t) - 1)] if pos_valid_q else cutlass.Float32(1.0)
 
             # ---- dQ dot (part q) -----------------------------------------------------
             part_q = [None] * 16
@@ -2971,7 +2978,7 @@ def compute2_warp_group(
             if cutlass.const_expr(cfg.fused_l2norm):
                 gInvK = cute.domain_offset((batch_start + abs_chunk * cfg.b_t,), mInvK[None, head_idx])
                 pos_valid_k = batch_start + abs_chunk * cfg.b_t + cg2_tidx < batch_end
-                fused_inv_k = gInvK[cg2_tidx] if pos_valid_k else cutlass.Float32(1.0)
+                fused_inv_k = gInvK[min(cg2_tidx, batch_end - (batch_start + abs_chunk * cfg.b_t) - 1)] if pos_valid_k else cutlass.Float32(1.0)
 
             # ---- dK inter rescale ----------------------------------------------------
             cg2_k_idx = cg2_k_index.idx
@@ -4610,6 +4617,8 @@ def get_compiled_cache(
     beta_dtype_str: str,
     dstate_in_dtype_str: str,
     dstate0_dtype_str: str,
+    device: int,
+    num_sm: int,
     HQ: int,
     HK: int,
     HV: int,
@@ -4766,6 +4775,8 @@ def chunk_gdn_bwd_sm100(
     inv_k=None,
     expand_num: int = 1,
     workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell chunked GDN bprop kernel (THD / varlen entry).
@@ -4792,23 +4803,25 @@ def chunk_gdn_bwd_sm100(
             when ``safe_gate``, which applies the safe-gate transform
             ``-exp(a_log) * softplus(gate + dt_bias)``
         beta: ``(total_tokens, HO)`` float32, update gate — post-sigmoid, or
-            io-dtype logits when ``use_beta_sigmoid``
+            raw logits (float32 or the io dtype) when ``use_beta_sigmoid``
         do: ``(total_tokens, HO, DV)`` float16/bfloat16, output gradient
         state_checkpoints: ``(total_checkpoints, HO, DV, DK)`` io dtype, per-chunk
             forward states from the prefill kernel's checkpoint output (``checkpoint_every_n_tokens=B_T``)
         dq/dk/dv: pre-allocated output gradients, shaped/typed like q/k/v at
             HO heads
-        dgate/dbeta: pre-allocated ``(total_tokens, HO)`` float32 gate/beta
-            gradients (``safe_gate`` leaves dgate in the transformed gate
-            space; ``use_beta_sigmoid`` leaves dbeta in post-sigmoid space,
-            io dtype)
+        dgate: pre-allocated ``(total_tokens, HO)`` float32 gate gradient
+            (``safe_gate`` leaves it in the transformed gate space)
+        dbeta: pre-allocated ``(total_tokens, HO)`` matching beta's dtype;
+            gradient wrt the post-sigmoid beta, or wrt the raw logits under
+            ``use_beta_sigmoid`` (the kernel folds the sigmoid derivative
+            into its own dbeta write)
         cu_seqlens: ``(num_seqs + 1,)`` int32
         use_initial_state: the forward ran with an initial state, so chunk 0
             has an entering state to load from ``state_checkpoints`` row 0
         scale: attention scale factor (must not be 0)
         safe_gate: interpret ``gate`` through the safe-gate transform
-        a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
-        dt_bias: ``(HO,)`` float32, safe-gate per-head bias (None = 0)
+        a_log: ``(HO,)`` float32/bf16/fp16 safe-gate per-head log-amplitude, or None for unit amplitude
+        dt_bias: ``(HO,)`` float32/bf16/fp16 safe-gate per-head bias, or None for zero bias
         use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         work_items: ``(max_items, 8)`` int32 work-item table from
             ``common/split_k.py`` (REQUIRED; an uncut table row is the whole
@@ -4850,6 +4863,8 @@ def chunk_gdn_bwd_sm100(
         str(beta.dtype),
         str(d_final_state.dtype) if d_final_state is not None else "none",
         str(d_initial_state.dtype) if d_initial_state is not None else "none",
+        device,
+        num_sm,
         HQ,
         HK,
         HV,
@@ -4902,7 +4917,7 @@ def chunk_gdn_bwd_sm100(
             allow_neg_eigval=allow_neg_eigval,
             fused_l2norm=fused_l2norm,
             dynamic_scheduling=dynamic_scheduling,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             h_q=HQ,
             h_k=HK,
             h_v=HV,

@@ -182,7 +182,7 @@ class KdaCuTilePlan(CompiledPlan):
         if self.use_beta_sigmoid:
             gate["use_beta_sigmoid_in_kernel"] = True
         if self.safe_gate:
-            gate.update(safe_gate=True, use_gate_in_kernel=True, lower_bound=self.lower_bound, A_log=nb["a_log"], dt_bias=nb["dt_bias"])
+            gate.update(safe_gate=True, use_gate_in_kernel=True, lower_bound=self.lower_bound, A_log=nb.get("a_log"), dt_bias=nb.get("dt_bias"))
         self.kernels.chunk_kda(
             nb["q"],
             nb["k"],

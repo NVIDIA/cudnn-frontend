@@ -23,6 +23,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 from .host import get_dtype
+from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 
@@ -129,7 +130,7 @@ def head_group_reduce(src, dst, *, stream) -> None:
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
     out_head_words = (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
 
-    key = (str(src.dtype).split(".")[-1], HO, H, D)
+    key = (str(src.dtype).split(".")[-1], HO, H, D, current_device())
     if key not in compiled_cache:
 
         src_c = from_dlpack(src, assumed_align=4)

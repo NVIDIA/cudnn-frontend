@@ -2676,8 +2676,8 @@ _STRUCTURED_OPS = {
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2730,8 +2730,8 @@ _STRUCTURED_OPS = {
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2784,8 +2784,8 @@ _STRUCTURED_OPS = {
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
@@ -2840,8 +2840,8 @@ _STRUCTURED_OPS = {
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
-            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
-            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_a_log": lambda n: "a_log" in n.inputs,
+            "d_dt_bias": lambda n: "dt_bias" in n.inputs,
         },
         infer={
             "dQ": _like("q"),
