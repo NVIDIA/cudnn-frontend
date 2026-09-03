@@ -46,7 +46,7 @@ host loops over head chunks to hold it under 4 GiB), and everything in the band
 is **envelope-served** — the tiles are fixed at 512, so d=264 costs the same
 MMA as d=512.
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | BPROP |
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d512 (DSv4)<br>BPROP<br>d ∈ (256, 512] |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | **Data types** | | | | | | |
 | FP16 / BF16 | ⚠️⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
@@ -95,13 +95,15 @@ supported head tile) — SM100 is the gap.
 ⁸ MXFP8 sets `d_pad_multiple=0` (exact native shapes only — the scale-factor
 plumbing is not audited for envelope zero-padding), so a d=64 MXFP8 graph is
 declined at plan time rather than padded.
-ᵇ **`sdpa_bwd_sm100` only — d ∈ (256, 512], multiples of 8, f16/bf16.** Read
-this column as "the backward engine, which happens to live at the d512 end of
-the row"; it does NOT follow the per-flavor columns to its left. Below 257 the
-d256 flavors are the right kernel and the engine declines. The whole band is
-**envelope-served** on 512-wide tiles, so d=264 pays d=512's MMA cost. Multiples
-of 8 rather than the forward's 16: the stage-3 epilogue narrows its store vector
-from 32 B to 16 B when d is not also a multiple of 16.
+ᵇ **`sdpa_bwd_sm100` — the d512 (DSv4) backward, and the ONLY FROST backward on
+this arch: d ∈ (256, 512], multiples of 8, f16/bf16.** It is one engine over one
+head-dim band, not a per-flavor column, so it does not follow the FPROP columns
+to its left: below 257 the d256 flavors are the right kernel and the engine
+declines, and every other `sdpa_backward()` shape on SM100 falls through to the
+cuDNN backend. The whole band is **envelope-served** on 512-wide tiles, so d=264
+pays d=512's MMA cost. Multiples of 8 rather than the forward's 16: the stage-3
+epilogue narrows its store vector from 32 B to 16 B when d is not also a
+multiple of 16.
 ᶜ A non-BSHD io tensor is staged through the workspace (one copy in, and one
 back out for a gradient); a BSHD-physical one is used in place. This is not
 hypothetical — building dO as `torch.randn(o.shape)` instead of
@@ -132,7 +134,7 @@ envelope (`thd_d_shapes=None`) and works.
 Engine: `sdpa_fwd_prefill_sm107_fp8` only. **No f16/bf16 and no MXFP8 forward,
 no backward** on the Rubin line — those graphs fall through to the backend.
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | BPROP |
+| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | BPROP<br>no engine |
 |---|:--:|:--:|:--:|
 | FP16 / BF16 | ❌ | ❌ | ❌ |
 | FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ❌ |
