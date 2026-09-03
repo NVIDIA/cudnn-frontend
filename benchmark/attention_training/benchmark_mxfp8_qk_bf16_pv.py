@@ -181,9 +181,13 @@ def _benchmark_shape(
     q_bf16 = (torch.randn(shape_q, device="cuda") * 0.5).to(torch.bfloat16)
     k_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
     v_bf16 = (torch.randn(shape_kv, device="cuda") * 0.5).to(torch.bfloat16)
+    torch.cuda.empty_cache()
     q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
+    torch.cuda.empty_cache()
     k_mx, sf_k = _quantize_mxfp8(k_bf16, columnwise=False)
+    torch.cuda.empty_cache()
     v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
+    torch.cuda.empty_cache()
     scale = 1.0 / math.sqrt(dim)
 
     return {
