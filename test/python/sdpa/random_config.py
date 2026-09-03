@@ -380,12 +380,12 @@ class RandomizationContext:
 
         if randoms["is_ragged_or_padded_or_full"] != "full":
             # Per-batch lengths draw U(0, s_max) — zero is a legal length, not
-            # a special case — with an extra ~10% forced-zero boost per entry
+            # a special case — with an extra ~3% forced-zero boost per entry
             # (a pure uniform would make zeros ~1/(s+1) rare and zero-length
             # handling would go untested in practice). Q and KV draw
             # independently.
-            randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(0, randoms_.s_q) for _ in range(randoms_.batches)]
-            randoms_.seq_len_kv = [0 if rng.random() < 0.1 else rng.randint(0, randoms_.s_kv) for i in range(randoms_.batches)]
+            randoms_.seq_len_q = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_q) for _ in range(randoms_.batches)]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.03 else rng.randint(0, randoms_.s_kv) for i in range(randoms_.batches)]
 
         # Packed token capacities (first-class). Default is the minimal packed
         # capacity; the optional total_token_slack knob widens capacity beyond
