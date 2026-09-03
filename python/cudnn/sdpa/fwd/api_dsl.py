@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from abc import abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
@@ -147,8 +147,17 @@ _CUDA_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
 @contextmanager
-def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
-    """Run PyTorch work on the CUDA stream used for the kernel launch."""
+def _torch_stream_context(
+    current_stream: Optional[cuda.CUstream],
+    device: torch.device,
+    *,
+    verify_current: bool = False,
+) -> Iterator[None]:
+    """Run PyTorch work on the CUDA stream used for the kernel launch.
+
+    ``verify_current`` bypasses the private raw-handle shortcut when a caller
+    supplies the stream, making that handle authoritative for the context.
+    """
     if current_stream is None:
         yield
         return
@@ -165,7 +174,7 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     # and entering a context for the current stream is a no-op. Building the two
     # Stream objects below costs ~3.4 us each and this runs several times per
     # execute; the raw handle getter is ~0.07 us.
-    if _CUDA_RAW_STREAM is not None:
+    if not verify_current and _CUDA_RAW_STREAM is not None:
         _idx = device.index if device.index is not None else torch.cuda.current_device()
         if handle == _CUDA_RAW_STREAM(_idx):
             yield
@@ -1470,6 +1479,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Run on the caller's stream (ExecutionContext.stream, resolved from the
         # execute-time handle); None -> the default stream. Threaded to every
         # kernel launch below (dense / fp8 / mxfp8 / THD).
+        explicit_stream = current_stream is not None
         current_stream = self._get_default_stream(current_stream)
 
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
@@ -1507,46 +1517,50 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._fp8 and self._pertensor:
             # Per-tensor FP8 (sdpa_fp8): scalar descales fold into the softmax scale
             # (descale_q·descale_k) and o_scale_fused (descale_v·scale_o).
-            self._execute_fp8(
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                scale_val,
-                sinks,
-                seq_kv_lens,
-                seq_q_lens,
-                descale_q,
-                descale_k,
-                descale_v,
-                scale_o,
-                amax_o,
-                current_stream,
-                workspace=workspace,
-            )
+            stream_context = _torch_stream_context(current_stream, q_tensor.device, verify_current=True) if explicit_stream else nullcontext()
+            with stream_context:
+                self._execute_fp8(
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    scale_val,
+                    sinks,
+                    seq_kv_lens,
+                    seq_q_lens,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    scale_o,
+                    amax_o,
+                    current_stream,
+                    workspace=workspace,
+                )
             return
 
         if self._fp8:
             # MXFP8 block-scale path (E4M3/E5M2 in, half out). Per-block E8M0 scales
             # dequant in-MMA, so scale_softmax_log2 carries only attn_scale·log2(e).
-            self._execute_mxfp8(
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                scale_softmax_log2,
-                sinks,
-                seq_kv_lens,
-                seq_q_lens,
-                sf_q,
-                sf_k,
-                sf_v,
-                amax_o,
-                current_stream,
-                workspace=workspace,
-            )
+            stream_context = _torch_stream_context(current_stream, q_tensor.device, verify_current=True) if explicit_stream else nullcontext()
+            with stream_context:
+                self._execute_mxfp8(
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    scale_softmax_log2,
+                    sinks,
+                    seq_kv_lens,
+                    seq_q_lens,
+                    sf_q,
+                    sf_k,
+                    sf_v,
+                    amax_o,
+                    current_stream,
+                    workspace=workspace,
+                )
             return
 
         if self.thd:
