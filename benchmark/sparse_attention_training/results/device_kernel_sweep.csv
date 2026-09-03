@@ -1,0 +1,26 @@
+variant,seqlen,h_q,h_kv,d_k,d_v,granularity,topk,group_scope,dtype,backend,ms,tflops,flops,note
+dsv4,4096,64,1,512,512,1,2048,1,bfloat16,default,2.2536,365.98,824767938560,
+dsv4,8192,64,1,512,512,1,2048,1,bfloat16,default,7.0463,273.09,1924279566336,
+dsv4,16384,64,1,512,512,1,2048,1,bfloat16,default,9.651,427.24,4123302821888,
+dsv4,32768,64,1,512,512,1,2048,1,bfloat16,default,19.7615,431.21,8521349332992,
+dsv4,65536,64,1,512,512,1,2048,1,bfloat16,default,52.8844,327.46,17317442355200,
+glm5.2,4096,64,1,576,512,1,2048,1,bfloat16,default,2.1718,403.5,876315934720,
+glm5.2,8192,64,1,576,512,1,2048,1,bfloat16,default,4.8326,423.08,2044547039232,
+glm5.2,16384,64,1,576,512,1,2048,1,bfloat16,default,10.1468,431.76,4381009248256,
+glm5.2,32768,64,1,576,512,1,2048,1,bfloat16,default,22.5009,402.38,9053933666304,
+glm5.2,65536,64,1,576,512,1,2048,1,bfloat16,default,42.042,437.65,18399782502400,
+glm5.3-flash,4096,64,1,512,512,1,2048,1,bfloat16,default,2.062,399.98,824767938560,
+glm5.3-flash,8192,64,1,512,512,1,2048,1,bfloat16,default,4.5957,418.71,1924279566336,
+glm5.3-flash,16384,64,1,512,512,1,2048,1,bfloat16,default,9.6347,427.96,4123302821888,
+glm5.3-flash,32768,64,1,512,512,1,2048,1,bfloat16,default,30.3912,280.39,8521349332992,
+glm5.3-flash,65536,64,1,512,512,1,2048,1,bfloat16,default,39.9306,433.69,17317442355200,
+qwen3.8-gqa,4096,24,2,256,256,4,512,2,bfloat16,default,130.9184,1.18,154719485952,per-KV-group indices (G=H_kv) to hit the registered GQA-substrate kernel
+qwen3.8-gqa,8192,24,2,256,256,4,512,2,bfloat16,default,323.3701,1.12,360877916160,per-KV-group indices (G=H_kv) to hit the registered GQA-substrate kernel
+qwen3.8-gqa,16384,24,2,256,256,4,512,2,bfloat16,default,634.6753,1.22,773194776576,per-KV-group indices (G=H_kv) to hit the registered GQA-substrate kernel
+qwen3.8-gqa,32768,24,2,256,256,4,512,2,bfloat16,default,1308.8315,1.22,1597828497408,per-KV-group indices (G=H_kv) to hit the registered GQA-substrate kernel
+qwen3.8-gqa,65536,24,2,256,256,4,512,2,bfloat16,default,3247.4785,1.0,3247095939072,per-KV-group indices (G=H_kv) to hit the registered GQA-substrate kernel
+minimax,4096,64,4,128,128,128,16,4,bfloat16,default,222.7956,0.94,210453397504,
+minimax,8192,64,4,128,128,128,16,4,bfloat16,default,386.2228,1.26,485331304448,
+minimax,16384,64,4,128,128,128,16,4,bfloat16,default,967.0461,1.07,1035087118336,
+minimax,32768,64,4,128,128,128,16,4,bfloat16,default,1961.3129,1.09,2134598746112,
+minimax,65536,64,4,128,128,128,16,4,bfloat16,default,4009.5871,1.08,4333622001664,

@@ -11,6 +11,28 @@ import cutlass.cute as cute
 
 from .swizzle import swizzle_xor_128b, swizzle_lin_128b
 
+# NOTE (sparse_attention/PR4 round-1 investigation): cutlass-dsl 4.7.0's
+# ``inline_ptx`` fails NVVM lowering (opaque, empty-log
+# ``NVVM_ERROR_COMPILATION``) for a multi-output asm block -- e.g.
+# ``mma_m16n8k16_f32`` below -- if it is called with a compile-time-constant
+# python-literal operand (``cutlass.Int32(0)``/``cutlass.Float32(0.0)``,
+# whether A/B or C). This reproduces on real sm_100a hardware and is *not* a
+# rejection of the ``mma.sync`` opcode itself: the same call compiles and
+# runs fine when every operand is a real (loaded/accumulated) register value,
+# which is what every real kernel mainloop does -- see
+# ``mma_m16n8k16_f32``'s production callers in
+# ``cudnn.sdpa.fwd.kernels.prefill_f16_sm120`` /
+# ``cudnn.sdpa.bwd.kernels._common_sm120``, and
+# ``python/cudnn/sparse_attention/fwd/sm100_gqa/gqa_prefill_bf16_tile_sm100.py``'s
+# module docstring for the repro that isolated this (do not "isolate" a
+# suspected mma.sync bug with all-literal zero operands -- that is exactly
+# what triggers this unrelated inline_ptx quirk and will misdiagnose a real
+# issue, or manufacture a fake one, as a hardware/toolchain gap). If you ever
+# need a literal-operand call (e.g. a synthetic unit test), bitcast Float32
+# literals to Int32 first (see ``mma_m16n8k32_f32`` below) -- note this only
+# fixes literal *Float32* C-operands; literal Int32 A/B operands still fold
+# and still need to come from a real register (e.g. an ``rmem`` tensor load).
+
 
 @cute.jit
 def mma_m16n8k16_f32(

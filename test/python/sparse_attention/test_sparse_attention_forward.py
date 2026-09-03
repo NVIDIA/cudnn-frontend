@@ -349,10 +349,9 @@ def test_device_kernel_matches_oracle(d_k, sink):
     torch.testing.assert_close(dev["out"].float(), ref_out.float(), atol=2e-2, rtol=2e-2)
     live = (length > 0).unsqueeze(-1).expand_as(dev["lse"])
     torch.testing.assert_close(dev["lse"][live], ref_lse[live], atol=1e-3, rtol=1e-3)
-    # KNOWN DEVIATION (kernel to fix when re-based onto this contract): the
-    # current DSA sparse-prefill kernel emits +inf dead-row LSE (FA2-style);
-    # the contract requires -inf (the LSE-merge identity). out is 0 either way.
-    assert torch.isinf(dev["lse"][~live]).all()
+    # Dead-row LSE now matches the contract's -inf sentinel (the LSE-merge
+    # identity), not the FA2-style +inf this kernel used to emit.
+    assert torch.isneginf(dev["lse"][~live]).all()
     assert torch.isneginf(ref_lse[~live]).all()
 
 

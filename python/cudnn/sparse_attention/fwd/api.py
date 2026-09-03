@@ -38,11 +38,25 @@ JAX, numpy): validation runs on canonical descriptors (cutlass dtypes,
 adapter devices) and never requires torch. Each registered kernel declares
 which frameworks it can execute and fails loudly otherwise.
 
-Execution dispatches to registered device kernels — currently the SM100 DSA
-sparse-prefill kernel for its envelope (THD, MQA latent with K aliased as V,
-``D_k in (512, 576)``, shared token-granularity indices), when that module
-is present in the tree. Configurations no kernel serves raise
-``NotImplementedError`` from ``check_support``. The normative reference
+Execution dispatches to registered device kernels, when the corresponding
+module is present in the tree:
+
+* the SM100 DSA sparse-prefill kernel for its envelope (THD, MQA latent
+  with K aliased as V, ``D_k in (512, 576)``, shared token-granularity
+  indices, FP16/BF16);
+* the SM100 GQA substrate kernel for its envelope (``G == H_kv``, block
+  granularity in ``(4, 64, 128)`` -- QSA/MSA shapes, BF16 or FP8-per-tensor,
+  K/V unaliased). The substrate module's own dispatcher
+  (``sparse_attention.fwd.sm100_gqa.dispatch``) has a correctness-safe,
+  D2H-validated mechanism to additionally try a tile-batched fast-path
+  kernel ahead of its scalar per-row mainloop for ``index_granularity ==
+  128``, but this API does not reach it: that fast path measured 1.13x-1.28x
+  *slower* than the scalar kernel on every shape tried this round (see
+  ``dispatch.py``'s module docstring for the numbers), so it stays off by
+  default rather than regressing callers of this wrapper.
+
+Configurations no kernel serves raise ``NotImplementedError`` from
+``check_support``. The normative reference
 implementation lives with the tests
 (``test/python/sparse_attention/sparse_attention_reference.py``), which is
 also the oracle every kernel is validated against.
@@ -82,6 +96,24 @@ def _get_dsa_prefill_kernel():
     except ImportError:
         return None
     return dsa_fwd
+
+
+def _get_gqa_substrate_kernel():
+    """Probe for the SM100 GQA substrate kernel (ships on its own branch).
+
+    Serves the ``G = H_kv``, granularity 4/64/128 envelope (QSA / MSA block
+    shapes) — structurally a block-sparse gather driven by ``topk_idxs``
+    rather than a static mask. Returns the wrapper or ``None`` so this
+    module stays import-safe (and the generic op falls through to
+    ``NotImplementedError``) on trees without the kernel module.
+    """
+    try:
+        from cudnn.sparse_attention.fwd.sm100_gqa import (
+            sparse_attention_forward_wrapper as gqa_fwd,
+        )
+    except ImportError:
+        return None
+    return gqa_fwd
 
 
 class SparseAttentionForward(APIBase):
@@ -131,6 +163,7 @@ class SparseAttentionForward(APIBase):
         self.is_thd = None
         self.group_scope = None  # G: 1, H_kv, or H_q
         self._dispatch = None  # registered device-kernel wrapper (set in check_support)
+        self._dispatch_envelope = None  # "dsa" | "gqa" | None (set in check_support)
 
     # ------------------------------------------------------------------
     # Validation
@@ -166,7 +199,10 @@ class SparseAttentionForward(APIBase):
         )
 
         # ---- dtypes (canonical descriptors carry cutlass dtypes) ----
-        self._check_dtype(q, [cutlass.Float16, cutlass.BFloat16], name="Q")
+        # FP16/BF16 for the DSA envelope, BF16/FP8-per-tensor for the GQA
+        # substrate envelope; envelope predicates below re-check the
+        # dtype-per-envelope split, this just admits the union.
+        self._check_dtype(q, [cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN], name="Q")
         self._check_dtype(k, q.dtype, name="K", extra_error_msg="K must have same dtype as Q")
         self._check_dtype(v, q.dtype, name="V", extra_error_msg="V must have same dtype as Q")
         self._check_dtype(idxs, cutlass.Int32, name="topk_idxs")
@@ -275,15 +311,41 @@ class SparseAttentionForward(APIBase):
             and d_k in (512, 576)
             and d_v == (512 if d_k == 576 else d_k)
             and major == 10
+            and q.dtype in (cutlass.Float16, cutlass.BFloat16)
         )
-        kernel = _get_dsa_prefill_kernel() if in_dsa_envelope else None
+        # SM100 GQA substrate kernel envelope: G == H_kv (per-KV-head-group
+        # indices), block granularity 4/64/128 (QSA / MSA shapes), BF16 or
+        # FP8-per-tensor. K/V need not alias (separate D_k/D_v storage) —
+        # the DSA envelope's aliased-latent requirement doesn't apply here.
+        # The two envelopes are mutually exclusive by construction: the DSA
+        # envelope pins granularity == 1 and G == 1, the GQA envelope pins
+        # granularity in (4, 64, 128) and G == H_kv > 1 (multi-KV-head).
+        in_gqa_envelope = (
+            not in_dsa_envelope
+            and self.group_scope == h_kv
+            and h_kv > 1
+            and self.index_granularity in (4, 64, 128)
+            and major == 10
+            and q.dtype in (cutlass.BFloat16, cutlass.Float8E4M3FN)
+        )
+        assert not (in_dsa_envelope and in_gqa_envelope), "sparse_attention_forward: DSA and GQA-substrate envelopes must be mutually exclusive"
+
+        if in_dsa_envelope:
+            kernel = _get_dsa_prefill_kernel()
+        elif in_gqa_envelope:
+            kernel = _get_gqa_substrate_kernel()
+        else:
+            kernel = None
         self._not_implemented_error_if(
             kernel is None,
             "sparse_attention_forward: no registered kernel supports this configuration; "
             "the SM100 DSA sparse-prefill kernel serves THD MQA-latent (H_kv=1, K aliased "
-            "as V, D_k in (512, 576), G=1, granularity=1) when its module is present",
+            "as V, D_k in (512, 576), G=1, granularity=1, FP16/BF16), and the SM100 GQA "
+            "substrate kernel serves G=H_kv, granularity in (4, 64, 128), BF16/FP8-per-tensor "
+            "-- when the corresponding module is present",
         )
         self._dispatch = kernel
+        self._dispatch_envelope = "dsa" if in_dsa_envelope else ("gqa" if in_gqa_envelope else None)
 
         self._is_supported = True
         return True
@@ -315,8 +377,27 @@ class SparseAttentionForward(APIBase):
         framework = detect_framework(q)
         if framework != "torch":
             raise NotImplementedError(f"the registered kernel currently executes torch tensors only, got {framework!r} inputs")
-        # K is V aliasing is part of this kernel's envelope; the sample
-        # descriptors cannot see storage, so verify on the real tensors.
+
+        if self._dispatch_envelope == "gqa":
+            # GQA substrate envelope: K/V are separate storage (no aliasing
+            # requirement), multi-KV-head, index-driven block gather.
+            result = self._dispatch(
+                q,
+                k,
+                v,
+                topk_idxs,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                cu_seqlens_q=cu_seqlens_q,
+                index_granularity=self.index_granularity,
+                softmax_scale=self.softmax_scale,
+                stream=current_stream,
+            )
+            return result["out"], result["lse"]
+
+        # DSA envelope: K/V aliasing is part of this kernel's envelope; the
+        # sample descriptors cannot see storage, so verify on the real
+        # tensors.
         d_v = v.shape[-1]
         if get_data_ptr(v) != get_data_ptr(k) or v.shape[0] != k.shape[0]:
             raise ValueError("the registered DSA sparse-prefill kernel requires V to alias K's storage (MLA latent); pass v as a view of k")
