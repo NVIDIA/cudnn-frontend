@@ -82,6 +82,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     scheduler_warp_loop,
     scheduler_warp_loop_persistent,
     read_tile_id_arrive,
+    read_clc_payload,
     SCHED_NATURAL,
 )
 from cudnn.frost.tile_dsl.pointwise import (
@@ -549,9 +550,10 @@ def _scheduler_warp_loop_thd_predecode(
 
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
         payload_base = state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-        nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base).load())
-        nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(1)).load())
-        nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+        nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, payload_base)
+        nxt_q = cute.arch.make_warp_uniform(nxt_q)
+        nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+        nxt_v = cute.arch.make_warp_uniform(nxt_v)
         q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
             nxt_q,
             nxt_hb,
@@ -617,9 +619,10 @@ def _load_next_coords(sched, sched_state, cta_in_pair, n_q_supers, n_qh, n_batch
 
     wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
     payload_base = sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)
-    nxt_q = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base).load())
-    nxt_hb = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(1)).load())
-    nxt_v = cute.arch.make_warp_uniform(sched.tile_id_smem.subview(payload_base + cutlass.Int32(2)).load())
+    nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, payload_base)
+    nxt_q = cute.arch.make_warp_uniform(nxt_q)
+    nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
+    nxt_v = cute.arch.make_warp_uniform(nxt_v)
     q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
         nxt_q,
         nxt_hb,
@@ -1201,7 +1204,7 @@ def _kernel(
                 CFG.CGA_M,
             )
         else:
-            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1654,7 +1657,7 @@ def _mma_warp_quiet(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(2)).load()
+        _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS))
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
@@ -2250,7 +2253,7 @@ def _mma_warp_group(
 
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
             wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-            nxt_v = sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS) + cutlass.Int32(2)).load()
+            _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS))
             is_valid_tile = nxt_v & cutlass.Int32(1)
         else:
             q_super_idx, _hd, batch_idx, split_idx, is_valid_tile = _load_next_coords(
