@@ -54,6 +54,7 @@ cover/
 # Local end-to-end benchmark artifacts
 qwen3.8-factorial-results/
 qwen-image-bf16-results/
+benchmark/hstu_attention/results/
 
 # Translations
 *.mo

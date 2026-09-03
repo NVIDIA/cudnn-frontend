@@ -1,0 +1,41 @@
+{
+  "average_kv_target": 2048,
+  "backward_impl": "auto",
+  "capability": [
+    10,
+    3
+  ],
+  "cases": [
+    {
+      "average_kv": 2036.0,
+      "batch_size": 64,
+      "forward": {
+        "compile_seconds": 4.033654929982731,
+        "max_ms": 0.209881591796875,
+        "median_ms": 0.20727040767669677,
+        "min_ms": 0.20629920959472656,
+        "samples_ms": [
+          0.20629920959472656,
+          0.20978078842163086,
+          0.20727040767669677,
+          0.2070688009262085,
+          0.209881591796875
+        ]
+      },
+      "max_kv": 3072,
+      "min_kv": 1024,
+      "total_kv": 130304,
+      "total_q": 64
+    }
+  ],
+  "cudnn_module": "/tmp/binc-hstu-baseline-21eddb1/python/cudnn/__init__.py",
+  "cute_dsl_arch": "sm_103a",
+  "device": "NVIDIA B300 SXM6 AC",
+  "direction": "forward",
+  "dtype": "bfloat16",
+  "forward_impl": "auto",
+  "head_dim": 128,
+  "heads": 4,
+  "mask": "local",
+  "torch_version": "2.13.0+cu130"
+}

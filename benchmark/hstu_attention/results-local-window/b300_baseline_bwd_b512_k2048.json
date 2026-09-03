@@ -1,0 +1,119 @@
+{
+  "capability": [
+    10,
+    3
+  ],
+  "cases": [
+    {
+      "average_kv": 2046.5,
+      "average_kv_target": 2048,
+      "base_ctas": 2048,
+      "batch_size": 512,
+      "heads": 4,
+      "max_kv": 3072,
+      "min_kv": 1024,
+      "total_kv": 1047808,
+      "windows": {
+        "2047:0": {
+          "results": {
+            "auto": {
+              "compile_seconds": 3.4859986044466496e-05,
+              "max_ms": 2.2116863250732424,
+              "median_ms": 2.200503921508789,
+              "min_ms": 2.2003536224365234,
+              "samples_ms": [
+                2.2116863250732424,
+                2.2004512786865233,
+                2.200881576538086,
+                2.200503921508789,
+                2.2003536224365234
+              ]
+            }
+          },
+          "window_size": [
+            2047,
+            0
+          ]
+        },
+        "255:0": {
+          "results": {
+            "auto": {
+              "compile_seconds": 4.402699414640665e-05,
+              "max_ms": 2.1987152099609375,
+              "median_ms": 2.1983423233032227,
+              "min_ms": 2.198142433166504,
+              "samples_ms": [
+                2.1987152099609375,
+                2.1983232498168945,
+                2.1983423233032227,
+                2.198142433166504,
+                2.1985488891601563
+              ]
+            }
+          },
+          "window_size": [
+            255,
+            0
+          ]
+        },
+        "63:0": {
+          "results": {
+            "auto": {
+              "compile_seconds": 2.763634811009979,
+              "max_ms": 2.197876739501953,
+              "median_ms": 2.1973615646362306,
+              "min_ms": 2.197260856628418,
+              "samples_ms": [
+                2.197876739501953,
+                2.1973615646362306,
+                2.197540855407715,
+                2.1973360061645506,
+                2.197260856628418
+              ]
+            }
+          },
+          "window_size": [
+            63,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "cudnn_module": "/tmp/binc-hstu-baseline-21eddb1/python/cudnn/__init__.py",
+  "cute_dsl_arch": "sm_103a",
+  "device": "NVIDIA B300 SXM6 AC",
+  "direction": "backward",
+  "dtype": "bfloat16",
+  "groups": 5,
+  "head_dim": 128,
+  "implementations": [
+    "auto"
+  ],
+  "iterations": 20,
+  "torch_version": "2.13.0+cu130",
+  "warmup": 5,
+  "windows": [
+    {
+      "name": "63:0",
+      "size": [
+        63,
+        0
+      ]
+    },
+    {
+      "name": "255:0",
+      "size": [
+        255,
+        0
+      ]
+    },
+    {
+      "name": "2047:0",
+      "size": [
+        2047,
+        0
+      ]
+    }
+  ]
+}

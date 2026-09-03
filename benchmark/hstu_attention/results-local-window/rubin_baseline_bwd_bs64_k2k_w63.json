@@ -1,0 +1,42 @@
+{
+  "average_kv_target": 2048,
+  "backward_impl": "auto",
+  "capability": [
+    10,
+    7
+  ],
+  "cases": [
+    {
+      "average_kv": 2036.0,
+      "backward": {
+        "compile_seconds": 8.385933929122984,
+        "max_ms": 0.266811203956604,
+        "median_ms": 0.26540958881378174,
+        "min_ms": 0.2649264097213745,
+        "samples_ms": [
+          0.266811203956604,
+          0.26557600498199463,
+          0.2649264097213745,
+          0.26540958881378174,
+          0.2650943994522095
+        ]
+      },
+      "batch_size": 64,
+      "max_kv": 3072,
+      "min_kv": 1024,
+      "selected_backward_impl": "baseline-auto",
+      "total_kv": 130304,
+      "total_q": 64
+    }
+  ],
+  "cudnn_module": "/tmp/binc-hstu-rubin-baseline-final-20260903d/python/cudnn/__init__.py",
+  "cute_dsl_arch": "sm_100f",
+  "device": "NVIDIA Graphics Device",
+  "direction": "backward",
+  "dtype": "bfloat16",
+  "forward_impl": "auto",
+  "head_dim": 128,
+  "heads": 4,
+  "mask": "local",
+  "torch_version": "2.13.0+cu130"
+}
