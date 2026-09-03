@@ -13,7 +13,7 @@ Usage:
     python -m benchmark.attention_training.runner --config qwen35 --dry-run
 """
 
-from ..config_types import ModelPreset, BenchmarkConfig
+from ..config_types import ModelPreset, BenchmarkConfig, fa2_on_ampere
 
 QWEN35 = ModelPreset(
     name="qwen35",
@@ -32,7 +32,7 @@ CONFIG = BenchmarkConfig(
         (4096, 4096),
         (2048, 2048),
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
     # Blackwell limits at head_dim=256: cuDNN bwd rejects head_dim>128 at
     # graph_bwd.validate(), and fa4's sm100 forward kernel asserts on tmem
     # exhaustion for head_dim=256 regardless of batch. Restrict to cuDNN fwd.

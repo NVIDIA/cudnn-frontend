@@ -720,94 +720,77 @@ forward and backward automatically build private block metadata on the active
 CUDA stream without adding public API parameters; D256 backward builds both
 Q-to-K and K-to-Q views from one coarse classification.
 
-(scaled-dot-product-attention-pytorch-op)=
-### SDPA PyTorch Custom Op (Experimental)
+(scaled-dot-product-attention-torch-ops)=
+### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 
-A high-level PyTorch custom operator that wraps the cuDNN SDPA forward and backward graphs into a single, autograd-compatible function. This provides a drop-in replacement for `torch.nn.functional.scaled_dot_product_attention` that routes computation through cuDNN.
+PyTorch custom ops (`torch.library`) exposing the full cuDNN SDPA feature
+surface — the features `torch.nn.functional.scaled_dot_product_attention`'s
+aten contract cannot express:
 
-**Key features:**
-- Full autograd support (forward + backward)
-- `torch.compile` compatible via FakeTensor/meta registration
-- Graph caching for efficient repeated execution
-- Supports FP16, BF16 datatypes
-- Supports causal masking, sliding window, padding mask, GQA/MQA, and ragged tensors
+- **attention sinks** — per-Q-head logits folded into the softmax denominator
+- **sliding window** — `window_left` (cuDNN convention: visible tokens
+  *including* self; FA2's `(w, 0)` maps to `window_left = w + 1`)
+- **bottom-right causal alignment** — inference-style diagonals
+- **padded batches** — per-batch actual lengths via `seq_len_q` / `seq_len_kv`
+- **THD / varlen packing** — FlashAttention-style `(T, H, D)` + `cu_seqlens`
 
-**Limitations:**
-- `attn_mask` and `dropout` are not yet supported
-- FP8 is not supported (use the Graph API directly)
-- For head dimension `256`, the specialized backward path currently supports only plain BHSD inputs. `seq_len_q`, `seq_len_kv`, `cumulative_seq_len_q`, and `cumulative_seq_len_kv` are not supported on that backward path.
+The ops build cuDNN pygraph `sdpa` / `sdpa_backward` nodes; the engine Router
+picks the best serving plan (FROST OSS kernels or cuDNN-backend engines) per
+configuration. Graphs are cached per configuration (bounded, thread-safe;
+cuDNN handles are thread-local).
 
-#### Python API
-
-```python
-from cudnn.experimental.ops import scaled_dot_product_attention
-
-output = scaled_dot_product_attention(
-    query,                        # (B, H_q, S_q, D) — FP16 or BF16
-    key,                          # (B, H_k, S_kv, D)
-    value,                        # (B, H_v, S_kv, D_v)
-    attn_mask=None,               # Not yet supported, must be None
-    dropout_p=0.0,                # Not yet supported, must be 0.0
-    is_causal=False,              # Apply causal (upper-triangular) mask
-    scale=None,                   # Attention scale, defaults to 1/sqrt(D)
-    enable_gqa=False,             # Enable grouped-query attention (H_q > H_k)
-    *,
-    diagonal_alignment=0,         # 0 = TOP_LEFT, 1 = BOTTOM_RIGHT
-    left_bound=-1,                # Sliding window left bound (-1 = disabled)
-    right_bound=-1,               # Sliding window right bound (-1 = disabled)
-    seq_len_q=None,               # Actual query seq lengths (B, 1, 1, 1) INT32
-    seq_len_kv=None,              # Actual key/value seq lengths (B, 1, 1, 1) INT32
-    cumulative_seq_len_q=None,    # Ragged offset for Q (B+1, 1, 1, 1) INT32
-    cumulative_seq_len_kv=None,   # Ragged offset for KV (B+1, 1, 1, 1) INT32
-)
-```
-
-**Args:**
-- `query` (torch.Tensor): Query tensor in BHSD layout `(B, H_q, S_q, D)`.
-- `key` (torch.Tensor): Key tensor in BHSD layout `(B, H_k, S_kv, D)`.
-- `value` (torch.Tensor): Value tensor in BHSD layout `(B, H_v, S_kv, D_v)`.
-- `attn_mask` (Optional[torch.Tensor]): Not yet supported. Must be `None`.
-- `dropout_p` (float): Not yet supported. Must be `0.0`.
-- `is_causal` (bool): If `True`, applies a causal mask (sets `right_bound=0`).
-- `scale` (Optional[float]): Attention scale factor. Defaults to `1/sqrt(D)`.
-- `enable_gqa` (bool): When `False`, raises `ValueError` if `H_q != H_k`. Set to `True` for grouped-query or multi-query attention.
-- `diagonal_alignment` (int): `0` for TOP_LEFT, `1` for BOTTOM_RIGHT alignment.
-- `left_bound` (int): Left sliding-window bound. `-1` disables.
-- `right_bound` (int): Right sliding-window bound. `-1` disables. `0` for causal.
-- `seq_len_q` (Optional[torch.Tensor]): Per-batch query sequence lengths `(B, 1, 1, 1)` INT32.
-- `seq_len_kv` (Optional[torch.Tensor]): Per-batch key/value sequence lengths `(B, 1, 1, 1)` INT32.
-- `cumulative_seq_len_q` (Optional[torch.Tensor]): Ragged offset for Q `(B+1, 1, 1, 1)` INT32.
-- `cumulative_seq_len_kv` (Optional[torch.Tensor]): Ragged offset for KV `(B+1, 1, 1, 1)` INT32.
-
-For head dimension `256`, backward support is narrower than the general SDPA op contract: the specialized `d=256` backward path requires plain BHSD tensors and does not support `seq_len_q`, `seq_len_kv`, `cumulative_seq_len_q`, or `cumulative_seq_len_kv`.
-
-**Returns:**
-- `output` (torch.Tensor): Attention output `(B, H_q, S_q, D_v)`.
-
-#### Example Usage
+#### Usage
 
 ```python
 import torch
-from cudnn.experimental.ops import scaled_dot_product_attention
+import cudnn
 
-B, H, S, D = 2, 8, 1024, 128
+_ = cudnn.sdpa_torch  # lazy public export: importing registers cudnn::sdpa_fwd / cudnn::sdpa_bwd
 
-q = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-k = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
-v = torch.randn(B, H, S, D, dtype=torch.float16, device="cuda", requires_grad=True)
+# Dense BHSD with sinks + sliding window
+o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True,
+                                  window_left=128, sinks=sinks, return_lse=True)
 
-# Forward
-output = scaled_dot_product_attention(q, k, v, is_causal=True)
+# THD / varlen (FA-style packed (T, H, D) + cu_seqlens), differentiable:
+q, k, v = (t.requires_grad_(True) for t in (q_thd, k_thd, v_thd))
+o, lse = torch.ops.cudnn.sdpa_fwd(q, k, v, scale, is_causal=True,
+                                  cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                  max_seqlen_q=mx, max_seqlen_kv=mx,
+                                  return_lse=True)
+o.backward(grad)  # routes through cudnn::sdpa_bwd via register_autograd
 
-# Backward (autograd handles this automatically)
-loss = output.sum()
-loss.backward()
-# q.grad, k.grad, v.grad are now populated
+# Or through the python wrapper (same op underneath). It defaults to
+# return_lse=False; autograd needs the stats, so ask for them explicitly:
+o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                          max_seqlen_q=mx, max_seqlen_kv=mx, return_lse=True)
 ```
 
-#### Tests
+#### Contracts and limits
 
-- Python tests: [test/python/test_cudnn_sdpa_op.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_cudnn_sdpa_op.py)
+- Dense tensors are BHSD `(B, H, S, D)` (any strides; the graph declares the
+  actual layout). Varlen tensors are packed `(T, H, D)`; non-contiguous views
+  (e.g. K/V slices of a fused `(T, 2, H, D)` KV projection) are declared with
+  their true strides. On the varlen path, a non-dense innermost dim or a
+  misaligned base pointer is repaired by one copy (warned as slow path); the
+  dense path declares the given strides as-is.
+- One io dtype per call (`fp16` or `bf16`); mixed-dtype inputs are rejected.
+- `sdpa_bwd` serves the **THD/varlen** path. Dense backward and sink backward
+  (dSink) are follow-ups and raise `NotImplementedError`. It consumes a
+  **padded** `(B, H, max_seqlen_q, 1)` fp32 LSE (backend restriction: bprop
+  THD rejects ragged LSE on SM8X/SM12X).
+- Autograd (`register_autograd`) requires `return_lse=True` on the forward;
+  the glue converts the packed TH1 stats to the padded layout device-side.
+- Both ops ship `register_fake` meta kernels. `cudnn::sdpa_fwd` passes
+  `torch.library.opcheck` on the dense and varlen paths, including
+  dynamic-shape AOT dispatch (`torch.compile`-ready); the opcheck autograd
+  case exercises `cudnn::sdpa_bwd` through the registered backward.
+
+#### Requirements
+
+- `nvidia-cudnn-frontend[cutedsl]`, cuDNN backend ≥ 9.6 (THD token-major
+  stats), sm80+.
+
+Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).
 
 (scaled-dot-product-attention-fp8-forward)=
 ### SDPA FP8 Forward

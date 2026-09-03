@@ -20,19 +20,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
-
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
 # importing them here would drag the CuTe DSL into every support check.
-def _adapter_sm120():
-    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+_SM120 = "SdpaBwdDslSm120"
+_SM80 = "SdpaBwdDslSm80"
 
-    return SdpaBwdDslSm120
+
+def _adapter(name: str):
+    from cudnn.sdpa.bwd import api_dsl
+
+    return getattr(api_dsl, name)
 
 
 def _cuda_driver():
@@ -340,13 +344,17 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaBwdKnobs] = None):
     return spec.lower(spec, facts, knobs)
 
 
-def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
+def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None, api_type: str = _SM120):
     """Lower the selected SDPA backward engine through its DSL adapter.
 
     Descriptor conversion, adapter lifecycle, variant-pack binding, and launch
-    construction live here; the adapter owns compilation and the three-kernel
-    execute chain.
+    construction live here; the adapter owns compilation and the kernel
+    execute chain. ``EngineSpec.lower`` binds the implementation through
+    ``api_type`` (mirrors ``lower_dsl_prefill``); SM80-only operands (bias →
+    dBias, plan-time bias facts) flow only to adapters declaring the matching
+    constructor / execute keywords.
     """
+    import inspect
 
     # Per-port geometry from facts.port_layouts, NOT the live IR tensors:
     # build_operation_graph rewrites the backward node's K/V ports to
@@ -383,7 +391,16 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    api = _adapter_sm120()(
+    adapter_cls = _adapter(api_type)
+    # SM80-only plan-time facts, forwarded only to adapters declaring them.
+    _extra_ctor = {
+        "has_bias": facts.has_bias,
+        "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
+        "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
+        "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
+    }
+    _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
+    api = adapter_cls(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(k_geom, facts.dtype, "k"),
         sample_v=_desc(v_geom, facts.dtype, "v"),
@@ -407,6 +424,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         tile_n=requested.tile_n if requested is not None else None,
         seq_kv_lens_present=seq_kv_t is not None,
         seq_q_lens_present=seq_q_t is not None,
+        **_extra_ctor,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -497,8 +515,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
 
 def _sm80_spec() -> EngineSpec:
-    """SM80 (A100) backward row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``bwd/api.py``), which owns kernel-flavor selection
+    """SM80 (A100) backward row: lowers through the shared ``lower_dsl_bwd``
+    onto ``SdpaBwdDslSm80`` (``bwd/api_dsl.py``), which owns kernel-flavor selection
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
     host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
     kernel caching, and the dedicated plain-dense d=64 fast path.  The
@@ -529,181 +547,13 @@ def _sm80_spec() -> EngineSpec:
             sink=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
-            # Served by gathering the strided stats into carved contiguous
-            # staging (issue #514 workspace machinery) — the kernels read a
-            # packed LSE; sm120 reads declared strides natively instead.
+            # The kernels READ the declared stats strides natively (the
+            # #712 analogue for the backward's loads), same as sm120 — no
+            # gather staging.
             strided_stats=True,
         ),
-        lower=lower_sm80_bwd,
+        lower=partial(lower_dsl_bwd, api_type=_SM80),
     )
-
-
-def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
-    """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter.
-
-    Built at plan time (issue #514): the adapter is constructed here from the
-    NORMALIZED buffer descriptors (compact BSHD-physical), its scratch
-    requirement plus this executor's own dense_flex gather staging is recorded
-    as ``workspace_bytes``, and execute carves everything from the caller's
-    workspace — no per-execute allocation on this path.
-    """
-    import dataclasses
-
-    from cudnn.api_base import TensorDesc
-    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
-
-    from .api import SdpabwdSm80
-
-    binding = ga.SdpaBinding(
-        q=facts.q_t,
-        k=facts.k_t,
-        v=facts.v_t,
-        o=facts.o_t,
-        stats=facts.stats_t,
-        bias=facts.bias_t,
-        sink_token=facts.sink_t,
-        seq_len_kv=facts.seq_kv_t,
-        seq_len_q=facts.seq_q_t,
-        do=facts.do_t,
-        dq=facts.dq_t,
-        dk=facts.dk_t,
-        dv=facts.dv_t,
-        dbias=facts.dbias_t,
-        dsink=facts.dsink_t,
-    )
-    mask_args = ga.adapter_mask_args(facts)
-    elem = 2  # fp16/bf16 — mismatch() admits no other input dtype
-    b, h_q = facts.b, facts.h_q
-
-    def _compact_desc(t, name):
-        desc = ga.tensor_desc_from_ir(t, name=name)
-        bb, hh, ss, dd = desc.shape
-        return dataclasses.replace(desc, stride=(ss * hh * dd, dd, hh * dd, 1), stride_order=(3, 1, 2, 0))
-
-    def _is_compact_bshd(t) -> bool:
-        _, h, s, d = tuple(t.get_dim())
-        return tuple(t.get_stride()) == (s * h * d, d, h * d, 1)
-
-    # dense_flex gather staging, sized from the PORT layouts (static): a port
-    # already stored as a compact BSHD-physical allocation is handed through
-    # zero-copy. The adapter's own scratch then covers head-dim pads and the
-    # kernel-internal buffers.
-    ports = ((facts.q_t, "q"), (facts.k_t, "k"), (facts.v_t, "v"), (facts.o_t, "o"), (facts.do_t, "dO"))
-
-    def _port_numel(t) -> int:
-        n = 1
-        for extent in t.get_dim():
-            n *= int(extent)
-        return n
-
-    stage_bytes = {name: (0 if _is_compact_bshd(t) else ws_align(_port_numel(t) * elem)) for t, name in ports}
-    # Strided stats (Capabilities.strided_stats): the kernels read a PACKED
-    # (B, H_q, S_q) fp32 LSE, so a stats input with any other declared strides
-    # is gathered into a carved contiguous chunk at execute.
-    _stats_contig = facts.stats_t is not None and tuple(facts.stats_t.get_stride()) == (h_q * facts.s_q, facts.s_q, 1, 1)
-    stats_stage = 0 if (facts.stats_t is None or _stats_contig) else ws_align(b * h_q * facts.s_q * 4)
-
-    q_desc = _compact_desc(facts.q_t, "q")
-    sample_lse = TensorDesc(
-        dtype=ga.to_torch_dtype(cudnn.data_type.FLOAT),
-        shape=(b, h_q, facts.s_q),
-        stride=(h_q * facts.s_q, facts.s_q, 1),
-        stride_order=(2, 1, 0),
-        device=q_desc.device,
-        name="lse",
-    )
-    api = SdpabwdSm80(
-        sample_q=q_desc,
-        sample_k=_compact_desc(facts.k_t, "k"),
-        sample_v=_compact_desc(facts.v_t, "v"),
-        sample_o=_compact_desc(facts.o_t, "o"),
-        sample_do=_compact_desc(facts.do_t, "dO"),
-        sample_lse=sample_lse,
-        scale_softmax=facts.scale,
-        has_seq_kv_lens=facts.seq_kv_t is not None,
-        has_bias=facts.has_bias,
-        **mask_args,
-    )
-    if not api.check_support():
-        raise ValueError("SdpabwdSm80 declined the normalized graph geometry")
-    api.compile()
-    bias_batch = int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1
-    api_scratch = api.scratch_workspace_bytes(
-        has_bias=facts.has_bias,
-        bias_batch=bias_batch,
-        has_sink=facts.has_sink,
-        deterministic=facts.deterministic,
-    )
-    total_workspace_bytes = sum(stage_bytes.values()) + stats_stage + api_scratch
-
-    def _normalize(carver, buf, staged: int):
-        if not staged:
-            return buf
-        bb, hh, ss, dd = buf.shape
-        dst = carver.take(bb * ss * hh * dd, buf.dtype).view(bb, ss, hh, dd)
-        dst.copy_(buf.permute(0, 2, 1, 3))
-        return dst.permute(0, 2, 1, 3)
-
-    def _ir_view(buf, ir_t):
-        """Reinterpret a variant-pack buffer through the IR tensor's dim/stride.
-
-        cuDNN's execute contract treats variant-pack entries as raw storage
-        laid out per the IR tensor descriptor — the caller's torch tensor may
-        be flat or otherwise logically reshaped. The staging/squeeze/copy_
-        paths below consume torch views, so rebuild the IR-shaped view instead
-        of trusting the caller's metadata (mirrors the forward lowering's
-        ``_ir_view``). INPUT ports only: output-port IR strides are
-        PROVISIONAL row-major unless the user assigned them (the layout
-        invariant in docs/python_graph_and_execution_backends.md), so the
-        gradient outputs below keep the caller tensor's own view — re-striding
-        them to the provisional layout would scatter the copy-back.
-        """
-        dim, stride = tuple(ir_t.get_dim()), tuple(ir_t.get_stride())
-        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
-            return buf
-        return buf.as_strided(dim, stride)
-
-    def _execute(variant_pack, workspace=None, stream=None):
-        resolved = ga.resolve_variant_pack(variant_pack, binding)
-        carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
-        # squeeze(-1) is a valid view for ANY (B, H_q, S_q, 1) strides; the
-        # kernels read a packed LSE, so a strided stats input (strided_stats)
-        # is gathered into carved contiguous staging first.
-        lse = _ir_view(resolved[id(facts.stats_t)], facts.stats_t).squeeze(-1)
-        if stats_stage:
-            lse_stage = carver.take(b * h_q * facts.s_q, lse.dtype).view(b, h_q, facts.s_q)
-            lse_stage.copy_(lse)
-            lse = lse_stage
-        dbias_buf = resolved.get(id(facts.dbias_t)) if facts.has_dbias and facts.dbias_t is not None else None
-        dsink_buf = resolved.get(id(facts.dsink_t)) if facts.has_dsink and facts.dsink_t is not None else None
-
-        api.execute(
-            q_tensor=_normalize(carver, _ir_view(resolved[id(facts.q_t)], facts.q_t), stage_bytes["q"]),
-            k_tensor=_normalize(carver, _ir_view(resolved[id(facts.k_t)], facts.k_t), stage_bytes["k"]),
-            v_tensor=_normalize(carver, _ir_view(resolved[id(facts.v_t)], facts.v_t), stage_bytes["v"]),
-            o_tensor=_normalize(carver, _ir_view(resolved[id(facts.o_t)], facts.o_t), stage_bytes["o"]),
-            do_tensor=_normalize(carver, _ir_view(resolved[id(facts.do_t)], facts.do_t), stage_bytes["dO"]),
-            lse_tensor=lse,
-            dq_tensor=resolved[id(facts.dq_t)],
-            dk_tensor=resolved[id(facts.dk_t)],
-            dv_tensor=resolved[id(facts.dv_t)],
-            dbias_tensor=dbias_buf,
-            dsink_tensor=dsink_buf.view(-1) if dsink_buf is not None else None,
-            scale_softmax=facts.scale,
-            deterministic=facts.deterministic,
-            # Stream from the caller's handle (ExecutionContext.stream);
-            # None keeps the current stream.
-            current_stream=stream,
-            workspace=carver.remaining() if (carver is not None and api_scratch) else None,
-            **ga.adapter_feature_buffers(facts, resolved),
-        )
-        return None
-
-    # Executor contract (engine._FrostSdpaBwdPlan): a non-zero workspace_bytes
-    # means _execute(variant_pack, workspace, stream) with the caller's buffer.
-    _execute.workspace_bytes = total_workspace_bytes
-    _execute.binding = binding
-    return _execute
 
 
 def engine_name(arch: str = "sm120") -> str:

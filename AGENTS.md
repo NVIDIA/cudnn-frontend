@@ -52,6 +52,8 @@ pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA ent
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.
 
+**Editable installs pin one checkout — a worktree or second clone is silently not under test.** `pip install -e .` installs a `sys.meta_path` finder whose `MAPPING` hard-codes the absolute path of the checkout it was installed from; meta-path finders run before `sys.path`, so `PYTHONPATH` cannot shadow it. Before trusting any measurement from a worktree or second clone, confirm the import actually resolves there: `python -c "import cudnn; print(cudnn.__file__)"`. If a deliberately destructive probe changes nothing, suspect the import path before the code.
+
 ## Test
 
 ```bash
@@ -85,6 +87,10 @@ First invocation builds the hook environments and can take >5 minutes; later run
 - Frontend-only OSS APIs are experimental; keep the `[cutedsl]` optional-dependency boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time).
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
+- Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
+- Never delete an existing log or diagnostic statement in a cleanup/refactor — several were added after repeated hard-to-repro failures and are the only tripwire for a recurrence (review on PR #280). If one looks redundant, ask before removing.
+- Every new source file needs the repo's SPDX/license header (flagged in review on PR #747) — enforced by the `spdx-license-header` pre-commit hook.
+- Changing any FROST SDPA `Capabilities` field that affects graph eligibility, or adding/retiring an `EngineSpec`, updates [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md) in the same commit — it is maintained by hand and has no other tripwire. A change confined to knob domains (`tile_ms`, `sched_policies`, ...) is exempt. [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) **Rule S2** is canonical for the exact scope; cite it in review.
 
 ## Agent skills
 
@@ -101,6 +107,10 @@ Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.cl
 
 ## PR labels
 
-When opening a pull request, apply **at minimum one label from each group**: one `cat-*` (change type), one or more `mod-*` (affected module), and one `orig-*` (originator). See the full label list at <https://github.com/NVIDIA/cudnn-frontend/labels>.
+When opening a pull request, apply **at minimum one label from each group**: one `cat-*` (change type), one or more `area:*` / `op:*` (affected area), and one `orig-*` (originator). See the full label list at <https://github.com/NVIDIA/cudnn-frontend/labels>.
 
-Leave `closed-*` and `open-*` labels for maintainers.
+Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar fields are set by reviewers/maintainers, not authors.
+
+## Reviewing a PR (human or agent)
+
+Each Hard Rule is numbered so it can be cited by number in review comments. Before approving or requesting changes on a diff, check it against every Hard Rules section whose directory it touches: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) (Rules 1-5, `execute()`/import-time), [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) (SDPA Rules S1+), [include/cudnn_frontend/AGENTS.md](include/cudnn_frontend/AGENTS.md) (header-only, warnings-as-errors), plus the conventions in [test/AGENTS.md](test/AGENTS.md) and [samples/AGENTS.md](samples/AGENTS.md). Where a rule names a detector (grep pattern, `set_sync_debug_mode` snippet, a `RED-then-green` test), prefer running or citing it over an eyeballed read. When a review surfaces a new concrete, checkable technique or trap that these guides don't already cover, land it in the relevant `AGENTS.md` in the same PR rather than leaving it in a review comment.

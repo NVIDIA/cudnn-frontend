@@ -958,6 +958,108 @@ def test_dsl_sm100_thd(dtype, d):
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
+# Issue #624: a THD caller binds K/V at BUFFER CAPACITY, not at the packed
+# total, and the descriptor extent is the host-derived capacity. Rows in
+# [total, capacity) are therefore inside the extent and get loaded. They are
+# masked, so P == 0 -- but 0 * NaN == NaN, so an UNINITIALIZED capacity tail
+# wipes whole tiles of O. The setup kernel patches the K/V descriptor extent to
+# the packed total cu_k[B] device-side so those rows are TMA-OOB and land as
+# exact zeros instead. Total 397 is deliberately not a multiple of TILE_N, so
+# the last sequence's tail tile steps past it.
+@pytest.mark.L0
+# (d_qk, d_v) rather than a single d: d192/d128 is its own kernel flavor, and
+# a single-d parametrization cannot reach it.
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["llama", "dsv3", "qwen", "dsv4"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct."""
+    _require_dsl()
+    import cudnn
+
+    dev = "cuda"
+    H = 8
+    seq_lens = [200, 150, 47]
+    B = len(seq_lens)
+    S_max = max(seq_lens)
+    T = sum(seq_lens)
+    cu = [0]
+    for s_i in seq_lens:
+        cu.append(cu[-1] + s_i)
+    scale = 1.0 / math.sqrt(d_qk)
+
+    q_pk = torch.randn(T, H, d_qk, device=dev, dtype=dtype)
+    k_pk = torch.randn(T, H, d_qk, device=dev, dtype=dtype)
+    v_pk = torch.randn(T, H, d_v, device=dev, dtype=dtype)
+
+    def _stride(dd):
+        return (S_max * H * dd, dd, H * dd, 1)
+
+    def _poisoned_buf(packed, dd):
+        """Capacity-sized storage; only [0, T) is live, the tail is NaN.
+
+        Returns the strided view only -- it keeps the storage alive, so there
+        is no need to bind the flat tensor as well."""
+        stor = torch.full((B * S_max * H * dd,), float("nan"), device=dev, dtype=dtype)
+        stor[: T * H * dd] = packed.reshape(-1)
+        return stor.as_strided((B, H, S_max, dd), _stride(dd))
+
+    q_gpu = _poisoned_buf(q_pk, d_qk)
+    k_gpu = _poisoned_buf(k_pk, d_qk)
+    v_gpu = _poisoned_buf(v_pk, d_v)
+    o_stor = torch.zeros(B * S_max * H * d_v, device=dev, dtype=dtype)
+    o_gpu = o_stor.as_strided((B, H, S_max, d_v), _stride(d_v))
+
+    slq = torch.tensor(seq_lens, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    slk = slq.clone()
+    cu_t = torch.tensor(cu, dtype=torch.int64, device=dev)
+    ro_qk = (cu_t * H * d_qk).view(B + 1, 1, 1, 1)
+    ro_v = (cu_t * H * d_v).view(B + 1, 1, 1, 1)
+
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, S_max, d_qk], stride=list(_stride(d_qk)), data_type=io, name="q")
+    tk = g.tensor(dim=[B, H, S_max, d_qk], stride=list(_stride(d_qk)), data_type=io, name="k")
+    tv = g.tensor(dim=[B, H, S_max, d_v], stride=list(_stride(d_v)), data_type=io, name="v")
+    sq = g.tensor_like(slq)
+    skv = g.tensor_like(slk)
+    qro = g.tensor_like(ro_qk)
+    kro = g.tensor_like(ro_qk)
+    vro = g.tensor_like(ro_v)
+    oro = g.tensor_like(ro_v)
+    tq.set_ragged_offset(qro)
+    tk.set_ragged_offset(kro)
+    tv.set_ragged_offset(vro)
+    o, _ = g.sdpa(
+        name="sdpa", q=tq, k=tk, v=tv, generate_stats=False, attn_scale=scale, use_causal_mask=True, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv
+    )
+    o.set_output(True).set_dim([B, H, S_max, d_v]).set_stride(list(_stride(d_v)))
+    o.set_ragged_offset(oro)
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(g, engine_name())
+    g.check_support()
+    g.build_plans()
+    vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
+    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    torch.cuda.synchronize()
+
+    o_out = o_stor[: T * H * d_v].reshape(T, H, d_v)
+    assert not torch.isnan(o_out).any(), f"{int(torch.isnan(o_out).sum())} NaNs in O -- the capacity tail reached BMM2"
+
+    o_ref = torch.zeros(T, H, d_v, device=dev, dtype=dtype)
+    for b in range(B):
+        lo, hi = cu[b], cu[b + 1]
+        qb = q_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        kb = k_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        vb = v_pk[lo:hi].permute(1, 0, 2).unsqueeze(0)
+        ob = _ref_sdpa_full(qb, kb, vb, scale=scale, is_causal=True)
+        o_ref[lo:hi] = ob.squeeze(0).permute(1, 0, 2)
+    torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
@@ -1510,6 +1612,32 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm100_thd_multi_unit_per_cta(monkeypatch, d):
+    """THD with more live units than the grid has clusters (issue #618).
+
+    The persistent grid is sized to the MACHINE, so a cluster claims units
+    repeatedly off the device-bounded counter. Every other THD case here is
+    small enough that each cluster is handed at most one unit, so none of them
+    re-enters the K/V pipeline for a second one -- the regime where an
+    unmatched consumer arrival used to desynchronise the next unit's producer
+    handshake. These lengths give 48-80 live units depending on the flavor's
+    CGA tile; FROST_THD_CLUSTERS pins the grid to 4 clusters so the claim loop
+    runs deep regardless of the device's SM count, and the unpinned pass covers
+    the natural sizing.
+    """
+    _require_dsl()
+    lens = [1024, 768, 512, 256]
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="token_major")
+
+    monkeypatch.delenv("FROST_THD_CLUSTERS")
+    _run_thd_stats_case(seq_lens_q=lens, seq_lens_kv=lens, d=d, mask="causal", stats_layout="head_major")
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host():
     """Issue #552 (D2H removal): the length tensors are consumed ONLY on
@@ -1636,6 +1764,47 @@ def test_dsl_sm100_thd_d192_d128_device_meta():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm100_thd_d192_d128_multi_unit_per_cta(monkeypatch):
+    """d192/d128 THD where a cluster claims more than one unit (issue #618).
+
+    The sibling device_meta case is one unit per cluster, so it never re-enters
+    the K/V pipeline. FROST_THD_CLUSTERS pins the persistent grid to 4 clusters
+    against 16 live units, making every cluster run four unit ranges."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    b, h, s = 2, 4, 1024
+    d_qk, d_v = 192, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
+    v = _bhsd(b, h, s, d_v, dtype)
+    o = torch.zeros_like(v)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    seq_lens = [1024, 768]
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    base_q = q.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_k = k.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_v = v.transpose(1, 2).reshape(b * s, h, d_v)
+    base_o = o.transpose(1, 2).reshape(b * s, h, d_v)
+    off = 0
+    for length in seq_lens:
+        qs = base_q[off : off + length].float()
+        ks = base_k[off : off + length].float()
+        vs = base_v[off : off + length].float()
+        scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+        ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+        torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+        off += length
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=42)
 def test_dsl_sm100_thd_execute_cuda_graph_capture():
     """Issue #552 endgame (d128): THD execute is CUDA-GRAPH CAPTURABLE — no
@@ -1706,9 +1875,11 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     FINITE. A caller that over-allocates and leaves the tail unwritten
     therefore poisons whole tiles through ``0 * NaN`` (issue #624).
 
-    Declaring the total clamps the TMA extent to the packed total, putting that
-    tail out of reach. Same graph, same data, only the tail fill differs: with
-    the declaration a NaN tail must be inert."""
+    Two mechanisms now put that tail out of reach: declaring the total clamps
+    the host-derived extent, and the THD setup kernel clamps the K/V extent to
+    ``cu_k[B]`` device-side regardless. Same graph, same data, only the tail
+    fill differs -- a NaN tail must be inert either way, and the two paths must
+    agree bit for bit."""
     _require_dsl()
     import cudnn
 
@@ -1782,13 +1953,22 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
     )
     assert torch.equal(declared_nan, declared_zero), "O must not depend on the capacity tail once the total is declared"
 
-    # Control: the tail is genuinely reachable without the declaration, so the
-    # assertions above are testing the clamp rather than a benign shape.
+    # The undeclared path is NaN-safe too, and deliberately so: the THD setup
+    # kernel now patches the K/V descriptor extent to cu_k[B] device-side on
+    # every flavor, which bounds the tail without any host declaration. Before
+    # that clamp this same call poisoned ~50% of O, and this assertion was
+    # inverted -- it asserted the NaN to prove the tail was reachable.
     undeclared_nan = _run(float("nan"), declare_total=False)
-    assert torch.isnan(undeclared_nan).any(), (
-        "expected the undeclared path to read the capacity tail (issue #624); if this no longer "
-        "holds the extent is exact by other means and this test needs rethinking"
+    undeclared_zero = _run(0.0, declare_total=False)
+    assert not torch.isnan(undeclared_nan).any(), (
+        f"the device-side K/V extent clamp must bound the capacity tail with or without a declared "
+        f"total: {int(torch.isnan(undeclared_nan).sum())} NaNs in O"
     )
+    assert torch.equal(undeclared_nan, undeclared_zero), "O must not depend on the capacity tail"
+    # Declaring the total is now a host-side tightening (capacity, grid and
+    # workspace sizing) rather than the only thing standing between the kernel
+    # and the tail -- so both paths must agree bit for bit.
+    assert torch.equal(declared_nan, undeclared_nan), "declaring the packed total must not change the result"
 
 
 @pytest.mark.L0

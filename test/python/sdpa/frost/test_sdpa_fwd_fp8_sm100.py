@@ -12,8 +12,8 @@ and checked.
 cuDNN's ``sdpa_fp8`` op exposes causal / bottom-right / sliding-window masks, attention
 sink, a padding mask (per-batch ``seq_len_kv`` → KV-side masking, tested here), and THD /
 ragged inputs (packed Q/K/V/O + per-operand ragged_offset + seq_len_q/kv or the
-cu_seq_len prefix-sum form, tested here — write_thd_meta envelope design, issue #552;
-ragged Stats in the packed token-major TH1 layout).
+cu_seq_len prefix-sum form, tested here — device-built metadata plus a persistent
+grid, issue #552; ragged Stats in the packed token-major TH1 layout).
 
 Requires: SM100 (Blackwell), cutlass-dsl, cuDNN >= 9.21 (fp8 SDPA). Skips otherwise.
 """
@@ -395,6 +395,28 @@ def test_fp8_d192_d128_masks(mask):
 
 @_skip_on_rubin
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_wide_swa_boundary_dense():
+    """Dense cga1 at WL + WR == cluster rows + TILE_N - 2; the final seam is KV row 130."""
+    swa_window = 2 * 128 * 1 + 128 - 2
+    out, o_ref, a_o, a_o_ref = _run(
+        1,
+        2,
+        2,
+        513,
+        513,
+        "e4m3",
+        torch.float16,
+        scale=1.0 / math.sqrt(192),
+        sdpa_kwargs=dict(use_causal_mask=True, left_bound=swa_window + 1),
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
 @pytest.mark.parametrize(
     ("in_key", "out_key", "with_sink"),
     [
@@ -709,7 +731,25 @@ def test_fp8_stats_less_zero_workspace(in_key):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False, declare_totals=False):
+def _run_thd(
+    seq_lens_q,
+    seq_lens_kv,
+    H_q,
+    H_kv,
+    in_key,
+    *,
+    scale,
+    causal=False,
+    bottom_right=False,
+    swa_window=None,
+    sink=None,
+    stats=False,
+    cu_lens=False,
+    declare_totals=False,
+    d=128,
+    d_qk=None,
+    d_v=None,
+):
     """THD/varlen: packed [T,H,D] Q/K/V/O + per-operand ragged_offset + per-batch
     lengths (or their cu prefix-sum form).
 
@@ -721,7 +761,8 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     import cudnn
 
     dev = "cuda"
-    D = 128
+    d_qk = d if d_qk is None else d_qk
+    d_v = d if d_v is None else d_v
     B = len(seq_lens_q)
     S_max_q, S_max_kv = max(seq_lens_q), max(seq_lens_kv)
     T_q, T_kv = sum(seq_lens_q), sum(seq_lens_kv)
@@ -734,47 +775,50 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
 
     cu_q, cu_k = _cu(seq_lens_q), _cu(seq_lens_kv)
 
-    q_pk = torch.randn(T_q, H_q, D, device=dev) * 0.5
-    k_pk = torch.randn(T_kv, H_kv, D, device=dev) * 0.5
-    v_pk = torch.randn(T_kv, H_kv, D, device=dev) * 0.5
+    q_pk = torch.randn(T_q, H_q, d_qk, device=dev) * 0.5
+    k_pk = torch.randn(T_kv, H_kv, d_qk, device=dev) * 0.5
+    v_pk = torch.randn(T_kv, H_kv, d_v, device=dev) * 0.5
     q8, dq = _quant(q_pk, in_key)
     k8, dk = _quant(k_pk, in_key)
     v8, dv = _quant(v_pk, in_key)
 
-    def _dense_buf(packed, s_max, h, dt):
+    def _dense_buf(packed, s_max, h, d, dt):
         # Dense-capacity storage; packed tokens in the leading elements (THD
         # contract). The capacity tail is NaN-POISONED (test_mhas_v2 parity):
         # the last sequence's KV tile steps past the packed total, and those
         # tail loads must land as zeros through the setup kernel's
         # packed-total-clamped K/V descriptors — a leaked NaN would wipe the
         # tile via BMM2's P·V (0 · NaN == NaN).
-        stride = (s_max * h * D, D, h * D, 1)
-        stor = torch.full((B * s_max * h * D,), float("nan"), device=dev, dtype=torch.float32).to(dt)
+        stride = (s_max * h * d, d, h * d, 1)
+        stor = torch.full((B * s_max * h * d,), float("nan"), device=dev, dtype=torch.float32).to(dt)
         stor[: packed.numel()] = packed.reshape(-1)
-        return stor, stor.as_strided((B, h, s_max, D), stride), stride
+        return stor, stor.as_strided((B, h, s_max, d), stride), stride
 
-    _, q_gpu, stride_q = _dense_buf(q8, S_max_q, H_q, q8.dtype)
-    _, k_gpu, stride_kv = _dense_buf(k8, S_max_kv, H_kv, k8.dtype)
-    _, v_gpu, _ = _dense_buf(v8, S_max_kv, H_kv, v8.dtype)
-    o_stor = torch.zeros(B * S_max_q * H_q * D, device=dev, dtype=torch.float16)
-    o_gpu = o_stor.as_strided((B, H_q, S_max_q, D), stride_q)
+    _, q_gpu, stride_q = _dense_buf(q8, S_max_q, H_q, d_qk, q8.dtype)
+    _, k_gpu, stride_k = _dense_buf(k8, S_max_kv, H_kv, d_qk, k8.dtype)
+    _, v_gpu, stride_v = _dense_buf(v8, S_max_kv, H_kv, d_v, v8.dtype)
+    stride_o = (S_max_q * H_q * d_v, d_v, H_q * d_v, 1)
+    o_stor = torch.zeros(B * S_max_q * H_q * d_v, device=dev, dtype=torch.float16)
+    o_gpu = o_stor.as_strided((B, H_q, S_max_q, d_v), stride_o)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     slq = torch.tensor(seq_lens_q, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     slk = torch.tensor(seq_lens_kv, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     cuq_t = torch.tensor(cu_q, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
     cuk_t = torch.tensor(cu_k, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
-    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * D).view(B + 1, 1, 1, 1)
-    ro_k = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * D).view(B + 1, 1, 1, 1)
+    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * d_qk).view(B + 1, 1, 1, 1)
+    ro_k = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * d_qk).view(B + 1, 1, 1, 1)
+    ro_v = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * d_v).view(B + 1, 1, 1, 1)
+    ro_o = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * d_v).view(B + 1, 1, 1, 1)
 
     def sc(val):
         return torch.tensor([[[[val]]]], dtype=torch.float32, device=dev)
 
     io = getattr(cudnn.data_type, _CUDNN_ITYPE[in_key])
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tq = g.tensor(dim=[B, H_q, S_max_q, D], stride=list(stride_q), data_type=io, name="q")
-    tk = g.tensor(dim=[B, H_kv, S_max_kv, D], stride=list(stride_kv), data_type=io, name="k")
-    tv = g.tensor(dim=[B, H_kv, S_max_kv, D], stride=list(stride_kv), data_type=io, name="v")
+    tq = g.tensor(dim=[B, H_q, S_max_q, d_qk], stride=list(stride_q), data_type=io, name="q")
+    tk = g.tensor(dim=[B, H_kv, S_max_kv, d_qk], stride=list(stride_k), data_type=io, name="k")
+    tv = g.tensor(dim=[B, H_kv, S_max_kv, d_v], stride=list(stride_v), data_type=io, name="v")
     sq_h = g.tensor_like(cuq_t if cu_lens else slq)
     skv_h = g.tensor_like(cuk_t if cu_lens else slk)
     qro, kro, vro, oro = (g.tensor_like(ro_q) for _ in range(4))
@@ -804,8 +848,13 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    if causal:
+    if bottom_right:
+        kw["use_causal_mask_bottom_right"] = True
+    elif causal:
         kw["use_causal_mask"] = True
+    if swa_window is not None:
+        kw["use_causal_mask"] = True
+        kw["left_bound"] = swa_window + 1
     vp = {
         tq: q_gpu,
         tk: k_gpu,
@@ -820,8 +869,8 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         skv_h: (cuk_t if cu_lens else slk),
         qro: ro_q,
         kro: ro_k,
-        vro: ro_k,
-        oro: ro_q,
+        vro: ro_v,
+        oro: ro_o,
     }
     if sink is not None:
         st = g.tensor_like(sink)
@@ -832,7 +881,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         # from the bound buffers' capacity.
         kw.update(max_total_seq_len_q=sum(seq_lens_q), max_total_seq_len_kv=sum(seq_lens_kv))
     o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
-    o.set_output(True).set_dim([B, H_q, S_max_q, D]).set_stride(list(stride_q)).set_data_type(cudnn.data_type.HALF)
+    o.set_output(True).set_dim([B, H_q, S_max_q, d_v]).set_stride(list(stride_o)).set_data_type(cudnn.data_type.HALF)
     o.set_ragged_offset(oro)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     stats_stor = None
@@ -841,7 +890,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
         stats_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
         stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-        stats_ro_t = (ro_q.flatten() // D).view(B + 1, 1, 1, 1).contiguous()
+        stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
         stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
         stats_t.set_ragged_offset(stats_ro)
         vp[stats_ro] = stats_ro_t
@@ -857,7 +906,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
-    o_ref = torch.zeros(T_q, H_q, D, device=dev, dtype=torch.float32)
+    o_ref = torch.zeros(T_q, H_q, d_v, device=dev, dtype=torch.float32)
     lse_ref = torch.zeros(T_q, H_q, dtype=torch.float32, device=dev)
     for b in range(B):
         if cu_q[b + 1] == cu_q[b]:
@@ -871,20 +920,38 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
         qb = (q8[cu_q[b] : cu_q[b + 1]].float() * dq).permute(1, 0, 2).unsqueeze(0)
         kb = (k8[cu_k[b] : cu_k[b + 1]].float() * dk).permute(1, 0, 2).unsqueeze(0)
         vb = (v8[cu_k[b] : cu_k[b + 1]].float() * dv).permute(1, 0, 2).unsqueeze(0)
-        ref_kw = dict(is_causal=True) if causal else {}
+        ref_kw = {}
+        if bottom_right:
+            ref_kw.update(is_causal=True, bottom_right=True)
+        elif causal or swa_window is not None:
+            ref_kw["is_causal"] = True
+        if swa_window is not None:
+            ref_kw["swa_window"] = swa_window
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
         ob = _ref(qb, kb, vb, scale=scale, **ref_kw)
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
         if stats:
-            lse_ref[cu_q[b] : cu_q[b + 1]] = _ref_lse(qb, kb, scale=scale, causal=causal, sinks=(sink.flatten() if sink is not None else None)).squeeze(0).T
+            lse_ref[cu_q[b] : cu_q[b + 1]] = (
+                _ref_lse(
+                    qb,
+                    kb,
+                    scale=scale,
+                    causal=bottom_right or causal or swa_window is not None,
+                    bottom_right=bottom_right,
+                    swa_window=swa_window,
+                    sinks=(sink.flatten() if sink is not None else None),
+                )
+                .squeeze(0)
+                .T
+            )
 
-    o_out = o_stor[: T_q * H_q * D].reshape(T_q, H_q, D)
+    o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
     lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
     return o_out, o_ref, amax_o.item(), o_ref.abs().max().item(), lse_out, (lse_ref if stats else None)
 
 
-def _ref_lse(qd, kd, *, scale, causal, sinks=None):
+def _ref_lse(qd, kd, *, scale, causal, bottom_right=False, swa_window=None, sinks=None):
     """Natural-log LSE reference over per-sequence scores, [1, H, S_q]."""
     _, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = kd.shape
@@ -894,7 +961,12 @@ def _ref_lse(qd, kd, *, scale, causal, sinks=None):
     if causal:
         i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
         j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
-        scores = scores.masked_fill(j > i, float("-inf"))
+        lim = i + (s_kv - s_q) if bottom_right else i
+        scores = scores.masked_fill(j > lim, float("-inf"))
+    if swa_window is not None:
+        i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
+        j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
+        scores = scores.masked_fill(j < i - swa_window, float("-inf"))
     if sinks is not None:
         col = sinks.view(1, h_q, 1, 1).float().expand(1, h_q, s_q, 1).to(dev)
         scores = torch.cat([scores, col], dim=-1)
@@ -932,6 +1004,96 @@ def test_fp8_thd(in_key, causal):
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, in_key, scale=scale, causal=causal)
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("in_key", "causal", "bottom_right"),
+    [("e4m3", False, False), ("e5m2", True, False), ("e4m3", False, True)],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_thd(in_key, causal, bottom_right):
+    """D192/D128 THD core path for both FP8 input formats and mask modes."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(
+        [200, 150],
+        [200, 150],
+        8,
+        8,
+        in_key,
+        scale=scale,
+        causal=causal,
+        bottom_right=bottom_right,
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_wide_swa_boundary_thd():
+    """THD cga2 at WL + WR == cluster rows + TILE_N - 2; the final seam is KV row 130."""
+    swa_window = 2 * 128 * 2 + 128 - 2
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(
+        [769],
+        [769],
+        2,
+        2,
+        "e4m3",
+        scale=1.0 / math.sqrt(192),
+        causal=True,
+        swa_window=swa_window,
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@_skip_on_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_thd_features():
+    """D192 THD composition: cu lengths, zero KV, sink, Stats, and poisoned tail."""
+    scale = 1.0 / math.sqrt(192)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd(
+        [126, 40, 60],
+        [0, 83, 77],
+        8,
+        8,
+        "e5m2",
+        scale=scale,
+        causal=True,
+        swa_window=64,
+        sink=sink,
+        stats=True,
+        cu_lens=True,
+        declare_totals=True,
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
+    torch.testing.assert_close(lse, lse_ref, atol=5e-2, rtol=3e-2, equal_nan=False)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
+    """THD where a cluster claims more than one unit (issue #618).
+
+    The persistent grid is machine-sized, so a cluster pulls units repeatedly
+    off the device-bounded counter; every other FP8 THD case fits one unit per
+    cluster and never re-enters the K/V pipeline. FROST_THD_CLUSTERS pins the
+    grid to 4 clusters so the claim loop runs deep on any device."""
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
+    scale = 1.0 / math.sqrt(d_qk)
+    lens = [1024, 768, 512, 256]
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(lens, lens, 8, 8, "e4m3", scale=scale, causal=True, d_qk=d_qk, d_v=d_v)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -1070,3 +1232,229 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
     scale = 1.0 / math.sqrt(128)
     out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sync_debug=True)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+# ===========================================================================
+# d512 flavor (d_qk = d_v = 512) — per-tensor FP8 only.
+#
+# Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
+# runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
+# Blackwell K=32 QMMA step.  There is no d512 MXFP8 kernel and no Rubin d512
+# kernel, so this whole section is sm100-only.
+# ===========================================================================
+
+_skip_d512_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d512 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+_D512 = 512
+_D512_SCALE = 1.0 / math.sqrt(_D512)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_masks(in_key, mask):
+    """Every causal-family mask on the d512 FP8 flavor."""
+    out, o_ref, a_o, a_o_ref = _run(2, 4, 4, 256, 256, in_key, torch.float16, scale=_D512_SCALE, sdpa_kwargs=_MASKS[mask], d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_output_dtypes(in_key, out_key):
+    """DTYPE_O is independent of DTYPE_QKV on d512 too.  The BF16/FP16 arms
+    also exercise the byte-sized Q u O SMEM alias: a BPE_O=2 output is twice
+    the FP8 input's width, and an element-sized alias would overflow into the
+    P-transfer ring."""
+    out_dt = _OUT[out_key]
+    out, o_ref, a_o, a_o_ref = _run(1, 4, 4, 256, 256, in_key, out_dt, scale=_D512_SCALE, sdpa_kwargs={}, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, out_dt, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_sink():
+    """Attention sink on d512: one extra softmax column with V = 0."""
+    sink = torch.randn(1, 8, 1, 1, device="cuda", dtype=torch.float32)
+    out, o_ref, a_o, a_o_ref = _run(1, 8, 8, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, sink=sink, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("h_q,h_kv", [(8, 2), (8, 1)], ids=["g4", "mqa"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_gqa(h_q, h_kv):
+    """Grouped / multi-query attention on d512."""
+    out, o_ref, a_o, a_o_ref = _run(2, h_q, h_kv, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_padded_kv():
+    """Per-batch KV padding (seq_len_kv) on d512: KV columns past the batch's
+    valid length are masked, so every query row keeps a well-defined
+    normalization."""
+    out, o_ref, a_o, a_o_ref = _run(2, 4, 4, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs={}, seq_lens_kv=[200, 137], d_qk=_D512, d_v=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_stats():
+    """generate_stats on d512: the dense LSE matches the natural-log reference."""
+    r = _run(1, 4, 4, 256, 256, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), d_qk=_D512, d_v=_D512, return_lse=True)
+    _check(r.output, r.reference, torch.float16, "e4m3", r.amax, r.reference_amax)
+    diff = (r.stats.float() - r.reference_stats).abs().max().item()
+    assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_multi_tile():
+    """A shape that spans several Q tiles and several persistent waves, so the
+    scheduler ring, the S_acc parity ring (XFER_STAGES=3 at FP8) and the KV
+    ring (STAGES_KV=3) all wrap."""
+    out, o_ref, a_o, a_o_ref = _run(
+        2, 4, 4, 1024, 1024, "e4m3", torch.float16, scale=_D512_SCALE, sdpa_kwargs=dict(use_causal_mask=True), d_qk=_D512, d_v=_D512
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+# --- d512 THD / varlen -----------------------------------------------------
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd(in_key, causal):
+    """THD/varlen self-attention on d512: two packed sequences of unequal,
+    tile-ragged length."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, in_key, scale=_D512_SCALE, causal=causal, d=_D512)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_cross_gqa():
+    """THD cross-attention on d512: unequal per-sequence Q and KV lengths with
+    unequal packed totals, under GQA."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", scale=_D512_SCALE, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_sink_stats():
+    """THD + sink + ragged Stats on d512 (packed token-major TH1 layout)."""
+    sink = torch.randn(1, 8, 1, 1, device="cuda", dtype=torch.float32)
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=_D512_SCALE, causal=True, sink=sink, stats=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    diff = (lse.float() - lse_ref).abs().max().item()
+    assert diff <= 5e-2, f"max|LSE-ref| = {diff:.4f}"
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_zero_len_kv():
+    """Zero-length KV and Q sequences on d512 (the d128 sibling's shapes).
+
+    The zero-KV sequence's rows are dead: the epilogue must return O := 0 /
+    LSE := -inf rather than the unwritten O TMEM, and those rows must not
+    poison amax_o -- which, on this flavor, is what the single select on the
+    row's scalar amax result guards.
+    """
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=_D512_SCALE, stats=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    # The whole ragged Stats buffer, live rows included -- not just the dead
+    # ones, or a wrong-but-finite LSE on the live sequences would pass.
+    torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2, equal_nan=False)
+    assert torch.equal(lse[:126], torch.full_like(lse[:126], float("-inf"))), "dead rows must report LSE = -inf"
+    # ... and a zero-length Q sequence, which contributes no tile at all.
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e5m2", scale=_D512_SCALE, d=_D512)
+    _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_thd_cu_seq_len():
+    """THD on d512 via the cu_seq_len prefix-sum length form."""
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", scale=_D512_SCALE, cu_lens=True, d=_D512)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+@pytest.mark.parametrize(
+    ("d_qk", "d_v"),
+    [(384, 448), (464, 368), (272, 272), (512, 496)],
+    ids=["d384_d448", "d464_d368", "d272", "d512_d496"],
+)
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
+    """The d512 flavor serves the (256, 512] head-dim band, d_qk != d_v included.
+
+    ENVELOPE semantics: the TMA descriptors carry the ACTUAL extents while the
+    tile box stays the compile-time 512 geometry, so Q/K loads past d_qk and V
+    loads past d_v hardware zero-fill (exact zero terms in QK^T and P.V, so S,
+    the softmax and O are bit-identical to the unpadded problem) and O stores
+    past d_v are OOB-clipped.  d % 16 at 1 byte/elem is the TMA 16-byte
+    global-stride rule.
+    """
+    out, o_ref, a_o, a_o_ref = _run(1, 4, 4, 256, 256, "e4m3", torch.float16, scale=1.0 / math.sqrt(d_qk), sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+def test_fp8_d512_envelope_floor_declines_below_256():
+    """Below the d512 floor the adapter declines instead of routing a much
+    smaller graph onto a kernel tuned for d = 512 (there is no d256 FP8
+    kernel, so d256 has no home -- that is the honest answer, not a 2x-padded
+    d512 launch).  Straddling the floor is declined too."""
+    from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
+
+    shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    for d_qk, d_v in [(384, 448), (464, 368), (272, 272), (512, 512)]:
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in [(256, 256), (160, 160), (384, 128), (512, 256)]:
+        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+
+
+@pytest.mark.L0
+def test_fp8_envelope_floor_matches_engine_row():
+    """The adapter's floor table and the engine row's must agree: the row
+    decides eligibility, the adapter picks the flavor, and a drift between them
+    is a plan that enters the ranked list only to die in the lowering."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import _SM100_FP8_ENVELOPE_FLOORS
+
+    row = {s.name: s.capabilities for s in engines.ENGINE_SPECS}[engines.engine_name(fp8=True)]
+    assert dict(row.d_envelope_floors) == _SM100_FP8_ENVELOPE_FLOORS
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+def test_fp8_d512_mxfp8_declines():
+    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
+    rejected up front, not fail late in the lowering."""
+    from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
+
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
+    assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))

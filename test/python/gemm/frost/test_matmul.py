@@ -131,14 +131,14 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     # sm120 (warp-scoped MMA, no cluster / no cta_group). Its arch range starts
     # at SM 10.0, so it runs on the Blackwell datacenter parts too. The family
     # is pinned to one geometry for now, so there is one entry to sweep.
-    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
 )
 
 _BATCHED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # rank-3 baseline
     "CONFIG_sm100_64x64x128_64x64x32_cluster2x2_1ctamma",  # rank-3 + TMA multicast
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # rank-3 + CTA_2 MMA
-    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",  # rank-3 on the warp-MMA family
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",  # rank-3 on the warp-MMA family
 )
 
 _BATCHED_SHAPES: tuple[tuple[int, int, int, int], ...] = (
@@ -181,7 +181,7 @@ _NONCANONICAL_LAYOUTS: tuple[tuple[str, str], ...] = tuple(p for p in _INPUT_LAY
 _NONPACKED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
 )
 _NONPACKED_LAYOUTS: tuple[tuple[str, str], ...] = (
     ("k", "k"),
@@ -273,9 +273,12 @@ def _compatible(
         )
     cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
-    # Each MMA instruction reads its own M sub-block of the SMEM tile, so the
-    # swizzle-group rule applies per MMA (== the whole extent at mma_size_m == 1).
-    mma_smem_m = cta_smem_m // cfg.mma_size_m
+    # Each tcgen05 MMA instruction reads its own M sub-block of the SMEM tile
+    # through its own descriptor, so the swizzle-group rule applies per MMA. A
+    # warp-scoped family (fixed mma tile: sm120) has no per-MMA descriptors --
+    # only the whole extent must cut into whole groups (the TMA group walk).
+    _per_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    mma_smem_m = cta_smem_m // _per_mma
     mma_smem_n = cta_smem_n
     if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
         return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
@@ -284,11 +287,16 @@ def _compatible(
     if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
     if cfg.pipeline == "sm120":
-        # v1 scope of the warp-scoped MMA template: K-major operands, N-major output.
-        if a_major != "k" or b_major != "k":
-            return False, f"sm120 reads K-major operands only, got A {a_major}-major / B {b_major}-major"
-        if out_major != "n":
-            return False, "sm120 stores N-major only"
+        # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
+        # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
+        # dtypes have no transposed load and must be K-major. (The n-frag pair
+        # rule for 8-bit N-major B is met by every catalog config, whose
+        # warp_tile_n = mma_size_n * 16.)
+        in_bits = 4 if in_dtype == "fp4_e2m1" else in_eb * 8
+        if in_bits not in (16, 8) and (a_major == "m" or b_major == "n"):
+            return False, (
+                f"sm120 MN-major operands are 16- or 8-bit only (ldmatrix.trans " f"b16 / m16n16.b8), got {in_dtype} A {a_major}-major / B {b_major}-major"
+            )
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
@@ -1173,6 +1181,10 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
+    from cudnn.gemm.frost.epilogue_codegen import generate
+
+    dual_epi = generate(chain, vec_bytes_epi=64, output_elem_bytes=1, tma_slots=frozenset({0, 1})).epilogue
+    assert dual_epi.index("_q1_lane") < dual_epi.index("_q0_frg"), "retire the register-heavy col quant before row quant"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q_row = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
@@ -2468,8 +2480,11 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     # sm103 pins the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
     # mma_tile_m % 128 == 0) and does not split (MMA_SIZE_M_MAX = 1).
     assert {c.mma_tile_m for c in CATALOG if c.pipeline == "sm103"} == {128}
-    # sm120's warp-scoped MMA has no M-split axis: its two M values are whole tiles.
-    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"} == {2}
+    # sm120's warp-scoped MMA has no M-split axis: mma_size_m IS the warp
+    # tile's fragment count, one value per swept warp-tile height.
+    sm120_axis = {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"}
+    assert sm120_axis == {c.warp_tile_m // 16 for c in CATALOG if c.pipeline == "sm120"}
+    assert {1, 2} <= sm120_axis
     assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2}
     assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm103"} == {1}
     # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
@@ -2479,7 +2494,9 @@ def test_catalog_enumerates_the_mma_m_axis() -> None:
     A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
     B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
     g.matmul(A=A, B=B, name="mm").set_output(True)
-    assert {cfg.mma_size_m for _t, cfg in candidates(analyze(g))} == {1, 2}
+    # Split tiles reach the funnel: whichever families serve THIS device, the
+    # candidates carry more than the unsplit tile.
+    assert {1, 2} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
 
 
 @pytest.mark.parametrize(
@@ -2903,23 +2920,30 @@ def test_epi_n_divides_the_drain_width() -> None:
     assert seen_non_pow2_tile, "the catalog no longer carries a non-power-of-2 drain width — the test is vacuous"
 
 
-def test_the_auto_path_never_picks_a_non_power_of_two_tile() -> None:
-    """`select_config` scores N only over {32,64,128,256}, so the widths the
-    divisor rule newly admits are reachable through a forced config, not through
-    the engine's own choice."""
-    from cudnn.gemm.frost.tile_config import select_config
+def test_the_auto_path_only_picks_catalog_widths() -> None:
+    """`select_config` now scans every hardware-legal N width (multiples of 32
+    up to 256) on the plain single-GEMM path — the widths the epilogue divisor
+    rule admits are the engine's own choices there, not just forced configs.
+    The CONSTRAINED paths keep the power-of-two ladder: block-scale needs
+    cta_n % 128 == 0 and multi-GEMM squeezes a shared power-of-two budget."""
+    from cudnn.gemm.frost.tile_config import by_name, select_config
 
-    widths = set()
+    widths, constrained_widths = set(), set()
     for M in (64, 128, 512, 4096, 16384):
         for N in (64, 128, 512, 4096, 11008):
             for num_gemms in (1, 2, 3):
                 for block_scale in (False, True):
                     try:
-                        widths.add(select_config(M, N, num_gemms=num_gemms, block_scale=block_scale).cta_tile_n)
+                        cfg = select_config(M, N, num_gemms=num_gemms, block_scale=block_scale)
                     except NotImplementedError:
-                        pass
+                        continue
+                    by_name(cfg.name)  # every auto pick must resolve in the catalog
+                    widths.add(cfg.cta_tile_n)
+                    if num_gemms > 1 or block_scale:
+                        constrained_widths.add(cfg.cta_tile_n)
     assert widths, "select_config produced nothing — the sweep is vacuous"
-    assert all(w & (w - 1) == 0 for w in widths), sorted(widths)
+    assert all(32 <= w <= 256 and w % 32 == 0 for w in widths), sorted(widths)
+    assert all(w & (w - 1) == 0 for w in constrained_widths), sorted(constrained_widths)
 
 
 def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
@@ -3157,43 +3181,55 @@ def test_sm120_registry_wiring() -> None:
 
 
 def test_sm120_tile_config_family() -> None:
-    """ConfigSm120: the family is PINNED to one geometry for now, and it pins
-    rather than validates -- a config crossing in from another family
-    (``as_pipeline``, which the auto path uses on an SM 12.x part) is rewritten
-    to it instead of being rejected, so no caller needs sm120 knowledge."""
+    """ConfigSm120: the geometry axes (CTA tile, K width, warp grid) are real,
+    swept, VALIDATED choices; only the family facts are enforced (16x16x32B
+    warp-MMA pair, no CGA, no warp-level K split, block >= compute grid + 2).
+    The warp grid is ALWAYS named via a ``_warpsMxN`` suffix -- an unsuffixed
+    spelling implies nothing and is rejected."""
     from cudnn.gemm.frost.tile_config import as_pipeline
 
     sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
-    assert len(sm120) == 1
-    (cfg,) = sm120
-    assert isinstance(cfg, ConfigSm120)
-    assert cfg.name == "CONFIG_sm120_128x128x128_16x16x32_cluster1x1"
+    assert len(sm120) > 100  # the swept family
+    assert all(isinstance(c, ConfigSm120) for c in sm120)
+    assert len({c.name for c in sm120}) == len(sm120)  # names stay unique
 
-    # The warp tile is a REAL level here: the CTA tile is split over a 4x2
-    # compute-warp grid, which is what makes sm120 different from the tcgen05
-    # families (where a warp tile is the CTA tile).
+    # The default-grid flagship keeps its historical name and geometry.
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     assert (cfg.cta_tile_m, cfg.cta_tile_n, cfg.cta_tile_k_bytes) == (128, 128, 128)
     assert (cfg.warp_tile_m, cfg.warp_tile_n, cfg.warp_tile_k_bytes) == (32, 64, 128)
-    # mma.sync is m16n8; the template issues two along N and treats the pair as
-    # one 16x16 instruction.
     assert (cfg.mma_tile_m, cfg.mma_tile_n, cfg.mma_tile_k_bytes) == (16, 16, 32)
     assert cfg.mma_size_m == 2  # == the template's _M_FRAGS
     assert cfg.cga_size_mn == (1, 1) and cfg.warps_per_cta == 12 and cfg.threads_per_cta == 384
     # The CTA pair is not an axis here at all -- reading it is an error, not a 1.
     assert not hasattr(cfg, "cta_group")
-
-    # Every axis is pinned, so a name that spells a different one round-trips
-    # to the pinned config and is rejected as non-canonical.
-    with pytest.raises(KeyError, match="round-trips"):
-        by_name("CONFIG_sm120_128x256x128_16x16x32_cluster1x1")
-    with pytest.raises(KeyError, match="round-trips"):
-        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster2x1")
-
-    # as_pipeline: an sm100 auto pick crosses over and lands on the pinned one.
-    conv = as_pipeline(by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"), "sm120")
-    assert isinstance(conv, ConfigSm120) and conv.name == cfg.name
-
     assert _resolve(cfg.name) is cfg
+
+    # A non-default warp grid is a REAL axis: named, resolvable, and the fields
+    # actually carry the passed geometry.
+    g81 = by_name("CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps8x1")
+    assert (g81.warp_tile_m, g81.warp_tile_n) == (32, 128)
+    assert (g81.mma_size_m, g81.mma_size_n) == (2, 8)
+    assert (g81.mma_tile_m, g81.mma_tile_n, g81.mma_tile_k_bytes) == (16, 16, 32)
+    assert by_name(g81.name) is g81 and g81.name.endswith("_warps8x1")
+
+    # The grid is NEVER implied: an unsuffixed sm120 spelling round-trips to
+    # its explicit `_warps1x1` reading and is rejected as non-canonical; family
+    # facts reject cleanly.
+    with pytest.raises(KeyError, match="round-trips"):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    with pytest.raises(NotImplementedError, match="no CGA"):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster2x1")
+    with pytest.raises(NotImplementedError):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps3x3")
+
+    # as_pipeline: an sm100 auto pick crosses over faithfully (CTA tile kept,
+    # family axes snapped). A tile the family cannot hold raises -- fine, since
+    # the only caller is the auto path and select_config never picks one.
+    conv = as_pipeline(by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"), "sm120")
+    assert isinstance(conv, ConfigSm120) and conv.cta_tile_mn == (128, 256)
+    assert conv.cga_size_mn == (1, 1) and (conv.mma_tile_m, conv.mma_tile_n) == (16, 16)
+    with pytest.raises(NotImplementedError):
+        as_pipeline(by_name("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma"), "sm120")
 
 
 def test_sm120_template_routing() -> None:
@@ -3203,7 +3239,7 @@ def test_sm120_template_routing() -> None:
     from cudnn.gemm.frost.tile_config import replace
 
     chain = analyze(_build_graph(256, 256, 128, "bf16", "bf16"))
-    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     assert select_template(chain, cfg).file == "sm120_matmul.py"
     # A 2-CTA sm120 config is not constructible: ConfigSm120 declares no
     # cta_group field at all, so the mode is not an axis here rather than an
@@ -3217,27 +3253,33 @@ def test_sm120_template_routing() -> None:
 
 
 def test_sm120_scope_gates() -> None:
-    """The v1 scope contract rejects through the registry (never a template
-    AssertionError mid-render): K-major-only inputs, N-major output, and a
-    pair-storable epilogue chunk."""
+    """The scope contract rejects through the registry (never a template
+    AssertionError mid-render): all eight major combinations pass for both
+    16-bit inputs (b16 ldmatrix.trans) and 8-bit inputs (byte-granule
+    ldmatrix.m16n16.trans.b8), and an N-major output needs a pair-storable
+    epilogue chunk."""
     from cudnn.gemm.frost.kernel_registry import select_template
 
-    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     tmpl = select_template(analyze(_build_graph(256, 256, 128, "bf16", "bf16")), cfg)
 
-    def scope_reject(**graph_kw):
-        return tmpl._extra_reject(analyze(_build_graph(256, 256, 128, "bf16", "bf16", **graph_kw)), cfg)
+    def scope_reject(in_dt="bf16", **graph_kw):
+        return tmpl._extra_reject(analyze(_build_graph(256, 256, 128, in_dt, "bf16", **graph_kw)), cfg)
 
-    assert scope_reject() is None
-    assert "K-major" in scope_reject(a_major="m")
-    assert "K-major" in scope_reject(b_major="n")
-    assert "N-major" in scope_reject(out_major="m")
+    # 16-bit and 8-bit inputs: every major combination is in scope.
+    for in_dt in ("bf16", "fp8_e4m3"):
+        for a_major in ("k", "m"):
+            for b_major in ("k", "n"):
+                for out_major in ("n", "m"):
+                    assert scope_reject(in_dt=in_dt, a_major=a_major, b_major=b_major, out_major=out_major) is None, (in_dt, a_major, b_major, out_major)
+    assert scope_reject(in_dt="fp8_e5m2", a_major="m", b_major="n") is None
 
-    # the funnel never offers sm120 points for an out-of-scope chain
+    # the funnel offers sm120 points for MN-major 16-bit AND 8-bit chains
     from cudnn.gemm.frost.kernel_registry import candidates
 
-    nmaj = analyze(_build_graph(256, 256, 128, "bf16", "bf16", b_major="n"))
-    assert not [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"]
+    for in_dt in ("bf16", "fp8_e4m3"):
+        nmaj = analyze(_build_graph(256, 256, 128, in_dt, "bf16", a_major="m", b_major="n"))
+        assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"], in_dt
 
 
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
@@ -3247,9 +3289,9 @@ def test_sm120_epi_vec_clamp_and_stg_only() -> None:
 
     chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
     for name in (
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
     ):
         c = by_name(name)
         v = _epi_vec_bytes(chain, c)
@@ -3263,7 +3305,78 @@ def test_sm120_epi_vec_clamp_and_stg_only() -> None:
 
     # 8B-aligned output rows (N=100 bf16) narrow the chunk to 4 elements
     narrow = analyze(_build_graph(256, 100, 256, "bf16", "bf16"))
-    assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")) == 8
+    assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")) == 8
+
+
+@pytest.mark.parametrize(
+    "a_major,b_major,out_major",
+    [(a, b, o) for a in ("k", "m") for b in ("k", "n") for o in ("n", "m")],
+    ids=[f"A{a}_B{b}_C{o}" for a in ("k", "m") for b in ("k", "n") for o in ("n", "m")],
+)
+def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> None:
+    """All eight A/B/output major combinations through the sm120 template on one
+    tail-heavy shape. The layout sweeps cover five of the eight; this pins the
+    three (MN-major input x M-major output) crosses they miss."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    M, N, K = 192, 192, 160
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major, b_major, out_major)
+    if not ok:
+        pytest.skip(reason)
+    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16", a_major, b_major, out_major), config=cfg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major, b_major=b_major, out_major=out_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    ref = _reference(a, b, "bf16")
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance("bf16", "bf16")
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  layout:    A{a_major}/B{b_major}/C{out_major}"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps1x8",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps8x1",
+        "CONFIG_sm120_256x128x64_16x16x32_cluster1x1_warps8x1",
+        "CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps2x4",
+    ],
+    ids=lambda n: n.removeprefix("CONFIG_sm120_"),
+)
+@pytest.mark.parametrize("a_major", ["k", "m"], ids=["Ak", "Am"])
+def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
+    """The warp grid is a real geometry axis: every grid (and a non-flagship
+    CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
+    the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
+    M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
+    if _current_arch() != 120:
+        pytest.skip(f"sm120-host-only matrix (running on sm_{_current_arch()})")
+    cfg = _resolve(config_name)
+    M, N, K = 192, 192, 160
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)
+    if not ok:
+        pytest.skip(reason)
+    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16", a_major=a_major), config=cfg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    ref = _reference(a, b, "bf16")
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance("bf16", "bf16")
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name} A-{a_major}-major"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
 
 
 def test_sm120_render_smoke() -> None:
@@ -3274,19 +3387,21 @@ def test_sm120_render_smoke() -> None:
     from cudnn.gemm.frost.compiler import _render_template
     from cudnn.gemm.frost.epilogue_codegen import generate
 
-    chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
-    for name in (
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",
-        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1",  # odd n-frag tail
-    ):
-        cfg = by_name(name)
-        vec = _epi_vec_bytes(chain, cfg)
-        snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2)  # empty tma_slots == STG everywhere
-        src = _render_template(chain, snippets, cfg)
-        assert "@@" not in src, "leftover injection markers"
-        ast.parse(src)
-        assert "cudnn_frost_sm120_matmul_" in src
-        assert "threads_per_cta = 384" in src
-        assert f"vec_bytes_epi = {vec}" in src
-        assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"
-        assert "tma_c_desc" not in src, "TMA-store arm must be stripped"
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    for a_major in ("k", "m"):
+        for b_major in ("k", "n"):
+            for out_major in ("n", "m"):
+                chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16", a_major=a_major, b_major=b_major, out_major=out_major))
+                vec = _epi_vec_bytes(chain, cfg)
+                snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2)  # empty tma_slots == STG everywhere
+                src = _render_template(chain, snippets, cfg)
+                combo = (a_major, b_major, out_major)
+                assert "@@" not in src, f"leftover injection markers {combo}"
+                ast.parse(src)
+                assert "frost_sm120_matmul_" in src
+                assert "threads_per_cta = 384" in src
+                assert f"vec_bytes_epi = {vec}" in src
+                assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"
+                assert "tma_c_desc" not in src, "TMA-store arm must be stripped"
+                assert f"a_is_m_major = {a_major == 'm'}" in src, combo
+                assert f"b_is_n_major = {b_major == 'n'}" in src, combo

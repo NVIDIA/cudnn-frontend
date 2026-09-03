@@ -16,11 +16,14 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 
 from . import _interface_sm100 as _iface_sm100
 
 
 class SparseAttentionBackward(APIBase):
+    """Validated architecture-dispatch wrapper for DSA backward."""
+
     def __init__(
         self,
         sample_q: torch.Tensor,  # (total_S_q, H, D) FP16/BF16
@@ -35,7 +38,9 @@ class SparseAttentionBackward(APIBase):
         sample_topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
+        deterministic: bool = False,
     ):
+        """Capture the sample tensor contract and execution policy."""
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
         self.kv_desc = self._make_tensor_desc(sample_kv, name="sample_kv")
@@ -47,8 +52,10 @@ class SparseAttentionBackward(APIBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
+        self.deterministic = bool(deterministic)
 
     def check_support(self) -> bool:
+        """Validate the device, dtype, shape, and deterministic contracts."""
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major < 9,
@@ -107,6 +114,10 @@ class SparseAttentionBackward(APIBase):
         # coordinates derived from Q, so a mismatched shape silently reads or
         # writes out of place at execution time instead of failing.
         total_s_q, num_heads, head_dim = self.q_desc.shape
+        self._value_error_if(
+            self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
+            f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
+        )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
         # layout that indexes shared memory out of bounds and crashes.
@@ -155,6 +166,22 @@ class SparseAttentionBackward(APIBase):
         # Priming requires real tensors, so compilation is deferred to execute().
         self._compiled_kernel = True
 
+    def scratch_workspace_bytes(self) -> int:
+        """Return reusable per-execution scratch for the selected backend."""
+        self._ensure_support_checked()
+        major, _ = torch.cuda.get_device_capability(self.q_desc.device)
+        if major == 9:
+            return 0
+        total_s_q, num_heads, head_dim = self.q_desc.shape
+        total_s_kv = self.kv_desc.shape[0]
+        return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
+            total_s_q,
+            total_s_kv,
+            head_dim,
+            num_heads,
+            self.deterministic,
+        )
+
     def execute(
         self,
         q: torch.Tensor,
@@ -169,7 +196,9 @@ class SparseAttentionBackward(APIBase):
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch one validated execution to the active GPU architecture."""
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:
@@ -202,6 +231,8 @@ class SparseAttentionBackward(APIBase):
             topk_length=topk_length,
             dq=dq,
             dkv=dkv,
+            deterministic=self.deterministic,
+            workspace=workspace,
             current_stream=current_stream,
         )
 
@@ -222,12 +253,16 @@ def sparse_attention_backward_wrapper(
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
     block_tile: int = 64,
+    deterministic: bool = False,
     stream: Optional[cuda.CUstream] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
-    ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+    ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
+    ``deterministic=True`` for bitwise-reproducible
+    H16/H32/H64/H96/H128 gradients on SM100.
     """
     key = (
         q.dtype,
@@ -241,6 +276,7 @@ def sparse_attention_backward_wrapper(
         topk_length is not None,
         int(block_tile),
         softmax_scale,
+        bool(deterministic),
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -255,10 +291,18 @@ def sparse_attention_backward_wrapper(
             sample_topk_length=topk_length,
             softmax_scale=softmax_scale,
             block_tile=block_tile,
+            deterministic=deterministic,
         )
         assert obj.check_support()
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
+
+    launch_stream = resolve_stream(stream)
+    if workspace is None:
+        workspace_bytes = obj.scratch_workspace_bytes()
+        if workspace_bytes:
+            with torch_stream_context(launch_stream):
+                workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
 
     dq_out, dkv_out, d_sink_out = obj.execute(
         q,
@@ -272,6 +316,7 @@ def sparse_attention_backward_wrapper(
         dkv=dkv,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
-        current_stream=stream,
+        workspace=workspace,
+        current_stream=launch_stream,
     )
     return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)

@@ -22,7 +22,8 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + dGLU (Unified)](gemm_fusions/grouped_gemm_dglu.md)
 - [Grouped GEMM + SwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_swiglu.md)
 - [Grouped GEMM + dSwiGLU (Legacy, Contiguous-only)](gemm_fusions/grouped_gemm_dswiglu.md)
-- [Grouped GEMM + sReLU (Unified)](gemm_fusions/grouped_gemm_srelu.md)
+- [Grouped GEMM + sReLU (Unified)](gemm_fusions/grouped_gemm_srelu.md) — optionally tanh
+  soft-clamped via `tanh_clamp_scale`
 - [Grouped GEMM + dsReLU (Unified)](gemm_fusions/grouped_gemm_dsrelu.md)
 - [Discrete Grouped GEMM + SwiGLU](gemm_fusions/discrete_grouped_gemm_swiglu.md)
 - [Discrete Grouped GEMM + dSwiGLU](gemm_fusions/discrete_grouped_gemm_dswiglu.md)
@@ -31,6 +32,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
 - [DeepSeek Sparse Attention (DSA)](dsa.md)
+- [Flex Attention](attention/flex_attention.md)
 - [HSTU Attention (Blackwell SM100/SM103)](attention/hstu.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
@@ -56,7 +58,9 @@ After installation, you can import the APIs directly from the `cudnn` package, i
 
 ## API Usage
 
-Each operation exposes two APIs:
+Most compiler-style operations expose the following two APIs. Functional
+autograd integrations such as BSA and Flex Attention instead document their
+own wrapper and reusable-plan lifecycle on their operation pages.
 
 ### 1. High-level wrapper
 

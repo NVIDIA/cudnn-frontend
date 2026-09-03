@@ -651,9 +651,7 @@ def recompute_w_u_fwd_kernel(
     beta_seg = beta.slice(axis=0, start=bos, stop=eos)
 
     Z = ct.PaddingMode.ZERO
-    # Keep Beta native bf16: scaling in bf16 avoids 2 extra ftof
-    # converts/MMA-input that an f32 cast would force.
-    b_b = ct.load(beta_seg, index=(i_t_loc, i_h), shape=(BT, 1), padding_mode=Z).reshape((BT,))
+    b_b = ct.astype(ct.load(beta_seg, index=(i_t_loc, i_h), shape=(BT, 1), padding_mode=Z).reshape((BT,)), ct.float32)
     b_A = ct.load(A_seg, index=(i_t_loc, i_h, 0), shape=(BT, 1, BT), padding_mode=Z).reshape((BT, BT))
 
     # U = A @ (V * Beta). latency=3 -> deeper pipeline of the per-tile TMA loads.

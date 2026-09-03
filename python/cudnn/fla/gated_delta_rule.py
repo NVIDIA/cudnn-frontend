@@ -88,10 +88,9 @@ def _to_native(
         if a_log_t.shape[0] != HO or dt_bias_t.shape[0] != HO:
             raise _Decline("a_log/dt_bias head count does not match HO=max(H,HV)")
 
-    # g is always fp32 (raw logits under safe_gate, else FLA's precomputed log decay).
-    # beta is io-dtype logits when the kernel applies the sigmoid, else fp32 post-activation.
-    g = g.float()
-    beta = beta.to(q.dtype) if use_beta_sigmoid_in_kernel else beta.float()
+    # beta is io-dtype logits when the kernel applies the sigmoid; post-activation beta rides as given.
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.to(q.dtype)
 
     def thd(t):
         # FLA's fused QKV short-conv returns one compact [B,T,Q+K+V]
@@ -104,7 +103,7 @@ def _to_native(
     if g2.shape[-1] != HO or beta2.shape[-1] != HO:
         raise _Decline("g/beta head count does not match HO=max(H,HV)")
 
-    h0 = None if initial_state is None else initial_state.float().contiguous()
+    h0 = None if initial_state is None else initial_state.contiguous()
     o, fs = gated_delta_net(
         thd(q),
         thd(k),

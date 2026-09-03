@@ -208,8 +208,10 @@ def test_bwd_engine_end_to_end():
     dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
     statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT)
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
+    # Output layout is honored only when DECLARED (the graph invariant:
+    # IR-inferred output strides are provisional) — bind BSHD-physical.
     for t in (dq, dk, dv):
-        t.set_output(True).set_data_type(_HALF)
+        t.set_output(True).set_data_type(_HALF).set_stride(st)
     _native_then_pin(gb, _BWD)
 
     do_buf = _buf()
@@ -358,8 +360,10 @@ def test_engine_execute_does_not_allocate():
     dob = gb.tensor(name="dO", dim=(B, H, S, D), stride=st, data_type=_HALF)
     statsb = gb.tensor(name="stats", dim=(B, H, S, 1), stride=stats_stride, data_type=cudnn.data_type.FLOAT)
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
-    for t in (dq, dk, dv):
-        t.set_output(True).set_data_type(_HALF)
+    # Declared BSHD-physical output layouts (IR-inferred strides are provisional).
+    dq.set_output(True).set_data_type(_HALF).set_stride(st)
+    dk.set_output(True).set_data_type(_HALF).set_stride(st_kv)
+    dv.set_output(True).set_data_type(_HALF).set_stride(st_kv)
     _native_then_pin(gb, _BWD)
     assert gb.get_workspace_size() > 0, "the SM80 bwd executor must report its carved scratch"
     do_buf = _buf()

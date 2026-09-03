@@ -2391,8 +2391,11 @@ _install_pointwise_builders()
 #   attrs              scalar/enum/list params stored in node.params verbatim
 #                      and forwarded as keywords at lowering
 #   outputs            output ports, in C++ return order
+#   maybe              per-output presence predicate over the node (an output
+#                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
 #   no_cdt             True for bindings without a compute_data_type kwarg
@@ -2481,6 +2484,12 @@ def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
     return [v[0], max(q[1], v[1]), v[2]]
+
+
+def _gdp_o_dims(node):
+    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    return [q[0], max(q[1], v[1]), v[2]]
 
 
 def _block_quant_scale_dims(node):
@@ -2642,7 +2651,16 @@ _STRUCTURED_OPS = {
     "gdn": dict(
         node_type=NodeType.GDN,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "batch_invariant",
+        ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
@@ -2654,7 +2672,7 @@ _STRUCTURED_OPS = {
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "batch_invariant"),
+        attrs=("scale", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
@@ -2671,6 +2689,61 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
+        python_only=True,
+    ),
+    "gdp": dict(
+        node_type=NodeType.GDP,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "batch_invariant",
+        ),
+        outputs=("O", "final_state", "state_checkpoints"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _gdp_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        python_only=True,
+    ),
+    "gdp_bwd": dict(
+        node_type=NodeType.GDP_BWD,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        attrs=(
+            "num_householder",
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "batch_invariant",
+        ),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
+        maybe={
+            "d_initial_state": lambda n: "initial_state" in n.inputs,
+            "d_a_log": lambda n: bool(n.params.get("safe_gate", False)),
+            "d_dt_bias": lambda n: bool(n.params.get("safe_gate", False)),
+        },
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "d_initial_state": _like("initial_state"),
+            "d_a_log": _like("a_log"),
+            "d_dt_bias": _like("dt_bias"),
+        },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
     "kda": dict(
@@ -2682,6 +2755,7 @@ _STRUCTURED_OPS = {
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
             "use_beta_sigmoid",
+            "allow_neg_eigval",
             "safe_gate",
             "gate_lower_bound",
             "batch_invariant",
@@ -2697,7 +2771,16 @@ _STRUCTURED_OPS = {
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
@@ -2714,6 +2797,7 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
     "gdn2": dict(
@@ -2725,6 +2809,7 @@ _STRUCTURED_OPS = {
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
             "use_beta_sigmoid",
+            "allow_neg_eigval",
             "beta_guard",
             "safe_gate",
             "gate_lower_bound",
@@ -2741,7 +2826,17 @@ _STRUCTURED_OPS = {
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
-        attrs=("scale", "use_qk_l2norm", "use_beta_sigmoid", "beta_guard", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "scale",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "beta_guard",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
             "d_initial_state": lambda n: "initial_state" in n.inputs,
@@ -2759,6 +2854,7 @@ _STRUCTURED_OPS = {
             "d_a_log": _like("a_log"),
             "d_dt_bias": _like("dt_bias"),
         },
+        dtype_like={"d_initial_state": "initial_state", "d_a_log": "a_log", "d_dt_bias": "dt_bias"},
         python_only=True,
     ),
     # ---- convolution ---------------------------------------------------------

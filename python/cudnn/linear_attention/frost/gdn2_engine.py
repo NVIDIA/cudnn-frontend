@@ -52,32 +52,43 @@ class Gdn2FrostEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         frost_la_gate("Gdn2FrostEngine", facts, "GDN2")
+        if facts.d_qk not in (64, 128):
+            raise NotImplementedError(f"Gdn2FrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
+        if facts.d_v not in (64, 128):
+            raise NotImplementedError(f"Gdn2FrostEngine: v head dim must be 64 or 128, got {facts.d_v}")
+        if facts.gate_channels != facts.d_qk:
+            raise NotImplementedError(f"Gdn2FrostEngine: g must carry d_qk = {facts.d_qk} channels, got {facts.gate_channels}")
         checkpoint = facts.checkpoint_every_n_tokens
-        if checkpoint and (facts.is_bwd or checkpoint % 16 != 0):
-            raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the GDN-2 node (got {checkpoint})")
+        if checkpoint and checkpoint % 16 != 0:
+            raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 (got {checkpoint})")
         if not facts.gates_at_ho:
             raise NotImplementedError(f"Gdn2FrostEngine: g/beta/w must carry HO = max(q, v) heads ({facts.h_o})")
         if facts.beta_guard and not facts.use_qk_l2norm:
             raise NotImplementedError("Gdn2FrostEngine: beta_guard requires use_qk_l2norm (the sensor is defined on the normalized key)")
-        fp32 = cudnn.data_type.FLOAT
         if facts.io_dtype is not None:
             for port, got in (("beta", facts.beta_dtype), ("w", facts.w_dtype)):
                 if got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the io dtype, got {got}")
+        gate_param_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
-            if got not in (fp32, None):
-                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32, got {got}")
+            if got not in gate_param_dtypes + (None,):
+                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16/fp16, got {got}")
+        state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+        for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
+            if got not in state_dtypes + (None,):
+                raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16, got {got}")
         if facts.is_bwd:
-            for port, got in (
-                ("d_a_log", facts.d_a_log_dtype),
-                ("d_dt_bias", facts.d_dt_bias_dtype),
-                ("initial_state", facts.state_dtype),
-                ("d_final_state", facts.d_final_state_dtype),
-                ("d_initial_state", facts.d_initial_state_dtype),
-                ("dG", facts.dg_dtype),
-            ):
-                if got not in (fp32, None):
-                    raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32, got {got}")
+            for port, got, want in (("d_a_log", facts.d_a_log_dtype, facts.a_log_dtype), ("d_dt_bias", facts.d_dt_bias_dtype, facts.dt_bias_dtype)):
+                if got not in (want, None):
+                    raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match its parameter dtype ({want}), got {got}")
+            state_grad_want = facts.state_dtype if facts.state_dtype is not None else cudnn.data_type.FLOAT
+            for port, got in (("d_final_state", facts.d_final_state_dtype), ("d_initial_state", facts.d_initial_state_dtype)):
+                if got not in (state_grad_want, None):
+                    raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the state dtype ({state_grad_want}), got {got}")
+            if facts.wants_d_initial_state and facts.d_initial_state_dtype is None:
+                raise NotImplementedError(f"Gdn2FrostEngine: 'd_initial_state' must mirror initial_state ({state_grad_want}), got an unset dtype")
+            if facts.dg_dtype not in (facts.g_dtype, None):
+                raise NotImplementedError(f"Gdn2FrostEngine: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
             for port, got in (
                 ("dO", facts.do_dtype),
                 ("state_checkpoints", facts.state_checkpoints_dtype),
@@ -86,19 +97,12 @@ class Gdn2FrostEngine(BaseEngine):
             ):
                 if facts.io_dtype is not None and got not in (facts.io_dtype, None):
                     raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must match the io dtype, got {got}")
-        else:
-            state_dtypes = (fp32, cudnn.data_type.BFLOAT16)
-            for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-                if got not in state_dtypes + (None,):
-                    raise NotImplementedError(f"Gdn2FrostEngine: '{port}' must be fp32/bf16, got {got}")
-            if facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-                raise NotImplementedError("Gdn2FrostEngine: 'state_checkpoints' must match the io dtype")
+        elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError("Gdn2FrostEngine: 'state_checkpoints' must match the io dtype")
         if not facts.state_pair_match:
             raise NotImplementedError("Gdn2FrostEngine: initial_state and final_state dtypes must match")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        # Bake the plan for the handle's device (via ctx), not the ambient one; a
-        # foreign raw-int handle (or none) carries no device -> None -> current.
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):
@@ -123,9 +127,10 @@ class CompiledGdn2:
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
         self.beta_guard = bool(node.params.get("beta_guard", False))
-        glb = node.params.get("gate_lower_bound")
-        self.gate_lower_bound = float(glb) if glb is not None else kernel_module.DEFAULT_GATE_LOWER_BOUND
+        gate_lower_bound = node.params.get("gate_lower_bound")
+        self.gate_lower_bound = float(gate_lower_bound) if gate_lower_bound is not None else kernel_module.DEFAULT_GATE_LOWER_BOUND
         self.has_final_state = "final_state" in node.outputs
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
@@ -178,34 +183,34 @@ class CompiledGdn2:
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
-        self.iq = pos["q"]
-        self.ik = pos["k"]
-        self.iv = pos["v"]
-        self.ig = pos["g"]
-        self.ibeta = pos["beta"]
-        self.iw = pos["w"]
-        self.icu = pos["cu_seqlens"]
-        self.is0 = pos.get("initial_state")
-        self.io_ = pos["O"]
-        self.ifs = pos.get("final_state")
-        self.ick = pos.get("state_checkpoints")
-        self.ia_log = pos.get("a_log")
-        self.idt_bias = pos.get("dt_bias")
+        self.index_q = pos["q"]
+        self.index_k = pos["k"]
+        self.index_v = pos["v"]
+        self.index_g = pos["g"]
+        self.index_beta = pos["beta"]
+        self.index_w = pos["w"]
+        self.index_cu_seqlens = pos["cu_seqlens"]
+        self.index_initial_state = pos.get("initial_state")
+        self.index_o = pos["O"]
+        self.index_final_state = pos.get("final_state")
+        self.index_state_checkpoints = pos.get("state_checkpoints")
+        self.index_a_log = pos.get("a_log")
+        self.index_dt_bias = pos.get("dt_bias")
 
     def run(self, views, workspace, stream) -> None:
-        q = views[self.iq]
-        k = views[self.ik]
-        v = views[self.iv]
-        g = views[self.ig]
-        beta = views[self.ibeta]
-        w = views[self.iw]
-        cu = views[self.icu]
-        state0 = views[self.is0] if self.is0 is not None else None
-        o = views[self.io_]
-        final_state = views[self.ifs] if self.ifs is not None else None
-        state_checkpoints = views[self.ick] if self.ick is not None else None
-        a_log = views[self.ia_log] if self.ia_log is not None else None
-        dt_bias = views[self.idt_bias] if self.idt_bias is not None else None
+        q = views[self.index_q]
+        k = views[self.index_k]
+        v = views[self.index_v]
+        g = views[self.index_g]
+        beta = views[self.index_beta]
+        w = views[self.index_w]
+        cu = views[self.index_cu_seqlens]
+        state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
+        o = views[self.index_o]
+        final_state = views[self.index_final_state] if self.index_final_state is not None else None
+        state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
+        a_log = views[self.index_a_log] if self.index_a_log is not None else None
+        dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         stream = stream if stream is not None else 0
 
         if self.split:
@@ -288,6 +293,7 @@ class CompiledGdn2:
             a_log=a_log,
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
+            allow_neg_eigval=self.allow_neg_eigval,
             beta_guard=self.beta_guard,
             work_items=work_items,
             work_count=work_count,
@@ -328,15 +334,19 @@ class CompiledGdn2Bwd:
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
+        self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
         self.beta_guard = bool(node.params.get("beta_guard", False))
-        glb = node.params.get("gate_lower_bound")
-        self.gate_lower_bound = float(glb) if glb is not None else bwd_module.DEFAULT_GATE_LOWER_BOUND
+        gate_lower_bound = node.params.get("gate_lower_bound")
+        self.gate_lower_bound = float(gate_lower_bound) if gate_lower_bound is not None else bwd_module.DEFAULT_GATE_LOWER_BOUND
         self.gate_bwd_blocks = GATE_BWD_BLOCKS
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
         self.has_dstate0 = "d_initial_state" in node.outputs
 
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
         self.b_t = bwd_module.CFG.B_T
+        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.coarse_checkpoints = self.has_state_checkpoints and self.checkpoint_cadence > self.b_t
+        self.needs_recompute = not self.has_state_checkpoints or self.coarse_checkpoints
         total = q.dim[0]
         HQ, HV = q.dim[1], v.dim[1]
         HO = g.dim[1]
@@ -347,10 +357,8 @@ class CompiledGdn2Bwd:
         layout = WorkspaceLayout()
         self.off_scheduler = layout.add(16)
         self.num_sm = multiprocessor_count(current_device())
-        # dynamic always: static costs 2.5-10.5% at multi-wave tile counts and never wins (lyris job 2752338)
         self.bwd_dynamic_scheduling = True
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # cuts never in batch-invariant mode
         self.split = not self.batch_invariant
         self.n_tiles = B * HO
         if self.split:
@@ -365,11 +373,21 @@ class CompiledGdn2Bwd:
             self.off_item_scratch = layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4)
             self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
-        if not self.has_state_checkpoints:
+        if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
             self.recompute_tensormap_bytes = tensormap_workspace_bytes(recompute_module, B)
             self.off_recompute_tensormaps = layout.add(self.recompute_tensormap_bytes, align=128)
+        if self.coarse_checkpoints:
+            interval_chunks = self.checkpoint_cadence // self.b_t
+            span_chunks = interval_chunks
+            if not self.batch_invariant:
+                ideal = compute_ideal_chunks(total, g.dim[1], self.num_sm, self.b_t)
+                span_chunks = interval_chunks * max(1, ideal // interval_chunks)
+            self.recompute_span_tokens = span_chunks * self.b_t
+            self.recompute_item_rows = max((total // (self.b_t * span_chunks) + 2 * B) * g.dim[1], 1)
+            self.off_work_items_recompute = layout.add(self.recompute_item_rows * WORK_ITEM_FIELDS * 4)
+            self.off_work_count_recompute = layout.add(4)
         HK = node.inputs["k"].dim[1]
         self.fold_dq = HQ < HO
         self.fold_dk = HK < HO
@@ -399,9 +417,12 @@ class CompiledGdn2Bwd:
         if self.split:
             regions.append(("item_scratch", self.off_item_scratch, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", self.off_chunk_scratch, "float32", (self.chunk_scratch_rows, HO)))
-        if not self.has_state_checkpoints:
+        if self.needs_recompute:
             regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, V, K)))
             regions.append(("recompute_tensormaps", self.off_recompute_tensormaps, "int64", (self.recompute_tensormap_bytes // 8,)))
+        if self.coarse_checkpoints:
+            regions.append(("work_items_recompute", self.off_work_items_recompute, "int32", (self.recompute_item_rows, WORK_ITEM_FIELDS)))
+            regions.append(("work_count_recompute", self.off_work_count_recompute, "int32", (1,)))
         if self.fold_dq:
             regions.append(("dq_ho", self.off_dq_ho, self.io_name, (total, HO, K)))
         if self.fold_dk:
@@ -419,52 +440,52 @@ class CompiledGdn2Bwd:
 
     def bind(self, names) -> None:
         pos = {name: i for i, name in enumerate(names)}
-        self.iq = pos["q"]
-        self.ik = pos["k"]
-        self.iv = pos["v"]
-        self.ig = pos["g"]
-        self.ibeta = pos["beta"]
-        self.iw = pos["w"]
-        self.icu = pos["cu_seqlens"]
-        self.ido = pos["dO"]
-        self.ick = pos.get("state_checkpoints")
-        self.is0 = pos.get("initial_state")
-        self.idfs = pos.get("d_final_state")
-        self.idq = pos["dQ"]
-        self.idk = pos["dK"]
-        self.idv = pos["dV"]
-        self.idg = pos["dG"]
-        self.idb = pos["dBeta"]
-        self.idw = pos["dW"]
-        self.ids0 = pos.get("d_initial_state")
-        self.ia_log = pos.get("a_log")
-        self.idt_bias = pos.get("dt_bias")
-        self.ida_log = pos.get("d_a_log")
-        self.iddt_bias = pos.get("d_dt_bias")
+        self.index_q = pos["q"]
+        self.index_k = pos["k"]
+        self.index_v = pos["v"]
+        self.index_g = pos["g"]
+        self.index_beta = pos["beta"]
+        self.index_w = pos["w"]
+        self.index_cu_seqlens = pos["cu_seqlens"]
+        self.index_do = pos["dO"]
+        self.index_state_checkpoints = pos.get("state_checkpoints")
+        self.index_initial_state = pos.get("initial_state")
+        self.index_d_final_state = pos.get("d_final_state")
+        self.index_dq = pos["dQ"]
+        self.index_dk = pos["dK"]
+        self.index_dv = pos["dV"]
+        self.index_dg = pos["dG"]
+        self.index_dbeta = pos["dBeta"]
+        self.index_dw = pos["dW"]
+        self.index_d_initial_state = pos.get("d_initial_state")
+        self.index_a_log = pos.get("a_log")
+        self.index_dt_bias = pos.get("dt_bias")
+        self.index_d_a_log = pos.get("d_a_log")
+        self.index_d_dt_bias = pos.get("d_dt_bias")
 
     def run(self, views, workspace, stream) -> None:
-        q = views[self.iq]
-        k = views[self.ik]
-        v = views[self.iv]
-        g = views[self.ig]
-        beta = views[self.ibeta]
-        w = views[self.iw]
-        cu = views[self.icu]
-        do = views[self.ido]
-        state_checkpoints = views[self.ick] if self.ick is not None else None
-        state0 = views[self.is0] if self.is0 is not None else None
-        dstate_in = views[self.idfs] if self.idfs is not None else None
-        dq = views[self.idq]
-        dk = views[self.idk]
-        dv = views[self.idv]
-        dg = views[self.idg]
-        db = views[self.idb]
-        dw = views[self.idw]
-        dstate0 = views[self.ids0] if self.ids0 is not None else None
-        a_log = views[self.ia_log] if self.ia_log is not None else None
-        dt_bias = views[self.idt_bias] if self.idt_bias is not None else None
-        d_a_log = views[self.ida_log] if self.ida_log is not None else None
-        d_dt_bias = views[self.iddt_bias] if self.iddt_bias is not None else None
+        q = views[self.index_q]
+        k = views[self.index_k]
+        v = views[self.index_v]
+        g = views[self.index_g]
+        beta = views[self.index_beta]
+        w = views[self.index_w]
+        cu = views[self.index_cu_seqlens]
+        do = views[self.index_do]
+        state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
+        state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
+        dstate_in = views[self.index_d_final_state] if self.index_d_final_state is not None else None
+        dq = views[self.index_dq]
+        dk = views[self.index_dk]
+        dv = views[self.index_dv]
+        dg = views[self.index_dg]
+        dbeta = views[self.index_dbeta]
+        dw = views[self.index_dw]
+        dstate0 = views[self.index_d_initial_state] if self.index_d_initial_state is not None else None
+        a_log = views[self.index_a_log] if self.index_a_log is not None else None
+        dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
+        d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
+        d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
@@ -488,7 +509,7 @@ class CompiledGdn2Bwd:
                     region["scheduler_all"],
                     stream,
                 )
-            if self.has_state_checkpoints:
+            if self.has_state_checkpoints and not self.coarse_checkpoints:
                 checkpoint_series = state_checkpoints
             else:
                 checkpoint_series = region["state_checkpoints"]
@@ -502,17 +523,20 @@ class CompiledGdn2Bwd:
                     beta,
                     w,
                     cu,
-                    state0,
+                    None if self.coarse_checkpoints else state0,
                     None,
                     checkpoint_series,
-                    work_items,
-                    work_count,
+                    region["work_items_recompute"] if self.coarse_checkpoints else work_items,
+                    region["work_count_recompute"] if self.coarse_checkpoints else work_count,
                     scheduler_recompute,
                     region["scheduler_all"],
-                    region.get("item_scratch"),
+                    region.get("item_scratch") if self.order_in_recompute else None,
                     region["recompute_tensormaps"],
                     self.b_t,
                     stream,
+                    seed_state_checkpoints=state_checkpoints if self.coarse_checkpoints else None,
+                    seed_every_n_tokens=self.checkpoint_cadence if self.coarse_checkpoints else 0,
+                    seed_span_tokens=self.recompute_span_tokens if self.coarse_checkpoints else 0,
                 )
             dq_out = region["dq_ho"] if self.fold_dq else dq
             dk_out = region["dk_ho"] if self.fold_dk else dk
@@ -531,7 +555,7 @@ class CompiledGdn2Bwd:
                 dk_out,
                 dv_out,
                 dg,
-                db,
+                dbeta,
                 dw,
                 cu,
                 dstate0 if self.has_dstate0 else None,
@@ -581,7 +605,7 @@ class CompiledGdn2Bwd:
                 stream=stream,
             )
 
-        if self.has_state_checkpoints:
+        if self.has_state_checkpoints and not self.coarse_checkpoints:
             checkpoint_series = state_checkpoints
         else:
             checkpoint_series = region["state_checkpoints"]
@@ -592,23 +616,27 @@ class CompiledGdn2Bwd:
                 beta,
                 w,
                 cu,
-                state0,
+                None if self.coarse_checkpoints else state0,
                 None,
                 checkpoint_every_n_tokens=self.b_t,
                 output_state_checkpoints=checkpoint_series,
+                seed_state_checkpoints=state_checkpoints if self.coarse_checkpoints else None,
+                seed_every_n_tokens=self.checkpoint_cadence if self.coarse_checkpoints else 0,
+                seed_span_tokens=self.recompute_span_tokens if self.coarse_checkpoints else 0,
                 use_qk_l2norm_in_kernel=self.use_qk_l2norm,
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 a_log=a_log,
                 dt_bias=dt_bias,
                 use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
                 beta_guard=self.beta_guard,
-                work_items=work_items,
-                work_count=work_count,
+                work_items=region["work_items_recompute"] if self.coarse_checkpoints else work_items,
+                work_count=region["work_count_recompute"] if self.coarse_checkpoints else work_count,
                 scheduler_counter=scheduler_recompute,
                 scheduler_all=region["scheduler_all"],
-                work_item_scratch=region.get("item_scratch"),
-                order_in_prologue=True,
+                work_item_scratch=region.get("item_scratch") if self.order_in_recompute else None,
+                order_in_prologue=self.order_in_recompute,
                 tensormap_workspace=region["recompute_tensormaps"],
                 stream=stream,
             )
@@ -634,7 +662,7 @@ class CompiledGdn2Bwd:
             dk_out,
             dv_out,
             dg,
-            db,
+            dbeta,
             dw,
             cu,
             self.scale,
@@ -647,6 +675,7 @@ class CompiledGdn2Bwd:
             a_log=a_log,
             dt_bias=dt_bias,
             use_beta_sigmoid=self.use_beta_sigmoid,
+            allow_neg_eigval=self.allow_neg_eigval,
             beta_guard=self.beta_guard,
             work_items=work_items,
             work_count=work_count,
