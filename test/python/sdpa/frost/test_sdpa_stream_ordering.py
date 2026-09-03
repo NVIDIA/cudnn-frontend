@@ -162,12 +162,11 @@ def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
     torch.cuda.synchronize()
     expected_output, expected_amax = output.clone(), amax.clone()
 
-    output.fill_(float("nan"))
-    amax.fill_(float("nan"))
-    torch.cuda.synchronize()
     side = torch.cuda.Stream()
     with torch.cuda.stream(side):
         torch.cuda._sleep(_SLEEP_CYCLES)
+        output.fill_(float("nan"))
+        amax.fill_(float("nan"))
     api.execute(
         q_tensor=q,
         k_tensor=k,
