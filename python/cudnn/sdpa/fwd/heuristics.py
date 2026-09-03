@@ -128,7 +128,7 @@ class _SplitKvLaunch(NamedTuple):
     ctas_per_tile: int
 
 
-def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
+def split_kv_candidates(*, sm_count: int, kv_tiles: int, dense_through: int = 1) -> List[int]:
     """The splits worth scoring on this device, ascending, always starting at 1.
 
     THE single split-KV list -- what a row can BUILD is a separate boolean
@@ -139,9 +139,11 @@ def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
     CTA-tiles than the machine has SMs, so that is where the occupancy argument
     for splitting runs out. Rounding UP rather than down offers the first
     over-subscribing point and lets the cost model reject it on the wave term,
-    instead of the bound pre-judging it. Powers of two because ``split_kv`` is a
-    TemplateParams field and so a kernel-module cache key -- an unrestricted
-    choice mints a compiled specialization per shape.
+    instead of the bound pre-judging it. Powers of two are the default because
+    ``split_kv`` is a TemplateParams field and so a kernel-module cache key --
+    an unrestricted choice mints a compiled specialization per shape.
+    ``dense_through`` additionally admits every integer through a small,
+    measured device-specific limit while retaining the power-of-two tail.
 
     Also bounded by ``kv_tiles // _SPLIT_KV_MIN_TILES``. The chunking hands the
     remainder to the LEADING splits, so the thinnest gets ``floor(kv_tiles/s)``
@@ -157,11 +159,11 @@ def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
         return [1]
     hi = 1 << max(0, (sm_count - 1).bit_length())  # 2**ceil(log2(sm_count))
     hi = min(hi, max(1, kv_tiles // _SPLIT_KV_MIN_TILES))
-    out, s = [], 1
+    out, s = list(range(1, min(hi, max(1, dense_through)) + 1)), 1
     while s <= hi:
         out.append(s)
         s <<= 1
-    return out
+    return sorted(set(out))
 
 
 def choose_split_kv(
@@ -610,6 +612,14 @@ def _split_points(
             kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
             ctas_per_tile=unsplit_knobs.cga or 1,
         )
+    # GR100's 208 SMs leave common context grids closest to a full wave at
+    # factors 3, 5, or 6. Keep the shared power-of-two tail, but score every
+    # small factor measured on the Rubin kernel.
+    candidates = split_kv_candidates(
+        sm_count=sm_count,
+        kv_tiles=split_launch.kv_tiles,
+        dense_through=8 if caps.sm_lo == 107 else 1,
+    )
     split = choose_split_kv(
         q_tiles=split_launch.q_tiles,
         heads_q=split_launch.heads_q,
@@ -622,6 +632,7 @@ def _split_points(
         # graph's own output.
         combine_rows=facts.s_q * facts.h_q * facts.b,
         ctas_per_tile=split_launch.ctas_per_tile,
+        candidates=candidates,
         unsplit_launch=unsplit_launch,
     )
     if split <= 1:
