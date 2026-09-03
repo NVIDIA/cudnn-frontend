@@ -1559,6 +1559,9 @@ def _sdpa_kernel(
                 Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
 
 
+_sdpa_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ---------------------------------------------------------------------------
 # Host wrapper.
 # ---------------------------------------------------------------------------

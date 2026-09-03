@@ -5,6 +5,8 @@ from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Pointer
+from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.scheduler import (
@@ -15,6 +17,30 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
+
+
+@cute.jit
+def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
+    """Replace fully padded V scale blocks before block-scaled BMM2.
+
+    F8_128x4 stores four 32-token V scale blocks in each 4-byte row group.
+    The packed THD tail may leave whole blocks outside the sequence; their data
+    TMA-loads as zero, but an E8M0 NaN scale would still make ``0 * NaN`` poison
+    the accumulator.  Preserve blocks containing valid tokens and replace only
+    the fully padded scale bytes with the finite scale 1.0 (0x7f).
+    """
+    remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+    valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+    if valid_blocks < cutlass.Int32(4):
+        lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+        keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+        fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+        for row_group in cutlass.range_constexpr(4):
+            byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+            word = Pointer(sv_sf.base.subview(byte_offset).data_ptr(), dtype=cutlass.Int32)
+            word.store((word.load(alignment=4) & keep_mask) | fill_mask, alignment=4)
+        nvvm.fence_proxy("async.shared", space="cta")
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class Bars(NamedTuple):
@@ -359,10 +385,8 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
 
     # Which grid does this flavor launch?  SCHED_NATURAL uses a 3-D
     # (q_super, head, batch) grid; the LPT policy flattens everything into x.
-    # NOTE this is the flavor's EFFECTIVE policy, not the requested one:
-    # make_cfg_d192 hardcodes SCHEDULER_POLICY=1 regardless of params, so a
-    # params-level check would miss it (and did -- d192 silently launched the
-    # unsplit grid because the split multiplier was only on the NATURAL branch).
+    # This must use the flavor's effective CFG policy so the helper and launch
+    # grid follow the same compile-time specialization.
     IS_LPT = CFG.SCHEDULER_POLICY != SCHED_NATURAL
 
     @cute.jit

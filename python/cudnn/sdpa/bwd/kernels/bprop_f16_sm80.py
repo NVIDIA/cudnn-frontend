@@ -52,7 +52,8 @@ Forces SCHED_DEFAULT (LPT remaps ``kv_tile`` and would break the order); zero
 extra GMEM beyond the small counter; perf-insensitive (gated knob).  dK/dV are
 already deterministic (each CTA owns distinct K rows → no cross-tile atomic).
 All semaphore code folds out under ``const_expr(deterministic)`` → the default
-(non-deterministic) path is byte-identical.
+(non-deterministic) path is byte-identical.  Under a sliding window the relay
+counts turns from a q-tile's first visiting kv-tile (``relay_turn``).
 
 Why two sub-groups: register capacity.  dV_acc + dK_acc + frags at d=128 bust
 the 255-reg/thread Ampere cap in a single group; splitting halves the live
@@ -405,6 +406,19 @@ def _bprop_kernel(
     else:
         q_lo_tile = cutlass.Int32(0)
     n_iters = cutlass.Int32(arith.maxsi((n_q_tiles_eff - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
+    # ---- SWA compute-skip (upper bound): the window keeps kv >= anchor(q) - W
+    #      (anchor = q, or q + causal_diag under bottom-right; see _mask_p), so
+    #      no q >= kv_base + tile_kv + W - diag attends this kv-tile.  Cap the
+    #      q-loop there (the forward trims kv_left the same way).  Fully-masked
+    #      tiles run 0 iters and the epilogue stores dK = dV = 0.
+    if cutlass.const_expr(mask_flags & MASK_SWA):
+        _q_hi_abs = kv_base + cutlass.Int32(tile_kv + swa_window)
+        if cutlass.const_expr(causal_bottom_right):
+            _q_hi_abs = _q_hi_abs - causal_diag
+        _q_hi_abs = cutlass.Int32(arith.maxsi(_q_hi_abs.ir_value(), cutlass.Int32(0).ir_value()))
+        _q_hi_t = (_q_hi_abs + cutlass.Int32(tile_q - 1)) // cutlass.Int32(tile_q)
+        _q_hi_t = cutlass.Int32(arith.minsi(_q_hi_t.ir_value(), n_q_tiles_eff.ir_value()))
+        n_iters = cutlass.Int32(arith.maxsi((_q_hi_t - q_lo_tile).ir_value(), cutlass.Int32(0).ir_value()))
     # THD over-provisioned grid: this CTA's kv-tile may start past the packed
     # sequence's KV length (n_kv_tiles = ceil(max_skv/tile_kv) covers the longest
     # sequence).  Force 0 q-iters for such tiles → no compute, and the dV/dK
@@ -420,10 +434,20 @@ def _bprop_kernel(
     k_tile_gmem = K_view.data_ptr() + k_tile_base
     v_tile_gmem = V_view.data_ptr() + v_tile_base
 
-    # LSE / do_dot: dense [B,H,SQ] → (batch*H+head)*SQ; THD packed [1,H,T_q]
-    # (T_q == SQ here) → head*T_q + cu_q[b].  Read below at + the in-seq q index.
-    lse_head_base = (head * cutlass.Int32(SQ) + cu_q_b) if cutlass.const_expr(THD_VARLEN) else (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
-    dot_head_base = lse_head_base
+    # LSE: STRIDE-AWARE on the dense path (a graph Stats input may carry any
+    # dense-compatible [B,H,SQ] layout; the compile-time strides come from the
+    # fake — a compact fake folds them to the packed constants, so the packed
+    # case is byte-identical).  THD keeps the packed [1,H,T_q] math (the grid
+    # `batch` is the LOGICAL sequence index, not the tensor's batch-1 dim).
+    # do_dot is an internal packed buffer → packed math always.
+    if cutlass.const_expr(THD_VARLEN):
+        lse_head_base = cutlass.Int64(head * cutlass.Int32(SQ) + cu_q_b)
+        LSE_Q_STRIDE = cutlass.Int64(1)
+        dot_head_base = head * cutlass.Int32(SQ) + cu_q_b
+    else:
+        lse_head_base = cutlass.Int64(batch) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(head) * cutlass.Int64(LSE.stride[1])
+        LSE_Q_STRIDE = cutlass.Int64(LSE.stride[2])
+        dot_head_base = (batch * cutlass.Int32(H) + head) * cutlass.Int32(SQ)
 
     # ---- SMEM tiles -------------------------------------------------------
     # Q∪dO is MERGED into one array so BMM1/dV/dK's per-sub-group B operand is a
@@ -704,8 +728,8 @@ def _bprop_kernel(
                 # clamped value is dead.
                 qr0 = _clamp_lt(qc0, q_bound) if cutlass.const_expr(GATE_Q) else qc0
                 qr1 = _clamp_lt(qc1, q_bound) if cutlass.const_expr(GATE_Q) else qc1
-                lse0 = Pointer(LSE_view.data_ptr() + lse_head_base + qr0, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
-                lse1 = Pointer(LSE_view.data_ptr() + lse_head_base + qr1, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+                lse0 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr0) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
+                lse1 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr1) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
                 off = nf * 4
                 # Bias: add bias/scale to UNSCALED acc1 (post-scale → +bias),
                 # matching the forward.  Cells: (kv_a,qc0)(kv_a,qc1)(kv_a8,qc0)(kv_a8,qc1).
@@ -907,17 +931,29 @@ def _bprop_kernel(
             mma_step(dq_acc, adst, bk, k_step=0, M=16 * DQ_M_BLOCKS, N=DQ_N, ab_dtype=io_dtype)
 
         # ---- dQ atomicAdd ---------------------------------------------------
-        # Deterministic relay (acquire): wait until every lower kv-tile has added
-        # its contribution to THIS (seq,head,q_tile) slot, so the fp32 atomicAdds
-        # land in fixed kv order → bitwise-reproducible dQ.  q-skip-safe: q_lo_tile
-        # is monotonic in kv_tile, so every kv' < kv_tile that reaches this q-tile
-        # relays before us → the wait target is exactly kv_tile.  Folds out (byte-
-        # identical fast path) when deterministic=False.
+        # Deterministic relay (acquire): the fp32 dQ atomicAdds of a (seq, head,
+        # q_tile) land in ascending kv_tile order, gated by a per-slot counter.
+        # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
+        # set is contiguous in kv_tile: the causal q_lo skip removes only higher
+        # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
+        # kv_first = max((q_row0 + diag - W) // tile_kv, 0) (the inverse of the
+        # q_hi cap; 0 without a window) and turn = kv_tile - kv_first.  Every
+        # visitor computes the same kv_first, so acquire (== turn) and release
+        # (turn + 1) agree.  Folds out when deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
+            if cutlass.const_expr(mask_flags & MASK_SWA):
+                _q_row0 = q_iter * cutlass.Int32(tile_q)
+                if cutlass.const_expr(causal_bottom_right):
+                    _q_row0 = _q_row0 + causal_diag
+                _kv_first = (_q_row0 - cutlass.Int32(swa_window)) // cutlass.Int32(tile_kv)
+                _kv_first = cutlass.Int32(arith.maxsi(_kv_first.ir_value(), cutlass.Int32(0).ir_value()))
+                relay_turn = kv_tile - _kv_first
+            else:
+                relay_turn = kv_tile
             if tidx == cutlass.Int32(0):
-                _dq_sem_wait(sem_ptr, kv_tile)
+                _dq_sem_wait(sem_ptr, relay_turn)
             nvvm.barrier_cta_sync()
         if cutlass.const_expr(dq_smem_coalesce or has_rope):
             # COALESCED via SMEM staging (sDQ).  Stage the dq_acc C-fragment into
@@ -1005,7 +1041,7 @@ def _bprop_kernel(
             nvvm.barrier_cta_sync()
             cute.arch.fence_acq_rel_gpu()
             if tidx == cutlass.Int32(0):
-                cute.arch.atomic_exch(sem_ptr, kv_tile + cutlass.Int32(1), sem="release", scope="gpu")
+                cute.arch.atomic_exch(sem_ptr, relay_turn + cutlass.Int32(1), sem="release", scope="gpu")
 
         # ---- B3: before next Q-iter overwrites the ring stage ---------------
         nvvm.barrier_cta_sync()
@@ -1124,6 +1160,9 @@ def _bprop_kernel(
                 Pointer((dK_view.data_ptr() + base_bot), dtype=cutlass.Int32).store(_kb, alignment=4)
 
 
+_bprop_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _atomic_add_f32(addr_i64, val):
     """``atom.global.add.f32`` on a 32-bit GMEM float element.  ``addr_i64`` is
@@ -1200,6 +1239,9 @@ def _do_dot_kernel(
             Pointer(cutlass.make_array_view(DELTA).data_ptr() + row, dtype=cutlass.Float32).store(acc)
 
 
+_do_dot_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ===========================================================================
 # Attention-sink gradient: dSink_h = -Σ_{b,q} exp(sink_h - lse[b,h,q]) *
 # do_dot[b,h,q].  Standalone (dQ/dK/dV are already sink-correct from the
@@ -1208,31 +1250,52 @@ def _do_dot_kernel(
 # ===========================================================================
 @cute.kernel
 def _dsink_kernel(
-    LSE: cute.Tensor,  # [B, H, SQ] fp32 (sink-aware, natural-log)
-    DO_DOT: cute.Tensor,  # [B, H, SQ] fp32
+    LSE: cute.Tensor,  # dense [B, H, SQ] fp32 (sink-aware, natural-log); THD packed [1, H, T_q]
+    DO_DOT: cute.Tensor,  # same shape, packed
     SINKS: cute.Tensor,  # [H] fp32 (natural-log sink logits)
     DSINK: cute.Tensor,  # [H] fp32 (atomicAdd target; zero-init)
-    SQ: cutlass.Constexpr[int],
-    n_bh: cutlass.Int32,  # B * H
+    CU_Q: cute.Tensor,  # THD: [n_seq + 1] int32 cumulative q seqlens; dense: 1-elem dummy
+    thd: cutlass.Constexpr[bool],
+    n_rows: cutlass.Int32,  # (B or n_seq) * H
 ):
+    """dSink[h] = -sum_rows exp(sink[h] - LSE) * (dO . O), one warp per (batch|sequence, head)
+    row.  Dense rows span ``SQ``; THD rows span ``[cu_q[b], cu_q[b+1])`` of the packed
+    ``[1, H, T_q]`` buffers with a runtime trip count.  ``-inf`` LSE rows contribute 0.
+    """
     bx, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
-    row = bx * cutlass.Int32(_DODOT_WARPS) + warp  # = b*H + h
-    if row < n_bh:
+    row = bx * cutlass.Int32(_DODOT_WARPS) + warp  # = (batch | seq) * H + h
+    if row < n_rows:
         H = SINKS.shape[0]
         h = row % cutlass.Int32(H)
+        b = row // cutlass.Int32(H)
         sink_h = Pointer(cutlass.make_array_view(SINKS).data_ptr() + h, dtype=cutlass.Float32).load()
-        base = row * cutlass.Int32(SQ)
+        SQ = cutlass.Int32(DO_DOT.shape[2])  # dense SQ, or the packed total T_q (dynamic)
+        # One warp per (batch | sequence, head) row: under THD the row covers the
+        # sequence's tokens [cu_q[b], cu_q[b+1]) of the packed [1, H, T_q]
+        # buffers (head stride T_q), so gap tokens are never read.  LSE is
+        # stride-aware on the dense path; do_dot is an internal packed buffer.
+        if cutlass.const_expr(thd):
+            cu_p = cutlass.make_array_view(CU_Q).data_ptr()
+            q_lo = Pointer(cu_p + b, dtype=cutlass.Int32).load()
+            n_q = Pointer(cu_p + b + cutlass.Int32(1), dtype=cutlass.Int32).load() - q_lo
+            base = cutlass.Int64(h) * cutlass.Int64(SQ) + cutlass.Int64(q_lo)
+            lse_base = cutlass.Int64(h) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(q_lo) * cutlass.Int64(LSE.stride[2])
+        else:
+            n_q = SQ
+            base = cutlass.Int64(row) * cutlass.Int64(SQ)
+            lse_base = cutlass.Int64(b) * cutlass.Int64(LSE.stride[0]) + cutlass.Int64(h) * cutlass.Int64(LSE.stride[1])
         lse_p = cutlass.make_array_view(LSE).data_ptr()
         dot_p = cutlass.make_array_view(DO_DOT).data_ptr()
         acc = cutlass.Float32(0.0)
-        for k in cutlass.range_constexpr((SQ + 31) // 32):
-            q = lane + cutlass.Int32(k * 32)
-            if q < cutlass.Int32(SQ):
-                lse_q = Pointer(lse_p + base + q, dtype=cutlass.Float32).load()
-                dd_q = Pointer(dot_p + base + q, dtype=cutlass.Float32).load()
+        n_chunks = (n_q + cutlass.Int32(31)) // cutlass.Int32(32)
+        for kk in cutlass.range(n_chunks, unroll=1):
+            q = lane + kk * cutlass.Int32(32)
+            if q < n_q:
+                lse_q = Pointer(lse_p + lse_base + cutlass.Int64(q) * cutlass.Int64(LSE.stride[2]), dtype=cutlass.Float32).load()
+                dd_q = Pointer(dot_p + base + cutlass.Int64(q), dtype=cutlass.Float32).load()
                 # Padded / fully-masked q-rows have LSE = -inf (forward writes -inf
                 # for an empty softmax denom).  exp2((sink - (-inf))·log2e) = +inf →
                 # NaN dSink.  Those rows don't exist (or attend nothing) → contribute
@@ -1243,6 +1306,9 @@ def _dsink_kernel(
             acc = acc + nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (4 - off), 0x1F, nvvm.Shfl.BFLY)
         if lane == cutlass.Int32(0):
             _atomic_add_f32(cutlass.make_array_view(DSINK).data_ptr() + h, -acc)
+
+
+_dsink_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
@@ -1263,6 +1329,9 @@ def _cast_kernel(
         dst = cutlass.make_array_view(dQ_out).data_ptr()
         v = Pointer(src + gid * cutlass.Int32(2), dtype=cutlass.Float32).load(count=2)
         Pointer(dst + gid * cutlass.Int32(2), dtype=cutlass.Int32).store(fp32_to_fp16(v[0], v[1], dtype=io_dtype), alignment=4)
+
+
+_cast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
@@ -1296,6 +1365,9 @@ def _dkv_reduce_kernel(
         for g in cutlass.range_constexpr(ratio):
             acc = acc + Pointer(src + in_base + cutlass.Int32(g * d), dtype=io_dtype).load().to(cutlass.Float32)
         Pointer(cutlass.make_array_view(OUT).data_ptr() + e, dtype=io_dtype).store(acc.to(io_dtype))
+
+
+_dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # ===========================================================================
@@ -1459,12 +1531,14 @@ def _dsink_host(
     DO_DOT: cute.Tensor,
     SINKS: cute.Tensor,
     DSINK: cute.Tensor,
-    SQ: cutlass.Constexpr[int],
-    n_bh: cutlass.Int32,
+    CU_Q: cute.Tensor,
+    thd: cutlass.Constexpr[bool],
+    n_rows: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    n_blocks = (n_bh + _DODOT_WARPS - 1) // _DODOT_WARPS
-    _dsink_kernel(LSE, DO_DOT, SINKS, DSINK, SQ, n_bh).launch(grid=(n_blocks, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream)
+    """Host launcher for :func:`_dsink_kernel`: ``n_rows`` = (batch|n_seq) * H warps."""
+    n_blocks = (n_rows + _DODOT_WARPS - 1) // _DODOT_WARPS
+    _dsink_kernel(LSE, DO_DOT, SINKS, DSINK, CU_Q, thd, n_rows).launch(grid=(n_blocks, 1, 1), block=(_DODOT_WARPS * 32, 1, 1), stream=stream)
 
 
 # ===========================================================================
@@ -1527,10 +1601,10 @@ def scratch_bytes(
 # there; ``n_batch_logical`` (the logical sequence count) sizes the
 # ``cu_seqlens`` ABI and IS plan-time. Launch marshaling lives in the adapter
 # (``api_dsl._sm80_bwd_call``); this module holds no host runtime logic.
-# The stats input is READ as a packed (B, H, SQ) LSE (raw-pointer packed
-# addressing in the device code) — a strided graph stats input is gathered
-# into carved staging by the adapter, unlike the forward's #712-style native
-# strided WRITES.
+# The stats input is READ stride-aware on the dense path: ``compile()``
+# takes a plan-time ``lse_stride`` and the device code loads through the
+# fake's strides (the #712 analogue for the backward's loads; a contiguous
+# plan keeps the packed compact fake — byte-identical codegen).
 # ===========================================================================
 from typing import NamedTuple  # noqa: E402
 
@@ -1557,6 +1631,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     swa_window: int = 0,
     rope_max_s: int = 0,
     n_batch_logical: int = 0,
+    lse_stride: "Optional[tuple[int, int, int]]" = None,
 ):
     """Compile (or fetch) this template specialization for one shape.
 
@@ -1567,6 +1642,11 @@ def compile(  # noqa: A001 — the template contract's entry point
     ``cute.sym_int`` per ragged group (Q/dO/dQ/LSE/do_dot share t_q; K/V and
     the per-query-head dK/dV write buffers share t_kv), so one artifact
     re-binds any totals.
+
+    ``lse_stride`` (dense only, plan-time): declared (B, H, SQ) strides of a
+    non-contiguous Stats input — the kernels then READ the LSE natively at
+    that layout (the #712 analogue for the backward's loads; ``None`` keeps
+    the packed compact fake, byte-identical codegen).
     """
     p = PARAMS
     io_dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
@@ -1584,11 +1664,17 @@ def compile(  # noqa: A001 — the template contract's entry point
     else:
         _b, _sq, _skv = b, sq, skv
         n_seq = b
-    # Deterministic-dQ relay counter stride: ceil(max_SQ / tile_q). THD +
-    # deterministic is rejected upstream (the FE support surface), so the
-    # dense sq is always real here when deterministic is on.
-    sem_q_stride = ((sq + p.tile_q - 1) // p.tile_q) if p.deterministic else 0
-    sem_units = max(n_seq * h * sem_q_stride, 1)
+    # Deterministic-dQ relay counter stride: ceil(max_SQ / tile_q) — from the
+    # dense sq here, or caller-owned under THD (see below).
+    if p.deterministic and p.thd_varlen:
+        # The packed extents are dynamic, so the relay counter's size is the
+        # caller's: it passes sem_q_stride = ceil(max_s_q / tile_q) at launch
+        # and a DQ_SEM of n_seq * h * sem_q_stride (compiled as a sym extent).
+        sem_q_stride = 0
+        sem_units = None
+    else:
+        sem_q_stride = ((sq + p.tile_q - 1) // p.tile_q) if p.deterministic else 0
+        sem_units = max(n_seq * h * sem_q_stride, 1)
 
     def _fake(dtype, shape, order, align=16):
         return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=order, assumed_align=align)
@@ -1602,7 +1688,11 @@ def compile(  # noqa: A001 — the template contract's entry point
     # dK/dV WRITE buffers carry H_q heads (per-query-head; GQA reduces after).
     fdk_ws = _fake(io_dtype, (_b, _skv, h, p.d_qk), r4)
     fdv_ws = _fake(io_dtype, (_b, _skv, h, p.d_v), r4)
-    fl = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    fl = (
+        cute.runtime.make_fake_tensor(cutlass.Float32, (_b, h, _sq), lse_stride, assumed_align=4)
+        if lse_stride is not None and not p.thd_varlen
+        else _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
+    )
     fdt = _fake(cutlass.Float32, (_b, h, _sq), (2, 1, 0))
     fsk = _fake(cutlass.Int32, (b if p.has_seq_kv_lens else 1,), (0,), align=4)
     bias_dtype = cutlass.Float32 if p.bias_is_fp32 else io_dtype
@@ -1614,7 +1704,7 @@ def compile(  # noqa: A001 — the template contract's entry point
     fcuq = _fake(cutlass.Int32, (_cu_len,), (0,), align=4)
     fcuk = _fake(cutlass.Int32, (_cu_len,), (0,), align=4)
     fsq = _fake(cutlass.Int32, (b if p.has_seq_q_lens else 1,), (0,), align=4)
-    fsem = _fake(cutlass.Int32, (sem_units,), (0,), align=4)
+    fsem = _fake(cutlass.Int32, (cute.sym_int(divisibility=1) if sem_units is None else sem_units,), (0,), align=4)
     fstream = cuda.CUstream(0)
 
     main = cute.compile(
@@ -1681,5 +1771,5 @@ def compile(  # noqa: A001 — the template contract's entry point
     if p.has_sink:
         fsinks = _fake(cutlass.Float32, (h,), (0,), align=4)
         fdsink = _fake(cutlass.Float32, (h,), (0,), align=4)
-        dsink = cute.compile(_dsink_host, fl, fdt, fsinks, fdsink, sq, cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
+        dsink = cute.compile(_dsink_host, fl, fdt, fsinks, fdsink, fcuq, bool(p.thd_varlen), cutlass.Int32(0), fstream, options="--enable-tvm-ffi")
     return CompiledBwd(main=main, do_dot=do_dot, cast=cast, reduce_k=reduce_k, reduce_v=reduce_v, dsink=dsink, sem_q_stride=sem_q_stride)

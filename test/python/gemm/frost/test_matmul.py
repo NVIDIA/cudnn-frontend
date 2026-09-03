@@ -1181,6 +1181,10 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
+    from cudnn.gemm.frost.epilogue_codegen import generate
+
+    dual_epi = generate(chain, vec_bytes_epi=64, output_elem_bytes=1, tma_slots=frozenset({0, 1})).epilogue
+    assert dual_epi.index("_q1_lane") < dual_epi.index("_q0_frg"), "retire the register-heavy col quant before row quant"
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q_row = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
@@ -3352,6 +3356,8 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
     the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
     M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
+    if _current_arch() != 120:
+        pytest.skip(f"sm120-host-only matrix (running on sm_{_current_arch()})")
     cfg = _resolve(config_name)
     M, N, K = 192, 192, 160
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)
@@ -3392,7 +3398,7 @@ def test_sm120_render_smoke() -> None:
                 combo = (a_major, b_major, out_major)
                 assert "@@" not in src, f"leftover injection markers {combo}"
                 ast.parse(src)
-                assert "cudnn_frost_sm120_matmul_" in src
+                assert "frost_sm120_matmul_" in src
                 assert "threads_per_cta = 384" in src
                 assert f"vec_bytes_epi = {vec}" in src
                 assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"

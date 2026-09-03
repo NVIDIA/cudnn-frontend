@@ -2387,6 +2387,46 @@ def test_epi_n_is_one_shared_column_count_not_a_per_output_one(cfg_name: str, dt
     assert _store_modes(chain, cfg) == want
 
 
+@pytest.mark.L0
+def test_col_quant_uses_a_wide_epilogue_drain() -> None:
+    """Column quant performs the same one-warp reduction per column at either
+    drain width.  Taking 64 columns at once halves the subtile/store overhead;
+    row quant keeps the lower-register 32-column default."""
+    from cudnn.gemm.frost.compiler import _epi_n, _epi_n_for_chain
+
+    M = N = K = 128
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+
+    def build(axis: int):
+        g = cudnn.pygraph(
+            io_data_type=cudnn.data_type.BFLOAT16,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        C = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+        Q, SF = g.block_scale_quantize(input=C, block_size=32, axis=axis, name="q")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        if axis == 1:
+            SF.set_dim([1, M // 32, N]).set_stride([M * N // 32, N, 1])
+        else:
+            SF.set_dim([1, M, N // 32]).set_stride([M * N // 32, N // 32, 1])
+        SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        return analyze(g)
+
+    row = build(-1)
+    col = build(1)
+    assert _epi_n(cfg, col.output_dtype) == 32, "the geometry-only default stays narrow"
+    assert _epi_n_for_chain(cfg, row) == 32
+    assert _epi_n_for_chain(cfg, col) == 64
+
+    # The wider cap must not turn a non-power-of-two drain into a partial
+    # subtile: 16 is the largest capped power-of-two divisor of 48.
+    cfg_48 = by_name("CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma")
+    assert _epi_n_for_chain(cfg_48, col) == 16
+
+
 @pytest.mark.parametrize(
     "majors,want",
     [

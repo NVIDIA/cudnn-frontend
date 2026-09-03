@@ -3,6 +3,7 @@
 
 import math
 import inspect
+from functools import partial
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
@@ -14,7 +15,12 @@ from cutlass._mlir.dialects import nvvm, llvm
 
 
 from .copy_utils import predicate_k
-from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import sub_packed_f32x2
+
+_sub_packed_f32x2 = partial(
+    cute.arch.calc_packed_f32x2_op,
+    src_c=None,
+    calc_func=nvvm.sub_packed_f32x2,
+)
 
 _NVVM_FMAX_REQUIRES_RESULT_TYPE = sum(1 for p in inspect.signature(nvvm.fmax).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)) > 2
 
@@ -371,8 +377,8 @@ def ex2_emulation_2(x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, i
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
-    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_rounded_back = _sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = _sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

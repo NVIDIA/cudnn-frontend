@@ -1550,6 +1550,8 @@ class SM120FusedMultiHeadAttentionForward:
                 head_idx,
             )
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,

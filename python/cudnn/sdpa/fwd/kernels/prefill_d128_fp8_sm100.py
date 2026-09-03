@@ -27,8 +27,9 @@ used by the f16 kernels — FP8 is element-addressed (no block-scale SF), so it
 rides the same path: packed ``[1,T,H,D]`` with DYNAMIC token extents (the
 packed totals never reach the host), the setup kernel builds the
 [kv|cu_q|cu_k] metadata + per-batch O TMA descriptors device-side, and the
-launch grid is the plan-time envelope (units past a sequence's live tiles
-decode the batch == n_batch sentinel and drain without loads or stores).
+launch grid is sized to the MACHINE and bounded by a device-read live unit
+count (issue #618; units past that total decode the batch == n_batch sentinel
+and drain without loads or stores).
 Ragged Stats ride the caller's declared layout (token-major (T, H) or
 head-major); the amax_o atomicMax is gated on live rows. Dense path
 byte-identical.
@@ -85,6 +86,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -185,6 +187,10 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
+# and the setup kernel publishes the live unit total it stops at.
+THD_PERSISTENT = True
 
 
 # SM100 llama is always cga2 → LPT reverse-row count in CGA-tile units.
@@ -204,9 +210,10 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 #   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
 # The decode walks batch_remap on EVERY THD flavor, so the setup kernel must
 # fill it; the trailing two words are read only by the persistent schedulers.
-# The setup kernel builds it DEVICE-side from the caller's length tensors and
-# the adapter launches the plan-time envelope grid (issue #552) — no length
-# ever reaches the host.
+# The setup kernel builds it DEVICE-side from the caller's length tensors
+# (issue #552) — no length ever reaches the host — and publishes the live unit
+# total + claim counter, so the adapter launches a MACHINE-sized grid rather
+# than the plan-time envelope (issue #618).
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
@@ -606,7 +613,27 @@ def _kernel(
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only CGA's (0,0,0) CTA issues.
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+
+
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 # === TMA-LDG warp ===
@@ -2160,10 +2187,14 @@ def _host(
         # DEVICE-side from the caller's length tensors (no host cumsum, no
         # H2D — issue #552), then the per-batch O descriptor array (reuse
         # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
-        # PLAN-TIME ENVELOPE (n_thd_units = B * ceil(S_q_decl/CGA_TILE_M) * QH,
-        # from the DECLARED S_q — no runtime length reaches the host); units
-        # past a sequence's live tiles decode the batch == n_batch sentinel
-        # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
+        # PERSISTENT cluster count — the adapter hands down n_thd_units
+        # already capped to what the device holds resident, min(plan-time
+        # envelope, SMs / CGA_SIZE), NOT the envelope itself (issue #618). It
+        # doubles as the claim counter's seed: cluster c runs unit c off its
+        # blockIdx, then pulls from the counter, so the grid and the seed must
+        # be the same number. Dispatching past the live total stays safe — such
+        # a unit decodes the batch == n_batch sentinel and drains without loads
+        # or stores. grid_x = n_thd_units * CGA_M.
         # Per-token element stride of packed O (o_tensor.stride[1] = QH * d_v)
         # — NOT CFG.TILE_O, which is only coincidentally right at QH == 1.
         # The FP8 setup variant also clamps runtime K/V descriptors to the
@@ -2183,6 +2214,8 @@ def _host(
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

@@ -267,6 +267,8 @@ class SM120DetDqGemmKernel:
                         alignment=4,
                     )
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(
         self,
@@ -414,6 +416,9 @@ def dot_do_o_kernel(
             (dq_sem_ptr + (batch * H + head) * num_q_tiles + q_block).store(cutlass.Int32(0))
 
 
+dot_do_o_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def dot_do_o_host(
     o: cute.Tensor,
@@ -527,6 +532,9 @@ def convert_dq_kernel(
                 )
 
 
+convert_dq_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def convert_dq_host(
     dq_accum: cute.Tensor,
@@ -572,6 +580,9 @@ def convert_dbias_kernel(
     gidx = bidx * 256 + tidx
     if gidx < total:
         (out_ptr + gidx).store((acc_ptr + gidx).load().to(out_dtype))
+
+
+convert_dbias_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -803,6 +814,9 @@ def dkv_reduce_kernel(
                 )
 
 
+dkv_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def dkv_reduce_host(
     dk_ws: cute.Tensor,
@@ -882,6 +896,9 @@ def dsink_kernel(
         )
     if tidx == 0:
         (dsink.iterator.raw_ptr() + head).store(-acc)
+
+
+dsink_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
