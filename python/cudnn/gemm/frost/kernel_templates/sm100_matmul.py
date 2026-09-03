@@ -522,8 +522,7 @@ def _kernel(
                 coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
             else:
                 coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
-            # Split-K: grid z carries batch*S; decode the batch coord and this
-            # split's contiguous whole-CTA-K-tile range (remainder to leading splits).
+            # Split-K: grid z carries batch*S
             if cutlass.const_expr(split_k_slices > 1):
                 batch_tile_l = tile_l // split_k_slices
                 split_idx = cutlass.Int64(tile_l % split_k_slices)
@@ -829,7 +828,7 @@ def _kernel(
             clc_full_phase_mma = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
             if cutlass.const_expr(split_k_slices > 1):
-                tile_l = bidz  # this tile's z coord; its split index sizes the K loop
+                tile_l = bidz  # this tile's z coord
             # Descriptor metadata and the SMEM allocation base are invariant
             # across persistent tiles.  Only the encoded start address advances.
             desc_a_roots = [

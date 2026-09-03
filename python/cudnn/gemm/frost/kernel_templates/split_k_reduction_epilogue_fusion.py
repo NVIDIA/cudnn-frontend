@@ -2,17 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """Split-K reduction epilogue: kernel 2 of the two-kernel split-K scheme.
-
-A regular importable module (like ``_tile_helpers``), not a rendered template:
-any main-GEMM template that stores fp32 partials (``sm100_matmul`` today)
-imports the kernel and passes its formerly-injected constants —
-``split_k_slices``, ``splitk_reduce_elems``, the store dtype, ``USE_PDL`` —
-as ``Constexpr`` arguments at the launch site.
-
-Each thread owns one ``splitk_reduce_elems``-wide fp32 group of one output row
-and sums it across the S partials in a fixed order — bitwise deterministic by
-construction — as four independent add chains unrolled at trace time (the
-support gate bounds S at 32), then applies the store cast and writes D.
+TODOs: add epilogue fusion.
 """
 
 from __future__ import annotations
