@@ -88,6 +88,7 @@ Custom shapes and CSV output:
 python benchmark_dsa_sparse_attention_backward.py --seqlens 4096,8192,16384 --topks 512,2048 --csv results.csv
 python benchmark_dsa_sparse_attention_backward.py --head-dim 576   # 512 value dims + 64 RoPE dims
 python benchmark_dsa_sparse_attention_backward.py --nheads 16 --head-dim 576  # SM100 H16/D576 M128 backend
+python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100 (10, 0) BF16 H128/D512 two-CTA backend
 ```
 
 Options:

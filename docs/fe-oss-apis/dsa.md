@@ -191,11 +191,21 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward wrapper's
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
 
-On SM100, the public backward entry point automatically selects the tuned
-kernel from `q.shape[1:3]`: H16 with `head_dim=576` uses the dedicated M128
-sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
-use the generic M64 pipeline. No backend or tile-size argument is required.
-SM90 continues to use its Hopper-specific implementation.
+On Blackwell SM100/SM103, the public backward entry point automatically selects
+the tuned kernel from the device, dtype, and tensor shape. On SM100 (10, 0) and
+SM103 (10, 3) devices, BF16 H128 with `head_dim = head_dim_v = 512` and
+`topk_max ∈ {128, 512, 1024, 1152, 2048}` uses the two-CTA specialization. H16 with
+`head_dim=576` uses the dedicated M128 sparse-row pipeline. FP16, other head
+counts and dimensions, and every other `topk_max` retain the existing
+generic/H16 selection. Other compute capabilities, including SM107, do not
+select the two-CTA path. No backend or tile-size argument is required. SM90
+continues to use its Hopper-specific implementation.
+
+The H128 specialization keeps the five tensor-core products in one
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
+caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
+output, and completes dSink with a separate FP32 reduction kernel. The helper
+launches do not change the two-CTA topology of the core computation.
 
 On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
 M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
@@ -208,6 +218,9 @@ A fixed-order two-stage reduction combines the 128 shards, and one CTA per
 head reduces `d_sink`. The additional dKV workspace is
 `128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
 `scratch_workspace_bytes()` as the authoritative full scratch size.
+`deterministic=True` takes precedence over the two-CTA selection: the BF16
+H128/D512 envelope also runs the bounded-wave M64 kernel when determinism is
+requested, because the two-CTA path accumulates dKV with FP32 atomics.
 
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
 scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
@@ -217,7 +230,7 @@ high-level wrapper accepts the same optional `workspace=` argument and only
 allocates convenience scratch when it is omitted.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
-- **Constraints** — SM90 or SM100; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
+- **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(

@@ -69,6 +69,7 @@ class BlockSparseAttnForwardSm100Blk64:
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
         use_exact_kv_layout: cutlass.Constexpr[bool] = False,
+        use_int64_kv_strides: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -128,6 +129,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
         self.use_exact_kv_layout = use_exact_kv_layout
+        self.use_int64_kv_strides = use_int64_kv_strides
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
         if pack_gqa:
@@ -321,15 +323,20 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits = Int32(self.num_splits)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
-        # The normal layout maps physical 64-token KV blocks directly. Keep the
-        # exact rank-5 layout only for strides outside the TMA coordinate range.
+        # The normal layout maps physical 64-token KV blocks directly. Use an
+        # exact-boundary view for partial tails or wide strides.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
         if const_expr(self.use_exact_kv_layout):
-            k_stride_s = Int64(mK_seq.layout.stride[0])
-            k_stride_d = Int64(mK_seq.layout.stride[1])
-            k_stride_h = Int64(mK_seq.layout.stride[2])
-            k_stride_b = Int64(mK_seq.layout.stride[3])
+            stride_dtype = Int64 if const_expr(self.use_int64_kv_strides) else Int32
+            k_stride_s = stride_dtype(mK_seq.layout.stride[0])
+            k_stride_d = stride_dtype(mK_seq.layout.stride[1])
+            k_stride_h = stride_dtype(mK_seq.layout.stride[2])
+            k_stride_b = stride_dtype(mK_seq.layout.stride[3])
+            # Keep a sixth logical mode so the exact-boundary descriptor uses
+            # the same efficient TMA coordinate form as the packed fast path.
+            # Unlike the packed view, the sequence extent remains exact, so a
+            # final partial 64-row tile is zero-filled by TMA.
             mK = cute.make_tensor(
                 mK_seq.iterator,
                 cute.make_layout(
@@ -339,6 +346,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         2,
                         mK_seq.shape[2],
                         mK_seq.shape[3],
+                        1,
                     ),
                     stride=(
                         k_stride_s,
@@ -346,13 +354,14 @@ class BlockSparseAttnForwardSm100Blk64:
                         k_dim_half * k_stride_d,
                         k_stride_h,
                         k_stride_b,
+                        0,
                     ),
                 ),
             )
-            v_stride_s = Int64(mV_seq.layout.stride[0])
-            v_stride_d = Int64(mV_seq.layout.stride[1])
-            v_stride_h = Int64(mV_seq.layout.stride[2])
-            v_stride_b = Int64(mV_seq.layout.stride[3])
+            v_stride_s = stride_dtype(mV_seq.layout.stride[0])
+            v_stride_d = stride_dtype(mV_seq.layout.stride[1])
+            v_stride_h = stride_dtype(mV_seq.layout.stride[2])
+            v_stride_b = stride_dtype(mV_seq.layout.stride[3])
             mV = cute.make_tensor(
                 mV_seq.iterator,
                 cute.make_layout(
@@ -362,6 +371,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         2,
                         mV_seq.shape[2],
                         mV_seq.shape[3],
+                        1,
                     ),
                     stride=(
                         v_stride_d,
@@ -369,6 +379,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         v_dim_part * v_stride_d,
                         v_stride_h,
                         v_stride_b,
+                        0,
                     ),
                 ),
             )
@@ -852,8 +863,8 @@ class BlockSparseAttnForwardSm100Blk64:
     def kernel(
         self,
         mQ: cute.Tensor,  # (s_q, d, h, b)
-        mK: cute.Tensor,  # Rank-5 Int64 or rank-6 sparse-block view
-        mV: cute.Tensor,  # Rank-5 Int64 or rank-6 sparse-block view
+        mK: cute.Tensor,  # Exact-boundary or sparse-block view
+        mV: cute.Tensor,  # Exact-boundary or sparse-block view
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mQScale: Optional[cute.Tensor],
@@ -1414,10 +1425,16 @@ class BlockSparseAttnForwardSm100Blk64:
 
             head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             if const_expr(self.use_exact_kv_layout):
-                mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
-                mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
-                gK_tma = cute.zipped_divide(mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2))
-                gV_tma = cute.zipped_divide(mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2))
+                mK_cur = mK[None, None, None, head_idx_kv, batch_idx, None]
+                mV_cur = mV[None, None, None, head_idx_kv, batch_idx, None]
+                gK_tma = cute.coalesce(
+                    cute.zipped_divide(mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2, 1)),
+                    target_profile=((1, 1, 1, 1), 1),
+                )
+                gV_tma = cute.coalesce(
+                    cute.zipped_divide(mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2, 1)),
+                    target_profile=((1, 1, 1, 1), 1),
+                )
             else:
                 mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, None, batch_idx]
