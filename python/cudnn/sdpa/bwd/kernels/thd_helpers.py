@@ -37,7 +37,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_row_offsets,
 )
 
-__all__ = ["THD_BWD_META_WORDS", "THD_ROWOFF_OFF", "THD_SETUP_THREADS", "build_thd_bwd_setup_kernel"]
+__all__ = ["THD_BWD_META_WORDS", "THD_ROWOFF_OFF", "THD_SETUP_THREADS", "build_thd_bwd_setup_kernel", "thd_bwd_setup_host"]
 
 
 @cute.kernel
@@ -80,3 +80,16 @@ def build_thd_bwd_setup_kernel(
 
 
 build_thd_bwd_setup_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def thd_bwd_setup_host(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, stream=None):
+    """One-block launch of the metadata builder.
+
+    Lives here rather than in the adapter because a `@cute.jit` defined inside a
+    method closes over the kernel and its block width, and the DSL requires a
+    code object with no free variables.
+    """
+    build_thd_bwd_setup_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters).launch(
+        grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream
+    )

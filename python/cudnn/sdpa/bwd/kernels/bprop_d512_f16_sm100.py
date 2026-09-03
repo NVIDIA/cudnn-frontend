@@ -998,7 +998,13 @@ def _compute_warp_group(
         #    trusting the clamped row's value. sg1 needs nothing: its dS is a
         #    product with the S it receives, so the zero propagates.
         if cutlass.const_expr(_PADDED):
-            q_row_safe = cute.math.min(q_row, seqlen_q - cutlass.Int32(1))
+            # Clamped from BELOW as well as above.  A THD dead unit -- one the
+            # occupancy-sized grid hands out past the live total -- decodes
+            # batch == n_batch and therefore a NEGATIVE length, so clamping only
+            # from above gives a negative row and an illegal LSE/delta read.
+            # row_scale zeroes the lane's contribution either way; this just
+            # keeps the address legal.
+            q_row_safe = cute.math.max(cutlass.Int32(0), cute.math.min(q_row, seqlen_q - cutlass.Int32(1)))
             row_scale = cutlass.Float32(arith.select((q_row < seqlen_q).ir_value(), cutlass.Float32(1.0).ir_value(), cutlass.Float32(0.0).ir_value()))
         else:
             q_row_safe = q_row
@@ -1381,19 +1387,28 @@ def _clamp_thd_input_descs_kernel(
     and the kernel boundary orders them before the main launch reads them.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
-        meta = cutlass.make_array_view(meta_t)
-        t_q = cutlass.Int32(meta[cutlass.Int32(2) * n_batch])  # cu_q[B]
-        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-        emit_clamped_desc(base_q_desc, desc_words, cutlass.Int32(Q_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
-        emit_clamped_desc(base_do_desc, desc_words, cutlass.Int32(DO_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
-        emit_clamped_desc(base_k_desc, desc_words, cutlass.Int32(K_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
-        emit_clamped_desc(base_v_desc, desc_words, cutlass.Int32(V_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
-        nvvm.fence_proxy_release(
-            nvvm.MemScope.GPU,
-            from_proxy=nvvm.Proxy.GENERIC,
-            to_proxy=nvvm.Proxy.TENSORMAP,
-        )
+    # Nested rather than `elect_sync() and tidx < 32`: Python's `and` forces a
+    # bool conversion of a staged value, which the DSL rejects.
+    if tidx < cutlass.Int32(32):
+        if nvvm.elect_sync():
+            _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch)
+
+
+@cute.jit
+def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch):
+    """Body of the clamp; the caller elects."""
+    meta = cutlass.make_array_view(meta_t)
+    t_q = cutlass.Int32(meta[cutlass.Int32(2) * n_batch])  # cu_q[B]
+    t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+    emit_clamped_desc(base_q_desc, desc_words, cutlass.Int32(Q_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
+    emit_clamped_desc(base_do_desc, desc_words, cutlass.Int32(DO_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
+    emit_clamped_desc(base_k_desc, desc_words, cutlass.Int32(K_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+    emit_clamped_desc(base_v_desc, desc_words, cutlass.Int32(V_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+    nvvm.fence_proxy_release(
+        nvvm.MemScope.GPU,
+        from_proxy=nvvm.Proxy.GENERIC,
+        to_proxy=nvvm.Proxy.TENSORMAP,
+    )
 
 
 _clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1615,7 +1630,13 @@ def compile(  # noqa: A001
     if CFG.THD_VARLEN:
         # delta is OURS, so it stays head-major packed [1, QH, T_q]: stage 1
         # produces it from the packed O/dO with a batch extent of 1.
-        fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _t_q), stride_order=(2, 1, 0), assumed_align=16)
+        # delta's extent is STATIC even under THD: the adapter binds the packed
+        # tensors at the capacity bound it passes as `sq_real`, so the producer's
+        # ceil(rows / 128) * 128 rounding is a compile-time number.  Both the
+        # symbolic alternatives fail -- a second shape symbol gets unified with
+        # Q's (and then rejects any packing that is not a multiple of 128), and
+        # a symbolic STRIDE crashes the DSL outright.
+        fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
         # The metadata buffer (THD_BWD_META_WORDS(B)) and the descriptor array
         # (THD_BWD_DESC_SLOTS(B) tensor maps), both written by the setup launch.
         fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (5 * b + 5,), stride_order=(0,), assumed_align=16)

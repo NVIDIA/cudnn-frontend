@@ -1588,6 +1588,19 @@ def _host(
     out_stride_h_0 = problem_size[_stride_idx + 2]
     out_stride_b_0 = problem_size[_stride_idx + 3]
     _stride_idx += 4
+    # B's K extent, separate from A's.  They coincide on the dense path, but
+    # under THD A's K axis is the BLOCKED workspace (rows padded per sequence)
+    # while B's is the PACKED tokens -- different lengths for the same logical
+    # reduction, so one shared symbol cannot describe both.
+    k_b = problem_size[_stride_idx]
+    # A's and C's M extents, likewise separate.  Dense passes all three equal;
+    # THD does not: for dV/dK the A operand's M is the workspace's uniform kv
+    # column count while C's is the PACKED output rows, and `m` itself is only
+    # the grid's M -- the longest sequence, which every group's tiles cover and
+    # a shorter one's spare tiles are clipped out of.
+    m_a = problem_size[_stride_idx + 1]
+    m_c = problem_size[_stride_idx + 2]
+    _stride_idx += 3
 
     # A broadcast operand collapses BOTH batch extents, not just one.
     if cutlass.const_expr(matmul_a_batch == 1):
@@ -1598,6 +1611,15 @@ def _host(
         b_h, b_b = 1, 1
     else:
         b_h, b_b = n_head, n_batch
+    # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
+    # metadata -- but the packed operands hold ONE batch element, reached by the
+    # coordinate offsets instead.  Describing them as n_batch-deep builds a
+    # tensor map over memory that is not there, which fails inside
+    # cuTensorMapEncodeTiled as an abort rather than an exception.
+    if cutlass.const_expr(_THD_MM):
+        a_b = 1
+        b_b = 1
+    c_batch = 1 if cutlass.const_expr(_THD_MM) else n_batch
 
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
@@ -1607,7 +1629,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[m, k_sym, a_h, a_b],
+                    global_dims=[m_a, k_sym, a_h, a_b],
                     global_strides=[
                         a_stride_k * ab_dtype.width // 128,
                         a_stride_h * ab_dtype.width // 128,
@@ -1622,7 +1644,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[k_sym, m, a_h, a_b],
+                    global_dims=[k_sym, m_a, a_h, a_b],
                     global_strides=[
                         a_stride_m * ab_dtype.width // 128,
                         a_stride_h * ab_dtype.width // 128,
@@ -1640,7 +1662,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[n, k_sym, b_h, b_b],
+                    global_dims=[n, k_b, b_h, b_b],
                     global_strides=[
                         b_stride_k * ab_dtype.width // 128,
                         b_stride_h * ab_dtype.width // 128,
@@ -1655,7 +1677,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[k_sym, n, b_h, b_b],
+                    global_dims=[k_b, n, b_h, b_b],
                     global_strides=[
                         b_stride_n * ab_dtype.width // 128,
                         b_stride_h * ab_dtype.width // 128,
@@ -1671,7 +1693,7 @@ def _host(
     tma_c_desc_0 = _tma.create_tensor_map_tiled(
         global_address=_c0.iterator.toint(),
         dtype=cd_dtype,
-        global_dims=[n, m, n_head, n_batch],
+        global_dims=[n, m_c, n_head, c_batch],
         global_strides=[
             # `cd_dtype.width`, not a literal 16: the A/B descriptors above already
             # derive it, and this one is now dtype-parameterized too.
@@ -1755,6 +1777,11 @@ def compile() -> Callable:
     # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
+    # See `_host`: A's and B's K extents are the same number only on the dense
+    # path, so they are separate symbols and the artifact serves both.
+    sym_k_b = cute.sym_int64()
+    sym_m_a = cute.sym_int64()
+    sym_m_c = cute.sym_int64()
     # Two symbolic batch extents instead of one flat `sym_l`.
     sym_h = cute.sym_int64()
     sym_b = cute.sym_int64()
@@ -1770,7 +1797,7 @@ def compile() -> Callable:
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_m, sym_k, sym_a_h, sym_a_b),
+            (sym_m_a, sym_k, sym_a_h, sym_a_b),
             stride_order=(0, 1, 2, 3) if a_is_m_major else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1778,7 +1805,7 @@ def compile() -> Callable:
     def _make_fake_b():
         return make_fake_compact_tensor(
             mma_b_dtype,
-            (sym_n, sym_k, sym_b_h, sym_b_b),
+            (sym_n, sym_k_b, sym_b_h, sym_b_b),
             stride_order=(0, 1, 2, 3) if b_is_n_major else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1786,7 +1813,7 @@ def compile() -> Callable:
     def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
             _dt,
-            (sym_m, sym_n // _div, sym_h, sym_b),
+            (sym_m_c, sym_n // _div, sym_h, sym_b),
             stride_order=(0, 1, 2, 3) if _mm else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1824,6 +1851,9 @@ def compile() -> Callable:
         sym_out_stride_n_0,
         sym_out_stride_h_0,
         sym_out_stride_b_0,
+        sym_k_b,
+        sym_m_a,
+        sym_m_c,
     )
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     # Dense binds 1-element dummies; THD's real extents are runtime, so both are
@@ -1862,7 +1892,7 @@ def _permuted(t, mn_dim: int, k_dim: int, h_dim: int, b_dim: int):
     return t.permute(mn_dim, k_dim, h_dim, b_dim)
 
 
-def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, desc_words=None):
+def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, desc_words=None, grid_m: int = None):
     """Run one ``(batch, head)``-batched GEMM.
 
     ``a`` / ``b`` / ``out`` are already permuted to ``(M|N, K, H, B)`` /
@@ -1880,7 +1910,12 @@ def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, d
         # has the slots and a None would fail at the call boundary.
         raise ValueError("matmul_bh needs `meta` and `desc_words` (dense may pass any 1-D dummies)")
     fn = compile()
-    m, k = int(a.shape[0]), int(a.shape[1])
+    # `m` sizes the GRID.  Dense: the operands' shared M.  THD: the caller
+    # passes the longest sequence, because the per-sequence extents are device
+    # values and A's own M is the workspace's column count, not an output row
+    # count.
+    m = int(a.shape[0]) if grid_m is None else int(grid_m)
+    k = int(a.shape[1])
     n = int(b.shape[0])
     problem_size = (
         m,
@@ -1891,5 +1926,8 @@ def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, d
         *(int(s) for s in a.stride()),
         *(int(s) for s in b.stride()),
         *(int(s) for s in out.stride()),
+        int(b.shape[1]),
+        int(a.shape[0]),
+        int(out.shape[0]),
     )
     return fn(problem_size, a, b, out, meta, desc_words, stream=stream)
