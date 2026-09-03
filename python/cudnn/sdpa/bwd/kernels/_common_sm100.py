@@ -21,6 +21,8 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.frost.tile_dsl.thd import thd_decode_unit
+
 
 def make_bwd_decode(CFG):
     """Return ``(decode_initial, decode_payload)`` for a role-split cluster.
@@ -33,18 +35,47 @@ def make_bwd_decode(CFG):
     lane-to-lane across ``cross_sg_peer = cta_id ^ CTA_MMA``. That falls out of
     keying the row on ``cta_in_pair`` (0/1 within a pair) rather than on the
     cluster-wide CTA id.
+
+    Under ``CFG.THD_VARLEN`` both arms decode the SAME linear unit id -- from
+    ``blockIdx.x`` for the first tile, from the persistent scheduler's payload
+    word afterwards -- so there is one THD body and the dense pair keeps its
+    old shape. A unit is ``TILE_M * CTA_MMA`` q rows of one head of one
+    sequence, matching what the setup launch counted into ``live``.
     """
+    _thd = int(getattr(CFG, "THD_VARLEN", 0))
+    _CGA_TILE_M = CFG.TILE_M * CFG.CTA_MMA
 
     @cute.jit
-    def decode_initial(bidx, bidy, bidz, cta_in_pair):
+    def _thd_decode(linear_cta, meta_t, n_batch, n_qh, cta_in_pair):
+        """Linear cluster id -> ``(q_block, head, batch)`` through batch_remap.
+
+        A dead unit (one no sequence claims -- the grid is occupancy-sized, not
+        work-sized) comes back with ``batch == n_batch``, and every read it then
+        makes stays IN BOUNDS of the metadata buffer: ``cu_q[n_batch]`` is the
+        packed total, so the per-sequence length reads go to zero or negative
+        and each role's loop bound collapses to empty rather than faulting.
+        """
+        u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        meta = cutlass.make_array_view(meta_t)
+        q_tile_idx, batch, head = thd_decode_unit(meta, n_batch, u, n_qh, cutlass.Int32(_CGA_TILE_M), False)
+        return q_tile_idx * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+
+    @cute.jit
+    def decode_initial(bidx, bidy, bidz, cta_in_pair, meta_t=None, n_batch=None, n_qh=None):
         """From blockIdx, for the first tile."""
+        if cutlass.const_expr(_thd):
+            return _thd_decode(bidx, meta_t, n_batch, n_qh, cta_in_pair)
         q_block = (bidx // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
         return q_block, bidy, bidz
 
     @cute.jit
-    def decode_payload(t0, t1, cta_in_pair):
-        """From a CLC response: ``t0`` is the cancelled cluster's blockIdx.x,
-        ``t1`` packs head in the low 16 bits and batch in the high 16."""
+    def decode_payload(t0, t1, cta_in_pair, meta_t=None, n_batch=None, n_qh=None):
+        """From the scheduler payload: dense (CLC) ``t0`` is the cancelled
+        cluster's blockIdx.x and ``t1`` packs head in the low 16 bits and batch
+        in the high 16; THD (persistent claim) puts ``unit * CGA_M`` in ``t0``
+        and leaves ``t1`` unused."""
+        if cutlass.const_expr(_thd):
+            return _thd_decode(t0, meta_t, n_batch, n_qh, cta_in_pair)
         q_block = (t0 // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
         head = t1 & cutlass.Int32(0xFFFF)
         batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
@@ -53,4 +84,42 @@ def make_bwd_decode(CFG):
     return decode_initial, decode_payload
 
 
-__all__ = ["make_bwd_decode"]
+def make_bwd_thd_coords(CFG):
+    """Return ``thd_coords(meta_t, batch, n_batch)`` -> the five per-sequence
+    values every warp role needs, or their dense fall-throughs.
+
+    ``(q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv)``:
+
+    * ``q_tok`` / ``kv_tok`` are ``cu_q[b]`` / ``cu_k[b]``, added to the SEQUENCE
+      coordinate of the packed Q/dO and K/V descriptors (whose batch coordinate
+      is then always 0 -- a packed tensor has one batch).
+    * ``ws_row`` is ``row_off[b]``, added to the row coordinate of the blocked
+      S/dS workspace.
+    * the two lengths drive the per-cell mask and the kv loop bounds, replacing
+      the scalars a dense launch threads.
+
+    Dense returns ``(0, 0, 0, scalar_q, scalar_kv)`` and every use folds away.
+    """
+    _thd = int(getattr(CFG, "THD_VARLEN", 0))
+
+    @cute.jit
+    def thd_coords(meta_t, batch, n_batch, scalar_seqlen_q, scalar_seqlen_kv):
+        if cutlass.const_expr(_thd):
+            meta = cutlass.make_array_view(meta_t)
+            cu_q0 = n_batch
+            cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+            row0 = cutlass.Int32(4) * n_batch + cutlass.Int32(4)
+            q_tok = cutlass.Int32(meta[cu_q0 + batch])
+            kv_tok = cutlass.Int32(meta[cu_k0 + batch])
+            # A dead unit reads batch == n_batch: cu[q0 + n_batch] is the packed
+            # total and cu[q0 + n_batch + 1] is cu_k[0] == 0, so the length goes
+            # NEGATIVE and every kv bound collapses to an empty range.
+            s_q = cutlass.Int32(meta[cu_q0 + batch + cutlass.Int32(1)]) - q_tok
+            s_kv = cutlass.Int32(meta[cu_k0 + batch + cutlass.Int32(1)]) - kv_tok
+            return q_tok, kv_tok, cutlass.Int32(meta[row0 + batch]), s_q, s_kv
+        return cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), scalar_seqlen_q, scalar_seqlen_kv
+
+    return thd_coords
+
+
+__all__ = ["make_bwd_decode", "make_bwd_thd_coords"]
