@@ -59,6 +59,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
     d192_square_br_as_tl,
+    d256_square_br_as_tl,
     pack_gqa_supported,
 )
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
@@ -426,7 +427,40 @@ def select_d192_auto_knobs(
     return sched_policy, 1 if pt_cga1 or mx_cga1 else 2
 
 
-def _d192_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
+def select_d256_auto_knobs(
+    params: Sm100TemplateParams,
+    *,
+    pertensor: bool,
+    s_q: int,
+    s_kv: int,
+) -> tuple[int, int]:
+    """Select the measured D256 scheduler and fixed FP8 CTA1 geometry."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if not fp8:
+        return params.sched_policy, 2
+    if params.split_kv > 1 or params.thd_varlen:
+        return SCHED_NATURAL, 1
+
+    no_mask = params.window_left is None and params.window_right is None and not params.seq_kv_lens_present
+    if no_mask:
+        return SCHED_NATURAL, 1
+
+    top_left = not params.bottom_right or d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
+    pt_lpt_l2 = (
+        pertensor
+        and params.window_left is None
+        and params.window_right is not None
+        and not params.seq_kv_lens_present
+        and top_left
+        and _ceil_div(s_q, 256) >= 16
+    )
+    if pt_lpt_l2:
+        return params.sched_policy, 1
+    return SCHED_LPT, 1
+
+
+def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
     dtype_codes = {
         cudnn.data_type.FP8_E4M3: DTYPE_E4M3,
         cudnn.data_type.FP8_E5M2: DTYPE_E5M2,
@@ -450,10 +484,16 @@ def _d192_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
-    has_d192_cga_domain = any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape)
-    if _selected_d_shape(caps, facts) != (192, 128) or not has_d192_cga_domain:
+    selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
+        params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
+        selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+        if selected_cga not in domain:
+            raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
+        return selected_sched, selected_cga
+    if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
-    params = _d192_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
+    params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
     selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
     if selected_cga not in domain:
         raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")

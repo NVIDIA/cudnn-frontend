@@ -90,8 +90,8 @@ class TemplateParams:
     # Compile-time LPT head/batch grouping. Keep 1 unless the selected kernel
     # and concrete graph shape opt into a divisor of B*Hq.
     lpt_head_group: int = 1
-    # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
-    # number of query tiles. Zero keeps the existing runtime derivation.
+    # Dense FP8 kernels may specialize scheduler selection/decoding to the
+    # graph's compile-time number of query tiles. Zero keeps runtime derivation.
     lpt_q_tiles: int = 0
     # Optional L2 working-set budget for SCHED_LPT_L2. Zero keeps the flavor's
     # default budget.
@@ -145,8 +145,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor not in ("d128", "d192", "d512"):
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192 and d512")
+    if fp8 and flavor not in ("d128", "d192", "d256", "d512"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
@@ -180,7 +180,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     # corrupt the result instead of dropping out.  Reject at the door.
     if k.split_kv != 1 and flavor not in _SPLIT_KV_FLAVORS:
         raise ValueError(f"{flavor}: split_kv is not implemented on this flavor (got {k.split_kv}); supported: {sorted(_SPLIT_KV_FLAVORS)}")
-    if k.cta_mma != 2 and flavor not in _CTA_MMA_FLAVORS:
+    # D256 selects its topology from the input family rather than exposing a
+    # free CTA-MMA knob: half inputs stay CTA2, while FP8/MXFP8 use CTA1.
+    d256_quantized_cta1 = flavor == "d256" and fp8 and k.cta_mma == 1
+    if k.cta_mma != 2 and flavor not in _CTA_MMA_FLAVORS and not d256_quantized_cta1:
         raise ValueError(f"{flavor}: cta_mma is not selectable on this flavor (got {k.cta_mma}); supported: {sorted(_CTA_MMA_FLAVORS)}")
     if flavor == "d192" and k.split_kv > 1 and k.cta_mma != 2:
         raise ValueError("d192: split_kv > 1 is validated only with cta_mma=2")
@@ -195,8 +198,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             # The sink logit is folded into the softmax denominator in the
             # per-tile epilogue, so every split would add its own copy of it.
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
-    if k.lpt_head_group not in (1, 8, 16):
-        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
+    lpt_head_groups = (1, 8, 16, 32) if flavor == "d256" else (1, 8, 16)
+    if k.lpt_head_group not in lpt_head_groups:
+        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be one of {lpt_head_groups}; got {k.lpt_head_group}")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
@@ -302,7 +306,8 @@ def _tma_iters(cfg) -> TmaIters:
 
 
 # ---------------------------------------------------------------------------
-# d256 flavor — d_qk = d_v = 256, SM100 (Blackwell), cga2 (Qwen-class models)
+# d256 flavor — d_qk = d_v = 256, SM100 (Blackwell), Qwen-class models
+# Half inputs use CTA2 collective MMA; FP8/MXFP8 use an independent CTA1 tile.
 # ---------------------------------------------------------------------------
 
 
@@ -338,8 +343,12 @@ class CfgD256:
 
     SOFTMAX_WARPGROUPS: int = 1
     CORRECTION_WARPS: int = 4
+    FUSED_CORR_SPLIT_P: int = 0
 
     SOFTMAX_REGS: int = 240
+    # The DSL traces the unreachable WG1 dispatch for one-WG specializations,
+    # so its placeholder must still be a legal setmaxnreg operand.
+    SOFTMAX_WG1_REGS: int = 40
     CORRECTION_REGS: int = 96
     MMA_REGS: int = 40
     TMALDG_REGS: int = 40
@@ -367,6 +376,7 @@ class CfgD256:
     OTHER_WARPS: int = 4
 
     SOFTMAX_WG0_BASE: int = 0
+    SOFTMAX_WG1_BASE: int = 4
     CORR_WARP_BASE: int = 4
     MMA_WARP_ID: int = 8
     TMALDG_WARP_ID: int = 9
@@ -396,45 +406,185 @@ class CfgD256:
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
+    fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
+    split_p = cfg.SOFTMAX_WARPGROUPS == 2
+    fused_corr_split_p = cfg.FUSED_CORR_SPLIT_P == 1
+    split_p_supported = fp8 and (cfg.MASK_FLAGS == MASK_NONE or ((cfg.MASK_FLAGS & ~MASK_PADDED) == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0))
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
-        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d256: register budget over 512"),
-        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d256: per-role regs must be multiples of 8"),
+        (
+            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
+            "d256: register budget over 512",
+        ),
+        (
+            cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0 and cfg.SOFTMAX_WG1_REGS % 8 == 0,
+            "d256: per-role regs must be multiples of 8",
+        ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
-        (cfg.CTA_MMA == 2, "d256 SM100 is cga2-only (CTA_MMA must be 2)"),
-        (cfg.STAGES_KV == 2, "d256 SM100 STAGES_KV: f16/bf16 -> 2 (192 KiB SMEM budget)"),
+        (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
+        (cfg.STAGES_KV == 2, "d256 SM100 uses two full/half-width KV stages"),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
-        (cfg.SOFTMAX_WARPGROUPS == 1, "d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: DTYPE_O must equal DTYPE_QKV"),
+        (not split_p or split_p_supported, "d256: unsupported split-P specialization"),
+        (cfg.SOFTMAX_WARPGROUPS == 2 if cfg.MASK_FLAGS == MASK_NONE and fp8 else True, "d256: dense FP8 must split P generation"),
+        (cfg.TOTAL_WARPS == (12 if fused_corr_split_p else 16 if split_p else 12), "d256: role layout and warp count disagree"),
+        (not fused_corr_split_p or (split_p and cfg.CORRECTION_WARPS == 0), "d256: fused split-P must replace the correction warp group"),
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
+            "d256: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+        ),
+        (fp8 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: half input requires DTYPE_O == DTYPE_QKV"),
     )
     for ok, msg in checks:
         if not ok:
             raise ValueError(msg)
 
 
-def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+def d256_square_br_as_tl(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
+    """Whether a D256 bottom-right mask is exactly top-left causal."""
+
+    return (
+        params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+        and not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+    )
+
+
+def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
+    """Apply strictly equivalent D256 lowering canonicalizations."""
+
+    return replace(params, bottom_right=False) if d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params
+
+
+def derive_d256_internal_params(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    batch_size: int,
+    h_q: int,
+    s_q: int,
+) -> TemplateParams:
+    """Derive D256-private codegen fields after public knobs are fixed."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if not fp8 or params.thd_varlen:
+        return params
+
+    pack_gqa_ratio = params.qh_per_kh if params.pack_gqa else 1
+    groups = batch_size * h_q // pack_gqa_ratio
+    lpt_head_group = 32 if pertensor and groups % 32 == 0 else 8 if not pertensor and groups % 8 == 0 else 1
+    q_tiles = (s_q + 255) // 256 if pertensor else 0
+    mask_flags = _mask_flags_from(params)
+    pt_lpt_l2 = pertensor and params.sched_policy == SCHED_LPT_L2 and mask_flags == MASK_CAUSAL and not params.bottom_right and q_tiles >= 16
+    return replace(
+        params,
+        lpt_head_group=lpt_head_group,
+        lpt_l2_size_mib=32 if pt_lpt_l2 else 0,
+    )
+
+
+def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, TmaIters]:
     _validate_params("d256", params)
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    cga = 1 if fp8 else 2
+    if params.cta_mma != cga:
+        raise ValueError(f"d256: {'FP8/MXFP8' if fp8 else 'BF16/FP16'} requires cta_mma={cga}; got {params.cta_mma}")
+    mask_flags = _mask_flags_from(params)
+    pt_plain_top_left_causal = (
+        not mxfp8 and (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_left and not params.window_right
+    )
+    # The fused correction/split-P schedule is the strict top-left causal fast
+    # path. Right-band widening uses the generic masked schedule; forcing the
+    # widened specialization through this path makes CUTLASS DSL 4.7 lowering
+    # grow pathologically without changing the supported mask semantics.
+    strict_top_left_causal = (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_right
+    split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
+    pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
+    fused_corr_split_p = mxfp8 and strict_top_left_causal
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
+
+    # These register profiles are coupled to the kernel's role topologies;
+    # they are not independent public knobs.
+    pt_e4_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
+    pt_e5_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
+    softmax_regs, softmax_wg1_regs, correction_regs = 240, 136 if split_p else 40, 96
+    if fused_corr_split_p:
+        softmax_regs, softmax_wg1_regs, correction_regs = 248, 216, 64
+    elif mxfp8 and split_p:
+        softmax_regs, softmax_wg1_regs, correction_regs = 256, 144, 72
+    elif pt_thd_split_p:
+        softmax_wg1_regs, correction_regs = 144, 88
+    elif pt_e4_causal_regs:
+        correction_regs = 64
+        if split_p:
+            softmax_regs = 216
+            softmax_wg1_regs = 168
+    elif pt_e5_causal_regs:
+        correction_regs = 96 if split_p else 112
+    elif mxfp8 and mask_flags != MASK_NONE:
+        correction_regs = 64
+        if params.dtype_qkv == DTYPE_E5M2 or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL):
+            softmax_regs = 248
+    elif not mxfp8 and fp8 and mask_flags != MASK_NONE:
+        correction_regs = 104
+    elif not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE:
+        correction_regs = 88
+
+    if fused_corr_split_p:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id, read_tile_arrivers = 12, 4, 64, 8, 11
+    elif split_p:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id, read_tile_arrivers = 16, 4, 8, 12, 15
+    else:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id = 12, 64, 4, 8
+        read_tile_arrivers = 11 if fp8 else 21
+
     cfg = CfgD256(
         DTYPE_QKV=params.dtype_qkv,
-        DTYPE_O=params.dtype_qkv,
+        DTYPE_O=dtype_o,
         BPE=b,
-        BPE_O=b,
+        BPE_O=b_o,
+        # FP8 uses one M128 CTA per work unit. With a full K/V slice per CTA,
+        # two KV stages consume the same SMEM payload as CTA2's four half-slices.
+        CGA_M=params.cta_mma,
+        CTA_MMA=params.cta_mma,
         Q_SWZ_BYTES=q_swz_bytes(256, b),
         K_SWZ_BYTES=q_swz_bytes(256, b),
-        V_SWZ_BYTES=v_swz_bytes(256, 2, b),
-        O_SWZ_BYTES=o_swz_bytes(256, b),
+        V_SWZ_BYTES=v_swz_bytes(256, 1 if fp8 else 2, b),
+        O_SWZ_BYTES=o_swz_bytes(256, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        MASK_FLAGS=_mask_flags_from(params),
+        TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        STAGES_KV=2,
+        SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
+        CORRECTION_WARPS=0 if fused_corr_split_p else 4,
+        FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
+        SOFTMAX_REGS=softmax_regs,
+        SOFTMAX_WG1_REGS=softmax_wg1_regs,
+        CORRECTION_REGS=correction_regs,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=total_warps * 32,
+        SOFTMAX_WG1_BASE=softmax_wg1_base,
+        CORR_WARP_BASE=correction_warp_base,
+        MMA_WARP_ID=mma_warp_id,
+        TMALDG_WARP_ID=mma_warp_id + 1,
+        TMASTG_WARP_ID=mma_warp_id + 2,
+        SCHED_WARP_ID=mma_warp_id + 3,
+        READ_TILE_ARRIVERS=read_tile_arrivers,
+        MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
+        L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
@@ -446,6 +596,14 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
         raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
+
+
+def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+    return _make_cfg_d256(params, mxfp8=False)
+
+
+def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+    return _make_cfg_d256(params, mxfp8=True)
 
 
 # ---------------------------------------------------------------------------
