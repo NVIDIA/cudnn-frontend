@@ -191,58 +191,84 @@ def _benchmark_shape(
     warmup: int,
     iters: int,
     execution: str,
+    variant: str,
 ) -> dict[str, dict[str, float]]:
-    """Run the three-way comparison at one B, Sq=Sk point."""
+    """Run the requested direct-adapter variants at one B, Sq=Sk point."""
     shape_q = (batch, q_heads, seqlen, dim)
     shape_kv = (batch, kv_heads, seqlen, dim)
-    q_bf16 = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16).normal_(0.0, 0.5)
-    k_bf16 = torch.empty(shape_kv, device="cuda", dtype=torch.bfloat16).normal_(
-        0.0, 0.5
-    )
-    v_bf16 = torch.empty(shape_kv, device="cuda", dtype=torch.bfloat16).normal_(
-        0.0, 0.5
-    )
-    torch.cuda.empty_cache()
-    q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
-    torch.cuda.empty_cache()
-    k_mx, sf_k = _quantize_mxfp8(k_bf16, columnwise=False)
-    torch.cuda.empty_cache()
-    v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
-    torch.cuda.empty_cache()
-    scale = 1.0 / math.sqrt(dim)
 
-    return {
-        HYBRID_NAME: _time_variant(
-            api_cls,
-            shape_q=shape_q,
-            q=q_mx,
-            k=k_mx,
-            v=v_bf16,
-            scale=scale,
-            pv_bf16=True,
-            sf_q=sf_q,
-            sf_k=sf_k,
-            sf_v=None,
-            warmup=warmup,
-            iters=iters,
-            execution=execution,
-        ),
-        MXFP8_NAME: _time_variant(
-            api_cls,
-            shape_q=shape_q,
-            q=q_mx,
-            k=k_mx,
-            v=v_mx,
-            scale=scale,
-            pv_bf16=False,
-            sf_q=sf_q,
-            sf_k=sf_k,
-            sf_v=sf_v,
-            warmup=warmup,
-            iters=iters,
-            execution=execution,
-        ),
-        BF16_NAME: _time_variant(
+    def bf16_input(shape: tuple[int, int, int, int]) -> torch.Tensor:
+        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).normal_(0.0, 0.5)
+
+    scale = 1.0 / math.sqrt(dim)
+    results: dict[str, dict[str, float]] = {}
+    run_mxfp8 = variant in ("all", "hybrid", "mxfp8")
+
+    # Retain only the inputs used by the active variant. For high-memory MHA,
+    # invoke each variant in a fresh process: CUDA-graph pools are process-
+    # scoped and cannot be returned to the allocator between variants.
+    if run_mxfp8:
+        q_bf16 = bf16_input(shape_q)
+        q_mx, sf_q = _quantize_mxfp8(q_bf16, columnwise=False)
+        del q_bf16
+        torch.cuda.empty_cache()
+
+        k_bf16 = bf16_input(shape_kv)
+        k_mx, sf_k = _quantize_mxfp8(k_bf16, columnwise=False)
+        del k_bf16
+        torch.cuda.empty_cache()
+
+        if variant in ("all", "hybrid"):
+            v_bf16 = bf16_input(shape_kv)
+            results[HYBRID_NAME] = _time_variant(
+                api_cls,
+                shape_q=shape_q,
+                q=q_mx,
+                k=k_mx,
+                v=v_bf16,
+                scale=scale,
+                pv_bf16=True,
+                sf_q=sf_q,
+                sf_k=sf_k,
+                sf_v=None,
+                warmup=warmup,
+                iters=iters,
+                execution=execution,
+            )
+            del v_bf16
+            torch.cuda.empty_cache()
+
+        if variant in ("all", "mxfp8"):
+            v_bf16 = bf16_input(shape_kv)
+            v_mx, sf_v = _quantize_mxfp8(v_bf16, columnwise=True)
+            del v_bf16
+            torch.cuda.empty_cache()
+            results[MXFP8_NAME] = _time_variant(
+                api_cls,
+                shape_q=shape_q,
+                q=q_mx,
+                k=k_mx,
+                v=v_mx,
+                scale=scale,
+                pv_bf16=False,
+                sf_q=sf_q,
+                sf_k=sf_k,
+                sf_v=sf_v,
+                warmup=warmup,
+                iters=iters,
+                execution=execution,
+            )
+            del v_mx, sf_v
+            torch.cuda.empty_cache()
+
+        del q_mx, k_mx, sf_q, sf_k
+        torch.cuda.empty_cache()
+
+    if variant in ("all", "bf16"):
+        q_bf16 = bf16_input(shape_q)
+        k_bf16 = bf16_input(shape_kv)
+        v_bf16 = bf16_input(shape_kv)
+        results[BF16_NAME] = _time_variant(
             api_cls,
             shape_q=shape_q,
             q=q_bf16,
@@ -256,8 +282,11 @@ def _benchmark_shape(
             warmup=warmup,
             iters=iters,
             execution=execution,
-        ),
-    }
+        )
+        del q_bf16, k_bf16, v_bf16
+        torch.cuda.empty_cache()
+
+    return results
 
 
 def main() -> None:
@@ -276,6 +305,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--execution", choices=("both", "eager", "graph"), default="both"
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("all", "hybrid", "mxfp8", "bf16"),
+        default="all",
+        help="time one variant in a fresh process, or all three (default)",
     )
     parser.add_argument(
         "--sweep",
@@ -326,7 +361,8 @@ def main() -> None:
     )
     print(
         f"{scope}: Hq={args.q_heads} Hkv={args.kv_heads} D={args.dim}; causal; "
-        f"{args.warmup} warmup launches; average of {args.iters} CUDA-event timed launches per row"
+        f"{args.warmup} warmup launches; average of {args.iters} CUDA-event timed launches per row; "
+        f"variant={args.variant}"
     )
     print(
         f"{'B':>4s} {'Sq=Sk':>7s} {'kernel':38s} {'execution':11s} "
@@ -345,17 +381,21 @@ def main() -> None:
                 warmup=args.warmup,
                 iters=args.iters,
                 execution=args.execution,
+                variant=args.variant,
             )
         except torch.OutOfMemoryError:
             print(f"{batch:4d} {seqlen:7d} {'OOM':38s} {'-':11s} {'-':>14s} {'-':>9s}")
         else:
+            bf16_timings = results.get(BF16_NAME, {})
             for name in (HYBRID_NAME, MXFP8_NAME, BF16_NAME):
                 for execution in ("eager", "cuda graph"):
-                    average_us = results[name].get(execution)
+                    average_us = results.get(name, {}).get(execution)
                     if average_us is None:
                         continue
-                    bf16_us = results[BF16_NAME][execution]
-                    relative = f"{average_us / bf16_us:.3f}x"
+                    bf16_us = bf16_timings.get(execution)
+                    relative = (
+                        f"{average_us / bf16_us:.3f}x" if bf16_us is not None else "-"
+                    )
                     print(
                         f"{batch:4d} {seqlen:7d} {name:38s} {execution:11s} "
                         f"{average_us:14.2f} {relative:>9s}"
