@@ -497,7 +497,8 @@ class PyGraph {
                   std::optional<PyCallback> fn,
                   std::optional<PyCallback> fn_bprop,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                  cudnn_frontend::AttentionImplementation_t const& implementation);
 
     // return [o, stats, amax_s, amax_o]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>
