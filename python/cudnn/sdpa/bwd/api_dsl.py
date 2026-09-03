@@ -2103,6 +2103,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._dot_fn = None
         self._reduce_fn = None
         self._zero_ws = False
+        self._dummy_desc = None
         # GQA / MQA: stage 3 cannot write dK/dV straight to the output, because
         # every Q head in a group contributes to the SAME KV head. It writes one
         # partial per Q head and a separate reduce folds the group. group == 1
@@ -2396,6 +2397,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
 
             lse = stats_tensor.reshape(b, h, sq)
             seq_kv = torch.full((b,), skv, device=q.device, dtype=torch.int32)
+            # Stage 2's THD ABI slots, unused on this dense path: the metadata
+            # buffer rides `seq_kv` (which the dense kernel never reads) and the
+            # descriptor array is a 1-element dummy. Cached on the adapter so a
+            # per-execute call does not allocate.
+            if self._dummy_desc is None or self._dummy_desc.device != q.device:
+                self._dummy_desc = torch.zeros(1, dtype=torch.int64, device=q.device)
+            desc_words = self._dummy_desc
             for c in range(h // chunk):
                 hb = c * chunk
                 hs = slice(hb, hb + chunk)
@@ -2413,7 +2421,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     lse,
                     delta,
                     seq_kv,
-                    (b, h, sqp, skvp, chunk, self.h_kv, sq, skv),
+                    desc_words,
+                    # The trailing 0 is N_THD_UNITS: the persistent grid's
+                    # cluster count, which only the THD path uses.
+                    (b, h, sqp, skvp, chunk, self.h_kv, sq, skv, 0),
                     float(scale),
                     float(scale_log2),
                     float(scale),
