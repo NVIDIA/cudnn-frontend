@@ -365,8 +365,9 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 
 ### Canonical layouts (additive)
 
-Each input is also accepted in its natural row-major form, normalized internally;
-the pre-permuted kernel-facing forms above keep working unchanged:
+Each input is also accepted in its natural row-major form. Canonical inputs compile at
+their own rank and bind directly, with no per-call host-side views; the pre-permuted
+kernel-facing forms above keep working unchanged:
 
 - `A`: `(valid_m, K)` row-major
 - `B`: `(L, N, K)` C-contiguous

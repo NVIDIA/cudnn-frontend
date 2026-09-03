@@ -94,8 +94,8 @@ def run_swiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None, alpha=...
 def assert_same(name, canonical_t, legacy_t):
     if legacy_t is None and canonical_t is None:
         return
-    legacy_flat = legacy_t.reshape(-1) if legacy_t.is_contiguous() else legacy_t.contiguous().reshape(-1)
-    canonical_flat = canonical_t.reshape(-1) if canonical_t.is_contiguous() else canonical_t.contiguous().reshape(-1)
+    legacy_flat = legacy_t.reshape(-1)
+    canonical_flat = canonical_t.reshape(-1)
     if canonical_flat.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn, torch.float8_e5m2, torch.float4_e2m1fn_x2):
         legacy_flat = legacy_flat.view(torch.uint8)
         canonical_flat = canonical_flat.view(torch.uint8)
@@ -205,10 +205,12 @@ def dswiglu_case(request):
     return cfg, inputs
 
 
-def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None):
+def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None, alpha=...):
     from cudnn import grouped_gemm_dswiglu_wrapper_sm100
 
     prob = inputs["prob_tensor"]
+    if alpha is ...:
+        alpha = inputs["alpha_tensor"]
     if canonical:
         a = inputs["a_tensor"].squeeze(-1)
         b = inputs["b_tensor"].permute(2, 0, 1)
@@ -232,7 +234,7 @@ def run_dswiglu(cfg, inputs, canonical, flat_sf=False, prob_dtype=None):
         sfa_tensor=sfa,
         sfb_tensor=sfb,
         padded_offsets=inputs["padded_offsets_tensor"],
-        alpha_tensor=inputs["alpha_tensor"],
+        alpha_tensor=alpha,
         beta_tensor=inputs["beta_tensor"],
         prob_tensor=prob,
         norm_const_tensor=inputs.get("norm_const_tensor"),
@@ -280,3 +282,17 @@ def test_grouped_gemm_dswiglu_canonical_bf16_prob(request):
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
     assert_same("d_row", canonical["d_row_tensor"], legacy["d_row_tensor"])
     torch.testing.assert_close(canonical["dprob_tensor"].reshape(-1), legacy["dprob_tensor"].reshape(-1), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_dswiglu_alpha_defaults_to_ones(request):
+    try:
+        cfg, inputs = dswiglu_case(request)
+        ones = torch.ones_like(inputs["alpha_tensor"])
+        explicit = run_dswiglu(cfg, inputs, canonical=True, alpha=ones)
+        defaulted = run_dswiglu(cfg, inputs, canonical=True, alpha=None)
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    assert_same("d_row", defaulted["d_row_tensor"], explicit["d_row_tensor"])
+    torch.testing.assert_close(defaulted["dprob_tensor"], explicit["dprob_tensor"], rtol=1e-4, atol=1e-4)
