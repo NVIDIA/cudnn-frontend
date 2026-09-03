@@ -32,9 +32,7 @@ from sdpa.suites.common import Fixed
 
 # Mask-flavor fuzz used by every suite that supports masks: causal, one-sided
 # windows, band around the diagonal, and no mask.
-SW_FULL = dict(
-    causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10
-)
+SW_FULL = dict(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10)
 SW_NONE = dict(no_mask=10)
 
 DIAG_BOTH = {
@@ -86,9 +84,7 @@ def dense_fwd():
         data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
-        is_ragged_or_padded_or_full=RandomChoice(
-            {"padded": 1, "cu_padded": 1, "full": 1}
-        ),
+        is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "cu_padded": 1, "full": 1}),
         with_sink_token=RandomChoice({True: 1, False: 3}),
         is_bias=RandomChoice({True: 1, False: 5}),
     )
@@ -308,9 +304,7 @@ def fp8_fwd():
         ),
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice(
-            {torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}
-        ),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1, "full": 1}),
@@ -338,9 +332,7 @@ def fp8_decode():
         ),
         head_count=RandomHeadGenerator(min=1, max=16, head_group_options=(1, 5, 2)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice(
-            {torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}
-        ),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_BOTH),
         is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
@@ -367,9 +359,7 @@ def fp8_thd_fwd():
         ),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice(
-            {torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}
-        ),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BR_HEAVY),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "cu_ragged": 1}),
@@ -399,9 +389,7 @@ def fp8_paged():
         ),
         head_count=RandomHeadGenerator(min=1, max=4, head_group_options=(1, 2, 0)),
         data_type=RandomChoice({torch.float8_e4m3fn: 2, torch.float8_e5m2: 1}),
-        output_type=RandomChoice(
-            {torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 1}
-        ),
+        output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_TL),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
@@ -602,11 +590,7 @@ def model_knobs(preset, phase):
     """Knob set for a popular-model preset: heads/dims pinned to the model,
     everything else (batch, seq lens, layout, mask flavor, data) fuzzed.
     ``phase``: context (prefill fwd), generation (decode fwd), bprop (training)."""
-    sink = (
-        RandomChoice({True: 1, False: 1})
-        if (preset.with_sink and phase != "generation")
-        else Fixed(False)
-    )
+    sink = RandomChoice({True: 1, False: 1}) if (preset.with_sink and phase != "generation") else Fixed(False)
 
     if phase == "generation":
         return dict(
@@ -619,16 +603,12 @@ def model_knobs(preset, phase):
                 s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
             ),
             d_qk_d_v=Fixed((preset.head_dim_qk, preset.head_dim_vo)),
-            head_count=Fixed(
-                (preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)
-            ),
+            head_count=Fixed((preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)),
             data_type=_f16(),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
             is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
-            block_size=RandomBlockSize(
-                min=16, max=256, with_high_probability=[16, 32, 128]
-            ),
+            block_size=RandomBlockSize(min=16, max=256, with_high_probability=[16, 32, 128]),
         )
 
     return dict(
@@ -646,9 +626,7 @@ def model_knobs(preset, phase):
             },
         ),
         d_qk_d_v=Fixed((preset.head_dim_qk, preset.head_dim_vo)),
-        head_count=Fixed(
-            (preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)
-        ),
+        head_count=Fixed((preset.num_q_heads, preset.num_kv_heads, preset.num_kv_heads)),
         data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**preset.mask_weights),
         diag_align=RandomChoice(DIAG_BOTH),

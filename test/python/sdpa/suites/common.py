@@ -39,9 +39,7 @@ REPRO_FILE = os.path.join(os.path.dirname(__file__), "test_repro_suite.py")
 def make_seeds(*, num_tests, rng_seed):
     """Deterministic seed sweep: (test_index, num_tests, data_seed) tuples."""
     rng = random.Random(rng_seed)
-    return [
-        (i + 1, num_tests, rng.randint(65536, 2147483647)) for i in range(num_tests)
-    ]
+    return [(i + 1, num_tests, rng.randint(65536, 2147483647)) for i in range(num_tests)]
 
 
 class Fixed:
@@ -68,9 +66,7 @@ class SuiteSpec:
     rng_seed: int
     knobs: Callable[[], dict]  # -> kwargs for RandomizationContext
     exec_kind: str = "fp16"  # fp16 | fp8 | mxfp8 (which exec harness)
-    post: Optional[Callable] = (
-        None  # post(cfg, rng, request) tweaks after randomization
-    )
+    post: Optional[Callable] = None  # post(cfg, rng, request) tweaks after randomization
     min_sm: Optional[tuple] = None  # torch.cuda.get_device_capability() gate
     fuzzed: tuple = ()
     pinned: tuple = ()
@@ -97,9 +93,7 @@ def model_params(phase):
         if not name.startswith("models.") or spec.phase != phase:
             continue
         model = name.split(".")[1]
-        params += [
-            pytest.param(name, t, id=f"{model}-test{t[0]}") for t in spec.seeds()
-        ]
+        params += [pytest.param(name, t, id=f"{model}-test{t[0]}") for t in spec.seeds()]
     return params
 
 
@@ -113,9 +107,7 @@ def _show_config(spec, cfg, test_no, env_info, request):
         "\n",
     )
     print(f"test_name        = {request.node.name}")
-    print(
-        f"platform_info    = {env_info['gpu_arch']} ({env_info['gpu_info']}), cudnn_ver={env_info['cudnn_ver']}"
-    )
+    print(f"platform_info    = {env_info['gpu_arch']} ({env_info['gpu_info']}), cudnn_ver={env_info['cudnn_ver']}")
     print()
     print(cfg.to_repro_cmd(REPRO_FILE))
     print(flush=True)

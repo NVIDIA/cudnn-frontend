@@ -14,17 +14,13 @@ from sdpa.suites.common import run_suite, suite_seeds
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.f16.dense"), ids=lambda p: f"test{p[0]}"
-)
+@pytest.mark.parametrize("test_no", suite_seeds("context.f16.dense"), ids=lambda p: f"test{p[0]}")
 def test_context_f16_dense(env_info, test_no, request, cudnn_handle):
     run_suite("context.f16.dense", env_info, test_no, request, cudnn_handle)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.f16.thd"), ids=lambda p: f"test{p[0]}"
-)
+@pytest.mark.parametrize("test_no", suite_seeds("context.f16.thd"), ids=lambda p: f"test{p[0]}")
 def test_context_f16_thd(env_info, test_no, request, cudnn_handle):
     run_suite("context.f16.thd", env_info, test_no, request, cudnn_handle)
 
@@ -43,9 +39,7 @@ MIXED_SEQ_LEN_FORM_CASES = [
     ids=["cu_q", "cu_kv", "cu_q_brcm", "cu_kv_brcm"],
 )
 @pytest.mark.L0
-def test_context_mixed_seq_len_forms(
-    env_info, cu_sides, diag_align, right_bound, request, cudnn_handle
-):
+def test_context_mixed_seq_len_forms(env_info, cu_sides, diag_align, right_bound, request, cudnn_handle):
     """Mixed-form sequence lengths: cumulative on one side, per-batch on the
     other. Deterministic configs with non-uniform per-batch lengths, so
     misreading one side's form cannot produce a passing result. Requires

@@ -60,9 +60,7 @@ _SPECS = [
         num_tests=256,
         rng_seed=888,
         knobs=knobs.dense_fwd,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + ("layout padded/cu_padded/full", "sink", "bias(1:5)"),
+        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded/full", "sink", "bias(1:5)"),
         pinned=("infer",),
     ),
     SuiteSpec(
@@ -265,9 +263,7 @@ _SPECS = [
         rng_seed=844,
         knobs=knobs.dense_bwd,
         post=post_train,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + ("layout padded/full", "deterministic", "sink", "bias(1:7)"),
+        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/full", "deterministic", "sink", "bias(1:7)"),
         pinned=("train"),
     ),
     SuiteSpec(
@@ -305,9 +301,7 @@ _SPECS = [
         knobs=knobs.fp8_thd_bwd,
         exec_kind="fp8",
         post=post_train,
-        fuzzed=_COMMON_FUZZ
-        + _MASK_FUZZ
-        + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
+        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("out fp8/fp16", "deterministic", "sink", "total_q/kv slack"),
         pinned=(
             "train",
             "e4m3 in",
@@ -359,12 +353,10 @@ for _preset in CATALOG:
                 dtype="f16",
                 level="L0",
                 num_tests=8,
-                rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}".encode())
-                % 100000,
+                rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}".encode()) % 100000,
                 knobs=partial(knobs.model_knobs, _preset, _phase),
                 post=_model_post(_phase),
-                fuzzed=("batch", "seq lens", "layout", "mask flavor", "data")
-                + (("paged 50%",) if _phase == "generation" else ()),
+                fuzzed=("batch", "seq lens", "layout", "mask flavor", "data") + (("paged 50%",) if _phase == "generation" else ()),
                 pinned=(
                     f"h_q={_preset.num_q_heads}",
                     f"h_kv={_preset.num_kv_heads}",

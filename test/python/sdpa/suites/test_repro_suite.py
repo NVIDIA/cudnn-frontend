@@ -18,9 +18,7 @@ from sdpa.fp8 import exec_sdpa_fp8
 from sdpa.mxfp8 import exec_sdpa_mxfp8
 
 
-@pytest.mark.skipif(
-    "not config.getoption('--repro')", reason="used with '--repro' only"
-)
+@pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1
 @pytest.mark.L2

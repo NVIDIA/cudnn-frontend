@@ -9,16 +9,12 @@ from sdpa.suites.common import run_suite, suite_seeds
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.fp8.dense"), ids=lambda p: f"test{p[0]}"
-)
+@pytest.mark.parametrize("test_no", suite_seeds("context.fp8.dense"), ids=lambda p: f"test{p[0]}")
 def test_context_fp8_dense(env_info, test_no, request, cudnn_handle):
     run_suite("context.fp8.dense", env_info, test_no, request, cudnn_handle)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "test_no", suite_seeds("context.fp8.thd"), ids=lambda p: f"test{p[0]}"
-)
+@pytest.mark.parametrize("test_no", suite_seeds("context.fp8.thd"), ids=lambda p: f"test{p[0]}")
 def test_context_fp8_thd(env_info, test_no, request, cudnn_handle):
     run_suite("context.fp8.thd", env_info, test_no, request, cudnn_handle)
