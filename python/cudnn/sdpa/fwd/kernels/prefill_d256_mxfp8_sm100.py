@@ -10,7 +10,7 @@ owners have completed instead of occupying permanent columns above O.
 
 THD / varlen uses packed Q/K/V/O plus per-sequence-tile-padded SF buffers. A
 device setup kernel builds ragged metadata and runtime O/K/V tensor maps; the
-main launch uses a plan-time envelope and dynamic packed extents.
+main launch uses a persistent grid and dynamic packed extents.
 """
 
 from functools import lru_cache
@@ -177,6 +177,7 @@ _BAR_V_EMPTY_1 = 6
 _KV_PIPELINE_LANES = 64
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+THD_PERSISTENT = True
 
 _sdpa_h = make_sdpa_helpers(
     CFG,
@@ -379,6 +380,11 @@ def _scheduler_warp_loop_predecode(
     seq_kv_lens_tensor,
     seq_q_lens_tensor,
 ):
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        meta = cutlass.make_array_view(seq_kv_lens_tensor)
+        ctr_ptr = Pointer(seq_kv_lens_tensor.iterator.raw_ptr(), dtype=cutlass.Int32) + cutlass.Int32(4) * n_batch + cutlass.Int32(3)
+        live_off = cutlass.Int32(4) * n_batch + cutlass.Int32(2)
+
     state = PipelineState.start()
     is_valid = cutlass.Int32(1)
 
@@ -388,13 +394,41 @@ def _scheduler_warp_loop_predecode(
         if nvvm.elect_sync():
             arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
         if nvvm.elect_sync() and is_cga_first_cta:
-            nvvm.clusterlaunchcontrol_try_cancel(
-                sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
-                sched.mb_scheduler.subview(state.idx),
-                multicast=1,
-            )
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
+                live = cutlass.Int32(meta[live_off])
+                valid = cutlass.Int32(
+                    arith.select(
+                        (uid < live).ir_value(),
+                        cutlass.Int32(1).ir_value(),
+                        cutlass.Int32(0).ir_value(),
+                    )
+                )
+                tile_ptr = cute.make_ptr(
+                    cutlass.Int32,
+                    sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)).data_ptr().toint(cutlass.Int32),
+                    cutlass.AddressSpace.smem,
+                    assumed_align=16,
+                )
+                mbar_ptr = cute.make_ptr(
+                    cutlass.Int64,
+                    sched.mb_scheduler.subview(state.idx).data_ptr().toint(cutlass.Int32),
+                    cutlass.AddressSpace.smem,
+                    assumed_align=8,
+                )
+                payload = (uid * cutlass.Int32(CFG.CGA_M), cutlass.Int32(0), valid, cutlass.Int32(0))
+                for cta_rank in cutlass.range_constexpr(CGA_SIZE):
+                    for word in cutlass.range_constexpr(4):
+                        cute.arch.store_async_dsmem(tile_ptr + word, payload[word], mbar_ptr, cta_rank)
+            else:
+                nvvm.clusterlaunchcontrol_try_cancel(
+                    sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
+                    sched.mb_scheduler.subview(state.idx),
+                    multicast=1,
+                )
 
-        nvvm.fence_proxy("async.shared", space="cta")
+        if cutlass.const_expr(not CFG.THD_VARLEN):
+            nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
 
@@ -1638,6 +1672,8 @@ def _mma_warp_group(
                 if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
                     wait(mb_qk_sf_reuse.subview(parity_cur_rt), qk_sf_reuse_phase_cur)
                     qk_sf_reuse_phase_pair = qk_sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
+                    wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
+                    sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
                 else:
                     wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
                     sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
@@ -1659,9 +1695,6 @@ def _mma_warp_group(
                 _consumer_arrive_k_empty(bars, kv_state_K, mcast_mask)
                 kv_state_K = advance(kv_state_K, CFG.STAGES_KV)
 
-                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
-                    wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
-                    sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
                 tmem_SF_P = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET))
                 tmem_SF_V = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET + SF_TMEM_COLS_P))
                 if cutlass.const_expr(CFG.MASK_FLAGS != 0):

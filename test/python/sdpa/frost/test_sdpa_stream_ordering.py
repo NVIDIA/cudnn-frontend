@@ -25,7 +25,7 @@ import torch
 from test_utils import torch_fork_set_rng
 from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
 
-pytestmark = requires_pre_rubin_blackwell
+pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 # ~0.5-1 s of spin: long enough that an unordered kernel launch on the
 # default stream reliably overtakes the side-stream mutation.
@@ -103,3 +103,81 @@ def test_sdpa_fwd_dsl_side_stream_ordering(d):
 
     assert not torch.isnan(out).any(), "SDPA kernel read the poisoned Q: launch was not ordered after the " "side-stream copy (env-stream routing broken)"
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["fp8", "mxfp8"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
+    """Dense output copy-back and amax postprocessing use the launch stream."""
+    from cuda.bindings import driver as cuda_driver
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 4, 128, 128
+    dev = torch.device("cuda")
+
+    if mxfp8:
+        from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+        def quantize(tensor, *, columnwise=False):
+            row, _, row_sf, col, _, col_sf = quantize_to_mxfp8(tensor, b, h, s, d, fp8_dtype=torch.float8_e4m3fn)
+            return (col, col_sf) if columnwise else (row, row_sf)
+
+        q, sf_q = quantize(torch.randn(b, h, s, d, device=dev) * 0.5)
+        k, sf_k = quantize(torch.randn(b, h, s, d, device=dev) * 0.5)
+        v, sf_v = quantize(torch.randn(b, h, s, d, device=dev) * 0.5, columnwise=True)
+        execute_args = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
+        api_args = {}
+    else:
+
+        def make_fp8():
+            return (torch.randn(b, h, s, d, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+        q, k, v = make_fp8(), make_fp8(), make_fp8()
+        one = torch.ones(1, dtype=torch.float32, device=dev)
+        scale_o = torch.full((1,), 2.0, dtype=torch.float32, device=dev)
+        execute_args = dict(descale_q=one, descale_k=one, descale_v=one, scale_o=scale_o)
+        api_args = dict(pertensor_fp8=True)
+
+    # Preserve D-contiguity while forcing the adapter's O scratch/copy-back path.
+    output_storage = torch.empty(b, h, s + 1, d, dtype=torch.float16, device=dev)
+    output = output_storage[:, :, :s, :]
+    assert not output.transpose(1, 2).is_contiguous()
+    amax = torch.empty(1, dtype=torch.float32, device=dev)
+
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=output,
+        dtype_o=torch.float16,
+        scale_softmax=1.0 / math.sqrt(d),
+        **api_args,
+    )
+    assert api.check_support()
+    api.compile()
+
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=output, amax_o=amax, **execute_args)
+    torch.cuda.synchronize()
+    expected_output, expected_amax = output.clone(), amax.clone()
+
+    output.fill_(float("nan"))
+    amax.fill_(float("nan"))
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(_SLEEP_CYCLES)
+    api.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=output,
+        amax_o=amax,
+        current_stream=cuda_driver.CUstream(side.cuda_stream),
+        **execute_args,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(amax, expected_amax, atol=0, rtol=0)

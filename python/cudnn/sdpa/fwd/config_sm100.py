@@ -416,7 +416,10 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
             cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
             "d256: register budget over 512",
         ),
-        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d256: per-role regs must be multiples of 8"),
+        (
+            cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0 and cfg.SOFTMAX_WG1_REGS % 8 == 0,
+            "d256: per-role regs must be multiples of 8",
+        ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
         (cfg.STAGES_KV == 2, "d256 SM100 uses two full/half-width KV stages"),
@@ -497,13 +500,13 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     pt_plain_top_left_causal = (
         not mxfp8 and (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_left and not params.window_right
     )
-    split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
-    pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     # The fused correction/split-P schedule is the strict top-left causal fast
     # path. Right-band widening uses the generic masked schedule; forcing the
     # widened specialization through this path makes CUTLASS DSL 4.7 lowering
     # grow pathologically without changing the supported mask semantics.
     strict_top_left_causal = (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_right
+    split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
+    pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     fused_corr_split_p = mxfp8 and strict_top_left_causal
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)

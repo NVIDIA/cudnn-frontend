@@ -39,6 +39,8 @@ pytestmark = [requires_blackwell, requires_dsl]
 # under test. The d192xd128 kernel flavor exists on the sm100 engine only.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
 _skip_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d192xd128 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+_skip_d256_on_rubin = pytest.mark.skipif(_SM == 107, reason="the d256xd256 per-tensor FP8 flavor has no Rubin kernel (sm107 serves d128 only)")
+_D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_d256_on_rubin)]
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _FP8_MAX = {"e4m3": 448.0, "e5m2": 57344.0}
@@ -578,6 +580,7 @@ def test_fp8_head_dim_envelope_padded():
 
 
 @pytest.mark.L0
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -600,6 +603,7 @@ def test_fp8_d256_output_dtypes(in_key, out_key):
 
 
 @pytest.mark.L0
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
 @torch_fork_set_rng(seed=0)
@@ -622,6 +626,7 @@ def test_fp8_d256_masks(in_key, mask):
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=59)
 def test_fp8_d256_strided_stats(in_key):
@@ -630,6 +635,7 @@ def test_fp8_d256_strided_stats(in_key):
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_bottom_right_rectangular(in_key):
@@ -652,6 +658,7 @@ def test_fp8_d256_bottom_right_rectangular(in_key):
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("case", ["right", "bottom_right", "right_swa"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_right_band_combinations(case):
@@ -681,6 +688,7 @@ def test_fp8_d256_right_band_combinations(case):
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -706,6 +714,7 @@ def test_fp8_d256_padding(in_key, causal):
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_dense_q_trim_stats_sink():
     """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
@@ -735,6 +744,7 @@ def test_fp8_d256_dense_q_trim_stats_sink():
 
 
 @pytest.mark.L1
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_fp8_d256_gqa_sink(in_key):
@@ -760,6 +770,7 @@ def test_fp8_d256_gqa_sink(in_key):
 
 
 @pytest.mark.L0
+@_skip_d256_on_rubin
 @pytest.mark.parametrize(
     ("in_key", "out_key", "with_sink"),
     [
@@ -822,7 +833,7 @@ def test_fp8_gqa(in_key):
     [(8, 4), (8, 2), (8, 1), (16, 1)],
     ids=["g2", "g4", "g8_mqa", "g16_mqa"],
 )
-@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_ratios(d, h_q, h_kv):
     """Packed plans across GQA ratios, causal, tile-unaligned s_q, LSE checked."""
@@ -865,7 +876,7 @@ def test_fp8_pack_gqa_tiles(s_q):
     "mask",
     ["none_padded", "causal", "causal_br", "swa", "sink_causal"],
 )
-@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_features(d, mask, out_dt):
     """Packed plans x the fp8 mask/sink envelope x both output dtypes."""
@@ -906,7 +917,7 @@ def test_fp8_pack_gqa_features(d, mask, out_dt):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_e5m2(d):
     """Packed e5m2 input path."""
@@ -1380,7 +1391,7 @@ def test_fp8_d192_d128_thd_features():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)], ids=["d128", "d192_d128"])
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256)], ids=["d128", "d192_d128", "d256"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
     """THD where a cluster claims more than one unit (issue #618).
@@ -1397,6 +1408,7 @@ def test_fp8_thd_multi_unit_per_cta(monkeypatch, d_qk, d_v):
 
 
 @pytest.mark.L0
+@_skip_d256_on_rubin
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1417,7 +1429,7 @@ def test_fp8_d256_thd(in_key, causal):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1444,7 +1456,7 @@ def test_fp8_thd_sliding_window(d, in_key, bottom_right):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
@@ -1454,7 +1466,7 @@ def test_fp8_thd_cross_gqa(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_sink(d):
     """THD causal + attention sink."""
@@ -1465,7 +1477,7 @@ def test_fp8_thd_sink(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
@@ -1476,7 +1488,7 @@ def test_fp8_thd_stats(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity, e.g.
@@ -1492,7 +1504,7 @@ def test_fp8_thd_zero_len_kv(d):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", _D128_D256)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""

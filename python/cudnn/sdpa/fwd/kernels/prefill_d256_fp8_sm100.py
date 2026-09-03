@@ -8,7 +8,7 @@ two full-width KV stages. Depending on the mask specialization, one or two
 softmax warp groups generate packed FP8 probabilities for Blackwell's K=32
 FP8 QMMA path and the sdpa_fp8 output scaling/amax ABI.
 
-THD / varlen follows the shared device-built-metadata and plan-time-envelope
+THD / varlen follows the shared device-built-metadata and persistent-grid
 design used by the D128 FP8 sibling. Packed token totals stay dynamic and the
 setup kernel builds per-sequence O plus packed-total-clamped K/V descriptors.
 """
@@ -126,6 +126,7 @@ vTmaTransactionBytes = vBufferElems * CFG.BPE * CFG.CTA_MMA
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+THD_PERSISTENT = True
 
 _sdpa_h = make_sdpa_helpers(
     CFG,
@@ -267,6 +268,11 @@ def _scheduler_warp_loop_predecode(
     seq_kv_lens_tensor,
     seq_q_lens_tensor,
 ):
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        meta = cutlass.make_array_view(seq_kv_lens_tensor)
+        ctr_ptr = Pointer(seq_kv_lens_tensor.iterator.raw_ptr(), dtype=cutlass.Int32) + cutlass.Int32(4) * n_batch + cutlass.Int32(3)
+        live_off = cutlass.Int32(4) * n_batch + cutlass.Int32(2)
+
     state = PipelineState.start()
     is_valid = cutlass.Int32(1)
 
@@ -276,13 +282,41 @@ def _scheduler_warp_loop_predecode(
         if nvvm.elect_sync():
             arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
         if nvvm.elect_sync() and is_cga_first_cta:
-            nvvm.clusterlaunchcontrol_try_cancel(
-                sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
-                sched.mb_scheduler.subview(state.idx),
-                multicast=1,
-            )
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
+                live = cutlass.Int32(meta[live_off])
+                valid = cutlass.Int32(
+                    arith.select(
+                        (uid < live).ir_value(),
+                        cutlass.Int32(1).ir_value(),
+                        cutlass.Int32(0).ir_value(),
+                    )
+                )
+                tile_ptr = cute.make_ptr(
+                    cutlass.Int32,
+                    sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)).data_ptr().toint(cutlass.Int32),
+                    cutlass.AddressSpace.smem,
+                    assumed_align=16,
+                )
+                mbar_ptr = cute.make_ptr(
+                    cutlass.Int64,
+                    sched.mb_scheduler.subview(state.idx).data_ptr().toint(cutlass.Int32),
+                    cutlass.AddressSpace.smem,
+                    assumed_align=8,
+                )
+                payload = (uid * cutlass.Int32(CFG.CGA_M), cutlass.Int32(0), valid, cutlass.Int32(0))
+                for cta_rank in cutlass.range_constexpr(CGA_SIZE):
+                    for word in cutlass.range_constexpr(4):
+                        cute.arch.store_async_dsmem(tile_ptr + word, payload[word], mbar_ptr, cta_rank)
+            else:
+                nvvm.clusterlaunchcontrol_try_cancel(
+                    sched.tile_id_smem.subview(state.idx * cutlass.Int32(SCHED_PAYLOAD_WORDS)),
+                    sched.mb_scheduler.subview(state.idx),
+                    multicast=1,
+                )
 
-        nvvm.fence_proxy("async.shared", space="cta")
+        if cutlass.const_expr(not CFG.THD_VARLEN):
+            nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
 

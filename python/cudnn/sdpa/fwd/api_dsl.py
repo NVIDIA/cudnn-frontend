@@ -886,6 +886,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._lse_stride: Optional[tuple[int, int, int]] = None
         self._k_mod = None
 
+    @property
+    def _d256_quantized(self) -> bool:
+        """Whether the selected kernel uses the D256 quantized length ABI."""
+        return self._fp8 and self.flavor == (256, 256)
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -2058,7 +2063,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fn = km.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
                 (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
-                if self.flavor == (256, 256)
+                if self._d256_quantized
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
             fn(
@@ -2122,7 +2127,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self.flavor == (256, 256) else ()
+        dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
         self._compiled_kernel(
             Q,
             K,
@@ -2153,8 +2158,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
             )
-        if o_needs_copy_back:
-            O_view.copy_(O)
+        with _torch_stream_context(current_stream, device):
+            if o_needs_copy_back:
+                O_view.copy_(O)
         self._logger.debug("execute (MXFP8) completed")
 
     def _execute_fp8(
@@ -2230,7 +2236,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fn = self._k_mod.compile(**self._thd_compile_kwargs())
             thd_lens_args = (
                 (None, pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
-                if self.flavor == (256, 256)
+                if self._d256_quantized
                 else (pack.q_lens_dev, pack.kv_lens_dev, cutlass.Int32(pack.lens_form))
             )
             fn(
@@ -2296,7 +2302,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
             O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
-        dense_q_lens_args = (seq_q_t,) if self.flavor == (256, 256) else ()
+        dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
         self._compiled_kernel(
             Q,
             K,
@@ -2329,13 +2335,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
             )
-        if o_needs_copy_back:
-            O_view.copy_(O)
-        if amax_o is not None:
-            # Device divisor: the same div_ as before, minus the readback.
-            # scale_o > 0 is caller contract (backend parity); None bound a
-            # cached 1.0 above.
-            amax_o_buf.div_(so_t)
+        with _torch_stream_context(current_stream, device):
+            if o_needs_copy_back:
+                O_view.copy_(O)
+            if amax_o is not None:
+                # Device divisor: the same div_ as before, minus the readback.
+                # scale_o > 0 is caller contract (backend parity); None bound a
+                # cached 1.0 above.
+                amax_o_buf.div_(so_t)
         self._logger.debug("execute (FP8 per-tensor) completed")
 
 

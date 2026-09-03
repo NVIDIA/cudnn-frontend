@@ -1126,6 +1126,7 @@ def _api_fp8_case(
 ):
     """FP8 / MXFP8 through the adapter; returns (split, O, O_unsplit, amax)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m
 
     _cc = torch.cuda.get_device_capability()
     if _cc not in ((10, 0), (10, 3)) and not (_cc == (10, 7) and not mx):
@@ -1137,26 +1138,44 @@ def _api_fp8_case(
         if mx:
             from sdpa.mxfp8_quant import quantize_to_mxfp8
 
-            def qz(shape):
+            def qz(shape, *, columnwise=False):
                 r = torch.randn(*shape, device=dev) * 0.5
-                a, _adq, aswz, *_ = quantize_to_mxfp8(r, shape[0], shape[1], shape[2], shape[3], fp8_dtype=fp8_dtype)
-                return a.reshape(*shape), aswz
+                row, row_dq, row_sf, col, col_dq, col_sf = quantize_to_mxfp8(r, shape[0], shape[1], shape[2], shape[3], fp8_dtype=fp8_dtype)
+                a, adq, aswz = (col, col_dq, col_sf) if columnwise else (row, row_dq, row_sf)
+                a = a.reshape(*shape)
+                return a, aswz, a.float() * adq.reshape(*shape)
 
-            q, sf_q = qz((b, h_q, s_q, d_qk))
-            k, sf_k = qz((b, h_kv, s_kv, d_qk))
-            v, sf_v = qz((b, h_kv, s_kv, d_v))
+            q, sf_q, q_ref = qz((b, h_q, s_q, d_qk))
+            k, sf_k, k_ref = qz((b, h_kv, s_kv, d_qk))
+            v, sf_v, v_ref = qz((b, h_kv, s_kv, d_v), columnwise=True)
             extra = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
             kw = {}
         else:
-            mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(fp8_dtype)
+
+            def mk(*sh):
+                return (torch.randn(*sh, device=dev) * 0.5).to(fp8_dtype)
+
             q, k, v = mk(b, h_q, s_q, d_qk), mk(b, h_kv, s_kv, d_qk), mk(b, h_kv, s_kv, d_v)
-            one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
-            extra = dict(descale_q=one(), descale_k=one(), descale_v=one(), scale_o=one())
+            q_ref, k_ref, v_ref = q.float(), k.float(), v.float()
+            one = torch.ones(1, dtype=torch.float32, device=dev)
+            extra = dict(descale_q=one, descale_k=one, descale_v=one, scale_o=one)
             kw = dict(pertensor_fp8=True)
 
         o = torch.zeros(b, h_q, s_q, d_v, device=dev, dtype=torch.float16)  # HALF out
         amax = torch.zeros(1, dtype=torch.float32, device=dev)
-        split_knob = 1 if force_one else _expected_split(b, h_q, s_q, s_kv)
+        split_cga = 1 if d_qk == 256 else 2
+        split_knob = (
+            1
+            if force_one
+            else _expected_split(
+                b,
+                h_q,
+                s_q,
+                s_kv,
+                rows_per_tile=cga_tile_m(d_qk, split_cga),
+                ctas_per_tile=split_cga,
+            )
+        )
         api = SdpaFwdDslSm100(
             sample_q=q,
             sample_k=k,
@@ -1175,10 +1194,17 @@ def _api_fp8_case(
         ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if ws_bytes else None
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, amax_o=amax, workspace=ws, **extra)
         torch.cuda.synchronize()
-        return split, o.float().clone(), amax.item()
+        return split, o.float().clone(), amax.item(), (q_ref, k_ref, v_ref)
 
-    _, o_one, _ = build(True)
-    split, o_split, amax = build(False)
+    _, o_one, _, _ = build(True)
+    split, o_split, amax, ref_inputs = build(False)
+    if d_qk == 256:
+        q_ref, k_ref, v_ref = (t.permute(0, 2, 1, 3) for t in ref_inputs)
+        reference = _ref_sdpa(q_ref, k_ref, v_ref, 1.0 / math.sqrt(d_qk), causal, h_kv).permute(0, 2, 1, 3)
+        atol = 8e-2 if fp8_dtype == torch.float8_e5m2 else 5e-2
+        for name, output in (("split", o_split), ("unsplit", o_one)):
+            diff = (output - reference).abs().max().item()
+            assert diff <= atol, f"D256 {name} max|O-ref|={diff:.4f} > {atol:.4f}"
     return split, o_split, o_one, amax
 
 
