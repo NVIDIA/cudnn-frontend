@@ -2201,9 +2201,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # A non-zero shift breaks the alignment that lets stage 3 read only what
         # stage 2 wrote, so the skipped region has to be ZEROED first -- see
         # _zero_ws_needed.
-        # Zero whenever the trim is ACTIVE, not just when shift != 0: the
-        # never-empty clamp above means a structurally-masked M tile reads one
-        # k-tile of workspace and must see zeros there.
+        # Zero whenever the trim is ACTIVE, not just when shift != 0. TWO
+        # independent reasons, either of which alone would require it:
+        #   1. the never-empty clamp in `_causal_k_range` means a structurally
+        #      masked M tile still reads one k-tile of workspace, and must see
+        #      zeros there;
+        #   2. stage 3's cluster M tile (512) is WIDER than stage 2's write
+        #      block (`gran`, 256), so a per-tile K range cannot exclude the
+        #      skipped region at all -- the zero-fill, not the trim, is what
+        #      makes the causal path correct. See `_causal_k_range`.
         self._zero_ws = lo != CAUSAL_K_NONE or hi != CAUSAL_K_NONE
         mm_lo = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),

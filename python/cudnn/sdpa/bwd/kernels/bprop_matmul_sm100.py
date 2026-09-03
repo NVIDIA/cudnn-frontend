@@ -67,14 +67,16 @@ from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE,
 
 PARAMS = globals().get("FROST_TEMPLATE_PARAMS", MatmulTemplateParams())
 
-# Tile config: CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma
+# Tile config: CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma
+# (was ...cluster2x1...; swapped on request. Every constant below is lifted
+# verbatim from the upstream rendering of THIS config -- do not hand-derive.)
 mma_inst_shape_mnk = (256, 256, 16)
 cta_group = 2
-cgrp_tile_mnk = (256, 256, 64)
-cta_tile_mnk = (128, 128, 64)
-epi_tile_mn = (128, 32)
+cgrp_tile_mnk = (512, 512, 64)
+cta_tile_mnk = (256, 128, 64)
+epi_tile_mn = (128, 64)
 threads_per_cta = 256
-cluster_shape_mnk = (2, 1, 1)
+cluster_shape_mnk = (2, 2, 1)
 # Upstream carries the rendering's batch size here purely to detect a BROADCAST
 # operand (== 1 means "one batch element, reuse it for all"). No stage-3 GEMM
 # broadcasts, so both are simply "batched"; the real extents are runtime.
@@ -97,13 +99,18 @@ causal_gran = int(PARAMS.causal_gran)
 causal_shift = int(PARAMS.causal_shift)
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
-ab_stages = 7
+ab_stages = 4
 b_collector_ok = False
-multicast_a = False
+multicast_a = True
 multicast_b = False
-a_mcast_slices = 1
+# Under a cluster with cga_n > 1 the A operand's MULTICAST also follows its
+# major -- a K-major A is split across the cluster's N columns (2 slices) while
+# an M-major A is broadcast whole. That was invisible at cluster2x1, where both
+# are 1, and it is why this table cannot be reused across cluster shapes
+# unchanged. Values lifted from the two upstream renderings of this config.
+_A_MCAST = {False: (2, False), True: (1, True)}  # is_m_major: (slices, empty_full_mask)
+a_mcast_slices, ab_empty_full_mask = _A_MCAST[a_is_m_major]
 b_mcast_slices = 1
-ab_empty_full_mask = False
 ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B
 # MN-major packs 64 elements per TMA group and walks K in 2048-byte steps;
 # K-major loads one group and steps 32 bytes.  Values lifted verbatim from the
@@ -118,7 +125,7 @@ b_smem_desc_leading_byte_offset, b_smem_k_step_bytes, b_tma_group_elems = _MAJOR
 a_smem_desc_stride_byte_offset = 1024
 b_smem_desc_stride_byte_offset = 1024
 a_smem_m_step_bytes = 16384
-mma_size_m = 1
+mma_size_m = 2
 mma_size_n = 1
 mma_size_k = 4
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
@@ -132,9 +139,9 @@ mma_c_dtype = cutlass.Float32
 acc_widen_to_fp32 = False
 ab_tma_dtype = cutlass.BFloat16
 mma_kind = nvvm.Tcgen05MMAKind.F16
-epi_n = 32
-epi_row_elems = 32
-tile_swizzle_n = 0
+epi_n = 64
+epi_row_elems = 64
+tile_swizzle_n = 1
 swizzle_l2_budget_bytes = 44214954
 num_gemms = 1
 num_a_operands = 1
@@ -143,7 +150,7 @@ gemm_a_idx = (0,)
 gemm_b_idx = (0,)
 num_tmem_alloc_cols = 512
 tmem_alloc_exclusive = False
-acc_stages = 2  # 256 acc cols/stage
+acc_stages = 1  # 512 acc cols/stage
 vec_bytes_epi = int(PARAMS.vec_bytes_epi)
 frost_compile_options = "--enable-tvm-ffi --gpu-arch sm_100a"
 n_tma_outputs = 1
@@ -152,10 +159,16 @@ epi_slot_widen = 1
 epi_packed_lanes = False
 epi_dp22 = False
 epi_stage_rows = 128
-epi_chunk_elems = 32
-ab_stages = 6  # SMEM-D 16400B fixed + cast LOAD 0B/stage + multi-GEMM 0B/stage
+epi_chunk_elems = 64
+ab_stages = 4  # SMEM-D 32784B fixed + cast LOAD 0B/stage + multi-GEMM 0B/stage
+# Upstream renders (2, 1, 1) here -- a mixed-CGA fallback the driver may pick
+# per cluster when the preferred shape does not fit. Pinned to None in this
+# fork: `_host` always sizes the grid as a multiple of the preferred cluster, so
+# the fallback is unreachable by construction, and its paths carry their own
+# coordinate/multicast logic that the 2-D (b, h) batch rewrite has never
+# exercised.
 fallback_cluster_shape_mnk = None
-mixed_a_pattern_pref = 1
+mixed_a_pattern_pref = 5
 mixed_b_pattern_pref = 1
 mixed_a_pattern_fb = 1
 mixed_b_pattern_fb = 1
@@ -252,15 +265,36 @@ def _decode_bh(l, n_head):
 def _causal_k_range(coord_m_cgrp, num_k_tiles):
     """The K-tile range this M tile may read, under stage 2's causal skip.
 
-    Stage 2 leaves the tiles above the diagonal UNWRITTEN, so this is first a
-    correctness bound and only then an optimization -- reading outside it reads
-    whatever was in the workspace.
+    Stage 2 leaves the tiles above the diagonal UNWRITTEN, so what is outside
+    this range is whatever the caller left in the workspace.
+
+    Whether that makes the range a CORRECTNESS bound or only an optimization
+    depends on the tight-trim invariant::
+
+        cgrp_tile_mnk[0] <= causal_gran
+
+    i.e. one cluster M tile fits inside one stage-2 write block. It HELD at the
+    2x1 cluster config (256 <= 256) and does NOT hold at the 2x2 config now in
+    use (512 > 256): a 512-row M tile straddles two 256-row stage-2 blocks, and
+    since the bounds below are per-tile, no range can cover the tile's live rows
+    without also covering its neighbour's skipped ones.
+
+    So at 2x2 this is an OPTIMIZATION ONLY, and the caller's zero-fill is what
+    makes it correct -- `api_dsl` sets `_zero_ws` whenever the trim is active,
+    which is exactly the condition under which any of this runs. Do not weaken
+    that zero-fill to "only when shift != 0" on the theory that the trim
+    protects the aligned case; at 2x2 it does not.
+
+    The 2x2 config is kept despite the looser trim because it measures faster
+    BOTH ways at B=1 H=128 S=8192 d=512 bf16: +3.5% no_mask, +7.8% causal (the
+    wider tile more than pays for the extra k-tiles it reads).
 
     Keyed on the CLUSTER's M tile base (``tile_m * cgrp_tile_m``), which is
     identical on both CTAs of a pair, and rounded to ``causal_gran`` -- stage
     2's own write granularity.  Rounding OUTWARD (down for the low bound, up for
-    the high one) is what keeps the range a subset of what stage 2 wrote while
-    still covering every structurally non-zero tile.
+    the high one) is what keeps the range covering every structurally non-zero
+    tile; under the tight-trim invariant that outward rounding also keeps it a
+    subset of what stage 2 wrote.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # two bounds and the min() below share one numeric type.
@@ -1277,8 +1311,8 @@ def _bprop_matmul_bh_sm100_kernel(
                     vec_out = (_r_mm).to(cutlass.BFloat16)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=4096, dtype=cutlass.BFloat16)
-                    _tsv_0.data_ptr(tidx * 32).store_swizzled(vec_out, alignment=64, swizzle=cutlass.Swizzle(2, 4, 3))
+                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cutlass.BFloat16)
+                    _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:
@@ -1476,8 +1510,8 @@ def _host(
             out_stride_h_0 * 16 // 128,
             out_stride_b_0 * 16 // 128,
         ],
-        box_dims=[32, epi_tile_mn[0], 1, 1],
-        swizzle=_tma.TensorMapSwizzle.s64b,
+        box_dims=[64, epi_tile_mn[0], 1, 1],
+        swizzle=_tma.TensorMapSwizzle.s128b,
     )
     tma_c_desc_list = [tma_c_desc_0]
 
