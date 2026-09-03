@@ -49,7 +49,7 @@ class _FrostGemmPlan(CompiledPlan):
             return self.get_workspace_size()
         out_uid = self._compiled.binding.outputs[0].get_uid()
         for uid, shape in zip(override_uids or (), override_shapes or ()):
-            if uid == out_uid:
+            if uid == out_uid and len(shape) == 3:
                 b, m, n = (int(x) for x in shape)
                 return sized(b, m, n)
         return self.get_workspace_size()
@@ -69,7 +69,8 @@ class _FrostGemmPlan(CompiledPlan):
             sized = getattr(self._compiled, "workspace_bytes_for", None)
             if sized is not None:
                 out = operands[self._tensors.index(self._compiled.binding.outputs[0])].shape
-                required = sized(int(out[0]), int(out[1]), int(out[2]))
+                if len(out) == 3:
+                    required = sized(int(out[0]), int(out[1]), int(out[2]))
         workspace = Workspace.over(variant_pack, required, "frost_gemm") if required else None
         launch = self._launch
         if launch is not None:
