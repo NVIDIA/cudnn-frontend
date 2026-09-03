@@ -31,6 +31,16 @@ _D = 512
 _TOL_COS = 0.9999
 _TOL_REL = 2e-2
 
+# The row claims HALF and BFLOAT16. Both get run: the two differ only by one
+# ternary in the adapter (`dtype_code`), which is exactly the kind of line that
+# is easy to leave pointing at the wrong template.
+_DTYPES = (torch.bfloat16, torch.float16)
+_DTYPE_IDS = ("bf16", "fp16")
+
+
+def _io_dtype(dt):
+    return cudnn.data_type.HALF if dt == torch.float16 else cudnn.data_type.BFLOAT16
+
 
 def _bshd_stride(shape):
     """cuDNN declares logical BHSD; the engine needs BSHD-physical storage."""
@@ -68,9 +78,10 @@ def _reference(q, k, v, do, keep=None, group=1):
     return o, lse, all_masked, dq, dk_q, dv_q
 
 
-def _build_graph(b, hq, hkv, sq, skv, d, scale, **sdpa_kwargs):
+def _build_graph(b, hq, hkv, sq, skv, d, scale, dt=torch.bfloat16, **sdpa_kwargs):
+    io = _io_dtype(dt)
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=io,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
@@ -79,7 +90,7 @@ def _build_graph(b, hq, hkv, sq, skv, d, scale, **sdpa_kwargs):
     t["stats"] = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
     dq, dk, dv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], attn_scale=scale, **sdpa_kwargs)
     for out, sh in ((dq, shq), (dk, shk), (dv, shk)):
-        out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(_bshd_stride(sh))
+        out.set_output(True).set_data_type(io).set_stride(_bshd_stride(sh))
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -93,25 +104,25 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, **sdpa_kwargs):
+def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, dt=torch.bfloat16, **sdpa_kwargs):
     """Build, pin the engine, execute, and compare against fp32 torch."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
     scale = 1.0 / math.sqrt(d)
-    q, do = _bshd(b, sq, hq, d), _bshd(b, sq, hq, d)
-    k, v = _bshd(b, skv, hkv, d), _bshd(b, skv, hkv, d)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
     o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group)
-    o = _bshd(b, sq, hq, d, fill=False)
-    o.copy_(o_ref.to(torch.bfloat16))
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
 
-    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, scale, **sdpa_kwargs)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, scale, dt=dt, **sdpa_kwargs)
     idx = _plan_index(g)
     assert idx is not None, f"{_ENGINE} not offered; plans = {[g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]}"
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    dq, dk, dv = _bshd(b, sq, hq, d, fill=False), _bshd(b, skv, hkv, d, fill=False), _bshd(b, skv, hkv, d, fill=False)
+    dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
     stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
     g.execute(
         {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, dq_t: dq, dk_t: dk, dv_t: dv},
@@ -139,8 +150,17 @@ def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0):
 # --------------------------------------------------------------------------- #
 
 
-def test_dense():
-    _run()
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_dense(dt):
+    _run(dt=dt)
+
+
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_causal_dtypes(dt):
+    """Both dtypes through the masked path too: the causal chain reads the
+    workspace back in the io dtype, so a dtype mix-up shows up here and not in
+    the dense case."""
+    _run(dt=dt, keep=_causal_keep(512, 512), use_causal_mask=True)
 
 
 @pytest.mark.parametrize("d", [264, 320, 384, 511 - 7, _D])
@@ -344,6 +364,93 @@ def test_reject_bias():
 
 def test_reject_deterministic():
     assert _decline_reason(use_deterministic_algorithm=True) is not None
+
+
+def test_reject_padding_mask():
+    """Per-batch seq_len is declined: the kernel threads a scalar length.
+
+    Asserted on a REAL graph, not just on the Capabilities field, because the
+    decline has to survive the analyzer too. When per-batch lengths land, this
+    test inverts (assert the decline is None) rather than being deleted.
+    """
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
+
+    b, hq, sq, skv = 2, 2, 256, 256
+    shq = [b, hq, sq, _D]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {n: g.tensor(name=n, dim=shq, stride=_bshd_stride(shq)) for n in ("q", "k", "v", "o", "do")}
+    st = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
+    slq = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+    slk = g.tensor(name="seq_len_kv", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+    try:
+        dq, dk, dv = g.sdpa_backward(
+            name="bwd",
+            q=t["q"],
+            k=t["k"],
+            v=t["v"],
+            o=t["o"],
+            dO=t["do"],
+            stats=st,
+            attn_scale=1.0 / math.sqrt(_D),
+            use_padding_mask=True,
+            seq_len_q=slq,
+            seq_len_kv=slk,
+        )
+        for out in (dq, dk, dv):
+            out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(_bshd_stride(shq))
+        g.validate()
+        g.build_operation_graph()
+    except cudnn.cudnnGraphNotSupportedError:
+        return  # refused before engine selection is also a decline
+    facts = ga.analyze(g)
+    spec = next(s_ for s_ in ENGINE_SPECS if s_.name == _ENGINE)
+    assert facts is None or mismatch(spec.capabilities, facts) is not None
+
+
+def test_reject_thd():
+    """THD/ragged is declined: stage 3 would need a variable-K grouped GEMM.
+
+    Same shape as the forward's THD test -- packed data behind dense-sized
+    descriptors plus a per-operand ragged_offset. Inverts when THD lands.
+    """
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
+
+    b, hq, s_max = 2, 2, 256
+    shq = [b, hq, s_max, _D]
+    stride = [s_max * hq * _D, _D, hq * _D, 1]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {n: g.tensor(name=n, dim=shq, stride=stride) for n in ("q", "k", "v", "o", "do")}
+    st = g.tensor(name="stats", dim=[b, hq, s_max, 1], stride=[hq * s_max, s_max, 1, 1], data_type=cudnn.data_type.FLOAT)
+    slq = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+    slk = g.tensor(name="seq_len_kv", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+    for n in ("q", "k", "v", "o", "do"):
+        t[n].set_ragged_offset(g.tensor(name=f"{n}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64))
+    try:
+        dq, dk, dv = g.sdpa_backward(
+            name="bwd",
+            q=t["q"],
+            k=t["k"],
+            v=t["v"],
+            o=t["o"],
+            dO=t["do"],
+            stats=st,
+            attn_scale=1.0 / math.sqrt(_D),
+            use_padding_mask=True,
+            seq_len_q=slq,
+            seq_len_kv=slk,
+        )
+        for out in (dq, dk, dv):
+            out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(stride)
+            out.set_ragged_offset(g.tensor(name=f"{out.get_name()}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64))
+        g.validate()
+        g.build_operation_graph()
+    except cudnn.cudnnGraphNotSupportedError:
+        return  # refused before engine selection is also a decline
+    facts = ga.analyze(g)
+    spec = next(s_ for s_ in ENGINE_SPECS if s_.name == _ENGINE)
+    assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
 def test_capabilities_match_what_is_implemented():

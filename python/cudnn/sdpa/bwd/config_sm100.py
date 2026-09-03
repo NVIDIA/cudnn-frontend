@@ -136,6 +136,23 @@ class MatmulTemplateParams:
     # bodies are textually identical), which is why it is a plain knob here.
     # Use `vec_bytes_epi_for(d, bpe)` rather than setting it by hand.
     vec_bytes_epi: int = 32
+    # IO dtype of A/B/D, as a DTYPE_* code.  Must match the stage-2 template's
+    # `dtype_qkv`: stage 3 reads the S/dS workspace stage 2 wrote and stores the
+    # gradients in the graph's io dtype.  Both are 2 B/element, so this changes
+    # only the dtype TOKENS in the rendered body -- every byte-size constant
+    # (swizzle, box dims, SMEM staging) is width-driven and unaffected.
+    dtype_qkv: int = DTYPE_BF16
+
+
+def validate_matmul_params(params: MatmulTemplateParams) -> None:
+    """Backstop on the stage-3 GEMM params, mirroring ``make_cfg_d512``'s role
+    for stage 2. Public because the template calls it; reaching a raise here
+    means the adapter built a record the Capabilities row should not have
+    admitted."""
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+        raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
+    if params.vec_bytes_epi not in (16, 32):
+        raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

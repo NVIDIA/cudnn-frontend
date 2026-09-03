@@ -2211,14 +2211,20 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         #      skipped region at all -- the zero-fill, not the trim, is what
         #      makes the causal path correct. See `_causal_k_range`.
         self._zero_ws = lo != CAUSAL_K_NONE or hi != CAUSAL_K_NONE
+        # dtype_qkv must match stage 2's: stage 3 reads the S/dS workspace stage
+        # 2 wrote, and stores the gradients in the graph's io dtype.
         mm_lo = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),
-            MatmulTemplateParams(a_is_m_major=True, b_is_n_major=True, causal_mode=lo, causal_gran=gran, causal_shift=shift, vec_bytes_epi=vec),
+            MatmulTemplateParams(
+                a_is_m_major=True, b_is_n_major=True, causal_mode=lo, causal_gran=gran, causal_shift=shift, vec_bytes_epi=vec, dtype_qkv=dtype_code
+            ),
             tag="sdpa_bwd_sm100_mm_lo",
         )
         mm_hi = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),
-            MatmulTemplateParams(a_is_m_major=False, b_is_n_major=True, causal_mode=hi, causal_gran=gran, causal_shift=shift, vec_bytes_epi=vec),
+            MatmulTemplateParams(
+                a_is_m_major=False, b_is_n_major=True, causal_mode=hi, causal_gran=gran, causal_shift=shift, vec_bytes_epi=vec, dtype_qkv=dtype_code
+            ),
             tag="sdpa_bwd_sm100_mm_hi",
         )
         stage2 = stage2_mod.compile(

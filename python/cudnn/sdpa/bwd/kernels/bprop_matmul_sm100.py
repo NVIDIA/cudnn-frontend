@@ -63,9 +63,17 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
-from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams
+from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
 
 PARAMS = globals().get("FROST_TEMPLATE_PARAMS", MatmulTemplateParams())
+validate_matmul_params(PARAMS)
+
+# A/B/D io dtype.  BF16 and FP16 are both 2 B/element and both take the
+# Tcgen05MMAKind.F16 path, so this is a token swap: nothing byte-sized below
+# changes.  It must agree with the stage-2 template's `dtype_qkv` -- stage 3
+# reads the S/dS workspace stage 2 wrote.
+_IO_DTYPE = cutlass.Float16 if int(PARAMS.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
 
 # Tile config: CONFIG_sm100_256x256x128_128x256x32_cluster2x2_2ctamma
 # (was ...cluster2x1...; swapped on request. Every constant below is lifted
@@ -130,14 +138,15 @@ mma_size_n = 1
 mma_size_k = 4
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
 
-# Dtype family: A=bf16->MMAbf16, B=bf16->MMAbf16, out=bf16 (K_BYTES=128)
-ab_dtype = cutlass.BFloat16
-cd_dtype = cutlass.BFloat16
-mma_a_dtype = cutlass.BFloat16
-mma_b_dtype = cutlass.BFloat16
+# Dtype family: A=f16->MMAf16, B=f16->MMAf16, out=f16 (K_BYTES=128).
+# `_IO_DTYPE` is BF16 or FP16 per PARAMS.dtype_qkv; the MMA kind is the same.
+ab_dtype = _IO_DTYPE
+cd_dtype = _IO_DTYPE
+mma_a_dtype = _IO_DTYPE
+mma_b_dtype = _IO_DTYPE
 mma_c_dtype = cutlass.Float32
 acc_widen_to_fp32 = False
-ab_tma_dtype = cutlass.BFloat16
+ab_tma_dtype = _IO_DTYPE
 mma_kind = nvvm.Tcgen05MMAKind.F16
 epi_n = 64
 epi_row_elems = 64
@@ -1307,11 +1316,11 @@ def _bprop_matmul_bh_sm100_kernel(
                     col_j = col
                     linear_idx = tile_b * out_stride_b_0 + tile_h * out_stride_h_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
-                    _r_mm = (vec_f32).to(cutlass.BFloat16)
-                    vec_out = (_r_mm).to(cutlass.BFloat16)
+                    _r_mm = (vec_f32).to(cd_dtype)
+                    vec_out = (_r_mm).to(cd_dtype)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cutlass.BFloat16)
+                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
                     _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
@@ -1503,12 +1512,14 @@ def _host(
     _c0 = _tma_c_outputs[0]
     tma_c_desc_0 = _tma.create_tensor_map_tiled(
         global_address=_c0.iterator.toint(),
-        dtype=cutlass.BFloat16,
+        dtype=cd_dtype,
         global_dims=[n, m, n_head, n_batch],
         global_strides=[
-            out_stride_m_0 * 16 // 128,
-            out_stride_h_0 * 16 // 128,
-            out_stride_b_0 * 16 // 128,
+            # `cd_dtype.width`, not a literal 16: the A/B descriptors above already
+            # derive it, and this one is now dtype-parameterized too.
+            out_stride_m_0 * cd_dtype.width // 128,
+            out_stride_h_0 * cd_dtype.width // 128,
+            out_stride_b_0 * cd_dtype.width // 128,
         ],
         box_dims=[64, epi_tile_mn[0], 1, 1],
         swizzle=_tma.TensorMapSwizzle.s128b,
@@ -1606,7 +1617,7 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    fake_c_0 = _make_fake_c(cutlass.BFloat16, 1, False)
+    fake_c_0 = _make_fake_c(cd_dtype, 1, False)
 
     def _sym_operand_strides(is_mn_major: bool) -> tuple:
         # Operand is permuted to (M|N, K, H, B): the unit stride is mode 0 when
