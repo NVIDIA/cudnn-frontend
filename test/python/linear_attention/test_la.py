@@ -699,6 +699,12 @@ def test_bwd_varlen(backend, variant, seq_lens):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=seq_lens))
 
 
+@pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_gdn_bwd_partial_final_chunk(backend, l2norm):
+    assert_bwd_parity(backend, make_case("gdn", torch.bfloat16, seq_lens=[68], H=1), l2norm=l2norm)
+
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_zero_length_sequence(backend, variant):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=[64, 0, 128]))
@@ -1561,12 +1567,153 @@ def test_safe_gate_backward_param_16bit(backend, variant, K, param_dtype):
         assert (got - ident).abs().max().item() / scale < 5e-2, name
 
 
-def test_beta_sigmoid_in_kernel(backend):
-    """KDA: io-dtype Beta logits with the in-kernel sigmoid match the
-    post-activation fp32 path."""
-    case = make_case("kda", torch.bfloat16, T=256)
+ABSENT_ARMS = ("no_a_log", "no_dt_bias", "no_params")
+
+
+def assert_bitwise_arms(name, got, want):
+    """The absent-parameter arm reproduces the explicit-zero arm byte for byte."""
+    assert got.dtype == want.dtype and got.shape == want.shape, f"{name}: {got.dtype} {tuple(got.shape)} vs {want.dtype} {tuple(want.shape)}"
+    assert torch.equal(bits(got), bits(want)), f"{name} differs between the absent-parameter and explicit-zero arms"
+
+
+def safe_gate_params(arm, a_full, dt_full):
+    """((a_ref, dt_ref), (a_abs, dt_abs)): the absent arm passes None where the
+    reference arm passes an explicit zero tensor."""
+    a_zero, dt_zero = torch.zeros_like(a_full), torch.zeros_like(dt_full)
+    if arm == "no_a_log":
+        return (a_zero, dt_full), (None, dt_full)
+    if arm == "no_dt_bias":
+        return (a_full, dt_zero), (a_full, None)
+    return (a_zero, dt_zero), (None, None)
+
+
+def safe_gate_kw(variant, a_log, dt_bias, **extra):
+    kw = dict(safe_gate=True, a_log=a_log, dt_bias=dt_bias, **extra)
+    if variant != "gdn":
+        kw["gate_lower_bound"] = -5.0
+    return kw
+
+
+@pytest.mark.parametrize("arm", ABSENT_ARMS)
+@pytest.mark.parametrize("T", [256, SPLIT_T])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_absent_params_fwd_bitwise(backend, variant, T, arm):
+    """An absent a_log is unit amplitude and an absent dt_bias is zero bias; o
+    and final_state are bitwise the explicit-zero-tensor run (SPLIT_T also
+    drives the split-K chunk scan, whose plan key carries the params)."""
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=T)
+    set_seed(SEED + 21)
+    a_full = torch.randn_like(a_log) * 0.3
+    dt_full = torch.randn_like(dt_bias) * 0.3
+    (a_ref, dt_ref), (a_abs, dt_abs) = safe_gate_params(arm, a_full, dt_full)
+    raw_case = case.clone(gates=dict(case.gates, g=graw))
+    o_ref, fs_ref = run_fwd(backend, raw_case, **safe_gate_kw(variant, a_ref, dt_ref, output_final_state=True))
+    o_abs, fs_abs = run_fwd(backend, raw_case, **safe_gate_kw(variant, a_abs, dt_abs, output_final_state=True))
+    assert_bitwise_arms("o", o_abs, o_ref)
+    assert_bitwise_arms("final_state", fs_abs, fs_ref)
+
+
+@pytest.mark.parametrize("arm", ABSENT_ARMS)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_absent_params_checkpoints_bitwise(backend, variant, arm):
+    """The per-chunk state_checkpoints series of the absent-parameter run is
+    bitwise the explicit-zero-tensor run."""
+    ckpt = CHUNK[variant] * 2
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=4 * ckpt)
+    set_seed(SEED + 23)
+    a_full = torch.randn_like(a_log) * 0.3
+    dt_full = torch.randn_like(dt_bias) * 0.3
+    (a_ref, dt_ref), (a_abs, dt_abs) = safe_gate_params(arm, a_full, dt_full)
+    raw_case = case.clone(gates=dict(case.gates, g=graw))
+    kw = dict(output_final_state=True, checkpoint_every_n_tokens=ckpt)
+    o_ref, fs_ref, ck_ref = run_fwd(backend, raw_case, **safe_gate_kw(variant, a_ref, dt_ref, **kw))
+    o_abs, fs_abs, ck_abs = run_fwd(backend, raw_case, **safe_gate_kw(variant, a_abs, dt_abs, **kw))
+    valid = case.N * ((case.T - 1) // ckpt + 1)
+    assert_bitwise_arms("o", o_abs, o_ref)
+    assert_bitwise_arms("final_state", fs_abs, fs_ref)
+    assert_bitwise_arms("state_checkpoints", ck_abs[:valid], ck_ref[:valid])
+
+
+@pytest.mark.parametrize("arm", ABSENT_ARMS)
+@pytest.mark.parametrize("K", [64, 128])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_absent_params_bwd_bitwise(backend, variant, K, arm):
+    """Every gradient of the absent-parameter run, the initial-state gradient
+    included, is bitwise the explicit-zero-tensor run; the absent parameter has
+    no leaf, so autograd has nothing to return for it (its zero twin does get a
+    finite grad)."""
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=128, K=K)
+    set_seed(SEED + 22)
+    a_full = torch.randn_like(a_log) * 0.3
+    dt_full = torch.randn_like(dt_bias) * 0.3
+    (a_ref, dt_ref), (a_abs, dt_abs) = safe_gate_params(arm, a_full, dt_full)
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    state0 = torch.randn(case.N, case.HO, case.V, case.K, device="cuda")
+    d_final = torch.randn_like(state0)
+
+    def run(a, dt):
+        tensors = {"q": case.q, "k": case.k, "v": case.v, "g": graw, "beta": case.gates["beta"]}
+        if variant == "gdn2":
+            tensors["w"] = case.gates["w"]
+        leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
+        leaves["initial_state"] = state0.detach().clone().requires_grad_(True)
+        params = {name: (None if t is None else t.detach().clone().requires_grad_(True)) for name, t in (("a_log", a), ("dt_bias", dt))}
+        kw = safe_gate_kw(variant, params["a_log"], params["dt_bias"], use_qk_l2norm_in_kernel=True)
+        with waive_unsupported(backend, variant):
+            o, fs = pinned_op(backend, variant)(*[leaves[n] for n in tensors], case.cu, initial_state=leaves["initial_state"], output_final_state=True, **kw)
+            torch.autograd.backward([o, fs], [dO, d_final])
+        return o, leaves, params
+
+    o_ref, leaves_ref, params_ref = run(a_ref, dt_ref)
+    o_abs, leaves_abs, params_abs = run(a_abs, dt_abs)
+    assert_bitwise_arms("o", o_abs, o_ref)
+    for name in leaves_ref:
+        assert_bitwise_arms("d" + name, leaves_abs[name].grad, leaves_ref[name].grad)
+    for name in ("a_log", "dt_bias"):
+        assert params_ref[name].grad is not None and bool(torch.isfinite(params_ref[name].grad).all()), name
+        if params_abs[name] is not None:
+            assert_bitwise_arms("d_" + name, params_abs[name].grad, params_ref[name].grad)
+
+
+@pytest.mark.parametrize("arm", ABSENT_ARMS)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_absent_params_bwd_op_outputs(variant, arm):
+    """The raw bwd op returns an EMPTY d_a_log / d_dt_bias for an absent
+    parameter, and register_fake declares the same shapes and dtypes."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    case, graw, a_log, dt_bias = safe_gate_case(variant, T=128)
+    set_seed(SEED + 24)
+    a_full = torch.randn_like(a_log) * 0.3
+    dt_full = torch.randn_like(dt_bias) * 0.3
+    a_abs, dt_abs = safe_gate_params(arm, a_full, dt_full)[1]
+    dO = torch.randn(case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    args = [dO, to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(graw), to_thd(case.gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"]))
+    args += [case.cu, float(case.K**-0.5)]
+    kw = safe_gate_kw(variant, a_abs, dt_abs)
+    bwd = getattr(torch.ops.cudnn, OP_NAMES[variant] + "_bwd")
+    with waive_declined(f"{variant} safe_gate {arm}"):
+        eager = bwd(*args, **kw)
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            meta = bwd(*args, **kw)
+    d_a_log, d_dt_bias = eager[-2], eager[-1]
+    assert (d_a_log.numel() == 0) == (a_abs is None), "d_a_log must be empty iff a_log is absent"
+    assert (d_dt_bias.numel() == 0) == (dt_abs is None), "d_dt_bias must be empty iff dt_bias is absent"
+    pairs = enumerate(zip(eager, meta))
+    got = [(i, e.dtype, tuple(e.shape), m.dtype, tuple(m.shape)) for i, (e, m) in pairs if e.dtype != m.dtype or tuple(e.shape) != tuple(m.shape)]
+    assert not got, f"meta/eager mismatch at output indices {got}"
+
+
+@pytest.mark.parametrize("variant", ["kda", "gdn"])
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=DTYPE_IDS.get)
+def test_beta_sigmoid_in_kernel(backend, variant, beta_dtype):
+    """KDA/GDN: float32/io-dtype Beta logits with the in-kernel sigmoid match
+    the post-activation fp32 path."""
+    case = make_case(variant, torch.bfloat16, T=256)
     set_seed(SEED + 11)
-    braw = torch.randn(1, case.T, case.HO, device="cuda").to(case.dtype)
+    braw = torch.randn(1, case.T, case.HO, device="cuda").to(beta_dtype)
     raw_case = case.clone(gates=dict(case.gates, beta=braw))
     eff_case = case.clone(gates=dict(case.gates, beta=braw.float().sigmoid()))
     o_raw, fs_raw = run_fwd(backend, raw_case, output_final_state=True, use_beta_sigmoid_in_kernel=True)
@@ -1575,14 +1722,18 @@ def test_beta_sigmoid_in_kernel(backend):
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_beta_sigmoid_backward(backend, variant):
+@pytest.mark.parametrize(
+    "variant,beta_dtype",
+    [(variant, torch.bfloat16) for variant in VARIANTS] + [("kda", torch.float32), ("gdn", torch.float32)],
+    ids=[*(f"{variant}-bf16" for variant in VARIANTS), "kda-fp32", "gdn-fp32"],
+)
+def test_beta_sigmoid_backward(backend, variant, beta_dtype):
     """The in-kernel Beta sigmoid returns the gradient wrt the raw logit, so
     dbeta must equal the post-activation path's dbeta times s * (1 - s) at the
-    io-rounded s the forward stores."""
+    s the forward stores (io-rounded for io-dtype logits, exact for fp32)."""
     case = make_case(variant, torch.bfloat16, T=256)
     set_seed(SEED + 13)
-    braw = torch.randn_like(case.gates["beta"].float()).to(case.dtype)
+    braw = torch.randn_like(case.gates["beta"].float()).to(beta_dtype)
     s_io = torch.sigmoid(braw.float()).to(case.dtype)
 
     def dbeta(beta, **kw):
@@ -1593,6 +1744,7 @@ def test_beta_sigmoid_backward(backend, variant):
         with waive_unsupported(backend, variant):
             o, _ = pinned_op(backend, variant)(*args, case.cu, **kw)
             o.sum().backward()
+        assert leaf.grad.dtype == beta.dtype
         return leaf.grad.double()
 
     got = dbeta(braw, use_beta_sigmoid_in_kernel=True)
@@ -1847,13 +1999,16 @@ def test_invalid_initial_state_count_raises(variant):
         op(variant)(*op_args(case), initial_state=state0)
 
 
-@pytest.mark.parametrize("variant", ["kda", "gdn2"])
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_invalid_safe_gate_args_raise(variant):
+    """safe_gate alone is valid (unit amplitude, zero bias); a gate parameter
+    without safe_gate is not."""
     case = make_case(variant, torch.bfloat16, T=64)
-    with pytest.raises(ValueError, match="safe_gate"):
-        op(variant)(*op_args(case), safe_gate=True)
-    with pytest.raises(ValueError, match="safe_gate"):
+    dt_shape = (case.HO,) if variant == "gdn" else (case.HO, case.K)
+    with pytest.raises(ValueError, match="require safe_gate=True"):
         op(variant)(*op_args(case), a_log=torch.zeros(case.HO, device="cuda"))
+    with pytest.raises(ValueError, match="require safe_gate=True"):
+        op(variant)(*op_args(case), dt_bias=torch.zeros(dt_shape, device="cuda"))
 
 
 # ---------------------------------------------------------------------------
@@ -2578,10 +2733,12 @@ def test_gdp_beta_two(gdp_frost):
     assert_gdp_bwd_parity(gdp_frost, base, expanded, 3)
 
 
-def test_gdp_use_beta_sigmoid(gdp_frost):
+@pytest.mark.parametrize("v_dim", [128, 64], ids=["v128", "v64"])
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32], ids=DTYPE_IDS.get)
+def test_gdp_use_beta_sigmoid(gdp_frost, v_dim, beta_dtype):
     n = 2
-    base, expanded = make_gdp_case(torch.bfloat16, n, T=128)
-    logits = torch.randn(expanded.T, expanded.HO, device="cuda", dtype=torch.bfloat16)
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, V=v_dim)
+    logits = torch.randn(expanded.T, expanded.HO, device="cuda", dtype=beta_dtype)
     args = gdp_args(base, expanded, n)
     args[4] = logits
     o, fs = run_gdp(gdp_frost, *args, output_final_state=True, use_beta_sigmoid_in_kernel=True)
@@ -2589,6 +2746,35 @@ def test_gdp_use_beta_sigmoid(gdp_frost):
     o_ref, fs_ref = gdp_ref(base, expanded, n)
     assert_rms_close("o", o, o_ref, FWD_TOL[torch.bfloat16])
     assert_rms_close("final_state", fs, fs_ref, STATE_TOL[torch.bfloat16])
+
+
+@pytest.mark.parametrize("v_dim", [128, 64], ids=["v128", "v64"])
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32], ids=DTYPE_IDS.get)
+def test_gdp_beta_sigmoid_backward(gdp_frost, v_dim, beta_dtype):
+    """The fused Beta sigmoid returns the gradient wrt the raw logit, so
+    dbeta must equal the post-activation path's dbeta times s * (1 - s) at the
+    s the forward stores (io-rounded for io-dtype logits, exact for fp32)."""
+    n = 2
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, V=v_dim)
+    set_seed(SEED + 13)
+    braw = torch.randn(expanded.T, expanded.HO, device="cuda").to(beta_dtype)
+    s_io = torch.sigmoid(braw.float()).to(torch.bfloat16)
+
+    def dbeta(beta, **kw):
+        leaf = beta.detach().clone().requires_grad_(True)
+        args = gdp_args(base, expanded, n)
+        args[4] = leaf
+        o, _ = run_gdp(gdp_frost, *args, **kw)
+        o.sum().backward()
+        assert leaf.grad.dtype == beta.dtype
+        return leaf.grad.double()
+
+    got = dbeta(braw, use_beta_sigmoid_in_kernel=True)
+    s = s_io.double()
+    ident = dbeta(s_io.to(braw.dtype)) * s * (1 - s)
+    scale = ident.abs().max().item()
+    assert scale > 1e-3, "dbeta is ~0, the comparison would be vacuous"
+    assert (got - ident).abs().max().item() / scale < 2e-2
 
 
 def test_gdp_allow_neg_eigval(gdp_frost):
@@ -2646,12 +2832,63 @@ def test_gdp_safe_gate_param_16bit(gdp_frost, param_dtype):
     assert_bitwise("final_state", fs16, fs32)
 
 
-def test_gdp_safe_gate_requires_params(gdp_frost):
-    """safe_gate needs a_log and dt_bias; the op declines without them."""
+def test_gdp_gate_params_require_safe_gate(gdp_frost):
+    """A gate parameter without safe_gate is rejected; safe_gate alone is valid."""
     n = 2
     base, expanded = make_gdp_case(torch.bfloat16, n, T=64)
-    with pytest.raises(ValueError, match="safe_gate requires a_log and dt_bias"):
-        run_gdp(gdp_frost, *gdp_args(base, expanded, n), safe_gate=True)
+    with pytest.raises(ValueError, match="require safe_gate=True"):
+        run_gdp(gdp_frost, *gdp_args(base, expanded, n), a_log=torch.zeros(expanded.HO, device="cuda"))
+    with pytest.raises(ValueError, match="require safe_gate=True"):
+        run_gdp(gdp_frost, *gdp_args(base, expanded, n), dt_bias=torch.zeros(expanded.HO, device="cuda"))
+
+
+@pytest.mark.parametrize("arm", ABSENT_ARMS)
+@pytest.mark.parametrize("v_dim", [128, 64], ids=["v128", "v64"])
+def test_gdp_safe_gate_absent_params_bitwise(gdp_frost, v_dim, arm):
+    """An absent a_log (unit amplitude) / dt_bias (zero bias) is bitwise the
+    explicit zero tensor in o, final_state and every gradient, the
+    initial-state gradient included; the absent parameter has no leaf."""
+    n = 3
+    base, expanded = make_gdp_case(torch.bfloat16, n, T=128, V=v_dim)
+    HO = expanded.HO
+    set_seed(SEED + 25)
+    g_raw = torch.randn(base.T, HO, device="cuda") * 0.5
+    a_full = torch.randn(HO, device="cuda") * 0.3
+    dt_full = torch.randn(HO, device="cuda") * 0.3
+    (a_ref, dt_ref), (a_abs, dt_abs) = safe_gate_params(arm, a_full, dt_full)
+    dO = torch.randn(base.T, HO, base.V, device="cuda", dtype=torch.bfloat16)
+    state0 = torch.randn(base.N, HO, base.V, base.K, device="cuda")
+    d_final = torch.randn_like(state0)
+
+    def run(a, dt):
+        args = gdp_args(base, expanded, n)
+        args[3] = g_raw
+        leaves = {name: t.detach().clone().requires_grad_(True) for name, t in zip(("q", "k", "v", "g", "beta"), args[:5])}
+        leaves["initial_state"] = state0.detach().clone().requires_grad_(True)
+        params = {name: (None if t is None else t.detach().clone().requires_grad_(True)) for name, t in (("a_log", a), ("dt_bias", dt))}
+        o, fs = run_gdp(
+            gdp_frost,
+            *[leaves[k] for k in ("q", "k", "v", "g", "beta")],
+            base.cu,
+            n,
+            initial_state=leaves["initial_state"],
+            output_final_state=True,
+            safe_gate=True,
+            **params,
+        )
+        torch.autograd.backward([o, fs], [dO, d_final])
+        return o, fs, leaves, params
+
+    o_ref, fs_ref, leaves_ref, params_ref = run(a_ref, dt_ref)
+    o_abs, fs_abs, leaves_abs, params_abs = run(a_abs, dt_abs)
+    assert_bitwise_arms("o", o_abs, o_ref)
+    assert_bitwise_arms("final_state", fs_abs, fs_ref)
+    for name in leaves_ref:
+        assert_bitwise_arms("d" + name, leaves_abs[name].grad, leaves_ref[name].grad)
+    for name in ("a_log", "dt_bias"):
+        assert params_ref[name].grad is not None and bool(torch.isfinite(params_ref[name].grad).all()), name
+        if params_abs[name] is not None:
+            assert_bitwise_arms("d_" + name, params_abs[name].grad, params_ref[name].grad)
 
 
 def test_gdp_n1_matches_gdn_bitwise(gdp_frost):
@@ -2733,14 +2970,13 @@ V64 = dict(K=128, V=64)
 
 
 def test_gdp_v64_routes_to_the_fork(gdp_frost):
-    """A d_v = 64 GDP compiles the fork kernels in both directions."""
-    from cudnn.linear_attention.frost.kernel import gdp_bprop_v64_f16, gdp_prefill_v64_f16
+    """A d_v = 64 GDP compiles the backward fork kernel."""
+    from cudnn.linear_attention.frost.kernel import gdp_bprop_v64_f16
 
     base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, **V64)
     leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
     out = run_gdp(gdp_frost, *leaves, base.cu, 3)
     torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
-    assert gdp_prefill_v64_f16.get_compiled_cache.cache_info().currsize > 0, "d_v = 64 GDP forward did not compile gdp_prefill_v64_f16"
     assert gdp_bprop_v64_f16.get_compiled_cache.cache_info().currsize > 0, "d_v = 64 GDP backward did not compile gdp_bprop_v64_f16"
 
 
@@ -2794,6 +3030,12 @@ def test_gdp_v64_bwd_varlen_states(gdp_frost):
 
 def test_gdp_v64_bwd_split_table(gdp_frost):
     base, expanded = make_gdp_case(torch.bfloat16, 3, T=SPLIT_T, lo=0.1, **V64)
+    assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, l2norm=True)
+
+
+def test_gdp_v64_bwd_varlen_l2norm(gdp_frost):
+    """Ragged final chunks on both timelines drive the fused-l2norm inv_q/inv_k tails."""
+    base, expanded = make_gdp_case(torch.bfloat16, 3, seq_lens=[68, 100], **V64)
     assert_gdp_bwd_parity(gdp_frost, base, expanded, 3, l2norm=True)
 
 

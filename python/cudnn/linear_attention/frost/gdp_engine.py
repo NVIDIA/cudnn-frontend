@@ -3,8 +3,9 @@
 
 """FROST GDP engine: GDP/GDP_BWD nodes on the ``num_householder`` sub-token
 expansion (gate on sub-token 0, readout on sub-token ``n - 1``).  Plans are
-built by ``gdn_engine.py``, which routes d_v = 64 to the fork kernels and
-everything else to the shared expanded-timeline kernels."""
+built by ``gdn_engine.py``, which runs the shared kernels for every forward
+and every d_v != 64 backward, and routes the d_v = 64 backward (n > 1) to the
+token-domain fork ``kernel/gdp_bprop_v64_f16.py``."""
 
 from __future__ import annotations
 

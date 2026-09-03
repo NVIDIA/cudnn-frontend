@@ -206,8 +206,9 @@ def build_fprop_graph(
     if state_dtype is not None:
         state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
     a_log_t = dt_bias_t = None
-    if safe_gate:
+    if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
+    if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([HO], data_type=dt_bias_dtype, name="dt_bias")
     O_t, fs_t, state_checkpoints_t = graph.gdp(
         q=q_t,
@@ -294,16 +295,15 @@ def gdp_fwd(
         raise ValueError(f"gated_delta_product: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("gated_delta_product: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
-    if safe_gate and (a_log is None or dt_bias is None):
-        raise ValueError("gated_delta_product: safe_gate requires a_log and dt_bias")
     if not safe_gate and (a_log is not None or dt_bias is not None):
         raise ValueError("gated_delta_product: a_log/dt_bias require safe_gate=True")
-    if safe_gate:
+    if a_log is not None:
         check_dtype("a_log", a_log, (torch.float32, torch.bfloat16, torch.float16))
+    if dt_bias is not None:
         check_dtype("dt_bias", dt_bias, (torch.float32, torch.bfloat16, torch.float16))
     cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
-    check_dtype("beta", beta, q.dtype if use_beta_sigmoid_in_kernel else (torch.float32, q.dtype))
+    check_dtype("beta", beta, (torch.float32, q.dtype))
     if initial_state is not None:
         check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
         if initial_state.shape[0] != N:
@@ -347,8 +347,8 @@ def gdp_fwd(
         use_beta_sigmoid_in_kernel,
         allow_neg_eigval,
         safe_gate,
-        a_log.dtype if safe_gate else None,
-        dt_bias.dtype if safe_gate else None,
+        a_log.dtype if a_log is not None else None,
+        dt_bias.dtype if dt_bias is not None else None,
         checkpoint,
         device,
         plan_name,
@@ -376,8 +376,8 @@ def gdp_fwd(
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
             allow_neg_eigval=bool(allow_neg_eigval),
             safe_gate=bool(safe_gate),
-            a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if safe_gate else None,
-            dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if safe_gate else None,
+            a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
+            dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -396,8 +396,9 @@ def gdp_fwd(
     }
     if state0 is not None:
         variant_pack[t["state0"]] = state0
-    if safe_gate:
+    if a_log is not None:
         variant_pack[t["a_log"]] = a_log
+    if dt_bias is not None:
         variant_pack[t["dt_bias"]] = dt_bias
     final_state = torch.empty(0, dtype=state_out_dtype, device=device)
     if output_final_state:
@@ -509,8 +510,9 @@ def build_bprop_graph(
     if checkpoint_rows is not None:
         checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
     a_log_t = dt_bias_t = None
-    if safe_gate:
+    if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
+    if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([HO], data_type=dt_bias_dtype, name="dt_bias")
     dQ_t, dK_t, dV_t, dG_t, dBeta_t, dstate0_t, d_a_log_t, d_dt_bias_t = graph.gdp_bwd(
         q=q_t,
@@ -590,10 +592,11 @@ def gdp_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GDP backward (internal): a cached single-node GDP_BWD pygraph, THD layout.
 
-    Returns ``(dq, dk, dv, dg, dbeta, d_initial_state)``; ``d_initial_state``
-    is a zero-size tensor when ``initial_state`` is ``None``. With
-    ``use_beta_sigmoid_in_kernel``, ``beta`` is io-dtype logits and ``dbeta``
-    is the raw-logit gradient.
+    Returns ``(dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias)``;
+    ``d_initial_state`` / ``d_a_log`` / ``d_dt_bias`` are zero-size tensors
+    when ``initial_state`` / ``a_log`` / ``dt_bias`` is ``None``. With
+    ``use_beta_sigmoid_in_kernel``, ``beta`` is raw logits (float32 or the
+    io dtype) and ``dbeta`` is the raw-logit gradient in ``beta``'s dtype.
     """
     total, H, K = q.shape
     n = int(num_householder)
@@ -614,15 +617,15 @@ def gdp_bwd(
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("gated_delta_product: allow_neg_eigval requires use_beta_sigmoid_in_kernel")
     if safe_gate:
-        if a_log is None or dt_bias is None:
-            raise ValueError("gated_delta_product: safe_gate requires a_log and dt_bias")
-        check_dtype("a_log", a_log, (torch.float32, torch.bfloat16, torch.float16))
-        check_dtype("dt_bias", dt_bias, (torch.float32, torch.bfloat16, torch.float16))
+        if a_log is not None:
+            check_dtype("a_log", a_log, (torch.float32, torch.bfloat16, torch.float16))
+        if dt_bias is not None:
+            check_dtype("dt_bias", dt_bias, (torch.float32, torch.bfloat16, torch.float16))
     elif a_log is not None or dt_bias is not None:
         raise ValueError("gated_delta_product: a_log/dt_bias require safe_gate=True")
     cu = cu_seqlens
     check_dtype("g", g, (torch.float32, torch.bfloat16, torch.float16))
-    check_dtype("beta", beta, q.dtype if use_beta_sigmoid_in_kernel else (torch.float32, q.dtype))
+    check_dtype("beta", beta, (torch.float32, q.dtype))
     if initial_state is not None:
         check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
         if initial_state.shape[0] != N:
@@ -639,6 +642,8 @@ def gdp_bwd(
         ("dO", dO),
         ("d_final_state", d_final_state),
         ("state_checkpoints", state_checkpoints),
+        ("a_log", a_log),
+        ("dt_bias", dt_bias),
     ):
         if tensor is not None and tensor.device != device:
             raise ValueError(f"gated_delta_product: {tensor_name} must be on q's device ({device}); got {tensor.device}")
@@ -675,8 +680,8 @@ def gdp_bwd(
         use_beta_sigmoid_in_kernel,
         allow_neg_eigval,
         safe_gate,
-        a_log.dtype if safe_gate else None,
-        dt_bias.dtype if safe_gate else None,
+        a_log.dtype if a_log is not None else None,
+        dt_bias.dtype if dt_bias is not None else None,
         device,
         plan_name,
     )
@@ -703,8 +708,8 @@ def gdp_bwd(
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
             allow_neg_eigval=bool(allow_neg_eigval),
             safe_gate=bool(safe_gate),
-            a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if safe_gate else None,
-            dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if safe_gate else None,
+            a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
+            dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
@@ -743,12 +748,13 @@ def gdp_bwd(
         variant_pack[t["checkpoints"]] = state_checkpoints
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
     d_dt_bias = torch.empty(0, dtype=torch.float32, device=device)
-    if safe_gate:
+    if a_log is not None:
         d_a_log = torch.empty_like(a_log)
-        d_dt_bias = torch.empty_like(dt_bias)
         variant_pack[t["a_log"]] = a_log
-        variant_pack[t["dt_bias"]] = dt_bias
         variant_pack[t["d_a_log"]] = d_a_log
+    if dt_bias is not None:
+        d_dt_bias = torch.empty_like(dt_bias)
+        variant_pack[t["dt_bias"]] = dt_bias
         variant_pack[t["d_dt_bias"]] = d_dt_bias
     graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     if dstate0 is None:
@@ -781,8 +787,8 @@ def gdp_bwd_fake(
     plan_name=None,
 ):
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
-    d_a_log = torch.empty_like(a_log) if safe_gate else q.new_empty(0, dtype=torch.float32)
-    d_dt_bias = torch.empty_like(dt_bias) if safe_gate else q.new_empty(0, dtype=torch.float32)
+    d_a_log = torch.empty_like(a_log) if a_log is not None else q.new_empty(0, dtype=torch.float32)
+    d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -828,8 +834,12 @@ def gdp_setup_context(ctx, inputs, output):
     if ctx.checkpoint_reuse:
         saved.append(output[2])
     ctx.safe_gate = bool(safe_gate)
-    if ctx.safe_gate:
-        saved.extend((a_log, dt_bias))
+    ctx.has_a_log = a_log is not None
+    ctx.has_dt_bias = dt_bias is not None
+    if ctx.has_a_log:
+        saved.append(a_log)
+    if ctx.has_dt_bias:
+        saved.append(dt_bias)
     ctx.save_for_backward(*saved)
     ctx.initial_state = initial_state
     ctx.num_householder = num_householder
@@ -844,14 +854,15 @@ def gdp_setup_context(ctx, inputs, output):
 
 
 def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
-    a_log = dt_bias = None
-    if ctx.safe_gate:
-        a_log, dt_bias = ctx.saved_tensors[-2:]
     if ctx.checkpoint_reuse:
         q, k, v, g, beta, cu_seqlens, state_checkpoints = ctx.saved_tensors[:7]
+        gate_params = list(ctx.saved_tensors[7:])
     else:
         q, k, v, g, beta, cu_seqlens = ctx.saved_tensors[:6]
         state_checkpoints = None
+        gate_params = list(ctx.saved_tensors[6:])
+    a_log = gate_params.pop(0) if ctx.has_a_log else None
+    dt_bias = gate_params.pop(0) if ctx.has_dt_bias else None
     initial_state = ctx.initial_state
 
     if dO is None:
@@ -896,8 +907,8 @@ def gdp_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         None,
         None,
-        d_a_log if ctx.safe_gate else None,
-        d_dt_bias if ctx.safe_gate else None,
+        d_a_log if ctx.has_a_log else None,
+        d_dt_bias if ctx.has_dt_bias else None,
         None,
         None,
     )
@@ -952,7 +963,7 @@ def gated_delta_product(
     ``num_householder == 1`` is exactly ``gated_delta_net``.  Dtypes are
     kernel-native and strict (callers convert).  ``g`` is float32, bfloat16
     or float16 and ``dG`` comes back in the same dtype.  ``beta`` and
-    ``dBeta`` are float32 or the io dtype (io-dtype logits under
+    ``dBeta`` are float32 or the io dtype (raw logits of either dtype under
     ``use_beta_sigmoid_in_kernel``; the fused sigmoid maps to ``(0, 1)``, or
     to ``(0, 2)`` under ``allow_neg_eigval``).  ``initial_state`` is float32
     or bfloat16, and ``final_state`` / the state gradients come back in the
@@ -965,11 +976,17 @@ def gated_delta_product(
         safe_gate: interpret ``g`` through the safe-gate transform
             ``-exp(a_log) * softplus(g + dt_bias)``. Applied in the expansion
             pass, because the transform has no finite logit that leaves the
-            filler sub-token rows neutral. Requires ``a_log`` and ``dt_bias``.
+            filler sub-token rows neutral. ``a_log`` and ``dt_bias`` are
+            optional; an absent ``a_log`` is unit amplitude
+            (``exp(a_log) = 1``), an absent ``dt_bias`` is zero bias, and an
+            absent parameter gets no gradient. Passing either without
+            ``safe_gate=True`` is an error.
         a_log: ``[HO]`` safe-gate per-head log-amplitude (float32, bfloat16 or
-            float16; ``d_a_log`` comes back in the same dtype).
+            float16; ``d_a_log`` comes back in the same dtype), or ``None``
+            for unit amplitude.
         dt_bias: ``[HO]`` safe-gate per-head bias (float32, bfloat16 or
-            float16; ``d_dt_bias`` comes back in the same dtype).
+            float16; ``d_dt_bias`` comes back in the same dtype), or ``None``
+            for zero bias.
         allow_neg_eigval: scale the fused beta sigmoid by 2, so the delta-rule
             operator ``I - beta k k^T`` can reach negative eigenvalues
             (a reflection rather than a projection). Requires
