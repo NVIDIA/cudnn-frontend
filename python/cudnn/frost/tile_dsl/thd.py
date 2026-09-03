@@ -113,9 +113,32 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32) -> 
     row-BLOCKED workspace, plus the total at ``row_off[B]``.
 
     ``row_off[b] = SUM_{i<b} ceil(s_q[i] / gran) * gran``.  Rounding each block
-    UP to ``gran`` (the producing kernel's write granularity) is what keeps a
-    sequence's tail tile inside its own block: at an unrounded offset the tail
-    would overlap the next sequence's first rows and quietly corrupt them.
+    UP is what keeps a sequence's tail tile inside its own block: at an
+    unrounded offset the tail would overlap the next sequence's first rows and
+    quietly corrupt them.
+
+    **Choosing ``gran`` -- it is bracketed from BOTH sides, and the padding is
+    pure waste, so it wants to be the smallest legal value:**
+
+    * **At least the CONSUMER's k-tile.**  The reader walks whole k-tiles, so
+      the rows between ``s_q[b]`` and the k-tile boundary must be inside the
+      block and must hold the zeros the producer wrote there.  Any smaller
+      ``gran`` and the reader's last k-tile reaches into the NEXT sequence's
+      live rows -- nonzero data, silently summed into the wrong gradient.
+    * **At least the PRODUCER's per-CTA store box, if you want to stay
+      descriptor-free.**  With ``gran`` == that box height, every box is wholly
+      inside its block or wholly outside it, so an out-of-range box is a
+      boolean SKIP at the store site.  Below it a box STRADDLES the boundary,
+      which no predicate can express -- it needs a per-sequence descriptor with
+      a clipped ``GLOBAL_DIM``, i.e. a GMEM descriptor read plus a
+      GENERIC->TENSORMAP acquire fence on every store.  That is real hot-path
+      cost to save (box - k_tile) rows per sequence.
+
+    For the SM100 d512 backward that is ``gran = TILE_M = 128`` (k-tile 64,
+    per-CTA box 128).  The cluster spans ``TILE_M * CTA_MMA = 256`` rows, but
+    each CTA stores its own 128 -- padding to 256 would double the waste for
+    nothing.  At B=64 short sequences that is 20 % of the workspace rather
+    than 33 %.
 
     Must run AFTER :func:`write_thd_meta` (it reads the ``cu_seqlens_q`` it
     wrote); callers run it on the same elected thread, where program order

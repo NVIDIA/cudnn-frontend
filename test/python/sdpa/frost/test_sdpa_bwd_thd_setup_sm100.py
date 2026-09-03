@@ -29,12 +29,12 @@ from frost_test_utils import _dsl_installed, requires_dsl, requires_pre_rubin_bl
 pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
 # Sequence lengths chosen so every interesting case is present at once: not a
-# multiple of the block granularity (70, 33, 5), exactly one block (128), and
-# lengths shorter than the probe's store box (33, 5) so the clip has something
-# to clip.
+# multiple of the block granularity (70, 33, 5), exactly one block (128), a
+# length spanning two blocks (130 kv), and lengths shorter than the probe's
+# store box (33, 5) so the clip has something to clip.
 _LENS_Q = (70, 33, 128, 5)
 _LENS_KV = (64, 40, 130, 8)
-_GRAN = 256  # stage 2's Q-row write granularity (TILE_M * CTA_MMA)
+_GRAN = 128  # the blocked workspace's row granularity: stage 2's per-CTA store box
 _D = 64  # 64 fp32 = 256 B rows: the unswizzled TMA STG inner-box cap exactly
 _PROBE_ROWS = 64  # store box; overshoots sequences 1 and 3
 _SENTINEL = -7.0
