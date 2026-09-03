@@ -61,15 +61,16 @@ MMA as d=512.
 | `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ❌ |
+| Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
@@ -105,9 +106,17 @@ from 32 B to 16 B when d is not also a multiple of 16.
 back out for a gradient); a BSHD-physical one is used in place. This is not
 hypothetical — building dO as `torch.randn(o.shape)` instead of
 `torch.empty_like(o)` loses o's memory format and yields a BHSD-contiguous dO.
-ᵈ Top-left only. Bottom-right is declined because under `S_kv < S_q` the leading
-q tiles get an EMPTY kv range and this kernel has no empty-tile path — every
-cross-CTA ring would need a bookkeeping arrive to keep the four CTAs in step.
+ᵉ **Any S_q and S_kv, not just tile multiples.** The engine rounds the COMPILE
+shape up to the tile (256 in q, 128 in kv), lets stage 2 compute the tail and
+mask it, and hands stage 3 a real-extent slice so the padding never reaches a
+GEMM's M/N/K. Note this is the UNIFORM length only -- a per-batch
+`seq_len_q/kv` padding mask is still declined (`padded=False`).
+ᶠ dK/dV are accumulated as one partial per Q head and folded onto the KV heads
+by the shared `dkv_reduce` kernel (deterministic, fixed-order fp32). dQ runs one
+GEMM per group member so the shared K head lines up without an expand or a copy.
+The head chunk is forced to a multiple of the group.
+ᵈ Top-left AND bottom-right. The empty kv range bottom-right admits needs no
+special path: every ring is per-kv-iteration, so a zero-trip loop fires nothing.
 Causal also skips whole kv tiles above the diagonal (~44 % of them at S=2048),
 which means those workspace tiles are never written and stage 3 must trim its K
 range to match — a correctness requirement, not just an optimization.
@@ -236,8 +245,8 @@ feature-free d=64 graph.
 |---|---|
 | Backward pass entirely | SM107 |
 | Backward outside d ∈ (256, 512] | SM100, SM103 — the only backward engine there serves that band |
-| Backward GQA / MQA (`H_q ≠ H_kv`) | SM100, SM103 (the `dkv_reduce` group reduce is not wired to it yet) |
-| Backward SWA / padding / bottom-right causal | SM100, SM103 |
+| Backward per-batch padding mask (`seq_len_q/kv`) | SM100, SM103 — a UNIFORM non-tile-multiple length is served; a per-batch one is not |
+| Backward sink / dSink, bias / dBias, deterministic, decode | SM100, SM103 |
 | f16/bf16 forward | SM107 (Rubin) |
 | MXFP8 forward | SM107, SM120, SM80 |
 | FP8 / MXFP8 backward | every arch |

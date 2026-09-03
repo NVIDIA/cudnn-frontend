@@ -59,7 +59,7 @@ from cudnn.frost.tile_dsl.barrier import (
     cga_wait,
 )
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
-from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, apply_mask_chunk, compute_kv_loop_bounds
+from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_PADDED, apply_mask_chunk, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.mma import mma_ts
 from cudnn.frost.tile_dsl.scheduler import Sched, read_tile_id_arrive, scheduler_warp_loop
 from cudnn.frost.tile_dsl.tma import (
@@ -93,6 +93,11 @@ _decode_initial, _decode_payload = make_bwd_decode(CFG)
 # Does any tile in this specialization need the per-cell mask at all?  Folds the
 # whole mask apparatus out of the dense build.
 _MASKED = CFG.MASK_FLAGS != MASK_NONE
+# Padding covers two things at once: a per-batch seq_len, and a sequence
+# length that is not a multiple of the tile (the engine rounds the COMPILE
+# shape up and passes the real length, so the tail tile is computed then
+# masked). Both reduce to "mask everything past seqlen".
+_PADDED = bool(CFG.MASK_FLAGS & MASK_PADDED)
 
 
 @cute.jit
@@ -694,6 +699,7 @@ def _compute_kv_iter(
     attn_scale_for_dS,
     seqlen_q,
     seqlen_kv,
+    row_scale,
     kv_loop,
     acc_state,
     smem_state,
@@ -754,6 +760,13 @@ def _compute_kv_iter(
                     mask_value=0.0,
                     window_right=CFG.WINDOW_RIGHT,
                 )
+            # Rows past the real S_q: zero the whole row. Their LSE came from a
+            # CLAMPED index and is meaningless, so the value must be discarded
+            # rather than trusted. This is OUTSIDE the apply_mask branch on
+            # purpose -- a padded q row is invalid on EVERY kv tile, including
+            # the interior ones that carry no mask code.
+            if cutlass.const_expr(_PADDED):
+                s_post = s_post * row_scale
 
             # The fp32 ship, sg0 -> sg1.  This buffer is UNSWIZZLED and
             # linear on purpose: unlike the forward's P it is never an
@@ -871,10 +884,23 @@ def _compute_warp_group(
         head_g = head_idx + head_base
         batch_g = batch_idx + batch_base
 
+        # Padding, q side. Two separate problems:
+        #  * lse / do_dot are [B, H, S_q] at the REAL length, so a lane whose row
+        #    sits past it would read OUT OF BOUNDS -- clamp the INDEX;
+        #  * that lane's S must come out 0, so carry a 0/1 factor rather than
+        #    trusting the clamped row's value. sg1 needs nothing: its dS is a
+        #    product with the S it receives, so the zero propagates.
+        if cutlass.const_expr(_PADDED):
+            q_row_safe = cute.math.min(q_row, seqlen_q - cutlass.Int32(1))
+            row_scale = cutlass.Float32(arith.select((q_row < seqlen_q).ir_value(), cutlass.Float32(1.0).ir_value(), cutlass.Float32(0.0).ir_value()))
+        else:
+            q_row_safe = q_row
+            row_scale = cutlass.Float32(1.0)
+
         # Per-q-row scalars, hoisted once per tile.  Both arrive RAW: the host
         # folds no log2e into the LSE and no attn_scale into the dot.
-        lse_q_log2e = lse_tensor[batch_g, head_g, q_row] * cutlass.Float32(LOG2E)
-        scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row] * attn_scale_in
+        lse_q_log2e = lse_tensor[batch_g, head_g, q_row_safe] * cutlass.Float32(LOG2E)
+        scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row_safe] * attn_scale_in
 
         kv_left, kv_unmasked_lo, kv_unmasked_hi, kv_right = _kv_tile_bounds(q_block, cta_in_pair, seqlen_q, seqlen_kv, n_kv)
 
@@ -897,6 +923,7 @@ def _compute_warp_group(
                     attn_scale_for_dS,
                     seqlen_q,
                     seqlen_kv,
+                    row_scale,
                     _kv_loop,
                     acc_state,
                     smem_state,
@@ -1181,7 +1208,7 @@ def _host(
     lse_tensor: cute.Tensor,
     do_dot_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
-    problem_size: Tuple[int, int, int, int, int, int],  # (B, QH, S_q, S_kv, QH_chunk, QH_kv)
+    problem_size: Tuple[int, int, int, int, int, int, int, int],  # (B, QH, S_q_pad, S_kv_pad, QH_chunk, QH_kv, S_q, S_kv)
     attn_scale_in: cutlass.Float32,
     attn_scale_log2e: cutlass.Float32,
     attn_scale_for_dS: cutlass.Float32,
@@ -1189,7 +1216,10 @@ def _host(
     batch_base: cutlass.Int32,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    B, QH, SQ, SKV, QH_CHUNK, QH_KV = problem_size
+    # SQ / SKV are the TILE-ROUNDED extents the grid and the workspace use;
+    # SQ_REAL / SKV_REAL are the lengths the masks compare against. They differ
+    # only when the caller's sequence length is not a multiple of the tile.
+    B, QH, SQ, SKV, QH_CHUNK, QH_KV, SQ_REAL, SKV_REAL = problem_size
 
     # Q/K/V/dO are BSHD [B, S, H, D]; the workspaces are [B, H_chunk, S_q, S_kv].
     # stride_order is innermost-first, so the coords the kernel passes are
@@ -1237,8 +1267,8 @@ def _host(
         lse_tensor,
         do_dot_tensor,
         seq_kv_lens_tensor,
-        cutlass.Int32(SQ),
-        cutlass.Int32(SKV),
+        cutlass.Int32(SQ_REAL),
+        cutlass.Int32(SKV_REAL),
         # GQA ratio, 1 for MHA. Q-head // this = the shared KV head.
         cutlass.Int32(QH // QH_KV),
         cutlass.Int32(SKV // CFG.TILE_N),
@@ -1266,6 +1296,8 @@ def compile(  # noqa: A001
     qh_chunk: int = 1,
     d: Optional[int] = None,
     qh_kv: Optional[int] = None,
+    sq_real: Optional[int] = None,
+    skv_real: Optional[int] = None,
 ) -> Callable:
     """Per-shape compile cache.
 
@@ -1287,6 +1319,10 @@ def compile(  # noqa: A001
     # the full TILE_K-wide MMA and get the right answer.  The only hard rule is
     # TMA's: the innermost extent must be 16-byte aligned, i.e. d * BPE % 16 == 0.
     qh_kv = qh if qh_kv is None else int(qh_kv)
+    # sq / skv are the TILE-ROUNDED compile extents; the real lengths drive the
+    # masks and the operand tensors' own extents.
+    sq_real = sq if sq_real is None else int(sq_real)
+    skv_real = skv if skv_real is None else int(skv_real)
     if qh % qh_kv != 0:
         raise ValueError(f"bwd d512: qh ({qh}) must be a multiple of qh_kv ({qh_kv})")
     d = CFG.TILE_K if d is None else int(d)
@@ -1298,17 +1334,24 @@ def compile(  # noqa: A001
     def _fake_bshd(shape, dtype=STORAGE_DTYPE):
         return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
 
-    fake_q = _fake_bshd((b, sq, qh, d))
+    # Q/K/V/dO carry the REAL sequence length: a tile reading past it is TMA
+    # zero-filled, which is exactly what the tail mask expects to see.
+    fake_q = _fake_bshd((b, sq_real, qh, d))
     # K/V are indexed by the KV head, so their head extent is qh_kv.
-    fake_k = _fake_bshd((b, skv, qh_kv, d))
-    fake_v = _fake_bshd((b, skv, qh_kv, d))
-    fake_do = _fake_bshd((b, sq, qh, d))
+    fake_k = _fake_bshd((b, skv_real, qh_kv, d))
+    fake_v = _fake_bshd((b, skv_real, qh_kv, d))
+    fake_do = _fake_bshd((b, sq_real, qh, d))
     # Chunk-local workspaces, [B, H_chunk, S_q, S_kv] at the io dtype.
     fake_s = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
     fake_ds = _fake_bshd((b, qh_chunk, sq, skv), dtype=WORKSPACE_DTYPE)
     # Plain per-lane reads, one q-row per lane -- no TMA, no barriers.
-    fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
-    fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq), stride_order=(2, 1, 0), assumed_align=16)
+    fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_real), stride_order=(2, 1, 0), assumed_align=16)
+    # do_dot's producer (dot_do_o_kernel) indexes delta with a row stride of
+    # ceil(S_q / 128) * 128, NOT S_q -- so the buffer, and this view of it, must
+    # use the same rounding. They coincide whenever S_q is a multiple of 128,
+    # which is why a non-multiple was the only shape that exposed it.
+    sq_dot = -(-sq_real // 128) * 128
+    fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
 
     return cute.compile(
@@ -1322,7 +1365,7 @@ def compile(  # noqa: A001
         fake_lse,
         fake_do_dot,
         fake_seq_kv_lens,
-        (b, qh, sq, skv, qh_chunk, qh_kv),
+        (b, qh, sq, skv, qh_chunk, qh_kv, sq_real, skv_real),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),

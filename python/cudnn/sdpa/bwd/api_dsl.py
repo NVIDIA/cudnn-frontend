@@ -2085,6 +2085,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self.head_dim_v = int(tuple(self.v_desc.shape)[3])
         self.dtype = self.q_desc.dtype
         self._bpe = 2
+        # Tile-rounded COMPILE shape. The kernel's grid and workspace are tiled,
+        # so a sequence length that is not a multiple runs on the next multiple
+        # up and the tail is masked. Q/K/V/dO ride their real TMA extents, whose
+        # overshoot is HW zero-filled; only S/dS are actually allocated padded.
+        self._sq_pad = -(-self.s_q_max // 256) * 256
+        self._skv_pad = -(-self.s_k_max // 128) * 128
+        self._is_padded = self._sq_pad != self.s_q_max or self._skv_pad != self.s_k_max
         self._compiled = None
         self._dot_fn = None
         self._reduce_fn = None
@@ -2094,7 +2101,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # partial per Q head and a separate reduce folds the group. group == 1
         # (MHA) skips both the partial buffers and the reduce entirely.
         self._gqa_group = self.h_q // self.h_kv
-        self._qh_chunk = _sm100_head_chunk(self.batch_size, self.h_q, self.s_q_max, self.s_k_max, self._bpe, group=self._gqa_group)
+        self._qh_chunk = _sm100_head_chunk(self.batch_size, self.h_q, self._sq_pad, self._skv_pad, self._bpe, group=self._gqa_group)
         # The kernels read/write BSHD-physical buffers. Any io tensor that is not
         # already one gets a staging copy carved from the workspace -- decided
         # HERE, from the descs' declared strides, so scratch_workspace_bytes()
@@ -2123,8 +2130,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self.head_dim_qk % 8 != 0, f"SM100 bwd: d must be a multiple of 8 (TMA 16-byte innermost extent at 2 B/elem); got {self.head_dim_qk}"
         )
         self._value_error_if(self.h_q % self.h_kv != 0, f"SM100 bwd: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
-        self._value_error_if(self.s_q_max % 256 != 0, f"SM100 bwd: S_q must be a multiple of 256 (TILE_M * CTA_MMA); got {self.s_q_max}")
-        self._value_error_if(self.s_k_max % 128 != 0, f"SM100 bwd: S_kv must be a multiple of 128 (TILE_N); got {self.s_k_max}")
+        # No S_q / S_kv tile rule any more: a non-multiple is served by rounding
+        # the compile shape up and masking the tail.
         # SWA and bottom-right causal ARE implemented (the tile bounds and the
         # per-cell mask both come from the shared mask helpers). Padding is not:
         # it needs the per-batch kv length, and this kernel threads a scalar.
@@ -2139,8 +2146,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         per-execute allocation: the executor carves all of it from the caller's
         buffer, which is what keeps the plan CUDA-graph friendly.
         """
-        delta = ws_align(self.batch_size * self.h_q * self.s_q_max * 4)
-        ws = ws_align(self.batch_size * self._qh_chunk * self.s_q_max * self.s_k_max * self._bpe)
+        delta = ws_align(self.batch_size * self.h_q * (-(-self.s_q_max // 128) * 128) * 4)
+        ws = ws_align(self.batch_size * self._qh_chunk * self._sq_pad * self._skv_pad * self._bpe)
         total = delta + 2 * ws
         for name in self._stage_in + self._stage_out:
             s_len = self.s_k_max if name in ("k", "v", "dK", "dV") else self.s_q_max
@@ -2211,11 +2218,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         stage2 = stage2_mod.compile(
             b=self.batch_size,
             qh=self.h_q,
-            sq=self.s_q_max,
-            skv=self.s_k_max,
+            sq=self._sq_pad,
+            skv=self._skv_pad,
             qh_chunk=self._qh_chunk,
             d=self.head_dim_qk,
             qh_kv=self.h_kv,
+            sq_real=self.s_q_max,
+            skv_real=self.s_k_max,
         )
         self._compiled = (dot_do_o_host, stage2_mod, stage2, mm_lo, mm_hi)
         return self._compiled
@@ -2264,10 +2273,17 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         stream = self._get_default_stream(current_stream)
         with _torch_stream_context(current_stream, q_tensor.device):
             carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100")
-            delta = carver.take(b * h * sq, torch.float32).reshape(b, h, sq)
+            # ROW_ROUND: dot_do_o_kernel strides delta by ceil(S_q/128)*128.
+            sq_dot = -(-sq // 128) * 128
+            delta = carver.take(b * h * sq_dot, torch.float32).reshape(b, h, sq_dot)
             chunk = self._qh_chunk
-            s_ws = carver.take(b * chunk * sq * skv, self.dtype).view(b, chunk, sq, skv)
-            ds_ws = carver.take(b * chunk * sq * skv, self.dtype).view(b, chunk, sq, skv)
+            # Allocated at the PADDED extent, because that is what stage 2's
+            # tiled grid writes; stage 3 consumes a REAL-extent slice, so the
+            # padded tail never reaches a GEMM's M/N/K at all.
+            sqp, skvp = self._sq_pad, self._skv_pad
+            s_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
+            ds_ws_full = carver.take(b * chunk * sqp * skvp, self.dtype).view(b, chunk, sqp, skvp)
+            s_ws, ds_ws = s_ws_full[:, :, :sq, :skv], ds_ws_full[:, :, :sq, :skv]
 
             # Layout normalisation. A conforming tensor is used in place (the
             # permute is a view); a non-conforming one gets a BSHD staging buffer
@@ -2311,9 +2327,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # straddle the written boundary and read residue. That showed up as a
             # 1-in-6 catastrophic dK/dV (cos 0.0006), not a numerics drift,
             # because it depends on whatever was in the buffer.
-            if self._zero_ws:
-                s_ws.zero_()
-                ds_ws.zero_()
+            if self._zero_ws or self._is_padded:
+                # The padded tail is walked by stage 3's tile-rounded M/K in the
+                # same way a mask-skipped tile is, so it gets the same treatment.
+                s_ws_full.zero_()
+                ds_ws_full.zero_()
 
             gqa = self._gqa_group > 1
             if gqa:
@@ -2360,17 +2378,19 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 hs = slice(hb, hb + chunk)
                 # STAGE 2: head_base offsets every full-tensor read; the S/dS
                 # workspace stays chunk-local at origin.
+                # Stage 2 gets the FULL padded workspace and the REAL seq
+                # lengths; it computes the tail tile and masks it.
                 stage2(
                     q,
                     k,
                     v,
                     do,
-                    s_ws,
-                    ds_ws,
+                    s_ws_full,
+                    ds_ws_full,
                     lse,
                     delta,
                     seq_kv,
-                    (b, h, sq, skv, chunk, self.h_kv),
+                    (b, h, sqp, skvp, chunk, self.h_kv, sq, skv),
                     float(scale),
                     float(scale_log2),
                     float(scale),

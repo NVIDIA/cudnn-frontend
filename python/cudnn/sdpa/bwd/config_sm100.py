@@ -455,10 +455,12 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
         #
         # Padding (`seq_kv_lens`) is still out: it needs the PER-BATCH kv length
         # at the bounds and mask sites, and this kernel threads only the scalar.
-        (
-            not (cfg.MASK_FLAGS & MASK_PADDED),
-            "bwd d512: padding masks (seq_kv_lens / seq_q_lens) are not implemented -- the kernel threads a scalar S_kv, not the per-batch length",
-        ),
+        # Padding IS implemented, for a UNIFORM length: the engine rounds the
+        # compile shape up to the tile and passes the real S_q / S_kv, and the
+        # kernel masks the tail (kv side through apply_mask_chunk, q side by
+        # zeroing the row). That is what makes a sequence length which is not a
+        # multiple of the tile work at all. A PER-BATCH seq_len still needs the
+        # per-batch value threaded to the bounds and mask sites.
         # LPT / LPT_L2 need lpt_tile_coords and its L2-residency model, which
         # bwd/kernels/_common_sm100.py deliberately does not copy.
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 v1: only SCHED_NATURAL is implemented (LPT/LPT_L2 need the L2 tile-coord model)"),

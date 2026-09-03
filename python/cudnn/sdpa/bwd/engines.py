@@ -99,6 +99,12 @@ class Capabilities:
     # (sm120's TMA 16-byte global-stride rule at 2 B/elem -> 8; sm80's
     # host-side padding has no such constraint -> 1).
     d_pad_multiple: int = 1
+    # EXCLUSIVE lower bound on an envelope row: head dims must be > this. An
+    # envelope with no floor silently claims every small head dim too, and pads
+    # it onto the big kernel -- for the sm100 d512 backward that is the whole
+    # 512-wide MMA for a d=128 graph, when a d256 flavor exists. 0 = no floor
+    # (the sm120/sm80 rows are continuum kernels and want none).
+    d_envelope_floor: int = 0
     # When True the lowering serves rectangular head dims with D_QK >= D_V
     # (e.g. 192/128); False requires D_QK == D_V.
     dqk_ge_dv: bool = False
@@ -190,6 +196,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return f"the envelope serves head-dim multiples of {m} (TMA 16-byte global-stride rule); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        fl = capabilities.d_envelope_floor
+        if fl and min(facts.d_qk, facts.d_v) <= fl:
+            return f"the envelope's floor is D > {fl} (a smaller flavor owns these); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
     elif facts.d_v not in capabilities.d:
@@ -589,6 +598,7 @@ def _sm100_spec() -> EngineSpec:
             d=frozenset({512}),
             d_envelope=True,
             d_pad_multiple=8,
+            d_envelope_floor=256,  # <= 256 belongs to the d256 flavors
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
