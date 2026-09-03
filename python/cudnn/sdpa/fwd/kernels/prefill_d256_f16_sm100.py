@@ -121,7 +121,7 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the

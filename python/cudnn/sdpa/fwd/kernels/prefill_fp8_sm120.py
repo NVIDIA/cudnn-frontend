@@ -73,7 +73,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel, sanitize_v_tail as _sanitize_v_tail, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel as _build_thd_meta_kernel, sanitize_v_tail as _sanitize_v_tail, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,

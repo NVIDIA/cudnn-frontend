@@ -314,7 +314,7 @@ python/cudnn/
         prefill_d512_f16_sm100.py
         prefill_f16_sm120.py
         _common_sm100.py
-        thd_sm100.py
+        thd_helpers.py
     bwd/                        future: same shape, its own api_dsl.py
 
   gemm/frost/                   engine.py + graph_analyzer.py + compiler.py

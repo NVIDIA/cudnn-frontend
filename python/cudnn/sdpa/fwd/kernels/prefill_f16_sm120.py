@@ -59,7 +59,7 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel as _build_thd_meta_kernel,
     sanitize_v_tail as _sanitize_v_tail,
     thd_claim_next,

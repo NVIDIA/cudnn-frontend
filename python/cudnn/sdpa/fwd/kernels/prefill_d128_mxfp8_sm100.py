@@ -242,7 +242,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; the setup kernel + TENSOR_MAP_QWORDS from the shared
-# kernels thd_sm100.py.  Gated by CFG.THD_VARLEN (folds out: _thd_tma_offsets
+# kernels thd_helpers.py.  Gated by CFG.THD_VARLEN (folds out: _thd_tma_offsets
 # is (0, 0, batch_idx) and _thd_sf_tile_bases (0, 0) dense — TMA coords
 # byte-identical).  Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs /
 # O stores per tile).  seq_kv_lens overloaded as the THD metadata buffer
@@ -253,7 +253,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # trailing two words are read only by the persistent schedulers.
 # MXFP8-only: _thd_sf_tile_bases returns the per-sequence SF-tile prefix bases
 # (cu_sf_q_base / cu_sf_k_base) for the packed scale-factor layout.
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial

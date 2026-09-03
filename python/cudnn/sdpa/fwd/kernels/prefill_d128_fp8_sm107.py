@@ -246,7 +246,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # The setup kernel builds it DEVICE-side from the caller's length tensors and
 # the adapter launches the plan-time envelope grid (issue #552) — no length
 # ever reaches the host.
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
