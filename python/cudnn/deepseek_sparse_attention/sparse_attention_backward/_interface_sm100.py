@@ -12,12 +12,96 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+from .dsa_bwd_sm100_deterministic import FlashAttentionDSABackwardSm100Deterministic
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+_WORKSPACE_ALIGNMENT = 128
+_DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
+
+
+def _align_workspace_bytes(num_bytes: int) -> int:
+    """Round a workspace segment size up to the shared alignment boundary."""
+    return -(-int(num_bytes) // _WORKSPACE_ALIGNMENT) * _WORKSPACE_ALIGNMENT
+
+
+def _workspace_shapes_sm100(
+    total_s_q: int,
+    total_s_kv: int,
+    head_dim: int,
+    num_heads: int,
+    deterministic: bool,
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Return byte-shaped LSE/OdO and dKV scratch layouts for one launch."""
+    acc_dtype = cutlass.Float32
+    workspace_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+        total_s_q,
+        head_dim,
+        num_heads,
+        1,
+        acc_dtype,
+    )
+    dkv_kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+    workspace_dkv_shape = dkv_kernel_cls._get_workspace_size_dKV(
+        total_s_kv,
+        head_dim,
+        1,
+        acc_dtype,
+    )
+    return workspace_lse_odo_shape, workspace_dkv_shape
+
+
+def flash_attn_bwd_sm100_workspace_size(
+    total_s_q: int,
+    total_s_kv: int,
+    head_dim: int,
+    num_heads: int,
+    deterministic: bool = False,
+) -> int:
+    """Return the reusable caller scratch required by the SM100 launch."""
+    workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
+        total_s_q,
+        total_s_kv,
+        head_dim,
+        num_heads,
+        deterministic,
+    )
+    return _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
+
+
+def _carve_workspace_sm100(
+    workspace: Optional[torch.Tensor],
+    device: torch.device,
+    workspace_lse_odo_shape: Tuple[int, ...],
+    workspace_dkv_shape: Tuple[int, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Validate and partition caller scratch into aligned kernel workspaces."""
+    required = _align_workspace_bytes(math.prod(workspace_lse_odo_shape)) + _align_workspace_bytes(math.prod(workspace_dkv_shape))
+    if workspace is None:
+        raise ValueError(f"SM100 DSA backward requires a {required}-byte caller workspace; pass a reusable uint8 CUDA tensor")
+    if not isinstance(workspace, torch.Tensor):
+        raise TypeError(f"workspace must be a torch.Tensor, got {type(workspace).__name__}")
+    if workspace.dtype != torch.uint8:
+        raise ValueError(f"workspace must have dtype torch.uint8, got {workspace.dtype}")
+    if workspace.device != device:
+        raise ValueError(f"workspace must be on {device}, got {workspace.device}")
+    if not workspace.is_contiguous():
+        raise ValueError("workspace must be contiguous")
+    flat = workspace.view(-1)
+    if flat.numel() < required:
+        raise ValueError(f"SM100 DSA backward requires a {required}-byte workspace; the provided buffer has {flat.numel()} bytes")
+    if flat.data_ptr() % 16 != 0:
+        raise ValueError(f"workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
+
+    lse_odo_bytes = math.prod(workspace_lse_odo_shape)
+    lse_odo_end = lse_odo_bytes
+    dkv_begin = _align_workspace_bytes(lse_odo_bytes)
+    dkv_end = dkv_begin + math.prod(workspace_dkv_shape)
+    return flat[:lse_odo_end].view(workspace_lse_odo_shape), flat[dkv_begin:dkv_end].view(workspace_dkv_shape)
 
 
 def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
@@ -41,7 +125,9 @@ def flash_attn_bwd_sm100(
     topk_length: Optional[torch.Tensor] = None,
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
     current_stream=None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -60,6 +146,9 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
+        deterministic: use the bounded-wave deterministic M64 kernel
+        workspace: reusable uint8 scratch sized by
+            ``flash_attn_bwd_sm100_workspace_size``
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -70,6 +159,9 @@ def flash_attn_bwd_sm100(
     # head_dim in {512, 576}; any other value indexes shared memory out of
     # bounds and crashes inside the kernel.
     assert head_dim in (512, 576), f"head_dim must be 512 or 576, got {head_dim}"
+    assert (
+        not deterministic or num_head in _DETERMINISTIC_HEAD_COUNTS
+    ), f"deterministic SM100 DSA backward supports heads in {_DETERMINISTIC_HEAD_COUNTS}, got H{num_head}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
@@ -102,21 +194,41 @@ def flash_attn_bwd_sm100(
 
     # H16 KV-major specialization can use the full M128 UMMA tile.  This
     # halves the top-k loop count while keeping one CTA per query token.
-    backend, block_tile = _select_sm100_backend(num_head, head_dim)
+    # Deterministic execution always uses the generic M64 kernel. Head counts
+    # below 64 use its masked tail, while counts above 64 serialize their M64
+    # head blocks so each dKV shard retains a single writer.
+    backend, block_tile = ("generic_m64", 64) if deterministic else _select_sm100_backend(num_head, head_dim)
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
     current_stream = resolve_stream(current_stream)
 
-    # Normalize inputs and allocate outputs/workspaces on the execution stream:
+    workspace_lse_odo_shape, workspace_dkv_shape = _workspace_shapes_sm100(
+        total_S_q,
+        total_S_kv,
+        head_dim,
+        num_head,
+        deterministic,
+    )
+    workspace_LSE_OdO, workspace_dKV = _carve_workspace_sm100(
+        workspace,
+        device,
+        workspace_lse_odo_shape,
+        workspace_dkv_shape,
+    )
+
+    # Normalize inputs and allocate outputs on the execution stream:
     # the kernel below launches on `current_stream`, so the semantically
-    # required zero-initialization of dkv/d_sink and both workspaces (and any
-    # contiguity copies) must be stream-ordered with it, not with the ambient
-    # torch stream the caller happens to be on.
+    # required output initialization and any contiguity copies must be
+    # stream-ordered with it, not with the ambient torch stream the caller
+    # happens to be on. Caller scratch is initialized inside the compiled
+    # kernel sequence.
     with torch_stream_context(current_stream):
         # Ensure contiguous
         q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
         lse = lse.contiguous()
+        if lse.data_ptr() % 8 != 0:
+            raise ValueError(f"lse must be 8-byte aligned for the SM100 FP32 pair-copy path; got data_ptr=0x{lse.data_ptr():x}")
         attn_sink = attn_sink.contiguous()
         topk_idxs = topk_idxs.contiguous()
         if topk_length is not None:
@@ -145,55 +257,32 @@ def flash_attn_bwd_sm100(
             dkv.fill_(0)
         d_sink = torch.zeros_like(attn_sink)
 
-        # Allocate workspace tensors
-        acc_dtype = cutlass.Float32
-        ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
-            total_S_q,
-            head_dim,
-            num_head,
-            batch_size,
-            acc_dtype,
-        )
-        workspace_LSE_OdO = torch.zeros(
-            *ws_lse_odo_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
-
-        ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
-            total_S_kv,
-            head_dim,
-            batch_size,
-            acc_dtype,
-        )
-        workspace_dKV = torch.zeros(
-            *ws_dkv_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
-
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length, deterministic)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
         out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
         dout_tensor = to_cute_tensor(dout, divisibility=head_dim_v)
-        lse_tensor = to_cute_tensor(lse, assumed_align=4)
+        lse_tensor = to_cute_tensor(lse, assumed_align=8)
         attn_sink_tensor = to_cute_tensor(attn_sink)
         topk_idxs_tensor = to_cute_tensor(topk_idxs)
         topk_length_tensor = to_cute_tensor(topk_length) if has_topk_length else None
         dq_tensor = to_cute_tensor(dq, divisibility=head_dim)
         dkv_tensor = to_cute_tensor(dkv, divisibility=head_dim)
         d_sink_tensor = to_cute_tensor(d_sink)
-        workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
-        workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
+        # Workspace extents vary with Q/KV length but are not part of the
+        # plan-time compile key. Keep all modes dynamic; the kernel consumes
+        # only the iterators, and the multidimensional shape avoids a single
+        # byte extent exceeding Int32 for the multi-GiB deterministic buffer.
+        workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO, fully_dynamic=True)
+        workspace_dKV_tensor = to_cute_tensor(workspace_dKV, fully_dynamic=True)
 
         if backend == "h16_m128":
             from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
@@ -219,7 +308,8 @@ def flash_attn_bwd_sm100(
             # Keep this constructor and class byte-for-byte on the tuned H64
             # path; embedding H16 conditionals in the same CuTe DSL class
             # measurably perturbs H64 code generation.
-            kernel_obj = FlashAttentionDSABackwardSm100(
+            kernel_cls = FlashAttentionDSABackwardSm100Deterministic if deterministic else FlashAttentionDSABackwardSm100
+            kernel_obj = kernel_cls(
                 element_dtype=dtype,
                 head_dim=head_dim,
                 head_dim_v=head_dim_v,
