@@ -2970,14 +2970,20 @@ V64 = dict(K=128, V=64)
 
 
 def test_gdp_v64_routes_to_the_fork(gdp_frost):
-    """A d_v = 64 GDP compiles the backward fork kernel."""
+    """A d_v = 64 GDP backward runs the fork kernel: its compile-cache getter is
+    called during this test, whatever earlier tests left in that cache."""
     from cudnn.linear_attention.frost.kernel import gdp_bprop_v64_f16
 
+    def fork_calls():
+        info = gdp_bprop_v64_f16.get_compiled_cache.cache_info()
+        return info.hits + info.misses
+
+    before = fork_calls()
     base, expanded = make_gdp_case(torch.bfloat16, 3, T=128, **V64)
     leaves = [to_thd(t).detach().clone().requires_grad_(True) for t in (base.q, expanded.k, expanded.v, base.gates["g"], expanded.gates["beta"])]
     out = run_gdp(gdp_frost, *leaves, base.cu, 3)
     torch.autograd.grad([out[0]], leaves, [torch.randn_like(out[0])])
-    assert gdp_bprop_v64_f16.get_compiled_cache.cache_info().currsize > 0, "d_v = 64 GDP backward did not compile gdp_bprop_v64_f16"
+    assert fork_calls() > before, "d_v = 64 GDP backward did not run gdp_bprop_v64_f16"
 
 
 @pytest.mark.parametrize("n", (1, 2, 3))
