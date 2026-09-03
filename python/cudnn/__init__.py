@@ -309,6 +309,10 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-fron
 
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
+    "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
+    "FlexAttentionFwd": (".flex_attention", "FlexAttentionFwd"),
+    "create_mask_plan": (".flex_attention", "create_mask_plan"),
+    "flex_attn_func": (".flex_attention", "flex_attn_func"),
     "sdpa_torch": (".sdpa.fwd.torch_op", "sdpa"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
