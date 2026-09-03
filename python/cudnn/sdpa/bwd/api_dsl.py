@@ -975,7 +975,9 @@ def _sm80_bwd_pad_last_dim(t: torch.Tensor, new_last: int) -> torch.Tensor:
     return torch.cat([t, pad], dim=-1).contiguous()
 
 
-def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False):
+def _sm80_thd_backward(
+    q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, window_size, causal_bottom_right, sinks=None, deterministic=False, max_s_kv=None, max_s_q=None
+):
     """THD / varlen backward: q/k/v/o/do are PACKED ``[1, T, H, D]`` (BSHD,
     B==1 — no transpose), ``lse`` is packed ``[1, H, T_q]`` (head-major,
     matching the kernel's THD LSE layout), and cu_q/cu_k are ``[n_seq+1]``
@@ -985,15 +987,17 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
     GQA reduces over the query-head group).  Returns packed ``[1, T, H, D]``
     dQ/dK/dV (BHSD-equivalent for B==1).
 
-    Wrapper-only Rule-3 residual: the grid extents (max seqlen per side, the
-    logical sequence count) are RUNTIME ints read from cu_seqlens on the HOST
-    — a D2H sync this functional wrapper accepts (the graph/engine path never
-    routes THD here without materialized host seqlens).
+    The over-provisioned grid needs the longest per-sequence KV length:
+    pass ``max_s_kv`` (any upper bound works — short tiles early-out) to keep
+    the call fully async; without it the wrapper reads it from ``cu_k`` on
+    the HOST (a D2H sync — the wrapper-only Rule-3 residual).  ``sinks``
+    ((H,) natural-log logits) adds a ``dsink_tensor`` output.  ``deterministic``
+    sizes the dQ relay counter from ``max_s_q`` (an upper bound on the
+    longest per-sequence Q length, trimmed to the packed total; the packed
+    total when absent — no D2H).  Like ``max_s_kv``, the hint is a caller
+    contract: the wrapper cannot validate it without a D2H read, and an
+    undersized value indexes the relay counter out of bounds.
     """
-    if sinks is not None:
-        raise NotImplementedError("SM80 THD bprop: attention sinks are dense-only")
-    if deterministic:
-        raise NotImplementedError("SM80 THD bprop: deterministic dQ is dense-only (no plan-time semaphore size under sym_int sq)")
     d_qk = q.shape[-1]
     d_v = v.shape[-1]
     h_q = q.shape[2]
@@ -1035,17 +1039,23 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
         is_causal=bool(is_causal),
         has_swa=has_swa,
         causal_bottom_right=bool(causal_bottom_right) and (bool(is_causal) or has_swa),
+        has_sink=sinks is not None,
+        deterministic=bool(deterministic),
         thd_varlen=True,
         sched_policy=_BWD_SCHED_NATURAL,  # LPT+THD is a future tweak
     )
     mod = _load_sm80_bwd_module(params)
-    # Host-side grid math (the wrapper-only D2H documented above).
-    cu_q_host = cu_q.to(dtype=torch.int32, device="cpu")
-    cu_k_host = cu_k.to(dtype=torch.int32, device="cpu")
-    n_seq = cu_q_host.numel() - 1
-    assert cu_k_host.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
-    max_sq = int((cu_q_host[1:] - cu_q_host[:-1]).max())
-    max_skv = int((cu_k_host[1:] - cu_k_host[:-1]).max())
+    # Host-side grid math.  n_seq is shape metadata (no sync); the longest KV
+    # length comes from the caller's max_s_kv hint, or from a host read of
+    # cu_k (the D2H documented above) when no hint is given.
+    n_seq = cu_q.numel() - 1
+    assert cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
+    if max_s_kv is not None:
+        max_s_kv = int(max_s_kv)
+        assert max_s_kv > 0, f"max_s_kv must be > 0; got {max_s_kv}"
+    else:
+        cu_k_host = cu_k.to(dtype=torch.int32, device="cpu")
+        max_s_kv = int((cu_k_host[1:] - cu_k_host[:-1]).max())
     c = mod.compile(1, h_q, h_kv, 0, 0, swa_window=swa, n_batch_logical=n_seq)
     t_q = q.shape[1]
     t_kv = k.shape[1]
@@ -1065,6 +1075,30 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
     dummy_i32 = torch.zeros(1, dtype=torch.int32, device=dev)
     dummy_f32 = torch.zeros(1, dtype=torch.float32, device=dev)
     c.do_dot(_fd_tvm(o), _fd_tvm(do), _fd_tvm(dot), _int32(h_q * t_q), stream)
+    dsink = None
+    if sinks is not None:
+        # Natural-log logits (the kernel applies log2e itself); one warp per
+        # (sequence, head) row over that sequence's tokens; zero-init target.
+        sinks_b = sinks.to(dtype=torch.float32, device=dev).reshape(h_q).contiguous()
+        dsink = torch.zeros(h_q, dtype=torch.float32, device=dev)
+        c.dsink(_fd_tvm(lse_t), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink), _fd_tvm(cu_q_t), _int32(n_seq * h_q), stream)
+    # Deterministic relay counter: one int32 per (sequence, head, q-tile),
+    # sized from the max_s_q hint (any upper bound) or, without one, from the
+    # packed total — host shape metadata, so no D2H read.  Fresh zeros every
+    # call: a stale counter deadlocks the relay's equality spin.
+    if deterministic:
+        # The packed total bounds every per-sequence length, so an over-provisioned
+        # hint is trimmed to it; an UNDERSIZED hint is a contract violation the
+        # wrapper cannot detect without a D2H read of cu_q (same contract as
+        # max_s_kv) -- the relay indexes the counter by q-tile, so it would run
+        # off the end of dq_sem.
+        q_bound = min(int(max_s_q), t_q) if max_s_q is not None else t_q
+        assert q_bound > 0, f"max_s_q must be > 0; got {q_bound}"
+        sem_q_stride = (q_bound + params.tile_q - 1) // params.tile_q
+        dq_sem = torch.zeros(n_seq * h_q * sem_q_stride, dtype=torch.int32, device=dev)
+    else:
+        sem_q_stride = 0
+        dq_sem = dummy_i32
     _sm80_bwd_call(
         c.main,
         q=q,
@@ -1083,15 +1117,15 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
         cu_q=cu_q_t,
         cu_k=cu_k_t,
         seq_q=dummy_i32,
-        dq_sem=dummy_i32,
+        dq_sem=dq_sem,
         n_q_tiles=(t_q + params.tile_q - 1) // params.tile_q,
         scale_log2=float(scale_softmax) * _BWD_LOG2E,
         attn_scale=float(scale_softmax),
         right_bound=right_bound,
         inv_scale=1.0 / float(scale_softmax),
         bias_bstride=0,
-        sem_q_stride=0,
-        grid_kv_tiles=(max_skv + params.tile_kv - 1) // params.tile_kv,
+        sem_q_stride=sem_q_stride,
+        grid_kv_tiles=(max_s_kv + params.tile_kv - 1) // params.tile_kv,
         grid_batch=n_seq,
         stream=stream,
     )
@@ -1108,7 +1142,10 @@ def _sm80_thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_cau
         dK_k = dK_k[..., :d_qk].contiguous()
     if pad_v:
         dV_k = dV_k[..., :d_v].contiguous()
-    return TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
+    out = TupleDict(dq_tensor=dQ_k, dk_tensor=dK_k, dv_tensor=dV_k)
+    if dsink is not None:
+        out["dsink_tensor"] = dsink
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1229,10 +1266,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
     Layouts: any dense layout with the head dim innermost-contiguous is
     served — non-BSHD-compact operands (dense_flex) gather into carved
-    staging, a strided stats input gathers to the packed LSE the kernels
-    read (``Capabilities.strided_stats``), and head dims inside a flavor
-    envelope pad host-side into the same carved buffers (issue #514: with a
-    workspace provided, execute allocates nothing).
+    staging, a strided stats input is READ natively at its declared strides
+    (``Capabilities.strided_stats``; no gather), and head dims inside a
+    flavor envelope pad host-side into the same carved buffers (issue #514:
+    with a workspace provided, execute allocates nothing).
     """
 
     def __init__(
@@ -1254,7 +1291,42 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self.mask_token: Optional[str] = None
         self.swa_window_runtime: int = 0
         self.right_bound_runtime: int = 0
+        self._lse_stride: "Optional[tuple[int, int, int]]" = None
         self._dummy_cache: dict = {}
+
+    def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
+        """Validate a caller-provided Stats/LSE buffer and return the
+        kernels' (B, H_q, S_q) READ view.
+
+        The logical contract is exactly ``B*H_q*S_q`` fp32 elements.  With a
+        strided plan (``_lse_stride``), rebuild the DECLARED layout over the
+        caller's storage — the kernels' loads were compiled against exactly
+        those strides; a contiguous plan requires a contiguous runtime buffer
+        (the compiled packed fake would misread anything else).
+        """
+        self._value_error_if(
+            lse_tensor.device != self.stats_desc.device,
+            f"stats must be on the plan's device {self.stats_desc.device}; got {lse_tensor.device} (the kernel binds this pointer directly)",
+        )
+        self._value_error_if(lse_tensor.dtype != torch.float32, f"stats must be float32; got {lse_tensor.dtype}")
+        expected = self.batch_size * self.h_q * self.s_q_max
+        self._value_error_if(
+            lse_tensor.numel() != expected,
+            f"stats must have B*H_q*S_q = {expected} elements; got {lse_tensor.numel()}",
+        )
+        shape = (self.batch_size, self.h_q, self.s_q_max)
+        stride = self._lse_stride
+        if stride is None:
+            self._value_error_if(not lse_tensor.is_contiguous(), "stats must be contiguous (the plan declared a packed LSE layout)")
+            return lse_tensor.view(shape)
+        if tuple(lse_tensor.shape) == shape and tuple(lse_tensor.stride()) == stride:
+            return lse_tensor
+        try:
+            return lse_tensor.as_strided(shape, stride, lse_tensor.storage_offset())
+        except RuntimeError as exc:
+            raise ValueError(
+                f"stats backing storage is too small for declared shape {shape}, stride {stride}, and storage_offset {lse_tensor.storage_offset()}"
+            ) from exc
 
     def _dummy(self, key: str, device: torch.device, factory) -> torch.Tensor:
         """A cached device-local dummy for a dead ABI slot (AGENTS.md Rule 1:
@@ -1310,11 +1382,21 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             stats_shape not in ((b, h_qo, s_qo), (b, h_qo, s_qo, 1)),
             f"stats must be (B, H_q, S_q[, 1]) = ({b}, {h_qo}, {s_qo}[, 1]); got {stats_shape}",
         )
-        # Any stats layout is served: a non-contiguous input gathers into
-        # carved staging (the kernels read a packed natural-log LSE).
-        self._stats_needs_stage = not self.stats_desc.is_contiguous()
+        # Any stats layout is served NATIVELY: the kernels' LSE loads are
+        # stride-aware, compiled against the DECLARED (B, H_q, S_q) strides
+        # (the trailing size-1 dim of a rank-4 Stats contributes no offset).
+        # Contiguous stats keep the packed compact fake (byte-identical).
+        self._lse_stride = None if self.stats_desc.is_contiguous() else tuple(int(st) for st in self.stats_desc.stride[:3])
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 BPROP")
+        # Plan-time device parity: the kernels bind the Stats pointer directly
+        # (native strided reads), and execute() validates the runtime LSE
+        # against stats_desc.device — so a host-side or cross-GPU Stats
+        # DECLARATION must be rejected here, before it can anchor that check.
+        self._value_error_if(
+            self.stats_desc.device != self.q_desc.device,
+            f"stats must be on Q's device {self.q_desc.device}; got {self.stats_desc.device}",
+        )
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
         self._value_error_if((major, minor) != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
@@ -1415,7 +1497,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 bool(self.s_q_max % self._params.tile_q or self.s_k_max % self._params.tile_kv),
                 "SM80 bprop: RoPE requires S_q/S_kv tile-aligned",
             )
-        # d64 fast-path gate: every input is plan-time state now.
+        # d64 fast-path gate: every input is plan-time state now.  The
+        # dedicated kernel keeps legacy PACKED LSE reads, so a strided Stats
+        # declaration routes to the generic (stride-aware) module instead.
         self._use_d64 = _sm80_d64_fast_path_eligible(
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
@@ -1435,6 +1519,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 deterministic=self.deterministic,
             ),
         )
+        if self._lse_stride is not None:
+            self._use_d64 = False
         if self._use_d64:
             self._kmod = None
             self._compiled_kernel = True  # d64 self-caches on first execute
@@ -1449,6 +1535,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 swa_window=int(self.swa_window_runtime),
                 rope_max_s=self._rope_max_s,
                 n_batch_logical=0,
+                lse_stride=self._lse_stride,
             )
         self._logger.debug("compile completed")
 
@@ -1489,8 +1576,6 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 total += ws_align(int(desc.shape[0]) * s_len * hh * fd * elem)
             else:
                 total += self._bshd_gather_bytes(desc)
-        if self._stats_needs_stage:
-            total += ws_align(b * hq * sq * 4)
         total += _kmod.scratch_bytes(
             B=b,
             SQ=sq,
@@ -1531,6 +1616,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         dbias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run the compiled SM80 backward on the adapter's carved workspace (Rule 1:
+        no per-call allocation; the dsink launch passes the dense dummy ``cu``).
+        """
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm80 is not compiled")
@@ -1593,14 +1681,12 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             O = _stage(o_tensor, pad_v, self.flavor_d_v)
             dO = _stage(do_tensor, pad_v, self.flavor_d_v)
 
-            # Stats → packed (B, H, S) LSE; squeeze(-1) is a valid view for
-            # any (B, H, S, 1) strides; strided inputs gather into staging
-            # (the kernels READ a packed LSE — raw-pointer addressing).
+            # Stats → the kernels' (B, H, S) LSE view; squeeze(-1) is a valid
+            # view for any (B, H, S, 1) strides.  A strided declaration binds
+            # the caller's storage directly — the kernels compiled stride-aware
+            # LSE loads against the declared layout (no gather, no copy).
             lse = stats_tensor.squeeze(-1) if stats_tensor.ndim == 4 else stats_tensor
-            if not lse.is_contiguous():
-                lse_stage = _take(lse.numel(), torch.float32, shape=lse.shape)
-                lse_stage.copy_(lse)
-                lse = lse_stage
+            lse = self._checked_lse_view(lse)
 
             # --- d64 fast path: the dedicated plain-dense MHA kernel keeps
             # its legacy self-caching module (dense-only; #604 is THD-only).
@@ -1688,7 +1774,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             # --- launch chain: do_dot → (dSink) → main → dQ cast → (GQA reduce)
             c.do_dot(_fd_tvm(O), _fd_tvm(dO), _fd_tvm(dot), _int32(b * hq * sq), launch_stream)
             if sink_tensor is not None:
-                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _int32(b * hq), launch_stream)
+                c.dsink(_fd_tvm(lse), _fd_tvm(dot), _fd_tvm(sinks_b), _fd_tvm(dsink_acc), _fd_tvm(cu_dummy), _int32(b * hq), launch_stream)
             _sm80_bwd_call(
                 c.main,
                 q=Q,
@@ -1765,6 +1851,8 @@ def sdpa_bwd_wrapper_sm80(
     cum_seqlen_q_tensor: Optional[torch.Tensor] = None,
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    max_s_kv: Optional[int] = None,
+    max_s_q: Optional[int] = None,
 ) -> TupleDict:
     """SM80 (A100) SDPA backward.
 
@@ -1774,6 +1862,16 @@ def sdpa_bwd_wrapper_sm80(
     fp32 when ``sinks`` is given (stable order: dq, dk, dv, dbias, dsink).
     ALiBi and block_mask are not supported (use the graph API, which routes
     them to the cuDNN backend); bias/dBias remain fully served.
+
+    THD (``cum_seqlen_*``): pass ``max_s_kv`` (any upper bound on the
+    longest per-sequence KV length) to keep the call fully async; without it
+    the wrapper reads the max from ``cu_k`` on the host (a D2H sync).  With
+    ``deterministic=True``, ``max_s_q`` (an upper bound on the longest
+    per-sequence Q length) sizes the dQ relay counter; the packed total is
+    used when absent.  Both hints are caller contracts (validating them
+    would need the D2H read they exist to avoid): an undersized ``max_s_kv``
+    drops KV tiles, an undersized ``max_s_q`` indexes the relay counter out
+    of bounds.
     """
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
@@ -1803,7 +1901,11 @@ def sdpa_bwd_wrapper_sm80(
                 causal_bottom_right=causal_bottom_right,
                 sinks=sinks,
                 deterministic=deterministic,
+                max_s_kv=max_s_kv,
+                max_s_q=max_s_q,
             )
+    if max_s_kv is not None or max_s_q is not None:
+        raise ValueError("max_s_kv / max_s_q are THD hints; they require cum_seqlen_q_tensor/cum_seqlen_k_tensor")
     for nm, t in (("Q", q_tensor), ("V", v_tensor), ("O", o_tensor), ("dO", do_tensor)):
         if t.ndim != 4:
             raise ValueError(f"{nm} must be rank-4 BHSD; got {t.ndim}D")
@@ -1826,6 +1928,11 @@ def sdpa_bwd_wrapper_sm80(
         q_tensor.stride(),
         k_tensor.stride(),
         v_tensor.stride(),
+        # The compiled kernel is SPECIALIZED on the declared LSE layout
+        # (compile()'s lse_stride — native strided reads), so the Stats
+        # geometry is part of the plan identity, not just runtime data.
+        lse_tensor.shape,
+        lse_tensor.stride(),
         q_tensor.dtype,
         is_causal,
         window_size,

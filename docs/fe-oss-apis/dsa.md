@@ -135,10 +135,32 @@ select the two-CTA path. No backend or tile-size argument is required. SM90
 continues to use its Hopper-specific implementation.
 
 The H128 specialization keeps the five tensor-core products in one
-two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to a
-temporary workspace, converts the FP32 dKV workspace to the public BF16
+two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
+caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
 output, and completes dSink with a separate FP32 reduction kernel. The helper
 launches do not change the two-CTA topology of the core computation.
+
+On SM100 with H16/H32/H64/H96/H128, `deterministic=True` selects a bounded-wave
+M64 implementation. Queries run in same-stream waves of 128 CTAs; CTA lane
+`i` is the sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked
+M64 head tile. H96/H128 split each query wave into ordered M64 head-block
+launches, preserving single-writer ownership without multiplying the number
+of shards. Kernel launch ordering serializes both head blocks and shard reuse
+across waves, so the protocol needs neither semaphores nor cooperative launch.
+A fixed-order two-stage reduction combines the 128 shards, and one CTA per
+head reduces `d_sink`. The additional dKV workspace is
+`128 * round_up(total_S_kv, 8) * round_up(D, 8) * sizeof(float)` bytes. Use
+`scratch_workspace_bytes()` as the authoritative full scratch size.
+`deterministic=True` takes precedence over the two-CTA selection: the BF16
+H128/D512 envelope also runs the bounded-wave M64 kernel when determinism is
+requested, because the two-CTA path accumulates dKV with FP32 atomics.
+
+`SparseAttentionBackward.scratch_workspace_bytes()` reports the full SM100
+scratch requirement. Pass a contiguous CUDA `uint8` tensor of at least this
+size to `execute(..., workspace=workspace)` and reuse it across calls; the
+compiled kernel initializes the dKV accumulator on every execution. The
+high-level wrapper accepts the same optional `workspace=` argument and only
+allocates convenience scratch when it is omitted.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
@@ -148,6 +170,7 @@ result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
+    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```

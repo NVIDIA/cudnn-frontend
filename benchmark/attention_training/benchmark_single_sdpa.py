@@ -1356,7 +1356,9 @@ else:
 
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
-            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
+            # flash-attn 2.7+ requires ints here: (-1, -1) is its no-window
+            # sentinel; passing None fails the SymInt cast in the op schema.
+            window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (-1, -1)
             return flash_attn_func(
                 query,
                 key,

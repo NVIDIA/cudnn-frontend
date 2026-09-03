@@ -20,7 +20,7 @@ those support checks have a gap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -93,6 +93,9 @@ class TemplateParams:
     # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
     # number of query tiles. Zero keeps the existing runtime derivation.
     lpt_q_tiles: int = 0
+    # Optional L2 working-set budget for SCHED_LPT_L2. Zero keeps the flavor's
+    # default budget.
+    lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
@@ -169,11 +172,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
-    # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor,
-    # but only make_cfg_d128 threads them into a Cfg and only the d128 kernel
-    # reads them.  Accepting them elsewhere would silently ignore them — and for
-    # split_kv that is not merely surprising but WRONG: the caller sizes an
-    # (S*B)-batch partial workspace and runs the combine, while the kernel keeps
+    # A flavor must explicitly consume split_kv / cta_mma. Accepting either
+    # elsewhere would silently ignore it; for split_kv that is also WRONG: the
+    # caller sizes an (S*B)-batch partial workspace and runs the combine, while the kernel keeps
     # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
     # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
     # corrupt the result instead of dropping out.  Reject at the door.
@@ -181,6 +182,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: split_kv is not implemented on this flavor (got {k.split_kv}); supported: {sorted(_SPLIT_KV_FLAVORS)}")
     if k.cta_mma != 2 and flavor not in _CTA_MMA_FLAVORS:
         raise ValueError(f"{flavor}: cta_mma is not selectable on this flavor (got {k.cta_mma}); supported: {sorted(_CTA_MMA_FLAVORS)}")
+    if flavor == "d192" and k.split_kv > 1 and k.cta_mma != 2:
+        raise ValueError("d192: split_kv > 1 is validated only with cta_mma=2")
     if k.split_kv < 1:
         raise ValueError(f"{flavor}: split_kv must be >= 1 (1 = KV-split off); got {k.split_kv}")
     if k.split_kv > 1:
@@ -194,8 +197,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
     if k.lpt_head_group not in (1, 8, 16):
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
-    if fp8 and flavor == "d192" and k.split_kv != 1:
-        raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
@@ -261,14 +262,15 @@ def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128) -> bool:
     return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and tile_m % (h_q // h_kv) == 0
 
 
-def cga_tile_m(d_qk: int) -> int:
+def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     """Q rows one cluster covers for a flavor: TILES_Q * TILE_M * CTA_MMA.
 
-    The tile-count denominator the pack_gqa heuristic needs (d128/d192: 512;
-    d256/d512: 256), computed from the flavor Cfg classes, not literals.
+    ``cta_mma`` overrides the flavor default when the selected kernel exposes a
+    CGA-width knob (D192). This keeps scheduler and heuristic geometry tied to
+    the configuration the launcher actually uses.
     """
     cls = {128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
-    return cls.TILES_Q * cls.TILE_M * cls.CTA_MMA
+    return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
 def _tma_iters_for(d_elems: int, bpe_val: int, swz_b: int) -> int:
@@ -859,7 +861,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
 
 
 # ---------------------------------------------------------------------------
-# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga2
+# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga1/cga2
 # ---------------------------------------------------------------------------
 
 
@@ -935,12 +937,107 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             raise ValueError(msg)
 
 
+def d192_square_br_as_tl(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
+    """Whether a D192 bottom-right mask is exactly top-left causal."""
+
+    return (
+        params.split_kv == 1
+        and not params.thd_varlen
+        and not params.seq_q_lens_present
+        and not params.seq_kv_lens_present
+        and params.window_left is None
+        and params.window_right == 0
+        and params.bottom_right
+        and s_q == s_kv
+        and 4096 < s_kv <= 8192
+    )
+
+
+def canonicalize_d192_lowering(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    s_q: int,
+    s_kv: int,
+) -> TemplateParams:
+    """Apply strictly equivalent D192 lowering canonicalizations."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    window_left = params.window_left
+    window_right = params.window_right
+
+    template_window_right = window_right
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+        # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
+        # MASK_NONE x32 path. 1 << 30 exceeds any dense D192 sequence that
+        # fits in SM100 memory while leaving signed-int32 headroom for q + R;
+        # it preserves the lowering without making the module key depend on S_kv.
+        template_window_right = 1 << 30
+
+    template_bottom_right = False if d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params.bottom_right
+
+    return replace(
+        params,
+        window_right=template_window_right,
+        bottom_right=template_bottom_right,
+    )
+
+
+def derive_d192_internal_params(
+    params: TemplateParams,
+    *,
+    pertensor: bool,
+    batch_size: int,
+    h_q: int,
+    s_q: int,
+    s_kv: int,
+) -> TemplateParams:
+    """Derive D192-private codegen fields after public knobs are fixed."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    pack_gqa_ratio = params.qh_per_kh if params.pack_gqa else 1
+    groups = batch_size * h_q // pack_gqa_ratio
+    lpt_head_group = 8 if fp8 and not params.thd_varlen and groups % 8 == 0 else 1
+    q_rows_per_cluster = cga_tile_m(192, params.cta_mma)
+    lpt_q_tiles = (s_q * pack_gqa_ratio + q_rows_per_cluster - 1) // q_rows_per_cluster if fp8 and not params.thd_varlen else 0
+
+    lpt_l2_size_mib = 0
+    lpt_l2_8k = params.sched_policy == SCHED_LPT_L2 and not params.thd_varlen and params.split_kv == 1 and s_q == 8192 and s_kv == 8192
+    if lpt_l2_8k and pertensor and params.dtype_qkv == DTYPE_E4M3 and groups % 24 != 0 and groups % 16 == 0:
+        # At 8K, 60 MiB groups 24 one-byte K/V heads; 40 MiB groups 16 and
+        # avoids a short final group for these grids.
+        lpt_l2_size_mib = 40
+    elif lpt_l2_8k and not fp8 and not params.pack_gqa and groups % 16 == 0:
+        # At 8K, each half-precision K/V head occupies 5 MiB. Grouping exactly
+        # 16 heads avoids a short final LPT-L2 group on the model grids.
+        lpt_l2_size_mib = 80
+
+    return replace(
+        params,
+        lpt_head_group=lpt_head_group,
+        lpt_q_tiles=lpt_q_tiles,
+        lpt_l2_size_mib=lpt_l2_size_mib,
+    )
+
+
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     _validate_params("d192", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    mask_flags = _mask_flags_from(params)
+    thd_swa = fp8 and params.thd_varlen and bool(mask_flags & MASK_SWA)
+    e4_thd_swa = thd_swa and params.dtype_qkv == DTYPE_E4M3
+    e5_dense_causal_regs = (
+        params.dtype_qkv == DTYPE_E5M2
+        and not params.thd_varlen
+        and params.split_kv == 1
+        and not params.bottom_right
+        and mask_flags == MASK_CAUSAL
+        and (params.window_right or 0) == 0
+    )
+    wide_role_regs = thd_swa or e5_dense_causal_regs
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -958,14 +1055,16 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
-        MASK_FLAGS=_mask_flags_from(params),
+        SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
+        MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=1,
-        SOFTMAX_REGS=184 if fp8 else 216 if _mask_flags_from(params) == MASK_NONE else 192,
-        CORRECTION_REGS=104 if fp8 else 40 if _mask_flags_from(params) == MASK_NONE else 88,
+        L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
+        SCHEDULER_POLICY=params.sched_policy,
+        SOFTMAX_REGS=192 if wide_role_regs else 184 if fp8 else 216 if mask_flags == MASK_NONE else 192,
+        CORRECTION_REGS=88 if wide_role_regs else 104 if fp8 else 40 if mask_flags == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
