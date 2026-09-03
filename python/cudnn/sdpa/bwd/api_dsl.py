@@ -2327,9 +2327,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # straddle the written boundary and read residue. That showed up as a
             # 1-in-6 catastrophic dK/dV (cos 0.0006), not a numerics drift,
             # because it depends on whatever was in the buffer.
-            if self._zero_ws or self._is_padded:
-                # The padded tail is walked by stage 3's tile-rounded M/K in the
-                # same way a mask-skipped tile is, so it gets the same treatment.
+            if self._zero_ws:
+                # NOT for padding: stage 2 writes its own zeros there. Its kv
+                # bound is div_up(REAL S_kv, TILE_N), so the tail tile IS visited
+                # and apply_mask_chunk zeroes the columns past the real length;
+                # the padded q rows are visited too (the grid is sized on the
+                # rounded S_q) and row_scale zeroes them. Only a MASK-SKIPPED
+                # tile is genuinely never written.
                 s_ws_full.zero_()
                 ds_ws_full.zero_()
 
