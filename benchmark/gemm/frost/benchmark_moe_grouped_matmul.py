@@ -51,9 +51,8 @@ def _vp_moe(handles, token, weight, fto, output):
     return {TOK: token, W: weight, FTO: fto, OUT: output}
 
 
-def _build_plan(g, cfg, name):
+def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    _, cta_group = spec_for(name, _SPEC_MAP)
     return jit_from_cudnn_graph(g, config=cfg)
 
 
