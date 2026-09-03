@@ -1,0 +1,17 @@
+case,arm,mask,direction,granularity,sparsity,ms,tflops
+wan14b-720p,cudnn,topk,fwd,64,0.9,36.846,472.1
+wan14b-720p,fa4,topk,fwd,64,0.9,102.182,170.2
+wan14b-720p,cudnn,topk,bwd,64,0.9,131.788,330.0
+wan14b-720p,fa4,topk,bwd,64,0.9,354.58,122.6
+wan14b-720p,cudnn,topk,fwd,128,0.9,21.847,796.2
+wan14b-720p,fa4,topk,fwd,128,0.9,39.479,440.6
+wan14b-720p,cudnn,topk,bwd,128,0.9,71.193,610.8
+wan14b-720p,fa4,topk,bwd,128,0.9,124.191,350.2
+wan14b-720p,cudnn,topk,fwd,256,0.9,21.839,796.5
+wan14b-720p,fa4,topk,fwd,256,0.9,20.951,830.3
+wan14b-720p,cudnn,topk,bwd,256,0.9,71.235,610.5
+wan14b-720p,fa4,topk,bwd,256,0.9,65.11,667.9
+wan14b-720p,cudnn,topk,fwd,128,0.0,204.429,850.9
+wan14b-720p,fa4,topk,fwd,128,0.0,205.955,844.6
+wan14b-720p,cudnn,topk,bwd,128,0.0,640.437,679.0
+wan14b-720p,fa4,topk,bwd,128,0.0,748.19,581.2

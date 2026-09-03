@@ -1,0 +1,13 @@
+case,arm,mask,direction,granularity,sparsity,ms,tflops
+minimax-h3-15s,cudnn,frame_causal,fwd,64,0.9344,43.102,364.5
+minimax-h3-15s,fa4,frame_causal,fwd,64,0.9344,27.056,580.7
+minimax-h3-15s,cudnn,frame_causal,bwd,64,0.9344,122.14,321.6
+minimax-h3-15s,fa4,frame_causal,bwd,64,0.9344,62.737,626.1
+minimax-h3-15s,cudnn,frame_causal,fwd,128,0.9344,20.034,784.2
+minimax-h3-15s,fa4,frame_causal,fwd,128,0.9344,19.075,823.6
+minimax-h3-15s,cudnn,frame_causal,bwd,128,0.9344,66.522,590.4
+minimax-h3-15s,fa4,frame_causal,bwd,128,0.9344,62.382,629.6
+minimax-h3-15s,cudnn,frame_causal,fwd,256,0.9344,19.959,787.1
+minimax-h3-15s,fa4,frame_causal,fwd,256,0.9344,19.076,823.6
+minimax-h3-15s,cudnn,frame_causal,bwd,256,0.9344,66.524,590.4
+minimax-h3-15s,fa4,frame_causal,bwd,256,0.9344,62.395,629.5
