@@ -88,7 +88,10 @@ def _build_graph(b, hq, hkv, sq, skv, d, scale, dt=torch.bfloat16, **sdpa_kwargs
     shq, shk = [b, hq, sq, d], [b, hkv, skv, d]
     t = {n: g.tensor(name=n, dim=sh, stride=_bshd_stride(sh)) for n, sh in (("q", shq), ("k", shk), ("v", shk), ("o", shq), ("do", shq))}
     t["stats"] = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
-    dq, dk, dv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], attn_scale=scale, **sdpa_kwargs)
+    # scale=None omits attn_scale entirely -- it is optional on the graph.
+    if scale is not None:
+        sdpa_kwargs["attn_scale"] = scale
+    dq, dk, dv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], **sdpa_kwargs)
     for out, sh in ((dq, shq), (dk, shk), (dv, shk)):
         out.set_output(True).set_data_type(io).set_stride(_bshd_stride(sh))
     g.validate()
@@ -104,11 +107,13 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, dt=torch.bfloat16, **sdpa_kwargs):
+def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, dt=torch.bfloat16, omit_scale=False, **sdpa_kwargs):
     """Build, pin the engine, execute, and compare against fp32 torch."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
-    scale = 1.0 / math.sqrt(d)
+    # None => omit attn_scale on the graph; the engine must then default it to
+    # 1/sqrt(d), which is what _reference assumes either way.
+    scale = None if omit_scale else 1.0 / math.sqrt(d)
     q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
     k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
     o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group)
@@ -208,6 +213,51 @@ def test_non_tile_multiple_seqlens(sq, skv):
 @pytest.mark.parametrize("sq,skv", [(500, 500), (1000, 1000)])
 def test_non_tile_multiple_causal(sq, skv):
     _run(sq=sq, skv=skv, keep=_causal_keep(sq, skv), use_causal_mask=True)
+
+
+def test_default_attn_scale():
+    """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d).
+
+    The adapter used to leave `scale_softmax` at None and die in execute with
+    `TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'`,
+    after the row had already admitted the graph and check_support had passed.
+    _reference always uses 1/sqrt(d), so a wrong default fails the comparison
+    rather than merely not raising.
+    """
+    _run(omit_scale=True)
+
+
+def test_reject_rectangular_head_dims():
+    """d_qk != d_v is declined: the kernel asserts d_qk == d_v.
+
+    The C++ node validation's d512 exception is deliberately permissive here
+    (it admits any pair in the band), so `mismatch()` is the only thing keeping
+    a rectangular graph away from an adapter that would raise on it.
+    """
+    assert _decline_reason(d=_D) is None, "sanity: the square case must be served"
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
+
+    b, hq, sq, skv = 2, 2, 256, 256
+    shq, shk = [b, hq, sq, 384], [b, hq, skv, 384]
+    shv = [b, hq, skv, 320]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {
+        n: g.tensor(name=n, dim=sh, stride=_bshd_stride(sh))
+        for n, sh in (("q", shq), ("k", shk), ("v", shv), ("o", [b, hq, sq, 320]), ("do", [b, hq, sq, 320]))
+    }
+    st = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
+    try:
+        dq, dk, dv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=st, attn_scale=1.0 / math.sqrt(384))
+        for out, sh in ((dq, shq), (dk, shk), (dv, shv)):
+            out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(_bshd_stride(sh))
+        g.validate()
+        g.build_operation_graph()
+    except cudnn.cudnnGraphNotSupportedError:
+        return  # refused before engine selection is also a decline
+    facts = ga.analyze(g)
+    spec = next(s_ for s_ in ENGINE_SPECS if s_.name == _ENGINE)
+    assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
 def test_non_bshd_do_is_staged():

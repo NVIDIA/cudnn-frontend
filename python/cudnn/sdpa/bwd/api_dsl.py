@@ -2085,6 +2085,13 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self.head_dim_v = int(tuple(self.v_desc.shape)[3])
         self.dtype = self.q_desc.dtype
         self._bpe = 2
+        # attn_scale is OPTIONAL on the graph, so `scale_softmax` arrives None
+        # when the caller omits it. Default it here, as the SM120 and SM80
+        # adapters do -- without this the row admits the graph, check_support
+        # passes, and execute dies on `None * log2(e)`. Found by review on the
+        # d512 bring-up PR; regression test `test_default_attn_scale`.
+        if self.scale_softmax is None or self.scale_softmax == 0.0:
+            self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         # Tile-rounded COMPILE shape. The kernel's grid and workspace are tiled,
         # so a sequence length that is not a multiple runs on the next multiple
         # up and the tail is masked. Q/K/V/dO ride their real TMA extents, whose
