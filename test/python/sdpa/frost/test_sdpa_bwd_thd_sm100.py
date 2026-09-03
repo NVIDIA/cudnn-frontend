@@ -148,22 +148,18 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
     assert not failures, "\n".join(bad)
 
 
-# Multi-sequence is KNOWN BROKEN and these are strict xfails, not deletions or
-# skips: stage 2 writes only sequence 0's S/dS block -- every other sequence's
-# block comes back untouched -- so the gradients for sequences >= 1 stay at
-# their zero init.  Strict, so the day it is fixed these XPASS and force the
-# marker off rather than passing silently.
-_MULTI_SEQ_BROKEN = pytest.mark.xfail(strict=True, reason="THD: stage 2 writes only sequence 0's workspace block")
+# Strict xfail, not a skip or a deletion: head-major packed Stats works at any
+# B, token-major does not yet, and strict means the day it does this XPASSes and
+# forces the marker off rather than passing silently.
+_MULTI_SEQ_BROKEN = pytest.mark.xfail(strict=True, reason="THD: token-major packed Stats is not read correctly at B > 1")
 
 
-@_MULTI_SEQ_BROKEN
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
 def test_thd_self_attention(dt):
     """Three sequences of unequal length, none a tile multiple."""
     _run((300, 128, 200), (300, 128, 200), dtype=dt)
 
 
-@_MULTI_SEQ_BROKEN
 def test_thd_cross_attention():
     """Unequal Q and KV lengths, and unequal packed totals with them."""
     _run((256, 100), (180, 300))

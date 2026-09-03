@@ -724,7 +724,14 @@ def _tmastg_warp_group(bars, sched, sCast, tma_s, tma_ds, meta_t, n_batch, n_qh,
         # The workspace is CHUNK-LOCAL: head_base / batch_base offset every
         # full-tensor access but NOT this store.
         head_ws = head_idx
-        batch_ws = batch_idx
+        # THD collapses the workspace's batch axis: [1, H_chunk, R, N], with the
+        # sequence reached by the ROW offset below.  Passing the sequence index
+        # here instead makes every store past sequence 0 out of bounds for the
+        # descriptor -- and a TMA store that is OOB is DROPPED, silently, which
+        # is the same clipping the output descriptors rely on working in their
+        # favour.  Symptom: sequence 0 exact, every other sequence's gradients
+        # untouched at their initial value.
+        batch_ws = cutlass.Int32(0) if cutlass.const_expr(_THD) else batch_idx
         # THD: the workspace is BLOCKED over packed q tokens, so this CTA's
         # rows live at row_off[b] + q_row_base and the batch coord is 0.
         ws_row_base = ws_row + q_row_base
