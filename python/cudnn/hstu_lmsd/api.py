@@ -39,9 +39,7 @@ def _require_same_device(reference: torch.Tensor, tensors) -> None:
     for name, tensor in tensors:
         _require_cuda_tensor(tensor, name)
         if tensor.device != reference.device:
-            raise ValueError(
-                f"{name} must be on {reference.device}, got {tensor.device}"
-            )
+            raise ValueError(f"{name} must be on {reference.device}, got {tensor.device}")
 
 
 def _require_matrix_layout(
@@ -55,9 +53,7 @@ def _require_matrix_layout(
     if tensor.stride(1) != 1:
         raise ValueError(f"{name} must have a unit innermost stride")
     if row_stride is not None and tensor.stride(0) != row_stride:
-        raise ValueError(
-            f"{name} row stride must be {row_stride}, got {tensor.stride(0)}"
-        )
+        raise ValueError(f"{name} row stride must be {row_stride}, got {tensor.stride(0)}")
     if tensor.stride(0) < tensor.shape[1]:
         raise ValueError(f"{name} rows must not overlap")
     if tensor.element_size() == 2 and tensor.stride(0) % 8 != 0:
@@ -66,30 +62,18 @@ def _require_matrix_layout(
 
 def _require_vector(tensor: torch.Tensor, name: str, length: int) -> None:
     if tensor.shape != (length,) or tensor.stride() != (1,):
-        raise ValueError(
-            f"{name} must be contiguous with shape ({length},), got "
-            f"shape {tuple(tensor.shape)} and stride {tuple(tensor.stride())}"
-        )
+        raise ValueError(f"{name} must be contiguous with shape ({length},), got " f"shape {tuple(tensor.shape)} and stride {tuple(tensor.stride())}")
 
 
 def _check_runtime_tensor(tensor: torch.Tensor, desc, name: str) -> None:
-    if (
-        tuple(tensor.shape) != tuple(desc.shape)
-        or tuple(tensor.stride()) != tuple(desc.stride)
-        or tensor.dtype != desc.dtype
-        or tensor.device != desc.device
-    ):
+    if tuple(tensor.shape) != tuple(desc.shape) or tuple(tensor.stride()) != tuple(desc.stride) or tensor.dtype != desc.dtype or tensor.device != desc.device:
         raise ValueError(f"{name} specification changed after compilation")
     _require_cuda_tensor(tensor, name)
 
 
 def _storage_span(tensor: torch.Tensor) -> tuple[int, int]:
     start = tensor.data_ptr()
-    offset = sum(
-        (int(size) - 1) * int(stride)
-        for size, stride in zip(tensor.shape, tensor.stride())
-        if size > 0
-    )
+    offset = sum((int(size) - 1) * int(stride) for size, stride in zip(tensor.shape, tensor.stride()) if size > 0)
     return start, start + (offset + 1) * tensor.element_size()
 
 
@@ -104,9 +88,7 @@ def _require_disjoint(writes, reads) -> None:
                 continue
             other_begin, other_end = _storage_span(other_tensor)
             if write_begin < other_end and other_begin < write_end:
-                raise ValueError(
-                    f"{write_name} storage must not overlap {other_name} storage"
-                )
+                raise ValueError(f"{write_name} storage must not overlap {other_name} storage")
 
 
 def _stream_handle(
@@ -179,31 +161,21 @@ class _HSTULMSDBase(APIBase):
         if u.dtype != x.dtype or weight.dtype != x.dtype or bias.dtype != x.dtype:
             raise ValueError("x, u, weight, and bias must have the same dtype")
         if x.shape != u.shape:
-            raise ValueError(
-                f"u must have shape {tuple(x.shape)}, got {tuple(u.shape)}"
-            )
+            raise ValueError(f"u must have shape {tuple(x.shape)}, got {tuple(u.shape)}")
         if self.num_rows <= 0:
             raise ValueError("x must contain at least one row")
+        # Supported matrix size: [N, D], with N > 0 and D = 512.
         if self.hidden_size != 512:
-            raise ValueError(
-                f"HSTU LMSD currently supports hidden size 512, got {self.hidden_size}"
-            )
+            raise ValueError(f"HSTU LMSD currently supports D=512, got D={self.hidden_size}")
         _require_matrix_layout(x, "x", row_stride=self.hidden_size)
         _require_matrix_layout(u, "u")
         _require_vector(weight, "weight", self.hidden_size)
         _require_vector(bias, "bias", self.hidden_size)
-        if not math.isfinite(self.dropout_ratio) or not (
-            0.0 <= self.dropout_ratio < 1.0
-        ):
-            raise ValueError(
-                "dropout_ratio must be finite and in [0, 1), got "
-                f"{self.dropout_ratio}"
-            )
+        if not math.isfinite(self.dropout_ratio) or not (0.0 <= self.dropout_ratio < 1.0):
+            raise ValueError("dropout_ratio must be finite and in [0, 1), got " f"{self.dropout_ratio}")
         major, minor = torch.cuda.get_device_capability(x.device)
         if major != 10:
-            raise RuntimeError(
-                f"HSTU LMSD requires an SM10x GPU; found SM{major}{minor}"
-            )
+            raise RuntimeError(f"HSTU LMSD requires an SM10x GPU; found SM{major}{minor}")
 
     def _check_runtime_common(
         self,
@@ -505,9 +477,7 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             (self._sample_dbias_workspace, "dbias_workspace"),
         ):
             if tensor.shape != (TARGET_TILES, d) or tensor.dtype != torch.float32:
-                raise ValueError(
-                    f"{name} must have shape ({TARGET_TILES}, {d}) and dtype torch.float32"
-                )
+                raise ValueError(f"{name} must have shape ({TARGET_TILES}, {d}) and dtype torch.float32")
             _require_matrix_layout(tensor, name, row_stride=d)
         writes = (
             ("dx", self._sample_dx),
@@ -561,7 +531,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         fake_du = self._fake_matrix(self.du_desc, n)
         fake_mean = self._fake_vector(self.mean_desc, n)
         fake_rstd = self._fake_vector(self.rstd_desc, n)
-        iters = (n + TARGET_TILES - 1) // TARGET_TILES
         main = cute.compile(
             LnMulDropoutBackward(compute_y=False),
             fake_dy,
@@ -582,10 +551,8 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             fake_dwp,
             fake_dbp,
             cutlass.Float32(self.dropout_ratio),
-            cutlass.Int32(n),
             cutlass.Int32(d),
             cutlass.Int32(n),
-            cutlass.Int32(iters),
             cutlass.Int32(TARGET_TILES),
             fake_stream,
             options="--enable-tvm-ffi",
@@ -605,8 +572,16 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         self._compiled_kernel = (main, reduce)
         self._release_common_samples()
         for name in (
-            "dy", "mean", "rstd", "mask", "dx", "du", "dweight", "dbias",
-            "dweight_workspace", "dbias_workspace",
+            "dy",
+            "mean",
+            "rstd",
+            "mask",
+            "dx",
+            "du",
+            "dweight",
+            "dbias",
+            "dweight_workspace",
+            "dbias_workspace",
         ):
             setattr(self, f"_sample_{name}", None)
 
@@ -632,9 +607,12 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             raise RuntimeError("HSTULMSDBwdSm100 kernels are not compiled")
         self._check_runtime_common(x_tensor, u_tensor, weight_tensor, bias_tensor)
         runtime = (
-            (dy_tensor, self.dy_desc, "dy"), (mean_tensor, self.mean_desc, "mean"),
-            (rstd_tensor, self.rstd_desc, "rstd"), (mask_tensor, self.mask_desc, "mask"),
-            (dx_tensor, self.dx_desc, "dx"), (du_tensor, self.du_desc, "du"),
+            (dy_tensor, self.dy_desc, "dy"),
+            (mean_tensor, self.mean_desc, "mean"),
+            (rstd_tensor, self.rstd_desc, "rstd"),
+            (mask_tensor, self.mask_desc, "mask"),
+            (dx_tensor, self.dx_desc, "dx"),
+            (du_tensor, self.du_desc, "du"),
             (dweight_tensor, self.dweight_desc, "dweight"),
             (dbias_tensor, self.dbias_desc, "dbias"),
             (dweight_workspace, self.dweight_workspace_desc, "dweight_workspace"),
@@ -666,7 +644,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         main, reduce = self._compiled_kernel
         d = self.hidden_size
         n = self.num_rows
-        iters = (n + TARGET_TILES - 1) // TARGET_TILES
         main(
             dy_tensor[:, :d],
             dy_tensor[:, d : 2 * d],
@@ -686,10 +663,8 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             dweight_workspace,
             dbias_workspace,
             cutlass.Float32(self.dropout_ratio),
-            cutlass.Int32(n),
             cutlass.Int32(d),
             cutlass.Int32(n),
-            cutlass.Int32(iters),
             cutlass.Int32(TARGET_TILES),
             stream,
         )
@@ -703,8 +678,7 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             stream,
         )
         _record_streams(
-            tuple(tensor for tensor, _, _ in runtime)
-            + (x_tensor, u_tensor, weight_tensor, bias_tensor),
+            tuple(tensor for tensor, _, _ in runtime) + (x_tensor, u_tensor, weight_tensor, bias_tensor),
             current_stream,
             x_tensor.device,
         )

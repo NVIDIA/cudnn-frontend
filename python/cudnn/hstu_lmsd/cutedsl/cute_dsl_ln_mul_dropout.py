@@ -89,6 +89,7 @@ TV_ROW = True              # output tile = one row
 # mean/rstd by ~2 ULP. Must be a power of two: the reduction butterfly
 # relies on 1 << off staying inside the aligned lane subgroup.
 TPR = 32
+# Full-tile requirement for low-level calls: D % (TPR * VEC) == 0.
 PACK_TAIL = True           # f32x2 arithmetic in the tail
 REREAD_X = True            # drop x after the reduction, load it again
 M0, M1 = 0xD2511F53, 0xCD9E8D57
