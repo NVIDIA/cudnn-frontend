@@ -146,12 +146,13 @@ class FlashAttentionDSABackwardSm100:
         self.dQ4_mma_tiler = (64, block_tile, block_tile)
         self.dKV4_mma_tiler = (64, block_tile, block_tile)
 
-        # 56 clears the gather-address-path spills (all on D512, ~99% on
-        # D576). The per-warp counts must exactly exhaust the CTA register
-        # pool, which the 640-thread launch fixes at 96 regs/thread:
-        # 128*56 + 128*128 + 256*128 + 128*40 = 61440 = 96 * 640
-        self.num_regs_load_KV = 56
-        self.num_regs_compute = 128
+        # Directly predicating the gather from the shuffled row index needs
+        # extra load-warp registers for D576. Reclaim them from compute only
+        # for that specialization while exactly preserving the CTA pool:
+        # D512: 128*64 + 128*120 + 256*128 + 128*40 = 61440
+        # D576: 128*72 + 128*112 + 256*128 + 128*40 = 61440
+        self.num_regs_load_KV = 64 if head_dim == 512 else 72
+        self.num_regs_compute = 120 if head_dim == 512 else 112
         self.num_regs_reduce = 128
         self.num_regs_mma = 40
         self.num_regs_empty = 40
@@ -482,7 +483,7 @@ class FlashAttentionDSABackwardSm100:
             sdS: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(dS_smem_layout_staged)], self.non_tma_align_bytes]
             sLSE: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(LSE_smem_layout)], self.non_tma_align_bytes]
             sSum_OdO: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(sum_OdO_smem_layout)], self.non_tma_align_bytes]
-            sValid: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, cute.cosize(valid_smem_layout)], self.non_tma_align_bytes]
+            sValid: cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, cute.cosize(valid_smem_layout)], self.non_tma_align_bytes]
 
         assert (
             SharedStorage.size_in_bytes() <= _max_smem_bytes
@@ -1247,6 +1248,7 @@ class FlashAttentionDSABackwardSm100:
         self,
         mKV: cute.Tensor,
         topk_idx: Int32,
+        row_is_valid: cutlass.Boolean,
         batch_idx: Int32,
         tile_sK: cute.Tensor,
         local_tidx: Int32,
@@ -1255,6 +1257,10 @@ class FlashAttentionDSABackwardSm100:
     ):
         gK_row = mKV[topk_idx, None, (0, batch_idx)]
         tile_gK = cute.composition(gK_row, cute.make_layout(tile_sK.shape))
+        pred_sK = tile_sK[None, local_tidx // 8]
+        pred_tSsK = async_thr_copy.partition_D(pred_sK)
+        load_pred = cute.make_fragment_like(pred_tSsK[(0, None), None], cutlass.Boolean)
+        load_pred.fill(row_is_valid)
         if cutlass.const_expr(self.head_dim == 512):
             for j in cutlass.range_constexpr(2):
                 group_idx = j * 4 + local_tidx // 8
@@ -1262,7 +1268,7 @@ class FlashAttentionDSABackwardSm100:
                 cur_sK = tile_sK[None, group_idx]
                 tSgK = async_thr_copy.partition_S(cur_gK)
                 tSsK = async_thr_copy.partition_D(cur_sK)
-                cute.copy(async_copy_atom, tSgK, tSsK)
+                cute.copy(async_copy_atom, tSgK, tSsK, pred=load_pred)
         else:
             for j in cutlass.range_constexpr(2):
                 group_idx = j * 4 + local_tidx // 8
@@ -1270,14 +1276,14 @@ class FlashAttentionDSABackwardSm100:
                 cur_sK = tile_sK[None, group_idx]
                 tSgK = async_thr_copy.partition_S(cur_gK)
                 tSsK = async_thr_copy.partition_D(cur_sK)
-                cute.copy(async_copy_atom, tSgK, tSsK)
+                cute.copy(async_copy_atom, tSgK, tSsK, pred=load_pred)
 
             cur_gK = tile_gK[None, 8]
             cur_sK = tile_sK[None, 8]
             tSgK = async_thr_copy.partition_S(cur_gK)
             tSsK = async_thr_copy.partition_D(cur_sK)
             if local_tidx < 8:
-                cute.copy(async_copy_atom, tSgK, tSsK)
+                cute.copy(async_copy_atom, tSgK, tSsK, pred=load_pred)
 
     @cute.jit
     def _zero_kv_row(
@@ -1345,28 +1351,28 @@ class FlashAttentionDSABackwardSm100:
         token_idx, _, batch_idx = cute.arch.block_idx()
 
         rows_per_warp = self.block_tile // self.num_load_KV_warps
-        valid_bits = Int32(0)
+        # Each of the first rows_per_warp lanes already owns one sparse row's
+        # index.  Validate it once in its owning lane and use a ballot to pack
+        # the per-row mask, rather than rebuilding the same predicate in every
+        # lane for every iteration of the fully-unrolled copy loop.
+        lane_idx = tile_index * self.block_tile + local_tidx * self.num_load_KV_warps + local_warp_idx
+        if cutlass.const_expr(mTopkLength is not None and not is_first):
+            lane_is_valid = idx_reg >= 0 and idx_reg < mKV.shape[0]
+        else:
+            lane_is_valid = lane_idx < topk and idx_reg >= 0 and idx_reg < mKV.shape[0]
+
+        valid_bits = cutlass.Uint32(cute.arch.vote_ballot_sync(lane_is_valid))
         for i in range(rows_per_warp):
             row = i * self.num_load_KV_warps + local_warp_idx
-            idx = tile_index * self.block_tile + row
+            row_idx = tile_index * self.block_tile + row
             tile_sK = sK_slice[row, (None, None)]
             topk_idx = cute.arch.shuffle_sync(idx_reg, i)
-
             if cutlass.const_expr(mTopkLength is not None and not is_first):
                 row_is_valid = topk_idx >= 0 and topk_idx < mKV.shape[0]
             else:
-                row_is_valid = idx < topk and topk_idx >= 0 and topk_idx < mKV.shape[0]
+                row_is_valid = row_idx < topk and topk_idx >= 0 and topk_idx < mKV.shape[0]
 
-            if local_tidx == 0:
-                valid_bit = Int32(1) << Int32(i)
-                valid_bit = Int32(arith.select(row_is_valid.ir_value(), valid_bit.ir_value(), Int32(0).ir_value()))
-                valid_bits = valid_bits | valid_bit
-
-            # P and dS are explicitly masked by valid_bits, so an invalid row
-            # can safely gather KV row 0.  Selecting a safe address keeps the
-            # gather branchless while still preventing every OOB access.
-            safe_topk_idx = Int32(arith.select(row_is_valid.ir_value(), topk_idx.ir_value(), Int32(0).ir_value()))
-            self._copy_kv_row(mKV, safe_topk_idx, batch_idx, tile_sK, local_tidx, async_copy_atom, async_thr_copy)
+            self._copy_kv_row(mKV, topk_idx, row_is_valid, batch_idx, tile_sK, local_tidx, async_copy_atom, async_thr_copy)
 
         # Each load warp publishes one 16-bit mask for its interleaved rows.
         # Compute keeps the two masks it needs in registers for the fragment.
@@ -1929,8 +1935,14 @@ class FlashAttentionDSABackwardSm100:
 
             valid_mask0 = sValid[cute.get(tTR_cS[0], mode=[1]) % self.num_load_KV_warps, 0]
             valid_mask1 = sValid[cute.get(tTR_cS[1], mode=[1]) % self.num_load_KV_warps, 0]
+            lane_half = (tidx_in_warp % 4) // 2
+            valid_mask0 = valid_mask0 >> lane_half
+            valid_mask1 = valid_mask1 >> lane_half
 
-            for i in cutlass.range(0, cute.size(tTR_rS), 4, unroll_full=True):
+            # For this T2R layout, each group of four registers maps to the
+            # same bit in two adjacent load-warp masks.  Align the masks once
+            # per tile so the unrolled loop uses only constexpr bit positions.
+            for i in cutlass.range_constexpr(0, cute.size(tTR_rS), 4):
                 lse0 = (
                     sLSE[cute.get(tTR_cS[i], mode=[0]), load_compute_LSE_consumer_state.index],
                     sLSE[cute.get(tTR_cS[i + 1], mode=[0]), load_compute_LSE_consumer_state.index],
@@ -1951,16 +1963,15 @@ class FlashAttentionDSABackwardSm100:
                     lse1,
                 )
 
-                row_i = cute.get(tTR_cS[i], mode=[1])
-                if (valid_mask0 & (Int32(1) << (row_i // self.num_load_KV_warps))) != 0:
+                row_bit = i // 2
+                if (valid_mask0 & (cutlass.Uint32(1) << row_bit)) != 0:
                     tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                     tTR_rS[i + 2] = cute.math.exp2(tTR_rS[i + 2], fastmath=True)
                 else:
                     tTR_rS[i] = Float32(0.0)
                     tTR_rS[i + 2] = Float32(0.0)
 
-                row_i1 = cute.get(tTR_cS[i + 1], mode=[1])
-                if (valid_mask1 & (Int32(1) << (row_i1 // self.num_load_KV_warps))) != 0:
+                if (valid_mask1 & (cutlass.Uint32(1) << row_bit)) != 0:
                     tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
                     tTR_rS[i + 3] = cute.math.exp2(tTR_rS[i + 3], fastmath=True)
                 else:
