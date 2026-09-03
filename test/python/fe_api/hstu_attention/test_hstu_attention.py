@@ -1517,18 +1517,60 @@ def test_d128_single_query_forward_split_selector(capability, supported, expecte
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    ("capability", "supported", "is_local", "expected"),
+    ("capability", "supported", "batch_size", "heads", "average_kv", "head_dim", "expected"),
     (
-        ((10, 3), True, False, 8),
-        ((10, 7), True, False, 13),
-        ((10, 3), True, True, 8),
-        ((10, 7), True, True, 13),
-        ((10, 7), False, True, 1),
-        ((10, 0), True, True, 1),
+        # Missing workload metadata preserves the architecture default.
+        ((10, 3), True, None, None, None, None, 8),
+        ((10, 7), True, None, None, None, None, 13),
+        # Short D64/D128 work uses the unsplit kernel on both targets.
+        ((10, 3), True, 64, 4, 255, 128, 1),
+        ((10, 3), True, 64, 4, 256, 128, 8),
+        ((10, 7), True, 64, 4, 255, 128, 1),
+        ((10, 7), True, 64, 4, 256, 128, 13),
+        # D256 retains split-KV at a medium grid size.
+        ((10, 3), True, 64, 4, 127, 256, 1),
+        ((10, 3), True, 64, 8, 127, 256, 8),
+        ((10, 7), True, 64, 4, 127, 256, 1),
+        ((10, 7), True, 64, 8, 127, 256, 13),
+        # An already-saturated grid extends the unsplit range to 768.
+        ((10, 3), True, 1024, 4, 767, 128, 1),
+        ((10, 3), True, 1024, 4, 768, 128, 8),
+        ((10, 7), True, 1024, 4, 767, 128, 1),
+        ((10, 7), True, 1024, 4, 768, 128, 13),
+        ((10, 7), False, 64, 4, 2048, 128, 1),
+        ((10, 0), True, 64, 4, 2048, 128, 1),
     ),
 )
-def test_single_query_backward_split_selector(capability, supported, is_local, expected):
-    assert _interface._select_q1_bwd_split_kv("auto", capability, supported, is_local) == expected
+def test_single_query_backward_split_selector(capability, supported, batch_size, heads, average_kv, head_dim, expected):
+    total_kv = None if batch_size is None or average_kv is None else batch_size * average_kv
+    assert (
+        _interface._select_q1_bwd_split_kv(
+            "auto",
+            capability,
+            supported,
+            batch_size=batch_size,
+            num_heads=heads,
+            total_kv=total_kv,
+            head_dim=head_dim,
+        )
+        == expected
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "batch_size", "heads", "split_kv", "expected"),
+    (
+        ((10, 3), 64, 4, 1, 512),
+        ((10, 3), 512, 4, 1, 128),
+        ((10, 3), 64, 4, 8, 128),
+        ((10, 7), 64, 4, 1, 512),
+        ((10, 7), 512, 4, 1, 128),
+        ((10, 7), 64, 4, 13, 128),
+    ),
+)
+def test_single_query_backward_thread_selector(capability, batch_size, heads, split_kv, expected):
+    assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv) == expected
 
 
 @pytest.mark.L0
@@ -1629,7 +1671,15 @@ def test_single_query_auto_backward_matches_pytorch(head_dim):
     expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
 
     assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
-    split_kv = {(10, 3): 8, (10, 7): 13}.get(torch.cuda.get_device_capability(), 1)
+    split_kv = _interface._select_q1_bwd_split_kv(
+        "auto",
+        torch.cuda.get_device_capability(),
+        True,
+        batch_size=batch,
+        num_heads=heads,
+        total_kv=sum(k_lengths),
+        head_dim=head_dim,
+    )
     expected_schedule = (split_kv, 256 // head_dim)
     assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-2:] == expected_schedule
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
@@ -1711,7 +1761,16 @@ def test_single_query_local_window_uses_general_paths_and_matches_pytorch(head_d
     assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
     bwd_compile_key = next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))
     assert bwd_compile_key[-3]
-    split_kv = {(10, 3): 8, (10, 7): 13}[torch.cuda.get_device_capability()]
+    split_kv = _interface._select_q1_bwd_split_kv(
+        "auto",
+        torch.cuda.get_device_capability(),
+        True,
+        True,
+        batch_size=batch,
+        num_heads=heads,
+        total_kv=sum(k_lengths),
+        head_dim=head_dim,
+    )
     expected_schedule = (split_kv, 256 // head_dim)
     assert bwd_compile_key[-2:] == expected_schedule
 

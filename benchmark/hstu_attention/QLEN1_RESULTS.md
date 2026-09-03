@@ -22,22 +22,41 @@ KV=128..4096, and opposing low-grid/long-KV and high-grid/short-KV corners.
 Additional local sweeps cover windows 63, 255, and 2047. Candidates are
 rotated within the same allocation and every case receives equal weight.
 
-The resulting automatic policy has no BS, head-count, KV-length, packed-token,
-window-size, or causal/local tuning branch:
+Forward has no BS, head-count, KV-length, packed-token, window-size, or
+causal/local tuning branch. Backward makes one cheap host-side choice between
+the unsplit kernel and the architecture default; it reads tensor metadata only
+and does not benchmark, synchronize the device, or inspect tensor values:
 
 | GPU | Direction | Global BF16 qlen=1 schedule |
 | --- | --- | --- |
 | B300 (SM10.3) | Forward | Tensor Core M64/N128, 16dp SiLU, tail-only masking, unsplit; 5 KV stages for D64/D128 and 3 for D256 |
-| B300 (SM10.3) | Backward | CUDA-core direct-pair, 4/2/1 KV rows per warp for D64/D128/D256, fixed split8 |
+| B300 (SM10.3) | Backward | CUDA-core direct-pair, 4/2/1 KV rows per warp for D64/D128/D256; adaptive unsplit or split8 |
 | Rubin (SM10.7) | Forward | Tensor Core M64/N128, 16dp SiLU, tail-only masking, unsplit; 5 KV stages for D64/D128 and 3 for D256 |
-| Rubin (SM10.7) | Backward | CUDA-core direct-pair, 4/2/1 KV rows per warp for D64/D128/D256, fixed split13 |
+| Rubin (SM10.7) | Backward | CUDA-core direct-pair, 4/2/1 KV rows per warp for D64/D128/D256; adaptive unsplit or split13 |
 
 D256 uses three stages only because five D256 stages exceed the shared-memory
 capacity; it is the same forward kernel family, not a workload heuristic.
-Against an oracle that picks the fastest backward split separately
-for every measured case, the fixed schedule's geometric-mean time is 1.059x
-the oracle on B300 and 1.046x on Rubin. Mask-specific choices improve the
-average by less than one percent, so they are intentionally not dispatched.
+
+The backward selector defines normalized work as
+`average_KV * D / 128` and base parallelism as `BS * H`. It uses the unsplit
+kernel when normalized work is below 256; D256 does so only through 256 base
+CTAs because it packs fewer rows per warp. It also uses unsplit when at least
+4096 base CTAs already exist and normalized work is below 768. All remaining
+cases use split8 on B300 or split13 on Rubin. Causal and local masks share this
+rule: local backward avoids arithmetic outside the window but must still write
+zero dK/dV rows across the complete packed KV extent.
+
+A fresh two-candidate validation reran all 216 backward cases per GPU after
+adding the selector (two warmups, three interleaved groups of six executions):
+
+| GPU | Unsplit selections | Adaptive / per-case oracle, geometric mean | p95 | Worst | Adaptive speedup over always split |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B300 (SM10.3) | 50 / 216 | 1.006x | 1.069x | 1.156x | 1.043x |
+| Rubin (SM10.7) | 50 / 216 | 1.003x | 1.013x | 1.103x | 1.035x |
+
+Here the oracle chooses only between the two retained schedules, unsplit and
+the architecture default, for each measured case. The selector therefore
+recovers nearly all of the useful crossover without a per-shape lookup table.
 
 The specialized policy applies to BF16 qlen=1 with causal or bounded-local
 masks, D=64/128/256, matching Q/K/V heads, non-paged KV, no arbitrary mask,
@@ -64,7 +83,8 @@ substantial work outside the requested window.
 
 This section records the earlier D128-only, mask-specific tuning that built
 the local path. The all-dimension policy above supersedes its B300 3-stage and
-both GPUs' local split4 choices in favor of one schedule per GPU/direction.
+both GPUs' local split4 choices in favor of one kernel family and the same
+lightweight backward selector for causal and local attention.
 
 Packed HSTU aligns its single query to KV row `seqlen_k - 1`, so a bounded
 local mask selects one contiguous suffix of KV. Forward reuses the M64/N128
@@ -79,8 +99,9 @@ The tuning sweep covers 18 shapes per GPU: batch sizes 64/512/1024 crossed
 with average KV lengths 128/256/512/1024/2048/4096, always H=4 and D=128.
 Each shape is measured at left windows 63, 255, and 2047, for 54 points per
 candidate. The raw interleaved measurements are in
-[`results-local-window/`](results-local-window/). No runtime batch/KV/window
-heuristic is added; selection is fixed per architecture.
+[`results-local-window/`](results-local-window/). These measurements predate
+the lightweight unsplit/split selector described above; their candidate
+timings remain the evidence used to check its local-window behavior.
 
 For forward, the table reports the speedup of five KV stages over three in
 that narrower D128 local sweep. B300 favored three stages there, while Rubin
@@ -96,8 +117,8 @@ For backward, split4 is the best setting across these 54 local D128 points on
 both targets. The B300 sweep labels this identical 128-thread configuration
 `direct-pair-t128-split4`; normal automatic dispatch obtains 128 threads from
 the split rule and does not retain the experimental override. The final global
-policy instead uses B300 split8 and Rubin split13 across both masks and all
-three dimensions.
+policy instead chooses between unsplit and B300 split8 or Rubin split13 across
+both masks and all three dimensions.
 
 | GPU | Fixed local schedule | Window 63 | Window 255 | Window 2047 | All 54 | Wins vs unsplit | Worst vs unsplit |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -652,10 +673,14 @@ D256 uses the same kernel family with its capacity-limited three-stage pipeline.
 
 Backward always uses the vectorized Q-major CUDA-core `hstu_bwd_q1.py` for the
 supported target. A warp packs four D64 rows, two D128 rows, or one D256 row
-while retaining aligned 128-bit lane transfers. B300 always uses split8 and
-Rubin always uses split13, for both causal and local attention. Each CTA writes
-disjoint dK/dV rows directly; only dQ is atomically combined. Unsupported
-layouts, full/arbitrary masks, paged KV, and FP16 keep the existing path.
+while retaining aligned 128-bit lane transfers. The metadata-only selector
+uses unsplit for short work or an already-large base grid; otherwise it uses
+split8 on B300 and split13 on Rubin. Large-grid unsplit launches use 128-thread
+CTAs, while smaller unsplit grids retain the wider architecture-level block.
+Causal and local attention share the selector and kernel source. Each CTA
+writes disjoint dK/dV rows directly; only split-KV dQ is atomically combined.
+Unsupported layouts, full/arbitrary masks, paged KV, and FP16 keep the existing
+path.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.

@@ -543,15 +543,21 @@ def main() -> None:
         if args.direction in ("backward", "both"):
             if args.backward_impl in ("auto", "dispatch"):
                 if hasattr(_interface, "_select_q1_bwd_algorithm"):
-                    selected_backward_impl = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
+                    q1_split_supported = dtype == torch.bfloat16 and args.head_dim in (64, 128, 256) and args.mask in ("causal", "local")
                     split_kv = _interface._select_q1_bwd_split_kv(
                         "auto",
                         torch.cuda.get_device_capability(device),
-                        dtype == torch.bfloat16 and args.head_dim in (64, 128, 256) and args.mask in ("causal", "local"),
+                        q1_split_supported,
                         args.mask == "local",
+                        batch_size=batch_size,
+                        num_heads=args.heads,
+                        total_kv=sum(k_lengths),
+                        head_dim=args.head_dim,
                     )
-                    if split_kv > 1:
-                        selected_backward_impl = f"direct-pair-split{split_kv}"
+                    if q1_split_supported:
+                        selected_backward_impl = "direct-pair" if split_kv == 1 else f"direct-pair-split{split_kv}"
+                    else:
+                        selected_backward_impl = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
                 else:
                     selected_backward_impl = "baseline-auto"
                 case["selected_backward_impl"] = selected_backward_impl

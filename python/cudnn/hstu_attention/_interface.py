@@ -186,6 +186,29 @@ def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     return _supports_bwd_original_qkv_layout(t) and t.stride(0) != 0 and t.stride(1) != 0
 
 
+def _select_q1_bwd_num_threads(capability: tuple[int, int], batch_size: int, num_heads: int, split_kv: int) -> int:
+    """Select the block size paired with the qlen=1 backward split."""
+    base_ctas = batch_size * num_heads
+    if split_kv == 1 and base_ctas >= 2048:
+        # Once the unsplit grid already has enough CTAs, a small block avoids
+        # spending 12--16 warps on each short sequence. Split kernels already
+        # reach the same four-warp floor below.
+        return 128
+    if capability == (10, 3):
+        # Five 12-warp CTAs fit per B300 SM and win once the grid is large;
+        # 16 warps expose more latency-hiding work for smaller grids.
+        num_threads = 384 if batch_size >= 448 else 512
+    elif capability == (10, 7):
+        num_threads = 512
+    else:
+        num_threads = 256
+    if split_kv > 1:
+        # Shrink each split CTA, but keep at least four warps so the per-CTA
+        # dQ reduction and short KV loop still have enough parallel work.
+        num_threads = max(128, (num_threads // split_kv // 32) * 32)
+    return num_threads
+
+
 def _hstu_varlen_bwd_q1_direct(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -217,21 +240,10 @@ def _hstu_varlen_bwd_q1_direct(
 
     batch_size = cu_seqlens_q.shape[0] - 1
     capability = _get_q1_device_capability(q.device)
-    if capability == (10, 3):
-        # Five 12-warp CTAs fit per B300 SM and win once the grid is large;
-        # 16 warps expose more latency-hiding work for smaller grids.
-        num_threads = 384 if batch_size >= 448 else 512
-    elif capability == (10, 7):
-        num_threads = 512
-    else:
-        num_threads = 256
-    if split_kv > 1:
-        # Shrink each split CTA, but keep at least four warps so the per-CTA
-        # dQ reduction and short KV loop still have enough parallel work.
-        num_threads = max(128, (num_threads // split_kv // 32) * 32)
+    num_heads = q.shape[1]
+    num_threads = _select_q1_bwd_num_threads(capability, batch_size, num_heads, split_kv)
 
     head_dim = q.shape[2]
-    num_heads = q.shape[1]
     compile_key = (q.device, q.dtype, head_dim, num_heads, num_threads, is_local, split_kv, rows_per_warp)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         total_q = cute.sym_int(divisibility=1)
@@ -399,22 +411,55 @@ def _select_q1_bwd_split_kv(
     capability: tuple[int, int],
     supported: bool,
     is_local: bool = False,
+    *,
+    batch_size: Optional[int] = None,
+    num_heads: Optional[int] = None,
+    total_kv: Optional[int] = None,
+    head_dim: Optional[int] = None,
 ) -> int:
-    """Resolve the architecture-level qlen=1 backward schedule."""
+    """Resolve the cheap workload-aware qlen=1 backward split."""
     if requested in _Q1_BWD_DIRECT_SPLITS:
         return _Q1_BWD_DIRECT_SPLITS[requested]
     if requested != "auto" or not supported:
         return 1
-    # Choose one split per architecture across both causal and local masks,
-    # D=64/128/256, BS=16..2048, H=1..8, and KV=128..4096. Mask-specific
-    # choices gain less than one percent in aggregate but add another dispatch
-    # axis, so keep the measured global compromise instead.
+
+    split_kv = {(10, 3): 8, (10, 7): 13}.get(capability, 1)
+    if split_kv == 1:
+        return 1
+
+    # Compare integer totals, avoiding a device read or a floating-point
+    # average. Scaling KV by D/128 accounts for the kernel's D64/D128/D256
+    # row-packing factors. D256 keeps splitting at medium grid sizes because
+    # one warp handles only one row; D64/D128 can stop earlier. Once 4096 base
+    # CTAs already exist, the small unsplit block remains worthwhile through a
+    # somewhat larger per-sequence workload on both targets.
+    has_workload = (
+        batch_size is not None
+        and batch_size > 0
+        and num_heads is not None
+        and num_heads > 0
+        and total_kv is not None
+        and total_kv >= 0
+        and head_dim is not None
+        and head_dim > 0
+    )
+    if has_workload:
+        assert batch_size is not None
+        assert num_heads is not None
+        assert total_kv is not None
+        assert head_dim is not None
+        scaled_work = total_kv * head_dim
+        base_ctas = batch_size * num_heads
+        if scaled_work < batch_size * 128 * 256 and (head_dim < 256 or base_ctas <= 256):
+            return 1
+        if base_ctas >= 4096 and scaled_work < batch_size * 128 * 768:
+            return 1
+
+    # Causal and local use the same thresholds. Local backward still writes
+    # zeros over the complete packed KV range, so total KV—not window width—is
+    # the relevant work estimate.
     _ = is_local
-    if capability == (10, 3):
-        return 8
-    if capability == (10, 7):
-        return 13
-    return 1
+    return split_kv
 
 
 def hstu_varlen_fwd_100(
@@ -862,13 +907,18 @@ def hstu_varlen_bwd_100(
     if _Q1_BWD_DIRECT_SPLITS.get(_q1_bwd_algorithm, 1) > 1 and q_dtype != torch.bfloat16:
         raise ValueError("The split-KV qlen=1 backward algorithms currently require BF16")
     capability = _get_q1_device_capability(q.device)
+    q1_split_supported = q1_direct_supported and q_dtype == torch.bfloat16
     q1_bwd_split_kv = _select_q1_bwd_split_kv(
         _q1_bwd_algorithm,
         capability,
-        q1_direct_supported and q_dtype == torch.bfloat16,
+        q1_split_supported,
         is_local,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        total_kv=k.shape[0],
+        head_dim=head_dim,
     )
-    if _q1_bwd_algorithm == "auto" and q1_bwd_split_kv > 1:
+    if _q1_bwd_algorithm == "auto" and q1_split_supported:
         selected_q1_bwd_algorithm = "direct-pair"
     elif q1_direct_supported:
         selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device)
