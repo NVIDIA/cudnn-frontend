@@ -179,3 +179,78 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
         pytest.skip("this part is small enough that the causal shape already fills it")
     assert result.split == result.expected_split > 1, "the causal arm must actually exercise the split"
     assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+# --- FP8, including a QUANTIZED O ------------------------------------------
+#
+# The SM120 FP8 adapter shares the split plumbing with SM100: under a split the
+# kernel writes half partials and the combine performs the only cast down to
+# the O dtype, applying scale_o there. Nothing above exercises the FP8 arm.
+
+
+def _sm120_fp8_case(h_q, h_kv, s_q, s_kv, *, out_dtype, split_kv, scale_o=1.0):
+    """FP8 through the SM120 adapter; returns (split, O, amax)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 part required")
+    b, d, dev = 1, 128, "cuda"
+    torch.manual_seed(0)
+    mk = lambda *sh: (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    q, k, v = mk(b, h_q, s_q, d), mk(b, h_kv, s_kv, d), mk(b, h_kv, s_kv, d)
+    o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=out_dtype)
+    amax = torch.zeros(1, dtype=torch.float32, device=dev)
+    one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
+
+    kw = dict(pertensor_fp8=True, dtype_o=out_dtype)
+    if split_kv > 1:
+        kw.update(split_kv=split_kv, sched_policy=0)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, **kw)
+    assert api.check_support()
+    ws_bytes = api.scratch_workspace_bytes()
+    api.compile()
+    ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if ws_bytes else None
+    api.execute(
+        q_tensor=q,
+        k_tensor=k,
+        v_tensor=v,
+        o_tensor=o,
+        amax_o=amax,
+        workspace=ws,
+        descale_q=one(),
+        descale_k=one(),
+        descale_v=one(),
+        scale_o=one() * scale_o,
+    )
+    torch.cuda.synchronize()
+    return api.split_kv, o.float().clone(), amax.item(), ws_bytes
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2], ids=["f16_out", "e4m3_out", "e5m2_out"])
+def test_sm120_fp8_split_matches_unsplit(out_dtype):
+    """A split must not move the result, quantized O included."""
+    _, unsplit, amax_one, _ = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=out_dtype, split_kv=1)
+    split, got, amax_split, ws = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=out_dtype, split_kv=4)
+    assert split == 4 and ws > 0
+    step = (unsplit.abs().max() * torch.finfo(out_dtype).eps).item()
+    assert (got - unsplit).abs().max().item() <= 4 * step + 5e-3
+    assert abs(amax_split - amax_one) <= 0.03, "amax must describe the recombined output at either split"
+
+
+def test_sm120_quantized_split_reduces_in_half():
+    """Partials are sized by the PARTIAL dtype, so an FP8 O carves the same
+    workspace as a half one -- sizing from O would under-allocate by half."""
+    _, _, _, ws_fp8 = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4)
+    _, _, _, ws_half = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float16, split_kv=4)
+    assert ws_fp8 == ws_half > 0
+
+
+@pytest.mark.parametrize("scale", [0.5, 2.0])
+def test_sm120_quantized_split_applies_scale_o_once(scale):
+    """scale_o is applied at the combine's cast, not in the split epilogue."""
+    _, one, amax_one, _ = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4)
+    _, scaled, amax_scaled, _ = _sm120_fp8_case(8, 1, 128, 8192, out_dtype=torch.float8_e4m3fn, split_kv=4, scale_o=scale)
+    want = one * scale
+    rel = (scaled - want).abs().max().item() / max(want.abs().max().item(), 1e-6)
+    assert rel <= 0.15, f"stored O is not scale_o x the unscaled O (rel {rel:.3f})"
+    assert abs(amax_scaled - amax_one) <= 0.03, "amax describes the PRE-quant output, so scale_o cannot move it"

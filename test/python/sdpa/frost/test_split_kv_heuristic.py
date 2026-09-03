@@ -378,3 +378,99 @@ def test_decode_rows_barely_pay_for_the_combine():
     prefill = choose_split_kv(q_tiles=1, heads_q=8, batch=1, kv_tiles=512, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8 * 4096)
     assert decode > 1
     assert decode >= prefill
+
+
+# --- a quantized O is a legal split target ---------------------------------
+#
+# The split kernels write HALF partials whatever the O dtype and the combine
+# performs the only cast down to it, so nothing about an FP8 output makes the
+# reduction narrower. Both the eligibility gate and the candidate generator
+# used to decline it; these pin that they no longer do.
+
+
+def _fp8_caps():
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    return next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_fp8").capabilities
+
+
+def _fp8_facts(dtype_o, *, mx=False):
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+
+    return ga.SdpaGraphFacts(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=512,
+        s_kv=16384,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=dtype_o,
+        is_fp8=not mx,
+        is_mxfp8=mx,
+        device_sm_count=B200_SMS,
+        device_cc=(10, 0),
+    )
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2", "HALF", "BFLOAT16"])
+@pytest.mark.parametrize("mx", [False, True], ids=["fp8", "mxfp8"])
+def test_quantized_output_does_not_block_a_split(out_name, mx):
+    """mismatch() must not decline split_kv on the O dtype alone."""
+    import cudnn
+
+    why = mismatch(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name), mx=mx), SdpaFwdKnobs(split_kv=4)) or ""
+    assert "split_kv" not in why, f"quantized O declined the split: {why}"
+
+
+@pytest.mark.parametrize("out_name", ["FP8_E4M3", "FP8_E5M2"])
+def test_quantized_output_still_gets_split_candidates(out_name):
+    """And the generator must actually PROPOSE one — passing the eligibility
+    gate is not enough if the candidate list is still hard-coded to [1]."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    points = _split_points(_fp8_caps(), _fp8_facts(getattr(cudnn.data_type, out_name)), 128, 128, 2)
+    assert points[0] > 1, f"a decode-shaped FP8-out graph got no split: {points}"
+    assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
+
+
+def test_quantized_and_half_outputs_choose_the_same_split():
+    """The O dtype is not a performance input: partials are half either way, so
+    the chooser must land on the same split for an FP8 and a bf16 output."""
+    import cudnn
+
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = _fp8_caps()
+    fp8 = _split_points(caps, _fp8_facts(cudnn.data_type.FP8_E4M3), 128, 128, 2)
+    half = _split_points(caps, _fp8_facts(cudnn.data_type.BFLOAT16), 128, 128, 2)
+    assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
+
+
+def test_every_combine_call_site_matches_the_compiled_arity():
+    """The combine is invoked POSITIONALLY, so adding a parameter to its host
+    silently breaks every call site that was not updated with it.
+
+    The failure is a TypeError raised only when a split actually runs, so a
+    missed site hides until some shape happens to split -- and the arms that
+    never split (dense half, THD) look fine either way. Compare the sites
+    against the signature instead of waiting for a shape to find them."""
+    import ast
+    import inspect
+
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.kernels import split_combine_sm100
+
+    # _host's parameters, minus the trailing `stream` keyword.
+    params = [p for p in inspect.signature(split_combine_sm100._host).parameters if p != "stream"]
+    expected = len(params)
+
+    tree = ast.parse(inspect.getsource(api_dsl))
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_combine_kernel"]
+    assert sites, "no combine call sites found — did the attribute get renamed?"
+    bad = [(n.lineno, len(n.args)) for n in sites if len(n.args) != expected]
+    assert not bad, f"combine call sites passing != {expected} positional args ({params}): {bad}"

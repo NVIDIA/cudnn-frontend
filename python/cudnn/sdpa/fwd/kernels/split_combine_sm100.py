@@ -31,6 +31,15 @@ THREADS = 128
 
 NEG_INF = float("-inf")
 
+# Workspace partials are always one of the half types; the FP8 entries are
+# reachable only as the OUTPUT type, where this pass performs the single cast.
+_ELEM = {
+    "f16": cutlass.Float16,
+    "bf16": cutlass.BFloat16,
+    "e4m3": cutlass.Float8E4M3FN,
+    "e5m2": cutlass.Float8E5M2,
+}
+
 
 @cute.kernel
 def _combine_kernel(
@@ -44,6 +53,11 @@ def _combine_kernel(
     # splits).  The FP8 kernels therefore skip their in-kernel amax write when
     # SPLIT_KV > 1 and leave it to this pass.  None-specialized off otherwise.
     amax_o: Optional[cute.Tensor],
+    # 1-element fp32 output scale, present only when O is stored quantized.
+    # The split kernels leave it out of their epilogue and write UNSCALED
+    # partials; this pass applies it at the single cast, so the FP8 rounding
+    # happens once, on the recombined value.
+    scale_o: Optional[cute.Tensor],
     n_batch: cutlass.Int32,
     n_splits: cutlass.Int32,
     d_v: cutlass.Int32,
@@ -95,6 +109,9 @@ def _combine_kernel(
     # -inf / 0.)
     neg_inf = cutlass.Float32(NEG_INF)
     amax_local = cutlass.Float32(0.0)
+    q_scale = cutlass.Float32(1.0)
+    if cutlass.const_expr(scale_o is not None):
+        q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
     for d0 in cutlass.range(tidx, d_v, THREADS, unroll=1):
         acc = cutlass.Float32(0.0)
         for s in cutlass.range(0, n_splits, 1, unroll=1):
@@ -106,11 +123,13 @@ def _combine_kernel(
                 acc = acc + w * cutlass.Float32(o_row[d0])
         out_row = oo[batch, q_row, head, :]
         o_val = acc * inv_den
-        out_row[d0] = o_val.to(o_out.element_type)
         if cutlass.const_expr(amax_o is not None):
-            # amax over the fp32 PRE-CAST value, matching what the single-pass
-            # epilogue reports.
+            # Measured before scale_o, so this is already the pre-quant amax and
+            # needs no post-hoc divide (the single-pass epilogue's does).
             amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+        if cutlass.const_expr(scale_o is not None):
+            o_val = o_val * q_scale
+        out_row[d0] = o_val.to(o_out.element_type)
 
     # One atomic per lane.  The value is non-negative, so its fp32 bit pattern
     # orders the same as the float and an integer atomicMax is exact -- the same
@@ -138,6 +157,7 @@ def _host(
     o_out: cute.Tensor,
     lse_out: Optional[cute.Tensor],
     amax_o: Optional[cute.Tensor],
+    scale_o: Optional[cute.Tensor],
     problem_size: Tuple[int, int, int, int],
     n_splits: cutlass.Int32,
     stream: _cuda_driver.CUstream = None,
@@ -149,6 +169,7 @@ def _host(
         o_out,
         lse_out,
         amax_o,
+        scale_o,
         cutlass.Int32(B),
         n_splits,
         cutlass.Int32(D),
@@ -170,6 +191,8 @@ def compile(  # noqa: A001
     has_lse: bool = False,
     lse_stride: Optional[tuple[int, int, int]] = None,
     has_amax: bool = False,
+    dtype_partial: Optional[str] = None,
+    has_scale_o: bool = False,
 ) -> Callable:
     """Compile the combine pass for one concrete (B, H, S_q, d_v, splits) shape.
 
@@ -181,10 +204,17 @@ def compile(  # noqa: A001
     same for the FP8-family amax of the recombined O.  ``lse_stride`` describes
     the caller-visible LSE output; the per-split LSE input workspace remains
     compact regardless of that final layout.
-    """
-    elem = {"f16": cutlass.Float16, "bf16": cutlass.BFloat16}[dtype_o]
 
-    fake_o_partial = cute.runtime.make_fake_compact_tensor(elem, (splits * b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
+    ``dtype_partial`` names the workspace element type, which need not be
+    ``dtype_o``: when O is stored quantized the split kernels keep their
+    partials in half precision and this pass performs the only cast down to
+    ``dtype_o``, applying ``scale_o`` (``has_scale_o``) at that single point.
+    It defaults to ``dtype_o`` for the non-quantized case.
+    """
+    elem = _ELEM[dtype_o]
+    elem_partial = _ELEM[dtype_partial or dtype_o]
+
+    fake_o_partial = cute.runtime.make_fake_compact_tensor(elem_partial, (splits * b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fake_lse_partial = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (splits * b, h, sq), stride_order=(2, 1, 0), assumed_align=16)
     fake_o_out = cute.runtime.make_fake_compact_tensor(elem, (b, sq, h, d_v), stride_order=(3, 2, 1, 0), assumed_align=16)
     fake_lse_out = (
@@ -197,6 +227,7 @@ def compile(  # noqa: A001
         else None
     )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_amax else None
+    fake_scale_o = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4) if has_scale_o else None
 
     return cute.compile(
         _host,
@@ -205,6 +236,7 @@ def compile(  # noqa: A001
         fake_o_out,
         fake_lse_out,
         fake_amax_o,
+        fake_scale_o,
         (b, h, sq, d_v),
         cutlass.Int32(0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
