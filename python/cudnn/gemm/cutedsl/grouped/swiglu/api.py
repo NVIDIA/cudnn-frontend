@@ -30,14 +30,17 @@ from cudnn.tensor_adapter import (
     get_compute_capability,
 )
 from ..canonical import (
+    canonical_b_fake,
+    canonical_mx_fake,
+    canonical_prob_fake,
+    check_sf_shape,
     default_alpha_ones,
     is_canonical_b,
     is_flat_sf,
     make_flat_sf_fake,
-    to_kernel_b,
-    to_kernel_prob,
-    to_kernel_sf,
-    unsqueeze_l_dim,
+    normalize_b,
+    normalize_mx,
+    normalize_prob,
 )
 
 _JAX_SF_LAYOUT_ERROR = (
@@ -132,24 +135,18 @@ class GroupedGemmSwigluSm100(APIBase):
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
-        # Canonical (natural row-major) inputs normalize to the kernel-facing views;
-        # pre-permuted kernel-facing inputs pass through unchanged.
-        sample_a = unsqueeze_l_dim(sample_a)
-        sample_b = to_kernel_b(sample_b)
-        sample_c = unsqueeze_l_dim(sample_c)
-        sample_d = unsqueeze_l_dim(sample_d)
-        sample_d_col = unsqueeze_l_dim(sample_d_col)
-        sample_prob = to_kernel_prob(sample_prob)
-        # Canonical (dense C-contiguous) SF buffers compile as flat 1-D pointers; the
-        # kernel rebuilds the MMA-tiled SF layouts from the A/B/D shapes.
+        # Descriptors and support checks see the kernel-facing views; canonical inputs
+        # compile at their own rank (see grouped/canonical.py).
+        self.canonical_a, sample_a = normalize_mx(sample_a)
+        self.canonical_b, sample_b = normalize_b(sample_b)
+        self.canonical_c, sample_c = normalize_mx(sample_c)
+        self.canonical_d, sample_d = normalize_mx(sample_d)
+        self.canonical_d_col, sample_d_col = normalize_mx(sample_d_col)
+        self.canonical_prob, sample_prob = normalize_prob(sample_prob)
         self.sfa_is_flat = is_flat_sf(sample_sfa)
         self.sfb_is_flat = is_flat_sf(sample_sfb)
         self.sfd_row_is_flat = is_flat_sf(sample_sfd_row)
         self.sfd_col_is_flat = is_flat_sf(sample_sfd_col)
-        sample_sfa = to_kernel_sf(sample_sfa, self.sfa_is_flat)
-        sample_sfb = to_kernel_sf(sample_sfb, self.sfb_is_flat)
-        sample_sfd_row = to_kernel_sf(sample_sfd_row, self.sfd_row_is_flat)
-        sample_sfd_col = to_kernel_sf(sample_sfd_col, self.sfd_col_is_flat)
 
         # Store sample tensor descriptors
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
@@ -227,27 +224,13 @@ class GroupedGemmSwigluSm100(APIBase):
 
         self._check_tensor_shape(self.d_col_desc, (tensor_m, n // 2, 1), "D_col")
 
-        def check_sf_shape(desc, is_flat, mma_shape, name):
-            if is_flat:
-                numel = 1
-                for dim in mma_shape:
-                    numel *= dim
-                self._check_tensor_shape(desc, [(numel,)], name)
-            else:
-                self._check_tensor_shape(desc, mma_shape, name)
-
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        check_sf_shape(self.sfa_desc, self.sfa_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
-        check_sf_shape(self.sfb_desc, self.sfb_is_flat, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+        check_sf_shape(self, self.sfa_desc, self.sfa_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
+        check_sf_shape(self, self.sfb_desc, self.sfb_is_flat, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
         rest_n2 = ceil_div(ceil_div(n // 2, self.sf_vec_size), 4)
-        check_sf_shape(
-            self.sfd_row_desc,
-            self.sfd_row_is_flat,
-            (32, 4, ceil_div(tensor_m, 128), 4, rest_n2, 1),
-            "SFD_row",
-        )
+        check_sf_shape(self, self.sfd_row_desc, self.sfd_row_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, rest_n2, 1), "SFD_row")
         rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
-        check_sf_shape(self.sfd_col_desc, self.sfd_col_is_flat, (32, 4, ceil_div(n // 2, 128), 4, rest_m, 1), "SFD_col")
+        check_sf_shape(self, self.sfd_col_desc, self.sfd_col_is_flat, (32, 4, ceil_div(n // 2, 128), 4, rest_m, 1), "SFD_col")
 
         self._check_tensor_shape(self.alpha_desc, (l,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
@@ -710,11 +693,11 @@ class GroupedGemmSwigluSm100(APIBase):
 
         _compiled_kernel = cute.compile(
             gemm_swiglu,
-            a=a_cute_fake,
-            b=b_cute_fake,
-            c=c_cute_fake,
-            d=d_cute_fake,
-            d_col=d_col_cute_fake,
+            a=canonical_mx_fake(a_cute_fake, self.canonical_a),
+            b=canonical_b_fake(b_cute_fake, self.canonical_b),
+            c=canonical_mx_fake(c_cute_fake, self.canonical_c),
+            d=canonical_mx_fake(d_cute_fake, self.canonical_d),
+            d_col=canonical_mx_fake(d_col_cute_fake, self.canonical_d_col),
             sfa=sfa_cute_fake,
             sfb=sfb_cute_fake,
             sfd_row_tensor=sfd_row_fake,
@@ -723,7 +706,7 @@ class GroupedGemmSwigluSm100(APIBase):
             norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
-            prob=prob_cute_fake,
+            prob=canonical_prob_fake(prob_cute_fake, self.canonical_prob),
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             options="--enable-tvm-ffi",
@@ -820,20 +803,20 @@ class GroupedGemmSwigluSm100(APIBase):
         )
         self._logger.debug("Executing grouped_gemm_swiglu kernel")
         self._compiled_kernel(
-            a_tensor=unsqueeze_l_dim(a_tensor),
-            b_tensor=to_kernel_b(b_tensor),
-            c_tensor=unsqueeze_l_dim(c_tensor),
-            d_tensor=unsqueeze_l_dim(d_tensor),
-            d_col_tensor=unsqueeze_l_dim(d_col_tensor),
-            sfa_tensor=to_kernel_sf(sfa_tensor, self.sfa_is_flat),
-            sfb_tensor=to_kernel_sf(sfb_tensor, self.sfb_is_flat),
-            sfd_row_tensor=to_kernel_sf(sfd_row_tensor, self.sfd_row_is_flat),
-            sfd_col_tensor=to_kernel_sf(sfd_col_tensor, self.sfd_col_is_flat),
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            d_col_tensor=d_col_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
-            prob_tensor=to_kernel_prob(prob_tensor),
+            prob_tensor=prob_tensor,
             stream=current_stream,
         )
 
@@ -1068,9 +1051,8 @@ def grouped_gemm_swiglu_wrapper_sm100(
         # Canonical-vs-kernel-facing input forms compile different signatures.
         prob_tensor.dtype if prob_tensor is not None else None,
         prob_tensor.ndim if prob_tensor is not None else None,
-        is_flat_sf(sfa_tensor),
-        is_flat_sf(sfb_tensor),
-        canonical_outputs,
+        (is_flat_sf(sfa_tensor), sfa_tensor.ndim),
+        (is_flat_sf(sfb_tensor), sfb_tensor.ndim),
         # The compiled signature binds the SF dtype (e8m0 vs e4m3).
         sfa_tensor.dtype,
         sfb_tensor.dtype,

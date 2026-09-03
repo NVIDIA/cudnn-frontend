@@ -19,6 +19,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector, arith
 
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..utils import (
     PersistentTileSchedulerParams,
     StaticPersistentTileScheduler,
@@ -561,6 +562,15 @@ class BlockScaledContiguousGroupedGemmKernel:
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
+        # Canonical-rank operands (grouped/canonical.py) normalize to the kernel-facing views.
+        a = kernel_facing_mx(a)
+        b = kernel_facing_b(b)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        dprob = kernel_facing_prob(dprob)
+
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
