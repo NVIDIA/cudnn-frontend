@@ -503,6 +503,32 @@ def test_reject_thd():
     assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
+def test_unserved_band_graph_declines_as_not_supported():
+    """An unserved d512 backward must raise cudnnGraphNotSupportedError.
+
+    Regression test for the error TYPE, not the message. The C++ node admits
+    d in (256, 512] so the FROST engine can claim it, but a graph in the band
+    that NO engine serves (here: deterministic, which this row declines and the
+    backend has no plan for) used to reach plan build via
+    `override_heuristics_query()`, which pins a backend engine id and bypasses
+    the heuristics query entirely. That pinned config then failed to finalize
+    with CUDNN_STATUS_NOT_SUPPORTED, which `_CUDNN_CHECK_CUDNN_ERROR` folded
+    into CUDNN_BACKEND_API_FAILED -- reaching Python as a bare RuntimeError.
+
+    That distinction is load-bearing: every SDPA harness in this repo skips on
+    cudnnGraphNotSupportedError and FAILS on anything else, so the wrong type
+    turned "nobody serves this" into 91 red cases in
+    test_mhas_v2.py::test_sdpa_random_bwd_L0 as soon as its head-dim sweep was
+    widened to 512.
+    """
+    b, hq, sq, skv = 2, 2, 256, 256
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        g = _build_graph_only(b, hq, hq, sq, skv, _D, 1.0 / math.sqrt(_D), use_deterministic_algorithm=True)
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        g.check_support()
+        g.build_plans()
+
+
 def test_capabilities_match_what_is_implemented():
     """The row must not claim anything the adapter would refuse at build. Guards
     against a Capabilities field being flipped on without the lowering."""

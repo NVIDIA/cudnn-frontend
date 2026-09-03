@@ -1176,6 +1176,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     // sequence length). Set at expand time when eligible.
     mutable bool use_sm90_ordered_dq_deterministic = false;
     mutable bool is_d256_on_blackwell              = false;  // Will be edited in pre_validate_node()
+    // Head dims in (256, 512] on Blackwell. This band has NO cuDNN backend
+    // plan -- it is served only by the frontend-only FROST engine
+    // (sdpa_bwd_sm100), which is opt-in. Recorded so override_heuristics_query()
+    // does not pin a backend engine that cannot possibly finalize here.
+    mutable bool is_d512_on_blackwell = false;  // Will be edited in pre_validate_node()
 
     // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
     // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
@@ -1358,6 +1363,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 // not select that engine still fails at plan creation.
                 bool const d512_supported =
                     (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 8 == 0) && (d_v % 8 == 0);
+                is_d512_on_blackwell = d512_supported;
                 RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)) && !d512_supported,
                                             error_code_t::GRAPH_NOT_SUPPORTED,
                                             "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v, "
@@ -2225,6 +2231,17 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
+        // The (256, 512] band has no cuDNN backend plan at all -- only the
+        // opt-in frontend FROST engine serves it. Pinning a backend engine id
+        // here bypasses the heuristics query entirely, and the pinned config
+        // then fails to finalize with CUDNN_STATUS_NOT_SUPPORTED, which
+        // surfaces as a generic backend-API error rather than "not supported".
+        // Decline the override and let heuristics run: it returns no configs
+        // and create_execution_plans reports GRAPH_NOT_SUPPORTED, which is what
+        // a caller (and every test harness) can act on.
+        if (is_d512_on_blackwell) {
+            return {-1, {}};
+        }
         int32_t const sm_version = context.get_sm_version();
         bool const use_new_knobs = detail::get_backend_version() >= 92300;
         // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
