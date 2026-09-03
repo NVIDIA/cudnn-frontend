@@ -11,6 +11,8 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 import cuda.bindings.driver as _cuda_driver
 
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+
 TENSOR_MAP_QWORDS = 128 // 8
 
 # THD metadata layout, in int32 words:
@@ -99,6 +101,66 @@ def write_thd_meta(meta, ql, kl, lens_form: cutlass.Int32, n_batch: cutlass.Int3
             meta[b] = lkv
             acc_k = acc_k + lkv
             meta[cuk0 + b + cutlass.Int32(1)] = acc_k
+
+
+@cute.jit
+def sanitize_v_tail(
+    sV,
+    lane: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    kv_seq_idx: cutlass.Int32,
+    in_dtype,
+    head_tile_v,
+    kv_tile,
+    v_swizzle_chunk_elems,
+) -> None:
+    """Zero ``sV`` rows at/past this tile's valid KV extent before P @ V.
+
+    Shared by the SM120 f16 and FP8 flavors (their sV tiles use the same
+    ``[I][kv_tile][C]`` TMA order and per-row swizzle; the element size rides
+    ``in_dtype``). The K/V TMA descriptors span the bound buffers' CAPACITY
+    (under THD the packed totals are device values, so the views bind
+    whole-buffer extents), so rows between the valid KV length and the tile
+    end can carry UNINITIALIZED storage — including NaN bit patterns. The
+    S-side mask overwrites those columns with -inf (a select, NaN-safe),
+    but P @ V still multiplies P = 0 against the NaN V row and
+    ``0 * NaN = NaN`` poisons the whole accumulator column-free. Reached
+    only from THD specializations' first masked step (see the call
+    sites): dense descriptors carry the declared S_kv, so their overhang
+    loads zero-fill in hardware — a dense PADDED graph's pad rows are
+    user memory and deliberately NOT sanitized here (whether the
+    contract requires tolerating NaN bit patterns there is an open
+    question for the sibling kernels too).
+
+    Every compute warp redundantly zeroes the full overhang (idempotent
+    zero stores race benignly), so a warp-level sync is enough for each
+    warp's own ``ldmatrix`` lanes to observe the zeros.
+    """
+    seg_elems = 16 // in_dtype.bytes  # elements per 16-byte store
+    segs_per_row = head_tile_v // seg_elems
+    row_lo = cute.math.max(cutlass.Int32(0), seqlen_k - kv_seq_idx)
+    for r_it in cutlass.range_constexpr(kv_tile // 32):
+        row = cutlass.Int32(r_it * 32) + lane
+        for seg in cutlass.range_constexpr(segs_per_row):
+            col = seg * seg_elems
+            phys_row = (col // v_swizzle_chunk_elems) * kv_tile + row
+            sv_ptr = (
+                sV.data_ptr()
+                + phys_row * v_swizzle_chunk_elems
+                + swizzle_xor(
+                    phys_row,
+                    col % v_swizzle_chunk_elems,
+                    v_swizzle_chunk_elems,
+                    in_dtype.bytes,
+                )
+            )
+            zero16 = cutlass.Vector.from_elements(
+                tuple(in_dtype(0.0) for _ in range(seg_elems)),
+                in_dtype,
+            )
+            if row >= row_lo:
+                sv_ptr.store(zero16, alignment=16)
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 @cute.jit
