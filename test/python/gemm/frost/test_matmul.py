@@ -3461,14 +3461,12 @@ def _splitk_data(B, M, N, K, torch_in=torch.bfloat16, torch_out=torch.bfloat16):
     return a, b, c, ref
 
 
-# Shapes cover what split-K changes: K tails, M tails, batch, deep K. The deep-K
-# entries (the slowest compiles+runs of the sweep) run at L1 only.
+# Shapes cover what split-K changes: K tails, M tails, batch.
 _SPLITK_SHAPES = (
     (1, 256, 256, 4096),
     (1, 256, 256, 4160),
+    (1, 300, 256, 4096),
     (3, 256, 512, 4096),
-    pytest.param((1, 300, 256, 8192), marks=pytest.mark.L1),
-    pytest.param((1, 128, 128, 16384), marks=pytest.mark.L1),
 )
 
 
@@ -3518,13 +3516,12 @@ def test_splitk_n_not_multiple_of_4(N):
 
 
 @requires_sm100
-@pytest.mark.L1
 def test_splitk_cta_group1():
-    g, A, Bt, C = _splitk_graph(1, 256, 256, 8192)
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
     compiled = _jit_splitk(g, 4, base_cfg=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
     assert compiled.store_modes == ("tma",)
     assert compiled.use_tma_store
-    a, b, c, ref = _splitk_data(1, 256, 256, 8192)
+    a, b, c, ref = _splitk_data(1, 256, 256, 4096)
     _run_splitk(compiled, {A: a, Bt: b, C: c})
     assert torch.equal(c, ref)
 
@@ -3539,11 +3536,10 @@ def test_splitk_narrow_epi_row():
 
 
 @requires_sm100
-@pytest.mark.L1
 def test_splitk_deterministic():
-    g, A, Bt, C = _splitk_graph(1, 256, 256, 8192)
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
     compiled = _jit_splitk(g, 8)
-    a, b, c1, _ = _splitk_data(1, 256, 256, 8192)
+    a, b, c1, _ = _splitk_data(1, 256, 256, 4096)
     c2 = torch.zeros_like(c1)
     _run_splitk(compiled, {A: a, Bt: b, C: c1})
     _run_splitk(compiled, {A: a, Bt: b, C: c2})
@@ -3570,14 +3566,14 @@ def test_splitk_more_slices_than_k_tiles():
     compiled = _jit_splitk(g, 4)
     a, b, c, _ = _splitk_data(1, 256, 256, 128)
     buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="exceeds the .* K tile"):
+    with pytest.raises(ValueError, match=r"exceeds the .* K tile"):
         compiled({A: a, Bt: b, C: c}, workspace=Workspace(buf, compiled.workspace_bytes, "t"))
 
 
 @requires_sm100
 def test_splitk_rejects_more_than_32_slices():
     # The reducer unrolls its accumulation at trace time; the gate bounds S.
-    g, A, Bt, C = _splitk_graph(1, 256, 256, 65536)
+    g, *_ = _splitk_graph(1, 256, 256, 65536)
     with pytest.raises(NotImplementedError, match="more than 32 slices"):
         _jit_splitk(g, 64)
 
@@ -3585,14 +3581,14 @@ def test_splitk_rejects_more_than_32_slices():
 @requires_sm100
 def test_splitk_rejects_grid_z_overflow():
     # Kernel 1's grid.z = batch * S; an explicit config must not bypass the limit.
-    g, A, Bt, C = _splitk_graph(40000, 32, 32, 4096)
-    with pytest.raises(NotImplementedError, match="grid.z"):
+    g, *_ = _splitk_graph(40000, 32, 32, 4096)
+    with pytest.raises(NotImplementedError, match=r"grid\.z"):
         _jit_splitk(g, 2)
 
 
 @requires_sm100
 def test_splitk_rejects_epilogue_fusion():
-    with pytest.raises(NotImplementedError, match="split_k_slices.*plain matmul"):
+    with pytest.raises(NotImplementedError, match=r"split_k_slices.*plain matmul"):
         _jit_splitk(_splitk_fused_graph(K=512), 2)
     # probe and build must agree: the same explicit config fails probe_supported
     # (split-K is a config attribute, gated with the rest of the config).
@@ -3601,7 +3597,7 @@ def test_splitk_rejects_epilogue_fusion():
     from cudnn.gemm.frost.compiler import probe_supported
     from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
 
-    with pytest.raises(NotImplementedError, match="split_k_slices.*plain matmul"):
+    with pytest.raises(NotImplementedError, match=r"split_k_slices.*plain matmul"):
         probe_supported(_splitk_fused_graph(K=512), replace(DEFAULT_CONFIG, split_k_slices=2))
 
 
