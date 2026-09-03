@@ -373,7 +373,7 @@ def test_DSA_sparse_attention_backward_sm100_masks_invalid_topk_rows(invalid_val
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    num_heads, head_dim, head_dim_v = 32, 576, 512
+    num_heads, head_dim, head_dim_v = 64, 576, 512
     q = torch.full((1, num_heads, head_dim), 8.0, dtype=torch.bfloat16, device=device)
     kv = torch.full((1, head_dim), -8.0, dtype=torch.bfloat16, device=device)
     dout = torch.randn(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
@@ -418,7 +418,7 @@ def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_v
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    num_heads, head_dim, head_dim_v = 32, 576, 512
+    num_heads, head_dim, head_dim_v = 64, 576, 512
     q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
     out = torch.zeros(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
@@ -460,7 +460,7 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, num_heads, head_dim = 8, 64, 32, 576
+    s_q, s_kv, num_heads, head_dim = 8, 64, 64, 576
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
     attn_sink = torch.linspace(2.0, 5.0, num_heads, dtype=torch.float32, device=device)
