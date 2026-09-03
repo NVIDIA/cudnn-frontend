@@ -2,105 +2,57 @@
 # SPDX-License-Identifier: MIT
 
 
-from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import arith
 import cuda.bindings.driver as _cuda_driver
 
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 
-TENSOR_MAP_QWORDS = 128 // 8
+from cudnn.frost.tile_dsl.thd import (
+    TENSOR_MAP_QWORDS,
+    THD_CTR_OFF,
+    THD_LIVE_OFF,
+    THD_META_WORDS,
+    THD_REMAP_OFF,
+    THD_SETUP_THREADS,
+    emit_clamped_desc,
+    emit_seq_descs,
+    thd_claim_next,
+    thd_decode_unit,
+    write_thd_batch_remap,
+    write_thd_live_and_ctr,
+    write_thd_meta,
+)
 
-# THD metadata layout, in int32 words:
-#   [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) | batch_remap(B) ]
-# The trailing batch_remap is a permutation of [0, B) ordered by DESCENDING
-# Q length, so the tile scheduler walks the longest sequences first (longest
-# processing time): the tail of a THD launch is then made of short sequences,
-# which is what bounds the ragged last wave.
-THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
-THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
-THD_LIVE_OFF = lambda b: 4 * b + 2  # noqa: E731   live unit total (device-computed)
-THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim counter
-
-# Threads for the THD setup launch. The metadata write itself is one elected
-# thread; the batch-remap ranking that follows is parallel over batches, so the
-# block is sized for that (B > THD_SETUP_THREADS just loops).
-THD_SETUP_THREADS = 256
-
-
-@cute.jit
-def write_thd_batch_remap(meta, n_batch: cutlass.Int32, tid: cutlass.Int32, nthreads: cutlass.Int32) -> None:
-    """Fill batch_remap with [0, B) sorted by descending Q length.
-
-    Rank-by-counting rather than a sort network: each thread owns a batch and
-    counts how many sequences outrank it, which is O(B^2) comparisons but fully
-    parallel, branch-free and trivially deterministic. Ties break on the
-    original index, so the permutation is stable and reproducible run to run.
-
-    Must be called AFTER write_thd_meta (it reads the cu_seqlens_q it wrote)
-    with a barrier in between.
-    """
-    cuq0 = n_batch
-    remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
-    i = tid
-    while i < n_batch:
-        len_i = cutlass.Int32(meta[cuq0 + i + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + i])
-        rank = cutlass.Int32(0)
-        for j in cutlass.range(0, n_batch, 1, unroll=1):
-            len_j = cutlass.Int32(meta[cuq0 + j + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + j])
-            # Descending by length; ties resolved by the lower original index.
-            outranks = (len_j > len_i) | ((len_j == len_i) & (j < i))
-            rank = rank + cutlass.Int32(arith.select(outranks.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
-        meta[remap0 + rank] = i
-        i = i + nthreads
-
-
-@cute.jit
-def write_thd_meta(meta, ql, kl, lens_form: cutlass.Int32, n_batch: cutlass.Int32) -> None:
-    """Single-thread body of the device-side THD metadata build (issue #552),
-    shared by the SM100 setup kernel (which follows it with the per-batch O
-    TMA descriptors) and the SM120 meta-only kernel. Writes the
-    [seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)] buffer from the
-    caller's length tensors — ``(B,)`` per-batch lengths (serial cumsum; B
-    is small) or the ``(B+1,)`` cu prefix-sum form, per side via
-    ``lens_form`` (bit 0: Q is cu, bit 1: KV is cu). cu prefixes are
-    NORMALIZED (element 0 subtracted): the packed buffers are addressed from
-    token 0, so a cu tensor sliced from a larger prefix means the same
-    lengths — and the host can no longer validate ``cu[0] == 0`` (Rule 3),
-    so an unnormalized base must not leak into the offsets the tiles and
-    the dead-unit sentinel read. Callers run this under ``elect_sync``."""
-    cuq0 = n_batch
-    cuk0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
-    q_is_cu = (lens_form & cutlass.Int32(1)) != cutlass.Int32(0)
-    kv_is_cu = (lens_form & cutlass.Int32(2)) != cutlass.Int32(0)
-    if q_is_cu:
-        base_q = cutlass.Int32(ql[0])
-        for b in cutlass.range(0, n_batch + cutlass.Int32(1), 1, unroll=1):
-            meta[cuq0 + b] = cutlass.Int32(ql[b]) - base_q
-    else:
-        acc = cutlass.Int32(0)
-        meta[cuq0] = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            acc = acc + cutlass.Int32(ql[b])
-            meta[cuq0 + b + cutlass.Int32(1)] = acc
-    if kv_is_cu:
-        base_k = cutlass.Int32(kl[0])
-        meta[cuk0] = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            meta[cuk0 + b + cutlass.Int32(1)] = cutlass.Int32(kl[b + cutlass.Int32(1)]) - base_k
-            meta[b] = cutlass.Int32(kl[b + cutlass.Int32(1)]) - cutlass.Int32(kl[b])
-    else:
-        acc_k = cutlass.Int32(0)
-        meta[cuk0] = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            lkv = cutlass.Int32(kl[b])
-            meta[b] = lkv
-            acc_k = acc_k + lkv
-            meta[cuk0 + b + cutlass.Int32(1)] = acc_k
+# The THD metadata layout, the batch ranking, the unit decode, the claim counter
+# and the per-sequence descriptor patchers moved to ``frost/tile_dsl/thd.py``
+# when the SM100 backward needed the same pieces -- a second copy of a metadata
+# LAYOUT is a silent-wrong-answer waiting to happen, since a reader offset and a
+# writer offset that disagree by one word decode garbage batches rather than
+# failing.  Re-exported here so the kernels importing them from this module keep
+# working.  What stays below is genuinely forward-specific: the SM120 sV tail
+# sanitizer (its SMEM order and swizzle are that kernel's), and the per-flavor
+# setup LAUNCHES.
+__all__ = [
+    "TENSOR_MAP_QWORDS",
+    "THD_CTR_OFF",
+    "THD_LIVE_OFF",
+    "THD_META_WORDS",
+    "THD_REMAP_OFF",
+    "THD_SETUP_THREADS",
+    "build_thd_meta_kernel",
+    "build_thd_meta_o_descs_kernel",
+    "build_thd_meta_o_kv_descs_kernel",
+    "sanitize_v_tail",
+    "thd_claim_next",
+    "thd_decode_unit",
+    "write_thd_batch_remap",
+    "write_thd_live_and_ctr",
+    "write_thd_meta",
+]
 
 
 @cute.jit
@@ -163,71 +115,6 @@ def sanitize_v_tail(
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
-@cute.jit
-def thd_decode_unit(
-    meta,
-    n_batch: cutlass.Int32,
-    uid: cutlass.Int32,
-    n_qh: cutlass.Int32,
-    q_tile: cutlass.Int32,
-    reverse_rows: bool,
-) -> tuple:
-    """Map a linear unit id to ``(q_tile_idx, batch, head)`` through batch_remap.
-
-    A unit is ``q_tile`` rows of one head of one sequence. Sequences are walked
-    LONGEST FIRST (the remap), and the head is the major axis within a sequence
-    so consecutive units sweep the Q tiles of a single head — those share a K/V
-    head, which is what keeps the claim order L2-friendly. ``reverse_rows``
-    walks a sequence's tiles from the diagonal back, putting the causal-heavy
-    tiles first.
-
-    A uid past the live total keeps ``batch == n_batch``; the caller is expected
-    to bound uid against the live count instead of relying on that sentinel.
-    """
-    cuq0 = n_batch
-    remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
-    f_batch = n_batch
-    f_head = cutlass.Int32(0)
-    f_qt = cutlass.Int32(0)
-    done = cutlass.Int32(0)
-    acc = cutlass.Int32(0)
-    for i in cutlass.range(0, n_batch, 1, unroll=1):
-        b = cutlass.Int32(meta[remap0 + i])
-        s_i = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
-        tb = (s_i + q_tile - cutlass.Int32(1)) // q_tile
-        # A zero-length sequence contributes no unit; keep the divisor legal
-        # anyway, since both quotients below are evaluated before the select.
-        tb_nz = cute.math.max(tb, cutlass.Int32(1))
-        units_b = tb * n_qh
-        in_rng = (done == cutlass.Int32(0)) & (uid < acc + units_b)
-        local = uid - acc
-        qt = local % tb_nz
-        if cutlass.const_expr(reverse_rows):
-            qt = tb - cutlass.Int32(1) - qt
-        f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-        f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // tb_nz).ir_value(), f_head.ir_value()))
-        f_qt = cutlass.Int32(arith.select(in_rng.ir_value(), qt.ir_value(), f_qt.ir_value()))
-        done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
-        acc = acc + units_b
-    return f_qt, f_batch, f_head
-
-
-@cute.jit
-def thd_claim_next(meta_t: cute.Tensor, ctr_off: cutlass.Int32, slot, tidx: cutlass.Int32) -> cutlass.Int32:
-    """Take the next unit from the device-side claim counter.
-
-    One atomic for the whole CTA, broadcast through a single SMEM word. The
-    leading barrier also separates the previous unit's use of the shared K/V
-    staging from the next unit's, so the caller does not need its own.
-    """
-    ctr_ptr = Pointer(meta_t.iterator.raw_ptr(), dtype=cutlass.Int32) + ctr_off
-    nvvm.barrier_cta_sync(0)
-    if tidx == cutlass.Int32(0):
-        slot[0] = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
-    nvvm.barrier_cta_sync(0)
-    return cutlass.Int32(slot[0])
-
-
 @cute.kernel
 def build_thd_meta_kernel(
     meta_t: cute.Tensor,
@@ -265,17 +152,7 @@ def build_thd_meta_kernel(
     # Live unit total + claim counter, as on SM100 — a SM120 unit is q_tile
     # rows of one head, so the same count applies with cga_tile_m := q_tile.
     cute.arch.barrier()
-    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
-    # implementation-defined lane, so conjoining it with tidx == 0 can
-    # select no thread at all and leave these words unwritten.
-    if tidx == cutlass.Int32(0):
-        live = cutlass.Int32(0)
-        cuq0 = n_batch
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
-            live = live + ((s_b + q_tile - cutlass.Int32(1)) // q_tile) * n_qh
-        meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
-        meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
+    write_thd_live_and_ctr(meta, n_batch, n_qh, q_tile, n_ctas, cutlass.Int32(tidx))
 
 
 build_thd_meta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -327,40 +204,12 @@ def build_thd_meta_o_kv_descs_kernel(
     if nvvm.elect_sync() and tidx < cutlass.Int32(32):
         meta = cutlass.make_array_view(meta_t)
         write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
-        cuq0 = n_batch
-        o_ptr = o_tensor.iterator.raw_ptr()
-        desc_base = o_desc_words.iterator.raw_ptr()
-        src_words = Pointer(base_o_desc.get_ptr(), dtype=cutlass.Int64)
-        row_elems = o_row_stride
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-                (dptr + i).store((src_words + i).load())
-            cu_q_b = cutlass.Int32(meta[cuq0 + b])
-            s_i = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cu_q_b
-            row_base = o_ptr + cu_q_b * row_elems
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_ADDRESS,
-                dptr,
-                new_value=row_base.toint(cutlass.Int64),
-            )
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_DIM,
-                dptr,
-                new_value=s_i,
-                ord=2,
-            )
+        # Per-batch O descriptors, from the cu_q values written above (same
+        # thread -- plain program order, no fence needed for the meta reads).
+        emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
         t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-        k_dptr = desc_base + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-        k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (k_dptr + i).store((k_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=k_seq_dim)
-        v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-        v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (v_dptr + i).store((v_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=v_seq_dim)
+        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=k_seq_dim)
+        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=v_seq_dim)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -379,18 +228,7 @@ def build_thd_meta_o_kv_descs_kernel(
     # wrong answer). The counter starts at n_clusters: cluster c takes unit c
     # from its blockIdx, then pulls from the counter.
     cute.arch.barrier()
-    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
-    # implementation-defined lane, so conjoining it with tidx == 0 can select
-    # no thread at all and leave these words unwritten.
-    if tidx == cutlass.Int32(0):
-        meta_w = cutlass.make_array_view(meta_t)
-        cuq0 = n_batch
-        live = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            s_b = cutlass.Int32(meta_w[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta_w[cuq0 + b])
-            live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
-        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
-        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx))
 
 
 build_thd_meta_o_kv_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -438,31 +276,9 @@ def build_thd_meta_o_descs_kernel(
     if nvvm.elect_sync() and tidx < cutlass.Int32(32):
         meta = cutlass.make_array_view(meta_t)
         write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
-        cuq0 = n_batch
         # Per-batch O descriptors, from the cu_q values written above (same
-        # thread — plain program order, no fence needed for the meta reads).
-        o_ptr = o_tensor.iterator.raw_ptr()
-        desc_base = o_desc_words.iterator.raw_ptr()
-        src_words = Pointer(base_o_desc.get_ptr(), dtype=cutlass.Int64)
-        row_elems = o_row_stride
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
-            for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-                (dptr + i).store((src_words + i).load())
-            cu_q_b = cutlass.Int32(meta[cuq0 + b])
-            s_i = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cu_q_b
-            row_base = o_ptr + cu_q_b * row_elems
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_ADDRESS,
-                dptr,
-                new_value=row_base.toint(cutlass.Int64),
-            )
-            nvvm.tensormap_replace(
-                nvvm.TensormapField.GLOBAL_DIM,
-                dptr,
-                new_value=s_i,
-                ord=2,
-            )
+        # thread -- plain program order, no fence needed for the meta reads).
+        emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
         # Packed-total-clamped K/V runtime descriptors (issue #624). K/V load
         # in TILE_N rows, so the LAST sequence's tile steps past the packed KV
         # total into the buffer's capacity tail — caller-owned bytes that may
@@ -474,16 +290,8 @@ def build_thd_meta_o_descs_kernel(
         # the caller's buffer. Mirrors build_thd_meta_o_kv_descs_kernel, which
         # the FP8/MXFP8 flavors have used for this since they were written.
         t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-        k_dptr = desc_base + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-        k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (k_dptr + i).store((k_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
-        v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-        v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
-        for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-            (v_dptr + i).store((v_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
+        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -498,18 +306,7 @@ def build_thd_meta_o_descs_kernel(
     # kernel reads its own bound from here. The counter starts at n_clusters:
     # cluster c takes unit c from its blockIdx, then pulls from the counter.
     cute.arch.barrier()
-    # Thread 0 alone, WITHOUT elect_sync: elect.sync picks an
-    # implementation-defined lane, so conjoining it with tidx == 0 can
-    # select no thread at all and leave these words unwritten.
-    if tidx == cutlass.Int32(0):
-        meta_w = cutlass.make_array_view(meta_t)
-        cuq0 = n_batch
-        live = cutlass.Int32(0)
-        for b in cutlass.range(0, n_batch, 1, unroll=1):
-            s_b = cutlass.Int32(meta_w[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta_w[cuq0 + b])
-            live = live + ((s_b + cga_tile_m - cutlass.Int32(1)) // cga_tile_m) * n_qh
-        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
-        meta_w[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx))
 
 
 build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
