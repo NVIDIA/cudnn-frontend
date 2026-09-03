@@ -842,6 +842,137 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=676)
+@pytest.mark.parametrize(
+    "invalid_value,topk_length_value,topk_width",
+    [
+        pytest.param(-1, None, 64, id="negative-padding"),
+        pytest.param(-1, None, 128, id="multi-tile-negative-padding"),
+        pytest.param(torch.iinfo(torch.int32).max, 1, 64, id="past-length"),
+        pytest.param(-1, 64, 64, id="active-negative"),
+        pytest.param(4097, None, 64, id="active-positive-oob"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_masks_invalid_topk_rows(invalid_value, topk_length_value, topk_width):
+    """Invalid sparse rows must contribute neither probability nor an OOB KV access."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    num_heads, head_dim, head_dim_v = 64, 576, 512
+    q = torch.full((1, num_heads, head_dim), 8.0, dtype=torch.bfloat16, device=device)
+    kv = torch.full((1, head_dim), -8.0, dtype=torch.bfloat16, device=device)
+    dout = torch.randn(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
+    attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+    topk_idxs = torch.full((1, topk_width), invalid_value, dtype=torch.int32, device=device)
+    topk_idxs[:, 0] = 0
+    topk_length = None if topk_length_value is None else torch.full((1,), topk_length_value, dtype=torch.int32, device=device)
+
+    out = kv[0, :head_dim_v].view(1, 1, head_dim_v).expand(1, num_heads, head_dim_v).contiguous()
+    lse = ((q.float() * kv[0].float()).sum(dim=-1) * (192**-0.5)).contiguous()
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=192**-0.5,
+        topk_length=topk_length,
+    )
+
+    expected_dkv = torch.zeros_like(kv)
+    expected_dkv[0, :head_dim_v] = dout.float().sum(dim=(0, 1)).to(torch.bfloat16)
+    assert torch.isfinite(result["dq"]).all()
+    assert torch.isfinite(result["dkv"]).all()
+    assert torch.isfinite(result["d_sink"]).all()
+    torch.testing.assert_close(result["dq"].float(), torch.zeros_like(result["dq"], dtype=torch.float32), atol=3e-5, rtol=0)
+    torch.testing.assert_close(result["dkv"], expected_dkv, atol=5e-2, rtol=1e-2)
+    assert torch.equal(result["d_sink"], torch.zeros_like(result["d_sink"]))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=677)
+@pytest.mark.parametrize("sink_value,empty_row", [(-math.inf, True), (math.inf, False)], ids=["empty-no-mass", "positive-infinite-sink"])
+def test_DSA_sparse_attention_backward_sm100_handles_infinite_sink_limits(sink_value, empty_row):
+    """Sink/LSE infinities must use their limiting probabilities without inf-inf."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    num_heads, head_dim, head_dim_v = 64, 576, 512
+    q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(1, head_dim, dtype=torch.bfloat16, device=device)
+    out = torch.zeros(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
+    dout = torch.randn_like(out)
+    attn_sink = torch.full((num_heads,), sink_value, dtype=torch.float32, device=device)
+    topk_idxs = torch.full((1, 64), torch.iinfo(torch.int32).max if empty_row else -1, dtype=torch.int32, device=device)
+    topk_length = torch.zeros(1, dtype=torch.int32, device=device) if empty_row else None
+    if empty_row:
+        lse = torch.full((1, num_heads), -math.inf, dtype=torch.float32, device=device)
+    else:
+        topk_idxs[:, 0] = 0
+        lse = ((q.float() * kv[0].float()).sum(dim=-1) * (192**-0.5)).contiguous()
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=192**-0.5,
+        topk_length=topk_length,
+    )
+
+    assert torch.equal(result["dq"], torch.zeros_like(result["dq"]))
+    assert torch.equal(result["dkv"], torch.zeros_like(result["dkv"]))
+    assert torch.equal(result["d_sink"], torch.zeros_like(result["d_sink"]))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=678)
+def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
+    """dSink uses the saved BF16 O but must multiply O*dO in FP32."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads, head_dim = 8, 64, 64, 576
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
+    attn_sink = torch.linspace(2.0, 5.0, num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.arange(s_kv, dtype=torch.int32, device=device).expand(s_q, -1).contiguous()
+    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, softmax_scale=192**-0.5)
+    dout = torch.randn_like(out)
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=192**-0.5,
+    )
+    p_sink = torch.exp(attn_sink.view(1, -1) - torch.logaddexp(lse, attn_sink.view(1, -1)))
+    expected_d_sink = (-p_sink * (out.float() * dout.float()).sum(dim=-1)).sum(dim=0)
+    torch.testing.assert_close(result["d_sink"], expected_d_sink, atol=2e-5, rtol=2e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=434)
 @pytest.mark.parametrize(
     "num_heads,s_kv,topk",
