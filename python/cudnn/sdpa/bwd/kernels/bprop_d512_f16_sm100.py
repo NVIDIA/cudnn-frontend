@@ -73,7 +73,7 @@ from cudnn.frost.tile_dsl.tma import (
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.sdpa.bwd.kernels._common_sm100 import make_bwd_decode
-from cudnn.sdpa.bwd.kernels.thd_helpers import DO_SLOT, K_SLOT, Q_SLOT, V_SLOT
+from cudnn.frost.tile_dsl.thd import emit_clamped_desc
 from cudnn.sdpa.bwd.config_sm100 import (
     TemplateParams,
     cast_bytes,
@@ -97,6 +97,15 @@ _decode_initial, _decode_payload = make_bwd_decode(CFG)
 # build at trace time.
 _THD = bool(CFG.THD_VARLEN)
 _TENSOR_MAP_QWORDS = 128 // 8
+# Stage 2's OWN descriptor-scratch slot map.  The clamped copies are patched
+# from this module's `_host`, which is the only place that knows their box dims,
+# swizzle and dim order -- for a [1, T, H, D] view addressed (d, head, seq,
+# batch) the sequence axis is ord=2, which is NOT what stage 3's (n, m, h, b)
+# operands use.  A shared builder would have to be told, and being told the
+# wrong number is a silent mis-clamp.
+Q_SLOT, DO_SLOT, K_SLOT, V_SLOT = 0, 1, 2, 3
+THD_STAGE2_DESC_SLOTS = 4
+_THD_SEQ_ORD = 2
 
 # Does any tile in this specialization need the per-cell mask at all?  Folds the
 # whole mask apparatus out of the dense build.
@@ -411,10 +420,10 @@ def _tmaldg_warp_group(
         # ONE acquire per descriptor per CTA, not one per tile: the setup launch
         # writes these once and never rewrites them, so the per-call fences
         # `tma_load_tile` would otherwise emit are pure hot-path cost.
-        tma_tensormap_acquire(_rt_desc(desc_words, Q_SLOT(n_batch)))
-        tma_tensormap_acquire(_rt_desc(desc_words, DO_SLOT(n_batch)))
-        tma_tensormap_acquire(_rt_desc(desc_words, K_SLOT(n_batch)))
-        tma_tensormap_acquire(_rt_desc(desc_words, V_SLOT(n_batch)))
+        tma_tensormap_acquire(_rt_desc(desc_words, cutlass.Int32(Q_SLOT)))
+        tma_tensormap_acquire(_rt_desc(desc_words, cutlass.Int32(DO_SLOT)))
+        tma_tensormap_acquire(_rt_desc(desc_words, cutlass.Int32(K_SLOT)))
+        tma_tensormap_acquire(_rt_desc(desc_words, cutlass.Int32(V_SLOT)))
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
     # Pre-armed: nothing has consumed the operand or the ring yet, so the first
@@ -452,7 +461,7 @@ def _tmaldg_warp_group(
             tma_load_tile(
                 sOperand[0],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, Q_SLOT(n_batch)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(Q_SLOT)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
                     if cutlass.const_expr(_THD)
                     else tma_q(cutlass.Int32(0), head_g, q_row_base, batch_g)
                 ),
@@ -465,7 +474,7 @@ def _tmaldg_warp_group(
             tma_load_tile(
                 sOperand[0],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, DO_SLOT(n_batch)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(DO_SLOT)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
                     if cutlass.const_expr(_THD)
                     else tma_do(cutlass.Int32(0), head_g, q_row_base, batch_g)
                 ),
@@ -496,7 +505,7 @@ def _tmaldg_warp_group(
                 tma_load_tile(
                     sRing[ring_state.idx],
                     (
-                        tma_slice_runtime_desc(_rt_desc(desc_words, K_SLOT(n_batch)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
+                        tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(K_SLOT)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
                         if cutlass.const_expr(_THD)
                         else tma_k(cutlass.Int32(0), kv_head_g, ring_row, batch_g)
                     ),
@@ -509,7 +518,7 @@ def _tmaldg_warp_group(
                 tma_load_tile(
                     sRing[ring_state.idx],
                     (
-                        tma_slice_runtime_desc(_rt_desc(desc_words, V_SLOT(n_batch)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
+                        tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(V_SLOT)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
                         if cutlass.const_expr(_THD)
                         else tma_v(cutlass.Int32(0), kv_head_g, ring_row, batch_g)
                     ),
@@ -1347,6 +1356,49 @@ def _tma_swz(byte_w: int):
     return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
 
 
+@cute.kernel
+def _clamp_thd_input_descs_kernel(
+    base_q_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_do_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    desc_words: cute.Tensor,
+    meta_t: cute.Tensor,
+    n_batch: cutlass.Int32,
+) -> None:
+    """Copy this kernel's four input descriptors, clamped to the PACKED TOTALS.
+
+    A THD caller binds Q/K/V/dO at buffer CAPACITY -- under continuous batching
+    the buffers are sized for the maximum and the current packing fills part of
+    them -- so the last sequence's tile tail steps into bytes that may never
+    have been written.  Masked score columns are NaN-safe here (the mask is a
+    select), but the MMA is not, and a declared ``max_total_seq_len`` does not
+    help: it is a MAXIMUM, while the row that must become zero is the CURRENT
+    packed total ``cu_q[B]`` -- a device value.  Hence the clamp, on device,
+    from the metadata the setup launch published.
+
+    One elected thread; the release fence publishes all four to the TMA proxy,
+    and the kernel boundary orders them before the main launch reads them.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+        meta = cutlass.make_array_view(meta_t)
+        t_q = cutlass.Int32(meta[cutlass.Int32(2) * n_batch])  # cu_q[B]
+        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
+        emit_clamped_desc(base_q_desc, desc_words, cutlass.Int32(Q_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
+        emit_clamped_desc(base_do_desc, desc_words, cutlass.Int32(DO_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
+        emit_clamped_desc(base_k_desc, desc_words, cutlass.Int32(K_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+        emit_clamped_desc(base_v_desc, desc_words, cutlass.Int32(V_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+        nvvm.fence_proxy_release(
+            nvvm.MemScope.GPU,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
+_clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     q_tensor: cute.Tensor,
@@ -1416,6 +1468,17 @@ def _host(
     q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster
     if cutlass.const_expr(_THD):
         grid_shape = (N_THD_UNITS * CFG.CGA_M, 1, 1)
+        # Ahead of the main launch, on the same stream: kernel-boundary
+        # ordering is what makes the patched descriptors visible below.
+        _clamp_thd_input_descs_kernel(
+            tma_q_desc,
+            tma_do_desc,
+            tma_k_desc,
+            tma_v_desc,
+            desc_words,
+            seq_kv_lens_tensor,
+            cutlass.Int32(B),
+        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     else:
         grid_shape = (q_clusters * CFG.CGA_M, QH_CHUNK, B)
 
@@ -1556,7 +1619,9 @@ def compile(  # noqa: A001
         # The metadata buffer (THD_BWD_META_WORDS(B)) and the descriptor array
         # (THD_BWD_DESC_SLOTS(B) tensor maps), both written by the setup launch.
         fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (5 * b + 5,), stride_order=(0,), assumed_align=16)
-        fake_desc_words = cute.runtime.make_fake_compact_tensor(cutlass.Int64, ((3 * b + 4) * (128 // 8),), stride_order=(0,), assumed_align=16)
+        fake_desc_words = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int64, (THD_STAGE2_DESC_SLOTS * _TENSOR_MAP_QWORDS,), stride_order=(0,), assumed_align=16
+        )
     else:
         fake_do_dot = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_dot), stride_order=(2, 1, 0), assumed_align=16)
         fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16)
