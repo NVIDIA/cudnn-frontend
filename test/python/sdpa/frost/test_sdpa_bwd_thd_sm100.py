@@ -86,7 +86,10 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
     eq, ekv = env(b, s_max_q), env(b, s_max_kv)
     e_stats = torch.empty(b, h, s_max_q, 1, device=dev, dtype=torch.float32)
     dq, dk, dv = torch.zeros_like(q_p), torch.zeros_like(k_p), torch.zeros_like(v_p)
-    stats = lse_p.reshape(t_q, h) if token_major_stats else lse_p
+    # TRANSPOSED, not reshaped: lse_p is head-major [1, H, T], so a reshape to
+    # (T, H) reinterprets that memory instead of re-laying it and hands the
+    # kernel garbage that looks correctly shaped.
+    stats = lse_p[0].transpose(0, 1).contiguous() if token_major_stats else lse_p
 
     api = SdpaBwdDslSm100(
         sample_q=eq,
@@ -148,12 +151,6 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
     assert not failures, "\n".join(bad)
 
 
-# Strict xfail, not a skip or a deletion: head-major packed Stats works at any
-# B, token-major does not yet, and strict means the day it does this XPASSes and
-# forces the marker off rather than passing silently.
-_MULTI_SEQ_BROKEN = pytest.mark.xfail(strict=True, reason="THD: token-major packed Stats is not read correctly at B > 1")
-
-
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
 def test_thd_self_attention(dt):
     """Three sequences of unequal length, none a tile multiple."""
@@ -170,7 +167,38 @@ def test_thd_single_sequence_matches_dense_shape():
     _run((512,), (512,))
 
 
-@_MULTI_SEQ_BROKEN
 def test_thd_stats_token_major():
     """The other packed Stats layout the forward can emit."""
     _run((300, 128), (300, 128), token_major_stats=True)
+
+
+def test_thd_requires_declared_totals():
+    """THD without max_total_seq_len_* is DECLINED, not silently mis-sized.
+
+    Asserted rather than skipped, per the engine contract: the blocked
+    workspace's row count and delta's row stride are both fixed at build time
+    from the packed token capacity, and undeclared that capacity falls back to
+    B * S_max -- more tokens than a packed buffer holds.
+    """
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    dev, b, h, s_max = "cuda", 2, 2, 256
+    env = torch.empty(b, s_max, h, _D, device=dev, dtype=torch.bfloat16).permute(0, 2, 1, 3)
+    e_stats = torch.empty(b, h, s_max, 1, device=dev, dtype=torch.float32)
+    kw = dict(
+        sample_q=env,
+        sample_k=env,
+        sample_v=env,
+        sample_o=env,
+        sample_do=env,
+        sample_stats=e_stats,
+        sample_dq=env,
+        sample_dk=env,
+        sample_dv=env,
+        scale_softmax=1.0 / math.sqrt(_D),
+        thd=True,
+    )
+    with pytest.raises(ValueError, match="max_total_seq_len"):
+        SdpaBwdDslSm100(**kw).check_support()
+    # ... and declared, the same graph is accepted.
+    assert SdpaBwdDslSm100(**kw, max_total_seq_len_q=400, max_total_seq_len_kv=400).check_support()

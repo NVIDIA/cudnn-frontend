@@ -2230,6 +2230,19 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: THD carries its lengths in the metadata buffer, not seq_len tensors"
             )
             self._value_error_if(self.is_causal, "SM100 bwd: THD with a causal mask is not implemented (the stage-3 K-trim is in absolute workspace rows)")
+            # The declared totals are REQUIRED, and the reason is the workspace,
+            # not the numerics.  scratch_workspace_bytes() is a BUILD-time
+            # function: the blocked S/dS row count and delta's row stride are
+            # both fixed from the packed token capacity before any buffer
+            # exists.  Undeclared, that capacity falls back to B * S_max --
+            # more tokens than a packed buffer holds -- and the packed views
+            # would read past it.  cuDNN's own backward node sizes its ragged
+            # workspaces from the same attribute.
+            self._value_error_if(
+                self.max_total_seq_len_q is None or self.max_total_seq_len_kv is None,
+                "SM100 bwd THD: max_total_seq_len_q and max_total_seq_len_kv must be declared "
+                "(the blocked workspace is sized from the packed token totals at build time)",
+            )
         else:
             self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: padding masks (seq lens) are not implemented")
         self._value_error_if(self.deterministic, "SM100 bwd: deterministic mode is not implemented")
