@@ -111,6 +111,11 @@ class MatmulTemplateParams:
 
     a_is_m_major: bool = False
     b_is_n_major: bool = True
+    # THD / varlen: the S/dS A operand is the BLOCKED workspace, B and the
+    # output are PACKED, and the per-group offsets come from the metadata the
+    # setup launch published.  Which axis is ragged follows from
+    # ``a_is_m_major``, so it needs no parameter of its own.
+    thd_varlen: bool = False
     # Causal K-trim.  Stage 2 under a causal mask leaves the tiles above the
     # diagonal UNWRITTEN, so this is a correctness requirement before it is an
     # optimization: a stage-3 GEMM must not read them.
@@ -159,6 +164,13 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
     if params.vec_bytes_epi not in (16, 32):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
+    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
+        # The causal K-trim assumes the workspace is one dense rectangle per
+        # (batch, head), which is exactly what THD's blocked layout is not: the
+        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
+        # workspace rows. Combining them needs the trim rewritten per group,
+        # which is a follow-up, not a silent approximation.
+        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented")
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

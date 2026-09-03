@@ -2441,6 +2441,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     n_head=chunk,
                     n_batch=b,
                     stream=stream,
+                    meta=seq_kv,
+                    desc_words=desc_words,
                 )
                 mm_lo.matmul_bh(
                     ds_ws.permute(3, 2, 1, 0),
@@ -2449,6 +2451,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     n_head=chunk,
                     n_batch=b,
                     stream=stream,
+                    meta=seq_kv,
+                    desc_words=desc_words,
                 )
                 # dQ = dS.K. Under GQA the K head is shared by `group` Q heads,
                 # so the GEMM runs once per group MEMBER: taking every `group`-th
@@ -2466,6 +2470,8 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                         n_head=kv_n,
                         n_batch=b,
                         stream=stream,
+                        meta=seq_kv,
+                        desc_words=desc_words,
                     )
 
             if gqa:
