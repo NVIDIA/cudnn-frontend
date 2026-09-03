@@ -105,51 +105,11 @@ def _auto_swizzle_w(m, n, k, nt_n):
 
 
 # @@SPLITK_ONLY:BEGIN@@
-SPLITK_REDUCE_THREADS = 256
+from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import (
+    SPLITK_REDUCE_THREADS,
+    _splitk_reduce_kernel,
+)
 
-
-@cute.kernel
-def _splitk_reduce_kernel(
-    m: cutlass.Int64,
-    n: cutlass.Int64,
-    batch: cutlass.Int64,
-    out_stride_m: cutlass.Int64,
-    out_stride_n: cutlass.Int64,
-    out_stride_l: cutlass.Int64,
-    mD: cute.Tensor,
-    mSplitK_partials: cute.Tensor,
-) -> None:
-    row = cutlass.Int64(cute.arch.block_idx()[0])
-    col = (cutlass.Int64(cute.arch.block_idx()[1]) * SPLITK_REDUCE_THREADS + cute.arch.thread_idx()[0]) * splitk_reduce_elems
-    batch_idx = cutlass.Int64(cute.arch.block_idx()[2])
-    if cutlass.const_expr(USE_PDL):
-        nvvm.griddepcontrol("wait")
-    if col < n:
-        elems_per_partial = m * n
-        partials_ptr = mSplitK_partials.iterator.raw_ptr()
-        # partials layout: [batch*split][M][N]
-        first_partial_offset = (batch_idx * split_k_slices * m + row) * n + col
-
-        chain_0 = (partials_ptr + first_partial_offset).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-        chain_1 = cutlass.full_like(chain_0, 0.0)
-        chain_2 = cutlass.full_like(chain_0, 0.0)
-        chain_3 = cutlass.full_like(chain_0, 0.0)
-        for s in cutlass.range_constexpr(1, split_k_slices):
-            _p = (partials_ptr + first_partial_offset + s * elems_per_partial).load(count=splitk_reduce_elems, alignment=splitk_reduce_elems * 4)
-            if cutlass.const_expr(s % 4 == 0):
-                chain_0 = chain_0 + _p
-            elif cutlass.const_expr(s % 4 == 1):
-                chain_1 = chain_1 + _p
-            elif cutlass.const_expr(s % 4 == 2):
-                chain_2 = chain_2 + _p
-            else:
-                chain_3 = chain_3 + _p
-        acc = (chain_0 + chain_1) + (chain_2 + chain_3)
-        d_offset = batch_idx * out_stride_l + row * out_stride_m + col * out_stride_n
-        (mD.iterator.raw_ptr() + d_offset).store(acc.to(cd_dtype), alignment=splitk_reduce_elems * cd_dtype.width // 8)
-
-
-_splitk_reduce_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # @@SPLITK_ONLY:END@@
 
 
@@ -1413,6 +1373,10 @@ def _host(
         out_stride_l_0,
         # @@INJECT_SPLITK_OUTPUT@@
         splitk_partials,
+        split_k_slices,
+        splitk_reduce_elems,
+        cd_dtype,
+        USE_PDL,
     ).launch(
         grid=(
             m,

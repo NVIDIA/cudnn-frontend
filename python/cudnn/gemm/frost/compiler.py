@@ -2528,6 +2528,12 @@ class CompiledFusedGemm:
     # workspace for split-K
     workspace_bytes: int = 0
 
+    def workspace_bytes_for(self, batch: int, m: int, n: int) -> int:
+        """workspace for a given shape."""
+        if self.config.split_k_slices == 1:
+            return 0
+        return align_up(self.config.split_k_slices * batch * m * n * 4)
+
     @property
     def tma_slots(self) -> "frozenset[int]":
         """Which dense output slots ride the TMA-C surface."""
@@ -2799,8 +2805,12 @@ class CompiledFusedGemm:
                 # Every slice must own at least one whole CTA-K tile.
                 if (k + cta_k_elems - 1) // cta_k_elems < split_k_slices:
                     raise ValueError(
-                        f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the " f"{(k + cta_k_elems - 1) // cta_k_elems} K tile(s) of K={k}"
+                        f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the "
+                        f"{(k + cta_k_elems - 1) // cta_k_elems} K tile(s) of K={k}; "
+                        f"the plan was built for a deeper K — rebuild for this shape"
                     )
+                if batch * split_k_slices > 65535:
+                    raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={split_k_slices} " f"exceeds the CUDA grid.z limit of 65535")
                 extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
             return launchable(
                 tuple(problem),
@@ -3738,6 +3748,7 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
     _check_executable(chain)
     if config is None:
         config = plan_config(chain)
+    _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from .kernel_registry import select_template
 
@@ -3794,6 +3805,8 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         # The reducer unrolls its accumulation at trace time; 32 bounds the
         # unroll and is where the auto-selector caps S anyway.
         reasons.append(f"more than 32 slices ({config.split_k_slices})")
+    if chain.matmul.batch * config.split_k_slices > 65535:
+        reasons.append(f"batch {chain.matmul.batch} * {config.split_k_slices} slices exceeds the grid.z limit of 65535")
     if reasons:
         return f"split_k_slices={config.split_k_slices} supports only a plain matmul with one " f"dense N-major output; got: {', '.join(reasons)}"
     return None

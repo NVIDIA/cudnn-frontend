@@ -42,6 +42,18 @@ class _FrostGemmPlan(CompiledPlan):
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
+    def get_workspace_size_for_shapes(self, override_uids, override_shapes) -> int:
+        """Workspace for an override-shape execute."""
+        sized = getattr(self._compiled, "workspace_bytes_for", None)
+        if sized is None or not self.get_workspace_size():
+            return self.get_workspace_size()
+        out_uid = self._compiled.binding.outputs[0].get_uid()
+        for uid, shape in zip(override_uids or (), override_shapes or ()):
+            if uid == out_uid:
+                b, m, n = (int(x) for x in shape)
+                return sized(b, m, n)
+        return self.get_workspace_size()
+
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         indices = self._operand_indices
         if indices is None:
