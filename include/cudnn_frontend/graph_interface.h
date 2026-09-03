@@ -2823,8 +2823,18 @@ class Graph : public ICudnn, public INode {
                         auto sdpa_bwd_attributes = j_sub_node.get<SDPA_backward_attributes>();
                         CHECK_TENSORS(sdpa_bwd_attributes);
                         FILL_GLOBAL_IO_TENSOR_MAP(sdpa_bwd_attributes);
-                        sub_nodes.emplace_back(
-                            std::make_unique<CompositeSDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
+                        switch (sdpa_bwd_attributes.implementation) {
+                            case AttentionImplementation_t::AUTO:
+                                return {error_code_t::INVALID_VALUE,
+                                        "Implementation cannot be AUTO in serialized form"};
+                            case AttentionImplementation_t::COMPOSITE:
+                                sub_nodes.emplace_back(std::make_unique<CompositeSDPABackwardNode>(
+                                    std::move(sdpa_bwd_attributes), context));
+                                break;
+                            case AttentionImplementation_t::UNIFIED:
+                                sub_nodes.emplace_back(
+                                    std::make_unique<UnifiedSDPABackwardNode>(std::move(sdpa_bwd_attributes), context));
+                        }
                     } else if (tag == "MATMUL") {
                         auto matmul_attributes = j_sub_node.get<Matmul_attributes>();
                         CHECK_TENSORS(matmul_attributes);
@@ -3916,7 +3926,23 @@ Graph::sdpa_backward(std::shared_ptr<Tensor_attributes> q,
     auto dK = attributes.outputs[SDPA_backward_attributes::output_names::dK] = output_tensor(attributes.name + "::dK");
     auto dV = attributes.outputs[SDPA_backward_attributes::output_names::dV] = output_tensor(attributes.name + "::dV");
 
-    sub_nodes.emplace_back(std::make_unique<CompositeSDPABackwardNode>(std::move(attributes), context));
+    if (attributes.implementation == AttentionImplementation_t::AUTO) {
+        // Sets attributes.implementation to a supporting implementation,
+        // or leaves as AUTO if none found
+        attributes._auto_select_implementation(context);
+    }
+
+    switch (attributes.implementation) {
+        case AttentionImplementation_t::AUTO:
+            throw std::runtime_error("No suitable implementation for given SDPA_backward_attributes");
+            break;
+        case AttentionImplementation_t::COMPOSITE:
+            sub_nodes.emplace_back(std::make_unique<CompositeSDPABackwardNode>(std::move(attributes), context));
+            break;
+        case AttentionImplementation_t::UNIFIED:
+            sub_nodes.emplace_back(std::make_unique<UnifiedSDPABackwardNode>(std::move(attributes), context));
+            break;
+    }
 
     return {dQ, dK, dV};
 }
