@@ -65,6 +65,11 @@ class _FrostGemmPlan(CompiledPlan):
         # which carry the shape this execute runs, override_shapes included.
         operands = variant_pack.operands(indices)
         required = self.get_workspace_size()
+        if required:
+            sized = getattr(self._compiled, "workspace_bytes_for", None)
+            if sized is not None:
+                out = operands[self._tensors.index(self._compiled.binding.outputs[0])].shape
+                required = sized(int(out[0]), int(out[1]), int(out[2]))
         workspace = Workspace.over(variant_pack, required, "frost_gemm") if required else None
         launch = self._launch
         if launch is not None:

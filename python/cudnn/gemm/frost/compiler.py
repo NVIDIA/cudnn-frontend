@@ -3571,7 +3571,12 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
 _TERMINAL_QUANT_ONE_CTA_MAX_M = 1408
 
 
-def plan_config(chain: FusionChain) -> TileConfig:
+def _graph_dynamic_shapes(graph) -> bool:
+    """Whether the frontend graph declared its shapes dynamic."""
+    return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False) -> TileConfig:
     """Choose the automatic tile strategy for one analyzed fusion chain."""
     from .kernel_registry import preferred_strategy
     from .tile_config import select_config
@@ -3604,7 +3609,11 @@ def plan_config(chain: FusionChain) -> TileConfig:
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
-    return _auto_split_k(chain, preferred_strategy(chain, config))
+    config = preferred_strategy(chain, config)
+    # skip splitK when dynamic_shape is enabled
+    if dynamic_shapes:
+        return config
+    return _auto_split_k(chain, config)
 
 
 def _precheck_plain(
@@ -3747,7 +3756,7 @@ def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) ->
         raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
     if config is None:
-        config = plan_config(chain)
+        config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph))
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from .kernel_registry import select_template
@@ -3805,8 +3814,6 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         # The reducer unrolls its accumulation at trace time; 32 bounds the
         # unroll and is where the auto-selector caps S anyway.
         reasons.append(f"more than 32 slices ({config.split_k_slices})")
-    if chain.matmul.batch * config.split_k_slices > 65535:
-        reasons.append(f"batch {chain.matmul.batch} * {config.split_k_slices} slices exceeds the grid.z limit of 65535")
     if reasons:
         return f"split_k_slices={config.split_k_slices} supports only a plain matmul with one " f"dense N-major output; got: {', '.join(reasons)}"
     return None

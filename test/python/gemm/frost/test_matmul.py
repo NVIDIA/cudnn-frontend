@@ -3411,8 +3411,10 @@ def test_sm120_render_smoke() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _splitk_graph(B, M, N, K, io_dt=cudnn.data_type.BFLOAT16, out_dt=cudnn.data_type.BFLOAT16):
-    g = cudnn.pygraph(io_data_type=io_dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+def _splitk_graph(B, M, N, K, io_dt=cudnn.data_type.BFLOAT16, out_dt=cudnn.data_type.BFLOAT16, dynamic=False):
+    g = cudnn.pygraph(
+        io_data_type=io_dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_dynamic_shape_enabled=dynamic
+    )
     A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1])
     Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K])
     C = g.matmul(name="mm", A=A, B=Bt)
@@ -3627,6 +3629,14 @@ def test_splitk_auto_select():
     assert 60000 * slices(_splitk_graph(60000, 128, 128, 65536)[0]) <= 65535
     # Fused graph never auto-splits (gate reused).
     assert slices(_splitk_fused_graph(K=8192)) == 1
+    # A dynamic-shape graph never auto-splits: S is baked at compile, and a
+    # runtime K below S CTA-K tiles cannot be served without a rebuild.
+    from cudnn.gemm.frost.compiler import _graph_dynamic_shapes, plan_config
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g_dyn = _splitk_graph(1, 256, 256, 16384, dynamic=True)[0]
+    assert _graph_dynamic_shapes(g_dyn)
+    assert plan_config(analyze(g_dyn), dynamic_shapes=_graph_dynamic_shapes(g_dyn)).split_k_slices == 1
 
 
 def test_splitk_config_name_round_trip():
