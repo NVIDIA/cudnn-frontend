@@ -33,13 +33,30 @@ BF16_NAME = "QKV BF16"
 def _quantize_mxfp8(
     x: torch.Tensor, *, columnwise: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return an MXFP8 tensor and its F8_128x4 SF tensor for direct SDPA."""
+    """Return MXFP8 data/SF without materializing a monolithic FP32 Q tensor."""
     from sdpa.mxfp8_quant import quantize_to_mxfp8
 
-    b, h, s, d = x.shape
-    data_d, _dq_d, sf_d, data_s, _dq_s, sf_s = quantize_to_mxfp8(x.float(), b, h, s, d)
-    data, sf = (data_s, sf_s) if columnwise else (data_d, sf_d)
-    return data.reshape_as(x), sf
+    def quantize_chunk(x_chunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        chunk_b, h, s, d = x_chunk.shape
+        data_d, _dq_d, sf_d, data_s, _dq_s, sf_s = quantize_to_mxfp8(
+            x_chunk.float(), chunk_b, h, s, d, with_ref=False
+        )
+        data, sf = (data_s, sf_s) if columnwise else (data_d, sf_d)
+        return data, sf
+
+    batch = x.shape[0]
+    chunk_size = 8
+    if batch <= chunk_size:
+        return quantize_chunk(x)
+
+    data_chunks: list[torch.Tensor] = []
+    sf_chunks: list[torch.Tensor] = []
+    for x_chunk in x.split(chunk_size, dim=0):
+        data, sf = quantize_chunk(x_chunk)
+        data_chunks.append(data)
+        sf_chunks.append(sf)
+        torch.cuda.empty_cache()
+    return torch.cat(data_chunks, dim=0), torch.cat(sf_chunks, dim=0)
 
 
 def _parse_positive_ints(value: str) -> tuple[int, ...]:
@@ -178,9 +195,7 @@ def _benchmark_shape(
     """Run the three-way comparison at one B, Sq=Sk point."""
     shape_q = (batch, q_heads, seqlen, dim)
     shape_kv = (batch, kv_heads, seqlen, dim)
-    q_bf16 = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16).normal_(
-        0.0, 0.5
-    )
+    q_bf16 = torch.empty(shape_q, device="cuda", dtype=torch.bfloat16).normal_(0.0, 0.5)
     k_bf16 = torch.empty(shape_kv, device="cuda", dtype=torch.bfloat16).normal_(
         0.0, 0.5
     )
