@@ -25,9 +25,33 @@ The API to set a dynamic shape graph's kernel cache is:
 graph.set_kernel_cache(kernel_cache)
 ```
 
+### Kernel cache introspection
+
+Starting with cuDNN 9.27, two accessors report the state of a finalized kernel cache:
+
+```cpp
+int64_t revision = 0;
+int64_t size     = 0;
+kernel_cache->revision(revision);   // counter that shows if the contents changed
+kernel_cache->size(size);           // number of entries
+```
+
+The same two accessors are available in Python:
+
+```python
+revision = kernel_cache.revision()
+size = kernel_cache.size()
+```
+
+Both accessors need a finalized kernel cache. They return an error before `build()`.
+
+- Use `revision()`, and not `size()`, to find if the cache changed. cuDNN can replace data that is already in the cache, so `size()` is not a reliable measure. An insertion, a replacement, a removal, or an eviction each add one to the revision counter. A lookup does not change it. A change in the counter shows, for example, that a new serialization is worth the cost.
+- Two different shapes can use the same kernel cache entry, and `size()` can stay the same after a build with a new shape.
+- The revision counter is local to the process. It is not part of the serialized data, and a `from_json()` load starts a new count. Two kernel caches have no common count.
+
 ## Thread-safety contract for KernelCache
 
-The `KernelCache` API (`build`, `from_json`, `to_json`, `is_finalized`) is **internally synchronized** with a plain `std::mutex`. Multiple threads may call these methods concurrently on the same `KernelCache` instance without external synchronization.
+The `KernelCache` API is **internally synchronized** with a plain `std::mutex`. Multiple threads may call these methods concurrently on the same `KernelCache` instance without external synchronization.
 
 `build()` is idempotent under the lock: the first caller to acquire the mutex initializes and finalizes the descriptor; subsequent callers return `OK` immediately without re-initializing it. This makes it safe for N graph threads sharing one `KernelCache` to each call `build()` concurrently — exactly one backend descriptor is created and finalized.
 
