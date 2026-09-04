@@ -1672,12 +1672,12 @@ class FlexAttentionBackwardSm100:
             # (4) dK += dS.T @ Q (2-CTA: needs separate Qt load)
             if const_expr(tma_atom_Qt is not None):
                 gQt = cute.local_tile(mQt_cur, cute.select(self.mma_tiler_dsq, mode=[1, 2]), (0, None))
-                tdKgQt = thr_mma_dK.partition_B(gQt)
+                tdK_gQt = thr_mma_dK.partition_B(gQt)
                 load_Qt, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Qt,
                     cta_coord=block_in_cluster_coord_vmnk[1],
                     cta_layout=b_cta_layout,
-                    src_tensor=tdKgQt,
+                    src_tensor=tdK_gQt,
                     dst_tensor=sQt,
                     mcast_mask=q_do_mcast_mask,
                 )
@@ -2988,25 +2988,25 @@ class FlexAttentionBackwardSm100:
                     mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
                     gdK = cute.local_tile(mdK_cur, (cluster_tile_n, self.tile_hdim), (n_block_for_tile, 0))
                     gdV = cute.local_tile(mdV_cur, (cluster_tile_n, self.tile_hdimv), (n_block_for_tile, 0))
-                    tdKgdK = gmem_thr_copy_zero_dK.partition_D(gdK)
+                    tdK_gdK = gmem_thr_copy_zero_dK.partition_D(gdK)
                     tdVgdV = gmem_thr_copy_zero_dV.partition_D(gdV)
                     cdK = cute.make_identity_tensor((cluster_tile_n, self.tile_hdim))
                     cdV = cute.make_identity_tensor((cluster_tile_n, self.tile_hdimv))
                     tdKcdK = gmem_thr_copy_zero_dK.partition_D(cdK)
                     tdVcdV = gmem_thr_copy_zero_dV.partition_D(cdV)
-                    assert cute.size(tdKgdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
-                    zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
+                    assert cute.size(tdK_gdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
+                    zero = cute.make_fragment_like(tdK_gdK[None, 0, 0])
                     zero.fill(0.0)
                     if tidx < 128:
-                        for i in cutlass.range_constexpr(tdKgdK.shape[1]):
+                        for i in cutlass.range_constexpr(tdK_gdK.shape[1]):
                             row_idx = tdKcdK[0, i, 0][0]
                             if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
-                                for j in cutlass.range_constexpr(tdKgdK.shape[2]):
+                                for j in cutlass.range_constexpr(tdK_gdK.shape[2]):
                                     if not const_expr(self.check_hdim_oob) or tdKcdK[0, i, j][1] < self.head_dim:
                                         cute.copy(
                                             gmem_tiled_copy_zero_dK,
                                             zero,
-                                            tdKgdK[None, i, j],
+                                            tdK_gdK[None, i, j],
                                         )
                     else:
                         for i in cutlass.range_constexpr(tdVgdV.shape[1]):
@@ -3378,14 +3378,14 @@ class FlexAttentionBackwardSm100:
         gdK = cute.local_tile(mdK_cur, (self.mma_tiler_dsq[0], self.tile_hdim), (None, 0))
         gdK_tile = gdK[None, None, n_block // self.cta_group_size]
 
-        tdKgdK = thr_mma_dK.partition_C(gdK_tile)
-        tdKgdK_r2g_p = thr_tmem_ld_dK.partition_D(tdKgdK)
-        tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
+        tdK_gdK = thr_mma_dK.partition_C(gdK_tile)
+        tdK_gdK_r2g_p = thr_tmem_ld_dK.partition_D(tdK_gdK)
+        tdK_gdK_r2g = self.split_wg(tdK_gdK_r2g_p, wg_idx, num_wg)
         if tidx < seqlen.seqlen_k - self.tile_n * n_block:
             cute.copy(
                 tiled_gmem_store_dK,
                 tdKrdK_r2s,
-                tdKgdK_r2g,
+                tdK_gdK_r2g,
             )
 
         cute.arch.sync_warp()
