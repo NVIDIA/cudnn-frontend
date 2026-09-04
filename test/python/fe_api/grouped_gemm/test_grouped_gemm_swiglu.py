@@ -221,6 +221,68 @@ def test_grouped_gemm_swiglu_wrapper_cache_prob_signature_smoke(request, monkeyp
     assert cache_entries == 2
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=3)
+def test_grouped_gemm_swiglu_wrapper_cache_keys_on_expert_count(request, monkeypatch):
+    """Two dense calls differing only in the expert count must not share a compiled object."""
+    try:
+        from cudnn import grouped_gemm_swiglu_wrapper_sm100
+        from cudnn.gemm.cutedsl.grouped.swiglu import api as grouped_gemm_swiglu_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    cache = grouped_gemm_swiglu_api._cache_of_GroupedGemmSwigluSm100Objects
+    cache.clear()
+    cfg = grouped_gemm_swiglu_init(
+        request=request,
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+    try:
+        for l in (4, 2):
+            cfg["l"], cfg["group_m_list"] = l, [256] * l
+            inputs = allocate_grouped_gemm_input_tensors(
+                n=cfg["n"],
+                k=cfg["k"],
+                l=l,
+                group_m_list=cfg["group_m_list"],
+                ab_dtype=cfg["ab_dtype"],
+                sf_dtype=cfg["sf_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                m_aligned=cfg["m_aligned"],
+            )
+            outputs = grouped_gemm_swiglu_wrapper_sm100(
+                a_tensor=inputs["a_tensor"],
+                b_tensor=inputs["b_tensor"],
+                sfa_tensor=inputs["sfa_tensor"],
+                sfb_tensor=inputs["sfb_tensor"],
+                padded_offsets=inputs["padded_offsets_tensor"],
+                alpha_tensor=inputs["alpha_tensor"],
+                norm_const_tensor=inputs["norm_const_tensor"],
+                prob_tensor=inputs["prob_tensor"],
+                acc_dtype=cfg["acc_dtype"],
+                c_dtype=cfg["c_dtype"],
+                d_dtype=cfg["d_dtype"],
+                sf_vec_size=cfg["sf_vec_size"],
+                mma_tiler_mn=cfg["mma_tiler_mn"],
+                cluster_shape_mn=cfg["cluster_shape_mn"],
+            )
+            torch.cuda.synchronize()
+            assert tuple(outputs["amax_tensor"].shape) == (l, 1)
+            check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+        assert len(cache) == 2
+    finally:
+        cache.clear()
+
+
 """
 GroupedGemmSwiglu API with explicit check_support, compile, and execute paths.
 Use this method when running one static configuration for each GroupedGemmSwiglu object.
