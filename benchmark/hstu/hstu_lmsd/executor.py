@@ -10,8 +10,8 @@ from typing import Optional
 from cuda.bindings import driver as cuda
 import torch
 
-from cudnn.hstu_lmsd import HSTULMSDBwdSm100, HSTULMSDFwdSm100
-from cudnn.hstu_lmsd.cutedsl.cute_dsl_ln_mul_dropout_bwd import (
+from cudnn.hstu.hstu_lmsd import HSTULMSDBwdSm100, HSTULMSDFwdSm100
+from cudnn.hstu.hstu_lmsd.cutedsl.cute_dsl_ln_mul_dropout_bwd import (
     TARGET_TILES,
 )
 
@@ -41,9 +41,7 @@ class HSTULMSDExecutor:
             raise RuntimeError("CUDA is not available")
         major, minor = torch.cuda.get_device_capability(self.device)
         if major != 10:
-            raise RuntimeError(
-                f"HSTU LMSD benchmarks require SM10x, found SM{major}{minor}"
-            )
+            raise RuntimeError(f"HSTU LMSD benchmarks require SM10x, found SM{major}{minor}")
 
         n = shape.num_rows
         d = shape.hidden_size
@@ -58,28 +56,18 @@ class HSTULMSDExecutor:
             self.u = self._u_storage[:, :d]
             self.weight = torch.randn((d,), dtype=torch.bfloat16, device=self.device)
             self.bias = torch.randn((d,), dtype=torch.bfloat16, device=self.device)
-            self.dy = torch.randn(
-                (n, 3 * d), dtype=torch.bfloat16, device=self.device
-            )
+            self.dy = torch.randn((n, 3 * d), dtype=torch.bfloat16, device=self.device)
 
-            self.y = torch.empty(
-                (n, 3 * d), dtype=torch.bfloat16, device=self.device
-            )
+            self.y = torch.empty((n, 3 * d), dtype=torch.bfloat16, device=self.device)
             self.mean = torch.empty((n,), dtype=torch.float32, device=self.device)
             self.rstd = torch.empty((n,), dtype=torch.float32, device=self.device)
             self.mask = torch.empty((n, d), dtype=torch.int8, device=self.device)
             self.dx = torch.empty((n, d), dtype=torch.bfloat16, device=self.device)
             self.du = torch.empty((n, d), dtype=torch.bfloat16, device=self.device)
-            self.dweight = torch.empty(
-                (d,), dtype=torch.bfloat16, device=self.device
-            )
+            self.dweight = torch.empty((d,), dtype=torch.bfloat16, device=self.device)
             self.dbias = torch.empty((d,), dtype=torch.bfloat16, device=self.device)
-            self.dweight_workspace = torch.empty(
-                (TARGET_TILES, d), dtype=torch.float32, device=self.device
-            )
-            self.dbias_workspace = torch.empty(
-                (TARGET_TILES, d), dtype=torch.float32, device=self.device
-            )
+            self.dweight_workspace = torch.empty((TARGET_TILES, d), dtype=torch.float32, device=self.device)
+            self.dbias_workspace = torch.empty((TARGET_TILES, d), dtype=torch.float32, device=self.device)
 
         self.forward_api = HSTULMSDFwdSm100(
             sample_x=self.x,
@@ -138,21 +126,8 @@ class HSTULMSDExecutor:
         n = self.shape.num_rows
         d = self.shape.hidden_size
         element_bytes = 2
-        forward_bytes = (
-            2 * n * d * element_bytes
-            + 2 * d * element_bytes
-            + 3 * n * d * element_bytes
-            + n * d
-            + 2 * n * 4
-        )
-        backward_bytes = (
-            5 * n * d * element_bytes
-            + 2 * d * element_bytes
-            + 2 * n * 4
-            + n * d
-            + 2 * n * d * element_bytes
-            + 2 * d * element_bytes
-        )
+        forward_bytes = 2 * n * d * element_bytes + 2 * d * element_bytes + 3 * n * d * element_bytes + n * d + 2 * n * 4
+        backward_bytes = 5 * n * d * element_bytes + 2 * d * element_bytes + 2 * n * 4 + n * d + 2 * n * d * element_bytes + 2 * d * element_bytes
         if mode == "forward":
             return forward_bytes
         if mode == "backward":

@@ -25,8 +25,6 @@ TARGET_TILES = 13568
 # D=512, this limit keeps their largest flattened element offset <= 2^31 - 1.
 MAX_NUM_ROWS = (1 << 31) // 512
 
-# The current explicit API requires D == 512.
-
 MIN_BLOCKS_PER_MP = 12
 
 

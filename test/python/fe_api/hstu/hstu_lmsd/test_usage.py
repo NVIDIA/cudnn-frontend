@@ -12,13 +12,13 @@ except (ImportError, OSError) as exc:
     pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
 
 from cudnn.api_base import TensorDesc
-from cudnn.hstu_lmsd import (
+from cudnn.hstu.hstu_lmsd import (
     HSTULMSDBwdSm100,
     HSTULMSDFwdSm100,
     hstu_lmsd_backward,
     hstu_lmsd_forward,
 )
-from cudnn.hstu_lmsd.cutedsl.cute_dsl_ln_mul_dropout_bwd import TARGET_TILES
+from cudnn.hstu.hstu_lmsd.cutedsl.cute_dsl_ln_mul_dropout_bwd import TARGET_TILES
 
 pytestmark = [
     pytest.mark.gpu_exclusive,
@@ -123,7 +123,7 @@ def test_metadata_only_check_support_accepts_forward_and_backward():
     ids=("hidden-size", "dtype", "layout", "row-count"),
 )
 def test_metadata_only_check_support_rejects_invalid_contracts(api_index, overrides, match):
-    """These cases were accepted too late unless check_support read TensorDesc."""
+    """Unsupported descriptors must fail during check_support()."""
     api = _metadata_only_apis(**overrides)[api_index]
     with pytest.raises(ValueError, match=match):
         api.check_support()

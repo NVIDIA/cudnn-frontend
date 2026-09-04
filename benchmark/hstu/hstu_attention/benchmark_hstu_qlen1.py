@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 import cudnn
 from cudnn import HSTUBwdSm100, HSTUFwdSm100
-from cudnn.hstu_attention import _interface
+from cudnn.hstu.hstu_attention import _interface
 
 _KV_LENGTH_PATTERN = (1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072)
 _Q1_FWD_TUNING_ALGORITHMS = (

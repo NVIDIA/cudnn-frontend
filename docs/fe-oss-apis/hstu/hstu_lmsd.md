@@ -173,6 +173,6 @@ reduction workspaces with shape `(13568, 512)`. Backward launches the main
 gradient kernel followed by the dWeight/dBias reduction kernel on the selected
 stream and does not recompute `y`.
 
-See the focused tests in [`test/python/fe_api/hstu_lmsd/`](../../test/python/fe_api/hstu_lmsd/)
+See the focused tests in [`test/python/fe_api/hstu/hstu_lmsd/`](../../../test/python/fe_api/hstu/hstu_lmsd/)
 for complete class and function calls. Benchmark workloads and measurement
-details are in the [HSTU LMSD benchmark README](../../benchmark/hstu_lmsd/README.md).
+details are in the [HSTU LMSD benchmark README](../../../benchmark/hstu/hstu_lmsd/README.md).

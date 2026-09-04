@@ -711,7 +711,7 @@ separate from the cuDNN Graph API described above.
 
 ### HSTU Attention FE OSS API (SM100/SM103)
 
-The experimental [HSTU Attention API](../fe-oss-apis/attention/hstu.md)
+The experimental [HSTU Attention API](../fe-oss-apis/hstu/hstu_attention.md)
 provides packed-variable-length forward and backward CuTe DSL kernels for
 Blackwell SM100/SM103 GPUs. HSTU applies SiLU to scaled QK scores without
 softmax, supports its specialized mask modes, and exposes the sequence

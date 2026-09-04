@@ -28,23 +28,22 @@ dependencies. The current kernels require an SM10x GPU and BF16 operands.
 
 ```bash
 # Forward and backward micro benchmarks plus the op-level E2E benchmark.
-python -m benchmark.hstu_lmsd.harness --shape smoke --mode all
+python -m benchmark.hstu.hstu_lmsd.harness --shape smoke --mode all
 
 # Production forward micro benchmark.
-python -m benchmark.hstu_lmsd.harness \
+python -m benchmark.hstu.hstu_lmsd.harness \
     --shape hstu_production --mode forward
 
 # Production forward-to-backward dataflow and a JSON result artifact.
-python -m benchmark.hstu_lmsd.harness \
+python -m benchmark.hstu.hstu_lmsd.harness \
     --shape hstu_production --mode e2e \
     --json benchmark/results/hstu_lmsd_production.json
 ```
 
 Use `--mode forward` or `--mode backward` for an individual micro benchmark,
 `--mode e2e` for one forward followed by one backward, and `--mode all` for all
-three measurements. `--warmup` and `--repeats` control sampling.
-Their defaults are 25 and 100, matching the benchmark that was previously
-embedded in the operation test.
+three measurements. `--warmup` and `--repeats` control sampling; their defaults
+are 25 and 100.
 
 ## Measurement Contract
 
@@ -63,9 +62,8 @@ embedded in the operation test.
 
 ## Kernel Configuration Rationale
 
-The forward kernel exposes only the shipping path. The choices below are fixed,
-not user-selectable runtime or compile-time knobs, so the implementation being
-reviewed is unambiguous.
+The forward kernel has one fixed implementation path. The choices below are not
+user-selectable runtime or compile-time knobs.
 
 | Choice | Rationale |
 |---|---|
@@ -73,7 +71,7 @@ reviewed is unambiguous.
 | One-row copy tile | Derives row ownership directly from the warp and avoids multi-row tile address work. |
 | Per-warp asynchronous `u` staging | Starts one 1024-byte global-to-shared bulk copy, reduces `x` while it is in flight, then reads `u` with 128-bit shared-memory loads. |
 | One current-row stage | Avoids the register, shared-memory, and barrier state required by cross-row prefetch. |
-| Scalar FP32 pointwise tail | Retains the measured v63 instruction schedule and bitwise output behavior. |
+| Scalar FP32 pointwise tail | Preserves the validated instruction schedule and bitwise output behavior. |
 | Reread `x` after the row reduction | Shortens the register live range; the second read is expected to hit cache. |
 | Streamed full 32-bit Philox samples | Matches the reference dropout probability and consumes each four-word result immediately to shorten its register live range. |
 | Load `weight` and `bias` after Philox | Keeps parameter fragments out of the integer-heavy random-number loop. |

@@ -145,7 +145,6 @@ class _HSTULMSDBase(APIBase):
             raise ValueError(f"u must have shape {tuple(x.shape)}, got {tuple(u.shape)}")
         if not 1 <= self.num_rows <= MAX_NUM_ROWS:
             raise ValueError(f"x row count must be in [1, {MAX_NUM_ROWS}], got {self.num_rows}")
-        # Supported matrix size: [N, D], with safe tiled offsets and D = 512.
         if self.hidden_size != 512:
             raise ValueError(f"HSTU LMSD currently supports D=512, got D={self.hidden_size}")
         _require_matrix_layout(x, "x", row_stride=self.hidden_size)
@@ -367,7 +366,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
 
 
 class HSTULMSDBwdSm100(_HSTULMSDBase):
-    """Explicit LMSD backward; the shipping path does not recompute y."""
+    """Explicit LMSD backward without forward-output recomputation."""
 
     def __init__(
         self,
@@ -469,10 +468,9 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         fake_db = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=ALIGNMENT_BYTES)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        # N is a runtime extent shared by every row-major operand. Compile one
-        # full-N kernel for all supported row counts with the same D/layout.
-        # Wide-stride dY/U operands use i64 row rebasing; MAX_NUM_ROWS keeps
-        # the direct X/mask/DX/DU tiled offsets within signed Int32.
+        # Compile the row count symbolically so one plan serves every supported N.
+        # Wide-stride dY/U use i64 row rebasing; MAX_NUM_ROWS keeps the remaining
+        # tiled offsets within signed Int32.
         rows = cute.sym_int()
         fake_dy_segment = self._make_fake_cute_tensor(
             dtype=self.dy_desc.dtype,

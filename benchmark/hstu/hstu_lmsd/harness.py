@@ -4,8 +4,8 @@
 """CLI harness for HSTU LMSD micro and forward-to-backward benchmarks.
 
 Examples:
-    python -m benchmark.hstu_lmsd.harness --shape smoke --mode all
-    python -m benchmark.hstu_lmsd.harness --shape hstu_production --mode all
+    python -m benchmark.hstu.hstu_lmsd.harness --shape smoke --mode all
+    python -m benchmark.hstu.hstu_lmsd.harness --shape hstu_production --mode all
 """
 
 from __future__ import annotations
@@ -139,16 +139,10 @@ def run_benchmarks(
     shape = get_model_shape(shape_name)
     executor = HSTULMSDExecutor(shape, seed=seed)
     if mode == "all":
-        timings = run_micro_benchmarks(
-            executor, warmup=warmup, repeats=repeats
-        )
-        timings.append(
-            run_e2e_benchmark(executor, warmup=warmup, repeats=repeats)
-        )
+        timings = run_micro_benchmarks(executor, warmup=warmup, repeats=repeats)
+        timings.append(run_e2e_benchmark(executor, warmup=warmup, repeats=repeats))
     elif mode == "e2e":
-        timings = [
-            run_e2e_benchmark(executor, warmup=warmup, repeats=repeats)
-        ]
+        timings = [run_e2e_benchmark(executor, warmup=warmup, repeats=repeats)]
     else:
         operation = executor.forward if mode == "forward" else executor.backward
         timings = [
@@ -179,11 +173,7 @@ def run_benchmarks(
 
 def _print_results(result: dict) -> None:
     shape = result["shape"]
-    print(
-        "HSTU LMSD "
-        f"shape={shape['name']} N={shape['num_rows']:,} D={shape['hidden_size']} "
-        f"u_stride={shape['u_storage_width']} device={result['device']}"
-    )
+    print(f"HSTU LMSD shape={shape['name']} N={shape['num_rows']:,} D={shape['hidden_size']} u_stride={shape['u_storage_width']} device={result['device']}")
     print("mode       p50(ms)  mean(ms)   min(ms)   p95(ms)  logical GB/s")
     for timing in result["timings"]:
         print(
@@ -229,10 +219,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     if args.list_shapes:
         for name, shape in MODEL_SHAPES.items():
-            print(
-                f"{name}: N={shape.num_rows:,}, D={shape.hidden_size}, "
-                f"u_stride={shape.u_storage_width}, p={shape.dropout_ratio}"
-            )
+            print(f"{name}: N={shape.num_rows:,}, D={shape.hidden_size}, u_stride={shape.u_storage_width}, p={shape.dropout_ratio}")
         return 0
     result = run_benchmarks(
         shape_name=args.shape,

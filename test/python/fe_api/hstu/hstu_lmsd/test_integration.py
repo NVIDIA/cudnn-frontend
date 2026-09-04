@@ -11,8 +11,8 @@ try:
 except (ImportError, OSError) as exc:
     pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
 
-import cudnn.hstu_lmsd.ops as _ops
-from cudnn.hstu_lmsd import hstu_lmsd_backward, hstu_lmsd_forward
+import cudnn.hstu.hstu_lmsd.ops as _ops
+from cudnn.hstu.hstu_lmsd import hstu_lmsd_backward, hstu_lmsd_forward
 
 pytestmark = [
     pytest.mark.gpu_exclusive,

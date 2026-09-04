@@ -115,7 +115,7 @@ class LnMulDropoutForward:
         key1 = cutlass.Uint32((seed >> 32) & MASK32)
 
         # Runtime loop bounds preserve one compiled binary across all supported
-        # row counts while retaining v63's persistent grid-stride schedule.
+        # row counts while retaining the persistent grid-stride schedule.
         for iteration in cutlass.range(num_iterations):
             row_block = block_idx + iteration * grid_size
             if row_block < num_row_blocks:
@@ -177,8 +177,8 @@ class LnMulDropoutForward:
                         rLmsdOut = cute.make_fragment_like(tXgLmsdOut)
                         rMask = cute.make_fragment_like(tXgMask)
 
-                        # Match the established reread-X schedule: the reduction
-                        # fragment is dead before X is fetched for the output pass.
+                        # Reload X only after the reduction fragment is dead,
+                        # limiting the register live range in the output pass.
                         tXgX = thread_copy.partition_S(gX[global_coord])
                         rX = cute.make_fragment_like(tXgX)
                         cute.copy(tensor_copy_atom, tXgX, rX)
@@ -245,7 +245,7 @@ class LnMulDropoutForward:
                             rXOut[element] = (x_value * scale if (mask_bits & MASK_X) != 0 else zero).to(gX.element_type)
                             rLmsdOut[element] = (layer_norm * scaled_silu if (mask_bits & MASK_LMSD) != 0 else zero).to(gX.element_type)
 
-                        # This order is part of the measured v63 schedule.
+                        # Keep this store order to preserve the measured instruction schedule.
                         cute.copy(tensor_copy_atom, rXOut, tXgXOut)
                         cute.copy(tensor_copy_atom, rSiluOut, tXgSiluOut)
                         cute.copy(tensor_copy_atom, rLmsdOut, tXgLmsdOut)
