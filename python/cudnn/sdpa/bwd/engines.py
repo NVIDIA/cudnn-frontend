@@ -163,6 +163,16 @@ class Capabilities:
     # THD is a SEPARATE code path (packed views + a blocked S/dS workspace), so
     # a feature the dense path serves is not automatically served under THD.
     # These are the conjunction verdicts; mismatch() knows the shape of each.
+    #
+    # BOTH ARE TRANSITIONAL AND MEANT TO BE DELETED, not accumulated. A
+    # conjunction flag earns its place only while some row genuinely cannot
+    # serve the pair; once the last one can, the flag is vacuous (it can never
+    # fire) and the field, its branch in mismatch(), and its tests all go --
+    # rather than being left set to True forever as a widening record of
+    # everything the packed path once could not do.
+    #   thd_causal: True on sdpa_bwd_sm100, the only row that sets thd -- so it
+    #     is ALREADY vacuous and is scheduled for removal.
+    #   thd_gqa:    still False; removal lands with the GQA-under-THD work.
     thd_causal: bool = False  # any causal-family bound (causal / SWA / band / bottom-right) under THD
     thd_gqa: bool = False  # h_q != h_kv under THD
     # True when THD REQUIRES sdpa(max_total_seq_len_q=..., max_total_seq_len_kv=...):
@@ -297,16 +307,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"graph uses {label}, which this engine does not support"
 
     if facts.thd and capabilities.thd:
-        # Conjunctions: the packed path is its own kernel specialization, and
-        # each of these is asserted by a reject test.
+        # These are the generic MATCHER, NOT a statement about any engine: a
+        # branch fires only for a row that has not set the flag. Reading the
+        # string below as "THD cannot do causal" is the wrong conclusion --
+        # sdpa_bwd_sm100 sets thd_causal=True and serves the whole causal
+        # family (stage 2 masks per sequence, stage 3 renders untrimmed; see
+        # SdpaBwdDslSm100.compile). thd_gqa is the one still declined.
+        #
+        # Both flags are TRANSITIONAL -- see Capabilities for the removal plan.
         if (facts.causal or facts.right_band_widening or facts.window_left is not None) and not capabilities.thd_causal:
-            return "causal-family masks under THD are not supported (the stage-3 K-trim is in absolute workspace rows)"
-        # NOTE for a row that sets thd_causal: stage 3 must then be rendered with
-        # causal_mode=CAUSAL_K_NONE and the workspace zero-filled, because that
-        # trim cannot be expressed in the blocked layout's per-sequence rows.
-        # See SdpaBwdDslSm100.compile.
+            return "this engine does not serve causal-family masks under THD (its row leaves thd_causal unset)"
         if facts.h_q != facts.h_kv and not capabilities.thd_gqa:
-            return f"GQA / MQA under THD is not supported (H_q={facts.h_q}, H_kv={facts.h_kv})"
+            return f"this engine does not serve GQA / MQA under THD (its row leaves thd_gqa unset; H_q={facts.h_q}, H_kv={facts.h_kv})"
         if capabilities.thd_declared_totals and (facts.max_total_seq_len_q is None or facts.max_total_seq_len_kv is None):
             return (
                 "THD requires sdpa_backward(max_total_seq_len_q=..., max_total_seq_len_kv=...): "
