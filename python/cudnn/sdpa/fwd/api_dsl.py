@@ -860,10 +860,10 @@ class SdpaFwdDsl(APIBase):
     def _fp32_partial_split(self) -> bool:
         """fp32 partials actually in effect for this launch.
 
-        Only the d128 flavor carries the extra kernel slot today, so the mode is
-        confined to it -- everything else silently keeps half partials rather
-        than mismatching the compiled ABI."""
-        return self.fp32_partials and self.split_kv > 1 and (self.head_dim_qk, self.head_dim_v) == (128, 128)
+        Only the d128 per-tensor FP8 kernel carries the extra ABI slot today, so
+        the mode is confined to it -- every other flavor silently keeps half
+        partials rather than passing an argument its kernel does not have."""
+        return self.fp32_partials and self.split_kv > 1 and self._fp8 and self._pertensor and (self.head_dim_qk, self.head_dim_v) == (128, 128)
 
     def _partial_dtype_tag(self) -> str:
         d = self._partial_torch_dtype()
