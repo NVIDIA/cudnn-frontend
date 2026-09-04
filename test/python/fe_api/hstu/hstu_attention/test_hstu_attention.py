@@ -18,13 +18,13 @@ try:
 except (ImportError, OSError) as exc:
     pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
 
-from cudnn.hstu_attention import (
+from cudnn.hstu.hstu_attention import (
     HSTUBwdSm100,
     HSTUFwdSm100,
     hstu_attention_backward,
     hstu_attention_forward,
 )
-from cudnn.hstu_attention import _interface, api as _api
+from cudnn.hstu.hstu_attention import _interface, api as _api
 
 pytestmark = [
     pytest.mark.gpu_exclusive,
@@ -1286,7 +1286,7 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 def test_d256_explicit_compile_and_packed_gradient_outputs():
-    from cudnn.hstu_attention._kernels.hstu_bwd_256_cute import (
+    from cudnn.hstu.hstu_attention._kernels.hstu_bwd_256_cute import (
         hstu_varlen_bwd_256_cute,
     )
 
@@ -1590,7 +1590,7 @@ def test_single_query_backward_thread_selector(capability, batch_size, heads, sp
 @pytest.mark.L0
 @pytest.mark.parametrize("algorithm", ("tc", "tc-small"))
 def test_single_query_backward_rejects_d256_q_major_algorithms(monkeypatch, algorithm):
-    from cudnn.hstu_attention._kernels import hstu_bwd_256_cute
+    from cudnn.hstu.hstu_attention._kernels import hstu_bwd_256_cute
 
     shape = (1, 1, 256)
     q = torch.empty(shape, dtype=torch.bfloat16)
@@ -2188,7 +2188,7 @@ def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
         assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
 
     if head_dim == 256:
-        from cudnn.hstu_attention._kernels.hstu_bwd_256_cute import (
+        from cudnn.hstu.hstu_attention._kernels.hstu_bwd_256_cute import (
             hstu_varlen_bwd_256_cute,
         )
 
