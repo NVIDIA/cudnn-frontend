@@ -129,13 +129,18 @@ EngineFamily(
     slots={"sdpa_fwd_prefill_sm100_d128": EngineSlot(0, opt_in=True), ...},
     analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+    validator=("cudnn._sdpa_validate", "validate_graph"),
 ),
 ```
 
 - A family is **pure data**: strings and ints, zero imports of engine code.
   `import cudnn` must never pay the CuTe-DSL import (~1.2 s) merely to know an
-  engine exists. `analyzer` and `heuristics` are `(module, callable)` pairs for
-  the same reason, resolved only when something needs to rank.
+  engine exists. `analyzer`, `heuristics` and `validator` are `(module, callable)`
+  pairs for the same reason, resolved only when something needs them. The
+  `validator` is what lets `pygraph.validate()` skip the eager C++ lowering for
+  a graph a python engine may serve (it runs the family's semantic rules; the
+  backend's verdict is deferred to planning) — see
+  `docs/python_graph_and_execution_backends.md`, *The manifest*.
 - **A family is a KIND OF GRAPH**, not a group of engines that ship together.
   `_ANCHOR_NODE_TO_FAMILY` maps a node type to the one family that serves that
   kind of graph, so a graph belongs to exactly one family or to none, and
