@@ -168,9 +168,12 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         # The causal K-trim assumes the workspace is one dense rectangle per
         # (batch, head), which is exactly what THD's blocked layout is not: the
         # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
-        # workspace rows. Combining them needs the trim rewritten per group,
-        # which is a follow-up, not a silent approximation.
-        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented")
+        # workspace rows. Rewriting it per group is a follow-up, not a silent
+        # approximation -- so a CAUSAL packed graph is served by rendering stage
+        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
+        # adapter zero-fills the workspace instead). This raise is what keeps
+        # that the only spelling: it is not a decline of causal under THD.
+        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

@@ -66,6 +66,7 @@ MMA as d=512.
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵍ |
+| THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -133,11 +134,20 @@ packed Stats layouts the FROST forward emits are read (token-major `(T, H)` and
 head-major `(1, QH, head_stride)`, the latter with a head stride wider than the
 packed total); a DENSE per-batch Stats on a ragged graph is declined, because its
 stride reads as head-major over storage that is not packed.
-Its own conjunctions are declined, each with a reject test: a **causal-family
-mask** (stage 3's K-trim is expressed in absolute workspace rows, which the
-blocked layout renumbers per sequence), **GQA** (the dK/dV partials would have
-to be packed per Q head), a non-BSHD-physical layout (the packed path has no
-staging copy), and a graph that does not declare
+The **causal family is served** (top-left, bottom-right, sliding window, right-band
+widening): stage 2 already masks from the per-sequence metadata lengths, including
+a per-sequence bottom-right diagonal `S_kv[b] − S_q[b]`. Stage 3 is rendered
+**untrimmed** under THD — its K-trim is expressed in absolute workspace rows, which
+the blocked layout renumbers per sequence — and the caller zero-fills the blocked
+workspace instead, which is what makes the masked-and-therefore-unwritten tiles
+read as zero. That costs the k-tiles causal would have skipped (see ᵈ) — measured
+at **−20 %** on the whole backward (A/B/A, dense path with the trim forced off,
+B=1 H=128 S=8192 d=512 bf16 causal: ~259 → ~207 TFLOPS). Correct, and a known
+optimization gap: re-trimming per sequence needs `row_off[b]` folded into the
+bounds and the bottom-right diagonal threaded per group.
+Its remaining conjunctions are declined, each with a reject test: **GQA** (the dK/dV
+partials would have to be packed per Q head), a non-BSHD-physical layout (the packed
+path has no staging copy), and a graph that does not declare
 **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here, because
 `scratch_workspace_bytes()` is a build-time function and the blocked row count
 comes from the packed totals before any buffer exists.
@@ -271,7 +281,7 @@ feature-free d=64 graph.
 | Backward pass entirely | SM107 |
 | Backward outside d ∈ (256, 512] | SM100, SM103 — the only backward engine there serves that band |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
-| Backward THD + causal, and THD + GQA | SM100, SM103 |
+| Backward THD + GQA | SM100, SM103 |
 | Backward sink / dSink, bias / dBias, deterministic, decode | SM100, SM103 |
 | f16/bf16 forward | SM107 (Rubin) |
 | MXFP8 forward | SM107, SM120, SM80 |

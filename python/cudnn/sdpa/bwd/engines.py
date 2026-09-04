@@ -266,6 +266,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         # each of these is asserted by a reject test.
         if (facts.causal or facts.right_band_widening or facts.window_left is not None) and not capabilities.thd_causal:
             return "causal-family masks under THD are not supported (the stage-3 K-trim is in absolute workspace rows)"
+        # NOTE for a row that sets thd_causal: stage 3 must then be rendered with
+        # causal_mode=CAUSAL_K_NONE and the workspace zero-filled, because that
+        # trim cannot be expressed in the blocked layout's per-sequence rows.
+        # See SdpaBwdDslSm100.compile.
         if facts.h_q != facts.h_kv and not capabilities.thd_gqa:
             return f"GQA / MQA under THD is not supported (H_q={facts.h_q}, H_kv={facts.h_kv})"
         if capabilities.thd_declared_totals and (facts.max_total_seq_len_q is None or facts.max_total_seq_len_kv is None):
@@ -737,13 +741,15 @@ def _sm100_spec() -> EngineSpec:
     launch writes the metadata, the per-sequence block offsets and the clipped
     output descriptors -- all device-side, no host cumsum. Both packed Stats
     layouts the forward can emit are read. Lengths arrive as per-batch
-    ``seq_len_q/kv`` (the backward node has no ``cu_seq_len_*`` port). Its own
-    conjunctions are declined and
-    each is asserted by a reject test: a causal-family mask (stage 3's K-trim is
-    in absolute workspace rows), GQA (the dK/dV partials would have to be packed
-    per Q head), and a graph that does not declare ``max_total_seq_len_q/kv``
-    (``scratch_workspace_bytes()`` is a build-time function and the blocked row
-    count comes from the packed totals).
+    ``seq_len_q/kv`` (the backward node has no ``cu_seq_len_*`` port). The causal
+    family is served: stage 2 masks from the per-sequence metadata lengths (the
+    bottom-right diagonal included, as ``S_kv[b] - S_q[b]``), and stage 3 is
+    rendered UNTRIMMED because its K-trim is in absolute workspace rows -- the
+    adapter zero-fills the blocked workspace instead. Its remaining conjunctions
+    are declined and each is asserted by a reject test: GQA (the dK/dV partials
+    would have to be packed per Q head), and a graph that does not declare
+    ``max_total_seq_len_q/kv`` (``scratch_workspace_bytes()`` is a build-time
+    function and the blocked row count comes from the packed totals).
 
     Everything else is declined for now and each rejection is asserted by a
     test: DENSE padding masks (the kernel compiles a scalar length; THD threads
@@ -766,6 +772,7 @@ def _sm100_spec() -> EngineSpec:
             right_band_widening=True,
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
+            thd_causal=True,  # stage 2 masks per sequence; stage 3 drops its trim and leans on the zero-fill
             thd_declared_totals=True,  # the blocked workspace is sized at build time
             # Any dense layout: the adapter uses a BSHD-physical tensor in place
             # (a permuted view, zero copy) and stages a non-conforming one

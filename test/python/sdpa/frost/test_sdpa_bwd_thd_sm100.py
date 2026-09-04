@@ -39,10 +39,35 @@ _D = 512
 _TOL_COS = 0.999
 
 
-def _ref_bwd(q, k, v, do, scale):
+def _causal_bias(s_q, s_kv, device, bottom_right=False, window_left=None, window_right=None):
+    """Additive -inf mask for ONE sequence, in that sequence's OWN geometry.
+
+    This is the whole reason the causal tests are per sequence: under THD the
+    diagonal is per sequence, so a mask built from the envelope ``S_max`` -- or
+    from the packed total -- is a different mask for every sequence but the
+    longest.  ``bottom_right`` aligns the diagonal to the last row, which under
+    THD makes the offset ``S_kv[b] - S_q[b]``, a per-sequence quantity.
+    ``window_left`` adds the sliding-window lower bound and ``window_right``
+    widens the upper one; both follow ``test_sdpa_bwd_dsl_sm100._causal_keep``,
+    i.e. ``left_bound`` is an inclusive column count
+    (``kv >= q + diag - (left_bound - 1)``) and ``right_bound`` an offset
+    (``kv <= q + diag + right_bound``).
+    """
+    q_i = torch.arange(s_q, device=device).view(-1, 1)
+    kv_i = torch.arange(s_kv, device=device).view(1, -1)
+    diag = (s_kv - s_q) if bottom_right else 0
+    keep = kv_i <= q_i + diag + (window_right or 0)
+    if window_left is not None:
+        keep = keep & (kv_i > q_i + diag - window_left)
+    return torch.where(keep, 0.0, float("-inf")).double()
+
+
+def _ref_bwd(q, k, v, do, scale, causal=False, bottom_right=False, window_left=None, window_right=None):
     """fp64 reference backward for ONE sequence."""
     q, k, v, do = (t.detach().double().requires_grad_(t is not do) for t in (q, k, v, do))
     s = (q @ k.transpose(-1, -2)) * scale
+    if causal:
+        s = s + _causal_bias(q.shape[-2], k.shape[-2], q.device, bottom_right, window_left, window_right)
     p = torch.softmax(s, dim=-1)
     o = p @ v
     o.backward(do)
@@ -225,7 +250,9 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7):
+def _thd_case(
+    lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, window_right=None
+):
     """Packed Q/K/V/dO plus the forward's O and packed LSE, per sequence in fp64.
 
     ``cap_*`` over-allocates the packed buffers past the real totals; with
@@ -262,10 +289,12 @@ def _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=Fals
             x[0, cu[i] : cu[i] + L].transpose(0, 1).double() for x, cu, L in ((q_p, cu_q, lens_q[i]), (k_p, cu_k, lens_kv[i]), (v_p, cu_k, lens_kv[i]))
         )
         sc = (qs @ ks.transpose(-1, -2)) * scale
+        if causal:
+            sc = sc + _causal_bias(lens_q[i], lens_kv[i], dev, bottom_right, window_left, window_right)
         lse_p[0, :, cu_q[i] : cu_q[i] + lens_q[i]] = torch.logsumexp(sc, dim=-1).float()
         o_p[0, cu_q[i] : cu_q[i] + lens_q[i]] = (torch.softmax(sc, dim=-1) @ vs).transpose(0, 1).to(dtype)
     return SimpleNamespace(
-        b=b, h=h, d=d, dtype=dtype, scale=scale,
+        b=b, h=h, d=d, dtype=dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left, window_right=window_right,
         lens_q=list(lens_q), lens_kv=list(lens_kv), cu_q=cu_q, cu_k=cu_k,
         t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv,
         q=q_p, k=k_p, v=v_p, do=do_p, o=o_p, lse=lse_p,
@@ -293,6 +322,10 @@ def _check(case, dq, dk, dv):
             case.v[0, sl_k].transpose(0, 1),
             case.do[0, sl_q].transpose(0, 1),
             case.scale,
+            causal=case.causal,
+            bottom_right=case.bottom_right,
+            window_left=case.window_left,
+            window_right=case.window_right,
         )
         for name, got, want in (
             ("dQ", dq[0, sl_q].transpose(0, 1), rq),
@@ -387,8 +420,27 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
 
 
 def _run_graph(lens_q, lens_kv, *, h=2, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
-    """Build the ragged graph, PIN the engine, execute, compare per sequence."""
-    case = _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison)
+    """Build the ragged graph, PIN the engine, execute, compare per sequence.
+
+    ``use_causal_mask`` / ``use_causal_mask_bottom_right`` thread through ``kw``
+    to the graph AND back into the case, so the fp64 reference masks with the
+    same per-sequence geometry the kernel does.  Passing one without the other
+    would compare a masked kernel against an unmasked reference.
+    """
+    case = _thd_case(
+        lens_q,
+        lens_kv,
+        h,
+        d,
+        dtype,
+        cap_q=sum(lens_q) + pad_cap,
+        cap_kv=sum(lens_kv) + pad_cap,
+        poison=poison,
+        causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right") or kw.get("diagonal_band_right_bound") is not None),
+        bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
+        window_left=kw.get("sliding_window_length"),
+        window_right=kw.get("diagonal_band_right_bound"),
+    )
     g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, **kw)
     g.validate()
     g.build_operation_graph()
@@ -454,6 +506,90 @@ def test_graph_thd_b1_matches_dense_shape():
     _run_graph((512,), (512,))
 
 
+# --- causal family ----------------------------------------------------------
+#
+# The per-sequence diagonal is the whole risk here.  Stage 2 masks from the
+# metadata lengths, but stage 3 reads a workspace whose masked tiles stage 2
+# never wrote -- so these also assert the THD zero-fill, and they are the tests
+# that would catch it being dropped as "the trim covers it".  Every case uses
+# unequal lengths, none a tile multiple: with equal lengths a diagonal built
+# from the envelope S_max would agree with the per-sequence one and the bug
+# would hide.
+
+
+@pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
+def test_graph_thd_causal(dt):
+    """Top-left causal over three unequal sequences."""
+    _run_graph((300, 128, 200), (300, 128, 200), dtype=dt, use_causal_mask=True)
+
+
+def test_graph_thd_causal_zero_length_sequence():
+    """Causal plus an empty sequence: the two skip paths meeting.
+
+    The masked tiles stage 2 never wrote and the zero-extent descriptor an empty
+    sequence needs are independent mechanisms, and this is the only case where
+    both are live at once.
+    """
+    _run_graph((256, 0, 128), (256, 0, 128), use_causal_mask=True)
+
+
+def test_graph_thd_causal_cross_attention():
+    """Unequal Q and KV lengths under causal.
+
+    Top-left aligned, so the diagonal does not move -- but S_kv[b] != S_q[b]
+    makes the number of live kv tiles per q row differ per sequence, which a
+    trim keyed on absolute workspace rows gets wrong.
+    """
+    _run_graph((256, 100), (180, 300), use_causal_mask=True)
+
+
+def test_graph_thd_causal_bottom_right():
+    """Bottom-right alignment: the diagonal offset IS per sequence.
+
+    ``S_kv[b] - S_q[b]`` is 56 for the first sequence and 200 for the second --
+    exactly the quantity stage 3's host-scalar ``causal_shift`` cannot express,
+    and the reason THD drops that trim rather than trying to.
+
+    Both sequences keep ``S_kv >= S_q`` on purpose.  Shorter the other way, the
+    leading ``S_q - S_kv`` rows have no unmasked column at all, and a fully
+    masked softmax row is NaN in the fp64 reference too -- a degenerate mask,
+    not a kernel property, and it would make this test assert nothing.
+    """
+    _run_graph((200, 100), (256, 300), use_causal_mask_bottom_right=True)
+
+
+def test_graph_thd_causal_swa():
+    """Sliding window: a LEFT bound on top of the causal right one.
+
+    A second per-sequence band edge, and the one stage 2 reaches through
+    ``kv_left`` rather than ``kv_right`` -- so it exercises the other end of
+    ``_kv_tile_bounds`` under packed lengths.
+    """
+    _run_graph((300, 128, 200), (300, 128, 200), use_causal_mask=True, sliding_window_length=64)
+
+
+def test_graph_thd_causal_right_band():
+    """Right-band widening: the causal upper bound pushed out by an offset.
+
+    The fourth member of the single ``thd_causal`` flag -- it covers causal, SWA,
+    bottom-right AND band widening, so each is its own accept test (engine
+    contract section 9).  ``diagonal_band_right_bound`` is exclusive with
+    ``use_causal_mask``; it IS the upper bound.
+    """
+    _run_graph((300, 128, 200), (300, 128, 200), diagonal_band_right_bound=64)
+
+
+def test_graph_thd_causal_nan_capacity_tail():
+    """Causal with a NaN tail past the declared totals.
+
+    Causal reads FEWER kv tiles, so it visits a different set of workspace rows
+    than the no-mask case the original tail test covers -- and the zero-fill now
+    writes the whole blocked buffer, which is a second thing that must not reach
+    the poisoned capacity rows.
+    """
+    _run_graph((256, 128), (256, 128), poison=True, pad_cap=384, use_causal_mask=True)
+
+
 # --- rejects: every THD conjunction the row declines ------------------------
 
 
@@ -482,11 +618,14 @@ def test_graph_thd_accepts_the_plain_case():
     assert _thd_mismatch() is None
 
 
-def test_reject_thd_causal():
-    """Stage 3's causal K-trim is expressed in ABSOLUTE workspace rows, which
-    the blocked layout renumbers per sequence."""
-    reason = _thd_mismatch(use_causal_mask=True)
-    assert reason is not None and ("causal" in reason.lower())
+def test_accept_thd_causal():
+    """The inverse of the reject this used to be (test/AGENTS.md: invert, do not
+    delete).  Stage 2 masks from the per-sequence metadata lengths and stage 3
+    drops its absolute-row K-trim under THD, so the causal family is served."""
+    assert _thd_mismatch(use_causal_mask=True) is None
+    assert _thd_mismatch(use_causal_mask_bottom_right=True) is None
+    assert _thd_mismatch(use_causal_mask=True, sliding_window_length=64) is None
+    assert _thd_mismatch(diagonal_band_right_bound=64) is None
 
 
 def test_reject_thd_gqa():

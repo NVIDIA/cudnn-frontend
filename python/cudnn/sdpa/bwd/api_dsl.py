@@ -2250,7 +2250,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: THD carries its lengths in the metadata buffer, not seq_len tensors"
             )
-            self._value_error_if(self.is_causal, "SM100 bwd: THD with a causal mask is not implemented (the stage-3 K-trim is in absolute workspace rows)")
             # The declared totals are REQUIRED, and the reason is the workspace,
             # not the numerics.  scratch_workspace_bytes() is a BUILD-time
             # function: the blocked S/dS row count and delta's row stride are
@@ -2362,8 +2361,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # A non-zero shift breaks the alignment that lets stage 3 read only what
         # stage 2 wrote, so the skipped region has to be ZEROED first -- see
         # _zero_ws_needed.
-        # Zero whenever the trim is ACTIVE, not just when shift != 0. TWO
-        # independent reasons, either of which alone would require it:
+        # Zero whenever a causal-family MASK is active, not just when shift != 0,
+        # and not "when the trim is active" -- THD has no trim and needs this
+        # MORE, not less. THREE independent reasons, any one of which alone
+        # would require it:
         #   1. the never-empty clamp in `_causal_k_range` means a structurally
         #      masked M tile still reads one k-tile of workspace, and must see
         #      zeros there;
@@ -2371,7 +2372,28 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         #      block (`gran`, 256), so a per-tile K range cannot exclude the
         #      skipped region at all -- the zero-fill, not the trim, is what
         #      makes the causal path correct. See `_causal_k_range`.
-        self._zero_ws = lo != CAUSAL_K_NONE or hi != CAUSAL_K_NONE
+        #   3. under THD the trim is switched off outright (below), so stage 3
+        #      reads EVERY k tile of the group, skipped ones included.
+        self._zero_ws = self.is_causal
+        # THD renders stage 3 UNTRIMMED, causal or not.  Every bound in
+        # `_causal_k_range` is an ABSOLUTE workspace row, and the blocked layout
+        # renumbers rows per sequence: `m0` arrives block-relative while
+        # `causal_shift` -- a host scalar built from `s_k_max - s_q_max` -- is a
+        # per-sequence quantity a template constant cannot hold.  Since the trim
+        # carries no correctness at the 2x2 cluster config (reason 2 above), the
+        # packed path simply drops it and pays the k-tiles causal would have
+        # skipped; `validate_matmul_params` refuses the combination so this stays
+        # the only way it can be spelled.  Making the trim per-sequence is an
+        # OPTIMIZATION, and a WORTHWHILE one: A/B/A on the dense path with the
+        # trim forced off (this exact code shape) measured -20 % on the whole
+        # backward at B=1 H=128 S=8192 d=512 bf16 causal, ~259 -> ~207 TFLOPS,
+        # every round.  The cost scales with sequence length, so a packed
+        # workload of short sequences pays much less.  Re-trimming needs
+        # `row_off[b]` folded into the bounds and the bottom-right diagonal
+        # threaded per group instead of as the host scalar `shift`.
+        if self.thd:
+            lo = hi = CAUSAL_K_NONE
+            shift = 0
         # dtype_qkv must match stage 2's: stage 3 reads the S/dS workspace stage
         # 2 wrote, and stores the gradients in the graph's io dtype.
         mm_lo = load_template(
@@ -2753,6 +2775,24 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # immediately before its own launch, and they are sequential on this
             # stream, so the kernel boundaries serialise the reuse.
             desc3 = carver.take((b + 1) * 16, torch.int64)
+
+            # Same rule as the dense path (see `_zero_ws` there): stage 2 leaves
+            # a mask-SKIPPED tile unwritten, and stage 3's cluster M tile (512)
+            # is wider than stage 2's write block (256), so no per-tile K range
+            # can exclude the skipped region -- the zero-fill is what makes the
+            # causal path correct.  THD additionally drops the trim outright
+            # (`_causal_k_range`), which leans on this harder still.
+            #
+            # Zeroed ONCE, outside the head-chunk loop: the skipped set depends
+            # on (q row, kv column, sequence) and not on the head, so the region
+            # a chunk leaves alone is the same region the next chunk leaves
+            # alone -- it stays zero for every chunk.
+            #
+            # Cheaper than the dense fill it replaces: the blocked buffer is
+            # `pad(T_q) x pad(S_kv_max)`, not `B x pad(S_q_max) x pad(S_kv_max)`.
+            if self._zero_ws:
+                s_ws.zero_()
+                ds_ws.zero_()
 
             q, k, v = as_bshd(q_tensor), as_bshd(k_tensor), as_bshd(v_tensor)
             o, do = as_bshd(o_tensor), as_bshd(do_tensor)

@@ -355,6 +355,12 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     the high one) is what keeps the range covering every structurally non-zero
     tile; under the tight-trim invariant that outward rounding also keeps it a
     subset of what stage 2 wrote.
+
+    Never reached under THD: the adapter renders the packed stage 3 with
+    ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
+    here is an ABSOLUTE workspace row and the blocked layout renumbers rows per
+    sequence.  ``validate_matmul_params`` enforces that.  See
+    ``SdpaBwdDslSm100.compile``.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # two bounds and the min() below share one numeric type.

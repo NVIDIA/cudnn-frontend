@@ -556,7 +556,7 @@ def test_capabilities_match_what_is_implemented():
     assert c.d_envelope_floor == 256, "an envelope with no floor silently claims every small head dim"
     assert c.thd, "the packed path is served (blocked S/dS workspace + per-sequence descriptors)"
     assert c.thd_declared_totals, "the blocked workspace is sized from the declared totals at BUILD time"
-    assert not c.thd_causal, "stage 3's K-trim is in absolute workspace rows, which the blocked layout renumbers"
+    assert c.thd_causal, "the causal family is served under THD (stage 2 masks per sequence; stage 3 drops its trim)"
     assert not c.thd_gqa, "the dK/dV partials would have to be packed per Q head"
     assert not c.cu_seq_len, "sdpa_backward has no cu_seq_len_* port; no row can claim or test it"
     assert not c.padded, "DENSE padding masks: the kernel compiles a scalar length; THD carries its own"
