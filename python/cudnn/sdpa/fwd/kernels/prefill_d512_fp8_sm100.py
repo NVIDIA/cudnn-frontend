@@ -126,6 +126,7 @@ from cudnn.frost.tile_dsl.barrier import (
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
     scheduler_warp_loop,
+    scheduler_warp_loop_persistent,
     read_tile_id_arrive,
     SCHED_NATURAL,
     SCHED_LPT,
@@ -228,6 +229,10 @@ BMM2_V_NBLOCK_ADVANCE = CFG.TILE_N * CFG.V_SWZ_BYTES
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# THD uses a persistent grid + device-bounded claim counter (not the CLC
+# envelope). The adapter caps the launch at min(envelope, SMs / CGA_SIZE)
+# and the setup kernel publishes the live unit total it stops at.
+THD_PERSISTENT = True
 
 P_TMA_ITERS = (CFG.TILE_N * CFG.BPE) // CFG.Q_SWZ_BYTES
 P_D_BLOCK = CFG.TILE_N // P_TMA_ITERS
@@ -421,8 +426,8 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel 
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
-# caller's length tensors and the adapter launches the plan-time envelope
-# grid (issue #552) — no length ever reaches the host.
+# caller's length tensors and publishes the live unit total the persistent
+# scheduler stops at (issue #552) — no length ever reaches the host.
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
@@ -792,7 +797,24 @@ def _kernel(
 
     else:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
-        scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            # THD: persistent grid + device-bounded claim counter, so no unit
+            # past the live total is ever handed out (the CLC path would need
+            # the grid to BE the work list, i.e. the plan-time envelope).
+            # n_batch is a kernel argument -- do NOT re-derive it from the
+            # metadata tensor's layout.
+            scheduler_warp_loop_persistent(
+                sched,
+                CFG.SCHEDULER_STAGES,
+                is_cga_first_cta,
+                seq_kv_lens_tensor,
+                cutlass.Int32(4) * n_batch + cutlass.Int32(3),
+                cutlass.Int32(4) * n_batch + cutlass.Int32(2),
+                CGA_SIZE,
+                CFG.CGA_M,
+            )
+        else:
+            scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2088,9 +2110,12 @@ def _tmastg_warp_group(
             # KV split: partials stack split-major on the workspace BATCH axis.
             o_batch = _partial_batch(batch_idx, split_idx, n_batch)
             if cutlass.const_expr(CFG.THD_VARLEN):
-                # DEAD unit (batch == n_batch, envelope grid — issue #552): no O
-                # rows exist and descriptor slot n_batch is never built, so skip
-                # the store; the barrier protocol below still runs.
+                # DEAD unit (batch == n_batch, over-launched grid — issue #552):
+                # the persistent scheduler never hands out a unit past the live
+                # total, but a cluster whose INITIAL blockIdx unit is already
+                # past it still runs once. No O rows exist and descriptor slot
+                # n_batch is never built, so skip the store; the barrier
+                # protocol below still runs.
                 if batch_idx < n_batch:
                     o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                     o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), q_head_idx, q_row_coord, cutlass.Int32(0))
@@ -2226,8 +2251,10 @@ def _host(
         # the packed KV total (o_desc_words slots n_batch+1 / n_batch+2) so a
         # tile tail past that total zero-fills instead of reading the buffer's
         # capacity tail — a NaN tail would poison BMM2's P·V. The shared setup
-        # also writes persistent-scheduler metadata; this envelope-grid flavor
-        # does not consume it.
+        # also seeds the persistent scheduler: n_thd_units is the resident
+        # cluster count the adapter capped the launch at AND the claim
+        # counter's start, and the setup kernel writes the live unit total the
+        # scheduler stops at.
         _build_thd_meta_o_kv_descs_kernel(
             o_tensor,
             tma_o_desc,

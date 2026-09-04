@@ -3238,7 +3238,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.q_lens_dev if pack is not None else None,
             pack.kv_lens_dev if pack is not None else None,
             cutlass.Int32(pack.lens_form) if pack is not None else None,
-            cutlass.Int32(0),  # thd_n_ctas: unused on this path (no persistent grid)
+            # Persistent THD grid extent; 0 (unread) on the dense path.
+            cutlass.Int32(self._thd_persistent_ctas(device) if pack is not None else 0),
             current_stream,
         )
         # Both of these consume what the kernel just wrote, so they belong on
