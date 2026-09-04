@@ -28,8 +28,8 @@ scheduler.  Validated on Blackwell (cc 10.0) vs a torch fp32 reference.
 
 THD / varlen (``CFG.THD_VARLEN=1``): packed ``[1,T,H,D]`` Q/K/V + ``cu_seqlens``
 coord offset (applied to BOTH Q slabs under TILES_Q=2), per-batch O
-TMA-descriptor array (shared ``thd_sm100.py``), packed ``[1,QH,T]`` LSE — via
-the shared ``_common_sm100`` / ``thd_sm100`` mechanism (same as the SM100 qwen
+TMA-descriptor array (shared ``thd_helpers.py``), packed ``[1,QH,T]`` LSE — via
+the shared ``_common_sm100`` / ``thd_helpers`` mechanism (same as the SM100 qwen
 / dsv4 kernels).  The dense ``[B,S,H,D]`` path is byte-identical (folds out at
 ``THD_VARLEN=0``).
 
@@ -223,7 +223,7 @@ CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTT
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 4B+4):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
 #   [3B+2..4B+1]=batch_remap(B)  [4B+2]=live units  [4B+3]=claim counter
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the

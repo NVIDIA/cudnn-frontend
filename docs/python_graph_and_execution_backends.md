@@ -254,9 +254,12 @@ are close.
   `cu_seqlens` (a dense batch is `[0, T, 2T, ...]`). `gdn_bwd` takes the
   forward inputs plus `dO` (and optionally `d_final_state`) and produces
   `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given,
-  + `d_a_log`/`d_dt_bias` iff the node carries `safe_gate` — the gate
-  transform's parameter gradients, with `dG`/`dBeta` then in raw-logit
-  space under `safe_gate`/`use_beta_sigmoid`);
+  + `d_a_log` iff the node carries `safe_gate` and an `a_log` input, and
+  `d_dt_bias` iff it carries `safe_gate` and a `dt_bias` input). Both gate
+  parameters are optional under `safe_gate`: an absent `a_log` is unit
+  amplitude (`exp(a_log) = 1`), an absent `dt_bias` is zero bias, and no
+  zero tensor is materialized for either. `dG`/`dBeta` are in raw-logit
+  space under `safe_gate`/`use_beta_sigmoid`;
   the cumulative gate and intra-chunk WY matrix are recomputed inside the
   engine, so the graph contract carries no forward intermediates. Both are
   python-engine-only ops: they have no cuDNN backend lowering, so routing
@@ -271,7 +274,8 @@ are close.
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
   and likewise serves `safe_gate` (in-kernel raw-logit gate transform, with
-  `d_a_log`/`d_dt_bias` produced by a deterministic reduction helper) and
+  `d_a_log`/`d_dt_bias` for the given parameters produced by a deterministic
+  reduction helper) and
   `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
   head dims.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
@@ -303,16 +307,13 @@ are close.
   and k/v/beta/dK/dV/dBeta at `total_T * num_householder` rows;
   `num_householder == 1` is exactly `gdn`. `GdpFrostEngine`
   (`cudnn.linear_attention.frost.gdp_engine`, SM100/SM103) is its only
-  engine and runs the shared GDN kernels, except at `d_v == 64`, where both
-  directions take their own forks: `kernel/gdp_prefill_v64_f16.py` reads q
-  compact and cp.async-scatters it into shared memory, and
-  `kernel/gdp_bprop_v64_f16.py` reads q/dO and writes dQ in the token
-  domain. At `d_v == 128` the expanded q read is already hidden behind the
-  wider V/O/checkpoint traffic while the scatter would pay full congestion
-  price, so the normalize writes q onto the expanded timeline and the shared
-  prefill reads it with a plain TMA. Otherwise only dO
-  (and q, when `use_qk_l2norm` is off) is zero-scattered into an expanded
-  workspace copy and only dQ is gathered back (`frost/common/expand.py`);
+  engine and runs the shared GDN kernels, except the `d_v == 64` backward
+  fork `kernel/gdp_bprop_v64_f16.py`, which reads q/dO and writes dQ in the
+  token domain. The forward reads q compact: the prefill re-reads each
+  64-token q block into every chunk of the block and runs its q-side work
+  (readout, rescale, O drain) once per block, so no expanded q copy exists.
+  In the `d_v == 128` backward, q and dO are zero-scattered into an expanded
+  workspace copy and dQ is gathered back (`frost/common/expand.py`);
   the gate is read compact with the sub-token rows derived in registers,
   O and dG are stored compact in-kernel, and `cu_seqlens` is scaled by `n`
   at every read site. `checkpoint_every_n_tokens` counts expanded sub-tokens (64 = the
@@ -432,9 +433,10 @@ only to decline is why `closed_under` existed.
   imports neither torch nor cutlass.
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
-  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor; `pyproject`'s extra
-  deliberately does NOT pin it, since that would make cudnn-frontend
-  incompatible with anything holding the DSL back.
+  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
+  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
+  since pinning that high would make cudnn-frontend incompatible with anything
+  holding the DSL back.
 - `test/python/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 

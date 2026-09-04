@@ -253,7 +253,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # (issue #552) — no length ever reaches the host — and publishes the live unit
 # total + claim counter, so the adapter launches a MACHINE-sized grid rather
 # than the plan-time envelope (issue #618).
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial

@@ -61,6 +61,7 @@ To add a new frontend-only API, follow these steps:
 4. Add a sample usage/test file in `test/python/fe_api/`.
 
 **Currently implemented frontend-only APIs**:
+- `cudnn.ops.causal_conv1d` (full-sequence forward/backward) and `cudnn.ops.causal_conv1d_update` (one-token mutable update)
 - `GEMM + Amax`
 - `RMSNorm + RHT + Amax`
 - `GEMM + SwiGLU`
@@ -79,6 +80,7 @@ To add a new frontend-only API, follow these steps:
 - `Grouped Gemm + Quant (Unified)`
 - `Grouped Gemm + Wgrad`
 - `Block Sparse Attention (BSA)`
+- `Flex Attention`
 - `HSTU Attention (Blackwell SM100/SM103)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`

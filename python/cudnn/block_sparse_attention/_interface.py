@@ -106,10 +106,10 @@ def _cutlass_dsl_version() -> tuple[int, int, int]:
 
 
 def _require_sage_fp8_cutedsl() -> None:
-    """Gate the new Sage FP8 kernels while preserving the package's 4.5 floor."""
+    """Gate the Sage FP8 kernels for environments that force a DSL below the package floor."""
     if _cutlass_dsl_version() < (4, 6, 1):
         raise RuntimeError(
-            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available with the package minimum of 4.5.0"
+            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available on older DSL builds"
         )
 
 
@@ -258,6 +258,14 @@ def _sm100_blk64_requires_int64_kv_strides(
         if rank6_shape[5] > 1 and batch_stride >= coord_stride_limit:
             return True
     return False
+
+
+def _sm100_blk64_has_partial_kv_tail(
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    """Return whether the final physical KV block is shorter than 64 rows."""
+    return k.shape[2] % 64 != 0 or v.shape[2] % 64 != 0
 
 
 def _tensor_layout_compile_key(t: torch.Tensor):
@@ -1396,7 +1404,8 @@ def bsa_attn_fwd_blk64_cutedsl(
     )
     if is_sage_fp8:
         assert q_bhsd.is_contiguous() and k_bhsd.is_contiguous() and v_bhsd.is_contiguous(), "Sage FP8 requires fully contiguous BHSD Q/K/V tensors"
-    use_exact_kv_layout = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    use_exact_kv_layout = use_int64_kv_strides or _sm100_blk64_has_partial_kv_tail(k_bhsd, v_bhsd)
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -1504,6 +1513,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             use_clc_scheduler,
             input_layout,
             use_exact_kv_layout,
+            use_int64_kv_strides,
             is_sage_fp8,
         ),
         (
@@ -1547,6 +1557,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
             use_exact_kv_layout=use_exact_kv_layout,
+            use_int64_kv_strides=use_int64_kv_strides,
         )
 
         bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(

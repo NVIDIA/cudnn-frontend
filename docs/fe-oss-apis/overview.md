@@ -9,6 +9,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
+- [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
@@ -31,6 +32,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
 - [Block Sparse Attention (BSA)](bsa.md)
+- [Flex Attention](attention/flex_attention.md)
 - [HSTU Attention (Blackwell SM100/SM103)](attention/hstu.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
@@ -40,12 +42,13 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax, GEMM + SwiGLU, and the grouped GEMM APIs require the `cutedsl` optional dependency, which can be installed via:
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2` and `apache-tvm-ffi` are required dependencies (and the DSL pulls `cuda-python` in transitively):
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
+(`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra now names only `cuda-python`. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
 
-The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
+Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
 pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
@@ -56,7 +59,14 @@ After installation, you can import the APIs directly from the `cudnn` package, i
 
 ## API Usage
 
-Each operation exposes two APIs:
+The causal-convolution family exposes semantic PyTorch operations only through
+`cudnn.ops.causal_conv1d` and `cudnn.ops.causal_conv1d_update`; they return
+ordinary tensors and keep prepared kernel objects private. The wrapper and
+class conventions below apply to prepared frontend-only kernel APIs.
+
+Most compiler-style operations expose the following two APIs. Functional
+autograd integrations such as BSA and Flex Attention instead document their
+own wrapper and reusable-plan lifecycle on their operation pages.
 
 ### 1. High-level wrapper
 

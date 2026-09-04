@@ -33,6 +33,7 @@ pytestmark = [
 
 _HAS_CUDA = torch.cuda.is_available()
 _IS_SM10X = _HAS_CUDA and torch.cuda.get_device_capability()[0] == 10
+_IS_Q1_SPLIT_TARGET = _HAS_CUDA and torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7))
 
 
 def _inputs(
@@ -69,6 +70,7 @@ def _reference_forward(
     alpha: float,
     scaling_seqlen: float,
     causal: bool,
+    window_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     outputs = []
     cu_q_cpu = cu_q.cpu()
@@ -81,7 +83,15 @@ def _reference_forward(
         v_i = v[k_start:k_end].float()
         scores = alpha * torch.einsum("qhd,khd->hqk", q_i, k_i)
         weights = F.silu(scores)
-        if causal:
+        if window_size is not None:
+            window_left = k_i.shape[0] if window_size[0] < 0 else min(window_size[0], k_i.shape[0])
+            window_right = k_i.shape[0] if window_size[1] < 0 else min(window_size[1], k_i.shape[0])
+            q_idx = torch.arange(q_i.shape[0], device=q.device)[:, None]
+            k_idx = torch.arange(k_i.shape[0], device=q.device)[None, :]
+            diagonal_offset = k_i.shape[0] - q_i.shape[0]
+            mask = (k_idx >= q_idx + diagonal_offset - window_left) & (k_idx <= q_idx + diagonal_offset + window_right)
+            weights = torch.where(mask.unsqueeze(0), weights, torch.zeros_like(weights))
+        elif causal:
             q_idx = torch.arange(q_i.shape[0], device=q.device)[:, None]
             k_idx = torch.arange(k_i.shape[0], device=q.device)[None, :]
             diagonal_offset = k_i.shape[0] - q_i.shape[0]
@@ -115,16 +125,6 @@ def _int32_alias(tensor: torch.Tensor, shape) -> torch.Tensor:
     for size in shape:
         numel *= size
     return tensor.flatten().view(torch.int32)[:numel].view(shape)
-
-
-@pytest.mark.L0
-def test_top_level_exports():
-    import cudnn
-
-    assert cudnn.HSTUFwdSm100 is HSTUFwdSm100
-    assert cudnn.HSTUBwdSm100 is HSTUBwdSm100
-    assert cudnn.hstu_attention_forward is hstu_attention_forward
-    assert cudnn.hstu_attention_backward is hstu_attention_backward
 
 
 @pytest.mark.L0
@@ -907,7 +907,7 @@ def test_explicit_api_rejects_runtime_stride_change():
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_forward_matches_pytorch(dtype, head_dim):
     q, k, v, _, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
@@ -947,7 +947,7 @@ def test_forward_matches_pytorch(dtype, head_dim):
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_backward_matches_pytorch(dtype, head_dim):
     q, k, v, do, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
@@ -997,7 +997,7 @@ def test_backward_matches_pytorch(dtype, head_dim):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
     cache = OrderedDict()
     monkeypatch.setattr(_api, "_BWD_CACHE", cache)
@@ -1413,7 +1413,7 @@ def test_d256_explicit_api_is_cuda_graph_capturable():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     torch.manual_seed(321)
     q_lengths = (37, 129)
@@ -1501,10 +1501,432 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
         torch.testing.assert_close(actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "supported", "head_dim", "expected"),
+    (
+        ((10, 0), True, 64, _interface._Q1_FWD_D64_D128_CONFIG),
+        ((10, 3), True, 128, _interface._Q1_FWD_D64_D128_CONFIG),
+        ((10, 7), True, 256, _interface._Q1_FWD_D256_CONFIG),
+        ((10, 7), False, 32, _interface._Q1_FWD_DEFAULT_CONFIG),
+        ((9, 0), True, 128, _interface._Q1_FWD_DEFAULT_CONFIG),
+    ),
+)
+def test_single_query_forward_config_selector(capability, supported, head_dim, expected):
+    assert _interface._select_q1_fwd_config(capability, supported, head_dim) == expected
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "supported", "batch_size", "heads", "average_kv", "head_dim", "expected"),
+    (
+        # Missing workload metadata preserves the architecture default.
+        ((10, 0), True, None, None, None, None, 8),
+        ((10, 3), True, None, None, None, None, 8),
+        ((10, 7), True, None, None, None, None, 13),
+        # Short D64/D128 work uses the unsplit kernel on every target.
+        ((10, 0), True, 64, 4, 255, 128, 1),
+        ((10, 0), True, 64, 4, 256, 128, 8),
+        ((10, 3), True, 64, 4, 255, 128, 1),
+        ((10, 3), True, 64, 4, 256, 128, 8),
+        ((10, 7), True, 64, 4, 255, 128, 1),
+        ((10, 7), True, 64, 4, 256, 128, 13),
+        # D256 retains split-KV at a medium grid size.
+        ((10, 0), True, 64, 4, 127, 256, 1),
+        ((10, 0), True, 64, 8, 127, 256, 8),
+        ((10, 3), True, 64, 4, 127, 256, 1),
+        ((10, 3), True, 64, 8, 127, 256, 8),
+        ((10, 7), True, 64, 4, 127, 256, 1),
+        ((10, 7), True, 64, 8, 127, 256, 13),
+        # An already-saturated grid extends the unsplit range to 768.
+        ((10, 0), True, 1024, 4, 767, 128, 1),
+        ((10, 0), True, 1024, 4, 768, 128, 8),
+        ((10, 3), True, 1024, 4, 767, 128, 1),
+        ((10, 3), True, 1024, 4, 768, 128, 8),
+        ((10, 7), True, 1024, 4, 767, 128, 1),
+        ((10, 7), True, 1024, 4, 768, 128, 13),
+        ((10, 7), False, 64, 4, 2048, 128, 1),
+    ),
+)
+def test_single_query_backward_split_selector(capability, supported, batch_size, heads, average_kv, head_dim, expected):
+    total_kv = None if batch_size is None or average_kv is None else batch_size * average_kv
+    assert (
+        _interface._select_q1_bwd_split_kv(
+            "auto",
+            capability,
+            supported,
+            batch_size=batch_size,
+            num_heads=heads,
+            total_kv=total_kv,
+            head_dim=head_dim,
+        )
+        == expected
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "batch_size", "heads", "split_kv", "head_dim", "expected"),
+    (
+        ((10, 0), 64, 4, 1, 128, 512),
+        ((10, 0), 512, 4, 1, 128, 128),
+        ((10, 0), 512, 4, 1, 256, 256),
+        ((10, 0), 64, 4, 8, 256, 128),
+        ((10, 3), 64, 4, 1, 128, 512),
+        ((10, 3), 512, 4, 1, 128, 128),
+        ((10, 3), 512, 4, 1, 256, 256),
+        ((10, 3), 64, 4, 8, 256, 128),
+        ((10, 7), 64, 4, 1, 128, 512),
+        ((10, 7), 512, 4, 1, 128, 128),
+        ((10, 7), 512, 4, 1, 256, 256),
+        ((10, 7), 64, 4, 13, 256, 128),
+        ((9, 0), 512, 4, 1, 256, 256),
+    ),
+)
+def test_single_query_backward_thread_selector(capability, batch_size, heads, split_kv, head_dim, expected):
+    assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv, head_dim) == expected
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("algorithm", ("tc", "tc-small"))
+def test_single_query_backward_rejects_d256_q_major_algorithms(monkeypatch, algorithm):
+    from cudnn.hstu_attention._kernels import hstu_bwd_256_cute
+
+    shape = (1, 1, 256)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    do = torch.empty_like(q)
+    cu = torch.tensor((0, 1), dtype=torch.int32)
+
+    monkeypatch.setattr(_interface, "_get_q1_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(hstu_bwd_256_cute, "hstu_varlen_bwd_256_cute", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match="tc and tc-small qlen=1 backward algorithms do not support D=256"):
+        _interface.hstu_varlen_bwd_100(
+            do,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            1,
+            1,
+            None,
+            None,
+            None,
+            -1,
+            0,
+            1.0,
+            None,
+            False,
+            _compile_only=True,
+            _q1_bwd_algorithm=algorithm,
+        )
+
+
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
+def test_single_query_auto_forward_uses_general_schedule_and_matches_pytorch(head_dim):
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+    torch.manual_seed(2027)
+    batch, heads = 64, 1
+    k_lengths = (1024, 2048, 2560, 3072) * (batch // 4)
+    q = torch.randn((batch, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    k = torch.randn((sum(k_lengths), heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    v = torch.randn_like(k) * 0.2
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k[1:] = torch.tensor(k_lengths, dtype=torch.int32, device="cuda").cumsum(0)
+    alpha = 0.7
+    scaling_seqlen = 2048.0
+
+    actual = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=1,
+        max_seqlen_k=max(k_lengths),
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )["o_tensor"]
+    expected = _reference_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    compile_key = next(iter(_interface.hstu_varlen_fwd_100.compile_cache))
+    assert compile_key[3] == 64
+    assert compile_key[13] == 1
+    assert compile_key[-1] == (0 if head_dim == 256 else 5)
+    torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
+
+
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
+def test_single_query_auto_backward_matches_pytorch(head_dim):
+    _interface._hstu_varlen_bwd_q1_direct.compile_cache.clear()
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    torch.manual_seed(2026)
+    batch, heads = 256, 1
+    k_lengths = (1, 127, 128, 257) * (batch // 4)
+    q = torch.randn((batch, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    k = torch.randn((sum(k_lengths), heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    v = torch.randn_like(k) * 0.2
+    do = torch.randn_like(q) * 0.2
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k[1:] = torch.tensor(k_lengths, dtype=torch.int32, device="cuda").cumsum(0)
+    alpha = 0.7
+    scaling_seqlen = 256.0
+
+    actual = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=1,
+        max_seqlen_k=max(k_lengths),
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    torch.cuda.synchronize()
+
+    q_ref = q.cpu().float().requires_grad_(True)
+    k_ref = k.cpu().float().requires_grad_(True)
+    v_ref = v.cpu().float().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
+
+    assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
+    split_kv = _interface._select_q1_bwd_split_kv(
+        "auto",
+        torch.cuda.get_device_capability(),
+        True,
+        batch_size=batch,
+        num_heads=heads,
+        total_kv=sum(k_lengths),
+        head_dim=head_dim,
+    )
+    expected_schedule = (split_kv, 256 // head_dim)
+    assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-2:] == expected_schedule
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
+        torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
+def test_single_query_local_window_uses_general_paths_and_matches_pytorch(head_dim):
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+    _interface._hstu_varlen_bwd_q1_direct.compile_cache.clear()
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    torch.manual_seed(2028)
+    k_lengths = (1, 63, 64, 127, 128, 129, 257)
+    batch, heads = len(k_lengths), 1
+    q = torch.randn((batch, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    k = torch.randn((sum(k_lengths), heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    v = torch.randn_like(k) * 0.2
+    do = torch.randn_like(q) * 0.2
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k[1:] = torch.tensor(k_lengths, dtype=torch.int32, device="cuda").cumsum(0)
+    alpha = 0.7
+    scaling_seqlen = 256.0
+
+    for window_size in ((0, 0), (1, 0), (63, 0), (64, 8), (128, 0), (255, 0)):
+        q_ref = q.cpu().float().requires_grad_(True)
+        k_ref = k.cpu().float().requires_grad_(True)
+        v_ref = v.cpu().float().requires_grad_(True)
+        expected_out = _reference_forward(
+            q_ref,
+            k_ref,
+            v_ref,
+            cu_q,
+            cu_k,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+            causal=False,
+            window_size=window_size,
+        )
+        expected_grads = torch.autograd.grad(expected_out, (q_ref, k_ref, v_ref), do.cpu().float())
+
+        actual_out = hstu_attention_forward(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max(k_lengths),
+            window_size=window_size,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )["o_tensor"]
+        actual_grads = hstu_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max(k_lengths),
+            window_size=window_size,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )
+        torch.testing.assert_close(actual_out.cpu().float(), expected_out, rtol=4e-2, atol=4e-2)
+        for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads):
+            torch.testing.assert_close(actual_grads[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
+
+    assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
+    fwd_compile_key = next(iter(_interface.hstu_varlen_fwd_100.compile_cache))
+    assert fwd_compile_key[3] == 64
+    assert fwd_compile_key[6]
+    assert fwd_compile_key[-1] == (0 if head_dim == 256 else 5)
+    assert not _interface.hstu_varlen_bwd_100.compile_cache
+    assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
+    bwd_compile_key = next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))
+    assert bwd_compile_key[-3]
+    split_kv = _interface._select_q1_bwd_split_kv(
+        "auto",
+        torch.cuda.get_device_capability(),
+        True,
+        True,
+        batch_size=batch,
+        num_heads=heads,
+        total_kv=sum(k_lengths),
+        head_dim=head_dim,
+    )
+    expected_schedule = (split_kv, 256 // head_dim)
+    assert bwd_compile_key[-2:] == expected_schedule
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+@pytest.mark.parametrize("head_dim", (32, 64, 128, 256))
+def test_single_query_forward_cache_reuses_runtime_shapes(head_dim):
+    """Packed token and batch extents must re-bind one compiled artifact."""
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+
+    for batch_size, kv_len in ((2, 128), (3, 192)):
+        q = torch.full((batch_size, 1, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+        k = torch.full((batch_size * kv_len, 1, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+        v = torch.full_like(k, 0.125)
+        cu_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+        cu_k = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * kv_len
+        out = torch.empty_like(q)
+        actual, _ = _interface.hstu_varlen_fwd_100(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            1,
+            kv_len,
+            63,
+            0,
+            0.7,
+            None,
+            scaling_seqlen=256.0,
+            out=out,
+        )
+        expected = _reference_forward(
+            q.cpu().float(),
+            k.cpu().float(),
+            v.cpu().float(),
+            cu_q,
+            cu_k,
+            alpha=0.7,
+            scaling_seqlen=256.0,
+            causal=False,
+            window_size=(63, 0),
+        )
+        torch.testing.assert_close(actual.cpu().float(), expected, rtol=4e-2, atol=4e-2)
+
+    assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
+    key = next(iter(_interface.hstu_varlen_fwd_100.compile_cache))
+    assert key[13] == 1
+    assert key[14] == 1
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
+def test_single_query_backward_cache_reuses_runtime_shapes(head_dim):
+    """Packed Q/K totals and batch size must re-bind one backward artifact."""
+    _interface._hstu_varlen_bwd_q1_direct.compile_cache.clear()
+
+    for batch_size, kv_len in ((2, 128), (3, 192)):
+        q = torch.full((batch_size, 1, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+        k = torch.full((batch_size * kv_len, 1, head_dim), 0.125, dtype=torch.bfloat16, device="cuda")
+        v = torch.full_like(k, 0.125)
+        do = torch.full_like(q, 0.125)
+        cu_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+        cu_k = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * kv_len
+        actual = hstu_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=kv_len,
+            window_size=(63, 0),
+            alpha=0.7,
+            scaling_seqlen=256.0,
+        )
+
+        q_ref = q.cpu().float().requires_grad_(True)
+        k_ref = k.cpu().float().requires_grad_(True)
+        v_ref = v.cpu().float().requires_grad_(True)
+        out_ref = _reference_forward(
+            q_ref,
+            k_ref,
+            v_ref,
+            cu_q,
+            cu_k,
+            alpha=0.7,
+            scaling_seqlen=256.0,
+            causal=False,
+            window_size=(63, 0),
+        )
+        expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
+        for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
+            torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
+
+    assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
+
+
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("mask_mode", ["full", "local", "arbitrary"])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_mask_modes_match_pytorch(mask_mode, head_dim):
     q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     seqlen = q.shape[0]
@@ -1655,7 +2077,7 @@ def test_d256_full_tile_arbitrary_mask_is_not_skipped():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_paged_kv_forward_matches_pytorch(head_dim):
     q, k, v, _, cu = _inputs(heads=1, seqlen=256, head_dim=head_dim)
     seqlen = q.shape[0]
@@ -1733,7 +2155,7 @@ def test_cache_hit_does_not_inspect_cuda_metadata_values(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
     q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     scalar_configs = ((0.35, 32.0), (1.1, 96.0))

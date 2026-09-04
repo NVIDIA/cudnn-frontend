@@ -1684,12 +1684,21 @@ class Graph : public ICudnn, public INode {
         }
 
         auto const candidate = plans.candidate;
-        auto execution_plan  = plans.execution_plans[candidate];
-        if (execution_plan != nullptr) {
-            auto serialized_plan    = execution_plan->getJsonRepresentation();
-            j["cudnn_backend_data"] = serialized_plan;
-            j["variant_pack_uids"]  = variant_pack_uids;
+
+        // OSS-sentinel candidates bypass the cuDNN backend and have no cudnnBackendExecutionPlan to write
+        if (candidate == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
+            candidate == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            return {error_code_t::GRAPH_NOT_SUPPORTED, "OSS engine graphs are not serializable"};
         }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            candidate < 0 || candidate >= static_cast<int64_t>(plans.execution_plans.size()) ||
+                plans.execution_plans[candidate] == nullptr,
+            error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+            "Graph::serialize: no built execution plan (candidate = " + std::to_string(candidate) + ")");
+
+        j["cudnn_backend_data"] = plans.execution_plans[candidate]->getJsonRepresentation();
+        j["variant_pack_uids"]  = variant_pack_uids;
 
         std::vector<BehaviorNote_t> selected_behavior_notes;
         CHECK_CUDNN_FRONTEND_ERROR(plans.get_behavior_notes_at_index(candidate, selected_behavior_notes));

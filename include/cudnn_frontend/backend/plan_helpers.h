@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <sstream>
 #include <vector>
 
 #include "cudnn.h"
@@ -208,8 +209,24 @@ create_engine_config(ManagedOpaqueDescriptor& engine_config,
                                                    knob_choices.size(),
                                                    backend_knob_choices.data()));
 
-    // Finalizing the descriptor
-    _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(engine_config->get_backend_descriptor()));
+    // Finalizing the descriptor.
+    //
+    // NOT_SUPPORTED here means exactly that: this engine cannot serve this
+    // operation graph. Map it to GRAPH_NOT_SUPPORTED rather than letting
+    // _CUDNN_CHECK_CUDNN_ERROR fold it into CUDNN_BACKEND_API_FAILED -- the
+    // latter reaches Python as a bare RuntimeError, so callers (and every test
+    // harness, which skips on cudnnGraphNotSupportedError and FAILS on
+    // anything else) cannot tell "unsupported" from "the backend broke".
+    // Any other status stays an API failure.
+    if (auto const status = detail::finalize(engine_config->get_backend_descriptor()); status != CUDNN_STATUS_SUCCESS) {
+        std::stringstream error_msg;
+        error_msg << "Finalizing the engine config failed with message: " << detail::get_last_error_string_()
+                  << ", and code: " << detail::get_error_string(status);
+        CUDNN_FE_LOG_LABEL_ENDL("ERROR: " << error_msg.str() << " at " << __FILE__ << ":" << __LINE__);
+        return {status == CUDNN_STATUS_NOT_SUPPORTED ? error_code_t::GRAPH_NOT_SUPPORTED
+                                                     : error_code_t::CUDNN_BACKEND_API_FAILED,
+                error_msg.str()};
+    }
 
     return {error_code_t::OK, ""};
 }

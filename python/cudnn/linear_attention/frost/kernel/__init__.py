@@ -19,9 +19,8 @@
 
 GDN: ``gdn_prefill_f16.py`` (prefill, optional per-chunk H output) with
 ``gdn_prefill_config.py``, and ``gdn_bprop_f16.py`` (backward) with
-``gdn_bprop_config.py``.  GDP shares them, except its d_v = 64 forks:
-``gdp_prefill_v64_f16.py`` (compact-q scatter) with ``gdp_prefill_v64_config.py``
-and ``gdp_bprop_v64_f16.py`` with ``gdp_bprop_v64_config.py``.  The tile
+``gdn_bprop_config.py``.  GDP shares them, except its d_v = 64 backward fork
+``gdp_bprop_v64_f16.py`` with ``gdp_bprop_v64_config.py``.  The tile
 primitives come from the shared ``cudnn.frost.tile_dsl``; ``thd.py`` lives
 in ``..common``.
 

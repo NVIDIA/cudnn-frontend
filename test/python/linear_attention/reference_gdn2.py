@@ -156,7 +156,9 @@ def gdn2_reference(
     gf = g.double()
     if safe_gate:
         lb = -5.0 if gate_lower_bound is None else float(gate_lower_bound)
-        gf = lb * torch.sigmoid(a_log.double().exp()[:, None] * (gf + dt_bias.double()))
+        a_exp = a_log.double().exp()[:, None] if a_log is not None else 1.0
+        bias = dt_bias.double() if dt_bias is not None else 0.0
+        gf = lb * torch.sigmoid(a_exp * (gf + bias))
     alphaf = gf.exp()  # [B, T, HO, K]
     betaf = beta.double()  # [B, T, HO, K]
     if use_beta_sigmoid:

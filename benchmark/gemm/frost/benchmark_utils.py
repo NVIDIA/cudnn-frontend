@@ -30,26 +30,23 @@ from cudnn.gemm.frost.tile_config import by_name as _by_name
 
 # Config selection
 
-LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma$")
-
 
 def spec_for(label, spec_map):
-    """(geometry cfg, cta_group) for a --configs label, or None.
+    """(config, cta_group) for a --configs label, or None.
 
     The sweep map comes from the registry funnel over CATALOG; a label naming a
     geometry outside it (e.g. a mma_size_m > 1 tile, which `by_name` synthesizes) is
-    still runnable, so parse it rather than calling it unsweepable."""
+    still runnable, so parse the complete canonical name rather than calling it
+    unsweepable.  ``cta_group`` is part of TileConfig geometry; do not strip its
+    suffix and carry a second, potentially inconsistent value beside the config."""
     spec = spec_map.get(label)
     if spec is not None:
         return spec
-    m = LABEL_RE.match(label)
-    if m is None:
-        return None
     try:
-        cfg = _by_name(m.group(1))
+        cfg = _by_name(label)
     except (KeyError, NotImplementedError):
         return None
-    return cfg, int(m.group(2))
+    return cfg, getattr(cfg, "cta_group", 1)
 
 
 def select_configs(arg, spec_map):

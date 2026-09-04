@@ -3,11 +3,14 @@
 
 import math
 import torch
-import cudnn
 
 from .helpers import get_fp8_scale_factor, get_fp8_descale_factor
+from .fp16_ref import _ScoreMask, _score_blocks, _pv, _grouped, _init_softmax_state, _prepare
 
 # fmt: off
+
+# Blocked over KV like fp16_ref (see the note there): the (b, h, s_q, s_kv)
+# score/probability matrices are never materialized.
 
 
 def compute_ref(q, k, v, attn_scale,
@@ -22,96 +25,23 @@ def compute_ref(q, k, v, attn_scale,
     b, s_q, h_q, d_qk = q.shape
     _, s_kv, h_k, _ = k.shape
     _, _, h_v, d_v = v.shape
+    device = q.device
 
-    if h_q != h_k:
-        k = k.repeat_interleave(h_q // h_k, dim=2)
-    if h_q != h_v:
-        v = v.repeat_interleave(h_q // h_v, dim=2)
+    q, k, v = _prepare(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), padding, device)
+    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=bias.float() if bias is not None else None, block_mask=None, is_alibi=False,
+                      padding=padding, diag_align=diag_align, left_bound=left_bound, right_bound=right_bound, device=device)
 
-    q = q.float()
-    k = k.float()
-    v = v.float()
+    m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token, device)
+    o = torch.zeros((b, h_q, s_q, d_v), dtype=torch.float32, device=device)
 
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    s_scale_effective = s_scale * (2.0 ** (-rescale_threshold))
+    s_descale_effective = s_descale * (2.0 ** rescale_threshold)
+    NEG_INF = float('-inf')
 
-    q_row_mask = None
-    kv_col_mask = None
-    if padding is not None:
-        seq_len_q_pad, seq_len_kv_pad = padding
-        q_mask_bhsd = torch.zeros((len(seq_len_q_pad), 1, s_q, 1), dtype=torch.bool, device=q.device)
-        kv_mask_bhsd = torch.zeros((len(seq_len_kv_pad), 1, s_kv, 1), dtype=torch.bool, device=q.device)
-        kv_col_mask = torch.zeros((len(seq_len_kv_pad), 1, 1, s_kv), dtype=torch.bool, device=q.device)
-
-        for i, (m, n) in enumerate(zip(seq_len_q_pad, seq_len_kv_pad)):
-            q_mask_bhsd[i, :, m:, :] = True
-            kv_mask_bhsd[i, :, n:, :] = True
-            kv_col_mask[i, :, :, n:] = True
-
-        q_row_mask = q_mask_bhsd
-
-        q = q.masked_fill(q_mask_bhsd, 0.0)
-        k = k.masked_fill(kv_mask_bhsd, 0.0)
-        v = v.masked_fill(kv_mask_bhsd, 0.0)
-
-    # Build combined_bias (shape: b, h_q, s_q, s_kv) before the tiled loop.
-    # Masking is encoded as -inf so it survives the per-block slicing.
-    combined_bias = torch.zeros((b, h_q, s_q, s_kv), dtype=torch.float32, device=q.device)
-    if bias is not None:
-        combined_bias = combined_bias + bias.float()
-    # BOTTOM_RIGHT alignment under padding/varlen anchors to each sequence's
-    # OWN lengths (offset_b = seq_len_kv[b] - seq_len_q[b]), matching
-    # fp16_ref; the padded maxima are only correct for the dense-full case.
-    idx_q = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
-    idx_k = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
-    if padding is not None:
-        br_offs = (torch.as_tensor(padding[1], device=q.device) - torch.as_tensor(padding[0], device=q.device)).view(b, 1, 1, 1)
-    else:
-        br_offs = torch.tensor(s_kv - s_q, device=q.device).view(1, 1, 1, 1)
-    if right_bound is not None and diag_align is not None:
-        if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            causal_sel = (idx_k - idx_q) >= (1 + right_bound)
-        else:
-            causal_sel = (idx_k - idx_q) >= (br_offs + 1 + right_bound)
-        combined_bias = combined_bias.masked_fill(causal_sel, float('-inf'))
-    if left_bound is not None and diag_align is not None:
-        if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            swa_sel = (idx_k - idx_q) <= (-1 * left_bound)
-        else:
-            swa_sel = (idx_k - idx_q) <= (br_offs - left_bound)
-        combined_bias = combined_bias.masked_fill(swa_sel, float('-inf'))
-
-    block_size = 128
-    num_blocks = (s_kv + block_size - 1) // block_size
-
-    # Initialize online softmax state. If sink_token is present, use it as the
-    # initial m_old with l_old=1, effectively adding a virtual attention score.
-    if sink_token is not None:
-        m_old = sink_token.float().expand(b, h_q, s_q, 1).clone()
-        l_old = torch.ones((b, h_q, s_q, 1), dtype=torch.float32, device=q.device)
-    else:
-        m_old = torch.full((b, h_q, s_q, 1), float('-inf'), dtype=torch.float32, device=q.device)
-        l_old = torch.zeros((b, h_q, s_q, 1), dtype=torch.float32, device=q.device)
-    o = torch.zeros((b, h_q, s_q, d_v), dtype=torch.float32, device=q.device)
-
-    for j in range(num_blocks):
-        start_idx = j * block_size
-        end_idx = min((j + 1) * block_size, s_kv)
-        k_block = k[:, :, start_idx:end_idx, :]
-        v_block = v[:, :, start_idx:end_idx, :]
-
-        # Q (FP8) @ K^T (FP8) -> S (FP32)
-        s_block = torch.einsum("bhqd,bhkd->bhqk", q.float(), k_block.float()) * q_descale * k_descale * attn_scale
-        s_block = s_block + combined_bias[:, :, :, start_idx:end_idx]
-
-        if padding is not None:
-            s_block = s_block.masked_fill(q_row_mask, float('-inf'))
-            s_block = s_block.masked_fill(kv_col_mask[:, :, :, start_idx:end_idx], float('-inf'))
-
+    # Q (FP8) @ K^T (FP8) -> S (FP32)
+    for start, end, s_block in _score_blocks(q, k, q_descale * k_descale * attn_scale, mask):
         m_block = s_block.max(dim=-1, keepdim=True).values
 
-        NEG_INF = float('-inf')
         is_first = (m_old == NEG_INF)
         # The kernel's online softmax runs in the log2 domain, so the rescale
         # threshold is in log2 units.
@@ -128,16 +58,14 @@ def compute_ref(q, k, v, attn_scale,
         l_old = l_old * correction
 
         p_block = torch.exp(s_block - m_new).nan_to_num()
-        if q_row_mask is not None:
-            p_block = p_block.masked_fill(q_row_mask, 0.0)
+        if mask.q_row_mask is not None:
+            p_block = p_block.masked_fill(mask.q_row_mask, 0.0)
         l_new = l_old + p_block.sum(dim=-1, keepdim=True)
 
         # P (FP32) -> P (FP8)
-        s_scale_effective = s_scale * (2.0 ** (-rescale_threshold))
-        s_descale_effective = s_descale * (2.0 ** rescale_threshold)
         p_block_quant = ((p_block * s_scale_effective).to(torch_itype)).float()
 
-        o = o + torch.einsum("bhqk,bhkd->bhqd", p_block_quant, v_block.float()) * v_descale * s_descale_effective
+        o = o + _pv(p_block_quant, v[:, :, start:end, :], h_v) * v_descale * s_descale_effective
         m_old = m_new
         l_old = l_new
 
@@ -151,6 +79,7 @@ def compute_ref(q, k, v, attn_scale,
 
     return o_quant, stats, o_amax
 
+
 def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          q_descale, k_descale, v_descale,
                          s_scale, s_descale, torch_itype,
@@ -163,100 +92,64 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax)."""
     b, s_q, h_q, d_qk = q.shape
     _, s_kv, h_k, _ = k.shape
-    _, _, h_v, _ = v.shape
+    _, _, h_v, d_v = v.shape
+    device = q.device
 
-    if h_q != h_k:
-        k = k.repeat_interleave(h_q // h_k, dim=2)
-    if h_q != h_v:
-        v = v.repeat_interleave(h_q // h_v, dim=2)
-
-    q = q.float()
-    k = k.float()
-    v = v.float()
-
-    q_row_mask = None
-    p_mask = None
-    if padding is not None:
-        seq_len_q_pad, seq_len_kv_pad = padding
-        q_mask_bhsd = torch.zeros((len(seq_len_q_pad), 1, s_q, 1), dtype=torch.bool, device=q.device)
-        kv_mask_bhsd = torch.zeros((len(seq_len_kv_pad), 1, s_kv, 1), dtype=torch.bool, device=q.device)
-        p_mask = torch.zeros((len(seq_len_kv_pad), 1, 1, s_kv), dtype=torch.bool, device=q.device)
-
-        for i, (m, n) in enumerate(zip(seq_len_q_pad, seq_len_kv_pad)):
-            q_mask_bhsd[i, :, m:, :] = True
-            kv_mask_bhsd[i, :, n:, :] = True
-            p_mask[i, :, :, n:] = True
-
-        q_row_mask = q_mask_bhsd
-
-        q = q.masked_fill(q_mask_bhsd.transpose(1, 2), 0.0)
-        k = k.masked_fill(kv_mask_bhsd.transpose(1, 2), 0.0)
-        v = v.masked_fill(kv_mask_bhsd.transpose(1, 2), 0.0)
-
-    # Compute P from Q and K
-    s = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * q_descale * k_descale * attn_scale
-
-    if padding is not None:
-        s = s.masked_fill(q_row_mask, float('-inf'))
-        s = s.masked_fill(p_mask, float('-inf'))
-
-    if bias is not None:
-        s = s + bias.float()
-    # Per-batch BOTTOM_RIGHT offsets under padding/varlen (see compute_ref).
-    idx_q = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
-    idx_k = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
-    if padding is not None:
-        br_offs = (torch.as_tensor(padding[1], device=q.device) - torch.as_tensor(padding[0], device=q.device)).view(b, 1, 1, 1)
-    else:
-        br_offs = torch.tensor(s_kv - s_q, device=q.device).view(1, 1, 1, 1)
-    if right_bound is not None and diag_align is not None:
-        if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            causal_sel = (idx_k - idx_q) >= (1 + right_bound)
-        else:
-            causal_sel = (idx_k - idx_q) >= (br_offs + 1 + right_bound)
-        s = s.masked_fill(causal_sel, float('-inf'))
-    if left_bound is not None and diag_align is not None:
-        if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
-            swa_sel = (idx_k - idx_q) <= (-1 * left_bound)
-        else:
-            swa_sel = (idx_k - idx_q) <= (br_offs - left_bound)
-        s = s.masked_fill(swa_sel, float('-inf'))
+    q, k, v = _prepare(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), padding, device)
+    dO = dO.float().transpose(1, 2)
+    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=bias.float() if bias is not None else None, block_mask=None, is_alibi=False,
+                      padding=padding, diag_align=diag_align, left_bound=left_bound, right_bound=right_bound, device=device)
+    qk_scale = q_descale * k_descale * attn_scale
 
     # The backward kernel does not renormalize: it recomputes P = exp(S - stats)
     # from the forward's log-sum-exp, which already accounts for the sink.
-    p_sink = None
     if stats is not None:
-        p = torch.exp(s - stats).nan_to_num()
-        if sink_token is not None:
-            p_sink = torch.exp(sink_token.float().expand(b, h_q, s_q, 1) - stats).nan_to_num()
-    elif sink_token is not None:
-        sink_expanded = sink_token.float().expand(b, h_q, s_q, 1)
-        s_extended = torch.cat([sink_expanded, s], dim=-1)
-        p_extended = s_extended.softmax(dim=-1).nan_to_num()
-        p_sink = p_extended[:, :, :, 0:1]
-        p = p_extended[:, :, :, 1:]
+        lse = stats.float()
     else:
-        p = s.softmax(dim=-1).nan_to_num()
+        m_old, l_old = _init_softmax_state(b, h_q, s_q, sink_token, device)
+        for _, _, s_block in _score_blocks(q, k, qk_scale, mask):
+            m_new = torch.maximum(m_old, s_block.max(dim=-1, keepdim=True).values)
+            l_old = l_old * torch.exp(m_old - m_new).nan_to_num() + torch.exp(s_block - m_new).nan_to_num().sum(dim=-1, keepdim=True)
+            m_old = m_new
+        lse = m_old + torch.log(l_old)
 
-    if q_row_mask is not None:
-        p = p.masked_fill(q_row_mask, 0.0)
-        if p_sink is not None:
-            p_sink = p_sink.masked_fill(q_row_mask, 0.0)
+    D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
 
-    # P (FP32) -> P (FP8)
-    p_quant = (p * s_scale).to(torch_itype)
+    dO_g_v = _grouped(dO, h_v)
+    q_g_k = _grouped(q, h_k)
 
-    # P (FP8) @ dO (FP8) -> dV (FP32)
-    dV = torch.einsum("bhqk,bqhd->bkhd", p_quant.float(), dO.float()) * s_descale * dO_descale
+    def dP_block(start, end):
+        # dO (FP8) @ V (FP8) -> dP (FP32)
+        dP = torch.einsum("bhgqd,bhkd->bhgqk", dO_g_v, v[:, :, start:end, :]).reshape(b, h_q, s_q, end - start)
+        return dP * dO_descale * v_descale
 
-    # dO (FP8) @ V (FP8) -> dP (FP32)
-    dP = torch.einsum("bqhd,bkhd->bhqk", dO.float(), v.float()) * dO_descale * v_descale
+    # dP is quantized with one global scale, so its amax needs a pass of its own.
+    dP_amax = 0.0
+    for start in range(0, s_kv, 128):
+        dP_amax = max(dP_amax, dP_block(start, min(start + 128, s_kv)).abs().max().item())
+    dP_scale = get_fp8_scale_factor(dP_amax, torch_otype)
+    dP_descale = get_fp8_descale_factor(dP_amax, torch_itype)
 
-    # Compute dS
-    o_float = o.float()
-    dO_float = dO.float()
-    D = (o_float * dO_float).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
-    dS = p * (dP - D) * attn_scale
+    dQ = torch.zeros((b, h_q, s_q, d_qk), dtype=torch.float32, device=device)
+    dK = torch.zeros((b, h_k, s_kv, d_qk), dtype=torch.float32, device=device)
+    dV = torch.zeros((b, h_v, s_kv, d_v), dtype=torch.float32, device=device)
+
+    for start, end, s_block in _score_blocks(q, k, qk_scale, mask):
+        p = torch.exp(s_block - lse).nan_to_num()
+        if mask.q_row_mask is not None:
+            p = p.masked_fill(mask.q_row_mask, 0.0)
+
+        # P (FP32) -> P (FP8); P (FP8) @ dO (FP8) -> dV (FP32)
+        p_quant = (p * s_scale).to(torch_itype).float()
+        dV[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(p_quant, h_v), dO_g_v) * s_descale * dO_descale
+
+        dS = p * (dP_block(start, end) - D) * attn_scale
+        # dS (FP32) -> dS (FP8)
+        dS_quant = ((dS * dP_scale).to(torch_itype)).float()
+
+        # dS (FP8) @ K (FP8) -> dQ (FP32); dS^T (FP8) @ Q (FP8) -> dK (FP32)
+        dQ = dQ + _pv(dS_quant, k[:, :, start:end, :], h_k) * k_descale * dP_descale
+        dK[:, :, start:end, :] = torch.einsum("bhgqk,bhgqd->bhkd", _grouped(dS_quant, h_k), q_g_k) * q_descale * dP_descale
 
     # Compute dSink_token if sink_token was provided
     # Formula: dSink = -exp(sink - logsumexp) * D summed over batch and sequence
@@ -264,27 +157,14 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     # not multiplied by attn_scale like Q @ K.T
     dSink_token = None
     if sink_token is not None:
-        dS_sink = -p_sink * D
-        dSink_token = dS_sink.sum(dim=(0, 2), keepdim=True)
+        p_sink = torch.exp(sink_token.float().expand(b, h_q, s_q, 1) - lse).nan_to_num()
+        if mask.q_row_mask is not None:
+            p_sink = p_sink.masked_fill(mask.q_row_mask, 0.0)
+        dSink_token = (-p_sink * D).sum(dim=(0, 2), keepdim=True)
 
-    dP_amax = dP.abs().max().item()
-    dP_scale = get_fp8_scale_factor(dP_amax, torch_otype)
-    dP_descale = get_fp8_descale_factor(dP_amax, torch_itype)
-
-    # dS (FP32) -> dS (FP8)
-    dS_quant = ((dS * dP_scale).to(torch_itype)).float()
-
-    # dS (FP8) @ K (FP8) -> dQ (FP32)
-    dQ = torch.einsum("bhqk,bkhd->bqhd", dS_quant, k.float()) * k_descale * dP_descale
-
-    # dS^T (FP8) @ Q (FP8) -> dK (FP32)
-    dK = torch.einsum("bhqk,bqhd->bkhd", dS_quant, q.float()) * q_descale * dP_descale
-
-    # Handle GQA reduction
-    if h_q != h_k:
-        dK = dK.reshape(dK.shape[0], dK.shape[1], h_k, h_q // h_k, dK.shape[3]).sum(dim=3)
-    if h_q != h_v:
-        dV = dV.reshape(dV.shape[0], dV.shape[1], h_v, h_q // h_v, dV.shape[3]).sum(dim=3)
+    dQ = dQ.transpose(1, 2)
+    dK = dK.transpose(1, 2)
+    dV = dV.transpose(1, 2)
 
     dQ_amax = dQ.abs().max().item()
     dK_amax = dK.abs().max().item()
