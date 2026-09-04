@@ -35,9 +35,11 @@ Occupancy: the fused dK/dV kernel's grid is (KV tiles, KV heads, B) and one
 2-CTA cluster walks every Q head of its KV head, so with few KV heads (GQA /
 MQA at small batch) most SMs idle -- 2 KV heads at S=8192 is 64 clusters on
 148 SMs. The adapter therefore splits the Q-head group across clusters
-(``_dkdv_head_split``: the smallest divisor of the group that reaches about two
-waves of clusters); each slice writes a partial dK/dV and the shared
-fixed-order ``dkv_reduce`` fold sums them, so the result stays deterministic.
+(``_dkdv_splits``: the smallest divisor of the group that reaches about one
+cluster per SM); every slice writes a partial dK/dV and the shared fixed-order
+``dkv_reduce`` fold sums them, so the result stays deterministic. The kernel can
+also chunk each KV tile's Q-tile range (``dkdv_seq_split``), but that never
+paid off in measurement and is opt-in only.
 
 Lives in its own module (not ``api_dsl.py``) so the MXFP8 lowering's imports
 stay out of the half-precision adapters' way; ``engines._adapter`` resolves it
@@ -66,6 +68,7 @@ _COMPILE_OPTIONS = "--opt-level 2"
 
 
 def _cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
     return -(-a // b)
 
 
@@ -97,10 +100,12 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         sample_sf_do_T,
         p_scale_log2: int = 8,
         dkdv_head_split: Optional[int] = None,
+        dkdv_seq_split: Optional[int] = None,
         **kwargs,
     ) -> None:
         # Stashed raw; descs are built in _initialize_implementation, which the
         # base __init__ calls once APIBase's own state exists.
+        """Record the problem shape, dtypes, mask and tuning knobs; validate the forced dK/dV split factors."""
         self._mxfp8_samples = dict(
             q_T=sample_q_T,
             k_T=sample_k_T,
@@ -115,8 +120,9 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             sf_do_T=sample_sf_do_T,
         )
         self.p_scale_log2 = int(p_scale_log2)
-        # None = pick from the shape (see _dkdv_head_split); an int forces it.
+        # None = pick from the shape (see _dkdv_splits); an int forces it.
         self._dkdv_head_split_override = None if dkdv_head_split is None else int(dkdv_head_split)
+        self._dkdv_seq_split_override = None if dkdv_seq_split is None else int(dkdv_seq_split)
         super().__init__(sample_q, sample_k, sample_v, sample_o, sample_do, sample_stats, sample_dq, sample_dk, sample_dv, **kwargs)
 
     # --- geometry --------------------------------------------------------------
@@ -176,6 +182,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         raise ValueError(graph_sf)
 
     def _initialize_implementation(self) -> None:
+        """Check the shape/dtype/mask contract against the kernels and compute the derived tiling constants."""
         s = self._mxfp8_samples
         self.q_T_desc = self._make_tensor_desc(s["q_T"], name="q_T")
         self.k_T_desc = self._make_tensor_desc(s["k_T"], name="k_T")
@@ -193,41 +200,60 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         self._gqa_group = self.h_q // max(self.h_kv, 1)
-        self._dkdv_split = self._dkdv_head_split()
+        self._dkdv_head, self._dkdv_seq = self._dkdv_splits()
+        self._dkdv_split = self._dkdv_head * self._dkdv_seq  # partial slots per KV head
         self._compiled = None
 
     # dK/dV cluster count below which the Q-head group is split across clusters:
     # two waves of 2-CTA clusters over the SMs.
-    _DKDV_TARGET_CLUSTERS_PER_SM = 2
+    _DKDV_TARGET_CLUSTERS_PER_SM = 1
 
-    def _dkdv_head_split(self) -> int:
-        """How many clusters share one (KV tile, KV head): the smallest divisor of
-        the GQA group that gives the fused dK/dV kernel about two waves of
-        clusters, or the whole group if none does.
+    def _dkdv_splits(self) -> tuple:
+        """(head split, sequence split) for the fused dK/dV kernel.
+
+        Head split: the smallest divisor of the GQA group that gives the kernel
+        about one cluster per SM (two CTAs per SM). Measured on B200, that
+        target picks the best or near-best factor from 2k to 8k; aiming for two
+        waves over-splits once the grid already covers the machine (8% slower
+        at 32/2 heads, S=8192).
+
+        Sequence split (cutting each KV tile's Q-tile range into ``seq``
+        chunks) is wired through the same partial/fold path but is never chosen
+        automatically: on every shape measured it was neutral at best (MHA,
+        S<=2k, under half a wave) and up to 30% slower otherwise -- the chunks
+        re-pay the per-cluster K/V load and pipeline setup, and the fold reads
+        ``seq`` partials. It stays available as ``dkdv_seq_split`` for
+        experiments.
 
         The kernel's grid is (KV tiles, KV heads, B) and one cluster walks every
         Q head of its KV head, so with few KV heads most SMs idle: 2 KV heads at
         S=8192 is 64 clusters on 148 SMs. Each split writes a partial dK/dV
-        (one slot per Q-head slice) that a fixed-order fold sums, so the
-        result stays deterministic; the price is the partial buffers
-        (2 * split * |dK| bytes) and the fold's read of them.
+        (one slot per slice) that a fixed-order fold sums, so the result stays
+        deterministic; the price is the partial buffers (2 * split * |dK|
+        bytes) and the fold's read of them.
         """
-        if self._dkdv_head_split_override is not None:
-            split = self._dkdv_head_split_override
-            if split < 1 or self._gqa_group % split != 0:
-                raise ValueError(f"SM100 MXFP8 bwd: dkdv_head_split={split} must divide the GQA group {self._gqa_group}")
-            return split
         h_r = self._gqa_group
         kv_clusters = _cdiv(self.s_k_max, 128) * self.h_kv * self.batch_size
         target = self._DKDV_TARGET_CLUSTERS_PER_SM * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        split = 1
-        for cand in range(1, h_r + 1):
-            if h_r % cand:
-                continue
-            split = cand
-            if kv_clusters * cand >= target:
-                break
-        return split
+        head = self._dkdv_head_split_override
+        if head is not None:
+            if head < 1 or h_r % head != 0:
+                raise ValueError(f"SM100 MXFP8 bwd: dkdv_head_split={head} must divide the GQA group {self._gqa_group}")
+        else:
+            head = 1
+            for cand in range(1, h_r + 1):
+                if h_r % cand:
+                    continue
+                head = cand
+                if kv_clusters * cand >= target:
+                    break
+        seq = self._dkdv_seq_split_override
+        if seq is not None:
+            if seq < 1:
+                raise ValueError(f"SM100 MXFP8 bwd: dkdv_seq_split={seq} must be >= 1")
+        else:
+            seq = 1  # opt-in only; see the docstring
+        return head, seq
 
     # --- capability backstop ---------------------------------------------------
     def check_support(self) -> bool:
@@ -290,6 +316,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
     # --- workspace -------------------------------------------------------------
     def _kernel_workspace_bytes(self) -> int:
+        """Bytes of scratch the kernels need: dQ accumulator, fp16 dO/O views, SF repack outputs and dK/dV partials."""
         import cutlass
 
         from cudnn.sdpa.bwd.kernels._bprop_mxfp8_common_sm100 import get_workspace_size
@@ -331,6 +358,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return q_geom, kv_geom, lse_geom, kv_out_geom
 
     def _mask_types(self):
+        """Map the requested attention mask onto the kernels' (mask_type, is_causal) pair."""
         from cudnn.sdpa.bwd.kernels import _bprop_mxfp8_masks_sm100 as masks
 
         # Upstream's selection, kept verbatim: the residual mask is needed only
@@ -367,9 +395,11 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         sp = self._dkdv_split
 
         def fake(dt, geom):
+            """Build a fake CuTe tensor with the given shape and stride order for compile."""
             return make_fake_tensor(dt, geom[0], geom[1], assumed_align=16)
 
         def fake_flat(dt, n):
+            """Build a fake flat 1-D CuTe tensor for compile."""
             return make_fake_tensor(dt, (n,), (1,), assumed_align=16)
 
         # SF repacks: one specialization per (rows, groups, planes, layout, source order).
@@ -394,6 +424,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         fdkv_out = fake(out_dt, kv_out_geom)  # the fused kernel's dK/dV (partial slots when split > 1)
 
         def fsf(name):
+            """Build a fake scale-factor tensor for compile."""
             return fake_flat(E8M0, repacks[name][0].dst_bytes)
 
         dq_kernel = BlackwellFmhaBackwardDQ256(
@@ -444,7 +475,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             is_persistent=False,
             online_ds_scale=online,
             p_scale_log2=self.p_scale_log2,
-            h_r_split=self._dkdv_split,
+            h_r_split=self._dkdv_head,
+            s_q_split=self._dkdv_seq,
         )
         dkdv_fn = cute.compile(
             dkdv_kernel,
@@ -485,6 +517,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import dkv_reduce_host
 
             def fake_c(dt, shape):
+                """Build a fake contiguous CuTe tensor for compile."""
                 return make_fake_tensor(dt, shape, tuple(int(math.prod(shape[i + 1 :])) for i in range(len(shape))), assumed_align=16)
 
             reduce_fn = cute.compile(
@@ -537,6 +570,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         sf_do: Optional[torch.Tensor] = None,
         sf_do_T: Optional[torch.Tensor] = None,
     ) -> None:
+        """Run the backward: SF repack, dQ kernel, dK/dV kernel and (when split) the fixed-order partial fold on ``stream``."""
         import cutlass
         from cutlass.cute.runtime import from_dlpack
         from cutlass.cute.typing import Float32
@@ -575,15 +609,18 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             # view. permute+contiguous is a no-op view here (check_support
             # admitted BSHD-physical only); the int8 view is the DSL's raw-byte
             # ABI for E4M3 payloads.
+            """View an fp8 tensor as the kernel's uint8 payload."""
             st = t.permute(0, 2, 1, 3).contiguous().view(torch.int8).view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0)
             ct = from_dlpack(st, assumed_align=16)
             ct.element_type = E4M3
             return ct
 
         def half_view(t, s, h_kv_, h_r_):
+            """View a tensor as the kernel's fp16/bf16 element type."""
             return from_dlpack(t.permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
 
         def sf_bytes(t):
+            """Byte size of one scale-factor plane set."""
             flat = t.contiguous()
             if flat.dtype != torch.int8:
                 flat = flat.view(torch.int8)

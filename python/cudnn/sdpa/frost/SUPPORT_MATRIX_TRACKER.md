@@ -153,9 +153,11 @@ scale-factor repack in front of the kernels (eleven launches, ~1–2 % of the
 backward) and its workspace (about one payload-equivalent of bytes). With few
 KV heads (GQA/MQA at small batch) the fused dK/dV kernel's grid — (KV tiles,
 KV heads, B) — would leave most SMs idle, so the adapter splits the Q-head group
-across clusters (smallest divisor of the group reaching ~2 waves) and folds the
-per-slice partials with a fixed-order fp32 reduce (still deterministic); that
-costs 2·split·|dK| bytes of workspace and one extra small launch.
+across clusters (smallest divisor of the group reaching ~1 cluster per SM); the
+per-slice partials are folded with a fixed-order fp32 reduce (still
+deterministic) at 2·split·|dK| bytes of workspace and one extra small launch.
+A Q-tile-range (sequence) split exists behind the same fold but is opt-in only:
+it did not pay off on any measured shape.
 
 ---
 

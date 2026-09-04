@@ -45,6 +45,7 @@ _OUT_CUDNN = {torch.bfloat16: cudnn.data_type.BFLOAT16, torch.float16: cudnn.dat
 
 
 def _cdiv(a, b):
+    """Ceiling division."""
     return (a + b - 1) // b
 
 
@@ -182,6 +183,7 @@ def _build_graph(
 
 
 def _plan_index(g, name=_ENGINE):
+    """Index of the FROST MXFP8 bwd plan in the graph's plan list."""
     for i in range(g.get_execution_plan_count()):
         pn = g.get_plan_name_at_index(i)
         if pn == name or pn.startswith(name + "["):
@@ -347,7 +349,44 @@ def _adapter_inputs(b, hq, hkv, sq, skv, out_dt=torch.bfloat16, causal=False, se
     )
 
 
+def _adapter_shapes(b, hq, hkv, sq, skv, out_dt=torch.bfloat16, causal=False):
+    """Shape-only operands (uninitialized, no reference) for probing the adapter's
+    plan-time decisions without paying for a reference computation."""
+    d, dev = _D, "cuda"
+    fp8 = lambda h, s: _to_bshd(torch.empty(b, h, s, d, device=dev, dtype=torch.float8_e4m3fn))  # noqa: E731
+    half = lambda h, s: _to_bshd(torch.empty(b, h, s, d, device=dev, dtype=out_dt))  # noqa: E731
+    q_row, q_col = _sf_dims(b, hq, sq, d)
+    k_row, k_col = _sf_dims(b, hkv, skv, d)
+    sf = lambda dims: torch.empty(dims, device=dev, dtype=torch.int8)  # noqa: E731
+    return dict(
+        q=fp8(hq, sq),
+        q_T=fp8(hq, sq),
+        k=fp8(hkv, skv),
+        k_T=fp8(hkv, skv),
+        v=fp8(hkv, skv),
+        o=half(hq, sq),
+        dO_f16=half(hq, sq),
+        dO=fp8(hq, sq),
+        dO_T=fp8(hq, sq),
+        stats=torch.empty(b, hq, sq, 1, device=dev),
+        sf_q=sf(q_row),
+        sf_q_T=sf(q_col),
+        sf_k=sf(k_row),
+        sf_k_T=sf(k_col),
+        sf_v=sf(k_row),
+        sf_dO=sf(q_row),
+        sf_dO_T=sf(q_col),
+        dq=half(hq, sq),
+        dk=half(hkv, skv),
+        dv=half(hkv, skv),
+        ref=None,
+        scale=1.0 / math.sqrt(d),
+        causal=causal,
+    )
+
+
 def _make_adapter(inp, **kw):
+    """Construct the SdpaBwdDslSm100Mxfp8 adapter for prepared inputs, forwarding split overrides."""
     from cudnn.sdpa.bwd.api_dsl_mxfp8_sm100 import SdpaBwdDslSm100Mxfp8
 
     return SdpaBwdDslSm100Mxfp8(
@@ -378,6 +417,7 @@ def _make_adapter(inp, **kw):
 
 
 def _run_adapter(api, inp):
+    """Run the adapter directly (no graph) and return dQ/dK/dV."""
     api.check_support()
     api.compile()
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
@@ -422,6 +462,7 @@ def _run_adapter(api, inp):
 @pytest.mark.L0
 @pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
 def test_dense(out):
+    """Dense (no mask) shapes across batch/head/seqlen combinations."""
     _run(out_dt=_OUT[out])
 
 
@@ -433,16 +474,19 @@ def test_default_attn_scale():
 
 @pytest.mark.L0
 def test_causal():
+    """Top-left causal mask, S_q == S_kv."""
     _run(causal=True)
 
 
 @pytest.mark.L0
 def test_gqa():
+    """Grouped-query attention with a small KV-head count."""
     _run(hq=4, hkv=2)
 
 
 @pytest.mark.L0
 def test_mqa():
+    """Multi-query attention (one KV head)."""
     _run(hq=4, hkv=1)
 
 
@@ -472,6 +516,7 @@ def test_ragged_kv_only(skv):
 
 @pytest.mark.L0
 def test_ragged_tails_causal_gqa():
+    """Causal GQA with S_q and S_kv not multiples of the tile size."""
     _run(hq=4, hkv=2, sq=129, skv=160, causal=True)
 
 
@@ -485,6 +530,7 @@ def test_causal_kv_tail():
 
 @pytest.mark.L0
 def test_q_tile_boundary_causal():
+    """Causal with S_q exactly on / one past a Q-tile boundary."""
     _run(hq=8, hkv=2, sq=257, skv=256, causal=True)
 
 
@@ -503,24 +549,34 @@ def test_deterministic_flag():
 
 @pytest.mark.L1
 def test_long_causal():
+    """Long causal sequence (L1) to exercise many KV iterations."""
     _run(b=1, hq=2, hkv=2, sq=2048, skv=2048, causal=True)
 
 
 @pytest.mark.L0
 def test_dkdv_head_split_heuristic():
     """The fused dK/dV kernel's grid is (KV tiles, KV heads, B); with few KV
-    heads the adapter splits the Q-head group across clusters so the GPU fills.
-    The split is a divisor of the group, the smallest reaching ~2 waves of
-    clusters, and 1 when there is no group (MHA) -- no partials, no fold."""
-    inp = _adapter_inputs(1, 32, 2, 2048, 2048)
-    api = _make_adapter(inp)
+    heads the adapter splits the Q-head group (a divisor of the group, the
+    smallest reaching ~1 cluster per SM). The sequence split is opt-in only, and
+    a large MHA shape needs neither -- no partials, no fold. Shape-only inputs:
+    nothing is computed."""
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    api = _make_adapter(_adapter_shapes(1, 32, 2, 2048, 2048))
     kv_clusters = 16 * 2  # 2048/128 tiles x 2 KV heads x B=1
-    assert 16 % api._dkdv_split == 0 and api._dkdv_split > 1
-    assert kv_clusters * api._dkdv_split >= 2 * sms or api._dkdv_split == 16
-    assert _make_adapter(_adapter_inputs(1, 2, 2, 256, 256))._dkdv_split == 1
+    assert 16 % api._dkdv_head == 0 and api._dkdv_head > 1
+    assert kv_clusters * api._dkdv_head >= sms or api._dkdv_head == 16
+    assert kv_clusters * (api._dkdv_head // 2) < sms  # the smallest such divisor
+    assert api._dkdv_seq == 1
+    # MHA, small batch, short sequence: no group to split; the sequence split is
+    # never chosen automatically.
+    api = _make_adapter(_adapter_shapes(1, 2, 2, 2048, 2048))
+    assert (api._dkdv_head, api._dkdv_seq) == (1, 1)
+    assert _make_adapter(_adapter_shapes(1, 2, 2, 2048, 2048), dkdv_seq_split=4)._dkdv_seq == 4
+    # Large MHA: the grid alone fills the machine.
+    api = _make_adapter(_adapter_shapes(4, 16, 16, 8192, 8192))
+    assert (api._dkdv_head, api._dkdv_seq) == (1, 1)
     with pytest.raises(ValueError):
-        _make_adapter(inp, dkdv_head_split=3)  # not a divisor of 16
+        _make_adapter(_adapter_shapes(1, 32, 2, 2048, 2048), dkdv_head_split=3)  # not a divisor of 16
 
 
 @pytest.mark.L0
@@ -535,6 +591,20 @@ def test_dkdv_head_split_forced(split):
         for name, a, b_ in zip(("dQ", "dK", "dV"), got, base):
             cos = torch.nn.functional.cosine_similarity(a.float().flatten(), b_.float().flatten(), dim=0).item()
             assert cos > 0.99999, f"{name} split={split} vs unsplit: cos={cos:.7f}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("seq_split", [2, 3, 8])
+def test_dkdv_seq_split_forced(seq_split):
+    """Q-sequence chunks per KV tile (3 does not divide the 4 Q tiles: uneven
+    chunks; 8 exceeds them: empty chunks must still write zeros), causal so
+    the per-tile ranges differ, MHA so only the sequence split is at work."""
+    inp = _adapter_inputs(1, 2, 2, 512, 384, causal=True)
+    got = _run_adapter(_make_adapter(inp, dkdv_seq_split=seq_split), inp)
+    base = _run_adapter(_make_adapter(inp, dkdv_seq_split=1), inp)
+    for name, a, b_ in zip(("dQ", "dK", "dV"), got, base):
+        cos = torch.nn.functional.cosine_similarity(a.float().flatten(), b_.float().flatten(), dim=0).item()
+        assert cos > 0.99999, f"{name} seq_split={seq_split} vs unsplit: cos={cos:.7f}"
 
 
 @pytest.mark.L0
@@ -600,6 +670,7 @@ def test_reject_other_head_dims(d):
 
 @pytest.mark.L0
 def test_reject_e5m2_payloads():
+    """e5m2 fp8 payloads are declined."""
     assert _decline_reason(fp8=cudnn.data_type.FP8_E5M2) is not None
 
 
@@ -611,21 +682,25 @@ def test_reject_gradient_dtype_mismatch():
 
 @pytest.mark.L0
 def test_reject_bottom_right_causal():
+    """Bottom-right causal is declined."""
     assert _decline_reason(use_causal_mask_bottom_right=True) is not None
 
 
 @pytest.mark.L0
 def test_reject_right_band_widening():
+    """Right-band widening masks are declined."""
     assert _decline_reason(right_bound=16) is not None
 
 
 @pytest.mark.L0
 def test_reject_sliding_window():
+    """Sliding-window masks are declined."""
     assert _decline_reason(use_causal_mask=True, left_bound=64) is not None
 
 
 @pytest.mark.L0
 def test_reject_padding_mask():
+    """Padding masks are declined."""
     assert _decline_reason(use_padding_mask=True, seq_len_dims=(1, 1, 1, 1)) is not None
 
 
@@ -638,6 +713,7 @@ def test_reject_amax_outputs():
 
 @pytest.mark.L0
 def test_reject_sink():
+    """Attention sinks are declined."""
     assert _decline_reason(with_sink=True) is not None
 
 
@@ -647,6 +723,7 @@ def test_reject_non_bshd_layout():
     BHSD-contiguous graph is declined, not staged (Hard Rule 2)."""
 
     def bhsd(sh):
+        """BHSD-strided tensor helper for the sink test."""
         b, h, s, d = sh
         return [h * s * d, s * d, d, 1]
 
@@ -655,11 +732,13 @@ def test_reject_non_bshd_layout():
 
 @pytest.mark.L0
 def test_reject_gqa_ratio_not_integer():
+    """Non-integer H_q / H_kv ratios are declined."""
     assert _decline_reason(hq=6, hkv=4) is not None
 
 
 @pytest.mark.L0
 def test_reject_foreign_tiles():
+    """Scale-factor tiles of a foreign layout are declined."""
     from cudnn.sdpa.bwd.engines import SdpaBwdKnobs
 
     assert _decline_reason(knobs=SdpaBwdKnobs(tile_m=64)) is not None
@@ -701,6 +780,7 @@ def test_capabilities_match_what_is_implemented():
 
 @pytest.mark.L0
 def test_engine_is_registered_and_opt_in():
+    """The engine is in the manifest and only used with the FROST opt-in env."""
     from cudnn.engines.manifest import MANIFEST
 
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
