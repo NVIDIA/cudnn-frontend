@@ -1672,12 +1672,12 @@ class FlexAttentionBackwardSm100:
             # (4) dK += dS.T @ Q (2-CTA: needs separate Qt load)
             if const_expr(tma_atom_Qt is not None):
                 gQt = cute.local_tile(mQt_cur, cute.select(self.mma_tiler_dsq, mode=[1, 2]), (0, None))
-                tdK_gQt = thr_mma_dK.partition_B(gQt)
+                tdKgQt = thr_mma_dK.partition_B(gQt)
                 load_Qt, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Qt,
                     cta_coord=block_in_cluster_coord_vmnk[1],
                     cta_layout=b_cta_layout,
-                    src_tensor=tdK_gQt,
+                    src_tensor=tdKgQt,
                     dst_tensor=sQt,
                     mcast_mask=q_do_mcast_mask,
                 )

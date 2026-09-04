@@ -1821,8 +1821,8 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         b_dw = ct.astype(-b_dw, b_A.dtype)
         b_dA = safe_mma(b_dw, ct.transpose(ct.astype(b_kg, b_A.dtype)), b_dA)
 
-        b_dk_gb = safe_matmul(b_A, b_dw)
-        b_db = b_db + ct.sum(ct.astype(b_dk_gb, ct.float32) * b_kg, axis=1)
+        b_dkgb = safe_matmul(b_A, b_dw)
+        b_db = b_db + ct.sum(ct.astype(b_dkgb, ct.float32) * b_kg, axis=1)
 
         b_q = ct.gather(q, q_base + (off_t + o_bt)[:, None] * (H * K) + k_cols, mask=kg_m, check_bounds=False, padding_value=0.0)
         b_kdk = ct.astype(b_k, ct.float32) * b_dk
@@ -1831,9 +1831,9 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             ct.astype(b_q, ct.float32) * b_dq
             - b_kdk
             + ct.astype(m_last, ct.float32)[:, None] * b_dgk[None, :]
-            + b_kg * ct.astype(b_dk_gb, ct.float32) * ct.astype(b_beta, ct.float32)[:, None]
+            + b_kg * ct.astype(b_dkgb, ct.float32) * ct.astype(b_beta, ct.float32)[:, None]
         )
-        b_dk = b_dk + ct.astype(b_dk_gb, ct.float32) * b_gb
+        b_dk = b_dk + ct.astype(b_dkgb, ct.float32) * b_gb
 
         ct.scatter(
             dq,

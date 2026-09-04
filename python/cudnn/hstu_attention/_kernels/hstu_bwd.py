@@ -2018,13 +2018,13 @@ class HSTUAttentionBackwardSm100:
         tdPTgV = thr_mma_dP.partition_A(gV)
         # (MMA, MMA_N, MMA_K, RestN, RestK, (H, B))
         tdPTgdO = thr_mma_dP.partition_B(gdO)
-        tdQgKt = tdK_gQt = tdVgdOt = None
+        tdQgKt = tdKgQt = tdVgdOt = None
         if cutlass.const_expr(self.use_2cta_instrs):
             assert gKt is not None
             assert gQt is not None
             assert gdOt is not None
             tdQgKt = thr_mma_dQ.partition_B(gKt)
-            tdK_gQt = thr_mma_dK.partition_B(gQt)
+            tdKgQt = thr_mma_dK.partition_B(gQt)
             tdVgdOt = thr_mma_dV.partition_B(gdOt)
 
         # ((atom_v, rest_v), STAGE)
@@ -2091,7 +2091,7 @@ class HSTUAttentionBackwardSm100:
             assert tma_atom_Qt is not None
             assert tma_atom_dOt is not None
             assert tdQgKt is not None
-            assert tdK_gQt is not None
+            assert tdKgQt is not None
             assert tdVgdOt is not None
             tKtsKt, tKtgKt_mkl = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_Kt,
@@ -2115,7 +2115,7 @@ class HSTUAttentionBackwardSm100:
                     ).shape
                 ),
                 cute.group_modes(sQt, 0, 3),
-                cute.group_modes(tdK_gQt, 0, 3),
+                cute.group_modes(tdKgQt, 0, 3),
             )
             tdOtsdOt, tdOtgdOt_mkl = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_dOt,
