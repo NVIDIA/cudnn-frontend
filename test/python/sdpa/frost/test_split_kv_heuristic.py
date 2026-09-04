@@ -324,6 +324,40 @@ def test_split_points_feeds_the_exact_cluster_extent():
     assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
 
 
+@pytest.mark.parametrize(
+    "s_q,s_kv,q_heads,kv_heads,expected",
+    [
+        (1024, 131072, 8, 1, 6),
+        (1024, 131072, 16, 2, 3),
+        (1024, 131072, 32, 4, 3),
+        (985, 62208, 9, 9, 5),
+        (8192, 8192, 8, 1, 1),
+    ],
+)
+def test_rubin_scores_small_non_power_of_two_splits(s_q, s_kv, q_heads, kv_heads, expected):
+    """Pin the GR100 wave-filling factors measured on context workloads."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm107_fp8").capabilities
+    facts = ga.SdpaGraphFacts(
+        b=1,
+        h_q=q_heads,
+        h_kv=kv_heads,
+        s_q=s_q,
+        s_kv=s_kv,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        device_sm_count=208,
+        device_cc=(10, 7),
+    )
+    assert _split_points(caps, facts, 128, 128, 2)[0] == expected
+
+
 # --- the candidate ladder ---------------------------------------------------
 
 
@@ -335,6 +369,12 @@ def test_ladder_is_derived_from_the_device(sm_count, top):
     got = split_kv_candidates(sm_count=sm_count, kv_tiles=1 << 20)
     assert got[0] == 1 and got[-1] == top
     assert got == [1 << i for i in range(len(got))]
+
+
+def test_dense_candidate_prefix_retains_the_power_of_two_tail():
+    got = split_kv_candidates(sm_count=208, kv_tiles=1 << 20, dense_through=8)
+    assert got[:8] == list(range(1, 9))
+    assert got[8:] == [16, 32, 64, 128, 256]
 
 
 def test_ladder_is_bounded_by_the_thinnest_split():
