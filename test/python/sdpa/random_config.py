@@ -375,8 +375,9 @@ class RandomizationContext:
             randoms_.left_bound = None if randoms_.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT else 1
             randoms_.right_bound = rng.randint(0, randoms_.s_kv // 2)
         elif randoms["with_sliding_mask"] == "band_around_diag":
-            randoms_.left_bound = rng.randint(1, randoms_.s_kv // 2)
-            randoms_.right_bound = rng.randint(1, randoms_.s_kv // 2)
+            # s_kv == 1 leaves an empty randint range; a 1-wide band is the only option.
+            randoms_.left_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
+            randoms_.right_bound = rng.randint(1, max(1, randoms_.s_kv // 2))
         elif randoms["with_sliding_mask"] == "causal":
             randoms_.right_bound = 0
 

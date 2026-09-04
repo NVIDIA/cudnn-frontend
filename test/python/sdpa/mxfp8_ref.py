@@ -157,8 +157,9 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         # with P near 1) drifts ~0.3 in dV while every other row agrees to 1e-3
         # (test_sdpa_mxfp8_bwd_L0 at s=2404 with a 1184 sliding window). With the
         # kernel's formulation the two round alike and the tight tolerance holds.
-        # torch.pow rather than torch.exp2: exp2 on a tensor this size raises a CUDA
-        # "invalid argument" in some torch nightlies.
+        # torch.pow(2, x) rather than torch.exp2: exp2 on fp32 CUDA tensors of ANY
+        # size raises "CUDA driver error: invalid argument" on some torch nightlies
+        # (seen on 2.14.0.dev20260710+cu130); exp/pow/log2 are unaffected.
         if stats is not None:
             p = torch.pow(2.0, s_raw * (attn_scale * _log2e) - lse * _log2e).nan_to_num().float()
         else:
