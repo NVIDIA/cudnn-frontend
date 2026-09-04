@@ -1235,6 +1235,9 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     o0_coord = 2 * curr_block_coord_o[0]
                     o1_coord = o0_coord + 1
+                    store_o1 = True
+                    if cutlass.const_expr(cute.is_static(mO_qdl.shape[0])):
+                        store_o1 = cutlass.const_expr(mO_qdl.shape[0] > self.qk_mma_tiler[0])
                     gO_qdl = cute.flat_divide(mO_qdl_, cute.select(self.pv_mma_tiler, mode=[0, 1]))
                     gO = gO_qdl[None, None, None, 0, curr_block_coord_o[2]]
                     tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
@@ -1256,15 +1259,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # O1
                     # 1. wait for O1 final
                     o1_handle = corr_epi_consumer.wait_and_advance()
-                    # 2. copy O1 to gmem
-                    cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-                    cute.arch.cp_async_bulk_commit_group()
+                    # A static single-tile residual mode folds its stride to zero,
+                    # so O1 aliases O0 instead of relying on TMA's OOB handling.
+                    if cutlass.const_expr(store_o1):
+                        cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
+                        cute.arch.cp_async_bulk_commit_group()
 
                     # Ensure O0 buffer is ready to be released
-                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    if cutlass.const_expr(store_o1):
+                        cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    else:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                     o0_handle.release()
                     # Ensure O1 buffer is ready to be released
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    if cutlass.const_expr(store_o1):
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                     o1_handle.release()
 
                 # Advance to next tile
