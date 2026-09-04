@@ -432,7 +432,7 @@ _logger = logging.getLogger(__name__)
 _cache_of_GroupedGemmGluSm100Objects = {}
 
 
-def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
+def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     """Convenience wrapper for grouped GEMM GLU forward operation.
 
     Auto-detects dense vs. discrete mode based on which weight arguments
@@ -595,48 +595,16 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
 
     _logger.debug("grouped_gemm_glu_wrapper_sm100: Creating output tensors")
 
-    if cd_major == "n":
-        c_tensor_out = torch.empty_strided((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), dtype=c_dtype, device=a_tensor.device)
-        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
-        d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
-    else:
+    if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
-
-    sfd_row_tensor = None
-    sfd_col_tensor = None
-    amax_tensor = None
-
-    if a_tensor.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
-        _logger.debug("grouped_gemm_glu_wrapper_sm100: Detected fp8 config, constructing sfd tensors")
-
-        sf_dtype = sfa_tensor.dtype
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-        sf_k_row = ceil_div(n_out, sf_vec_size)
-        mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(sf_k_row, 4), 32, 4, 4)
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-
-        sf_k_col = ceil_div(valid_m, sf_vec_size)
-        mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-
-    if d_dtype in [torch.bfloat16, torch.float16]:
-        _logger.debug("grouped_gemm_glu_wrapper_sm100: Constructing amax_tensor")
-        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+    is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
+    sf_dtype = sfa_tensor.dtype if is_fp8_config else None
+    outputs = _glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, a_tensor.device)
+    c_tensor_out, d_tensor, d_col_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_glu_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return TupleDict(
-            c_tensor=c_tensor_out,
-            d_tensor=d_tensor,
-            d_col_tensor=d_col_tensor,
-            amax_tensor=amax_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
-        )
+        return outputs
 
     # ---- Build cache key ----
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
@@ -831,6 +799,9 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         api.compile()
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
 
+    if memo_key is not None:
+        _glu_wrapper_memo[memo_key] = (GroupedGemmBackend.BLOCK_SCALED, api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype)
+
     # ---- Execute ----
     if is_dense:
         api.execute(
@@ -883,10 +854,25 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             current_stream=current_stream,
         )
 
+    return outputs
+
+
+def _glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, device) -> TupleDict:
+    import torch
+
+    sfd_row_tensor = sfd_col_tensor = amax_tensor = None
+    if sf_dtype is not None:
+        mma_permute_order = (3, 4, 1, 5, 2, 0)
+        mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
+        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
+        mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
+        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    if d_dtype in (torch.bfloat16, torch.float16):
+        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=device)
     return TupleDict(
-        c_tensor=c_tensor_out,
-        d_tensor=d_tensor,
-        d_col_tensor=d_col_tensor,
+        c_tensor=torch.empty_strided((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), dtype=c_dtype, device=device),
+        d_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
+        d_col_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
@@ -1070,7 +1056,7 @@ def _glu_operand_meta(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
     return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
 
 
-# Operand-metadata key -> the BF16 path's derived result. One entry per distinct
+# Operand-metadata key -> (backend, derived result). One entry per distinct
 # (operand metadata, config), the same growth as _cache_of_GroupedGemmGluSm100Objects.
 _glu_wrapper_memo: dict = {}
 
@@ -1175,7 +1161,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
 
     if memo_key is not None:
-        _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
+        _glu_wrapper_memo[memo_key] = (GroupedGemmBackend.BF16, api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
 
     api.execute(
         a_tensor=call.a_tensor,
@@ -1296,8 +1282,38 @@ def grouped_gemm_glu_wrapper_sm100(
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
     )
     memo = _glu_wrapper_memo.get(memo_key)
+    if memo is not None and memo[0] is GroupedGemmBackend.BLOCK_SCALED:
+        _, api, valid_m, n_full, n_out, l, memo_c_dtype, memo_d_dtype, sf_dtype = memo
+        outputs = _glu_block_scaled_outputs(valid_m, n_full, n_out, l, memo_c_dtype, memo_d_dtype, sf_dtype, sf_vec_size, a_tensor.device)
+        api.execute(
+            a_tensor=a_tensor,
+            c_tensor=outputs["c_tensor"],
+            d_tensor=outputs["d_tensor"],
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            d_col_tensor=outputs["d_col_tensor"],
+            sfd_row_tensor=outputs["sfd_row_tensor"],
+            sfd_col_tensor=outputs["sfd_col_tensor"],
+            amax_tensor=outputs["amax_tensor"],
+            norm_const_tensor=norm_const_tensor,
+            prob_tensor=prob_tensor,
+            linear_offset=linear_offset if linear_offset is not None else (1.0 if act_func == "geglu" else 0.0),
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
+            current_stream=current_stream,
+        )
+        return outputs
     if memo is not None:
-        api, framework, valid_m, n_full, n_out, memo_c_dtype, memo_d_dtype = memo
+        _, api, framework, valid_m, n_full, n_out, memo_c_dtype, memo_d_dtype = memo
         c_out = _glu_allocate_output(framework, (valid_m, n_full, 1), (n_full, 1, valid_m * n_full), memo_c_dtype, a_tensor.device)
         d_out = _glu_allocate_output(framework, (valid_m, n_out, 1), (n_out, 1, valid_m * n_out), memo_d_dtype, a_tensor.device)
         api.execute(
@@ -1394,7 +1410,7 @@ def grouped_gemm_glu_wrapper_sm100(
         return _grouped_gemm_glu_bf16_call(call, memo_key)
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
-    return _grouped_gemm_glu_block_scaled_call(call)
+    return _grouped_gemm_glu_block_scaled_call(call, memo_key)
 
 
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]
