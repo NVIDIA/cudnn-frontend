@@ -33,7 +33,7 @@ pytestmark = [
 
 _HAS_CUDA = torch.cuda.is_available()
 _IS_SM10X = _HAS_CUDA and torch.cuda.get_device_capability()[0] == 10
-_IS_Q1_SPLIT_TARGET = _HAS_CUDA and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+_IS_Q1_SPLIT_TARGET = _HAS_CUDA and torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7))
 
 
 def _inputs(
@@ -1520,25 +1520,31 @@ def test_d128_single_query_forward_split_selector(capability, supported, expecte
     ("capability", "supported", "batch_size", "heads", "average_kv", "head_dim", "expected"),
     (
         # Missing workload metadata preserves the architecture default.
+        ((10, 0), True, None, None, None, None, 8),
         ((10, 3), True, None, None, None, None, 8),
         ((10, 7), True, None, None, None, None, 13),
-        # Short D64/D128 work uses the unsplit kernel on both targets.
+        # Short D64/D128 work uses the unsplit kernel on every target.
+        ((10, 0), True, 64, 4, 255, 128, 1),
+        ((10, 0), True, 64, 4, 256, 128, 8),
         ((10, 3), True, 64, 4, 255, 128, 1),
         ((10, 3), True, 64, 4, 256, 128, 8),
         ((10, 7), True, 64, 4, 255, 128, 1),
         ((10, 7), True, 64, 4, 256, 128, 13),
         # D256 retains split-KV at a medium grid size.
+        ((10, 0), True, 64, 4, 127, 256, 1),
+        ((10, 0), True, 64, 8, 127, 256, 8),
         ((10, 3), True, 64, 4, 127, 256, 1),
         ((10, 3), True, 64, 8, 127, 256, 8),
         ((10, 7), True, 64, 4, 127, 256, 1),
         ((10, 7), True, 64, 8, 127, 256, 13),
         # An already-saturated grid extends the unsplit range to 768.
+        ((10, 0), True, 1024, 4, 767, 128, 1),
+        ((10, 0), True, 1024, 4, 768, 128, 8),
         ((10, 3), True, 1024, 4, 767, 128, 1),
         ((10, 3), True, 1024, 4, 768, 128, 8),
         ((10, 7), True, 1024, 4, 767, 128, 1),
         ((10, 7), True, 1024, 4, 768, 128, 13),
         ((10, 7), False, 64, 4, 2048, 128, 1),
-        ((10, 0), True, 64, 4, 2048, 128, 1),
     ),
 )
 def test_single_query_backward_split_selector(capability, supported, batch_size, heads, average_kv, head_dim, expected):
@@ -1561,6 +1567,9 @@ def test_single_query_backward_split_selector(capability, supported, batch_size,
 @pytest.mark.parametrize(
     ("capability", "batch_size", "heads", "split_kv", "expected"),
     (
+        ((10, 0), 64, 4, 1, 512),
+        ((10, 0), 512, 4, 1, 128),
+        ((10, 0), 64, 4, 8, 128),
         ((10, 3), 64, 4, 1, 512),
         ((10, 3), 512, 4, 1, 128),
         ((10, 3), 64, 4, 8, 128),
@@ -1573,8 +1582,8 @@ def test_single_query_backward_thread_selector(capability, batch_size, heads, sp
     assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv) == expected
 
 
-@pytest.mark.L0
-@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM103 or SM107 GPU")
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
 def test_single_query_auto_forward_uses_general_schedule_and_matches_pytorch(head_dim):
     _interface.hstu_varlen_fwd_100.compile_cache.clear()
@@ -1621,7 +1630,7 @@ def test_single_query_auto_forward_uses_general_schedule_and_matches_pytorch(hea
     torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
 def test_single_query_auto_backward_matches_pytorch(head_dim):
@@ -1686,8 +1695,8 @@ def test_single_query_auto_backward_matches_pytorch(head_dim):
         torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
 
 
-@pytest.mark.L0
-@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM103 or SM107 GPU")
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
 def test_single_query_local_window_uses_general_paths_and_matches_pytorch(head_dim):
     _interface.hstu_varlen_fwd_100.compile_cache.clear()
@@ -1776,7 +1785,7 @@ def test_single_query_local_window_uses_general_paths_and_matches_pytorch(head_d
 
 
 @pytest.mark.L0
-@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM103 or SM107 GPU")
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize(
     ("head_dim", "algorithm"),
     ((64, "tc"), (64, "auto"), (128, "auto"), (256, "auto")),
@@ -1827,7 +1836,7 @@ def test_single_query_forward_cache_reuses_runtime_shapes(head_dim, algorithm):
 
 
 @pytest.mark.L0
-@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM103 or SM107 GPU")
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
 def test_single_query_backward_cache_reuses_runtime_shapes(head_dim):
     """Packed Q/K totals and batch size must re-bind one backward artifact."""

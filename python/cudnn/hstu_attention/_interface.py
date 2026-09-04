@@ -194,9 +194,11 @@ def _select_q1_bwd_num_threads(capability: tuple[int, int], batch_size: int, num
         # spending 12--16 warps on each short sequence. Split kernels already
         # reach the same four-warp floor below.
         return 128
-    if capability == (10, 3):
-        # Five 12-warp CTAs fit per B300 SM and win once the grid is large;
-        # 16 warps expose more latency-hiding work for smaller grids.
+    if capability in ((10, 0), (10, 3)):
+        # SM100 follows the measured B300 schedule until device-specific
+        # measurements justify a separate policy. Five 12-warp CTAs fit per
+        # B300 SM and win once the grid is large; 16 warps expose more
+        # latency-hiding work for smaller grids.
         num_threads = 384 if batch_size >= 448 else 512
     elif capability == (10, 7):
         num_threads = 512
@@ -350,8 +352,8 @@ def _select_q1_fwd_split_kv(
         return 2
     if requested == "tc-split4":
         return 4
-    # The general SM103/SM107 schedule is deliberately unsplit. Keeping these
-    # arguments makes the selector compatible with its existing call sites.
+    # The general SM100/SM103/SM107 schedule is deliberately unsplit. Keep these
+    # arguments so the selector remains compatible with its existing call sites.
     _ = capability, supported
     return 1
 
@@ -368,8 +370,9 @@ def _select_q1_bwd_algorithm(
     capability = _get_q1_device_capability(device)
 
     # B300 (SM103): direct wins at the requested BS=64 point and from BS=128.
-    # The small-MMA path retains two measured low-grid crossover regions.
-    if capability == (10, 3):
+    # The small-MMA path retains two measured low-grid crossover regions. SM100
+    # shares this policy until device-specific measurements justify a split.
+    if capability in ((10, 0), (10, 3)):
         if batch_size < 64:
             return "tc-small"
         if batch_size < 80:
@@ -423,7 +426,8 @@ def _select_q1_bwd_split_kv(
     if requested != "auto" or not supported:
         return 1
 
-    split_kv = {(10, 3): 8, (10, 7): 13}.get(capability, 1)
+    # SM100 shares the measured SM103 split until it can be tuned separately.
+    split_kv = {(10, 0): 8, (10, 3): 8, (10, 7): 13}.get(capability, 1)
     if split_kv == 1:
         return 1
 
@@ -508,11 +512,11 @@ def hstu_varlen_fwd_100(
     q1_m64_supported = q1_dynamic_thd and q_dtype == torch.bfloat16 and head_dim in (64, 128, 256)
     q1_split_supported = q1_m64_supported and is_causal
     capability = _get_q1_device_capability(q.device)
-    # Keep one kernel family across both targets, masks, and the measured batch,
+    # Keep one kernel family across all SM10x targets, masks, and the measured batch,
     # head-count, and KV-length range. D64/D128 use the robust five-stage pipe;
     # D256 keeps the same M64/N128 kernel but uses its capacity-limited
     # three-stage pipe because five D256 KV stages do not fit in shared memory.
-    if _q1_fwd_algorithm == "auto" and q1_m64_supported and capability in ((10, 3), (10, 7)):
+    if _q1_fwd_algorithm == "auto" and q1_m64_supported and capability in ((10, 0), (10, 3), (10, 7)):
         _q1_fwd_algorithm = "tc-m64-16dp-tail" if head_dim == 256 else "tc-m64-16dp-tail-kv5"
     q1_m64_algorithm = _q1_fwd_algorithm in (
         "tc-m64",
