@@ -47,19 +47,6 @@ classifiers = [
 ]
 
 dependencies = [
-    # The CuTeDSL stack is a required dependency: the OSS kernel engines (FROST
-    # SDPA, GEMM fusions, sparse/linear attention) are Python kernels that JIT
-    # through CuTeDSL, and they are a headline part of the package rather than an
-    # add-on. Still NOT pinned to the floor those engines want (4.7.0, see
-    # CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py): pinning that high here would
-    # make this package uninstallable next to anything holding the DSL back --
-    # vLLM and friends carry their own constraints. The engines check the version
-    # at support time and decline when it is too old, so an older DSL costs those
-    # engines and nothing else. The 4.6.2 floor is the oldest DSL this package is
-    # tested against, and it is also what sets `requires-python` above: every
-    # nvidia-cutlass-dsl release is `Requires-Python >=3.10`.
-    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
-    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
     "nvidia-cutlass-dsl[cu13]>=4.6.2",
     "apache-tvm-ffi>=0.1.11",
 ]
