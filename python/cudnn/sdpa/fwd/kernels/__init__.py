@@ -7,7 +7,8 @@ Filenames encode the coverage matrix: ``<phase>_d<dim>_<dtype-family>_sm<arch>.p
 (e.g. ``prefill_d512_f16_sm100.py`` — f16 covers fp16 and bf16, picked by TemplateParams).
 
 ``prefill_f16_sm120.py`` omits the dimension because one implementation covers
-all supported head dimensions and also runs on SM121.
+all supported head dimensions and also runs on SM121; ``prefill_d256_f16_sm120.py``
+is its d256 flavor (head dims that tile at 256 on both sides; likewise for fp8).
 
 Every template specializes on its architecture's frozen ``TemplateParams`` at
 import time (module global ``FROST_TEMPLATE_PARAMS``, injected by

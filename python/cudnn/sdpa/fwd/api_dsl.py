@@ -43,6 +43,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
     FP8_HEAD_TILE_GRANULE as _SM120_FP8_HEAD_TILE_GRANULE,
     TemplateParams as Sm120TemplateParams,
+    flavor_cfg as _sm120_flavor_cfg,
+    pick_flavor as _sm120_pick_flavor,
     smem_bytes as _sm120_smem_bytes,
 )
 
@@ -124,10 +126,11 @@ def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
 
-_SM120_KERNEL_FILE = "prefill_f16_sm120.py"
-# Per-tensor FP8 kernel (E4M3/E5M2 in, FP16/BF16/FP8 out, mma.sync
-# m16n8k32); selected by the graph op (sdpa_fp8) via check_support's dtype.
-_SM120_FP8_KERNEL_FILE = "prefill_fp8_sm120.py"
+# Keyed by kernel flavor (config_sm120.FLAVOR_CFGS envelope); None = the general template.
+_SM120_KERNEL_FILES = {(256, 256): "prefill_d256_f16_sm120.py", None: "prefill_f16_sm120.py"}
+_SM120_FP8_KERNEL_FILES = {(256, 256): "prefill_d256_fp8_sm120.py", None: "prefill_fp8_sm120.py"}
+
+
 _SM120_DTYPE_QKV_CODE = {
     torch.float8_e4m3fn: DTYPE_E4M3,
     torch.float8_e5m2: DTYPE_E5M2,
@@ -342,10 +345,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag)
 
 
-def _load_sm120_kernel_module(params: Sm120TemplateParams, fp8: bool = False):
-    if fp8:
-        return _load_kernel_template(_SM120_FP8_KERNEL_FILE, params, tag="sdpa_fwd_sm120_fp8")
-    return _load_kernel_template(_SM120_KERNEL_FILE, params, tag="sdpa_fwd_sm120")
+def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False):
+    tag = "sdpa_fwd_sm120_fp8" if fp8 else "sdpa_fwd_sm120"
+    if flavor is not None:
+        tag = f"{tag}_{_flavor_tag(flavor)}"
+    return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
 
 
 class SdpaFwdDsl(APIBase):
@@ -2582,10 +2586,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     with the head dim innermost (``dense_flex``, same envelope as SM100):
     ``execute()`` normalizes to the kernel's compact-BSHD storage via
     ``_to_bshd`` / ``_to_bshd_writable`` — zero-copy when the tensor already
-    is BSHD-compact, one gather / scatter copy otherwise. The kernel supports
+    is BSHD-compact, one gather / scatter copy otherwise. The kernels support
     FP16/BF16 MHA, GQA, and MQA; head dimensions in multiples of 8 through
-    256 (ENVELOPE: the kernel compiles at tiles rounded up to 16 and TMA
-    zero-fills the pad columns); top-left or bottom-right causal masks; left sliding
+    256 (ENVELOPE: the general template compiles at tiles rounded up to 16 and
+    TMA zero-fills the pad columns; head dims inside the d256 flavor's envelope
+    run the d256 template instead, ``config_sm120.pick_flavor``); top-left or
+    bottom-right causal masks; left sliding
     windows; optional per-batch query and key/value lengths; optional
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, whose per-shape compile is deferred to
@@ -2593,11 +2599,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     ``scale_softmax`` is a runtime parameter. Dtype, shape, tile sizes, masks,
     and length-tensor / sink / THD presence are compile-time specializations.
+    ``tile_m`` / ``tile_n`` are honored on both templates; left unset, the d256
+    template runs its flavor Cfg (``config_sm120.flavor_cfg``) and the general
+    template the largest KV tile that fits.
     """
 
     def _initialize_implementation(self) -> None:
         self.q_tile = _SM120_Q_TILES[0] if self.tile_m is None else self.tile_m
         self.kv_tile = _SM120_KV_TILES[0] if self.tile_n is None else self.tile_n
+        self.flavor: Optional[tuple[int, int]] = None
         self.compute_capability: Optional[tuple[int, int]] = None
         self.head_dim_qk: Optional[int] = None
         self.head_dim_v: Optional[int] = None
@@ -2708,6 +2718,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        # Kernel flavor (config_sm120.FLAVOR_CFGS); None = the general template.
+        self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
+        if self.flavor is not None:
+            cfg = _sm120_flavor_cfg(self.flavor, self._fp8)
+            self.q_tile = cfg.TILE_M if self.tile_m is None else self.tile_m
+            self.kv_tile = cfg.TILE_N if self.tile_n is None else self.tile_n
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self.thd,
@@ -2799,7 +2815,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # FP8 stages a byte per KV element but still writes O in half.
             return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
 
-        if self.tile_n is None:
+        if self.tile_n is None and self.flavor is None:
             # Pick the largest KV tile that fits this device.
             self.kv_tile = next((t for t in _SM120_KV_TILES if _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(
@@ -2894,7 +2910,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
         )
-        self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
+        self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
         if self.thd:
             # The THD compile key is PLAN-TIME-ONLY (the packed token totals
             # compile as dynamic extents and max_sq is a runtime launch

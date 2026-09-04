@@ -105,6 +105,23 @@ def test_unknown_sm_count_falls_back_without_dividing_by_zero():
     assert tiles(4096, device_sm_count=None) == (128, 128)
 
 
+def test_d256_envelope_takes_the_flavor_cfg_at_any_fill():
+    """Head dims the general template would tile at 256 on both sides run the
+    d256 template, whose Cfg pins the tiles regardless of grid fill: (64, 64)
+    f16 (dims above 240, the 16-granule step below), (128, 128) FP8 (above
+    224, the 32-granule step). Any other head dim stays on the rule."""
+    for s_q in (512, 2048, 16384):
+        for d in (248, 256):
+            assert tiles(s_q, d_qk=d, d_v=d) == (64, 64)
+            assert tiles(s_q, d_qk=256, d_v=d) == (64, 64)
+        assert tiles(s_q, d_qk=240, d_v=256, is_fp8=True) == (128, 128)
+    assert tiles(16384, d_qk=240, d_v=240)[0] == 128  # f16 240 is a native tile: general template, grid rule
+    assert tiles(16384, d_qk=224, d_v=224, is_fp8=True)[0] == 128
+    assert tiles(16384, d_qk=256, d_v=240)[0] == 128
+    assert tiles(16384, d_qk=256, d_v=128)[0] == 128
+    assert tiles(512, d_qk=240, d_v=240)[0] == 64
+
+
 def test_a_wide_head_gives_up_tile_n_128_only_when_it_cannot_fit():
     """SMEM, not speed, is what takes 128 away — and FP8 keeps it further out
     because its KV tile is a byte per element while O still stages in half."""

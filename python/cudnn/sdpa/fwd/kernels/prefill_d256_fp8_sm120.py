@@ -3,7 +3,7 @@
 
 """
 A fused multi-head attention (FMHA) per-tensor FP8 (e4m3 / e5m2) kernel for
-the NVIDIA Blackwell GeForce (SM120 / SM121).
+the NVIDIA Blackwell GeForce (SM120 / SM121) — the d256 flavor.
 
 Same architecture as the f16 kernel — dedicated TMA load warp, GMEM-direct Q,
 fp32 online softmax in registers, right-to-left masked KV walk — with the MMA
@@ -41,9 +41,8 @@ Constraints:
 - Input dtype: e4m3 or e5m2 (the MMA tag and the P quantization target
   follow it); output dtype FP16 / BF16 / E4M3 / E5M2 (fp8 O via a direct
   quantizing store, ``o_scale_fused`` applied before the cast)
-- Head TILES are multiples of 32 between 32 and 256, inclusive; actual head
-  dims may be smaller multiples of 16 (TMA 16-byte global-stride rule at
-  1 byte/elem) — TMA zero-fills the pad columns (the head-dim ENVELOPE)
+- Head dims must lie in the flavor envelope, (256 - granule, 256] on both sides
+  (multiples of 16; ``config_sm120.D256_FP8_CFG``)
 - Q heads must be divisible by the number of K/V heads
 - Q/K/V/O use compact BSHD storage (THD packs them to ``(1, T, H, D)``)
 - Supported CTA Q/KV tiles are 128 or 64
@@ -73,7 +72,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel as _build_thd_meta_kernel, sanitize_v_tail as _sanitize_v_tail, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel, THD_SETUP_THREADS
 from cudnn.sdpa.fwd.kernels._common_sm120 import (
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
@@ -81,6 +80,8 @@ from cudnn.sdpa.fwd.kernels._common_sm120 import (
     nvvm_threadquad_reduction_sum,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
+    D256_FLAVOR,
+    pick_flavor,
     FP8_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
@@ -689,6 +690,58 @@ class SM120FusedMultiHeadAttentionForward:
         return p_regs
 
     @cute.jit
+    def sanitize_v_tail(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        kv_seq_idx: cutlass.Int32,
+    ) -> None:
+        """Zero ``sV`` rows at/past this tile's valid KV extent before P @ V.
+
+        The K/V TMA descriptors span the bound buffers' CAPACITY (under THD
+        the packed totals are device values, so the views bind whole-buffer
+        extents), so rows between the valid KV length and the tile end can
+        carry UNINITIALIZED storage — including fp8 NaN bit patterns. The
+        S-side mask overwrites those columns with -inf (a select, NaN-safe),
+        but P @ V still multiplies P = 0 against the NaN V row and
+        ``0 * NaN = NaN`` poisons the whole accumulator column-free. Reached
+        only from THD specializations' first masked step (see the call
+        site): dense descriptors carry the declared S_kv, so their overhang
+        loads zero-fill in hardware — a dense PADDED graph's pad rows are
+        user memory and deliberately NOT sanitized here (whether the
+        contract requires tolerating NaN bit patterns there is an open
+        question for the sibling kernels too).
+
+        Every compute warp redundantly zeroes the full overhang (idempotent
+        zero stores race benignly), so a warp-level sync is enough for each
+        warp's own ``ldmatrix`` lanes to observe the zeros.
+        """
+        segs_per_row = self.head_tile_v // 16  # 16-byte segments per V row
+        row_lo = cute.math.max(cutlass.Int32(0), basic_params.seqlen_k - kv_seq_idx)
+        for r_it in cutlass.range_constexpr(self.kv_tile // 32):
+            row = cutlass.Int32(r_it * 32) + basic_params.lane
+            for seg in cutlass.range_constexpr(segs_per_row):
+                col = seg * 16
+                phys_row = (col // self.v_swizzle_chunk_elems) * self.kv_tile + row
+                sv_ptr = (
+                    mma_params.sV.data_ptr()
+                    + phys_row * self.v_swizzle_chunk_elems
+                    + swizzle_xor(
+                        phys_row,
+                        col % self.v_swizzle_chunk_elems,
+                        self.v_swizzle_chunk_elems,
+                        self.in_dtype.bytes,
+                    )
+                )
+                zero16 = cutlass.Vector.from_elements(
+                    tuple(self.in_dtype(0.0) for _ in range(16)),
+                    self.in_dtype,
+                )
+                if row >= row_lo:
+                    sv_ptr.store(zero16, alignment=16)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+
+    @cute.jit
     def mma_pv(
         self,
         basic_params: SimpleNamespace,
@@ -843,16 +896,7 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
-            _sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            self.sanitize_v_tail(basic_params, mma_params, kv_tile_idx * self.kv_tile)
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -1759,7 +1803,7 @@ def compile(  # noqa: A001
     """Compile and cache one architecture-specific compact BSHD shape.
 
     ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
-    head dim (P@V output width); they are independent, e.g. (192, 128).
+    head dim (P@V output width).
 
     THD specializations pack the batch: ``b`` is the real sequence count and
     ``sq``/``skv`` are IGNORED — the packed token totals are runtime values
@@ -1780,6 +1824,11 @@ def compile(  # noqa: A001
     head-row stride (``>= T``, a shape — part of the cache key).
     """
 
+    # This flavor's envelope: the head dims the general template would compile
+    # at 256-wide tiles on both sides. The adapter routes everything else to the
+    # general template, so reaching here otherwise is a routing bug.
+    if pick_flavor(d_qk, d_v, fp8=True) != D256_FLAVOR:
+        raise ValueError(f"SM120 SDPA d256 flavor serves head dims that round up to {D256_FLAVOR} at the head-tile granule; got ({d_qk}, {d_v})")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=IN_DTYPE,
         out_dtype=OUT_DTYPE,
@@ -1794,8 +1843,8 @@ def compile(  # noqa: A001
         thd_varlen=PARAMS.thd_varlen,
         thd_lse_head_major=lse_head_major,
         thd_batch=b,
-        head_tile_qk=round_up_head_tile(d_qk),
-        head_tile_v=round_up_head_tile(d_v),
+        head_tile_qk=D256_FLAVOR[0],
+        head_tile_v=D256_FLAVOR[1],
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
         split_kv=PARAMS.split_kv,

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Compile-time configuration for the FROST SM120 SDPA prefill template."""
+"""Compile-time configuration for the FROST SM120 SDPA prefill templates."""
 
 from __future__ import annotations
 
@@ -19,6 +19,34 @@ SUPPORTED_HEAD_TILE_MAX = 256
 SUPPORTED_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, SUPPORTED_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
 FP8_HEAD_TILE_GRANULE = 32
 SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
+
+
+@dataclass(frozen=True)
+class Cfg:
+    D_QK: int
+    D_V: int
+    TILE_M: int
+    TILE_N: int
+
+
+D256_F16_CFG = Cfg(D_QK=256, D_V=256, TILE_M=64, TILE_N=64)
+D256_FP8_CFG = Cfg(D_QK=256, D_V=256, TILE_M=128, TILE_N=128)
+D256_FLAVOR = (D256_F16_CFG.D_QK, D256_F16_CFG.D_V)
+FLAVOR_CFGS = {D256_FLAVOR: (D256_F16_CFG, D256_FP8_CFG)}
+
+
+def flavor_cfg(flavor: tuple[int, int], fp8: bool) -> Cfg:
+    return FLAVOR_CFGS[flavor][fp8]
+
+
+def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
+    """The flavor whose native head tiles the general template would compile
+    ``(d_qk, d_v)`` at (each dim rounded up at the dtype family's head-tile
+    granule), or ``None`` for the general template."""
+    granule = FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE
+    tiles = (-(-d_qk // granule) * granule, -(-d_v // granule) * granule)
+    return tiles if tiles in FLAVOR_CFGS else None
+
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
 # authoritative number at build time; this constant lets the ranking answer

@@ -62,7 +62,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     d256_square_br_as_tl,
     pack_gqa_supported,
 )
-from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
+from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, flavor_cfg, pick_flavor, smem_bytes
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
     Capabilities,
@@ -275,7 +275,14 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     causal, which the seeded repeat shows as a tie. What survives repetition is
     that the misses cluster on CAUSAL shapes, where the triangular mask shifts
     the per-CTA balance in a way `grid` alone does not capture.
+
+    A head-dim pair a kernel flavor covers (``config_sm120.pick_flavor``) takes
+    that flavor's Cfg tiles instead of the rule.
     """
+    flavor = pick_flavor(facts.d_qk, facts.d_v, facts.is_fp8)
+    if flavor is not None:
+        cfg = flavor_cfg(flavor, facts.is_fp8)
+        return cfg.TILE_M, cfg.TILE_N
     sm_count = facts.device_sm_count or 0
     grid = -(-facts.s_q // 128) * facts.h_q * facts.b
     if facts.causal:
