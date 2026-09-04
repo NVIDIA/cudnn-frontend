@@ -2884,6 +2884,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # sets ride SCHED_NATURAL.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            self._not_implemented_error_if(
+                self.fp32_partials,
+                "fp32_partials is an SM100 mode: this producer is compiled without the partial-tensor slot",
+            )
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 "split_kv > 1 serves unpadded dense graphs only",

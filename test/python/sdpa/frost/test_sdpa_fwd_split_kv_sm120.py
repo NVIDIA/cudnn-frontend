@@ -275,3 +275,31 @@ def test_sm120_quantized_split_applies_scale_o_once(scale):
     rel = (scaled - want).abs().max().item() / max(want.abs().max().item(), 1e-6)
     assert rel <= 0.15, f"stored O is not scale_o x the unscaled O (rel {rel:.3f})"
     assert abs(amax_scaled - amax_one) <= 0.03, "amax describes the PRE-quant output, so scale_o cannot move it"
+
+
+def test_sm120_rejects_fp32_partials():
+    """fp32 partials is an SM100 mode; the SM120 producer has no slot for the
+    partial tensor.  The predicate that gates it lives on the shared base, so
+    without an explicit refusal SM120 would inherit the knob and silently drop
+    it -- and a dropped knob is exactly what this adapter does not do."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 part required")
+    b, h, s_q, s_kv, d, dev = 1, 8, 128, 8192, 128, "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(b, h, s_q, d, device=dev, dtype=torch.float16)
+    k = torch.randn(b, 1, s_kv, d, device=dev, dtype=torch.float16)
+    v = torch.randn(b, 1, s_kv, d, device=dev, dtype=torch.float16)
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        split_kv=4,
+        sched_policy=0,
+        fp32_partials=True,
+    )
+    with pytest.raises(NotImplementedError, match="fp32_partials"):
+        api.check_support()
