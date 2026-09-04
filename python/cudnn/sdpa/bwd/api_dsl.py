@@ -88,6 +88,7 @@ class SdpaBwdDsl(APIBase):
         max_total_seq_len_q: Optional[int] = None,
         max_total_seq_len_kv: Optional[int] = None,
         thd_stats_token_major: bool = False,
+        thd_stats_head_stride: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._warn_experimental_api()
@@ -131,6 +132,10 @@ class SdpaBwdDsl(APIBase):
         # natively.  Both are served; the kernel selects on the compiled fake
         # tensor's static rank, so this only has to reach `compile()`.
         self.thd_stats_token_major = bool(thd_stats_token_major)
+        # Head-major only: the caller's declared Stats head stride.  The forward
+        # emits a token capacity rounded up to 64, so it is routinely WIDER than
+        # the packed total; 0 / None means compact (the packed total itself).
+        self.thd_stats_head_stride = 0 if thd_stats_head_stride is None else int(thd_stats_head_stride)
 
         self.batch_size: Optional[int] = None
         self.s_q_max: Optional[int] = None
@@ -2131,6 +2136,19 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         """
         return capacity if declared is None else min(capacity, max(int(declared), 0))
 
+    @property
+    def thd_total_q(self) -> Optional[int]:
+        """Packed Q-token extent this instance binds its views at, or None when
+        not THD.  The lowering builds the caller's packed views at exactly this
+        many tokens, so it reads the number from here rather than re-deriving
+        it -- two copies of ``min(B * S_max, declared)`` is one copy too many."""
+        return self._t_q_cap if self.thd else None
+
+    @property
+    def thd_total_kv(self) -> Optional[int]:
+        """Packed KV-token extent; see :attr:`thd_total_q`."""
+        return self._t_kv_cap if self.thd else None
+
     @staticmethod
     def _bshd_physical_ok(desc: TensorDesc) -> bool:
         """True when a logical-BHSD desc sits on compact BSHD storage.
@@ -2171,6 +2189,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         self._dummy_desc = None
         self._setup_fn = None
         self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
+        # Head-major Stats only: the caller's head stride, which the compiled
+        # artifact binds as the LSE tensor's third EXTENT.  0 = compact.
+        self._thd_lse_head_stride = int(getattr(self, "thd_stats_head_stride", 0) or 0) if (self.thd and not self._thd_lse_token_major) else 0
         # GQA / MQA: stage 3 cannot write dK/dV straight to the output, because
         # every Q head in a group contributes to the SAME KV head. It writes one
         # partial per Q head and a separate reduce folds the group. group == 1
@@ -2242,6 +2263,26 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 self.max_total_seq_len_q is None or self.max_total_seq_len_kv is None,
                 "SM100 bwd THD: max_total_seq_len_q and max_total_seq_len_kv must be declared "
                 "(the blocked workspace is sized from the packed token totals at build time)",
+            )
+            # The THD chain has no staging leg: `_execute_thd` binds the caller's
+            # packed buffers straight to the kernels, whose fake tensors are
+            # compact BSHD.  A declared layout that the dense path would stage
+            # through the workspace is therefore a decline here, not a silent
+            # wrong-layout bind.
+            self._value_error_if(
+                bool(self._stage_in or self._stage_out),
+                f"SM100 bwd THD: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical " "(the packed path has no staging copy)",
+            )
+            self._value_error_if(
+                self._thd_lse_token_major and bool(self.thd_stats_head_stride),
+                "SM100 bwd THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
+            )
+            # A head stride SHORTER than the packed total puts the later heads'
+            # rows past the buffer -- the kernel reads [0, h, row] at that
+            # stride for every row < t_q.
+            self._value_error_if(
+                bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_cap,
+                f"SM100 bwd THD: Stats head stride {self._thd_lse_head_stride} must cover the packed " f"token total {self._t_q_cap}",
             )
         else:
             self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 bwd: padding masks (seq lens) are not implemented")
@@ -2374,6 +2415,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             sq_real=self._t_q_cap if self.thd else self.s_q_max,
             skv_real=self._t_kv_cap if self.thd else self.s_k_max,
             lse_token_major=self._thd_lse_token_major,
+            lse_head_stride=self._thd_lse_head_stride,
         )
         self._compiled = (dot_do_o_host, stage2_mod, stage2, mm_lo, mm_hi)
         return self._compiled
@@ -2779,7 +2821,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 )
             self._dot_fn(_t(o), _t(do), _t(delta), None, None, stream)
 
-            lse = stats_tensor.reshape(t_q_cap, h) if self._thd_lse_token_major else stats_tensor.reshape(1, h, t_q_cap)
+            # Reshape, not re-stride: the caller's Stats already arrives in its
+            # declared packing (the lowering views it; the standalone tests pass
+            # it directly), so this only re-asserts the shape `compile()` baked
+            # into the artifact.
+            lse = stats_tensor.reshape(t_q_cap, h) if self._thd_lse_token_major else stats_tensor.reshape(1, h, self._thd_lse_head_stride or t_q_cap)
             gqa = self._gqa_group > 1
             self._value_error_if(gqa, "SM100 bwd THD: GQA is not implemented yet (the dK/dV partials need packed per-Q-head buffers)")
 

@@ -1547,6 +1547,7 @@ def compile(  # noqa: A001
     sq_real: Optional[int] = None,
     skv_real: Optional[int] = None,
     lse_token_major: bool = False,
+    lse_head_stride: int = 0,
 ) -> Callable:
     """Per-shape compile cache.
 
@@ -1622,12 +1623,25 @@ def compile(  # noqa: A001
     # Stats is the CALLER's, in either packing the forward emits; the kernel
     # branches on the static rank, so the layout is fully encoded here.
     if CFG.THD_VARLEN:
-        fake_lse = (
-            cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_t_q, qh), stride_order=(1, 0), assumed_align=4)
-            if lse_token_major
-            else cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _t_q), stride_order=(2, 1, 0), assumed_align=4)
-        )
+        if lse_token_major:
+            if lse_head_stride:
+                raise ValueError("bwd d512: lse_head_stride is head-major-only (token-major (T, H) is compact)")
+            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (_t_q, qh), stride_order=(1, 0), assumed_align=4)
+        else:
+            # Head-major (1, QH, head_stride).  head_stride is the CALLER's --
+            # the forward emits a token capacity rounded up to 64, so it is
+            # routinely WIDER than the packed total -- and it enters as the
+            # tensor's third EXTENT, exactly as the forward's own epilogue
+            # builds this fake (prefill_d512_f16_sm100.py, `_lse_hs`).  It has
+            # to be the extent and not a stride: the fake is compact, and a
+            # symbolic stride crashes the DSL.  0 = compact = the packed token
+            # symbol itself.  Reads are all `[0, head_g, row]` with
+            # row < t_q <= head_stride, so a wider extent is only ever slack.
+            _lse_hs = int(lse_head_stride) if lse_head_stride else _t_q
+            fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1, qh, _lse_hs), stride_order=(2, 1, 0), assumed_align=4)
     else:
+        if lse_head_stride:
+            raise ValueError("bwd d512: lse_head_stride is THD-only")
         fake_lse = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (b, qh, sq_real), stride_order=(2, 1, 0), assumed_align=16)
     # do_dot's producer (dot_do_o_kernel) indexes delta with a row stride of
     # ceil(S_q / 128) * 128, NOT S_q -- so the buffer, and this view of it, must
