@@ -62,9 +62,9 @@ def dense_fwd():
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -95,9 +95,9 @@ def thd_fwd():
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -130,9 +130,9 @@ def dense_bwd():
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -164,9 +164,9 @@ def thd_bwd():
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -203,7 +203,7 @@ def decode():
             s_q_min=1,
             s_q_max=1,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -224,14 +224,14 @@ def decode():
 
 
 def lean_attn():
-    # Decode against a long KV (513..4096): the lean-attention split regime.
+    # Decode against a long KV (513..8192): the lean-attention split regime.
     return dict(
         batches=RandomBatchSize(min=1, max=32),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
             s_q_max=1,
             s_kv_min=513,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 100, "s_q=s_kv": 0, "s_q=random": 0},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -258,7 +258,7 @@ def paged():
             s_q_min=1,
             s_q_max=64,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 5,
@@ -289,9 +289,9 @@ def fp8_fwd():
         batches=RandomBatchSize(min=1, max=8, with_high_probability=[4]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -319,7 +319,7 @@ def fp8_decode():
             s_q_min=1,
             s_q_max=1,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -344,9 +344,9 @@ def fp8_thd_fwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=64,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -402,9 +402,9 @@ def fp8_bwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=64,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -431,9 +431,9 @@ def fp8_thd_bwd():
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=64,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=64,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 5, "s_q=random": 5},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -464,9 +464,9 @@ def mxfp8_fwd():
         batches=RandomBatchSize(min=1, max=4),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=128,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=128,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -496,9 +496,9 @@ def mxfp8_bwd():
         batches=RandomBatchSize(min=1, max=4),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=256,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=256,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 0, "s_q=s_kv": 1, "s_q=random": 1},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -531,7 +531,7 @@ def thd_chunked():
             s_q_min=1,
             s_q_max=64,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={"s_q=1": 3, "s_q=s_kv": 1, "s_q=random": 10},
         ),
         d_qk_d_v=RandomHiddenDimSize(
@@ -599,7 +599,7 @@ def model_knobs(preset, phase):
                 s_q_min=1,
                 s_q_max=1,
                 s_kv_min=1,
-                s_kv_max=4096,
+                s_kv_max=8192,
                 s_q_distribution={"s_q=1": 100, "s_q=s_kv": 1, "s_q=random": 0},
             ),
             d_qk_d_v=Fixed((preset.head_dim_qk, preset.head_dim_vo)),
@@ -615,9 +615,9 @@ def model_knobs(preset, phase):
         batches=RandomBatchSize(min=1, max=4, with_high_probability=[1, 2]),
         s_q_s_kv=RandomSequenceLength(
             s_q_min=1,
-            s_q_max=4096,
+            s_q_max=8192,
             s_kv_min=1,
-            s_kv_max=4096,
+            s_kv_max=8192,
             s_q_distribution={
                 "s_q=1": 0,
                 "s_q=s_kv": 8,
