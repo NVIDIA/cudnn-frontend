@@ -262,9 +262,7 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _thd_case(
-    lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, window_right=None
-):
+def _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, window_right=None, hkv=None,):  # fmt: skip
     """Packed Q/K/V/dO plus the forward's O and packed LSE, per sequence in fp64.
 
     ``cap_*`` over-allocates the packed buffers past the real totals; with
@@ -283,14 +281,18 @@ def _thd_case(
         cu_k.append(cu_k[-1] + c)
     g = torch.Generator(device=dev).manual_seed(seed)
 
-    def _pk(cap, live):
-        x = torch.randn(1, cap, h, d, generator=g, device=dev, dtype=dtype) * 0.3
+    # K/V carry H_kv heads under GQA; Q/dO/O always carry H_q.
+    hkv = h if hkv is None else hkv
+    grp = h // hkv
+
+    def _pk(cap, live, nh):
+        x = torch.randn(1, cap, nh, d, generator=g, device=dev, dtype=dtype) * 0.3
         if poison and cap > live:
             x[0, live:] = float("nan")
         return x
 
-    q_p, do_p = _pk(cap_q, t_q), _pk(cap_q, t_q)
-    k_p, v_p = _pk(cap_kv, t_kv), _pk(cap_kv, t_kv)
+    q_p, do_p = _pk(cap_q, t_q, h), _pk(cap_q, t_q, h)
+    k_p, v_p = _pk(cap_kv, t_kv, hkv), _pk(cap_kv, t_kv, hkv)
     o_p = torch.full_like(q_p, float("nan") if poison else 0.0)
     lse_p = torch.full((1, h, cap_q), float("nan") if poison else 0.0, device=dev, dtype=torch.float32)
     scale = 1.0 / math.sqrt(d)
@@ -300,20 +302,26 @@ def _thd_case(
         qs, ks, vs = (
             x[0, cu[i] : cu[i] + L].transpose(0, 1).double() for x, cu, L in ((q_p, cu_q, lens_q[i]), (k_p, cu_k, lens_kv[i]), (v_p, cu_k, lens_kv[i]))
         )
+        # GQA: one KV head feeds `grp` consecutive Q heads. repeat_interleave,
+        # not repeat -- the kernel's mapping is `kv_head = q_head // grp`, so
+        # heads 0..grp-1 share KV head 0. Getting this backwards still produces
+        # a plausible-looking O and would only show as a cosine miss.
+        if grp > 1:
+            ks, vs = ks.repeat_interleave(grp, dim=0), vs.repeat_interleave(grp, dim=0)
         sc = (qs @ ks.transpose(-1, -2)) * scale
         if causal:
             sc = sc + _causal_bias(lens_q[i], lens_kv[i], dev, bottom_right, window_left, window_right)
         lse_p[0, :, cu_q[i] : cu_q[i] + lens_q[i]] = torch.logsumexp(sc, dim=-1).float()
         o_p[0, cu_q[i] : cu_q[i] + lens_q[i]] = (torch.softmax(sc, dim=-1) @ vs).transpose(0, 1).to(dtype)
     return SimpleNamespace(
-        b=b, h=h, d=d, dtype=dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left, window_right=window_right,
+        b=b, h=h, hkv=hkv, d=d, dtype=dtype, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left, window_right=window_right,
         lens_q=list(lens_q), lens_kv=list(lens_kv), cu_q=cu_q, cu_k=cu_k,
         t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv,
         q=q_p, k=k_p, v=v_p, do=do_p, o=o_p, lse=lse_p,
     )  # fmt: skip
 
 
-def _check(case, dq, dk, dv):
+def _check(case, dq, dk, dv, hkv=None):
     """Per-sequence comparison against the fp64 reference.
 
     Collected, not asserted per gradient: which of the three a sequence gets
@@ -328,10 +336,12 @@ def _check(case, dq, dk, dv):
             continue
         sl_q = slice(case.cu_q[i], case.cu_q[i] + case.lens_q[i])
         sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
+        _grp = case.h // case.hkv
+        _rep = (lambda x: x.repeat_interleave(_grp, dim=0)) if _grp > 1 else (lambda x: x)
         rq, rk, rv = _ref_bwd(
             case.q[0, sl_q].transpose(0, 1),
-            case.k[0, sl_k].transpose(0, 1),
-            case.v[0, sl_k].transpose(0, 1),
+            _rep(case.k[0, sl_k].transpose(0, 1)),
+            _rep(case.v[0, sl_k].transpose(0, 1)),
             case.do[0, sl_q].transpose(0, 1),
             case.scale,
             causal=case.causal,
@@ -339,6 +349,14 @@ def _check(case, dq, dk, dv):
             window_left=case.window_left,
             window_right=case.window_right,
         )
+        if case.hkv != case.h:
+            # GQA: the reference ran with K/V BROADCAST to every Q head, so its
+            # dK/dV are per Q head. The kernel returns them already folded onto
+            # the KV heads, so sum each group before comparing -- comparing
+            # against one group member would pass for MQA and fail for GQA, and
+            # comparing unfolded would fail for both.
+            rk = rk.reshape(case.hkv, _grp, *rk.shape[1:]).sum(1)
+            rv = rv.reshape(case.hkv, _grp, *rv.shape[1:]).sum(1)
         for name, got, want in (
             ("dQ", dq[0, sl_q].transpose(0, 1), rq),
             ("dK", dk[0, sl_k].transpose(0, 1), rk),
@@ -431,7 +449,7 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     return g, vp, (dq_t, dk_t, dv_t)
 
 
-def _run_graph(lens_q, lens_kv, *, h=2, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
+def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.
 
     ``use_causal_mask`` / ``use_causal_mask_bottom_right`` thread through ``kw``
@@ -452,8 +470,9 @@ def _run_graph(lens_q, lens_kv, *, h=2, d=_D, dtype=torch.bfloat16, stats_layout
         bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
         window_left=kw.get("sliding_window_length"),
         window_right=kw.get("diagonal_band_right_bound"),
+        hkv=hkv,
     )
-    g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, **kw)
+    g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, **kw)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -462,7 +481,11 @@ def _run_graph(lens_q, lens_kv, *, h=2, d=_D, dtype=torch.bfloat16, stats_layout
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    dq, dk, dv = (torch.zeros_like(x) for x in (case.q, case.k, case.v))
+    # dK / dV carry H_kv heads under GQA, so they are shaped from the graph's
+    # KV head count, not from the Q tensors.
+    _kvh = h if hkv is None else hkv
+    dq = torch.zeros_like(case.q)
+    dk, dv = (torch.zeros(1, case.cap_kv, _kvh, d, device="cuda", dtype=dtype) for _ in range(2))
     vp.update({dq_t: dq, dk_t: dk, dv_t: dv})
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
@@ -470,7 +493,7 @@ def _run_graph(lens_q, lens_kv, *, h=2, d=_D, dtype=torch.bfloat16, stats_layout
     for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
         live = x[0, : case.t_q] if name == "dQ" else x[0, : case.t_kv]
         assert torch.isfinite(live).all(), f"{name} has non-finite values in the packed region"
-    _check(case, dq, dk, dv)
+    _check(case, dq, dk, dv, hkv=_kvh)
     return case, dq, dk, dv
 
 
@@ -582,6 +605,34 @@ def test_graph_thd_b1_matches_dense_shape():
     _run_graph((512,), (512,))
 
 
+@pytest.mark.parametrize("hkv", (2, 1), ids=("gqa_group2", "mqa"))
+def test_graph_thd_gqa(hkv):
+    """Packed GQA / MQA end to end.
+
+    The dK/dV partials are ONE PER Q HEAD over the packed kv axis, then folded
+    onto the KV heads. Two things this pins that a single group size would not:
+    MQA (group 4) collapses every Q head onto one KV head, and the reference
+    must SUM a group's contributions -- comparing against one member passes for
+    MQA and fails for GQA, so both sizes run.
+    """
+    _run_graph((300, 128, 200), (300, 128, 200), h=4, hkv=hkv)
+
+
+def test_graph_thd_gqa_causal():
+    """GQA together with a per-sequence causal mask -- the two THD conjunctions
+    that were declined separately, now exercised together."""
+    _run_graph((256, 100), (256, 100), h=4, hkv=2, use_causal_mask=True)
+
+
+def test_graph_thd_gqa_cross_attention_and_zero_length():
+    """GQA over unequal Q/KV totals with an empty sequence in the middle.
+
+    The dK/dV partial buffer is sized on the packed KV capacity while dQ rides
+    the Q one, so unequal totals are what would catch the two being conflated.
+    """
+    _run_graph((256, 0, 100), (180, 0, 300), h=4, hkv=2)
+
+
 # --- causal family ----------------------------------------------------------
 #
 # The per-sequence diagonal is the whole risk here.  Stage 2 masks from the
@@ -647,10 +698,12 @@ def test_graph_thd_causal_swa():
 def test_graph_thd_causal_right_band():
     """Right-band widening: the causal upper bound pushed out by an offset.
 
-    The fourth member of the single ``thd_causal`` flag -- it covers causal, SWA,
-    bottom-right AND band widening, so each is its own accept test (engine
-    contract section 9).  ``diagonal_band_right_bound`` is exclusive with
-    ``use_causal_mask``; it IS the upper bound.
+    The fourth causal-family band, and each gets its own accept test rather than
+    one test for "causal" (engine contract section 9).  That granularity is what
+    justified deleting the ``thd_causal`` conjunction flag outright: all four
+    bands are served, so nothing is left for the flag to decline.
+    ``diagonal_band_right_bound`` is exclusive with ``use_causal_mask``; it IS
+    the upper bound.
     """
     _run_graph((300, 128, 200), (300, 128, 200), diagonal_band_right_bound=64)
 
@@ -697,17 +750,24 @@ def test_graph_thd_accepts_the_plain_case():
 def test_accept_thd_causal():
     """The inverse of the reject this used to be (test/AGENTS.md: invert, do not
     delete).  Stage 2 masks from the per-sequence metadata lengths and stage 3
-    drops its absolute-row K-trim under THD, so the causal family is served."""
+    drops its absolute-row K-trim under THD, so the causal family is served.
+
+    Kept after the ``thd_causal`` flag was deleted, and now MORE load-bearing
+    than before: with no flag left to decline on, this is the only thing that
+    would catch a regression re-introducing a causal-under-THD refusal."""
     assert _thd_mismatch(use_causal_mask=True) is None
     assert _thd_mismatch(use_causal_mask_bottom_right=True) is None
     assert _thd_mismatch(use_causal_mask=True, sliding_window_length=64) is None
     assert _thd_mismatch(diagonal_band_right_bound=64) is None
 
 
-def test_reject_thd_gqa():
-    """The dK/dV partials would have to be packed per Q head."""
-    reason = _thd_mismatch(h=4, hkv=2)
-    assert reason is not None and "GQA" in reason
+def test_accept_thd_gqa():
+    """The inverse of the reject this used to be (test/AGENTS.md: invert, do not
+    delete).  The dK/dV partials are now packed per Q head over the kv axis and
+    folded by the shared reduce, so GQA and MQA are both served."""
+    assert _thd_mismatch(h=4, hkv=2) is None  # GQA, group 2
+    assert _thd_mismatch(h=4, hkv=1) is None  # MQA, group 4
+    assert _thd_mismatch(h=4, hkv=2, use_causal_mask=True) is None  # with a mask
 
 
 def test_reject_thd_without_declared_totals():

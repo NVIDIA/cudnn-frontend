@@ -2272,15 +2272,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 bool(self._stage_in or self._stage_out),
                 f"SM100 bwd THD: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical " "(the packed path has no staging copy)",
             )
-            # Declined HERE and not only at execute: `_execute_thd` raises after
-            # the workspace carve and the do_dot launch, so a direct
-            # SdpaBwdDslSm100 caller would pay a build and an allocation before
-            # learning the plan is unserved. The graph path never reaches either
-            # (the row leaves `thd_gqa` False), which is why this is a backstop.
-            self._value_error_if(
-                self._gqa_group > 1,
-                "SM100 bwd THD: GQA is not implemented yet (the dK/dV partials need packed per-Q-head buffers)",
-            )
             self._value_error_if(
                 self._thd_lse_token_major and bool(self.thd_stats_head_stride),
                 "SM100 bwd THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
@@ -2323,7 +2314,11 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         if self._gqa_group > 1:
             # One dK and one dV partial per Q head, reduced to the KV heads at
             # the end. Sized on h_q, not h_kv -- that is the whole point.
-            total += 2 * ws_align(self.batch_size * self.s_k_max * self.h_q * self.head_dim_qk * self._bpe)
+            # THD packs the kv axis into ONE batch of `t_kv_cap` tokens, which is
+            # the same memory win the blocked S/dS workspace gets: B * S_kv_max
+            # tokens become the declared packed total.
+            _kv_rows = self._t_kv_cap if self.thd else self.batch_size * self.s_k_max
+            total += 2 * ws_align(_kv_rows * self.h_q * self.head_dim_qk * self._bpe)
         return total
 
     # --- compilation ---------------------------------------------------------
@@ -2875,8 +2870,21 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             # it directly), so this only re-asserts the shape `compile()` baked
             # into the artifact.
             lse = stats_tensor.reshape(t_q_cap, h) if self._thd_lse_token_major else stats_tensor.reshape(1, h, self._thd_lse_head_stride or t_q_cap)
+            # GQA: the stage-3 dK/dV GEMMs write ONE PARTIAL PER Q HEAD and a
+            # separate reduce folds the group. Writing straight to dk/dv would
+            # have a group's Q heads overwrite each other instead of summing.
+            # Packed `[1, T_kv_cap, H_q, D]` -- the same shape the dense path
+            # uses with the batch collapsed, so every downstream slice, the
+            # per-sequence descriptor bases (which take their row stride from
+            # the C tensor) and `dkv_reduce_host` (which sizes its grid from
+            # `dk.shape[0..2]`) all work unchanged.
             gqa = self._gqa_group > 1
-            self._value_error_if(gqa, "SM100 bwd THD: GQA is not implemented yet (the dK/dV partials need packed per-Q-head buffers)")
+            if gqa:
+                dk_part = carver.take(t_kv_cap * h * d, self.dtype).view(1, t_kv_cap, h, d)
+                dv_part = carver.take(t_kv_cap * h * d, self.dtype).view(1, t_kv_cap, h, d)
+                dk_tgt, dv_tgt = dk_part, dv_part
+            else:
+                dk_tgt, dv_tgt = dk, dv
 
             for c in range(h // chunk):
                 hb = c * chunk
@@ -2906,7 +2914,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 mm_lo.matmul_bh(
                     s_ws.permute(3, 2, 1, 0),
                     do[:, :, hs, :].permute(3, 1, 2, 0),
-                    dv[:, :, hs, :].permute(1, 3, 2, 0),
+                    dv_tgt[:, :, hs, :].permute(1, 3, 2, 0),
                     n_head=chunk,
                     n_batch=b,
                     stream=stream,
@@ -2917,7 +2925,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 mm_lo.matmul_bh(
                     ds_ws.permute(3, 2, 1, 0),
                     q[:, :, hs, :].permute(3, 1, 2, 0),
-                    dk[:, :, hs, :].permute(1, 3, 2, 0),
+                    dk_tgt[:, :, hs, :].permute(1, 3, 2, 0),
                     n_head=chunk,
                     n_batch=b,
                     stream=stream,
@@ -2925,14 +2933,52 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                     desc_words=desc3,
                     grid_m=self.s_k_max,
                 )
-                mm_hi.matmul_bh(
-                    ds_ws.permute(2, 3, 1, 0),
-                    k[:, :, hs, :].permute(3, 1, 2, 0),
-                    dq[:, :, hs, :].permute(1, 3, 2, 0),
-                    n_head=chunk,
-                    n_batch=b,
-                    stream=stream,
-                    meta=meta,
-                    desc_words=desc3,
-                    grid_m=self.s_q_max,
-                )
+                # dQ = dS.K. Under GQA the K head is shared by `group` Q heads,
+                # so the GEMM runs once per group MEMBER: taking every `group`-th
+                # Q head lines A and the output up with the KV heads exactly, and
+                # every operand stays a strided view (no expand, no copy). The
+                # per-sequence dQ descriptors follow, because they take their row
+                # stride from the C tensor and striding the HEAD axis leaves the
+                # row stride at H_q * D.
+                kv_lo, kv_n = hb // self._gqa_group, chunk // self._gqa_group
+                kvs = slice(kv_lo, kv_lo + kv_n)
+                for gi in range(self._gqa_group):
+                    a_g = ds_ws[:, gi :: self._gqa_group] if gqa else ds_ws
+                    o_g = dq[:, :, hs, :][:, :, gi :: self._gqa_group, :] if gqa else dq[:, :, hs, :]
+                    mm_hi.matmul_bh(
+                        a_g.permute(2, 3, 1, 0),
+                        k[:, :, kvs, :].permute(3, 1, 2, 0),
+                        o_g.permute(1, 3, 2, 0),
+                        n_head=kv_n,
+                        n_batch=b,
+                        stream=stream,
+                        meta=meta,
+                        desc_words=desc3,
+                        grid_m=self.s_q_max,
+                    )
+
+            if gqa:
+                # Fold the Q-head partials onto the KV heads -- the same
+                # arch-neutral reduce the dense path uses, unchanged: it is
+                # elementwise over rows and sizes its grid from the OUTPUT's
+                # (batch, seq, head), so a packed batch of 1 needs nothing
+                # special.
+                from cudnn.sdpa.bwd.kernels.bprop_chain_f16_sm120 import dkv_reduce_host
+
+                io_dt = cutlass.BFloat16 if self.dtype == torch.bfloat16 else cutlass.Float16
+                if self._reduce_fn is None:
+                    self._reduce_fn = cutlass.cute.compile(
+                        dkv_reduce_host,
+                        _t(dk_part),
+                        _t(dv_part),
+                        _t(dk),
+                        _t(dv),
+                        d,
+                        d,
+                        self._gqa_group,
+                        io_dt,
+                        False,
+                        make_fake_stream(use_tvm_ffi_env_stream=False),
+                        options="--enable-tvm-ffi",
+                    )
+                self._reduce_fn(_t(dk_part), _t(dv_part), _t(dk), _t(dv), stream)
