@@ -35,7 +35,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, KDA_ID_BASE
+from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, GDP_ID_BASE, KDA_ID_BASE
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -129,6 +129,8 @@ _ANCHOR_NODE_TO_FAMILY = {
     "KDA_BWD": "kda",
     "GDN2": "gdn2",
     "GDN2_BWD": "gdn2",
+    "GDP": "gdp",
+    "GDP_BWD": "gdp",
 }
 
 # ---------------------------------------------------------------------------
@@ -159,6 +161,14 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "Gdn2Engines",
         slots={"gdn2_frost": EngineSlot(0)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
+        GDP_ID_BASE,
+        "gdp",
+        "cudnn.linear_attention",
+        "GdpEngines",
+        slots={"gdp_frost": EngineSlot(0)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
@@ -199,6 +209,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
+            "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),

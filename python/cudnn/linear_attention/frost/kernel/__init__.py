@@ -19,8 +19,10 @@
 
 GDN: ``gdn_prefill_f16.py`` (prefill, optional per-chunk H output) with
 ``gdn_prefill_config.py``, and ``gdn_bprop_f16.py`` (backward) with
-``gdn_bprop_config.py``.  The tile primitives come from the shared
-``cudnn.frost.tile_dsl``; ``thd.py`` lives in ``..common``.
+``gdn_bprop_config.py``.  GDP shares them, except its d_v = 64 backward fork
+``gdp_bprop_v64_f16.py`` with ``gdp_bprop_v64_config.py``.  The tile
+primitives come from the shared ``cudnn.frost.tile_dsl``; ``thd.py`` lives
+in ``..common``.
 
 KDA: ``kda_prefill_f16.py`` (prefill, BT=16, per-key-channel decay) with
 ``kda_prefill_config.py``; ``kda_bprop_f16.py`` (backward) is a STUB.

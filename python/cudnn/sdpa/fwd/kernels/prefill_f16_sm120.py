@@ -59,8 +59,9 @@ from cudnn.frost.tile_dsl.scheduler import (
 )
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
-from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel as _build_thd_meta_kernel,
+    sanitize_v_tail as _sanitize_v_tail,
     thd_claim_next,
     thd_decode_unit,
     THD_SETUP_THREADS,
@@ -834,6 +835,17 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
+        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+            _sanitize_v_tail(
+                mma_params.sV,
+                basic_params.lane,
+                basic_params.seqlen_k,
+                kv_tile_idx * self.kv_tile,
+                self.in_dtype,
+                self.head_tile_v,
+                self.kv_tile,
+                self.v_swizzle_chunk_elems,
+            )
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -1537,6 +1549,8 @@ class SM120FusedMultiHeadAttentionForward:
                 batch_idx,
                 head_idx,
             )
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(

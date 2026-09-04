@@ -417,7 +417,7 @@ _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -793,6 +793,9 @@ def _kernel(
     else:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta)
+
+
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -2222,9 +2225,9 @@ def _host(
         # The FP8 setup variant additionally clamps runtime K/V descriptors to
         # the packed KV total (o_desc_words slots n_batch+1 / n_batch+2) so a
         # tile tail past that total zero-fills instead of reading the buffer's
-        # capacity tail — a NaN tail would poison BMM2's P·V.  It does not write
-        # the live-unit total / claim counter, which only the SM120 persistent
-        # scheduler reads; this kernel runs the plan-time envelope grid.
+        # capacity tail — a NaN tail would poison BMM2's P·V. The shared setup
+        # also writes persistent-scheduler metadata; this envelope-grid flavor
+        # does not consume it.
         _build_thd_meta_o_kv_descs_kernel(
             o_tensor,
             tma_o_desc,
@@ -2238,6 +2241,8 @@ def _host(
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(CGA_TILE_M),
+            n_thd_units,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

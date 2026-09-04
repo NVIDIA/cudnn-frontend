@@ -22,6 +22,21 @@ Warp layout (8 warps × 32 = 256 threads/CTA):
   warp  5   : TMA producer (cta_group=2: both CTAs load their slice)  — setmaxnreg.dec 40
   warp  6   : CLC scheduler (leader CTA issues queries; every CTA waits + reads + arrives empty)  — setmaxnreg.dec 40
   warp  7   : unused donor — setmaxnreg.dec 40
+
+FORKED BY ``sdpa/bwd/kernels/bprop_matmul_sm100.py``
+----------------------------------------------------
+The SDPA backward's stage-3 gradient GEMMs need a 2-D ``(batch, head)`` batch:
+their operands are BSHD ``[B, S, H, D]``, so the batch element is the PAIR
+``(b, h)`` at offset ``b*(S*H*D) + h*D`` -- a two-level stride that the single
+uniform batch stride here cannot express, and that cannot be normalised
+host-side without copying a multi-GiB workspace per chunk.  That fork takes a
+rendered dense-bf16 expansion of this template and widens the TMA descriptors
+to 4-D ``[k, m, h, b]``.  It is otherwise identical: same mainloop, same CLC
+scheduler, same TMEM pipeline, same epilogue.
+
+**Any correctness fix or performance improvement here should be applied there
+too, and vice versa.**  The fork carries the matching note and a list of the
+points where the two intentionally differ.
 """
 
 from __future__ import annotations
@@ -1195,6 +1210,9 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

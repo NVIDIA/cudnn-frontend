@@ -114,6 +114,135 @@ def test_recommend_every_set_is_admissible():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "engine_name,dtype,is_fp8",
+    [
+        ("sdpa_fwd_prefill_sm120", cudnn.data_type.HALF, False),
+        ("sdpa_fwd_prefill_sm120_fp8", cudnn.data_type.FP8_E4M3, True),
+    ],
+)
+def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
+    facts = _facts(
+        s_q=256,
+        s_kv=256,
+        d_qk=192,
+        d_v=128,
+        dtype=dtype,
+        dtype_o=cudnn.data_type.HALF,
+        is_fp8=is_fp8,
+        device_cc=(12, 0),
+        device_sm_count=84,
+    )
+    offered = {engine_name: 20504}
+    plans = recommend("A", facts, offered)
+    assert plans
+    assert all(plan.knobs.cga == 1 for plan in plans)
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == engine_name)
+    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["per_tensor", "block_scale"])
+@pytest.mark.parametrize(
+    ("d_qk", "d_v", "expected_cga"),
+    [(128, 128, 2), (256, 256, 1)],
+    ids=["d128", "d256"],
+)
+def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected_cga):
+    """A unified dtype-family engine must advertise the geometry it launches."""
+
+    name = engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    facts = _facts(
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_mxfp8=mxfp8,
+        is_fp8=not mxfp8,
+    )
+    plans = recommend("A", facts, {name: 20510})
+    assert plans
+    assert {plan.knobs.cga for plan in plans} == {expected_cga}
+
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
+    wrong_cga = 1 if expected_cga == 2 else 2
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
+
+
+@pytest.mark.L0
+def test_per_tensor_fp8_envelope_uses_d256_cga1():
+    """A non-native dense shape inherits the geometry of its covering flavor."""
+
+    name = engines.engine_name(fp8=True)
+    facts = _facts(
+        d_qk=224,
+        d_v=224,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_fp8=True,
+    )
+    plans = recommend("A", facts, {name: 20510})
+    assert plans
+    assert {plan.knobs.cga for plan in plans} == {1}
+
+
+@pytest.mark.L0
+def test_d256_fp8_config_requires_cga1():
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_FP16
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256, make_cfg_d256_mxfp8
+
+    params = TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, cta_mma=1)
+    cfg_pt = make_cfg_d256(params)[0]
+    cfg_mx = make_cfg_d256_mxfp8(params)[0]
+    assert cfg_pt.CGA_M == cfg_pt.CTA_MMA == 1
+    assert cfg_mx.CGA_M == cfg_mx.CTA_MMA == 1
+    with pytest.raises(ValueError, match="FP8/MXFP8 requires cta_mma=1"):
+        make_cfg_d256(TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP16, cta_mma=2))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["per_tensor", "block_scale"])
+@pytest.mark.parametrize("sched_policy", [0, 1, 2], ids=["natural", "lpt", "lpt_l2"])
+def test_d256_config_honors_explicit_scheduler(mxfp8, sched_policy):
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_FP16
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256, make_cfg_d256_mxfp8
+
+    params = TemplateParams(
+        dtype_qkv=DTYPE_E4M3,
+        dtype_o=DTYPE_FP16,
+        window_right=0,
+        sched_policy=sched_policy,
+        cta_mma=1,
+    )
+    make_cfg = make_cfg_d256_mxfp8 if mxfp8 else make_cfg_d256
+    assert make_cfg(params)[0].SCHEDULER_POLICY == sched_policy
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("mxfp8", "expected_sched"),
+    [(False, 2), (True, 1)],
+    ids=["per_tensor_lpt_l2", "block_scale_lpt"],
+)
+def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
+    name = engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    facts = _facts(
+        s_q=8192,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_mxfp8=mxfp8,
+        is_fp8=not mxfp8,
+    )
+    plans = recommend("A", facts, {name: 20510})
+    assert plans[0].knobs.cga == 1
+    assert plans[0].knobs.split_kv == 1
+    assert plans[0].knobs.sched_policy == expected_sched
+
+
+@pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     """Placement is the SHARED layer's job (engines/heuristics._assemble):
     proposals lead the backend's entries inside each mode block by standing
@@ -194,16 +323,17 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
     # The split value depends on this device's SM count — ask the chooser
     # rather than hard-coding one that only holds at one part's geometry.
     from cudnn._device import device_info
+    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m
     from cudnn.sdpa.fwd.heuristics import choose_split_kv
 
     want = choose_split_kv(
-        q_tiles=-(-SQ // 256),
+        q_tiles=-(-SQ // cga_tile_m(D)),
         heads_q=H,
         batch=B,
         kv_tiles=-(-SKV // 128),
         sm_count=device_info(torch.cuda.current_device()).sm_count,
+        combine_rows=SQ * H * B,
         ctas_per_tile=2,
-        max_split=4,
     )
     if want == 1:
         pytest.skip("this part is small enough that the shape already fills it")

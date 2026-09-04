@@ -383,6 +383,7 @@ def _run_thd_case(
     check_stats: bool = False,
     stats_layout: str = "token_major",
     cu_lens: bool = False,
+    nan_capacity_tail: bool = False,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -405,9 +406,17 @@ def _run_thd_case(
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
     v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
-    q_view, _, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
-    k_view, _, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
-    v_view, _, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
+    q_view, q_storage, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
+    k_view, k_storage, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
+    v_view, v_storage, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
+    if nan_capacity_tail:
+        # A THD caller binds K/V at buffer CAPACITY; rows in [total, capacity)
+        # were never written. NaN-poison them.
+        t_q = sum(seq_q_lens)
+        t_kv = sum(seq_kv_lens)
+        q_storage[t_q * h_q * head_dim :] = float("nan")
+        k_storage[t_kv * h_kv * head_dim :] = float("nan")
+        v_storage[t_kv * h_kv * d_v :] = float("nan")
     o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), d_v, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
     # SENTINEL fill: the kernel writes every valid packed O token (compared
     # against the reference below); everything else — the whole buffer when
@@ -525,6 +534,9 @@ def _run_thd_case(
             assert (stats_storage == _THD_SENTINEL).all(), "t_q == 0 wrote to the ragged Stats"
         return
     packed_o = o_storage[: cu[-1] * h_q * d_v].view(max(cu[-1], 1), h_q, d_v)
+    if nan_capacity_tail:
+        n_nan = int(torch.isnan(packed_o).sum())
+        assert n_nan == 0, f"{n_nan} NaNs in O -- the K/V capacity tail reached BMM2"
     if check_stats and stats_layout == "head_major":
         packed_stats = stats_storage.view(h_q, t_cap)  # (H, head_stride); tokens at [:, cu[i]:cu[i+1]]
     elif check_stats:
@@ -919,6 +931,15 @@ def test_dsl_sm120_thd():
     """THD self-attention: packed ragged batch vs per-sequence references."""
 
     _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128)], ids=["d64", "d128", "d192x128"])
+@torch_fork_set_rng(seed=23)
+def test_dsl_sm120_thd_nan_capacity_tail(d_qk, d_v):
+    """THD with a NaN-poisoned capacity tail: O must be finite and correct."""
+
+    _run_thd_case(seq_q_lens=[200, 150, 47], seq_kv_lens=[200, 150, 47], head_dim=d_qk, head_dim_v=d_v, is_causal=True, nan_capacity_tail=True)
 
 
 @pytest.mark.L0

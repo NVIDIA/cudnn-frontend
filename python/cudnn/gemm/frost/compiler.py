@@ -2060,7 +2060,7 @@ def _render_template(
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
-    src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
+    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
 
@@ -2258,7 +2258,7 @@ def _render_block_scale_template(
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
-    src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
+    src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
     return src
 
 
@@ -3605,6 +3605,7 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False) -> TileConf
         b_n_major=chain.matmul.b_major == "n",
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
         force_cta_group=force_cta_group,
+        m_is_group_average=chain.moe is not None,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is

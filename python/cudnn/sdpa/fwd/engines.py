@@ -87,7 +87,7 @@ class SdpaFwdKnobs:
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
-    cga: Optional[int] = None  # cluster size (CTAs cooperating per tile)
+    cga: Optional[int] = None  # CTA group width used by one cooperative MMA tile
     pack_gqa: Optional[bool] = None  # Head packing for GQA/MQA
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
@@ -200,10 +200,7 @@ class Capabilities:
     # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
     cu_seq_len: bool = False
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
-    # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
-    # kernels and the SM120 fp8 kernel via SEQ_Q_LENS_PRESENT; the SM100
-    # FP8/MXFP8 kernels lack the epilogue trim, so their specs keep this
-    # False.
+    # q-rows write LSE=-inf / O=0, cuDNN >= 9.14).
     padded_stats: bool = False
     # Dense padded graphs carrying per-batch seq_len_q: the kernel's epilogue
     # trims padded q rows (O := 0, LSE := -inf). Rows whose kernel lacks the
@@ -213,6 +210,9 @@ class Capabilities:
     # row reusing an adapter for a trim-less kernel would silently inherit
     # the wrong answer otherwise).
     dense_seq_q_trim: bool = False
+    # A unified engine row may contain only some native flavors with the trim.
+    # The smallest native shape covering the graph selects this override.
+    dense_seq_q_trim_d_shapes: frozenset[tuple[int, int]] = frozenset()
     # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
     decode: bool = True
 
@@ -252,6 +252,11 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+    # Shape-specific CGA domains for rows that lower several native flavors.
+    # ``cgas`` remains the default. A split-specific entry further narrows the
+    # domain for split-KV plans without changing the unsplit public domain.
+    cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    split_cgas_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
     pack_gqas: frozenset[bool] = frozenset({False})
     # Does this row's lowering wire the KV-split path (kernel SplitHelpers +
     # adapter carving the partial slabs + launching the combine)? A GATE, not a
@@ -288,6 +293,37 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
     return facts.s_q + r <= facts.s_kv
 
 
+def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
+    """Smallest native flavor whose envelope covers this graph."""
+
+    covering = [shape for shape in capabilities.d_shapes if facts.d_qk <= shape[0] and facts.d_v <= shape[1]]
+    return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
+
+
+def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
+    """CGA domain of the native flavor and split leg selected by the graph."""
+
+    selected = _selected_d_shape(capabilities, facts)
+    domain = capabilities.cgas
+    if selected is not None:
+        for shape, shape_domain in capabilities.cgas_by_d_shape:
+            if shape == selected:
+                domain = shape_domain
+                break
+        if (split_kv or 1) > 1:
+            for shape, split_domain in capabilities.split_cgas_by_d_shape:
+                if shape == selected:
+                    domain = split_domain
+                    break
+    return domain
+
+
+def supports_dense_seq_q_trim(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """Whether the graph-selected native flavor trims dense padded Q rows."""
+
+    return capabilities.dense_seq_q_trim or _selected_d_shape(capabilities, facts) in capabilities.dense_seq_q_trim_d_shapes
+
+
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
@@ -310,7 +346,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.sched_policy, capabilities.sched_policies, "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
-            (knobs.cga, capabilities.cgas, "cga"),
+            (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
             (knobs.softmax_precision, capabilities.softmax_precisions, "softmax_precision"),
         ):
@@ -472,7 +508,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
-    if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
+    if facts.padded and facts.wants_stats and not facts.thd and not (capabilities.padded_stats or supports_dense_seq_q_trim(capabilities, facts)):
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
     if facts.stats_t is not None and not facts.thd:
@@ -558,6 +594,8 @@ def _sm100_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})),),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # All four f16 flavor kernels wire SplitHelpers, and the adapter
             # carves the partial slabs + launches split_combine_sm100 when
             # split_kv > 1 (dense f16 only; see mismatch's facts x knobs gate).
@@ -571,8 +609,8 @@ def _sm100_spec() -> EngineSpec:
 def _sm100_mxfp8_spec() -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen (d128/d128 only — the d192/d128 kernel is dense-only) rides the
-    shared packed lowering (write_thd_meta envelope design, issue #552; packed
+    THD/varlen on all three native shapes rides the shared packed lowering
+    (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
     in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
@@ -587,12 +625,10 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             phase="prefill",
             # Exact native shapes only (d_pad_multiple=0): the SF plumbing is
             # not audited for envelope zero-padding.
-            d_shapes=frozenset({(128, 128), (192, 128)}),
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             d_pad_multiple=0,
-            # Only the d128 kernel carries the write_thd_meta THD leg and
-            # wires SplitHelpers; the d192x128 file is dense-only.
-            thd_d_shapes=frozenset({(128, 128)}),
-            split_d_shapes=frozenset({(128, 128)}),
+            thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -606,12 +642,15 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
+            dense_seq_q_trim_d_shapes=frozenset({(256, 256)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1}))),
+            split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # The split path also needs a half-precision O (mismatch's
-            # facts x knobs gate) and rides the d128 flavor (split_d_shapes).
+            # facts x knobs gate).
             split_kv_supported=True,
             # PackGQA is currently not supported for the MXFP8 SDPA engine:
             # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
@@ -630,15 +669,12 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
     shared row could only describe their union with knob x arch notches.
     Within a row the head dim is a LOWERING concern — the adapter picks the
-    kernel flavor (d128 or d192xd128) covering the graph. Each row declares
+    kernel flavor covering the graph. Each row declares
     exactly what its own kernels carry:
 
-    - d_shapes: the sm100 row picks between the d128, d192xd128 and d512
-      flavors; Rubin has only the d128 sibling, so a Rubin d192 graph is
-      ineligible at probe time instead of a late build error.  There is no
-      d256 per-tensor FP8 kernel, so the adapter's flavor walk is restricted
-      to this set (api_dsl._pick_flavor's ``candidates``) rather than the
-      f16 flavor list.
+    - d_shapes: the sm100 row picks among d128, d192xd128, d256, and d512;
+      Rubin has only the d128 sibling, so wider Rubin graphs are ineligible at
+      probe time instead of failing during lowering.
     - The ENVELOPE (d_pad_multiple=16, the TMA 16-byte global-stride rule at
       1 byte/elem): smaller head dims ride TMA zero-padding — exact in FP8,
       and the descales are scalars so no per-column plumbing is affected.
@@ -647,25 +683,23 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     - softmax_precisions: the f16x2 exponent arm lives only in the SM107
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
-    - thd_d_shapes: the d128 and d512 per-tensor kernels carry the
-      write_thd_meta THD leg; the d192x128 file is dense-only.
-    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers
-      (the SM107 sibling carries the same plumbing as its SM100 twin), so both
-      rows advertise the split; the d192x128 file forks its own scheduler and
-      has none, which is what split_d_shapes pins.
-    - sched_policies: the LPT/LPT_L2 remap is not yet ported to the SM107
-      sibling (issue #653); {NATURAL} keeps requests honest AND routes the
-      graph path around the un-ported derivation (place() hands the adapter
-      an explicit policy from this domain).
+    - thd_d_shapes: all SM100 native flavors carry the
+      write_thd_meta THD leg; the SM107 row carries its d128 sibling.
+    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers;
+      SM100 d192x128 and d256 carry the same split contract.
+    - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
+      (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
+      every decode call site, which is what the shared LPT_L2 decode requires,
+      so its remap is in lockstep with the SM100 twin (place() hands the
+      adapter an explicit policy from this domain).
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
-    fully-masked row can poison the global amax.  THD/varlen (d128/d128 only —
-    the d192/d128 kernel is dense-only) rides the shared packed lowering
-    (write_thd_meta envelope design, issue #552; packed Q/K/V/O contract
-    only) — on cc10.7 (Rubin) through the SM107 sibling kernel, which carries
-    the same THD leg.
+    fully-masked row can poison the global amax. THD/varlen rides the shared
+    packed lowering on all SM100 native shapes (write_thd_meta envelope
+    design, issue #552; packed Q/K/V/O contract only). Rubin keeps the
+    d128-only SM107 sibling.
     """
 
     rubin_row = arch == "sm107"
@@ -678,7 +712,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (512, 512)}),
+            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=16,
             # The d512 flavor serves the (256, 512] band on BOTH head dims —
             # the range no smaller FP8 flavor reaches, at most 2x zero-padding.
@@ -686,7 +720,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # graph onto a kernel whose cga4x1 role-split geometry is tuned for
             # d = 512. Mirrored by api_dsl._SM100_FP8_ENVELOPE_FLOORS.
             d_envelope_floors=() if rubin_row else (((512, 512), 256),),
-            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (512, 512)}),
+            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
@@ -700,33 +734,35 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
-            # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
-            # only reachable padded+stats population is KV-only padding with
-            # full-length seq_len_q (the fp8 suite; test_mhas_v2 fp8 padding
-            # comes only via paged/THD, both ineligible here), where the trim
-            # is a no-op. Dense fp8 padding with SHORT seq_len_q + stats would
-            # report untrimmed LSE — plumb the trim before relying on it.
+            # D256 carries the dense padded-Q epilogue trim; the older D128 and
+            # D192/D128 siblings remain KV-padding-only for dense graphs.
             padded_stats=True,
+            dense_seq_q_trim_d_shapes=(frozenset() if rubin_row else frozenset({(256, 256)})),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            # LPT/LPT_L2 remap is not yet ported to the SM107 sibling (issue
-            # #653) — its row serves NATURAL only until the port lands.
-            sched_policies=(frozenset({SCHED_NATURAL}) if rubin_row else frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})),
+            # LPT/LPT_L2 remap is in lockstep with the SM100 sibling (issue
+            # #653): every decode call site threads qh_per_kh/seqlen_kv, which
+            # is what the shared _common_sm100 LPT_L2 decode demands.  The L2
+            # figure the remap blocks against (CFG.L2_SIZE_MIB) is a tuning
+            # hint for the grouping, not a chip capacity, so the SM100 number
+            # carries to Rubin unchanged.
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            cgas_by_d_shape=(() if rubin_row else (((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))),
+            split_cgas_by_d_shape=(() if rubin_row else (((192, 128), frozenset({2})),)),
             # f16x2-softmax arm: only the SM107 sibling kernel carries the
             # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
             # it). FLOAT is the f32 pipeline every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             # Split partials reduce in half precision, so mismatch()'s
-            # facts x knobs gate additionally requires a bf16/fp16 O on the
-            # quantized rows; split_d_shapes pins it to the d128 flavor.
+            # facts x knobs gate additionally requires a bf16/fp16 O.
             split_kv_supported=True,
-            split_d_shapes=frozenset({(128, 128)}),
+            split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
@@ -880,7 +916,8 @@ def lower_dsl_prefill(
     # buffer a trim-less kernel can't honor is dropped here rather than
     # erroring at execute (the row declares plumbed-ness; see
     # Capabilities.dense_seq_q_trim).
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and spec.capabilities.dense_seq_q_trim
+    dense_seq_q_trim = supports_dense_seq_q_trim(spec.capabilities, facts)
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and dense_seq_q_trim
     api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -897,8 +934,8 @@ def lower_dsl_prefill(
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
-        # THD carries Q lengths via cu_seqlens; the SM100 FP8/MXFP8 kernels
-        # are not plumbed (see seq_q_lens_present above).
+        # THD carries Q lengths via cu_seqlens; support is selected per native
+        # flavor above because only D256 FP8/MXFP8 currently consumes it.
         seq_q_lens_present=seq_q_lens_present,
         # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
         # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
@@ -1046,7 +1083,7 @@ def lower_dsl_prefill(
         # THD is exempt: ragged lengths ARE shorter than S_q by construction,
         # and the packed layout gives each sequence its own extent, so
         # nothing is written past a valid length.
-        if not spec.capabilities.dense_seq_q_trim and not facts.thd and seq_q_buf is not None:
+        if not dense_seq_q_trim and not facts.thd and seq_q_buf is not None:
             min_seq_q = int(seq_q_buf.min().item())
             if min_seq_q < int(facts.s_q):
                 raise NotImplementedError(

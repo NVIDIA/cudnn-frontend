@@ -3357,6 +3357,8 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
     the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
     M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
+    if _current_arch() != 120:
+        pytest.skip(f"sm120-host-only matrix (running on sm_{_current_arch()})")
     cfg = _resolve(config_name)
     M, N, K = 192, 192, 160
     ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)
@@ -3397,7 +3399,7 @@ def test_sm120_render_smoke() -> None:
                 combo = (a_major, b_major, out_major)
                 assert "@@" not in src, f"leftover injection markers {combo}"
                 ast.parse(src)
-                assert "cudnn_frost_sm120_matmul_" in src
+                assert "frost_sm120_matmul_" in src
                 assert "threads_per_cta = 384" in src
                 assert f"vec_bytes_epi = {vec}" in src
                 assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"

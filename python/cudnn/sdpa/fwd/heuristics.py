@@ -41,15 +41,38 @@ the honest answer while nobody has timed it.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import cudnn
 
 from cudnn.engines.base import PlanConfig
-from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_supported
+from cudnn.frost.tile_dsl.constants import (
+    DTYPE_BF16,
+    DTYPE_E4M3,
+    DTYPE_E5M2,
+    DTYPE_FP16,
+    SCHED_LPT,
+    SCHED_LPT_L2,
+    SCHED_NATURAL,
+)
+from cudnn.sdpa.fwd.config_sm100 import (
+    TemplateParams as Sm100TemplateParams,
+    cga_tile_m,
+    d192_square_br_as_tl,
+    d256_square_br_as_tl,
+    pack_gqa_supported,
+)
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, mismatch
+from cudnn.sdpa.fwd.engines import (
+    ENGINE_SPECS,
+    Capabilities,
+    EngineSpec,
+    SdpaFwdKnobs,
+    _band_covers_kv_tail,
+    _selected_d_shape,
+    effective_cgas,
+    mismatch,
+)
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
@@ -98,6 +121,13 @@ _SPLIT_KV_CTA_COST = 21.0
 _SPLIT_KV_COMBINE_COST = 0.2
 
 
+class _SplitKvLaunch(NamedTuple):
+    q_tiles: int
+    heads_q: int
+    kv_tiles: int
+    ctas_per_tile: int
+
+
 def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
     """The splits worth scoring on this device, ascending, always starting at 1.
 
@@ -144,6 +174,7 @@ def choose_split_kv(
     combine_rows: int,
     ctas_per_tile: int = 1,
     candidates: Optional[List[int]] = None,
+    unsplit_launch: Optional[_SplitKvLaunch] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -182,12 +213,19 @@ def choose_split_kv(
     and never splits; and a long-S_q chunk splits less than a short one, because
     its combine has more rows to reduce.
 
+    ``q_tiles`` / ``heads_q`` / ``kv_tiles`` / ``ctas_per_tile`` describe the
+    split leg. ``unsplit_launch`` may describe a different complete no-split
+    assignment, as happens when D192 uses CGA1 unsplit but requires CGA2 for a
+    split. It defaults to the split geometry, preserving the ordinary case.
+
     Returns 1 when there is nothing to split or nothing beats not splitting.
     ``candidates`` defaults to :func:`split_kv_candidates` for the device.
     """
-    if min(q_tiles, heads_q, batch, kv_tiles, sm_count, ctas_per_tile) <= 0:
+    split_launch = _SplitKvLaunch(q_tiles, heads_q, kv_tiles, ctas_per_tile)
+    if unsplit_launch is None:
+        unsplit_launch = split_launch
+    if min(*split_launch, *unsplit_launch, batch, sm_count) <= 0:
         return 1
-    base_ctas = q_tiles * heads_q * batch * ctas_per_tile
     if kv_tiles <= 1:
         return 1
     if candidates is None:
@@ -206,8 +244,10 @@ def choose_split_kv(
         # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
         if split > 1 and kv_tiles // split < _SPLIT_KV_MIN_TILES:
             continue
+        launch = unsplit_launch if split == 1 else split_launch
+        base_ctas = launch.q_tiles * launch.heads_q * batch * launch.ctas_per_tile
         waves = _ceil_div(base_ctas * split, sm_count)
-        cost = waves * (_ceil_div(kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine_waves * split * _SPLIT_KV_COMBINE_COST
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine_waves * split * _SPLIT_KV_COMBINE_COST
         if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
     return best_split
@@ -325,6 +365,141 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     return [primary if primary in domain else _sole(domain) or SCHED_NATURAL] + runners
 
 
+def select_d192_auto_knobs(
+    params: Sm100TemplateParams,
+    *,
+    pertensor: bool,
+    s_q: int,
+    s_kv: int,
+) -> tuple[int, int]:
+    """Select the measured D192 scheduler and CGA defaults.
+
+    This function is shared by graph heuristics and standalone callers. It
+    chooses public knobs only; lowering canonicalizations and private codegen
+    fields are derived separately in ``config_sm100``.
+    """
+
+    if params.split_kv > 1:
+        return SCHED_NATURAL, 2
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    mxfp8 = fp8 and not pertensor
+    window_left = params.window_left
+    window_right = params.window_right
+    top_left = not params.bottom_right or d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
+
+    mx_dense_mid_causal_cga1 = (
+        mxfp8
+        and not params.thd_varlen
+        and window_left is None
+        and window_right == 0
+        and top_left
+        and 4096 < s_kv <= 8192
+        and (params.dtype_qkv == DTYPE_E5M2 or s_q >= 4096)
+    )
+    sched_policy = SCHED_NATURAL if mx_dense_mid_causal_cga1 else params.sched_policy
+
+    pt_cga1 = (
+        pertensor
+        and not params.thd_varlen
+        and (
+            window_left is not None
+            or (params.dtype_qkv == DTYPE_E5M2 and window_right is None)
+            or (params.dtype_qkv == DTYPE_E4M3 and params.dtype_o in (DTYPE_E4M3, DTYPE_E5M2) and window_left is None and window_right == 0 and top_left)
+        )
+    )
+
+    mx_cga1 = False
+    if mxfp8:
+        masked = window_right is not None
+        sliding = window_left is not None
+        if params.thd_varlen:
+            if params.dtype_qkv == DTYPE_E5M2 and not masked:
+                mx_cga1 = True
+            elif masked and sliding:
+                min_s_kv = 4096 if params.dtype_qkv == DTYPE_E4M3 else 2048
+                mx_cga1 = s_kv >= min_s_kv
+            elif masked:
+                mx_cga1 = s_kv >= 2048
+        elif masked:
+            mx_cga1 = params.dtype_qkv == DTYPE_E4M3 or sliding or s_kv <= 4096
+    mx_cga1 = mx_cga1 or mx_dense_mid_causal_cga1
+    return sched_policy, 1 if pt_cga1 or mx_cga1 else 2
+
+
+def select_d256_auto_knobs(
+    params: Sm100TemplateParams,
+    *,
+    pertensor: bool,
+    s_q: int,
+    s_kv: int,
+) -> tuple[int, int]:
+    """Select the measured D256 scheduler and fixed FP8 CTA1 geometry."""
+
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if not fp8:
+        return params.sched_policy, 2
+    if params.split_kv > 1 or params.thd_varlen:
+        return SCHED_NATURAL, 1
+
+    no_mask = params.window_left is None and params.window_right is None and not params.seq_kv_lens_present
+    if no_mask:
+        return SCHED_NATURAL, 1
+
+    top_left = not params.bottom_right or d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
+    pt_lpt_l2 = (
+        pertensor
+        and params.window_left is None
+        and params.window_right is not None
+        and not params.seq_kv_lens_present
+        and top_left
+        and _ceil_div(s_q, 256) >= 16
+    )
+    if pt_lpt_l2:
+        return params.sched_policy, 1
+    return SCHED_LPT, 1
+
+
+def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
+    dtype_codes = {
+        cudnn.data_type.FP8_E4M3: DTYPE_E4M3,
+        cudnn.data_type.FP8_E5M2: DTYPE_E5M2,
+        cudnn.data_type.BFLOAT16: DTYPE_BF16,
+        cudnn.data_type.HALF: DTYPE_FP16,
+    }
+    return Sm100TemplateParams(
+        dtype_qkv=dtype_codes[facts.dtype],
+        dtype_o=dtype_codes.get(facts.dtype_o, -1),
+        window_left=facts.window_left,
+        window_right=(facts.right_bound if facts.right_band_widening else 0 if facts.causal else None),
+        bottom_right=facts.bottom_right,
+        seq_kv_lens_present=facts.padded,
+        seq_q_lens_present=facts.seq_q_trim,
+        sched_policy=sched_policy,
+        thd_varlen=facts.thd,
+        split_kv=split_kv,
+    )
+
+
+def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int) -> tuple[int, Optional[int]]:
+    caps = spec.capabilities
+    domain = effective_cgas(caps, facts, split_kv)
+    selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
+        params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
+        selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+        if selected_cga not in domain:
+            raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
+        return selected_sched, selected_cga
+    if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
+        return sched_policy, _sole(domain)
+    params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
+    selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+    if selected_cga not in domain:
+        raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
+    return selected_sched, selected_cga
+
+
 # --- pack_gqa (GQA head packing) --------------------------------------------
 
 
@@ -338,35 +513,44 @@ def _pack_gqa_wins(facts, tile_q: int) -> bool:
     return facts.s_q < tile_q
 
 
-def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int]) -> int:
+def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
-    The SM100 family runs CGA tiles — ``cga_tile_m`` of the flavor the envelope
-    lowering picks for the graph's head dims (d128/d192: 512; d256/d512:
-    256). SM120 launches one CTA per tile, so it is ``tile_m`` itself.
+    The SM100 family runs CGA tiles. D192 accepts CGA1 and CGA2, so callers must
+    pass the CGA of the complete assignment they are evaluating. SM120 launches
+    one CTA per tile, so it is ``tile_m`` itself.
     """
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
-        return cga_tile_m(128)
+        return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
-        return cga_tile_m(192)
+        return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
-        return cga_tile_m(256)
-    return cga_tile_m(512)
+        return cga_tile_m(256, cga)
+    return cga_tile_m(512, cga)
 
 
-def _pack_gqa_points(caps: Capabilities, facts, tile_m: int) -> Tuple[bool, ...]:
+def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not (True in caps.pack_gqas and not facts.thd and facts.h_q != facts.h_kv and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m)):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m)):
+    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)):
         return (True, False)
     return (False, True)
 
 
-def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Optional[int], cga: Optional[int], pack_g: int = 1) -> List[Optional[int]]:
+def _split_points(
+    caps: Capabilities,
+    facts,
+    tile_m: Optional[int],
+    tile_n: Optional[int],
+    cga: Optional[int],
+    pack_g: int = 1,
+    *,
+    unsplit_knobs: Optional[SdpaFwdKnobs] = None,
+) -> List[Optional[int]]:
     """Ordered split-KV candidates for the chosen tile geometry.
 
     ``pack_g`` is the pack_gqa group of the set the split rides (1 =
@@ -376,11 +560,10 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
 
     The value comes from :func:`choose_split_kv`'s wave-cost model, fed the
     EXACT launch geometry via :func:`_pack_gqa_tile_q` — the Q rows one grid
-    tile covers, which on SM100 is the cluster's ``TILES_Q*TILE_M*CTA_MMA``
-    (512 at d128/d192), not ``tile_m*cga`` (256). The distinction is the whole
-    model: fed 256 the chooser sees twice the tiles the launch actually has,
-    so it reads a half-empty machine as full and under-splits or declines to
-    split at all. The generator respects the split path's structural limits
+    tile covers, which on SM100 is the cluster's ``TILES_Q*TILE_M*CTA_MMA``.
+    ``unsplit_knobs`` lets the no-split candidate carry a different complete
+    geometry; D192 requires this because split-KV is CGA2-only while its tuned
+    unsplit assignment may use CGA1. The generator respects structural limits
     (dense-only, no sink — mismatch() enforces the same, so an emitted >1
     never reaches a kernel that cannot honor it).
 
@@ -398,26 +581,48 @@ def _split_points(caps: Capabilities, facts, tile_m: Optional[int], tile_n: Opti
         # This S_kv would be served through the synthesized KV-tail padding,
         # which the split cannot ride (mismatch declines the same combination).
         return [no_split]
-    if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+    if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (
+        cudnn.data_type.HALF,
+        cudnn.data_type.BFLOAT16,
+    ):
         # The combine reduces partials in half precision; reducing QUANTIZED
         # partials would lose what the split is meant to be neutral about.
         return [no_split]
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]
-    rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m)
-    split = choose_split_kv(
+    rows_per_tile = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    split_launch = _SplitKvLaunch(
         q_tiles=_ceil_div(facts.s_q * pack_g, rows_per_tile),
         heads_q=facts.h_q // pack_g,
-        batch=facts.b,
         kv_tiles=_ceil_div(facts.s_kv, tile_n or 128),
+        ctas_per_tile=cga or 1,
+    )
+    unsplit_launch = None
+    if unsplit_knobs is not None:
+        unsplit_pack_g = (facts.h_q // facts.h_kv) if unsplit_knobs.pack_gqa else 1
+        unsplit_launch = _SplitKvLaunch(
+            q_tiles=_ceil_div(
+                facts.s_q * unsplit_pack_g,
+                _pack_gqa_tile_q(caps, facts, unsplit_knobs.tile_m, unsplit_knobs.cga),
+            ),
+            heads_q=facts.h_q // unsplit_pack_g,
+            kv_tiles=_ceil_div(facts.s_kv, unsplit_knobs.tile_n or 128),
+            ctas_per_tile=unsplit_knobs.cga or 1,
+        )
+    split = choose_split_kv(
+        q_tiles=split_launch.q_tiles,
+        heads_q=split_launch.heads_q,
+        batch=facts.b,
+        kv_tiles=split_launch.kv_tiles,
         sm_count=sm_count,
         # The combine's grid is (S_q, H, B) — the REAL head count, not the
         # packed one: packing folds heads into Q rows for the main kernel, but
         # the combine still reduces one block per (row, head, batch) of the
         # graph's own output.
         combine_rows=facts.s_q * facts.h_q * facts.b,
-        ctas_per_tile=cga or 1,
+        ctas_per_tile=split_launch.ctas_per_tile,
+        unsplit_launch=unsplit_launch,
     )
     if split <= 1:
         return [no_split]
@@ -440,11 +645,6 @@ def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
     return [None if sole == cudnn.data_type.HALF else sole]
 
 
-def _cga_points(caps: Capabilities) -> List[Optional[int]]:
-    """CGA candidates — every row today declares a single honest point."""
-    return [_sole(caps.cgas)]
-
-
 # ---------------------------------------------------------------------------
 # the combiner — complete assignments, Σ growth, never the cartesian product
 # ---------------------------------------------------------------------------
@@ -463,58 +663,78 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """
     caps = spec.capabilities
     tiles = _tile_points(spec, facts)
-    scheds = _sched_points(caps, facts)
-    cga = _cga_points(caps)[0]
-    # pack_gqa couples with the tile axis: a packed set rides the LARGEST
-    # SMEM-fitting tile that admits the ratio — packing fixes the underfill
-    # small tiles exist for, and a bigger tile admits a bigger G (G must
-    # divide it) — while an unpacked set keeps the tile rule's choice.
-    pack_tile = next(
-        ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_points(caps, facts, m or 128)),
-        None,
-    )
-    packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128)[0]
+    generic_scheds = _sched_points(caps, facts)
     unpacked_pack = False if True in caps.pack_gqas else _sole(caps.pack_gqas)
-    base_tile = pack_tile if packed_first else tiles[0]
-    # The split model sees the launch geometry of the set it rides — the
-    # packed grid when the baseline packs.
-    splits = _split_points(caps, facts, base_tile[0], base_tile[1], cga, pack_g=(facts.h_q // facts.h_kv) if packed_first else 1)
     # A split set rides the plain scheduler: the SM120 config bars a split under
     # the LPT remaps, and in the underfilled regime a split targets, LPT
     # balancing is moot — the split itself levels the grid. The coupling is
     # structural, so it binds whichever leg leads; it cannot live only on the
     # runner-up loop or a leading split would inherit the derived LPT policy.
-    plain_sched = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else scheds[0]
+    plain_sched = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else generic_scheds[0]
 
-    def _leg(split: Optional[int]) -> SdpaFwdKnobs:
+    unsplit_sched, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=generic_scheds[0])
+    scheds = [unsplit_sched] + [policy for policy in generic_scheds if policy != unsplit_sched]
+
+    def _pack_choice(cga: Optional[int]):
+        # A packed set rides the largest fitting tile that admits the ratio. The
+        # decision uses this leg's actual CGA span; D192 CGA1 and CGA2 cover a
+        # different number of Q rows.
+        pack_tile = next(
+            ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_points(caps, facts, m or 128, cga)),
+            None,
+        )
+        packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128, cga)[0]
+        return (pack_tile if packed_first else tiles[0]), packed_first, pack_tile
+
+    def _leg(split_value: int) -> SdpaFwdKnobs:
+        sched_policy, cga = _auto_sched_cga(
+            spec,
+            facts,
+            split_kv=split_value,
+            sched_policy=plain_sched if split_value > 1 else scheds[0],
+        )
+        base_tile, packed_first, _ = _pack_choice(cga)
         return SdpaFwdKnobs(
-            sched_policy=plain_sched if (split or 1) > 1 else scheds[0],
+            sched_policy=sched_policy,
             tile_m=base_tile[0],
             tile_n=base_tile[1],
             cga=cga,
             pack_gqa=True if packed_first else unpacked_pack,
-            split_kv=split,
+            split_kv=split_value,
             softmax_precision=_softmax_points(caps)[0],
         )
 
+    unsplit_leg = _leg(1)
+    split_leg = _leg(2)
+    split_pack_g = (facts.h_q // facts.h_kv) if split_leg.pack_gqa else 1
+    splits = _split_points(
+        caps,
+        facts,
+        split_leg.tile_m,
+        split_leg.tile_n,
+        split_leg.cga,
+        pack_g=split_pack_g,
+        unsplit_knobs=unsplit_leg,
+    )
     base = _leg(splits[0])
     out = [base]
     for tile_m, tile_n in tiles[1:]:
         # A packed baseline's tile runners keep the packing, so tiles the
         # ratio cannot ride are skipped — emitted, they would only spend
         # set-cap slots for mismatch to drop.
-        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128):
+        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga):
             continue
         out.append(replace(base, tile_m=tile_m, tile_n=tile_n))
     # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
     # scheduler above, so an LPT runner is only a candidate without one.
-    sched_host = base if (base.split_kv or 1) == 1 else _leg(splits[-1])
+    sched_host = unsplit_leg
     for policy in scheds[1:]:
         out.append(replace(sched_host, sched_policy=policy))
     # The opposite pack_gqa leg, riding its own tile (packed: the largest
     # admitting tile; unpacked: the tile rule's best).
+    _, _, pack_tile = _pack_choice(base.cga)
     if pack_tile is not None:
-        if packed_first:
+        if base.pack_gqa is True:
             out.append(replace(base, pack_gqa=unpacked_pack, tile_m=tiles[0][0], tile_n=tiles[0][1]))
         else:
             out.append(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1]))
@@ -528,18 +748,21 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
-def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
+def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     """The config expected to build where the tuned choice may not.
 
     Today this is the smallest tile the row admits with the plain scheduler
     and no split — the config that asks least of the device, which is the one
     thing a fallback must be.
     """
+    caps = spec.capabilities
+    sched_policy = SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies)
+    sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched_policy)
     return SdpaFwdKnobs(
-        sched_policy=SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies),
+        sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
         tile_n=min(caps.tile_ns, default=None),
-        cga=_sole(caps.cgas),
+        cga=cga,
         pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
         softmax_precision=_sole(caps.softmax_precisions),
@@ -572,7 +795,7 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
-        sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(caps)]
+        sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(spec, facts)]
         for knobs in sets:
             if mismatch(caps, facts, knobs) is None:
                 out.append(PlanConfig(engine_id, knobs))
