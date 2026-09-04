@@ -47,8 +47,8 @@ from ..moe_sched_extension import (
     ContiguousAndConsistentGroupedGemmSchedExtension,
 )
 from ..moe_kernel_helpers import (
-    fmin,
     fmax,
+    tanh_clamp_unit,
     atomic_max_float32,
     compute_stages,
     compute_grid,
@@ -1894,6 +1894,18 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mProb = real_prob[mPosition, 0, 0]
 
+                # Per-row scale applied to the activation below the subtile loop.
+                # Plain srelu: prob.
+                # Soft-clamped srelu: the activation is t^2 * (s^2 prob) with t = tanh(relu(x)/s),
+                # so s^2 is folded in here once per tile. This expression must match clamp_k_srelu
+                # in the dsrelu kernel.
+                if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value and self.tanh_clamp_scale is not None):
+                    clamp_s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+                    clamp_s2 = cutlass.Float32(self.tanh_clamp_scale * self.tanh_clamp_scale)
+                    prob_scale = cutlass.Float32(mProb) * clamp_s2
+                else:
+                    prob_scale = mProb
+
                 # C1 fix: phase-based acc stage indexing for overlapping_accum
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1973,37 +1985,36 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                     acc_vec = tTR_rAcc.load()
 
                     if cutlass.const_expr(self.epilogue_type == EpilogueType.SRELU.value):
-                        acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
                         if cutlass.const_expr(self.tanh_clamp_scale is not None):
-                            # Soft-clamped squared ReLU: c = s * tanh(relu(x) / s); out = c**2.
-                            # Plain squared ReLU is the s -> infinity limit. t is capped at 1:
-                            # tanh.approx.f32's range is not assumed (the backward kernel needs
-                            # 1 - t**2 >= 0); the cap makes c <= s structural.
-                            one = cutlass.Float32(1.0)
-                            s = cutlass.Float32(self.tanh_clamp_scale)
-                            s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+                            # Soft-clamped squared ReLU: out = (s * tanh(relu(x)/s))^2 * w,
+                            # computed as t^2 * prob_scale where t = tanh(relu(x)/s), and
+                            # prob_scale = s^2 * w was folded once per tile.
+                            # tanh_clamp_unit is relu, tanh and the defensive t <= 1 cap in
+                            # two instructions (negative x -> t = 0, NaN -> 0).
+                            # The dsrelu kernel's d_srelu regen uses this same expression;
+                            # keep them identical.
                             if cutlass.const_expr(self.vectorized_f32):
                                 for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                                    t0 = fmin(cute.math.tanh(acc_relu[i] * s_rcp, fastmath=True), one)
-                                    t1 = fmin(cute.math.tanh(acc_relu[i + 1] * s_rcp, fastmath=True), one)
-                                    c0, c1 = cute.arch.mul_packed_f32x2(
-                                        (t0, t1),
-                                        (s, s),
+                                    u0, u1 = cute.arch.mul_packed_f32x2(
+                                        (acc_vec[i], acc_vec[i + 1]),
+                                        (clamp_s_rcp, clamp_s_rcp),
                                         rnd="rn",
                                         ftz=False,
                                     )
+                                    t0 = tanh_clamp_unit(u0)
+                                    t1 = tanh_clamp_unit(u1)
                                     tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
-                                        (c0, c1),
-                                        (c0, c1),
+                                        (t0, t1),
+                                        (t0, t1),
                                         rnd="rn",
                                         ftz=False,
                                     )
                             else:
                                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                    t = fmin(cute.math.tanh(acc_relu[i] * s_rcp, fastmath=True), one)
-                                    c = t * s
-                                    tTR_rAcc[i] = c * c
+                                    t = tanh_clamp_unit(acc_vec[i] * clamp_s_rcp)
+                                    tTR_rAcc[i] = t * t
                         else:
+                            acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                                 tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
                                     (acc_relu[i], acc_relu[i + 1]),
@@ -2018,13 +2029,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                         for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                             tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
                                 (acc_vec[i], acc_vec[i + 1]),
-                                (mProb, mProb),
+                                (prob_scale, prob_scale),
                                 rnd="rn",
                                 ftz=False,
                             )
                     else:
                         for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                            tCompute[i] = acc_vec[i] * mProb
+                            tCompute[i] = acc_vec[i] * prob_scale
 
                     if cutlass.const_expr(self.generate_amax):
                         thread_tile_amax = amax_reduction_per_thread(tCompute, thread_tile_amax)
