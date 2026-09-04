@@ -16,11 +16,9 @@ import torch
 
 from cudnn.api_base import APIBase, TensorDesc
 
-from .cutedsl.cute_dsl_ln_mul_dropout import (
-    ALIGN,
-    LnMulDropoutForward,
-    _keep_threshold32,
-)
+from ._runtime import record_streams, stream_handle
+from .cutedsl._common import ALIGNMENT_BYTES, keep_threshold32
+from .cutedsl.cute_dsl_ln_mul_dropout import LnMulDropoutForward
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import (
     MAX_NUM_ROWS,
     TARGET_TILES,
@@ -32,8 +30,8 @@ from .cutedsl.cute_dsl_ln_mul_dropout_bwd import (
 def _require_cuda_tensor(tensor: torch.Tensor, name: str) -> None:
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.data_ptr() % ALIGN != 0:
-        raise ValueError(f"{name} storage must be {ALIGN}-byte aligned")
+    if tensor.data_ptr() % ALIGNMENT_BYTES != 0:
+        raise ValueError(f"{name} storage must be {ALIGNMENT_BYTES}-byte aligned")
 
 
 def _require_same_device_desc(reference: TensorDesc, tensors) -> None:
@@ -100,32 +98,6 @@ def _require_disjoint(writes, reads) -> None:
             other_begin, other_end = _storage_span(other_tensor)
             if write_begin < other_end and other_begin < write_end:
                 raise ValueError(f"{write_name} storage must not overlap {other_name} storage")
-
-
-def _stream_handle(
-    stream: Optional[cuda.CUstream | torch.cuda.Stream],
-    device: torch.device,
-) -> cuda.CUstream:
-    if stream is None:
-        return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    if isinstance(stream, torch.cuda.Stream):
-        if stream.device != device:
-            raise ValueError(f"stream must be on {device}, got {stream.device}")
-        return cuda.CUstream(stream.cuda_stream)
-    return stream
-
-
-def _record_streams(tensors, stream, device: torch.device) -> None:
-    if stream is None:
-        return
-    if isinstance(stream, torch.cuda.Stream):
-        torch_stream = stream
-    elif int(stream) == 0:
-        torch_stream = torch.cuda.default_stream(device)
-    else:
-        torch_stream = torch.cuda.ExternalStream(int(stream), device=device)
-    for tensor in tensors:
-        tensor.record_stream(torch_stream)
 
 
 class _HSTULMSDBase(APIBase):
@@ -210,7 +182,7 @@ class _HSTULMSDBase(APIBase):
             dtype=desc.dtype,
             shape=(rows, desc.shape[1]),
             stride=desc.stride,
-            assumed_align=ALIGN,
+            assumed_align=ALIGNMENT_BYTES,
         )
 
     def _fake_vector(self, desc, length=None) -> cute.Tensor:
@@ -218,7 +190,7 @@ class _HSTULMSDBase(APIBase):
             dtype=desc.dtype,
             shape=(desc.shape[0] if length is None else length,),
             stride=desc.stride,
-            assumed_align=ALIGN,
+            assumed_align=ALIGNMENT_BYTES,
         )
 
 
@@ -250,7 +222,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         self.rstd_desc = self._make_tensor_desc(sample_rstd, name="rstd")
         self.mask_desc = self._make_tensor_desc(sample_mask, name="mask")
         self.eps = float(eps)
-        self._threshold = _keep_threshold32(self.dropout_ratio)
+        self._threshold = keep_threshold32(self.dropout_ratio)
 
     def check_support(self) -> bool:
         if self._is_supported:
@@ -289,12 +261,14 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         fake_u = self._fake_matrix(self.u_desc, rows)
         fake_weight = self._fake_vector(self.weight_desc)
         fake_bias = self._fake_vector(self.bias_desc)
-        fake_y = self._make_fake_cute_tensor(
+        fake_output_segment = self._make_fake_cute_tensor(
             dtype=self.y_desc.dtype,
             shape=(rows, self.hidden_size),
             stride=self.y_desc.stride,
-            assumed_align=ALIGN,
+            assumed_align=ALIGNMENT_BYTES,
         )
+        # All three output segments have the same plan-time tensor contract.
+        fake_silu_output = fake_x_output = fake_lmsd_output = fake_output_segment
         fake_mask = self._fake_matrix(self.mask_desc, rows)
         fake_mean = self._fake_vector(self.mean_desc, rows)
         fake_rstd = self._fake_vector(self.rstd_desc, rows)
@@ -305,9 +279,9 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             fake_u,
             fake_weight,
             fake_bias,
-            fake_y,
-            fake_y,
-            fake_y,
+            fake_silu_output,
+            fake_x_output,
+            fake_lmsd_output,
             fake_mask,
             fake_mean,
             fake_rstd,
@@ -351,16 +325,19 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             (("y", y_tensor), ("mean", mean_tensor), ("rstd", rstd_tensor), ("mask", mask_tensor)),
             (("x", x_tensor), ("u", u_tensor), ("weight", weight_tensor), ("bias", bias_tensor)),
         )
-        stream = _stream_handle(current_stream, x_tensor.device)
+        stream = stream_handle(current_stream, x_tensor.device)
         d = self.hidden_size
+        silu_output = y_tensor[:, :d]
+        x_output = y_tensor[:, d : 2 * d]
+        lmsd_output = y_tensor[:, 2 * d :]
         self._compiled_kernel(
             x_tensor,
             u_tensor,
             weight_tensor,
             bias_tensor,
-            y_tensor[:, :d],
-            y_tensor[:, d : 2 * d],
-            y_tensor[:, 2 * d :],
+            silu_output,
+            x_output,
+            lmsd_output,
             mask_tensor,
             mean_tensor,
             rstd_tensor,
@@ -373,7 +350,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             cutlass.Int32(d),
             stream,
         )
-        _record_streams(
+        record_streams(
             (x_tensor, u_tensor, weight_tensor, bias_tensor, y_tensor, mean_tensor, rstd_tensor, mask_tensor),
             current_stream,
             x_tensor.device,
@@ -477,10 +454,10 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         d = self.hidden_size
         fake_weight = self._fake_vector(self.weight_desc)
         fake_bias = self._fake_vector(self.bias_desc)
-        fake_dwp = self._make_fake_cute_tensor_from_desc(self.dweight_workspace_desc, assumed_align=ALIGN)
-        fake_dbp = self._make_fake_cute_tensor_from_desc(self.dbias_workspace_desc, assumed_align=ALIGN)
-        fake_dw = self._make_fake_cute_tensor_from_desc(self.dweight_desc, assumed_align=ALIGN)
-        fake_db = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=ALIGN)
+        fake_dwp = self._make_fake_cute_tensor_from_desc(self.dweight_workspace_desc, assumed_align=ALIGNMENT_BYTES)
+        fake_dbp = self._make_fake_cute_tensor_from_desc(self.dbias_workspace_desc, assumed_align=ALIGNMENT_BYTES)
+        fake_dw = self._make_fake_cute_tensor_from_desc(self.dweight_desc, assumed_align=ALIGNMENT_BYTES)
+        fake_db = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=ALIGNMENT_BYTES)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         # N is a runtime extent shared by every row-major operand. Compile one
@@ -488,12 +465,14 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         # Wide-stride dY/U operands use i64 row rebasing; MAX_NUM_ROWS keeps
         # the direct X/mask/DX/DU tiled offsets within signed Int32.
         rows = cute.sym_int()
-        fake_dy = self._make_fake_cute_tensor(
+        fake_dy_segment = self._make_fake_cute_tensor(
             dtype=self.dy_desc.dtype,
             shape=(rows, d),
             stride=self.dy_desc.stride,
-            assumed_align=ALIGN,
+            assumed_align=ALIGNMENT_BYTES,
         )
+        # All three dY segments have the same plan-time tensor contract.
+        fake_dy_silu = fake_dy_x = fake_dy_lmsd = fake_dy_segment
         fake_x = self._fake_matrix(self.x_desc, rows)
         fake_u = self._fake_matrix(self.u_desc, rows)
         fake_mask = self._fake_matrix(self.mask_desc, rows)
@@ -502,10 +481,10 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         fake_mean = self._fake_vector(self.mean_desc, rows)
         fake_rstd = self._fake_vector(self.rstd_desc, rows)
         main = cute.compile(
-            LnMulDropoutBackward(compute_y=False),
-            fake_dy,
-            fake_dy,
-            fake_dy,
+            LnMulDropoutBackward(),
+            fake_dy_silu,
+            fake_dy_x,
+            fake_dy_lmsd,
             fake_x,
             fake_u,
             fake_weight,
@@ -513,9 +492,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             fake_mask,
             fake_dx,
             fake_du,
-            fake_dx,
-            fake_dx,
-            fake_dx,
             fake_mean,
             fake_rstd,
             fake_dwp,
@@ -596,13 +572,16 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
                 ("mask", mask_tensor),
             ),
         )
-        stream = _stream_handle(current_stream, x_tensor.device)
+        stream = stream_handle(current_stream, x_tensor.device)
         main, reduce = self._compiled_kernel
         d = self.hidden_size
+        dy_silu = dy_tensor[:, :d]
+        dy_x = dy_tensor[:, d : 2 * d]
+        dy_lmsd = dy_tensor[:, 2 * d :]
         main(
-            dy_tensor[:, :d],
-            dy_tensor[:, d : 2 * d],
-            dy_tensor[:, 2 * d :],
+            dy_silu,
+            dy_x,
+            dy_lmsd,
             x_tensor,
             u_tensor,
             weight_tensor,
@@ -610,9 +589,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             mask_tensor,
             dx_tensor,
             du_tensor,
-            dx_tensor,
-            dx_tensor,
-            dx_tensor,
             mean_tensor,
             rstd_tensor,
             dweight_workspace,
@@ -632,7 +608,7 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             cutlass.Int32(d),
             stream,
         )
-        _record_streams(
+        record_streams(
             tuple(tensor for tensor, _, _, _ in runtime) + (x_tensor, u_tensor, weight_tensor, bias_tensor),
             current_stream,
             x_tensor.device,

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import nullcontext
 from typing import Optional
 
 from cuda.bindings import driver as cuda
@@ -14,6 +13,7 @@ import torch
 
 from cudnn.api_base import TupleDict
 
+from ._runtime import allocation_context, tensor_signature
 from .api import HSTULMSDBwdSm100, HSTULMSDFwdSm100
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import TARGET_TILES
 
@@ -21,19 +21,6 @@ _CACHE_CAPACITY = 128
 _FWD_CACHE: OrderedDict = OrderedDict()
 _BWD_CACHE: OrderedDict = OrderedDict()
 _MASK_DROPOUT_RATIO_ATTR = "_cudnn_hstu_lmsd_dropout_ratio"
-
-
-def _tensor_signature(tensor: torch.Tensor, *, dynamic_rows: bool = False):
-    """Return the plan-time tensor contract, optionally erasing runtime N."""
-    shape = tuple(tensor.shape)
-    if dynamic_rows:
-        shape = (None, *shape[1:])
-    return (
-        shape,
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
 
 
 def _cache_get(cache: OrderedDict, key):
@@ -48,22 +35,6 @@ def _cache_put(cache: OrderedDict, key, value) -> None:
     cache.move_to_end(key)
     if len(cache) > _CACHE_CAPACITY:
         cache.popitem(last=False)
-
-
-def _as_torch_stream(stream, device: torch.device) -> torch.cuda.Stream:
-    if isinstance(stream, torch.cuda.Stream):
-        if stream.device != device:
-            raise ValueError(f"stream must be on {device}, got {stream.device}")
-        return stream
-    if int(stream) == 0:
-        return torch.cuda.default_stream(device)
-    return torch.cuda.ExternalStream(int(stream), device=device)
-
-
-def _allocation_context(stream, device: torch.device):
-    if stream is None:
-        return nullcontext()
-    return torch.cuda.stream(_as_torch_stream(stream, device))
 
 
 def _saved_dropout_ratio(mask_tensor: torch.Tensor, dropout_ratio: Optional[float]) -> float:
@@ -98,21 +69,21 @@ def hstu_lmsd_forward(
     if x_tensor.ndim != 2:
         raise ValueError("x_tensor must be rank 2")
     n, d = x_tensor.shape
-    with torch.cuda.device(x_tensor.device), _allocation_context(stream, x_tensor.device):
+    with torch.cuda.device(x_tensor.device), allocation_context(stream, x_tensor.device):
         y_tensor = torch.empty((n, 3 * d), dtype=x_tensor.dtype, device=x_tensor.device)
         mean_tensor = torch.empty((n,), dtype=torch.float32, device=x_tensor.device)
         rstd_tensor = torch.empty((n,), dtype=torch.float32, device=x_tensor.device)
         mask_tensor = torch.empty((n, d), dtype=torch.int8, device=x_tensor.device)
 
     key = (
-        _tensor_signature(x_tensor, dynamic_rows=True),
-        _tensor_signature(u_tensor, dynamic_rows=True),
-        _tensor_signature(weight_tensor),
-        _tensor_signature(bias_tensor),
-        _tensor_signature(y_tensor, dynamic_rows=True),
-        _tensor_signature(mean_tensor, dynamic_rows=True),
-        _tensor_signature(rstd_tensor, dynamic_rows=True),
-        _tensor_signature(mask_tensor, dynamic_rows=True),
+        tensor_signature(x_tensor, dynamic_rows=True),
+        tensor_signature(u_tensor, dynamic_rows=True),
+        tensor_signature(weight_tensor),
+        tensor_signature(bias_tensor),
+        tensor_signature(y_tensor, dynamic_rows=True),
+        tensor_signature(mean_tensor, dynamic_rows=True),
+        tensor_signature(rstd_tensor, dynamic_rows=True),
+        tensor_signature(mask_tensor, dynamic_rows=True),
         float(eps),
         float(dropout_ratio),
     )
@@ -184,7 +155,7 @@ def hstu_lmsd_backward(
         raise ValueError("x_tensor must be rank 2")
     n, d = x_tensor.shape
     dropout_ratio = _saved_dropout_ratio(mask_tensor, dropout_ratio)
-    with torch.cuda.device(x_tensor.device), _allocation_context(stream, x_tensor.device):
+    with torch.cuda.device(x_tensor.device), allocation_context(stream, x_tensor.device):
         if dx_tensor is None:
             dx_tensor = torch.empty((n, d), dtype=x_tensor.dtype, device=x_tensor.device)
         if du_tensor is None:
@@ -197,20 +168,20 @@ def hstu_lmsd_backward(
         dbias_workspace = torch.empty((TARGET_TILES, d), dtype=torch.float32, device=x_tensor.device)
 
     key = (
-        _tensor_signature(dy_tensor, dynamic_rows=True),
-        _tensor_signature(x_tensor, dynamic_rows=True),
-        _tensor_signature(u_tensor, dynamic_rows=True),
-        _tensor_signature(weight_tensor),
-        _tensor_signature(bias_tensor),
-        _tensor_signature(mean_tensor, dynamic_rows=True),
-        _tensor_signature(rstd_tensor, dynamic_rows=True),
-        _tensor_signature(mask_tensor, dynamic_rows=True),
-        _tensor_signature(dx_tensor, dynamic_rows=True),
-        _tensor_signature(du_tensor, dynamic_rows=True),
-        _tensor_signature(dweight_tensor),
-        _tensor_signature(dbias_tensor),
-        _tensor_signature(dweight_workspace),
-        _tensor_signature(dbias_workspace),
+        tensor_signature(dy_tensor, dynamic_rows=True),
+        tensor_signature(x_tensor, dynamic_rows=True),
+        tensor_signature(u_tensor, dynamic_rows=True),
+        tensor_signature(weight_tensor),
+        tensor_signature(bias_tensor),
+        tensor_signature(mean_tensor, dynamic_rows=True),
+        tensor_signature(rstd_tensor, dynamic_rows=True),
+        tensor_signature(mask_tensor, dynamic_rows=True),
+        tensor_signature(dx_tensor, dynamic_rows=True),
+        tensor_signature(du_tensor, dynamic_rows=True),
+        tensor_signature(dweight_tensor),
+        tensor_signature(dbias_tensor),
+        tensor_signature(dweight_workspace),
+        tensor_signature(dbias_workspace),
         float(dropout_ratio),
     )
     api = _cache_get(_BWD_CACHE, key)

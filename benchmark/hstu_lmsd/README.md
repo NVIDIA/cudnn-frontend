@@ -60,3 +60,32 @@ embedded in the operation test.
   byte definition stable across implementation changes.
 - The E2E case is operator-level training dataflow (`forward -> backward`), not
   a full recommendation model benchmark.
+
+## Kernel Configuration Rationale
+
+The forward kernel exposes only the shipping path. The choices below are fixed,
+not user-selectable runtime or compile-time knobs, so the implementation being
+reviewed is unambiguous.
+
+| Choice | Rationale |
+|---|---|
+| 32 threads per row, 2 rows per CTA | Preserves the established LayerNorm reduction order and bitwise output behavior. |
+| One-row copy tile | Derives row ownership directly from the warp and avoids multi-row tile address work. |
+| Packed FP32x2 pointwise tail | Evaluates independent element pairs while retaining FP32 arithmetic. |
+| Reread `x` after the row reduction | Shortens the register live range; the second read is expected to hit cache. |
+| Full 32-bit Philox samples | Matches the reference dropout probability instead of quantizing it to 16 bits. |
+| 64-bit row pointer rebasing | Keeps large production layouts in one launch without overflowing row byte offsets. |
+
+Historical same-job tuning on Rubin SM107a at `N=2,739,421`, `D=512`, BF16,
+and a locked 4752 MHz memory clock measured this configuration at 0.933x the
+latency of the preceding CuTe DSL forward kernel (1.824 ms baseline). A
+16-thread-per-row variant was faster but changed the LayerNorm accumulation
+order, so it is not part of the shipping implementation.
+
+The following alternatives were measured and rejected: TMA/shared-memory
+staging, shared-memory output staging, multi-warp row reductions, register
+capping, hand-selected Philox integer instructions, and deferred input or
+output partitioning. They either added staging/synchronization work, reduced
+resident warps, or reproduced instructions that the compiler already emitted.
+The detailed measurements remain available in the pull-request discussion;
+they are not part of the executable kernel contract.

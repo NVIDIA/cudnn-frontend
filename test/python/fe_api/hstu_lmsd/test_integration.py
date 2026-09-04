@@ -36,12 +36,12 @@ def _backward_reference(dy, x, u, weight, bias, mask, p, eps):
     uf = u.float()
     wf = weight.float()
     bf = bias.float()
-    dy0, dy1, dy2 = (part.float() for part in dy.split(d, dim=1))
+    dy_silu, dy_x, dy_lmsd = (part.float() for part in dy.split(d, dim=1))
     mask_i32 = mask.to(torch.int32)
     zero = torch.zeros((), device=x.device)
-    direct_du = torch.where((mask_i32 & 4) != 0, dy0 * scale, zero)
-    direct_dx = torch.where((mask_i32 & 2) != 0, dy1 * scale, zero)
-    fused_dy = torch.where((mask_i32 & 1) != 0, dy2 * scale, zero)
+    direct_du = torch.where((mask_i32 & 4) != 0, dy_silu * scale, zero)
+    direct_dx = torch.where((mask_i32 & 2) != 0, dy_x * scale, zero)
+    fused_dy = torch.where((mask_i32 & 1) != 0, dy_lmsd * scale, zero)
 
     mean, rstd = _layer_norm_reference(x, eps)
     xhat = (xf - mean[:, None]) * rstd[:, None]
