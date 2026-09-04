@@ -195,10 +195,10 @@ def _select_q1_bwd_num_threads(capability: tuple[int, int], batch_size: int, num
         # reach the same four-warp floor below.
         return 128
     if capability in ((10, 0), (10, 3)):
-        # SM100 follows the measured B300 schedule until device-specific
-        # measurements justify a separate policy. Five 12-warp CTAs fit per
-        # B300 SM and win once the grid is large; 16 warps expose more
-        # latency-hiding work for smaller grids.
+        # Paired B200/B300 sweeps show the same block-size trend, so SM100 and
+        # SM103 share one policy. Five 12-warp CTAs fit per B300 SM and win
+        # once the grid is large; 16 warps expose more latency-hiding work for
+        # smaller grids.
         num_threads = 384 if batch_size >= 448 else 512
     elif capability == (10, 7):
         num_threads = 512
@@ -370,8 +370,8 @@ def _select_q1_bwd_algorithm(
     capability = _get_q1_device_capability(device)
 
     # B300 (SM103): direct wins at the requested BS=64 point and from BS=128.
-    # The small-MMA path retains two measured low-grid crossover regions. SM100
-    # shares this policy until device-specific measurements justify a split.
+    # The small-MMA path retains two measured low-grid crossover regions. B200
+    # (SM100) uses the same fallback crossover policy.
     if capability in ((10, 0), (10, 3)):
         if batch_size < 64:
             return "tc-small"
@@ -426,7 +426,8 @@ def _select_q1_bwd_split_kv(
     if requested != "auto" or not supported:
         return 1
 
-    # SM100 shares the measured SM103 split until it can be tuned separately.
+    # Paired B200/B300 sweeps show no stable architecture-specific split
+    # crossover, so SM100 and SM103 share one default.
     split_kv = {(10, 0): 8, (10, 3): 8, (10, 7): 13}.get(capability, 1)
     if split_kv == 1:
         return 1
