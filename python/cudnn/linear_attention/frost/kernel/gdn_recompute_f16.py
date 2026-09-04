@@ -29,12 +29,12 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     T_pairwise[i,j]  = cumprod[i] / cumprod[j]  (i>=j)       inter-token transfer weights
     (stored in registers; 128 regs/thread)
 
-  GEMM 1 - KK   : W_kk[BT,BT]  = K  @ K^T       (lower-triangular intra scores)
-  GEMM 3 - K*state : KS[BT,DV] = K  @ S_prev    (key applied to state)
-  GEMM 5 - U       : U[BT,DV]  = T_inv @ Y       (corrected value vectors)
-                      where T_inv = (I + M_kk)^{-1},  M_kk[i,j] = T[i,j]*Beta[i]*W_kk[i,j]  (lower-tri, hierarchical blockwise inverse)
-  GEMM 7 - KV update : S_upd[DK,DV] = K^T @ (decay .* U)  (state update, BT contraction)
-                        where Y[BT,DV] = V - KS    (delta rule residuals, after decay)
+  KK GEMM        : W_kk[BT,BT]  = K  @ K^T       (lower-triangular intra scores)
+  K*state GEMM   : KS[BT,DV] = K  @ S_prev    (key applied to state)
+  U GEMM         : U[BT,DV]  = T_inv @ Y       (corrected value vectors)
+                   where T_inv = (I + M_kk)^{-1},  M_kk[i,j] = T[i,j]*Beta[i]*W_kk[i,j]  (lower-tri, hierarchical blockwise inverse)
+  KV update GEMM : S_upd[DK,DV] = K^T @ (decay .* U)  (state update, BT contraction)
+                   where Y[BT,DV] = V - KS    (delta rule residuals, after decay)
 
   Epilogue:
     S_next    = cumprod[BT-1] * S_prev + S_upd        (update state in TMEM)
@@ -55,7 +55,7 @@ enable_checkpoints compiles trim K stages to fit the checkpoint buffer):
 TMEM layout (512 columns):
   Buffer                  Cols
   state                   128     <-- DKxDV fp32 = 128x128x4B
-  state input                64     <-- fp16 state staging (GEMM 3 A operand)
+  state input                64     <-- fp16 state staging (K*state A operand)
   cg0 shared acc          128     <-- 2-stage ring: KK0/KK1
   cg1 shared acc           64     <-- 1-stage ring: KS then U
   Y / decayed-U input        64     <-- slot 0 = Y (V - K*state), slot 1 = decayed U (b16)
@@ -88,7 +88,6 @@ from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_Q
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, gen_interval_items, load_cu, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import data_ptr
-from cudnn.frost.device import current_device, multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -474,7 +473,10 @@ def gate_beta_warp(
 
     lane_idx = tidx % cfg.threads_per_warp
 
-    a = cutlass.Float32(0.0)
+    if cutlass.const_expr(cfg.safe_gate and mA_log is None):
+        a = opaque_f32_zero() - cutlass.Float32(RCP_LN2)
+    else:
+        a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
@@ -482,9 +484,11 @@ def gate_beta_warp(
             cfg, tile_idx, mWorkItems
         )
         n_local = write_end - compute_start
-        if cutlass.const_expr(cfg.safe_gate):
+        if cutlass.const_expr(cfg.safe_gate and mA_log is not None):
             if n_local > 0:
                 a = -cute.math.exp2(mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        if cutlass.const_expr(cfg.safe_gate and mDt_bias is not None):
+            if n_local > 0:
                 bias = mDt_bias[head_idx].to(cutlass.Float32)
         if n_local > 0:
             for local_idx in cutlass.range(n_local):
@@ -805,7 +809,7 @@ def tcgen05_mma_warp(
                     if elect_one:
                         bars.mb_cg0_acc_ready[member1_acc_idx].arrive(cta_group=1)
 
-            # ---- k state (GEMM 3) = state(T) @ K^T -----------------------------------
+            # ---- k state = state(T) @ K^T --------------------------------------------
             if have_state:
                 bars.mb_state_input_ready[state_input_idx].wait(state_input_index.phase)
                 state_input_index = advance(state_input_index, cfg.tmem_state_input_stages)
@@ -818,7 +822,7 @@ def tcgen05_mma_warp(
                 if elect_one:
                     bars.mb_k_state_acc_ready[0].arrive(cta_group=1)
 
-            # ---- U (GEMM 5) = Y(T) @ T^-1 --------------------------------------------
+            # ---- U = Y(T) @ T^-1 -----------------------------------------------------
             bars.mb_t_inv_ready[tinv_idx].wait(tinv_index.phase)
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
             bars.mb_y_input_ready[0].wait(y_input_ready.phase)
@@ -846,7 +850,7 @@ def tcgen05_mma_warp(
                     if elect_one:
                         bars.mb_cg0_acc_ready[member0_acc_idx].arrive(cta_group=1)
 
-            # ---- state (GEMM 7) += decayed U(T) @ K ----------------------------------
+            # ---- state += decayed U(T) @ K -------------------------------------------
             bars.mb_decay_u_input_ready[0].wait(decay_u_input_ready.phase)
             decay_u_input_ready = advance(decay_u_input_ready, 1)
             kv_acc_index = advance(kv_acc_index, cfg.tmem_state_acc_stages)
@@ -2470,6 +2474,8 @@ def get_compiled_cache(
     a_log_dtype_str: str,
     dt_bias_dtype_str: str,
     beta_dtype_str: str,
+    device: int,
+    num_sm: int,
     HK: int,
     HV: int,
     HO: int,
@@ -2607,6 +2613,8 @@ def chunk_gdn_recompute_sm100(
     *,
     expand_num: int = 1,
     workspace,
+    device: int,
+    num_sm: int,
     stream,
 ) -> None:
     """Execute the Blackwell chunked GDN recompute kernel (state/checkpoint-only,
@@ -2624,7 +2632,7 @@ def chunk_gdn_recompute_sm100(
             when ``safe_gate``, which applies the safe-gate transform
             ``-exp(a_log) * softplus(gate + dt_bias)``
         beta: ``(total_tokens, HO)`` float32, update gate — post-sigmoid, or
-            io-dtype logits when ``use_beta_sigmoid``
+            raw logits (float32 or the io dtype) when ``use_beta_sigmoid``
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
@@ -2643,8 +2651,8 @@ def chunk_gdn_recompute_sm100(
             skips its log2 (rescales by 1/ln2) instead of exponentiating
             upstream
         safe_gate: interpret ``gate`` through the safe-gate transform
-        a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
-        dt_bias: ``(HO,)`` float32, safe-gate per-head bias (None = 0)
+        a_log: ``(HO,)`` float32/bf16/fp16 safe-gate per-head log-amplitude, or None for unit amplitude
+        dt_bias: ``(HO,)`` float32/bf16/fp16 safe-gate per-head bias, or None for zero bias
         use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         expand_num: multiply every device-side ``cu_seqlens`` value by this
             factor (GDP's ``num_householder``-expanded timeline; 1 = off)
@@ -2690,7 +2698,6 @@ def chunk_gdn_recompute_sm100(
     state_dtype = get_dtype(state_dtype_src) if state_dtype_src is not None else cutlass.Float32
 
     cu_stream = cuda.CUstream(int(stream))
-
     cache = get_compiled_cache(
         str(k.dtype),
         str(state_dtype_src),
@@ -2699,6 +2706,8 @@ def chunk_gdn_recompute_sm100(
         str(a_log.dtype) if a_log is not None else "none",
         str(dt_bias.dtype) if dt_bias is not None else "none",
         str(beta.dtype),
+        device,
+        num_sm,
         HK,
         HV,
         HO,
@@ -2765,7 +2774,7 @@ def chunk_gdn_recompute_sm100(
             use_beta_sigmoid,
             allow_neg_eigval,
             dynamic_scheduling,
-            num_sm=multiprocessor_count(current_device()),
+            num_sm=num_sm,
             h_k=HK,
             h_v=HV,
             n_heads_out=HO,

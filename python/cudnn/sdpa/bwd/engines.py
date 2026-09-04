@@ -31,6 +31,7 @@ from cudnn.sdpa import graph_analyzer as ga
 # importing them here would drag the CuTe DSL into every support check.
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
+_SM100 = "SdpaBwdDslSm100"
 
 
 def _adapter(name: str):
@@ -98,6 +99,12 @@ class Capabilities:
     # (sm120's TMA 16-byte global-stride rule at 2 B/elem -> 8; sm80's
     # host-side padding has no such constraint -> 1).
     d_pad_multiple: int = 1
+    # EXCLUSIVE lower bound on an envelope row: head dims must be > this. An
+    # envelope with no floor silently claims every small head dim too, and pads
+    # it onto the big kernel -- for the sm100 d512 backward that is the whole
+    # 512-wide MMA for a d=128 graph, when a d256 flavor exists. 0 = no floor
+    # (the sm120/sm80 rows are continuum kernels and want none).
+    d_envelope_floor: int = 0
     # When True the lowering serves rectangular head dims with D_QK >= D_V
     # (e.g. 192/128); False requires D_QK == D_V.
     dqk_ge_dv: bool = False
@@ -189,6 +196,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return f"the envelope serves head-dim multiples of {m} (TMA 16-byte global-stride rule); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        fl = capabilities.d_envelope_floor
+        if fl and min(facts.d_qk, facts.d_v) <= fl:
+            return f"the envelope's floor is D > {fl} (a smaller flavor owns these); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
     elif facts.d_v not in capabilities.d:
@@ -556,6 +566,56 @@ def _sm80_spec() -> EngineSpec:
     )
 
 
+def _sm100_spec() -> EngineSpec:
+    """SM100 (Blackwell) large-head-dim backward row.
+
+    A three-stage chain rather than one fused kernel, because a fused d=512
+    backward does not fit: dV [128 kv, 512] fp32 needs 512 TMEM columns and dK
+    another 512, plus the S/dS accumulators -- against 512 per CTA.
+
+        stage 1  do_dot = rowsum(dO * O)          (shared with the sm120 chain)
+        stage 2  S and dS workspaces              bprop_d512_f16_sm100.py
+        stage 3  dV = S^T.dO, dK = dS^T.Q, dQ = dS.K   bprop_matmul_sm100.py
+
+    ``d`` is an ENVELOPE: the kernel's tiles are fixed at 512 and a smaller head
+    dim rides the TMA descriptors' real extent, whose overshoot is HW
+    zero-filled, so the padded lanes contribute nothing. That costs the full
+    512-wide MMA at any d, which is why the lower bound is 264 -- below that the
+    d256 flavors are the right kernel. ``d_pad_multiple=8`` is TMA's 16-byte
+    innermost-extent rule at 2 B/elem; the stage-3 epilogue store vector narrows
+    from 32 B to 16 B when d is not also a multiple of 16.
+
+    Everything else is declined for now and each rejection is asserted by a
+    test: GQA (needs the dK/dV group reduce wired), the non-causal masks, THD
+    (the workspace goes ragged and stage 3 becomes a variable-K grouped GEMM),
+    bias/dbias/sink/dsink, deterministic, and decode.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=103,
+            d=frozenset({512}),
+            d_envelope=True,
+            d_pad_multiple=8,
+            d_envelope_floor=256,  # <= 256 belongs to the d256 flavors
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            right_band_widening=True,
+            gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
+            # Any dense layout: the adapter uses a BSHD-physical tensor in place
+            # (a permuted view, zero copy) and stages a non-conforming one
+            # through the workspace. That is not hypothetical -- a caller that
+            # builds dO as torch.randn(o.shape) instead of empty_like(o) loses
+            # o's memory format and hands over a BHSD-contiguous dO.
+            layouts=frozenset({"bshd", "dense_flex"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100),
+    )
+
+
 def engine_name(arch: str = "sm120") -> str:
     """The shipped engine name for a coverage cell (test/user convenience)."""
 
@@ -564,6 +624,6 @@ def engine_name(arch: str = "sm120") -> str:
 
 # Preference order: the ranked plan list offers these in this order (see
 # cudnn/sdpa/bwd/engine.py, which wraps each spec as a BaseEngine).
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec())
+ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec())
 
 __all__ = ["ENGINE_SPECS", "Capabilities", "EngineSpec", "SdpaBwdKnobs", "analyze_for", "engine_name", "mismatch"]

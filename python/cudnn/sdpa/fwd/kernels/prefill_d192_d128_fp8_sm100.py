@@ -317,7 +317,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 # THD metadata and descriptor setup. D192 exposes K as a rank-5 tensor map
 # (three 64-element D chunks), so its sequence extent is descriptor dimension
 # 1; V remains rank-4 with sequence extent dimension 2.
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 

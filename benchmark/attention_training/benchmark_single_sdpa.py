@@ -1971,17 +1971,47 @@ else:
     # Compute MMA SOL% using the per-arch FLOPs/clk/SM table and the actual
     # sampled boost clock observed during the benchmark window.
     _peak_mma_tflops = None
+    # Why the peak is unavailable, when it is -- the two causes need different
+    # advice and conflating them sends the user after the wrong one.
+    _peak_unavailable = "unavailable"
     try:
         _flops_per_clk_per_sm = _peak_flops_per_clock_per_sm(args.data_type)
         _num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         _sampled_mhz = _clock_sampler.peak_mhz()
-        if _flops_per_clk_per_sm is not None and _sampled_mhz is not None:
+        if _flops_per_clk_per_sm is None:
+            # No dense-MMA peak modelled for this dtype / arch (e.g. --data_type float).
+            _peak_unavailable = f"no MMA peak modelled for {args.data_type} on this arch"
+        elif _sampled_mhz is None:
+            _peak_unavailable = "no clock sample -- pip install pynvml"
+        else:
             _peak_mma_tflops = _flops_per_clk_per_sm * _num_sms * _sampled_mhz / 1e6
-    except Exception:
-        pass
+    except Exception as _e:
+        _peak_unavailable = f"peak lookup failed ({type(_e).__name__})"
 
-    fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
-    bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
+    def _sol(tflops):
+        """SOL% against the dense-MMA peak, or an explicit note when we cannot
+        compute it.
+
+        The peak needs both a modelled dense-MMA rate for the dtype and a
+        sampled boost clock (which needs ``pynvml``). When either is missing the
+        SOL suffix used to vanish entirely and an impossible TFLOPS number
+        printed unremarked -- the only cross-check this harness has on its own
+        arithmetic, silently disabled. Say so instead, naming WHICH of the two
+        is missing, and shout when a number exceeds the hardware: >100% SOL
+        means the FLOP model or the timing is wrong, never that the kernel is
+        fast.
+        """
+        if tflops <= 0:
+            return ""
+        if not _peak_mma_tflops:
+            return f", SOL n/a ({_peak_unavailable})"
+        pct = tflops / _peak_mma_tflops * 100
+        if pct > 100.0:
+            return f", {pct:.1f}% SOL -- ABOVE HARDWARE PEAK, MEASUREMENT IS WRONG"
+        return f", {pct:.1f}% SOL"
+
+    fwd_sol_str = _sol(fwd_tflops)
+    bwd_sol_str = _sol(bwd_tflops)
 
     if args.format_output:
         print(

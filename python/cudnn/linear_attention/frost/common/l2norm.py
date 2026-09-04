@@ -17,6 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4, st_global, st_global_v2, st_global_v4
@@ -205,7 +206,7 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), d)
+    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), d, current_device())
     if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
         compiled_cache[key] = cute.compile(

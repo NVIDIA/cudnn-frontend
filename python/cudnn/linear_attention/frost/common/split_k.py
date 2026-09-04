@@ -59,10 +59,11 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import sigmoid, softplus
+from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, sigmoid, softplus
 from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4
 
 from .host import get_dtype
+from cudnn.frost.device import current_device
 
 USE_PDL = True
 
@@ -519,9 +520,15 @@ def frost_split_k_scan_channel(
                         a_exp = cutlass.Float32(1.0)
                         dt_vals = cutlass.Array(cutlass.Float32, cpl)
                         if cutlass.const_expr(safe_gate):
-                            a_exp = cute.math.exp2(mALog[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True)
+                            if cutlass.const_expr(mALog is not None):
+                                a_exp = cute.math.exp2(mALog[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True)
+                            else:
+                                a_exp = opaque_f32_zero() + cutlass.Float32(1.0)
                             for q in cutlass.range_constexpr(cpl):
-                                dt_vals[q] = mDtBias[head_idx, lane_idx * cutlass.Int32(cpl) + cutlass.Int32(q)].to(cutlass.Float32)
+                                if cutlass.const_expr(mDtBias is not None):
+                                    dt_vals[q] = mDtBias[head_idx, lane_idx * cutlass.Int32(cpl) + cutlass.Int32(q)].to(cutlass.Float32)
+                                else:
+                                    dt_vals[q] = opaque_f32_zero()
                         ch_acc = cutlass.Array(cutlass.Float32, cpl, alignment=16)
                         for q in cutlass.range_constexpr(cpl):
                             ch_acc[q] = cutlass.Float32(0.0)
@@ -601,7 +608,8 @@ def frost_split_k_scan_scalar(
     chunk-scratch rows for heads ``[hg*32, (hg+1)*32)``; lane ``l`` owns head
     ``hg*32 + l``, so reads and writes coalesce and no reduction is needed.
     With ``safe_gate`` each token contributes ``-exp(A_log[h]) * softplus(g +
-    dt_bias[h]) * RCP_LN2``.  The item count is the plan kernel's."""
+    dt_bias[h]) * RCP_LN2``; an absent ``mALog`` is unit amplitude, an absent
+    ``mDtBias`` zero bias.  The item count is the plan kernel's."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -615,8 +623,14 @@ def frost_split_k_scan_scalar(
     a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     if cutlass.const_expr(safe_gate):
-        a = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
-        bias = mDtBias[h_r].to(cutlass.Float32)
+        if cutlass.const_expr(mALog is not None):
+            a = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        else:
+            a = -(opaque_f32_zero() + cutlass.Float32(1.0)) * cutlass.Float32(RCP_LN2)
+        if cutlass.const_expr(mDtBias is not None):
+            bias = mDtBias[h_r].to(cutlass.Float32)
+        else:
+            bias = opaque_f32_zero()
     common = read_plan(mChunkVals)
     if common >= cutlass.Int32(0):
         blk = cutlass.Int32(bidx[0])
@@ -1184,7 +1198,8 @@ def build_split_table(
     the matching transform so cuts land on true decay: per-channel
     ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``
     (``gate_lower_bound`` required), scalar ``-exp(a_log[h]) * softplus(g +
-    dt_bias[h])``.
+    dt_bias[h])``.  ``a_log`` / ``dt_bias`` may each be None under
+    ``safe_gate`` (unit amplitude / zero bias).
 
     ``split=False`` is rejected: each main kernel's prologue synthesizes the
     no-cuts table itself (``order_gen``).
@@ -1235,11 +1250,12 @@ def build_split_table(
         str(a_log.dtype) if a_log is not None else "none",
         str(dt_bias.dtype) if dt_bias is not None else "none",
         int(expand_num),
+        current_device(),
     )
     if key not in compiled_cache:
 
         dt_bias_c = None
-        if safe_gate:
+        if dt_bias is not None:
             dt_bias_c = from_dlpack(dt_bias, assumed_align=4)
             dt_bias_c.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
         chunk_scratch_c = None
@@ -1272,7 +1288,7 @@ def build_split_table(
             cutlass.Float32(log2_threshold),
             cutlass.Float32(gate_scale_log2),
             from_dlpack(gate, assumed_align=(8 if gate_elem_bytes == 2 else 4)).mark_layout_dynamic(leading_dim=len(gate.shape) - 1) if split else None,
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if safe_gate else None,
+            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             dt_bias_c,
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             chunk_scratch_c,

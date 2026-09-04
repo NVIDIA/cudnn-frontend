@@ -280,7 +280,7 @@ def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
     chain = analyze(_build_graph(E=4, S=512, N=256, K=512, num_groups=4))
     cfg = by_name(_CFG)
     epi_n = _epi_n(cfg, chain.output_dtype)
-    host = _host_tma_c_descs(chain, frozenset({0}), epi_n)
+    host = _host_tma_c_descs(chain, cfg, frozenset({0}), epi_n)
     sequence = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
 
     assert "global_dims=[n, m]" in host
