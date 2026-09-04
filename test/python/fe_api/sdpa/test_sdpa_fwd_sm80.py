@@ -271,8 +271,8 @@ def test_sm80_thd_compile_key_plan_time_only():
     def cache_totals():
         # The lru counters are session-global (earlier tests in a full run
         # accumulate misses), so assert on DELTAS across our calls only.
-        mods = [m for (path, _params), m in template_loader._MODULES.items() if "sm80" in str(path)]
-        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "sm80" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
 
     varlen([96, 160])  # first call: one compile

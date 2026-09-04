@@ -375,8 +375,8 @@ def test_sm80_bwd_thd_compile_key_plan_time_only():
         # Count ONLY the bprop template's per-shape lru (the fwd wrapper runs
         # too, and its counters are covered by the forward's twin test); the
         # counters are session-global, so assert on DELTAS across our calls.
-        mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
 
     varlen([96, 160])  # first call: one compile
@@ -801,8 +801,8 @@ def test_sm80_bwd_thd_sinks_deterministic_compile_key():
 
     def cache_totals():
         """(misses, hits) summed over the loaded bprop template modules' compile caches."""
-        mods = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in mods if hasattr(m.compile, "cache_info")]
+        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
+        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
         return sum(i.misses for i in infos), sum(i.hits for i in infos)
 
     sinks = torch.randn(4, dtype=torch.float32, device="cuda")
