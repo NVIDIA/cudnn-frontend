@@ -339,10 +339,17 @@ def emit_seq_descs(
             dptr,
             new_value=row_base.toint(cutlass.Int64),
         )
+        # Clamped to >= 1: a tensor map with a ZERO extent is not merely empty,
+        # it is INVALID, and any access through it raises
+        # cudaErrorIllegalInstruction -- so a zero-length sequence cannot be
+        # left to the hardware clip.  The extent-1 descriptor is structurally
+        # valid and never dereferenced: a consumer that can reach an empty
+        # sequence's tiles must skip the access itself (stage 3's epilogue
+        # does; the forward's scheduler hands out no unit for one).
         nvvm.tensormap_replace(
             nvvm.TensormapField.GLOBAL_DIM,
             dptr,
-            new_value=s_b,
+            new_value=cute.math.max(s_b, cutlass.Int32(1)),
             ord=seq_ord,
         )
 

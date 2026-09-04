@@ -1320,6 +1320,15 @@ def _bprop_matmul_bh_sm100_kernel(
                 from_proxy=nvvm.Proxy.GENERIC,
                 to_proxy=nvvm.Proxy.TENSORMAP,
             )
+        # The C-side cu_seqlens prefix inside the metadata buffer: dV/dK write
+        # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
+        # makes when it bases each sequence's descriptor.
+        _thd_meta = cutlass.make_array_view(meta_t) if cutlass.const_expr(_THD_MM) else None
+        _thd_c_cu0 = (
+            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(a_is_m_major) else n_batch)
+            if cutlass.const_expr(_THD_MM)
+            else cutlass.Int32(0)
+        )
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
@@ -1343,6 +1352,17 @@ def _bprop_matmul_bh_sm100_kernel(
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * pair_n_size
+            # A group whose OUTPUT sequence has zero rows. Its clipped C
+            # descriptor is built at extent 1 rather than 0 (a tensor map with a
+            # zero extent is INVALID and traps -- see tile_dsl.thd.emit_seq_descs),
+            # so the hardware clip that drops every other overshooting tile
+            # cannot drop this one: skip the store instead. Read once per tile,
+            # not per subtile; `tile_b` is refreshed at the bottom of the loop.
+            _thd_c_len = (
+                cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b])
+                if cutlass.const_expr(_THD_MM)
+                else cutlass.Int32(1)
+            )
             if cutlass.const_expr(epi_dp22):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -1424,11 +1444,15 @@ def _bprop_matmul_bh_sm100_kernel(
                             # carries the base, so the M coordinate stays
                             # sequence-relative.
                             if cutlass.const_expr(_THD_MM):
-                                nvvm.cp_async_bulk_tensor_global_shared_cta(
-                                    (desc_words.iterator.raw_ptr() + tile_b * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic),
-                                    _tsv_0.data_ptr(),
-                                    (col, coord_m, tile_h, cutlass.Int32(0)),
-                                )
+                                # Skipping only the STORE keeps the epilogue's
+                                # pipeline intact: the commit below still runs,
+                                # and an empty bulk group commits immediately.
+                                if _thd_c_len > cutlass.Int32(0):
+                                    nvvm.cp_async_bulk_tensor_global_shared_cta(
+                                        (desc_words.iterator.raw_ptr() + tile_b * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic),
+                                        _tsv_0.data_ptr(),
+                                        (col, coord_m, tile_h, cutlass.Int32(0)),
+                                    )
                             else:
                                 nvvm.cp_async_bulk_tensor_global_shared_cta(
                                     tma_c_descs[0].get_ptr(),
