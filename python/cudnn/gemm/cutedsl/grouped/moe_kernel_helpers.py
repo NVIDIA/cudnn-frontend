@@ -404,9 +404,7 @@ def sigmoid(x):
     import torch
 
     LOG2_E = 1.4426950408889634
-    # torch.pow(2, y) rather than torch.exp2: exp2 on fp32 CUDA tensors raises
-    # "CUDA driver error: invalid argument" on some torch nightlies (2.14.0.dev2026xx).
-    exp_x = torch.pow(2.0, x * (-LOG2_E))
+    exp_x = torch.exp2(x * (-LOG2_E))
     ret = 1.0 / (exp_x + 1.0)
     return ret
 
