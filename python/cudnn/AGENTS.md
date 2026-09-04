@@ -232,6 +232,48 @@ SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
   ``keep_mangled_name=True``, and do not use compiler flags or symbol rewriting
   instead.
 - Verify with ``(cd test/python && pytest -q test_frost_kernel_name_prefix.py)``.
+- This call runs at module import, and DSL APIs used this way can be newer than
+  the `pyproject.toml` floor admits. It is legal only because Rule 7's gate runs
+  before the kernel module is imported — do not add an import path that skips
+  it.
+
+**Rule 7 — gate the CuTe DSL version at runtime; never assume the installed
+DSL satisfies your kernel.**
+
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the
+  **downstream** floor, not ours: vLLM and SGLang inherit quack-kernels'
+  `==4.6.2`, and a higher floor would make this package uninstallable next to
+  them. The FROST-derived kernels need more (`CUTEDSL_MIN_VERSION`, 4.7.0). So
+  an installed DSL that satisfies pip can still be below what a kernel needs,
+  and every backend/kernel must cope with that at runtime.
+- Before a path imports a DSL-version-specific API, check the installed version
+  with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
+  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
+  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
+  inside the DSL, and never let it read as a missing-dependency install hint:
+  the package is installed, and that `pip install` changes nothing.
+- The gate lives at the entry the caller hits, before the kernel module is
+  imported: the semantic op's route check (`_can_route_causal_conv1d_bulk` in
+  `ops/causal_conv1d.py`, `_validated_native_update` in
+  `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
+  `__init__`'s lazy import. Module-scope code in kernel files may assume the
+  floor only because that gate ran first.
+- Known floors — extend this list when you take a dependency on a newer API,
+  and say so in the PR body if it raises the floor of a user-facing op:
+  `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
+  `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+- Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
+  they do not fail. CI runs the `oss:` lanes across the supported DSL versions
+  (`ci/stages/oss_tests/jobs.yml` on the GitLab side); a lane below your floor
+  must show skips, not errors.
+- Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
+  with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
+  ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
+  route next to it had the check and declined cleanly. Earlier, PR #854's
+  module-scope `set_name_prefix(..., remove_cutlass_symbol=True)` failed the
+  same way on a since-dropped 4.5.x lane, reported as "install optional
+  dependencies".
 
 
 ## Frontend-only kernel package layout
@@ -299,6 +341,7 @@ Every OSS kernel API extends `APIBase` and implements:
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
 5. Tests: `test/python/fe_api/<family>/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
+6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 
