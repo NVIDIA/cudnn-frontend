@@ -18,6 +18,7 @@ os.environ.setdefault(
 # before jax initializes its backend.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import faulthandler
 import sys
 import time
 import pytest
@@ -33,6 +34,92 @@ import cudnn
 import torch
 
 # fmt: off
+
+# =================== Crash isolation =====================
+# Three failure modes are unrecoverable in-process and make every later test lie:
+#   - a segfault or abort kills the interpreter;
+#   - a faulting kernel (illegal memory access, device-side assert, ...) poisons
+#     the CUDA context, so every later CUDA call -- fixture setup included --
+#     returns the same sticky error;
+#   - a hung test, CPU or GPU, blocks the session forever.
+# So the tests run inside a pytest-xdist worker (one is injected below when the
+# caller did not ask for -n), and the worker is killed as soon as its context is
+# dead or a test overruns its deadline. The controller reports the offending
+# test, replaces the worker, and the rest of the session runs in a fresh process
+# with fresh fixtures. Escape hatches: -s / --pdb / -n<N> / CUDNN_TEST_NO_ISOLATION=1.
+#
+# Caveat for GPU hangs: killing the process does not stop a kernel that is still
+# running; the driver keeps that context alive until the kernel finishes, and
+# the next worker can block behind it. Nothing short of a GPU reset fixes that.
+
+_TEST_TIMEOUT_S = float(os.environ.get("CUDNN_TEST_TIMEOUT", "900"))
+_xdist_controller = False
+_stderr_fd = None  # dup of the real stderr, taken while pytest's capture is suspended
+
+
+def _is_xdist_worker():
+    return os.environ.get("PYTEST_XDIST_WORKER") is not None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    # Runs before xdist's own tryfirst hook, which expands numprocesses into tx
+    # specs. Workers re-enter this hook with numprocesses reset to None; skip
+    # there, or a worker spawns workers of its own.
+    opt = config.option
+    if _is_xdist_worker() or os.environ.get("CUDNN_TEST_NO_ISOLATION"):
+        return
+    if not hasattr(opt, "numprocesses"):
+        return  # pytest-xdist not installed
+    if opt.maxworkerrestart is None:
+        opt.maxworkerrestart = 100000  # xdist's default is 4x the worker count; every crashing test costs one
+    if opt.numprocesses is not None or opt.tx or opt.collectonly:
+        return
+    if opt.capture == "no" or opt.usepdb:
+        return  # interactive run: keep the tests in this process
+    opt.numprocesses = 1
+
+
+def _dead_cuda_context():
+    # A sticky context error is returned by every later CUDA call, so one
+    # synchronize is both the cheapest and the most complete probe; it also
+    # surfaces async faults the test itself swallowed.
+    if not torch.cuda.is_initialized():
+        return None
+    try:
+        torch.cuda.synchronize()
+    except Exception as e:
+        return str(e).strip().splitlines()[0]
+    return None
+
+
+def pytest_runtest_logstart(nodeid, location):
+    # faulthandler's watchdog is a C thread that needs no GIL, so it fires even
+    # while the main thread sits in a CUDA driver call; a Python thread or
+    # SIGALRM handler would never get to run there. exit=True dumps every
+    # thread's stack to the real stderr and then _exit()s the worker.
+    if _TEST_TIMEOUT_S > 0 and not _xdist_controller:
+        faulthandler.dump_traceback_later(_TEST_TIMEOUT_S, exit=True, file=_stderr_fd)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logfinish(nodeid, location):
+    if _xdist_controller:
+        return  # only replays worker reports; ran no CUDA work of its own
+    # The probe blocks on any kernel the test left running, so it runs with the
+    # watchdog still armed; disarm only once it has returned.
+    error = _dead_cuda_context()
+    faulthandler.cancel_dump_traceback_later()
+    if error is None:
+        return
+    msg = f"[crash-guard] {nodeid}: CUDA context is unusable ({error})"
+    if not _is_xdist_worker():
+        pytest.exit(msg, returncode=1)  # no supervisor to restart us: stop cleanly instead of cascading
+    print(f"{msg}; killing the worker", file=sys.__stderr__, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.5)  # let this test's report drain to the xdist controller first
+    os._exit(os.EX_SOFTWARE)
 
 # =================== GPU memory gate (pytest-xdist) =====================
 # Several xdist workers share one GPU. A memory-hungry test in one worker (a
@@ -132,14 +219,16 @@ def cudnn_handle():
 
 
 # =================== PyTest Hooks =====================
-def pytest_load_initial_conftests(args, early_config, parser):
-    if not any(arg.startswith("--tb=") for arg in args):
-        args.insert(0, "--tb=short")
-    if "--no-header" not in args:
-        args.insert(0, "--no-header")
+# (pytest_load_initial_conftests is not called for conftest.py files -- pluggy
+# snapshots the hook impls before conftests are registered -- so the --tb=short
+# / --no-header defaults it used to set live in pytest.ini addopts instead.)
 
 
 def pytest_configure(config):
+    global _xdist_controller, _stderr_fd
+    _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
+    _stderr_fd = os.dup(sys.__stderr__.fileno())
+
     assert torch.cuda.is_available()
 
     print("===== cudnn-frontend conftest.py ====")
