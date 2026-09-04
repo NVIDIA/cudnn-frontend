@@ -31,9 +31,13 @@ THREADS = 128
 
 NEG_INF = float("-inf")
 
-# Workspace partials are always one of the half types; the FP8 entries are
-# reachable only as the OUTPUT type, where this pass performs the single cast.
+# The FP8 entries are reachable only as the OUTPUT type, where this pass
+# performs the single cast.  "f32" is a PARTIAL-only type: the split epilogue can
+# write its fp32 accumulator straight to global (no SMEM staging), so the
+# reduction reads exactly what the mainloop produced with no intermediate
+# rounding.
 _ELEM = {
+    "f32": cutlass.Float32,
     "f16": cutlass.Float16,
     "bf16": cutlass.BFloat16,
     "e4m3": cutlass.Float8E4M3FN,

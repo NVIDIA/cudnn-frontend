@@ -107,6 +107,11 @@ class TemplateParams:
     # that kernels/split_combine_sm100.py reduces.  1 = off (byte-identical
     # codegen to the single-pass kernel).
     split_kv: int = 1
+    # Write the split partials as fp32 straight from the epilogue's accumulator
+    # registers, bypassing the SMEM O tile and its TMA store.  Costs 2x the
+    # partial workspace and gives the combine an unrounded input.  Partial-only:
+    # it never changes the caller-visible O.
+    fp32_partials: bool = False
     # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA
     # pair share one MMA, each holding half of every K/V tile); 1 = cga1, one
     # independent CTA per tile.

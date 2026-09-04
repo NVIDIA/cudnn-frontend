@@ -252,6 +252,9 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# fp32 partials: only meaningful under a split, and it replaces the SMEM/TMA
+# O path entirely rather than widening it.
+_FP32_PARTIALS = bool(PARAMS.fp32_partials) and SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
@@ -322,6 +325,7 @@ def _kernel(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    o_partial_f32: Optional[cute.Tensor],
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -518,6 +522,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
             amax_o_tensor=amax_o_tensor,
+            o_partial_f32=o_partial_f32,
             qh_per_kh=qh_per_kh,
         )
 
@@ -930,6 +935,12 @@ def _tmastg_warp_group(
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_o_full[qs].wait(o_full_phase)
+            # fp32 partials bypass SMEM entirely: the epilogue stored them
+            # straight to global, so nothing is staged here to move. Keep the
+            # barrier handshake so this warp group stays in lockstep.
+            if cutlass.const_expr(_FP32_PARTIALS):
+                bars.mb_o_empty[qs].arrive()
+                continue
 
             # O TMA params follow O's swizzle, not V's (V and O swizzles may differ).
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1731,6 +1742,7 @@ def _correction_warp_group(
     o_scale_fused,
     amax_o_tensor,
     qh_per_kh,
+    o_partial_f32=None,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -1949,7 +1961,35 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
-            if cutlass.const_expr(CFG.DTYPE_O <= 1):
+            if cutlass.const_expr(_FP32_PARTIALS):
+                # FP32 partials: store the epilogue's OWN fp32 accumulator
+                # straight to the split workspace -- no cast, no SMEM staging,
+                # no TMA.  Storing the accumulator directly is what lets the
+                # partial be fp32 without the SMEM O tile growing to match:
+                # the tile is simply not used on this path.
+                _op32 = cutlass.make_array_view(o_partial_f32)
+                _o_b32 = _partial_batch(batch_idx, split_idx, n_batch)
+                _F32_EPI = 32  # one tcgen05_ld 32x32b chunk
+                for _blk in cutlass.range_constexpr(CFG.TILE_O // _F32_EPI):
+                    _o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + _blk * _F32_EPI)
+                    _o_chunk = nvvm.tcgen05_ld(
+                        "32x32b",
+                        nvvm.make_tmem_ptr(_o_addr, cutlass.Float32),
+                        num=_F32_EPI,
+                    )
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    _o_s = _o_chunk * inv_sum
+                    if _row_valid:
+                        _row_out = _op32[_o_b32, q_row_global, row_head_idx, :]
+                        for _j in cutlass.range_constexpr(_F32_EPI):
+                            # Dead-row sanitize, as on the SMEM paths: an empty
+                            # mainloop never wrote O TMEM, so the load is garbage.
+                            _v = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), _o_s[_j].ir_value()))
+                            _row_out[cutlass.Int32(_blk * _F32_EPI + _j)] = _v
+                # The TMA-store warp group still runs its barrier handshake, so
+                # release its slot even though nothing was staged.
+                bars.mb_o_empty[qs].wait(o_empty_phase)
+            elif cutlass.const_expr(CFG.DTYPE_O <= 1):
                 # FP8 output (DTYPE_O ∈ {0,1}): hand-rolled 16:4 fp8 pack +
                 # STS.128 — forces F2FP outputs into a register quad so STS.128
                 # needs no PRMT to gather them (vs the DSL store_swizzled which
@@ -2113,6 +2153,7 @@ def _host(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    o_partial_f32: Optional[cute.Tensor] = None,
     # THD device metadata build (issue #552): the CALLER's Q/KV length
     # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
     # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) — consumed only by the
@@ -2167,9 +2208,16 @@ def _host(
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+    # Under fp32 partials the epilogue writes o_tensor directly and this
+    # descriptor is never used -- but it still has to BUILD, and an fp32 element
+    # doubles the box's inner byte width past what the O swizzle allows.  Halve
+    # the box so the descriptor stays legal; nothing reads it.
+    _o_box = list(vo_box_o)
+    if _FP32_PARTIALS:
+        _o_box[-1] = max(1, _o_box[-1] // 2)
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
-        box_dims=vo_box_o,
+        box_dims=tuple(_o_box),
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.O_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
@@ -2249,6 +2297,7 @@ def _host(
         descale_v_t,
         scale_o_t,
         amax_o_tensor,
+        o_partial_f32,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2335,7 +2384,9 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
-        OUT_STORAGE_DTYPE,
+        # Under fp32 partials o_tensor IS the fp32 split workspace: the epilogue
+        # writes it directly and the TMA descriptor built from it goes unused.
+        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
         (_o_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
@@ -2458,6 +2509,9 @@ def compile(  # noqa: A001
         _fake_scale(),
         _fake_scale(),
         fake_amax_o,
+        # o_partial_f32 exists in the ABI only when the mode is on, so the
+        # traced signature matches what the adapter passes.
+        *((fake_o,) if _FP32_PARTIALS else ()),
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,

@@ -378,6 +378,7 @@ class SdpaFwdDsl(APIBase):
         tile_n: Optional[int] = None,
         cga: Optional[int] = None,
         split_kv: Optional[int] = None,
+        fp32_partials: bool = False,
         softmax_precision: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
     ) -> None:
@@ -461,6 +462,10 @@ class SdpaFwdDsl(APIBase):
         # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
         # graph heuristics pass an explicit split count when splitting wins.
         self.split_kv = 1 if split_kv is None else int(split_kv)
+        # Experimental: fp32 split partials -- the epilogue stores its own
+        # accumulator registers straight to the workspace, bypassing the SMEM
+        # O tile and its TMA store.  Partial-only; O's dtype is unchanged.
+        self.fp32_partials = bool(fp32_partials)
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
         self.softmax_precision = softmax_precision
@@ -848,10 +853,23 @@ class SdpaFwdDsl(APIBase):
         # A quantized O has no half counterpart to inherit, so pick f16 -- its
         # 10-bit mantissa carries the partials more precisely than bf16's 7, and
         # the range that would favour bf16 is what scale_o already handles.
+        if self._fp32_partial_split():
+            return torch.float32
         return torch.bfloat16 if self._o_dtype() == torch.bfloat16 else torch.float16
 
+    def _fp32_partial_split(self) -> bool:
+        """fp32 partials actually in effect for this launch.
+
+        Only the d128 flavor carries the extra kernel slot today, so the mode is
+        confined to it -- everything else silently keeps half partials rather
+        than mismatching the compiled ABI."""
+        return self.fp32_partials and self.split_kv > 1 and (self.head_dim_qk, self.head_dim_v) == (128, 128)
+
     def _partial_dtype_tag(self) -> str:
-        return "bf16" if self._partial_torch_dtype() == torch.bfloat16 else "f16"
+        d = self._partial_torch_dtype()
+        if d == torch.float32:
+            return "f32"
+        return "bf16" if d == torch.bfloat16 else "f16"
 
     def _o_itemsize(self) -> int:
         return self._partial_torch_dtype().itemsize
@@ -1306,6 +1324,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            fp32_partials=self._fp32_partial_split(),
             cta_mma=(1 if self._fp8 and self.flavor == (256, 256) else 2) if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
@@ -2377,6 +2396,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dv_t,
             so_kernel,
             amax_o_buf,
+            # o_partial_f32: the SAME split workspace, written directly by the
+            # epilogue under fp32 partials.  Only the d128 kernel carries this
+            # slot, so it is appended only when the mode is on.
+            *((O_dst,) if self._fp32_partial_split() else ()),
             *dense_q_lens_args,
             stream=current_stream,
         )
