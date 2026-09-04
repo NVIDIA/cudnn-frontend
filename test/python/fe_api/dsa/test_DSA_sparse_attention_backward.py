@@ -1199,15 +1199,93 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
 
 
 @pytest.mark.L0
-@torch_fork_set_rng(seed=437)
+@torch_fork_set_rng(seed=877)
 @pytest.mark.parametrize(
-    "sink_value",
+    "invalid_value,topk_length_value",
     [
-        pytest.param(2.4e38, id="finite-but-rescale-overflows"),
-        pytest.param(float("inf"), id="pos-inf"),
+        pytest.param(-1, None, id="noncompact-negative"),
+        pytest.param(1, None, id="noncompact-positive-oob"),
+        pytest.param(torch.iinfo(torch.int32).max, 1, id="garbage-past-length"),
+        pytest.param(-1, 64, id="compact-negative"),
+        pytest.param(1, 64, id="compact-positive-oob"),
+        pytest.param(1, 65, id="oversized-length"),
+        pytest.param(None, None, id="noncompact-mixed-two-tile"),
+        pytest.param(None, 128, id="compact-mixed-two-tile"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value):
+def test_DSA_sparse_attention_backward_sm90_masks_invalid_topk_rows(invalid_value, topk_length_value):
+    """SM90 must reject invalid sparse rows before KV access, probability use, and dKV scatter."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    device = torch.device("cuda")
+    num_heads, head_dim, head_dim_v = 32, 576, 512
+    topk_width = 128 if invalid_value is None else 64
+    q = torch.full((1, num_heads, head_dim), 8.0, dtype=torch.bfloat16, device=device)
+
+    # Put readable guard rows on both sides of the logical one-row KV view.
+    # An unfixed gather can then fail numerically without poisoning the CUDA
+    # context through a wild pointer. dKV accumulation is rounded to 64 rows,
+    # so the positive guard index is safe there as well.
+    kv_storage = torch.zeros(3, head_dim, dtype=torch.bfloat16, device=device)
+    kv_storage[1].fill_(-8.0)
+    kv = kv_storage[1:2]
+
+    # Likewise retain one full guard tile behind the logical top-k view. The
+    # oversized-length case reaches only its first row in the peeled tile.
+    topk_storage = torch.full((1, 2 * topk_width), -1 if invalid_value is None else invalid_value, dtype=torch.int32, device=device)
+    topk_storage[:, 0] = 0
+    topk_idxs = topk_storage[:, :topk_width]
+    topk_length = None if topk_length_value is None else torch.full((1,), topk_length_value, dtype=torch.int32, device=device)
+
+    attn_sink = torch.full((num_heads,), -math.inf, dtype=torch.float32, device=device)
+    dout = torch.randn(1, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
+    out = kv[0, :head_dim_v].view(1, 1, head_dim_v).expand(1, num_heads, head_dim_v).contiguous()
+    lse = ((q.float() * kv[0].float()).sum(dim=-1) * (192**-0.5)).contiguous()
+    if invalid_value is None:
+        topk_idxs.zero_()
+        invalid_positions = torch.tensor([idx for idx in range(topk_width) if idx % 3 != 0], dtype=torch.int64, device=device)
+        topk_idxs[:, invalid_positions[::2]] = -1
+        topk_idxs[:, invalid_positions[1::2]] = 1
+        lse += math.log(topk_width - invalid_positions.numel())
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=192**-0.5,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    expected_dkv = torch.zeros_like(kv)
+    expected_dkv[0, :head_dim_v] = dout.float().sum(dim=(0, 1)).to(torch.bfloat16)
+    assert torch.isfinite(result["dq"]).all()
+    assert torch.isfinite(result["dkv"]).all()
+    assert torch.isfinite(result["d_sink"]).all()
+    torch.testing.assert_close(result["dq"].float(), torch.zeros_like(result["dq"], dtype=torch.float32), atol=3e-5, rtol=0)
+    torch.testing.assert_close(result["dkv"], expected_dkv, atol=5e-2, rtol=1e-2)
+    assert torch.equal(result["d_sink"], torch.zeros_like(result["d_sink"]))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=437)
+@pytest.mark.parametrize(
+    "sink_value,empty_row",
+    [
+        pytest.param(-math.inf, True, id="empty-no-mass"),
+        pytest.param(2.4e38, False, id="finite-but-rescale-overflows"),
+        pytest.param(float("inf"), False, id="pos-inf"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value, empty_row):
     """A saturating attention sink must not turn the gradients into NaN."""
     try:
         from cudnn import DSA
@@ -1223,16 +1301,20 @@ def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value):
     kv = (torch.randn(s_kv, head_dim, device=device) / 10).to(torch.bfloat16)
     attn_sink = torch.full((num_heads,), sink_value, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
-    topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
-
-    out, lse = ref_sparse_attention_forward(
-        q,
-        kv,
-        attn_sink,
-        topk_idxs,
-        topk_length=topk_length,
-        softmax_scale=softmax_scale,
-    )
+    topk_length = torch.zeros(s_q, dtype=torch.int32, device=device) if empty_row else torch.full((s_q,), topk, dtype=torch.int32, device=device)
+    if empty_row:
+        topk_idxs.fill_(torch.iinfo(torch.int32).max)
+        out = torch.zeros(s_q, num_heads, 512, dtype=torch.bfloat16, device=device)
+        lse = torch.full((s_q, num_heads), -math.inf, dtype=torch.float32, device=device)
+    else:
+        out, lse = ref_sparse_attention_forward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+        )
     dout = torch.randn_like(out)
 
     result = DSA.sparse_attention_backward_wrapper(
