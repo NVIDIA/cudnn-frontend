@@ -1335,6 +1335,15 @@ def _bprop_matmul_bh_sm100_kernel(
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
+        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over S_q
+        # for the m-major dV/dK GEMMs and over S_kv for the k-major dQ one,
+        # exactly opposite to which axis each writes.  Used only to detect a
+        # zero-length reduction; see `_thd_k_len` in the loop.
+        _thd_k_cu0 = (
+            (n_batch if cutlass.const_expr(a_is_m_major) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
+            if cutlass.const_expr(_THD_MM)
+            else cutlass.Int32(0)
+        )
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
@@ -1366,6 +1375,26 @@ def _bprop_matmul_bh_sm100_kernel(
             # not per subtile; `tile_b` is refreshed at the bottom of the loop.
             _thd_c_len = (
                 cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b])
+                if cutlass.const_expr(_THD_MM)
+                else cutlass.Int32(1)
+            )
+            # A group whose REDUCTION axis is empty: S_q[b] == 0 for dV/dK,
+            # S_kv[b] == 0 for dQ.  `_thd_group` then returns `nkt == 0`, the
+            # mainloop runs zero iterations, and `scale_d` starts False -- so no
+            # MMA ever wrote the accumulator and the TMEM read below returns
+            # whatever the previous tile left there.
+            #
+            # Unlike `_thd_c_len` this canNOT be fixed by skipping the store:
+            # the OUTPUT rows exist (`_thd_c_len > 0`) and the caller expects
+            # them written.  Store ZEROS instead, which is also the right
+            # answer -- a sequence with no queries contributes nothing to its
+            # keys' and values' gradients, and one with no keys has no gradient
+            # to receive.
+            #
+            # A select, not a multiply by zero: the uninitialised TMEM can hold
+            # any bit pattern, and `0 * NaN` is NaN (issue #624's rule).
+            _thd_k_len = (
+                cutlass.Int32(_thd_meta[_thd_k_cu0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(_thd_meta[_thd_k_cu0 + tile_b])
                 if cutlass.const_expr(_THD_MM)
                 else cutlass.Int32(1)
             )
@@ -1435,7 +1464,17 @@ def _bprop_matmul_bh_sm100_kernel(
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                     _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
-                    _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                    # The branch is CTA-uniform (it reads only `tile_b`) and it
+                    # wraps the store ALONE -- the fence and the named barrier
+                    # below stay outside it, so no path through here can diverge
+                    # on a sync.
+                    if cutlass.const_expr(_THD_MM):
+                        if _thd_k_len > cutlass.Int32(0):
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                        else:
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                    else:
+                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:

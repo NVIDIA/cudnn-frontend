@@ -145,6 +145,10 @@ at **−20 %** on the whole backward (A/B/A, dense path with the trim forced off
 B=1 H=128 S=8192 d=512 bf16 causal: ~259 → ~207 TFLOPS). Correct, and a known
 optimization gap: re-trimming per sequence needs `row_off[b]` folded into the
 bounds and the bottom-right diagonal threaded per group.
+A sequence that is empty on ONE side only (`S_q[b] == 0` with `S_kv[b] > 0`, or
+the reverse) is served and returns exactly zero for that sequence: its GEMM's
+reduction axis is empty, so no MMA initialises the accumulator, and the epilogue
+stores zeros rather than TMEM residue.
 Its remaining conjunctions are declined, each with a reject test: **GQA** (the dK/dV
 partials would have to be packed per Q head), a non-BSHD-physical layout (the packed
 path has no staging copy), and a graph that does not declare

@@ -490,6 +490,47 @@ def test_graph_thd_zero_length_sequence():
     _run_graph((256, 0, 128), (256, 0, 128))
 
 
+@pytest.mark.parametrize(
+    "lens_q,lens_kv",
+    (
+        ((0, 128, 256), (192, 128, 256)),
+        ((192, 128, 256), (0, 128, 256)),
+    ),
+    ids=("empty_q_side", "empty_kv_side"),
+)
+def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv):
+    """A sequence empty on ONE side only -- the other side still has rows.
+
+    ``test_graph_thd_zero_length_sequence`` empties BOTH sides, which hides this:
+    there the output length is 0 too, so the epilogue's store-skip covers it.
+    Empty on one side only, the group's REDUCTION axis is empty (``nkt == 0``,
+    zero mainloop iterations, ``scale_d`` still False) while its OUTPUT rows
+    exist and must be written -- so the accumulator is never initialised and the
+    epilogue has to store zeros explicitly.
+
+    Zero is not a convention here, it is the answer: with no queries a sequence
+    contributes nothing to its keys' and values' gradients, and with no keys
+    there is no gradient to receive.
+
+    Verified RED without the epilogue's ``_thd_k_len`` guard: ``empty_kv_side``
+    returns ``max |dQ| = 2.9e+20``.  Note ``empty_q_side`` PASSED unguarded on
+    that run -- the residue it read happened to be zeros.  Both cases are kept
+    for exactly that reason: which one shows the bug depends on what the
+    previous tile left in TMEM, so a single case is not a reliable detector, and
+    the residue being FINITE (2.9e+20 is) means ``_run_graph``'s ``isfinite``
+    assertion does not catch it either.  The explicit zero check below is the
+    detector.
+    """
+    case, dq, dk, dv = _run_graph(lens_q, lens_kv)
+    # _check skips a sequence that is empty on either side (there is no reference
+    # for it), so assert the empty one's own gradients are exactly zero here.
+    i = 0
+    sl_q = slice(case.cu_q[i], case.cu_q[i] + case.lens_q[i])
+    sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
+    for name, got in (("dQ", dq[0, sl_q]), ("dK", dk[0, sl_k]), ("dV", dv[0, sl_k])):
+        assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
+
+
 def test_graph_thd_nan_capacity_tail():
     """Declared totals larger than the live packing, with a NaN tail.
 
