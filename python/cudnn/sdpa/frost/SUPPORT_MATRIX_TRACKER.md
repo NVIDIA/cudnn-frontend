@@ -82,7 +82,7 @@ MMA as d=512.
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ · dense only under THDʰ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
@@ -162,12 +162,17 @@ A sequence that is empty on ONE side only (`S_q[b] == 0` with `S_kv[b] > 0`, or
 the reverse) is served and returns exactly zero for that sequence: its GEMM's
 reduction axis is empty, so no MMA initialises the accumulator, and the epilogue
 stores zeros rather than TMEM residue.
-Its remaining conjunctions are declined, each with a reject test: **GQA** (the dK/dV
-partials would have to be packed per Q head), a non-BSHD-physical layout (the packed
-path has no staging copy), and a graph that does not declare
-**`max_total_seq_len_q`/`_kv`** — those are REQUIRED here, because
-`scratch_workspace_bytes()` is a build-time function and the blocked row count
-comes from the packed totals before any buffer exists.
+**GQA / MQA is served** as well: the stage-3 dK/dV GEMMs write one partial per Q
+head over the PACKED kv axis and the shared reduce folds the group onto the KV
+heads, so the packed path now matches the dense one feature for feature. With
+that, BOTH THD conjunction flags (`thd_causal`, `thd_gqa`) are **deleted** rather
+than set True — a conjunction flag is transitional by design and earns its place
+only while some row genuinely cannot serve the pair.
+What remains is a property of the path, not a feature it declines: a
+non-BSHD-physical layout (the packed path has no staging copy), and a graph that
+does not declare **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here,
+because `scratch_workspace_bytes()` is a build-time function and the blocked row
+count comes from the packed totals before any buffer exists.
 ʲ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
@@ -312,7 +317,6 @@ feature-free d=64 graph.
 | Backward pass entirely | SM107 |
 | Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
-| Backward THD + GQA | SM100, SM103 |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
