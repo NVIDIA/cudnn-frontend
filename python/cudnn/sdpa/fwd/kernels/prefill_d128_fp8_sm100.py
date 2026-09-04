@@ -2203,7 +2203,9 @@ def _host(
     # the box so the descriptor stays legal; nothing reads it.
     _o_box = list(vo_box_o)
     if _FP32_PARTIALS:
-        _o_box[-1] = max(1, _o_box[-1] // 2)
+        # fp32 is 4 bytes; scale the box by the O element's own width so
+        # the inner dimension stays inside the swizzle's byte limit.
+        _o_box[-1] = max(1, _o_box[-1] * CFG.BPE_O // 4)
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
         box_dims=tuple(_o_box),

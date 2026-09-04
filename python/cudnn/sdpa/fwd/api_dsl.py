@@ -863,7 +863,7 @@ class SdpaFwdDsl(APIBase):
         Confined to the flavors whose kernel carries the extra ABI slot; every
         other one silently keeps half partials rather than passing an argument
         its kernel does not have."""
-        return self.fp32_partials and self.split_kv > 1 and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128))
+        return self.fp32_partials and self.split_kv > 1 and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128), (256, 256))
 
     def _partial_dtype_tag(self) -> str:
         d = self._partial_torch_dtype()
