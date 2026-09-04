@@ -66,7 +66,7 @@ MMA as d=512.
 | FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ✅ᵍ (E4M3 only, d=256) |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | ✅ᵍ (fp16/bf16 gradients) |
-| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
+| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
@@ -181,6 +181,16 @@ none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`
 quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
 (MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
 envelope (`thd_d_shapes=None`) and works.
+¹⁰ The per-tensor FP8 d192×d128 and d256 flavors are **floored to their exact
+shapes** (`d_envelope_floors` `((192,128),128), ((256,256),255)`, mirrored in
+`fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`): with d_qk zero-padded into d192×d128
+the kernel's output is wrong (4–19 % of elements off by O(1) in `test_mhas_v2`),
+and the d256 padded envelope is run-to-run nondeterministic on long causal
+e5m2/GQA/sink graphs. So an FP8 graph with head dims in (128, 256) that is not
+exactly (192, 128) or (256, 256) is declined by the engine and takes the classic
+backend verdict — the same envelope the C++ `validate()` always enforced. The
+d128 flavor's ×16 envelope and the d512 band² are unaffected. Lift the floors
+once the kernels' padded paths pass the battery.
 ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
 d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
 GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
