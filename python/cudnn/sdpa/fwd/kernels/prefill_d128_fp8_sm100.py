@@ -162,6 +162,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     make_split_helpers,
+    store_fp32_partial_tile as _store_fp32_partial_tile,
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -1962,32 +1963,22 @@ def _correction_warp_group(
             sO_sub_base = sO[qs].base
 
             if cutlass.const_expr(_FP32_PARTIALS):
-                # FP32 partials: store the epilogue's OWN fp32 accumulator
-                # straight to the split workspace -- no cast, no SMEM staging,
-                # no TMA.  Storing the accumulator directly is what lets the
-                # partial be fp32 without the SMEM O tile growing to match:
-                # the tile is simply not used on this path.
-                _op32 = cutlass.make_array_view(o_partial_f32)
-                _o_b32 = _partial_batch(batch_idx, split_idx, n_batch)
-                _F32_EPI = 32  # one tcgen05_ld 32x32b chunk
-                for _blk in cutlass.range_constexpr(CFG.TILE_O // _F32_EPI):
-                    _o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + _blk * _F32_EPI)
-                    _o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(_o_addr, cutlass.Float32),
-                        num=_F32_EPI,
-                    )
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    _o_s = _o_chunk * inv_sum
-                    if _row_valid:
-                        _row_out = _op32[_o_b32, q_row_global, row_head_idx, :]
-                        for _j in cutlass.range_constexpr(_F32_EPI):
-                            # Dead-row sanitize, as on the SMEM paths: an empty
-                            # mainloop never wrote O TMEM, so the load is garbage.
-                            _v = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), _o_s[_j].ir_value()))
-                            _row_out[cutlass.Int32(_blk * _F32_EPI + _j)] = _v
-                # The TMA-store warp group still runs its barrier handshake, so
-                # release its slot even though nothing was staged.
+                # fp32 partials: the accumulator goes straight to the workspace,
+                # so the SMEM O tile and its TMA store are both bypassed.
+                _store_fp32_partial_tile(
+                    o_partial_f32,
+                    tmem_base_epi,
+                    tmem_O_off,
+                    inv_sum,
+                    row_dead,
+                    _row_valid,
+                    _partial_batch(batch_idx, split_idx, n_batch),
+                    q_row_global,
+                    row_head_idx,
+                    CFG.TILE_O,
+                )
+                # The TMA-store warp group still runs its handshake; release the
+                # slot even though nothing was staged.
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             elif cutlass.const_expr(CFG.DTYPE_O <= 1):
                 # FP8 output (DTYPE_O ∈ {0,1}): hand-rolled 16:4 fp8 pack +

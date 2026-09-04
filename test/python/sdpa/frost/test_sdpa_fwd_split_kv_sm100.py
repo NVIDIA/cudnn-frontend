@@ -1131,6 +1131,7 @@ def _api_fp8_case(
     b=1,
     out_dtype=torch.float16,
     scale_o=1.0,
+    fp32_partials=False,
 ):
     """FP8 / MXFP8 through the adapter; returns (split, O, O_unsplit, amax).
 
@@ -1197,6 +1198,7 @@ def _api_fp8_case(
             split_kv=split_knob,
             is_causal=causal,
             pack_gqa=pack_gqa,
+            fp32_partials=fp32_partials,
             **kw,
         )
         assert api.check_support()
@@ -1460,3 +1462,104 @@ def test_api_d256_quantized_split_reduces_in_half():
         return api.scratch_workspace_bytes()
 
     assert carved(torch.float8_e4m3fn) == carved(torch.float16) > 0
+
+
+# --- fp32 split partials ----------------------------------------------------
+#
+# The split epilogue normally casts its fp32 accumulator into the SMEM O tile
+# and TMA-stores that, so a partial is as wide as the staged tile. Under this
+# mode it stores the accumulator straight to the workspace instead, which is
+# what lets the partial be fp32 without the tile growing to match.
+
+
+def _fp32_partials_api(split, out_dtype=torch.float16, fp32_partials=True, b=1, h_q=8, s_q=512, s_kv=8192, d=128):
+    """Build (and run) the d128 per-tensor FP8 adapter in the requested mode."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("per-tensor FP8 d128 prefill requires cc10.0 / cc10.3 / cc10.7")
+    dev = "cuda"
+    torch.manual_seed(0)
+
+    def mk(*sh):
+        return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+    q, k, v = mk(b, h_q, s_q, d), mk(b, 1, s_kv, d), mk(b, 1, s_kv, d)
+    o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=out_dtype)
+    amax = torch.zeros(1, dtype=torch.float32, device=dev)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        dtype_o=out_dtype,
+        split_kv=split,
+        pertensor_fp8=True,
+        fp32_partials=fp32_partials,
+        scale_softmax=1.0 / math.sqrt(d),
+    )
+    assert api.check_support()
+    api.compile()
+    wsb = api.scratch_workspace_bytes()
+    ws = torch.empty(wsb, dtype=torch.uint8, device=dev) if wsb else None
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, amax_o=amax, workspace=ws, descale_q=one, descale_k=one, descale_v=one, scale_o=one)
+    torch.cuda.synchronize()
+
+    qf = q.double()
+    kf, vf = (t.double().repeat_interleave(h_q, dim=1) for t in (k, v))
+    ref = torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf
+    return api, o.float().clone(), ref, wsb
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split", [2, 4, 8], ids=lambda s: f"split{s}")
+def test_fp32_partials_match_an_independent_reference(split):
+    """The direct-to-global epilogue must produce the same answer as the staged
+    one -- it is a different STORE path for the same values, so any divergence
+    is an addressing or dead-row bug, not a rounding difference."""
+    api, got, ref, _ = _fp32_partials_api(split)
+    assert api._fp32_partial_split(), "mode did not take effect for this flavor"
+    assert (got.double() - ref).abs().max().item() <= 5e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split", [2, 4], ids=lambda s: f"split{s}")
+def test_fp32_partials_agree_with_half_partials(split):
+    """Widening the partial must not MOVE the result.
+
+    Storage width is not the accuracy limiter here (the combine is a convex
+    combination, so per-split store error averages rather than accumulates), so
+    the two modes should land within a hair of each other. A large gap means the
+    fp32 path is writing the wrong elements, not that it is more precise."""
+    _, wide, ref, ws_wide = _fp32_partials_api(split, fp32_partials=True)
+    _, half, _, ws_half = _fp32_partials_api(split, fp32_partials=False)
+    assert (wide - half).abs().max().item() <= 2e-3
+    # ... and it costs exactly the 2x partial workspace it claims to.
+    assert ws_wide > ws_half, f"fp32 partials did not grow the workspace ({ws_wide} vs {ws_half})"
+
+
+@pytest.mark.L0
+def test_fp32_partials_compile_the_combine_for_f32():
+    """The combine has to READ f32; compiling it for f16 would reinterpret the
+    workspace and produce garbage rather than fail."""
+    from cudnn.sdpa.fwd.kernels import split_combine_sm100 as comb
+
+    seen = []
+    orig = comb.compile
+    try:
+        comb.compile = lambda **kw: (seen.append(kw), orig(**kw))[1]
+        _fp32_partials_api(4)
+    finally:
+        comb.compile = orig
+    assert seen, "the combine was never compiled"
+    assert seen[0]["dtype_partial"] == "f32", f"combine partial dtype is {seen[0]['dtype_partial']!r}"
+
+
+@pytest.mark.L0
+def test_fp32_partials_fold_off_without_a_split():
+    """split_kv == 1 has no partials at all, so the mode must disappear rather
+    than compile a second kernel variant for the same work."""
+    api, _got, _ref, wsb = _fp32_partials_api(1)
+    assert not api._fp32_partial_split()
+    assert wsb == 0

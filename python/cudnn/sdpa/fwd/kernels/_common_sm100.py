@@ -328,6 +328,45 @@ def compute_kv_loop_bounds(
     )
 
 
+@cute.jit
+def store_fp32_partial_tile(
+    o_partial_f32,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_dead,
+    row_valid,
+    o_batch,
+    q_row_global,
+    row_head_idx,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int] = 32,
+) -> None:
+    """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
+
+    The staged path casts the accumulator into the SMEM O tile and TMA-stores
+    that, which ties the partial's width to the tile's.  Here the accumulator
+    goes to global directly, so the partial can be fp32 while the tile -- and
+    therefore the SMEM budget -- is untouched.  Shared by every flavor whose
+    epilogue holds its O accumulator in TMEM.
+
+    ``row_dead`` reproduces the staged path's sanitize: an empty mainloop never
+    wrote O TMEM, so the load returns garbage that must not reach the combine.
+    """
+    op = cutlass.make_array_view(o_partial_f32)
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        if row_valid:
+            row_out = op[o_batch, q_row_global, row_head_idx, :]
+            for j in cutlass.range_constexpr(chunk):
+                row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                    arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                )
+
+
 class SplitHelpers(NamedTuple):
     """Split-aware decode / bounds closures, plus the two flags kernels fold on."""
 
