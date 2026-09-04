@@ -2048,6 +2048,7 @@ def _correction_warp_group(
                     tmem_base_epi,
                     tmem_O_off,
                     inv_sum,
+                    row_dead,
                     q_row_global < seqlen_q,
                     _partial_batch(batch_idx, split_idx, n_batch),
                     q_row_global,

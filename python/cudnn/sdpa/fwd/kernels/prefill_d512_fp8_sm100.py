@@ -1355,7 +1355,11 @@ def _compute_warp_group(
                     if _valid32:
                         _row_out = _op32[_o_b32, q_row_global, row_head_idx, :]
                         for _j in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
-                            _row_out[cutlass.Int32(b * O_EPI_BLOCK_SIZE + _j)] = o_scaled[_j]
+                            # NaN * 0.0 is NaN: an empty mainloop never wrote O TMEM, so the
+                            # beta-zeroed scale does not sanitize a dead row on its own.
+                            _row_out[cutlass.Int32(b * O_EPI_BLOCK_SIZE + _j)] = cutlass.Float32(
+                                arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value())
+                            )
                     if ((b + 1) * O_EPI_BLOCK_SIZE) % O_CHUNK_ELEMS == 0:
                         chunk = (b * O_EPI_BLOCK_SIZE) // O_CHUNK_ELEMS
                         nvvm.fence_proxy("async.shared", space="cta")

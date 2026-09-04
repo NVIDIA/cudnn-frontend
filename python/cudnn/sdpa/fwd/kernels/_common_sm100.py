@@ -334,6 +334,7 @@ def store_fp32_partial_tile(
     tmem_base,
     tmem_o_off,
     inv_sum,
+    row_dead,
     row_valid,
     o_batch,
     q_row_global,
@@ -354,10 +355,10 @@ def store_fp32_partial_tile(
     different stride than the staged epilogue does silently returns the wrong
     columns rather than failing.
 
-    Dead rows need no separate guard: every caller has already folded the
-    empty-mainloop case into ``inv_sum`` (it is selected to 0.0 there), so the
-    garbage a dead row loads from O TMEM is multiplied out to zero -- the same
-    thing the staged path relies on.
+    ``row_dead`` cannot be dropped in favour of the zeroed ``inv_sum`` every
+    caller already computes: an empty mainloop never wrote O TMEM, so the load
+    can return NaN, and ``NaN * 0.0`` is NaN, not zero.  The staged paths avoid
+    this by not loading at all for such rows; here the select does it.
     """
     op = cutlass.make_array_view(o_partial_f32)
     for blk in cutlass.range_constexpr(tile_o // chunk):
@@ -368,7 +369,9 @@ def store_fp32_partial_tile(
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
             for j in cutlass.range_constexpr(chunk):
-                row_out[cutlass.Int32(blk * chunk + j)] = scaled[j]
+                row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                    arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                )
 
 
 class SplitHelpers(NamedTuple):

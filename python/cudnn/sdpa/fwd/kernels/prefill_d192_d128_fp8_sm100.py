@@ -2523,6 +2523,7 @@ def _correction_warp_group(
                     tmem_base_epi,
                     tmem_O_off,
                     inv_sum,
+                    row_dead,
                     _row_valid,
                     _partial_batch(batch_idx, split_idx, n_batch),
                     q_row_global,
@@ -2530,6 +2531,10 @@ def _correction_warp_group(
                     CFG.TILE_O,
                     O_CHUNK,
                 )
+                # The staged branch releases the stats slot from inside its loop; the
+                # next persistent tile's prologue waits on it, so it must happen here
+                # too or the second tile deadlocks.
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
                 if cutlass.const_expr(CFG.DTYPE_O <= 1):

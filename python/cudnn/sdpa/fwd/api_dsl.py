@@ -863,6 +863,11 @@ class SdpaFwdDsl(APIBase):
         Confined to the flavors whose kernel carries the extra ABI slot; every
         other one silently keeps half partials rather than passing an argument
         its kernel does not have."""
+        # This lives on the shared base, so SM120 inherits it -- but only the
+        # SM100 kernels carry the extra ABI slot, and an SM120 producer
+        # compiled without it would be handed an argument it cannot take.
+        if type(self).__name__ != "SdpaFwdDslSm100":
+            return False
         return self.fp32_partials and self.split_kv > 1 and (self.head_dim_qk, self.head_dim_v) in ((128, 128), (192, 128), (256, 256), (512, 512))
 
     def _partial_dtype_tag(self) -> str:
