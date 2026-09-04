@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -69,6 +71,57 @@ assert QK_ROPE == FEATCELL, "the rope occupies exactly one feature cell; QK_ROPE
 assert HALF == QK_ROPE // 2, "HALF must be QK_ROPE // 2"
 assert TILE_M % BLOCK == 0, "TILE_M must be a whole number of MXFP8 blocks"
 assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COLBLK x N_FEATCELL"
+
+
+ROPE_BF16_FMA = int(os.environ.get("NVTE_FUSED_Q_UPROJ_ROPE_BF16_FMA", "0")) > 0
+
+@cute.jit
+def _to_bf16_f32(v):
+    """Round an fp32 value through BF16 and back, matching the unfused RoPE's storage."""
+    return v.to(cutlass.BFloat16).to(cutlass.Float32)
+
+_ROPE_PROLOGUE = (
+    "{\n"
+    " .reg .b32 pp, qq, cc, ss, tq;\n"
+    " .reg .b16 h0, h1;\n"
+    " mov.b32 pp, {{$r0}, {$r1}};\n"
+    " mov.b32 qq, {{$r2}, {$r3}};\n"
+    " mov.b32 cc, {{$r4}, {$r5}};\n"
+    " mov.b32 ss, {{$r6}, {$r7}};\n"
+)
+_ROPE_EPILOGUE = (
+    " mov.b32 {h0, h1}, pp;\n"
+    " cvt.f32.bf16 {$w0}, h0;\n"
+    " cvt.f32.bf16 {$w1}, h1;\n"
+    "}\n"
+)
+
+
+@cute.jit
+def _rope_lo_bf16(p0, p1, q0, q1, c0, c1, s0, s1):
+    """Low rotated half: v_k = fma.rn.bf16(p_k, c_k, -mul.bf16(q_k, s_k)), two features at once."""
+    return cute.arch.inline_ptx(
+        _ROPE_PROLOGUE
+        + " mul.bf16x2 tq, qq, ss;\n"
+        + " neg.bf16x2 tq, tq;\n"
+        + " fma.rn.bf16x2 pp, pp, cc, tq;\n"
+        + _ROPE_EPILOGUE,
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[p0, p1, q0, q1, c0, c1, s0, s1],
+    )
+
+
+@cute.jit
+def _rope_hi_bf16(p0, p1, q0, q1, c0, c1, s0, s1):
+    """High rotated half: v_k = fma.rn.bf16(p_k, s_k, mul.bf16(q_k, c_k)), two features at once."""
+    return cute.arch.inline_ptx(
+        _ROPE_PROLOGUE
+        + " mul.bf16x2 tq, qq, cc;\n"
+        + " fma.rn.bf16x2 pp, pp, ss, tq;\n"
+        + _ROPE_EPILOGUE,
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[p0, p1, q0, q1, c0, c1, s0, s1],
+    )
 
 
 @cute.struct
@@ -436,6 +489,7 @@ def gemm_proj_rope_mxfp8_kernel(
             b = fc * 2 + (lane // HALFW)  # 32-feature row-block 0..5
             col_amax0 = cutlass.Float32(0.0)
             col_amax1 = cutlass.Float32(0.0)
+            
             # TE weight layout: NOPE at features 0..127, ROPE at features 128..191 (last cell)
             is_rope = fc == (N_FEATCELL - 1)
             if is_rope:
@@ -451,40 +505,65 @@ def gemm_proj_rope_mxfp8_kernel(
                 cos_base = mCos[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 sin_base = mSin[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 if is_second_half:
-                    # lanes 16..31: v = p*s + q*c
+                    # lanes 16..31: v = p*s + q*c.  Triton materializes q*c and folds p*s
+                    # into the fma.
                     for r in cutlass.range_constexpr(BLOCK):
-                        p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
-                        q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
-                        p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
-                        q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
-                        c0 = tc[0].to(cutlass.Float32)
-                        s0 = ts[0].to(cutlass.Float32)
-                        c1 = tc[1].to(cutlass.Float32)
-                        s1 = ts[1].to(cutlass.Float32)
-                        ps0, ps1 = cute.arch.mul_packed_f32x2((p0, p1), (s0, s1))
-                        v0, v1 = cute.arch.fma_packed_f32x2((q0, q1), (c0, c1), (ps0, ps1))
+                        if cutlass.const_expr(ROPE_BF16_FMA):
+                            v0, v1 = _rope_hi_bf16(
+                                sACC[tok0 + r, pcol0].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol0 + 1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1 + 1].bitcast(cutlass.Int16),
+                                tc[0].bitcast(cutlass.Int16),
+                                tc[1].bitcast(cutlass.Int16),
+                                ts[0].bitcast(cutlass.Int16),
+                                ts[1].bitcast(cutlass.Int16),
+                            )
+                        else:
+                            p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
+                            q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
+                            p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
+                            q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
+                            c0 = tc[0].to(cutlass.Float32)
+                            s0 = ts[0].to(cutlass.Float32)
+                            c1 = tc[1].to(cutlass.Float32)
+                            s1 = ts[1].to(cutlass.Float32)
+                            qc0, qc1 = cute.arch.mul_packed_f32x2((q0, q1), (c0, c1))
+                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (s0, s1), (qc0, qc1))
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
                         col_amax1 = cute.arch.fmax(col_amax1, cute.arch.fmax(v1, -v1))
                 else:
-                    # lanes 0..15: v = p*c - q*s
+                    # lanes 0..15: v = p*c - q*s.  Triton materializes q*s, negates it, and
+                    # folds p*c into the fma.
                     for r in cutlass.range_constexpr(BLOCK):
-                        p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
-                        q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
-                        p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
-                        q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
                         tc = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
                         ts = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cs_row_bytes, cute.AddressSpace.gmem, assumed_align=2), (2,))
-                        c0 = tc[0].to(cutlass.Float32)
-                        s0 = ts[0].to(cutlass.Float32)
-                        c1 = tc[1].to(cutlass.Float32)
-                        s1 = ts[1].to(cutlass.Float32)
-                        pc0, pc1 = cute.arch.mul_packed_f32x2((p0, p1), (c0, c1))
-                        qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
-                        v0, v1 = cute.arch.fma_packed_f32x2((qs0, qs1), (cutlass.Float32(-1.0), cutlass.Float32(-1.0)), (pc0, pc1))
+                        if cutlass.const_expr(ROPE_BF16_FMA):
+                            v0, v1 = _rope_lo_bf16(
+                                sACC[tok0 + r, pcol0].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol0 + 1].bitcast(cutlass.Int16),
+                                sACC[tok0 + r, pcol1 + 1].bitcast(cutlass.Int16),
+                                tc[0].bitcast(cutlass.Int16),
+                                tc[1].bitcast(cutlass.Int16),
+                                ts[0].bitcast(cutlass.Int16),
+                                ts[1].bitcast(cutlass.Int16),
+                            )
+                        else:
+                            p0 = sACC[tok0 + r, pcol0].to(cutlass.Float32)
+                            q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
+                            p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
+                            q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
+                            c0 = tc[0].to(cutlass.Float32)
+                            s0 = ts[0].to(cutlass.Float32)
+                            c1 = tc[1].to(cutlass.Float32)
+                            s1 = ts[1].to(cutlass.Float32)
+                            qs0, qs1 = cute.arch.mul_packed_f32x2((q0, q1), (s0, s1))
+                            v0, v1 = cute.arch.fma_packed_f32x2((p0, p1), (c0, c1), (-qs0, -qs1))
                         buf0[r] = v0
                         buf1[r] = v1
                         col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
@@ -497,6 +576,7 @@ def gemm_proj_rope_mxfp8_kernel(
                     buf1[r] = v1
                     col_amax0 = cute.arch.fmax(col_amax0, cute.arch.fmax(v0, -v0))
                     col_amax1 = cute.arch.fmax(col_amax1, cute.arch.fmax(v1, -v1))
+            
             invc0, sbc0, invc1, sbc1 = _e8m0_pair(col_amax0, col_amax1)
             scol_row = m_idx * COLBLK + cb
             mScol[scol_row, head, f0] = cutlass.Uint8(sbc0)
