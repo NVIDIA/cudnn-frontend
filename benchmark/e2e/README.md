@@ -11,6 +11,18 @@ training step cuDNN already owns, and which un-owned op is next. Layer count and
 be reduced to avoid repeating identical work; every such reduction or stand-in is
 printed and documented rather than described as a full-model benchmark.
 
+Every model leaf is a controlled **cuDNN-off versus cuDNN-on** experiment. The
+off treatment uses the credible non-cuDNN framework route, even when the stock
+framework dispatcher already selects cuDNN by default. The broader program has
+five purposes:
+
+1. expose cuDNN technology and its user-visible impact;
+2. measure the return from fusions and specialized kernels;
+3. surface integration gaps before users hit them;
+4. identify the next high-value kernel opportunity; and
+5. take missed opportunities back upstream through Megatron, vLLM, SGLang, and
+   related integrations.
+
 The current dense preset follows Qwen3.8-27B (and the kernel-equivalent
 Qwen3.5/3.6-27B): H=5120, I=17408, GDN 16 QK / 48 V heads at head-dim 128, and a 3:1
 GDN/full-attention period. It keeps four layers and scales the vocabulary by the
@@ -101,32 +113,125 @@ four-layer shape proxy, not full 64-layer Qwen throughput.
 
 On the same full B200, the Qwen-Image proxy uses the published H=3072,
 24x128-head and FFN=12288 dimensions, B=1, 4096 image plus 512 text tokens, and
-four of the 60 repeated transformer blocks. Forty balanced batches with three
-repeats compare an explicitly forced PyTorch FlashAttention treatment with the
-FE public cuDNN backend graph; all projections, QK norm, RoPE, AdaLN, biased
-GELU FFNs, residuals, and output work are common and remain inside the timed
-transformer forward.
+four of the 60 repeated transformer blocks. Each block has one image-stream and
+one text-stream dense biased GELU MLP; this model has no MoE/router. Forty
+Williams-balanced batches with three repeats measure two independent treatments:
 
-| SDPA treatment | p50 transformer forward | paired ratio | latency reduction | speedup | wins |
-|---|---:|---:|---:|---:|---:|
-| forced PyTorch FlashAttention | 9.943 ms | 1.00000 | -- | -- | -- |
-| direct FE/cuDNN backend | 7.883 ms | **0.79640** | **20.36%** | **1.256x** | **40/40** |
+- `M`: stock Diffusers GELU MLP versus public
+  `cudnn.gemm.ops.gelu_mlp(x, w1, b1, w2, b2)`; and
+- `A`: explicitly forced PyTorch FlashAttention versus the FE public cuDNN
+  backend graph for joint SDPA.
 
-The unforced public Torch call already selects `CUDNN_ATTENTION` at this d128
-shape, so this is an implementation A/B rather than a claim of an additional
-dispatcher-level user speedup. The complete four-block output matched within
-0.141% relative L2. The focused B=2 unequal-text mask case matched within 0.300%
-relative L2. Raw artifact SHA-256: `288ce0415c0cfd6564fde99debe0273a2304c07e7810547bd5da8b25cda0fbba`.
+| bits (M/A) | GELU MLP | joint SDPA | p50 transformer forward | paired ratio vs `00` | wins vs `00` |
+|---|---|---|---:|---:|---:|
+| `00` | Torch | forced PyTorch Flash | 9.978 ms | 1.00000 | -- |
+| `01` | Torch | cuDNN backend | 7.921 ms | 0.79444 | 40/40 |
+| `10` | cuDNN | forced PyTorch Flash | 9.785 ms | 0.98292 | 34/40 |
+| `11` | cuDNN | cuDNN backend | 7.770 ms | **0.78121** | **40/40** |
 
-The shared, model-agnostic harness lives in [`_perfshare.py`](_perfshare.py); a
-model file only builds its model, applies the swaps, and calls `profile_and_report`.
+The directly paired `11/00` result is 21.88% lower elapsed time, or **1.280x**.
+The conditional attention ratio is 0.79285 (**1.261x**, 2.045 ms median
+saving); the conditional GELU-MLP ratio is 0.98403 (**1.016x**, 0.142 ms median
+saving). The MLP win is directionally consistent in both contexts: 34/40 wins
+with Flash attention and 38/40 with cuDNN attention.
+
+`gelu_mlp` implements the same published biased
+`Linear -> GELU(approximate="tanh") -> Linear` FFN semantics and matches Torch
+within the documented BF16 tolerance. Its forward fuses the first matmul, bias,
+BF16 boundary, and GELU into one cuDNN graph launch, then runs the output linear
+as a second graph; its autograd path also fuses
+`dout @ w2` with GELU backward. It is not the SwiGLU op used by Qwen3.8.
+
+A separate CUDA-event diagnostic explains where the E2E gain comes from. These
+are mutually exclusive module regions from that diagnostic run, not the formal
+factorial samples or FLOP shares:
+
+Diagnostic artifact SHA-256: `fb3cb4d9381b400fec80d2635cf32c1d19926c3933a6c0356fe2120cd4aa3ef1`.
+
+| four-block region | cuDNN-off time | off share | cuDNN-on time |
+|---|---:|---:|---:|
+| two GELU MLPs per block | 2.030 ms | 21.0% | 1.861 ms |
+| joint SDPA core | 2.749 ms | 28.4% | 0.677 ms |
+| attention projections, QK norm, RoPE, and surrounding work | 3.307 ms | 34.2% | 3.493 ms |
+| AdaLN, residuals, output, and other work | 1.589 ms | 16.4% | 1.626 ms |
+
+The stock unforced Torch call already selects `CUDNN_ATTENTION` at this d128
+shape. That is successful cuDNN adoption, not a reason to discard the result:
+the controlled experiment explicitly disables cuDNN SDPA by forcing Flash in
+the off arm and quantifies the full-transformer impact of turning cuDNN back on.
+It does not claim a further 1.280x from changing Torch's current dispatcher.
+
+The complete four-block outputs matched the `00` baseline within 0.142%
+relative L2; the focused B=2 unequal-text mask case matched within 0.300%.
+Raw artifact SHA-256: `63274d0602fe0582088f5241e0dcddcaac244c1426c955bc8e979c4a09fb55d3`.
+
+## Qwen-Image ModelOpt NVFP4 proxy result
+
+The sibling [`Qwen-Image/run_nvfp4.py`](Qwen-Image/run_nvfp4.py) leaf anchors
+its placement and quantization policy to NVIDIA ModelOpt 0.46.0 commit
+`43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a`: Qwen-Image's middle
+transformer blocks use NVFP4 E2M1/block-16 Linears with E4M3 block scales and
+`max` calibration. ModelOpt's Qwen invocation does not enable
+`quantize_mha`, so joint attention remains BF16; this is not an all-FP4 model
+or an MXFP8-attention result.
+
+The four proxy blocks represent full-model blocks `[2, 20, 39, 57]` from the
+official quantized range 2..57. Every block routes all 14 Linear roles through
+NVFP4, including the two M=1 modulation projections. The proxy deliberately
+uses BF16 as its high-precision dtype and one synthetic frozen max-calibration
+pass instead of ModelOpt's default FP16/calibration workload. It therefore
+claims recipe-policy alignment and kernel-plumbing/performance evidence, not
+official calibration state or image quality. All 56 weights are prepacked once
+during setup and excluded from event timing; this differs from the quoted bare
+ModelOpt CLI's default `compress=false` execution state.
+
+On the same full B200 and formal four-block shape, 42 position- and
+carryover-balanced batches with three repeats measured:
+
+| arm | Linear / FFN treatment | joint SDPA | p50 transformer forward | paired ratio vs A | wins vs A |
+|---|---|---|---:|---:|---:|
+| `A` | Torch BF16 / Diffusers GELU FFN | forced PyTorch Flash BF16 | 9.852 ms | 1.00000 | -- |
+| `B` | Torch BF16 + cuDNN BF16 `gelu_mlp` | cuDNN BF16 | 7.782 ms | **0.78997** | **42/42** |
+| `C` | cuDNN FROST NVFP4 for all 14 Linears | cuDNN BF16 | 7.646 ms | **0.77567** | **42/42** |
+
+At fixed BF16, B/A is 21.00% lower elapsed time, or **1.266x**. The complete
+cuDNN-enabled low-precision stack C is 22.43% lower than A, or **1.289x**. C is
+also 1.73% lower than the already-optimized BF16 cuDNN arm B
+(`C/B=0.98267`, **1.018x**, 37/42 wins). This incremental low-precision win is
+modest: its paired p10--p90 ratio spans 0.97600--1.00452, so a few batches
+slightly favor B.
+
+The final C path caches typed views and resolved FROST bindings per logical
+Linear, validates every stable buffer in `select("C")` outside the CUDA-event
+region, and uses the public `run_resolved` entry point. Direct Linear outputs
+remain fresh allocations whose temporary binding slot is always cleared. This
+removes the repeated host binding work exposed by the earlier diagnostic while
+retaining strict route and lifetime guards; it does not use a private lowered
+launcher.
+
+The run requires exact successful routes for all 56 NVFP4 Linears, with 56
+logical activation quantizations reduced to 33 physical operations (25
+standalone, eight fused, and 23 cache hits). A setup-only numerical gate
+executes all seven distinct M/N/K/epilogue contracts against an independent
+E2M1/F8_128x4 dequantized reference. The four-block C output differs from A by
+0.852% relative L2, which is recorded only as a finite diagnostic because the
+proxy uses random weights and synthetic calibration.
+
+Raw artifact SHA-256: `7af126f91ea958a8912e611168136afc2241fbc79e9d74d4a26ace907648f7e6`.
+The benchmark-private BF16-to-NVFP4 kernel is derived from FlashInfer commit
+`f212ec8230486e3615502b8af75fe7022c60b2f3`, retaining its Apache-2.0 notice
+and its TensorRT-LLM provenance; FROST folds dequantization into the MMA.
+
+For Qwen3.8, the shared, model-agnostic harness lives in
+[`_perfshare.py`](_perfshare.py); its model file only builds the model, applies
+the swaps, and calls `profile_and_report`.
 
 ## Models
 
 | folder | proxy of | current precision leaf | notes |
 |---|---|---|---|
 | [`Qwen3.8/`](Qwen3.8/) | Qwen3.8/3.6/3.5-27B dense hybrid Gated DeltaNet LM | BF16 fwd+CE+bwd, 2^3 GDN/MLP/SDPA | exact MLP/GDN dimensions; 4-layer period; selectable Torch FlashAttention or cuDNN-backend d256 GQA at 20Q/4KV instead of gated 24Q/4KV |
-| [`Qwen-Image/`](Qwen-Image/) | Qwen-Image diffusion transformer | BF16 transformer forward, forced PyTorch Flash-vs-cuDNN joint SDPA | exact H=3072, 24x128 and FFN=12288; 4/60 repeated blocks; 4096 image + 512 text tokens |
+| [`Qwen-Image/`](Qwen-Image/) | Qwen-Image diffusion transformer | BF16 2^2 GELU-MLP/SDPA plus ModelOpt-anchored NVFP4 three-arm leaf | exact H=3072, 24x128 and FFN=12288; 4/60 repeated blocks; 4096 image + 512 text tokens; no MoE |
 
 Planned: Kimi Linear (KDA), DeepSeek-V3.
 
@@ -173,14 +278,25 @@ python benchmark/e2e/Qwen3.8/run_model.py --preset qwen3.5-27b --inspect  # equi
 # Qwen-Image uses the pinned benchmark-only Diffusers implementation.
 python -m pip install -r benchmark/e2e/Qwen-Image/requirements.txt
 
-# Validation-only reduced-token mask/route/correctness smoke.
+# Validation-only reduced-token mask/route/correctness smoke for all four
+# Torch/cuDNN MLP x attention treatments.
 python benchmark/e2e/Qwen-Image/run_bf16.py \
   --mode smoke --output-dir qwen-image-bf16-results/smoke
 
-# Formal one-forward BF16 transformer proxy: B=1, 4096 image + 512 text tokens,
-# four real-shape blocks, 40 balanced batches x 3 repeats on a full B200.
+# Formal four-arm BF16 transformer proxy: B=1, 4096 image + 512 text tokens,
+# four real-shape blocks, 40 Williams-balanced batches x 3 repeats on a full B200.
 python benchmark/e2e/Qwen-Image/run_bf16.py \
   --mode formal --output-dir qwen-image-bf16-results/formal
+
+# ModelOpt-anchored NVFP4 validation. The benchmark-private quantizer lazily
+# compiles one SM100 CUDA extension, so CUDA_HOME, an sm_100a-capable nvcc,
+# a host C++ compiler, Ninja, and a writable Torch extension cache are required.
+python benchmark/e2e/Qwen-Image/run_nvfp4.py \
+  --mode smoke --output-dir qwen-image-nvfp4-results/smoke
+
+# Formal three-arm A/B/C run: BF16 off, BF16 cuDNN, then all-Linear NVFP4 cuDNN.
+python benchmark/e2e/Qwen-Image/run_nvfp4.py \
+  --mode formal --output-dir qwen-image-nvfp4-results/formal
 ```
 
 The Qwen3.8 runner requires a cuDNN build with the fused GEMM engine and the
@@ -214,9 +330,10 @@ complete denoising loop and is not image-quality evidence. The model/config and
 Diffusers implementation are pinned in the artifact. The A/B explicitly forces
 PyTorch FlashAttention versus direct FE/cuDNN; the artifact also reports the
 unforced public Torch dispatch choice (Torch 2.13 on B200 already selects cuDNN
-for this d128 shape). This BF16 leaf has no
-ModelOpt claim; a future ModelOpt-anchored NVFP4+FP8 experiment belongs in a
-separate `run_nvfp4_fp8.py`.
+for this d128 shape). The orthogonal MLP axis compares the stock Diffusers FFN
+with the public cuDNN GELU-MLP op. The BF16 leaf itself has no ModelOpt claim;
+the separate `run_nvfp4.py` leaf owns the pinned low-precision recipe, synthetic
+calibration disclosure, route gates, and low-precision artifact.
 
 ## Add a model
 

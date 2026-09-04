@@ -106,16 +106,18 @@ jax = [
 ]
 
 [build-system]
-requires = ["setuptools>=64", "cmake>=3.18", "ninja==1.11.1.1", "pybind11[global]>=2.13,<3"]
+requires = ["setuptools>=64", "wheel>=0.38.4", "cmake>=3.18", "ninja==1.11.1.1", "pybind11[global]>=2.13,<3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = {find = {where = ["python", "."], include = ["cudnn*", "include"], namespaces = true}}
 package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
+license-files = ["LICENSE.txt", "LICENSE-MIT.txt", "NOTICE", "THIRD_PARTY_LICENSES.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
 include = ["**/*"]
+"cudnn.gemm.ops" = ["csrc/*.cu", "csrc/*.cuh"]
