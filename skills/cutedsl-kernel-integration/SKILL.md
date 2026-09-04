@@ -26,7 +26,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 2. Implement the class API by extending `APIBase`; keep constructor descriptors, `check_support()`, `compile()`, and `execute()` consistent with the closest template.
 3. Add a high-level wrapper that allocates outputs, caches/reuses compiled kernels where the template does, and returns a `TupleDict`.
 4. Export the public class and wrapper through the operation/family `__init__.py` files and `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`.
-5. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra is now an empty back-compat alias -- do not add to it.
+5. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
 6. Add FE OSS documentation and update the relevant overview or operation index links.
 7. Add tests under `test/python/fe_api/`, including support validation and numerical/reference coverage when executable.
 8. For grouped/discrete/MoE/SDPA kernels, preserve the source helper and scheduler topology; shared helper modules should be internal package files, not public `cudnn` exports.

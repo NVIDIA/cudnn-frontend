@@ -42,11 +42,11 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2`, `cuda-python`, and `apache-tvm-ffi` are required dependencies:
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2` and `apache-tvm-ffi` are required dependencies (and the DSL pulls `cuda-python` in transitively):
 ```bash
 pip install nvidia-cudnn-frontend
 ```
-(`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra is now an empty back-compat alias. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
+(`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra now names only `cuda-python`. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
 
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash

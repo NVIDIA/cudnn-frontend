@@ -24,7 +24,7 @@ Directory-specific guides: [include/cudnn_frontend/AGENTS.md](include/cudnn_fron
 - NVIDIA GPU required for essentially all tests and samples (SDPA/OSS kernels need Hopper SM90 or Blackwell SM100+).
 - CUDA toolkit (`nvcc`), cuDNN **9.x** backend (headers + libs), CMake ≥ 3.23, a C++17 compiler.
 - If cuDNN or CUDA are not in default system locations, set `CUDNN_PATH` and `CUDAToolkit_ROOT` (both honored by CMake and `setup.py`).
-- Python ≥ 3.9. `cudnn.backend_version()` gates many features at runtime (integer, e.g. 9.12.0 → `91200`); tests skip on older backends.
+- Python ≥ 3.10. `cudnn.backend_version()` gates many features at runtime (integer, e.g. 9.12.0 → `91200`); tests skip on older backends.
 
 ## Build
 
@@ -44,7 +44,7 @@ Python (editable; compiles the pybind11 extension via CMake):
 
 ```bash
 pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
-                              # ".[cutedsl]" still resolves -- it is now an empty back-compat alias for the line above
+                              # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
 pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
