@@ -14,7 +14,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 import torch
 
-from cudnn.api_base import APIBase
+from cudnn.api_base import APIBase, TensorDesc
 
 from .cutedsl.cute_dsl_ln_mul_dropout import (
     ALIGN,
@@ -22,6 +22,7 @@ from .cutedsl.cute_dsl_ln_mul_dropout import (
     _keep_threshold32,
 )
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import (
+    MAX_NUM_ROWS,
     TARGET_TILES,
     LnMulDropoutBackward,
     LnMulDropoutGradReduce,
@@ -35,38 +36,48 @@ def _require_cuda_tensor(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} storage must be {ALIGN}-byte aligned")
 
 
-def _require_same_device(reference: torch.Tensor, tensors) -> None:
-    for name, tensor in tensors:
-        _require_cuda_tensor(tensor, name)
-        if tensor.device != reference.device:
-            raise ValueError(f"{name} must be on {reference.device}, got {tensor.device}")
+def _require_same_device_desc(reference: TensorDesc, tensors) -> None:
+    if reference.device.type != "cuda":
+        raise ValueError(f"{reference.name} must be on a CUDA device, got {reference.device}")
+    for name, desc in tensors:
+        if desc.device.type != "cuda":
+            raise ValueError(f"{name} must be on a CUDA device, got {desc.device}")
+        if desc.device != reference.device:
+            raise ValueError(f"{name} must be on {reference.device}, got {desc.device}")
 
 
 def _require_matrix_layout(
-    tensor: torch.Tensor,
+    desc: TensorDesc,
     name: str,
     *,
     row_stride: Optional[int] = None,
 ) -> None:
-    if tensor.ndim != 2:
-        raise ValueError(f"{name} must be rank 2, got shape {tuple(tensor.shape)}")
-    if tensor.stride(1) != 1:
+    if desc.ndim != 2:
+        raise ValueError(f"{name} must be rank 2, got shape {tuple(desc.shape)}")
+    if desc.stride[1] != 1:
         raise ValueError(f"{name} must have a unit innermost stride")
-    if row_stride is not None and tensor.stride(0) != row_stride:
-        raise ValueError(f"{name} row stride must be {row_stride}, got {tensor.stride(0)}")
-    if tensor.stride(0) < tensor.shape[1]:
+    if row_stride is not None and desc.stride[0] != row_stride:
+        raise ValueError(f"{name} row stride must be {row_stride}, got {desc.stride[0]}")
+    if desc.stride[0] < desc.shape[1]:
         raise ValueError(f"{name} rows must not overlap")
-    if tensor.element_size() == 2 and tensor.stride(0) % 8 != 0:
+    if desc.dtype == torch.bfloat16 and desc.stride[0] % 8 != 0:
         raise ValueError(f"{name} row starts must remain 16-byte aligned")
 
 
-def _require_vector(tensor: torch.Tensor, name: str, length: int) -> None:
-    if tensor.shape != (length,) or tensor.stride() != (1,):
-        raise ValueError(f"{name} must be contiguous with shape ({length},), got " f"shape {tuple(tensor.shape)} and stride {tuple(tensor.stride())}")
+def _require_vector(desc: TensorDesc, name: str, length: int) -> None:
+    if desc.shape != (length,) or desc.stride != (1,):
+        raise ValueError(f"{name} must be contiguous with shape ({length},), got " f"shape {tuple(desc.shape)} and stride {tuple(desc.stride)}")
 
 
-def _check_runtime_tensor(tensor: torch.Tensor, desc, name: str) -> None:
-    if tuple(tensor.shape) != tuple(desc.shape) or tuple(tensor.stride()) != tuple(desc.stride) or tensor.dtype != desc.dtype or tensor.device != desc.device:
+def _check_runtime_tensor(
+    tensor: torch.Tensor,
+    desc: TensorDesc,
+    name: str,
+    *,
+    num_rows: Optional[int] = None,
+) -> None:
+    expected_shape = tuple(desc.shape) if num_rows is None else (num_rows, *desc.shape[1:])
+    if expected_shape != tuple(tensor.shape) or tuple(tensor.stride()) != tuple(desc.stride) or tensor.dtype != desc.dtype or tensor.device != desc.device:
         raise ValueError(f"{name} specification changed after compilation")
     _require_cuda_tensor(tensor, name)
 
@@ -125,34 +136,30 @@ class _HSTULMSDBase(APIBase):
     def _init_common(
         self,
         *,
-        sample_x: torch.Tensor,
-        sample_u: torch.Tensor,
-        sample_weight: torch.Tensor,
-        sample_bias: torch.Tensor,
+        sample_x: torch.Tensor | TensorDesc,
+        sample_u: torch.Tensor | TensorDesc,
+        sample_weight: torch.Tensor | TensorDesc,
+        sample_bias: torch.Tensor | TensorDesc,
         dropout_ratio: float,
     ) -> None:
         super().__init__()
         self._warn_experimental_api()
-        self._sample_x = sample_x
-        self._sample_u = sample_u
-        self._sample_weight = sample_weight
-        self._sample_bias = sample_bias
         self.x_desc = self._make_tensor_desc(sample_x, name="x")
         self.u_desc = self._make_tensor_desc(sample_u, name="u")
         self.weight_desc = self._make_tensor_desc(sample_weight, name="weight")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="bias")
         self.dropout_ratio = float(dropout_ratio)
-        if sample_x.ndim != 2:
+        if self.x_desc.ndim != 2:
             raise ValueError("x must be rank 2")
-        self.num_rows = int(sample_x.shape[0])
-        self.hidden_size = int(sample_x.shape[1])
+        self.num_rows = int(self.x_desc.shape[0])
+        self.hidden_size = int(self.x_desc.shape[1])
 
     def _check_common(self) -> None:
-        x = self._sample_x
-        u = self._sample_u
-        weight = self._sample_weight
-        bias = self._sample_bias
-        _require_same_device(
+        x = self.x_desc
+        u = self.u_desc
+        weight = self.weight_desc
+        bias = self.bias_desc
+        _require_same_device_desc(
             x,
             (("u", u), ("weight", weight), ("bias", bias)),
         )
@@ -162,9 +169,9 @@ class _HSTULMSDBase(APIBase):
             raise ValueError("x, u, weight, and bias must have the same dtype")
         if x.shape != u.shape:
             raise ValueError(f"u must have shape {tuple(x.shape)}, got {tuple(u.shape)}")
-        if self.num_rows <= 0:
-            raise ValueError("x must contain at least one row")
-        # Supported matrix size: [N, D], with N > 0 and D = 512.
+        if not 1 <= self.num_rows <= MAX_NUM_ROWS:
+            raise ValueError(f"x row count must be in [1, {MAX_NUM_ROWS}], got {self.num_rows}")
+        # Supported matrix size: [N, D], with safe tiled offsets and D = 512.
         if self.hidden_size != 512:
             raise ValueError(f"HSTU LMSD currently supports D=512, got D={self.hidden_size}")
         _require_matrix_layout(x, "x", row_stride=self.hidden_size)
@@ -183,14 +190,20 @@ class _HSTULMSDBase(APIBase):
         u: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor,
-    ) -> None:
-        for tensor, desc, name in (
-            (x, self.x_desc, "x"),
-            (u, self.u_desc, "u"),
-            (weight, self.weight_desc, "weight"),
-            (bias, self.bias_desc, "bias"),
+    ) -> int:
+        if x.ndim != 2 or x.shape[0] <= 0:
+            raise ValueError(f"x must be rank 2 with at least one row, got shape {tuple(x.shape)}")
+        num_rows = int(x.shape[0])
+        if num_rows > MAX_NUM_ROWS:
+            raise ValueError(f"x row count must be in [1, {MAX_NUM_ROWS}], got {num_rows}")
+        for tensor, desc, name, dynamic_rows in (
+            (x, self.x_desc, "x", True),
+            (u, self.u_desc, "u", True),
+            (weight, self.weight_desc, "weight", False),
+            (bias, self.bias_desc, "bias", False),
         ):
-            _check_runtime_tensor(tensor, desc, name)
+            _check_runtime_tensor(tensor, desc, name, num_rows=num_rows if dynamic_rows else None)
+        return num_rows
 
     def _fake_matrix(self, desc, rows) -> cute.Tensor:
         return self._make_fake_cute_tensor(
@@ -208,26 +221,20 @@ class _HSTULMSDBase(APIBase):
             assumed_align=ALIGN,
         )
 
-    def _release_common_samples(self) -> None:
-        self._sample_x = None
-        self._sample_u = None
-        self._sample_weight = None
-        self._sample_bias = None
-
 
 class HSTULMSDFwdSm100(_HSTULMSDBase):
     """Explicit compile/execute API for HSTU LMSD forward on SM10x."""
 
     def __init__(
         self,
-        sample_x: torch.Tensor,
-        sample_u: torch.Tensor,
-        sample_weight: torch.Tensor,
-        sample_bias: torch.Tensor,
-        sample_y: torch.Tensor,
-        sample_mean: torch.Tensor,
-        sample_rstd: torch.Tensor,
-        sample_mask: torch.Tensor,
+        sample_x: torch.Tensor | TensorDesc,
+        sample_u: torch.Tensor | TensorDesc,
+        sample_weight: torch.Tensor | TensorDesc,
+        sample_bias: torch.Tensor | TensorDesc,
+        sample_y: torch.Tensor | TensorDesc,
+        sample_mean: torch.Tensor | TensorDesc,
+        sample_rstd: torch.Tensor | TensorDesc,
+        sample_mask: torch.Tensor | TensorDesc,
         eps: float = 1e-6,
         dropout_ratio: float = 0.1,
     ) -> None:
@@ -238,10 +245,6 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             sample_bias=sample_bias,
             dropout_ratio=dropout_ratio,
         )
-        self._sample_y = sample_y
-        self._sample_mean = sample_mean
-        self._sample_rstd = sample_rstd
-        self._sample_mask = sample_mask
         self.y_desc = self._make_tensor_desc(sample_y, name="y")
         self.mean_desc = self._make_tensor_desc(sample_mean, name="mean")
         self.rstd_desc = self._make_tensor_desc(sample_rstd, name="rstd")
@@ -254,16 +257,16 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             return True
         self._check_common()
         n, d = self.num_rows, self.hidden_size
-        y = self._sample_y
-        mean = self._sample_mean
-        rstd = self._sample_rstd
-        mask = self._sample_mask
-        _require_same_device(
-            self._sample_x,
+        y = self.y_desc
+        mean = self.mean_desc
+        rstd = self.rstd_desc
+        mask = self.mask_desc
+        _require_same_device_desc(
+            self.x_desc,
             (("y", y), ("mean", mean), ("rstd", rstd), ("mask", mask)),
         )
-        if y.shape != (n, 3 * d) or y.dtype != self._sample_x.dtype:
-            raise ValueError(f"y must have shape ({n}, {3 * d}) and dtype {self._sample_x.dtype}")
+        if y.shape != (n, 3 * d) or y.dtype != self.x_desc.dtype:
+            raise ValueError(f"y must have shape ({n}, {3 * d}) and dtype {self.x_desc.dtype}")
         _require_matrix_layout(y, "y", row_stride=3 * d)
         for tensor, name in ((mean, "mean"), (rstd, "rstd")):
             _require_vector(tensor, name, n)
@@ -274,15 +277,6 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         _require_matrix_layout(mask, "mask", row_stride=d)
         if not math.isfinite(self.eps) or self.eps <= 0.0:
             raise ValueError(f"eps must be positive and finite, got {self.eps}")
-        _require_disjoint(
-            (("y", y), ("mean", mean), ("rstd", rstd), ("mask", mask)),
-            (
-                ("x", self._sample_x),
-                ("u", self._sample_u),
-                ("weight", self._sample_weight),
-                ("bias", self._sample_bias),
-            ),
-        )
         self._is_supported = True
         return True
 
@@ -318,7 +312,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             fake_mean,
             fake_rstd,
             cutlass.Int64(0),
-            cutlass.Int32(self.num_rows),
+            cutlass.Int32(1),
             cutlass.Int32(0),
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
@@ -327,11 +321,6 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             fake_stream,
             options="--enable-tvm-ffi",
         )
-        self._release_common_samples()
-        self._sample_y = None
-        self._sample_mean = None
-        self._sample_rstd = None
-        self._sample_mask = None
 
     def execute(
         self,
@@ -348,14 +337,14 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
     ) -> None:
         if self._compiled_kernel is None:
             raise RuntimeError("HSTULMSDFwdSm100 kernel is not compiled")
-        self._check_runtime_common(x_tensor, u_tensor, weight_tensor, bias_tensor)
+        n = self._check_runtime_common(x_tensor, u_tensor, weight_tensor, bias_tensor)
         for tensor, desc, name in (
             (y_tensor, self.y_desc, "y"),
             (mean_tensor, self.mean_desc, "mean"),
             (rstd_tensor, self.rstd_desc, "rstd"),
             (mask_tensor, self.mask_desc, "mask"),
         ):
-            _check_runtime_tensor(tensor, desc, name)
+            _check_runtime_tensor(tensor, desc, name, num_rows=n)
         if not -(1 << 63) <= int(seed) < (1 << 63):
             raise ValueError("seed must fit in a signed 64-bit integer")
         _require_disjoint(
@@ -376,7 +365,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             mean_tensor,
             rstd_tensor,
             cutlass.Int64(seed),
-            cutlass.Int32(self.num_rows),
+            cutlass.Int32(n),
             cutlass.Int32(0),
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
@@ -396,20 +385,20 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
 
     def __init__(
         self,
-        sample_dy: torch.Tensor,
-        sample_x: torch.Tensor,
-        sample_u: torch.Tensor,
-        sample_weight: torch.Tensor,
-        sample_bias: torch.Tensor,
-        sample_mean: torch.Tensor,
-        sample_rstd: torch.Tensor,
-        sample_mask: torch.Tensor,
-        sample_dx: torch.Tensor,
-        sample_du: torch.Tensor,
-        sample_dweight: torch.Tensor,
-        sample_dbias: torch.Tensor,
-        sample_dweight_workspace: torch.Tensor,
-        sample_dbias_workspace: torch.Tensor,
+        sample_dy: torch.Tensor | TensorDesc,
+        sample_x: torch.Tensor | TensorDesc,
+        sample_u: torch.Tensor | TensorDesc,
+        sample_weight: torch.Tensor | TensorDesc,
+        sample_bias: torch.Tensor | TensorDesc,
+        sample_mean: torch.Tensor | TensorDesc,
+        sample_rstd: torch.Tensor | TensorDesc,
+        sample_mask: torch.Tensor | TensorDesc,
+        sample_dx: torch.Tensor | TensorDesc,
+        sample_du: torch.Tensor | TensorDesc,
+        sample_dweight: torch.Tensor | TensorDesc,
+        sample_dbias: torch.Tensor | TensorDesc,
+        sample_dweight_workspace: torch.Tensor | TensorDesc,
+        sample_dbias_workspace: torch.Tensor | TensorDesc,
         dropout_ratio: float = 0.1,
     ) -> None:
         self._init_common(
@@ -432,7 +421,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             "dbias_workspace": sample_dbias_workspace,
         }
         for name, tensor in samples.items():
-            setattr(self, f"_sample_{name}", tensor)
             setattr(self, f"{name}_desc", self._make_tensor_desc(tensor, name=name))
 
     def check_support(self) -> bool:
@@ -440,64 +428,45 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             return True
         self._check_common()
         n, d = self.num_rows, self.hidden_size
-        x = self._sample_x
+        x = self.x_desc
         tensors = (
-            ("dy", self._sample_dy),
-            ("mean", self._sample_mean),
-            ("rstd", self._sample_rstd),
-            ("mask", self._sample_mask),
-            ("dx", self._sample_dx),
-            ("du", self._sample_du),
-            ("dweight", self._sample_dweight),
-            ("dbias", self._sample_dbias),
-            ("dweight_workspace", self._sample_dweight_workspace),
-            ("dbias_workspace", self._sample_dbias_workspace),
+            ("dy", self.dy_desc),
+            ("mean", self.mean_desc),
+            ("rstd", self.rstd_desc),
+            ("mask", self.mask_desc),
+            ("dx", self.dx_desc),
+            ("du", self.du_desc),
+            ("dweight", self.dweight_desc),
+            ("dbias", self.dbias_desc),
+            ("dweight_workspace", self.dweight_workspace_desc),
+            ("dbias_workspace", self.dbias_workspace_desc),
         )
-        _require_same_device(x, tensors)
-        if self._sample_dy.shape != (n, 3 * d) or self._sample_dy.dtype != x.dtype:
+        _require_same_device_desc(x, tensors)
+        if self.dy_desc.shape != (n, 3 * d) or self.dy_desc.dtype != x.dtype:
             raise ValueError(f"dy must have shape ({n}, {3 * d}) and dtype {x.dtype}")
-        _require_matrix_layout(self._sample_dy, "dy")
-        for tensor, name in ((self._sample_mean, "mean"), (self._sample_rstd, "rstd")):
-            _require_vector(tensor, name, n)
-            if tensor.dtype != torch.float32:
+        _require_matrix_layout(self.dy_desc, "dy")
+        for desc, name in ((self.mean_desc, "mean"), (self.rstd_desc, "rstd")):
+            _require_vector(desc, name, n)
+            if desc.dtype != torch.float32:
                 raise ValueError(f"{name} must have dtype torch.float32")
-        if self._sample_mask.shape != (n, d) or self._sample_mask.dtype != torch.int8:
+        if self.mask_desc.shape != (n, d) or self.mask_desc.dtype != torch.int8:
             raise ValueError(f"mask must have shape ({n}, {d}) and dtype torch.int8")
-        _require_matrix_layout(self._sample_mask, "mask", row_stride=d)
-        for tensor, name in ((self._sample_dx, "dx"), (self._sample_du, "du")):
-            if tensor.shape != (n, d) or tensor.dtype != x.dtype:
+        _require_matrix_layout(self.mask_desc, "mask", row_stride=d)
+        for desc, name in ((self.dx_desc, "dx"), (self.du_desc, "du")):
+            if desc.shape != (n, d) or desc.dtype != x.dtype:
                 raise ValueError(f"{name} must have shape ({n}, {d}) and dtype {x.dtype}")
-            _require_matrix_layout(tensor, name, row_stride=d)
-        for tensor, name in ((self._sample_dweight, "dweight"), (self._sample_dbias, "dbias")):
-            _require_vector(tensor, name, d)
-            if tensor.dtype != x.dtype:
+            _require_matrix_layout(desc, name, row_stride=d)
+        for desc, name in ((self.dweight_desc, "dweight"), (self.dbias_desc, "dbias")):
+            _require_vector(desc, name, d)
+            if desc.dtype != x.dtype:
                 raise ValueError(f"{name} must have dtype {x.dtype}")
-        for tensor, name in (
-            (self._sample_dweight_workspace, "dweight_workspace"),
-            (self._sample_dbias_workspace, "dbias_workspace"),
+        for desc, name in (
+            (self.dweight_workspace_desc, "dweight_workspace"),
+            (self.dbias_workspace_desc, "dbias_workspace"),
         ):
-            if tensor.shape != (TARGET_TILES, d) or tensor.dtype != torch.float32:
+            if desc.shape != (TARGET_TILES, d) or desc.dtype != torch.float32:
                 raise ValueError(f"{name} must have shape ({TARGET_TILES}, {d}) and dtype torch.float32")
-            _require_matrix_layout(tensor, name, row_stride=d)
-        writes = (
-            ("dx", self._sample_dx),
-            ("du", self._sample_du),
-            ("dweight", self._sample_dweight),
-            ("dbias", self._sample_dbias),
-            ("dweight_workspace", self._sample_dweight_workspace),
-            ("dbias_workspace", self._sample_dbias_workspace),
-        )
-        reads = (
-            ("dy", self._sample_dy),
-            ("x", x),
-            ("u", self._sample_u),
-            ("weight", self._sample_weight),
-            ("bias", self._sample_bias),
-            ("mean", self._sample_mean),
-            ("rstd", self._sample_rstd),
-            ("mask", self._sample_mask),
-        )
-        _require_disjoint(writes, reads)
+            _require_matrix_layout(desc, name, row_stride=d)
         self._is_supported = True
         return True
 
@@ -514,23 +483,24 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         fake_db = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=ALIGN)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        # N is fixed by this API object's runtime descriptors. Compile one
-        # concrete full-N kernel; device-side i64 rebasing handles tensors
-        # whose addressable span exceeds 4 GiB.
-        n = self.num_rows
+        # N is a runtime extent shared by every row-major operand. Compile one
+        # full-N kernel for all supported row counts with the same D/layout.
+        # Wide-stride dY/U operands use i64 row rebasing; MAX_NUM_ROWS keeps
+        # the direct X/mask/DX/DU tiled offsets within signed Int32.
+        rows = cute.sym_int()
         fake_dy = self._make_fake_cute_tensor(
             dtype=self.dy_desc.dtype,
-            shape=(n, d),
+            shape=(rows, d),
             stride=self.dy_desc.stride,
             assumed_align=ALIGN,
         )
-        fake_x = self._fake_matrix(self.x_desc, n)
-        fake_u = self._fake_matrix(self.u_desc, n)
-        fake_mask = self._fake_matrix(self.mask_desc, n)
-        fake_dx = self._fake_matrix(self.dx_desc, n)
-        fake_du = self._fake_matrix(self.du_desc, n)
-        fake_mean = self._fake_vector(self.mean_desc, n)
-        fake_rstd = self._fake_vector(self.rstd_desc, n)
+        fake_x = self._fake_matrix(self.x_desc, rows)
+        fake_u = self._fake_matrix(self.u_desc, rows)
+        fake_mask = self._fake_matrix(self.mask_desc, rows)
+        fake_dx = self._fake_matrix(self.dx_desc, rows)
+        fake_du = self._fake_matrix(self.du_desc, rows)
+        fake_mean = self._fake_vector(self.mean_desc, rows)
+        fake_rstd = self._fake_vector(self.rstd_desc, rows)
         main = cute.compile(
             LnMulDropoutBackward(compute_y=False),
             fake_dy,
@@ -552,7 +522,7 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             fake_dbp,
             cutlass.Float32(self.dropout_ratio),
             cutlass.Int32(d),
-            cutlass.Int32(n),
+            cutlass.Int32(1),
             cutlass.Int32(TARGET_TILES),
             fake_stream,
             options="--enable-tvm-ffi",
@@ -570,20 +540,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             options="--enable-tvm-ffi",
         )
         self._compiled_kernel = (main, reduce)
-        self._release_common_samples()
-        for name in (
-            "dy",
-            "mean",
-            "rstd",
-            "mask",
-            "dx",
-            "du",
-            "dweight",
-            "dbias",
-            "dweight_workspace",
-            "dbias_workspace",
-        ):
-            setattr(self, f"_sample_{name}", None)
 
     def execute(
         self,
@@ -605,21 +561,21 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
     ) -> None:
         if self._compiled_kernel is None:
             raise RuntimeError("HSTULMSDBwdSm100 kernels are not compiled")
-        self._check_runtime_common(x_tensor, u_tensor, weight_tensor, bias_tensor)
+        n = self._check_runtime_common(x_tensor, u_tensor, weight_tensor, bias_tensor)
         runtime = (
-            (dy_tensor, self.dy_desc, "dy"),
-            (mean_tensor, self.mean_desc, "mean"),
-            (rstd_tensor, self.rstd_desc, "rstd"),
-            (mask_tensor, self.mask_desc, "mask"),
-            (dx_tensor, self.dx_desc, "dx"),
-            (du_tensor, self.du_desc, "du"),
-            (dweight_tensor, self.dweight_desc, "dweight"),
-            (dbias_tensor, self.dbias_desc, "dbias"),
-            (dweight_workspace, self.dweight_workspace_desc, "dweight_workspace"),
-            (dbias_workspace, self.dbias_workspace_desc, "dbias_workspace"),
+            (dy_tensor, self.dy_desc, "dy", True),
+            (mean_tensor, self.mean_desc, "mean", True),
+            (rstd_tensor, self.rstd_desc, "rstd", True),
+            (mask_tensor, self.mask_desc, "mask", True),
+            (dx_tensor, self.dx_desc, "dx", True),
+            (du_tensor, self.du_desc, "du", True),
+            (dweight_tensor, self.dweight_desc, "dweight", False),
+            (dbias_tensor, self.dbias_desc, "dbias", False),
+            (dweight_workspace, self.dweight_workspace_desc, "dweight_workspace", False),
+            (dbias_workspace, self.dbias_workspace_desc, "dbias_workspace", False),
         )
-        for tensor, desc, name in runtime:
-            _check_runtime_tensor(tensor, desc, name)
+        for tensor, desc, name, dynamic_rows in runtime:
+            _check_runtime_tensor(tensor, desc, name, num_rows=n if dynamic_rows else None)
         _require_disjoint(
             (
                 ("dx", dx_tensor),
@@ -643,7 +599,6 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
         stream = _stream_handle(current_stream, x_tensor.device)
         main, reduce = self._compiled_kernel
         d = self.hidden_size
-        n = self.num_rows
         main(
             dy_tensor[:, :d],
             dy_tensor[:, d : 2 * d],
@@ -678,7 +633,7 @@ class HSTULMSDBwdSm100(_HSTULMSDBase):
             stream,
         )
         _record_streams(
-            tuple(tensor for tensor, _, _ in runtime) + (x_tensor, u_tensor, weight_tensor, bias_tensor),
+            tuple(tensor for tensor, _, _, _ in runtime) + (x_tensor, u_tensor, weight_tensor, bias_tensor),
             current_stream,
             x_tensor.device,
         )

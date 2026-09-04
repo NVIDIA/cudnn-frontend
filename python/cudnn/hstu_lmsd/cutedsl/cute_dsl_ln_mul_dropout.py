@@ -28,10 +28,10 @@ Four changes over the previous version, none of which alters the arithmetic:
                step (8.0e-6 over N*D draws) and 576x below one bf16 ULP, so it
                is not observable -- but it costs 31% to remove and the decision
                was to remove it.
-  I64_REBASE   moves the non-contiguous U input and the three strided Y outputs
-               to the current row with 64-bit pointer arithmetic. Subsequent
-               CuTe indexing is local to that row, so the production shape can
-               run in one launch without overflowing a 32-bit byte offset.
+  I64_REBASE   moves every row-bearing input/output to the current row with
+               64-bit pointer arithmetic. Subsequent CuTe indexing is local to
+               that row, so large shapes can run in one launch without
+               overflowing a 32-bit byte offset.
   TPR          threads per row. TPR=32 is the default and keeps every output
                bit-identical to the previous kernel. TPR=16 puts two rows on a
                warp and shortens the reduction butterfly from five levels to
@@ -73,7 +73,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as _cm
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+
+from cudnn.datatypes import _convert_to_cutlass_data_type
 
 VEC = 8
 ROWS = 2
@@ -84,14 +86,14 @@ LOG2E = 1.4426950408889634
 
 HOIST = True
 DIV_MODE = "approx"
-TV_ROW = True              # output tile = one row
+TV_ROW = True  # output tile = one row
 # 32 keeps every output bit-identical; 16 is ~4% faster and moves
 # mean/rstd by ~2 ULP. Must be a power of two: the reduction butterfly
 # relies on 1 << off staying inside the aligned lane subgroup.
 TPR = 32
 # Full-tile requirement for low-level calls: D % (TPR * VEC) == 0.
-PACK_TAIL = True           # f32x2 arithmetic in the tail
-REREAD_X = True            # drop x after the reduction, load it again
+PACK_TAIL = True  # f32x2 arithmetic in the tail
+REREAD_X = True  # drop x after the reduction, load it again
 M0, M1 = 0xD2511F53, 0xCD9E8D57
 W0, W1 = 0x9E3779B9, 0xBB67AE85
 MASK32 = 0xFFFFFFFF
@@ -138,7 +140,7 @@ def _keep_threshold32(p: float) -> int:
         return struct.unpack("f", struct.pack("f", x))[0]
 
     p32 = f32(p)
-    scale = f32(2.0 ** -32)
+    scale = f32(2.0**-32)
     lo, hi = 0, 1 << 32
     while lo < hi:
         mid = (lo + hi) // 2
@@ -157,6 +159,7 @@ def _keep_threshold(p: float) -> int:
     conversion, an f32 multiply and an f32 compare -- 24 times per thread per tile.
     """
     import struct
+
     p32 = struct.unpack("f", struct.pack("f", p))[0]
     inv = 1.0 / 65536.0
     for h in range(65537):
@@ -221,40 +224,29 @@ class LnMulDropoutForward:
         row = block_idx * rows_per_block + thread_idx // self.threads_per_row
         valid = row < nrows
         if valid:
-            tensor_copy_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), gX.element_type
-            )
-            mask_copy_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), gM.element_type
-            )
+            tensor_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type)
+            mask_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gM.element_type)
             # A one-row tile is addressed by the thread's position within its
             # row; a multi-row tile is addressed by the CTA thread id.
-            copy_thread_idx = (
-                thread_in_row
-                if cutlass.const_expr(self.tile_one_row)
-                else thread_idx
-            )
-            thread_copy = cute.make_tiled_copy_tv(
-                tensor_copy_atom, thr_layout, val_layout
-            ).get_slice(copy_thread_idx)
-            mask_thread_copy = cute.make_tiled_copy_tv(
-                mask_copy_atom, thr_layout, val_layout
-            ).get_slice(copy_thread_idx)
+            copy_thread_idx = thread_in_row if cutlass.const_expr(self.tile_one_row) else thread_idx
+            thread_copy = cute.make_tiled_copy_tv(tensor_copy_atom, thr_layout, val_layout).get_slice(copy_thread_idx)
+            mask_thread_copy = cute.make_tiled_copy_tv(mask_copy_atom, thr_layout, val_layout).get_slice(copy_thread_idx)
 
             tile_row = row if cutlass.const_expr(self.tile_one_row) else block_idx
             row_coord = ((0, 0), (tile_row, 0))
+            gX_row = _domain_offset_i64(row_coord, gX)
             gU_row = _domain_offset_i64(row_coord, gU)
             gY0_row = _domain_offset_i64(row_coord, gY0)
             gY1_row = _domain_offset_i64(row_coord, gY1)
             gY2_row = _domain_offset_i64(row_coord, gY2)
+            gM_row = _domain_offset_i64(row_coord, gM)
 
             rX_tiles, rU_tiles, tXgY_tiles, tXgMask_tiles = [], [], [], []
             tXgX_tiles, tXgW_tiles, tXgB_tiles = [], [], []
             for j in cutlass.range_constexpr(NTILE):
-                tile_coord = ((None, None), (tile_row, j))
                 row_tile_coord = ((None, None), (0, j))
                 for src, src_coord, dst in (
-                    (gX, tile_coord, rX_tiles),
+                    (gX_row, row_tile_coord, rX_tiles),
                     (gU_row, row_tile_coord, rU_tiles),
                 ):
                     t = thread_copy.partition_S(src[src_coord])
@@ -264,7 +256,7 @@ class LnMulDropoutForward:
                 if cutlass.const_expr(self.reread_x):
                     # keep the partition so the compute pass can fetch x again; the
                     # fragment itself dies with the reduction below
-                    tXgX_tiles.append(thread_copy.partition_S(gX[tile_coord]))
+                    tXgX_tiles.append(thread_copy.partition_S(gX_row[row_tile_coord]))
                 param_coord = ((None, None), (0, j))
                 tXgW_tiles.append(thread_copy.partition_S(gW[param_coord]))
                 tXgB_tiles.append(thread_copy.partition_S(gB[param_coord]))
@@ -275,9 +267,7 @@ class LnMulDropoutForward:
                         thread_copy.partition_S(gY2_row[row_tile_coord]),
                     )
                 )
-                tXgMask_tiles.append(
-                    mask_thread_copy.partition_S(gM[tile_coord])
-                )
+                tXgMask_tiles.append(mask_thread_copy.partition_S(gM_row[row_tile_coord]))
 
             sum_x = cutlass.Float32(0.0)
             sum_sq_x = cutlass.Float32(0.0)
@@ -287,9 +277,7 @@ class LnMulDropoutForward:
                     sum_x = sum_x + v
                     sum_sq_x = sum_sq_x + v * v
             # The butterfly stays inside the aligned threads-per-row subgroup.
-            for off in cutlass.range_constexpr(
-                self.threads_per_row.bit_length() - 1
-            ):
+            for off in cutlass.range_constexpr(self.threads_per_row.bit_length() - 1):
                 sum_x = sum_x + cute.arch.shuffle_sync_bfly(sum_x, 1 << off)
                 sum_sq_x = sum_sq_x + cute.arch.shuffle_sync_bfly(sum_sq_x, 1 << off)
 
@@ -329,19 +317,12 @@ class LnMulDropoutForward:
                 #         indexes the block of 8 columns.
                 # 32-bit: one call per (stream, 4 elements); the counter indexes
                 #         the block of 4, i.e. 2*philox_block + half.
-                philox_block = (
-                    cutlass.Uint32(j * self.threads_per_row)
-                    + cutlass.Uint32(thread_in_row)
-                )
+                philox_block = cutlass.Uint32(j * self.threads_per_row) + cutlass.Uint32(thread_in_row)
                 philox_words = []
                 for mask_plane in cutlass.range_constexpr(3):
                     for h in cutlass.range_constexpr(2 if self.philox32 else 1):
                         c0 = cutlass.Uint32(row) + cutlass.Uint32(row_off)
-                        c1 = (
-                            philox_block * cutlass.Uint32(2) + cutlass.Uint32(h)
-                            if cutlass.const_expr(self.philox32)
-                            else philox_block
-                        )
+                        c1 = philox_block * cutlass.Uint32(2) + cutlass.Uint32(h) if cutlass.const_expr(self.philox32) else philox_block
                         c2 = cutlass.Uint32(mask_plane)
                         c3 = cutlass.Uint32(0)
                         kk0, kk1 = k0, k1
@@ -371,8 +352,7 @@ class LnMulDropoutForward:
                             keep = word >= thresh
                         else:
                             word = philox_words[mask_plane][e // 2]
-                            half = ((word >> cutlass.Uint32(16 * (e % 2)))
-                                    & cutlass.Uint32(0xFFFF))
+                            half = (word >> cutlass.Uint32(16 * (e % 2))) & cutlass.Uint32(0xFFFF)
                             keep = half >= thresh
                         bits = bits | (cutlass.Int8(1 << mask_plane) if keep else cutlass.Int8(0))
                     rMask[e] = bits
@@ -388,42 +368,31 @@ class LnMulDropoutForward:
                     for p in cutlass.range_constexpr(self.vector_size // 2):
                         e0 = 2 * p
                         e1 = e0 + 1
-                        xf2 = (rX[e0].to(cutlass.Float32),
-                               rX[e1].to(cutlass.Float32))
-                        uf2 = (rU[e0].to(cutlass.Float32),
-                               rU[e1].to(cutlass.Float32))
-                        wv2 = (rW[e0].to(cutlass.Float32),
-                               rW[e1].to(cutlass.Float32))
-                        bv2 = (rB[e0].to(cutlass.Float32),
-                               rB[e1].to(cutlass.Float32))
-                        xh2 = cute.arch.mul_packed_f32x2(
-                            cute.arch.sub_packed_f32x2(xf2, mean2), rstd2)
+                        xf2 = (rX[e0].to(cutlass.Float32), rX[e1].to(cutlass.Float32))
+                        uf2 = (rU[e0].to(cutlass.Float32), rU[e1].to(cutlass.Float32))
+                        wv2 = (rW[e0].to(cutlass.Float32), rW[e1].to(cutlass.Float32))
+                        bv2 = (rB[e0].to(cutlass.Float32), rB[e1].to(cutlass.Float32))
+                        xh2 = cute.arch.mul_packed_f32x2(cute.arch.sub_packed_f32x2(xf2, mean2), rstd2)
                         ln2 = cute.arch.fma_packed_f32x2(xh2, wv2, bv2)
-                        ex2 = (cute.arch.exp2(uf2[0] * nl2),
-                               cute.arch.exp2(uf2[1] * nl2))
+                        ex2 = (cute.arch.exp2(uf2[0] * nl2), cute.arch.exp2(uf2[1] * nl2))
                         den2 = cute.arch.add_packed_f32x2(ex2, one2)
-                        su2 = (_cm.div(uf2[0], den2[0], approx=True),
-                               _cm.div(uf2[1], den2[1], approx=True))
+                        su2 = (_cm.div(uf2[0], den2[0], approx=True), _cm.div(uf2[1], den2[1], approx=True))
                         sus2 = cute.arch.mul_packed_f32x2(su2, scale2)
                         xs2 = cute.arch.mul_packed_f32x2(xf2, scale2)
                         ys2 = cute.arch.mul_packed_f32x2(ln2, sus2)
                         zero = cutlass.Float32(0.0)
                         for q in cutlass.range_constexpr(2):
                             mb = rMask[e0 + q].to(cutlass.Int32)
-                            rUOut[e0 + q] = (sus2[q] if (mb & 4) != 0
-                                           else zero).to(gX.element_type)
-                            rXOut[e0 + q] = (xs2[q] if (mb & 2) != 0
-                                           else zero).to(gX.element_type)
-                            rY[e0 + q] = (ys2[q] if (mb & 1) != 0
-                                          else zero).to(gX.element_type)
+                            rUOut[e0 + q] = (sus2[q] if (mb & 4) != 0 else zero).to(gX.element_type)
+                            rXOut[e0 + q] = (xs2[q] if (mb & 2) != 0 else zero).to(gX.element_type)
+                            rY[e0 + q] = (ys2[q] if (mb & 1) != 0 else zero).to(gX.element_type)
                 for e in cutlass.range_constexpr(0 if self.pack_tail else self.vector_size):
                     xf = rX[e].to(cutlass.Float32)
                     uf = rU[e].to(cutlass.Float32)
                     wv = rW[e].to(cutlass.Float32)
                     bv = rB[e].to(cutlass.Float32)
                     ln = (xf - mean) * rstd * wv + bv
-                    den = (cutlass.Float32(1.0)
-                           + cute.arch.exp2(-uf * cutlass.Float32(LOG2E)))
+                    den = cutlass.Float32(1.0) + cute.arch.exp2(-uf * cutlass.Float32(LOG2E))
                     if cutlass.const_expr(self.div_mode == "approx"):
                         su = _cm.div(uf, den, approx=True)
                     elif cutlass.const_expr(self.div_mode == "rcp"):
@@ -450,7 +419,6 @@ class LnMulDropoutForward:
                 gMean[row] = mean
                 gRstd[row] = rstd
 
-
     @cute.jit
     def __call__(
         self,
@@ -474,9 +442,7 @@ class LnMulDropoutForward:
         stream: cuda.CUstream,
     ):
         thr_layout = cute.make_ordered_layout(
-            (1, self.threads_per_row)
-            if self.tile_one_row
-            else (self.rows_per_cta, 32),
+            (1, self.threads_per_row) if self.tile_one_row else (self.rows_per_cta, 32),
             order=(1, 0),
         )
         # The CTA still has rows_per_cta warps when the output tile is one row,
@@ -485,12 +451,8 @@ class LnMulDropoutForward:
             (self.rows_per_cta * 32 // self.threads_per_row, 32),
             order=(1, 0),
         )
-        val_layout = cute.make_ordered_layout(
-            (1, self.vector_size), order=(1, 0)
-        )
-        _row_tiler, _ = cute.make_layout_tv(
-            row_thr_layout, val_layout
-        )
+        val_layout = cute.make_ordered_layout((1, self.vector_size), order=(1, 0))
+        _row_tiler, _ = cute.make_layout_tv(row_thr_layout, val_layout)
         grid_n = cute.size(cute.zipped_divide(mX, _row_tiler), mode=[1, 0])
         tiler, _ = cute.make_layout_tv(thr_layout, val_layout)
         tile = lambda tensor: cute.zipped_divide(tensor, tiler)
@@ -529,25 +491,28 @@ class LnMulDropoutForward:
             stream=stream,
         )
 
+
 _COMPILED: dict[tuple, object] = {}
 
 
-def _compiled_launch(key: tuple, args: tuple):
-    """Cache compiled kernels by (rows, cols, dtype). Block sizes are fixed, so
-    there are usually only two entries.
+def _plan_signature(tensor: torch.Tensor, *, dynamic_rows: bool) -> tuple:
+    shape = tuple(tensor.shape)
+    if dynamic_rows:
+        shape = (None, *shape[1:])
+    return shape, tuple(tensor.stride()), tensor.dtype, tensor.device
 
-    The key is supplied explicitly by the caller rather than read positionally
-    out of args: a positional index silently goes stale the moment the signature
-    changes.
-    """
+
+def _compiled_launch(key: tuple, compile_args: tuple):
+    """Compile once for a plan-time layout contract; runtime N stays symbolic."""
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = cute.compile(LnMulDropoutForward(), *args)
+        fn = cute.compile(
+            LnMulDropoutForward(),
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
         _COMPILED[key] = fn
     return fn
-
-
-_COMPILED_KEY_EXTRA = ()
 
 
 def ln_mul_dropout_fwd(
@@ -568,36 +533,111 @@ def ln_mul_dropout_fwd(
     contract with the Triton backward -- see where the mask is read in
     triton_hstu_linear.py.
     """
+    if x.ndim != 2:
+        raise ValueError(f"x must be rank 2, got shape {tuple(x.shape)}")
     N, D = x.shape
-    assert D % (VEC * 32) == 0, f"D must be a multiple of {VEC * 32}, got {D}"
+    if not 1 <= N < (1 << 31):
+        raise ValueError(f"N must fit in a positive signed Int32, got {N}")
+    if D != 512:
+        raise ValueError(f"D must be 512, got {D}")
+    if u.shape != x.shape:
+        raise ValueError(f"u must have shape {tuple(x.shape)}, got {tuple(u.shape)}")
+    if weight.shape != (D,) or bias.shape != (D,):
+        raise ValueError(f"weight and bias must have shape ({D},)")
+    if x.dtype != torch.bfloat16 or any(tensor.dtype != x.dtype for tensor in (u, weight, bias)):
+        raise ValueError("x, u, weight, and bias must all have dtype torch.bfloat16")
     x = x.detach()
     u = u.detach()
     weight = weight.detach()
     bias = bias.detach()
     dev = x.device
+    if any(tensor.device != dev for tensor in (u, weight, bias)):
+        raise ValueError("x, u, weight, and bias must be on the same device")
+    if dev.type != "cuda":
+        raise ValueError("x, u, weight, and bias must be CUDA tensors")
+    if tuple(x.stride()) != (D, 1):
+        raise ValueError(f"x must have stride ({D}, 1), got {tuple(x.stride())}")
+    if u.stride(1) != 1 or u.stride(0) < D or u.stride(0) % 8 != 0:
+        raise ValueError("u must have unit innermost stride and 16-byte-aligned, non-overlapping rows")
+    if tuple(weight.stride()) != (1,) or tuple(bias.stride()) != (1,):
+        raise ValueError("weight and bias must be contiguous")
+    if any(tensor.data_ptr() % ALIGN != 0 for tensor in (x, u, weight, bias)):
+        raise ValueError(f"all inputs must be {ALIGN}-byte aligned")
     y = torch.empty((N, 3 * D), dtype=x.dtype, device=dev)
     mask = torch.empty((N, D), dtype=torch.int8, device=dev)
     mean = torch.empty((N,), dtype=torch.float32, device=dev)
     rstd = torch.empty((N,), dtype=torch.float32, device=dev)
 
-    w2 = weight.unsqueeze(0).expand(ROWS, D).contiguous()
-    b2 = bias.unsqueeze(0).expand(ROWS, D).contiguous()
-    kw = {"assumed_align": ALIGN}
-    thresh = (_keep_threshold32(dropout_ratio) if PHILOX32
-              else _keep_threshold(dropout_ratio))
+    if training:
+        effective_dropout_ratio = dropout_ratio
+        thresh = _keep_threshold32(dropout_ratio) if PHILOX32 else _keep_threshold(dropout_ratio)
+    else:
+        effective_dropout_ratio = 0.0
+        thresh = 0
+    stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
 
-    args = (
-        from_dlpack(x, **kw), from_dlpack(u, **kw),
-        from_dlpack(w2, **kw), from_dlpack(b2, **kw),
-        from_dlpack(y[:, :D], **kw), from_dlpack(y[:, D:2 * D], **kw),
-        from_dlpack(y[:, 2 * D:], **kw), from_dlpack(mask, **kw),
-        from_dlpack(mean), from_dlpack(rstd),
-        cutlass.Int64(seed), cutlass.Int32(N), cutlass.Int32(0),
-        cutlass.Float32(eps), cutlass.Float32(dropout_ratio),
-        cutlass.Uint32(thresh), cutlass.Int32(D))
-    key = (N, D, x.dtype, HOIST, DIV_MODE, TPR, VEC, ROWS, TV_ROW,
-           PACK_TAIL, REREAD_X, PHILOX32, MIN_BLOCKS_PER_MP)
-    _compiled_launch(key + _COMPILED_KEY_EXTRA, args)(*args)
+    launch_args = (
+        x,
+        u,
+        weight,
+        bias,
+        y[:, :D],
+        y[:, D : 2 * D],
+        y[:, 2 * D :],
+        mask,
+        mean,
+        rstd,
+        cutlass.Int64(seed),
+        cutlass.Int32(N),
+        cutlass.Int32(0),
+        cutlass.Float32(eps),
+        cutlass.Float32(effective_dropout_ratio),
+        cutlass.Uint32(thresh),
+        cutlass.Int32(D),
+        stream,
+    )
+    rows = cute.sym_int()
+    dtype = _convert_to_cutlass_data_type(x.dtype)
+    compile_args = (
+        make_fake_tensor(dtype, (rows, D), stride=tuple(x.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=tuple(u.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (D,), stride=tuple(weight.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (D,), stride=tuple(bias.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=(3 * D, 1), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=(3 * D, 1), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=(3 * D, 1), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Int8, (rows, D), stride=(D, 1), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Float32, (rows,), stride=(1,), assumed_align=4),
+        make_fake_tensor(cutlass.Float32, (rows,), stride=(1,), assumed_align=4),
+        cutlass.Int64(0),
+        cutlass.Int32(1),
+        cutlass.Int32(0),
+        cutlass.Float32(0.0),
+        cutlass.Float32(0.0),
+        cutlass.Uint32(0),
+        cutlass.Int32(D),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+    )
+    key = (
+        "hstu_lmsd_fwd_dynamic_v1",
+        _plan_signature(x, dynamic_rows=True),
+        _plan_signature(u, dynamic_rows=True),
+        _plan_signature(weight, dynamic_rows=False),
+        _plan_signature(bias, dynamic_rows=False),
+        HOIST,
+        DIV_MODE,
+        TPR,
+        VEC,
+        ROWS,
+        TV_ROW,
+        PACK_TAIL,
+        REREAD_X,
+        PHILOX32,
+        MIN_BLOCKS_PER_MP,
+    )
+    with torch.cuda.device(dev):
+        compiled = _compiled_launch(key, compile_args)
+    compiled(*launch_args)
     return y, mean, rstd, mask
 
 

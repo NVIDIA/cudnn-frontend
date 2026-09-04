@@ -14,14 +14,19 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as _cm
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+
+from cudnn.datatypes import _convert_to_cutlass_data_type
 
 VEC = 8
 ROWS = 1
 ALIGN = 16
 TARGET_TILES = 13568
+# X, mask, DX, and DU retain the faster tiled Int32 addressing path. With
+# D=512, this limit keeps their largest flattened element offset <= 2^31 - 1.
+MAX_NUM_ROWS = (1 << 31) // 512
 
-# Full-tile requirement for low-level calls: D % (64 * VEC) == 0.
+# The current low-level wrapper and public API require D == 512.
 
 FAST_DIV = True
 MIN_BLOCKS_PER_MP = 12
@@ -139,10 +144,8 @@ class LnMulDropoutBackward:
             rDW_accum[e] = cutlass.Float32(0.0)
             rDB_accum[e] = cutlass.Float32(0.0)
 
-        # X and mask use the regular tiled layout, so their per-thread
-        # partitions can retain the row mode and be created once. Keep all
-        # register fragments inside the persistent loop to avoid extending
-        # their live ranges across rows.
+        # These tensors stay below the public API's flattened Int32 offset
+        # limit, so partition them once and retain the faster tiled path.
         tXgX_rows, tXgMask_rows = [], []
         for j in cutlass.range_constexpr(NTILE):
             all_rows = ((None, None), (None, j))
@@ -453,16 +456,23 @@ class LnMulDropoutGradReduce:
 _COMPILED: dict[tuple, object] = {}
 
 
+def _plan_signature(tensor: torch.Tensor, *, dynamic_rows: bool) -> tuple:
+    shape = tuple(tensor.shape)
+    if dynamic_rows:
+        shape = (None, *shape[1:])
+    return shape, tuple(tensor.stride()), tensor.dtype, tensor.device
+
+
 def _compiled(
     key: tuple,
-    args: tuple,
+    compile_args: tuple,
     *,
     compute_y: bool,
 ):
     fn = _COMPILED.get(key)
     if fn is None:
         op = LnMulDropoutBackward(compute_y=compute_y)
-        fn = cute.compile(op, *args)
+        fn = cute.compile(op, *compile_args, options="--enable-tvm-ffi")
         _COMPILED[key] = fn
     return fn
 
@@ -487,13 +497,44 @@ def ln_mul_dropout_bwd(
     existing Triton kernel (_ln_mul_dropout_bwd_dwdb, measured at 0.017 ms), so
     it is not reimplemented here.
     """
+    if x.ndim != 2:
+        raise ValueError(f"x must be rank 2, got shape {tuple(x.shape)}")
     N, D = x.shape
-    assert D == 512, f"D must be 512, got {D}"
+    if not 1 <= N <= MAX_NUM_ROWS:
+        raise ValueError(f"N must be in [1, {MAX_NUM_ROWS}], got {N}")
+    if D != 512:
+        raise ValueError(f"D must be 512, got {D}")
+    if dy.shape != (N, 3 * D):
+        raise ValueError(f"dy must have shape ({N}, {3 * D}), got {tuple(dy.shape)}")
+    if u.shape != x.shape or random_mask.shape != x.shape:
+        raise ValueError(f"u and random_mask must have shape {tuple(x.shape)}")
+    if weight.shape != (D,) or bias.shape != (D,):
+        raise ValueError(f"weight and bias must have shape ({D},)")
+    if mean.shape != (N,) or rstd.shape != (N,):
+        raise ValueError(f"mean and rstd must have shape ({N},)")
+    if x.dtype != torch.bfloat16 or any(tensor.dtype != x.dtype for tensor in (dy, u, weight, bias)):
+        raise ValueError("dy, x, u, weight, and bias must all have dtype torch.bfloat16")
+    if mean.dtype != torch.float32 or rstd.dtype != torch.float32:
+        raise ValueError("mean and rstd must have dtype torch.float32")
+    if random_mask.dtype != torch.int8:
+        raise ValueError("random_mask must have dtype torch.int8")
     dy, x, u = dy.detach(), x.detach(), u.detach()
     weight, bias = weight.detach(), bias.detach()
     mean, rstd, random_mask = mean.detach(), rstd.detach(), random_mask.detach()
 
     dev = x.device
+    if dev.type != "cuda" or any(tensor.device != dev for tensor in (dy, u, weight, bias, mean, rstd, random_mask)):
+        raise ValueError("all inputs must be CUDA tensors on the same device")
+    if tuple(x.stride()) != (D, 1) or tuple(random_mask.stride()) != (D, 1):
+        raise ValueError(f"x and random_mask must have stride ({D}, 1)")
+    if dy.stride(1) != 1 or dy.stride(0) < 3 * D or dy.stride(0) % 8 != 0:
+        raise ValueError("dy must have unit innermost stride and 16-byte-aligned, non-overlapping rows")
+    if u.stride(1) != 1 or u.stride(0) < D or u.stride(0) % 8 != 0:
+        raise ValueError("u must have unit innermost stride and 16-byte-aligned, non-overlapping rows")
+    if tuple(weight.stride()) != (1,) or tuple(bias.stride()) != (1,) or tuple(mean.stride()) != (1,) or tuple(rstd.stride()) != (1,):
+        raise ValueError("weight, bias, mean, and rstd must be contiguous")
+    if any(tensor.data_ptr() % ALIGN != 0 for tensor in (dy, x, u, weight, bias, mean, rstd, random_mask)):
+        raise ValueError(f"all inputs must be {ALIGN}-byte aligned")
     dx = torch.empty((N, D), dtype=x.dtype, device=dev)
     du = torch.empty((N, D), dtype=x.dtype, device=dev)
     if compute_y:
@@ -510,44 +551,80 @@ def ln_mul_dropout_bwd(
     dw_p = torch.empty((n_tiles, D), dtype=torch.float32, device=dev)
     db_p = torch.empty((n_tiles, D), dtype=torch.float32, device=dev)
 
-    w2 = weight.unsqueeze(0).expand(ROWS, D).contiguous()
-    b2 = bias.unsqueeze(0).expand(ROWS, D).contiguous()
-    kw = {"assumed_align": ALIGN}
-
     nblk = (N + ROWS - 1) // ROWS
     stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    args = (
-        from_dlpack(dy[:, :D], **kw),
-        from_dlpack(dy[:, D : 2 * D], **kw),
-        from_dlpack(dy[:, 2 * D :], **kw),
-        from_dlpack(x, **kw),
-        from_dlpack(u, **kw),
-        from_dlpack(w2, **kw),
-        from_dlpack(b2, **kw),
-        from_dlpack(random_mask, **kw),
-        from_dlpack(dx, **kw),
-        from_dlpack(du, **kw),
-        from_dlpack(y0, **kw),
-        from_dlpack(y1, **kw),
-        from_dlpack(y2, **kw),
-        from_dlpack(mean),
-        from_dlpack(rstd),
-        from_dlpack(dw_p, **kw),
-        from_dlpack(db_p, **kw),
+    launch_args = (
+        dy[:, :D],
+        dy[:, D : 2 * D],
+        dy[:, 2 * D :],
+        x,
+        u,
+        weight,
+        bias,
+        random_mask,
+        dx,
+        du,
+        y0,
+        y1,
+        y2,
+        mean,
+        rstd,
+        dw_p,
+        db_p,
         cutlass.Float32(dropout_ratio),
         cutlass.Int32(D),
         cutlass.Int32(nblk),
         cutlass.Int32(grid),
         stream,
     )
+    rows = cute.sym_int()
+    dtype = _convert_to_cutlass_data_type(x.dtype)
+    fake_dx = make_fake_tensor(dtype, (rows, D), stride=(D, 1), assumed_align=ALIGN)
+    if compute_y:
+        fake_y = tuple(make_fake_tensor(dtype, (rows, D), stride=(3 * D, 1), assumed_align=ALIGN) for _ in range(3))
+    else:
+        fake_y = (fake_dx, fake_dx, fake_dx)
+    compile_args = (
+        make_fake_tensor(dtype, (rows, D), stride=tuple(dy.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=tuple(dy.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=tuple(dy.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=tuple(x.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (rows, D), stride=tuple(u.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (D,), stride=tuple(weight.stride()), assumed_align=ALIGN),
+        make_fake_tensor(dtype, (D,), stride=tuple(bias.stride()), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Int8, (rows, D), stride=tuple(random_mask.stride()), assumed_align=ALIGN),
+        fake_dx,
+        make_fake_tensor(dtype, (rows, D), stride=(D, 1), assumed_align=ALIGN),
+        *fake_y,
+        make_fake_tensor(cutlass.Float32, (rows,), stride=tuple(mean.stride()), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Float32, (rows,), stride=tuple(rstd.stride()), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Float32, (n_tiles, D), stride=(D, 1), assumed_align=ALIGN),
+        make_fake_tensor(cutlass.Float32, (n_tiles, D), stride=(D, 1), assumed_align=ALIGN),
+        cutlass.Float32(0.0),
+        cutlass.Int32(D),
+        cutlass.Int32(1),
+        cutlass.Int32(grid),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+    )
     key = (
-        N,
-        D,
-        x.dtype,
+        "hstu_lmsd_bwd_dynamic_v1",
+        _plan_signature(dy, dynamic_rows=True),
+        _plan_signature(x, dynamic_rows=True),
+        _plan_signature(u, dynamic_rows=True),
+        _plan_signature(weight, dynamic_rows=False),
+        _plan_signature(bias, dynamic_rows=False),
+        _plan_signature(mean, dynamic_rows=True),
+        _plan_signature(rstd, dynamic_rows=True),
+        _plan_signature(random_mask, dynamic_rows=True),
+        VEC,
+        ROWS,
+        TARGET_TILES,
         FAST_DIV,
         MIN_BLOCKS_PER_MP,
         compute_y,
         "i64_single_launch",
     )
-    _compiled(key, args, compute_y=compute_y)(*args)
+    with torch.cuda.device(dev):
+        compiled = _compiled(key, compile_args, compute_y=compute_y)
+    compiled(*launch_args)
     return dx, du, y, dw_p, db_p
