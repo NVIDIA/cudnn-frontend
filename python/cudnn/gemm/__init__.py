@@ -21,6 +21,7 @@ _LAZY_EXPORTS = {
     "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),
     "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),
     "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),
+    "swiglu_moe": ("cudnn.gemm.ops", "swiglu_moe"),
 }
 
 

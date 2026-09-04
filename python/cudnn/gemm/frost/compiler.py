@@ -4238,11 +4238,17 @@ class CompiledMoeGemm:
         ):
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
-        for role, slots in (("token", a_slots), ("weight", b_slots)):
+        for role, slots, major in (
+            ("token", a_slots, chain.matmul.a_major),
+            ("weight", b_slots, chain.matmul.b_major),
+        ):
+            unit_dim = -1 if major == "k" else -2
             for t in slots:
-                if len(t.shape) != 3 or t.stride(-1) != 1:
+                if len(t.shape) != 3 or t.stride(unit_dim) != 1:
                     raise ValueError(
-                        f"multi-GEMM MoE {role} must be rank-3 with contiguous " f"innermost dim; got shape {tuple(t.shape)} stride {tuple(t.stride())}"
+                        f"multi-GEMM MoE {role} must be rank-3 and contiguous "
+                        f"along its {major}-major dimension; got shape "
+                        f"{tuple(t.shape)} stride {tuple(t.stride())}"
                     )
         if _moe_dense_layout_bad(out):
             raise ValueError("multi-GEMM MoE output requires contiguous innermost dim")
