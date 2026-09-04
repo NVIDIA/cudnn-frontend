@@ -433,9 +433,10 @@ only to decline is why `closed_under` existed.
   imports neither torch nor cutlass.
 - A missing or too-old DSL is a DECLINE at `check_support()`, probed without
   executing the module (`importlib.util.find_spec`, `importlib.metadata`).
-  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor; `pyproject`'s extra
-  deliberately does NOT pin it, since that would make cudnn-frontend
-  incompatible with anything holding the DSL back.
+  `CUTEDSL_MIN_VERSION` in `frost/buffers.py` is the floor these engines want;
+  `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
+  since pinning that high would make cudnn-frontend incompatible with anything
+  holding the DSL back.
 - `test/python/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 

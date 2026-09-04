@@ -45,7 +45,7 @@ docker run -it --gpus=all --workdir /workspace \
 Then, inside the container:
 
 ```bash
-PIP_CONSTRAINT="" pip install nvidia-cudnn-frontend[cutedsl] transformer-engine
+PIP_CONSTRAINT="" pip install nvidia-cudnn-frontend transformer-engine
 
 python cutedsl_fusion_benchmarks.py
 ```

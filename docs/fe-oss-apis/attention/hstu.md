@@ -43,10 +43,10 @@ guide](../../../LICENSING.md) and [third-party notices](../../../THIRD_PARTY_LIC
 
 ## Installation
 
-Install cuDNN Frontend with its CuTe DSL optional dependencies:
+Install cuDNN Frontend; its CuTe DSL dependencies are required and come with it:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 The implementation is available from `cudnn.hstu_attention` and through the

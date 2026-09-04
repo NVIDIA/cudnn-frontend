@@ -793,7 +793,7 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
 
 #### Requirements
 
-- `nvidia-cudnn-frontend[cutedsl]`, cuDNN backend ≥ 9.6 (THD token-major
+- `nvidia-cudnn-frontend`, cuDNN backend ≥ 9.6 (THD token-major
   stats), sm80+.
 
 Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).

@@ -109,7 +109,7 @@ pip install nvidia-cudnn-frontend
 ```
 
 **Requirements:**
-*   Python 3.9+
+*   Python 3.10+
 *   NVIDIA driver and CUDA Toolkit
 *   NVIDIA cuDNN (minimum 8.5.0)
 

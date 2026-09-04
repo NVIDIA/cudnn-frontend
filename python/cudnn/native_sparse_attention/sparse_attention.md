@@ -28,9 +28,9 @@ python/cudnn/native_sparse_attention/
 
 ## Installation
 
-Install the optional cudnn dependences required for NSA:
+The dependencies NSA needs are required dependencies of the package:
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## Usage

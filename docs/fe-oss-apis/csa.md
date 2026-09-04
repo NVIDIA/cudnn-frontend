@@ -155,7 +155,7 @@ that need a fully deterministic backward must use an eager implementation.
 ## Installation
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## API Usage

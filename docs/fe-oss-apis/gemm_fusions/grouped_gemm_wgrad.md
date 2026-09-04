@@ -5,10 +5,10 @@ SM100+ APIs for grouped MoE weight gradients. The same public surface dispatches
 BF16 inputs to the BF16 kernel and preserves the legacy FP4/FP8 block-scaled
 backend.
 
-Install the optional CuTe DSL dependencies before importing either API:
+The CuTe DSL dependencies both APIs need ship with the package:
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ## JAX support

@@ -31,8 +31,9 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 
 - Hopper (SM90) or Blackwell (SM100) GPU
 - PyTorch with CUDA support
-- `pip install nvidia-cudnn-frontend[cutedsl]` (or a development install of
-  this repository's `python/` package with the `cutedsl` extra)
+- `pip install nvidia-cudnn-frontend` (or a development install of
+  this repository's `python/` package) -- the CuTe DSL dependencies are
+  required dependencies and come with either
 
 ## How to run
 
