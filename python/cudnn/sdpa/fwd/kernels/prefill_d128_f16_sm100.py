@@ -165,6 +165,7 @@ else:
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     Bars,
     make_split_helpers,
+    store_fp32_partial_tile as _store_fp32_partial_tile,
     KvLoopBounds,
     make_classic_bars,
     compute_kv_loop_bounds,
@@ -252,6 +253,7 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+_FP32_PARTIALS = bool(PARAMS.fp32_partials) and SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
@@ -330,6 +332,7 @@ def _kernel(
     # CFG.SEQ_Q_LENS_PRESENT — the DSL specializes on None, so the flag-off
     # ABI is unchanged.
     seq_q_lens_tensor: Optional[cute.Tensor] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -533,6 +536,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             qh_per_kh=qh_per_kh,
+            o_partial_f32=o_partial_f32,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -962,6 +966,9 @@ def _tmastg_warp_group(
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_o_full[qs].wait(o_full_phase)
+            if cutlass.const_expr(_FP32_PARTIALS):
+                bars.mb_o_empty[qs].arrive()
+                continue
 
             # O TMA params follow O's swizzle (NOT V's) — under gptoss cga2 V drops to Swz64B while O stays Swz128B.
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1819,6 +1826,7 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     qh_per_kh,
+    o_partial_f32=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -2033,37 +2041,52 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
-            for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                o_fp16 = cutlass.Vector.from_elements(
-                    tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK)),
-                    STORAGE_DTYPE,
+            if cutlass.const_expr(_FP32_PARTIALS):
+                _store_fp32_partial_tile(
+                    o_partial_f32,
+                    tmem_base_epi,
+                    tmem_O_off,
+                    inv_sum,
+                    row_dead,
+                    q_row_global < seqlen_q,
+                    _partial_batch(batch_idx, split_idx, n_batch),
+                    q_row_global,
+                    row_head_idx,
+                    CFG.TILE_O,
                 )
-                if cutlass.const_expr(not MAY_BE_EMPTY) or (bounds.right > bounds.left):
-                    o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
-                    o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                        num=O_CHUNK,
+                bars.mb_o_empty[qs].wait(o_empty_phase)
+            else:
+                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                    o_fp16 = cutlass.Vector.from_elements(
+                        tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK)),
+                        STORAGE_DTYPE,
                     )
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    o_scaled = o_chunk * inv_sum
-                    o_fp16 = o_scaled.to(STORAGE_DTYPE)
+                    if cutlass.const_expr(not MAY_BE_EMPTY) or (bounds.right > bounds.left):
+                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_CHUNK,
+                        )
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        o_scaled = o_chunk * inv_sum
+                        o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
-                col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
-                block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
-                block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
-                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
+                    col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
+                    block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
+                    block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
+                    smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
 
-                smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
-                # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
-                # earlier TMEM-load loop), keeping TMEM-load/FFMA/cast overlapped
-                # with TMA-STG draining the prior persistent tile.
-                if chunk_idx == 0:
-                    bars.mb_o_empty[qs].wait(o_empty_phase)
-                smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                    smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
+                    # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
+                    # earlier TMEM-load loop), keeping TMEM-load/FFMA/cast overlapped
+                    # with TMA-STG draining the prior persistent tile.
+                    if chunk_idx == 0:
+                        bars.mb_o_empty[qs].wait(o_empty_phase)
+                    smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
-            # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
-            nvvm.fence_proxy("async.shared", space="cta")
+                # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
+                nvvm.fence_proxy("async.shared", space="cta")
 
             bars.mb_o_full[qs].arrive()
 
@@ -2131,6 +2154,7 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2181,9 +2205,12 @@ def _host(
         swizzle=_v_tma_swz,
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+    _o_box = list(vo_box_o)
+    if _FP32_PARTIALS:
+        _o_box[-1] = max(1, _o_box[-1] // 2)
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
-        box_dims=vo_box_o,
+        box_dims=tuple(_o_box),
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.O_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
@@ -2257,6 +2284,7 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         seq_q_lens_tensor,
+        o_partial_f32,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2351,7 +2379,7 @@ def compile(  # noqa: A001
     fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
     fake_k = _fake_bshd((_fake_batch, skv, kh, d_qk), k_stride)
     fake_v = _fake_bshd((_fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd((_o_batch, sq, qh, d_v), o_stride, dtype=STORAGE_DTYPE)
+    fake_o = _fake_bshd((_o_batch, sq, qh, d_v), o_stride, dtype=cutlass.Float32 if _FP32_PARTIALS else STORAGE_DTYPE)
     if not has_lse:
         # No Stats output: the LSE argument is None-specialized and the store
         # is compiled out entirely — no dummy buffer exists at any level.
@@ -2472,6 +2500,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
