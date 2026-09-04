@@ -581,13 +581,8 @@ def _split_points(
         # This S_kv would be served through the synthesized KV-tail padding,
         # which the split cannot ride (mismatch declines the same combination).
         return [no_split]
-    if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (
-        cudnn.data_type.HALF,
-        cudnn.data_type.BFLOAT16,
-    ):
-        # The combine reduces partials in half precision; reducing QUANTIZED
-        # partials would lose what the split is meant to be neutral about.
-        return [no_split]
+    # A quantized O is a legal split target: the partials stay half whatever the
+    # O dtype and the combine performs the only cast down to it.
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
         return [no_split]

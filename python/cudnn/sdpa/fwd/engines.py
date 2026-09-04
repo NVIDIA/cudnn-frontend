@@ -372,11 +372,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # path the split cannot ride. Mirror lower_dsl_prefill's
                 # synth_kv_padding predicate so the plan is never listed.
                 return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
-            if (facts.is_fp8 or facts.is_mxfp8) and facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
-                # The combine reduces partials in half precision; reducing
-                # QUANTIZED partials would lose what the split must be
-                # numerically neutral about.
-                return "split_kv > 1 on a quantized graph requires a bf16/fp16 O"
+            # No gate on the O dtype: the partials stay half whatever it is,
+            # and the combine performs the only cast down to it.
             if capabilities.split_d_shapes is not None and not any(facts.d_qk <= sq and facts.d_v <= sv for sq, sv in capabilities.split_d_shapes):
                 return (
                     f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel " f"flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
@@ -759,8 +756,6 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
             # it). FLOAT is the f32 pipeline every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
-            # Split partials reduce in half precision, so mismatch()'s
-            # facts x knobs gate additionally requires a bf16/fp16 O.
             split_kv_supported=True,
             split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),

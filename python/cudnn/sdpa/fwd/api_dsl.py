@@ -812,27 +812,60 @@ class SdpaFwdDsl(APIBase):
 
     # -- KV-split shared helpers (SM100 + SM120 dense split paths) -----------
 
-    def _o_itemsize(self) -> int:
-        return 2  # f16 / bf16; the split path is half-precision-O only
+    def _o_dtype(self):
+        """The torch dtype O is STORED as.
 
-    def _combine_dtype_tag(self) -> str:
-        # The combine reduces INTO the O dtype: the graph's dtype_o on the
-        # quantized rows (half-gated by check_support), Q's dtype elsewhere.
-        # self.dtype is the fp8 INPUT type on those rows, so falling back to it
-        # would compile an f16 combine for a bf16 output; not every arch's
-        # check_support populates dtype_o, so read the O descriptor when it does
-        # not (SM100 sets it and is unaffected).
-        # Read the O DESCRIPTOR, not self.dtype_o: the latter is a cudnn.data_type
-        # enum on some rows (SM120 fp8) and a torch dtype on others, so comparing
-        # it against torch.bfloat16 silently yields "f16" and compiles a
-        # half-precision combine for a bf16 output. self.dtype is the fp8 INPUT
-        # type on the quantized rows, so it cannot stand in either.
+        Read the O DESCRIPTOR, not self.dtype_o: the latter is a cudnn.data_type
+        enum on some rows (SM120 fp8) and a torch dtype on others, so comparing
+        it against a torch dtype silently misclassifies those rows.  self.dtype
+        is the fp8 INPUT type on the quantized rows, so it cannot stand in
+        either; it is only the fallback for the non-quantized rows, where O
+        follows Q.
+        """
         o_dtype = getattr(self.o_desc, "dtype", None) if self._fp8 else self.dtype
         if o_dtype is None:
             o_dtype = self.dtype_o if self.dtype_o is not None else self.dtype
+        return o_dtype
+
+    def _quantized_split(self) -> bool:
+        """A split whose O is stored quantized: the partials stay half and the
+        cast down to the FP8 O moves from the kernel epilogue to the combine."""
+        return self.split_kv > 1 and self._fp8 and self._o_dtype() in _SM100_FP8_DTYPES
+
+    def _split_scale_o(self) -> bool:
+        """Whether that cast also applies a scalar scale_o.
+
+        Only the per-tensor rows have one.  Block-scaled (MXFP8) O carries its
+        scaling in the SF tensors, not a scalar, so its combine casts unscaled —
+        exactly what its single-pass epilogue does.
+        """
+        return self._quantized_split() and self._pertensor
+
+    def _partial_torch_dtype(self) -> torch.dtype:
+        """The type the split kernels WRITE.  Always half: the reduction runs
+        wider than a quantized output, so the FP8 rounding happens once, on the
+        recombined value, rather than once per split."""
+        # A quantized O has no half counterpart to inherit, so pick f16 -- its
+        # 10-bit mantissa carries the partials more precisely than bf16's 7, and
+        # the range that would favour bf16 is what scale_o already handles.
+        return torch.bfloat16 if self._o_dtype() == torch.bfloat16 else torch.float16
+
+    def _partial_dtype_tag(self) -> str:
+        return "bf16" if self._partial_torch_dtype() == torch.bfloat16 else "f16"
+
+    def _o_itemsize(self) -> int:
+        return self._partial_torch_dtype().itemsize
+
+    def _combine_dtype_tag(self) -> str:
+        # The combine reduces INTO the O dtype.  A quantized O is a legal split
+        # target: this pass performs the single cast down to it, from half
+        # partials (see _partial_dtype_tag).
+        o_dtype = self._o_dtype()
+        if o_dtype in _SM100_FP8_DTYPES:
+            return "e5m2" if o_dtype == torch.float8_e5m2 else "e4m3"
         return "bf16" if o_dtype == torch.bfloat16 else "f16"
 
-    def _split_partials(self, workspace, o_like, device, current_stream=None):
+    def _split_partials(self, workspace, device, current_stream=None):
         """The split-major (O, LSE) partial buffers, carved from the caller's
         workspace when there is one and torch-allocated otherwise (standalone
         use, matching what the rest of this adapter does).
@@ -845,14 +878,17 @@ class SdpaFwdDsl(APIBase):
         rows = self.split_kv * self.batch_size
         o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
         lse_shape = (rows, self.h_q, self.s_q_max)
+        # NOT o_like.dtype: a quantized O is stored narrower than its partials,
+        # which stay half so the reduction runs wider than the final cast.
+        o_dtype = self._partial_torch_dtype()
         if workspace is None:
             with _torch_stream_context(current_stream, device):
                 return (
-                    torch.empty(o_shape, dtype=o_like.dtype, device=device),
+                    torch.empty(o_shape, dtype=o_dtype, device=device),
                     torch.empty(lse_shape, dtype=torch.float32, device=device),
                 )
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), f"{type(self).__name__} (KV split)")
-        o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_like.dtype).view(o_shape)
+        o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_dtype).view(o_shape)
         lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
         return o_part, lse_part
 
@@ -1136,10 +1172,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # split_combine_sm100 (which also owns the FP8 amax of the
             # recombined O). Structural limits mirror mismatch()'s
             # facts x knobs gate so the standalone API declines identically.
-            self._not_implemented_error_if(
-                self._fp8 and self.dtype_o not in (torch.float16, torch.bfloat16),
-                "split_kv > 1 on a quantized graph requires a bf16/fp16 O (the combine reduces half-precision partials)",
-            )
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             self._value_error_if(
@@ -1260,7 +1292,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
-            dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
+            # A quantized-O split compiles the kernel to write HALF partials;
+            # the combine performs the single cast to the real O dtype.
+            dtype_o=(_SM100_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else _SM100_DTYPE_QKV_CODE[self.dtype_o]),
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
@@ -1395,6 +1429,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_v=self.head_dim_v,
                 splits=self.split_kv,
                 dtype_o=self._combine_dtype_tag(),
+                dtype_partial=self._partial_dtype_tag(),
+                has_scale_o=self._split_scale_o(),
                 has_lse=self.lse_desc is not None,
                 has_amax=self._fp8,
                 lse_stride=self._lse_stride,
@@ -1432,9 +1468,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
         if self.split_kv > 1:
             # Split-major partial slabs the main kernel writes and the combine
-            # pass reduces: O_s [splits*B, S_q, H, d_v] in the O dtype (half —
-            # the split path requires a bf16/fp16 O even on the FP8 families)
-            # and lse_s [splits*B, H, S_q] fp32. Carved from the caller's
+            # pass reduces: O_s [splits*B, S_q, H, d_v] in the PARTIAL dtype
+            # (always half, even when O itself is quantized -- the combine owns
+            # that cast) and lse_s [splits*B, H, S_q] fp32. Carved from the caller's
             # workspace — zero per-execute allocations (Hard Rule 1).
             o_bytes = self.split_kv * b * self.s_q_max * qh * self.head_dim_v * self._o_itemsize()
             lse_bytes = self.split_kv * b * qh * self.s_q_max * 4
@@ -1616,7 +1652,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # No zero-fill: the split kernel writes EVERY (split, batch) slot,
             # emitting O := 0 / lse := -inf for empty split ranges itself.
             s, b, h, sq, dv = self.split_kv, self.batch_size, self.h_q, self.s_q_max, self.head_dim_v
-            o_partial, lse_partial = self._split_partials(workspace, o_arg, device, current_stream)
+            o_partial, lse_partial = self._split_partials(workspace, device, current_stream)
             self._compiled_kernel(
                 Q,
                 K,
@@ -1638,6 +1674,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 o_arg,
                 lse_arg,
                 None,
+                None,  # dense half O: no amax, and never a quantized cast
                 (b, h, sq, dv),
                 cutlass.Int32(s),
                 stream=current_stream,
@@ -2140,7 +2177,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # caller's O/LSE and owns the recombined amax.
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
-            O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
+            O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
         dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
         self._compiled_kernel(
             Q,
@@ -2168,6 +2205,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 O,
                 lse,
                 amax_o_buf,
+                None,  # block-scaled O: no scalar scale to apply at the cast
                 (b, h_q, sq, self.head_dim_v),
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
@@ -2218,6 +2256,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         dk_t = self._scale_view(descale_k, "descale_k", device)
         dv_t = self._scale_view(descale_v, "descale_v", device)
         so_t = self._scale_view(scale_o, "scale_o", device)
+        # Under a quantized split the kernel writes UNSCALED half partials and
+        # the combine applies scale_o once, at its single cast; bind the
+        # identity here so the epilogue folds nothing in.
+        so_kernel = self._scale_view(None, "scale_o", device) if self._split_scale_o() else so_t
         scale_softmax_log2 = scale_val * math.log2(math.e)
         o_scale_fused = 1.0
 
@@ -2315,7 +2357,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # the recombined amax.
         O_dst, lse_dst = O, lse
         if self.split_kv > 1:
-            O_dst, lse_dst = self._split_partials(workspace, O, device, current_stream)
+            O_dst, lse_dst = self._split_partials(workspace, device, current_stream)
         dense_q_lens_args = (seq_q_t,) if self._d256_quantized else ()
         self._compiled_kernel(
             Q,
@@ -2333,7 +2375,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dq_t,
             dk_t,
             dv_t,
-            so_t,
+            so_kernel,
             amax_o_buf,
             *dense_q_lens_args,
             stream=current_stream,
@@ -2345,6 +2387,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 O,
                 lse,
                 amax_o_buf,
+                so_t if self._split_scale_o() else None,
                 (b, h_q, sq, self.head_dim_v),
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
@@ -2356,7 +2399,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # Device divisor: the same div_ as before, minus the readback.
                 # scale_o > 0 is caller contract (backend parity); None bound a
                 # cached 1.0 above.
-                amax_o_buf.div_(so_t)
+                # Not under a quantized split: the combine measured the amax
+                # PRE-scale, so it is already the pre-quant value.
+                if not self._split_scale_o():
+                    amax_o_buf.div_(so_t)
         self._logger.debug("execute (FP8 per-tensor) completed")
 
 
@@ -2808,10 +2854,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # backstop additionally bars a split under the LPT remaps —
             # validated at compile via make_cfg, and the heuristic's split
             # sets ride SCHED_NATURAL.
-            self._value_error_if(
-                self._fp8 and self.o_desc.dtype not in (torch.float16, torch.bfloat16),
-                "split_kv > 1 on a quantized graph requires a bf16/fp16 O (the combine reduces half-precision partials)",
-            )
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             self._value_error_if(
@@ -2865,7 +2907,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 )
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
-            dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
+            # A quantized-O split writes HALF partials; the combine performs
+            # the single cast to the real O dtype.
+            dtype_o=(_SM120_DTYPE_QKV_CODE[torch.float16] if self._quantized_split() else _SM120_DTYPE_QKV_CODE[self.o_desc.dtype]),
             sched_policy=sched_policy,
             window_left=self.window_left,
             window_right=self.window_right,
@@ -2919,6 +2963,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 d_v=self.head_dim_v,
                 splits=self.split_kv,
                 dtype_o=self._combine_dtype_tag(),
+                dtype_partial=self._partial_dtype_tag(),
+                has_scale_o=self._split_scale_o(),
                 has_lse=self.lse_desc is not None,
                 # The quantized rows stand their in-kernel amax down under a split,
                 # so the combine owns the amax of the RECOMBINED O.
@@ -3049,7 +3095,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # the shared combine reduces them into the caller's O/LSE.
         o_dst, lse_dst = o, lse
         if self.split_kv > 1:
-            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
+            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device, current_stream)
         self._compiled_kernel(
             q,
             k,
@@ -3074,6 +3120,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 o,
                 lse,
                 None,
+                None,  # dense half O: never a quantized cast
                 (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
@@ -3122,6 +3169,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         dk_t = self._scale_view(descale_k, "descale_k", device)
         dv_t = self._scale_view(descale_v, "descale_v", device)
         so_t = self._scale_view(scale_o, "scale_o", device)
+        # Under a quantized split the kernel writes UNSCALED half partials and
+        # the combine applies scale_o once, at its single cast; bind the
+        # identity here so the epilogue folds nothing in.
+        so_kernel = self._scale_view(None, "scale_o", device) if self._split_scale_o() else so_t
         scale_softmax_log2 = scale_val * math.log2(math.e)
         o_scale_fused = 1.0
 
@@ -3210,7 +3261,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # combine below owns both the reduction and the amax.
         o_dst, lse_dst = o, lse
         if self.split_kv > 1:
-            o_dst, lse_dst = self._split_partials(workspace, o, q_tensor.device, current_stream)
+            o_dst, lse_dst = self._split_partials(workspace, q_tensor.device, current_stream)
 
         fn = self._compiled_kernel
         if pack is not None:
@@ -3233,7 +3284,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             dq_t,
             dk_t,
             dv_t,
-            so_t,
+            so_kernel,
             cutlass.Int32(pack.max_sq if pack is not None else 0),
             pack.q_lens_dev if pack is not None else None,
             pack.kv_lens_dev if pack is not None else None,
@@ -3256,6 +3307,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 # expects a tensor -- _amax_slot hands back a cached dummy when
                 # the caller supplied nothing. Same as the SM100 arms.
                 amax_o_buf,
+                so_t if self._split_scale_o() else None,
                 (self.batch_size, self.h_q, self.s_q_max, self.head_dim_v),
                 cutlass.Int32(self.split_kv),
                 stream=current_stream,
@@ -3266,7 +3318,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if amax_o is not None:
                 # Device divisor: same div_, minus the readback; scale_o > 0
                 # is caller contract (None bound a cached 1.0 above).
-                amax_o_buf.div_(so_t)
+                # Not under a quantized split: the combine measured the amax
+                # PRE-scale, so it is already the pre-quant value.
+                if not self._split_scale_o():
+                    amax_o_buf.div_(so_t)
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
     def _thd_compile_kwargs(self) -> dict:
