@@ -23,7 +23,10 @@ _FP32 = cudnn.data_type.FLOAT
 _FC1_CACHE = {}
 _MM_CACHE = {}
 _DSWIGLU_CACHE = {}
+_WGRAD_CACHE = {}
 _FROST_WORKSPACES = {}
+_CUDNN_HANDLES = {}
+_CUDNN_WORKSPACES = {}
 
 
 def _device_key(tensor: torch.Tensor) -> tuple:
@@ -55,14 +58,14 @@ def _frost_workspace(plan, tensor):
 def _frost_fc1(routed_x, Wg, Wu, offsets):
     """Fused ``gate/up grouped GEMMs + SwiGLU``; also materialize BF16 taps."""
     _, S, H = routed_x.shape
-    E, I, _ = Wg.shape
-    key = ("fc1", S, H, I, E, routed_x.dtype, *_device_key(routed_x))
+    E, interm, _ = Wg.shape
+    key = ("fc1", S, H, interm, E, routed_x.dtype, *_device_key(routed_x))
     plan = _FC1_CACHE.get(key)
     if plan is None:
         graph = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         X = graph.tensor(name="x", dim=[1, S, H], stride=[S * H, H, 1], data_type=_BF16)
-        WG = graph.tensor(name="Wg", dim=[E, H, I], stride=[H * I, 1, H], data_type=_BF16)
-        WU = graph.tensor(name="Wu", dim=[E, H, I], stride=[H * I, 1, H], data_type=_BF16)
+        WG = graph.tensor(name="Wg", dim=[E, H, interm], stride=[H * interm, 1, H], data_type=_BF16)
+        WU = graph.tensor(name="Wu", dim=[E, H, interm], stride=[H * interm, 1, H], data_type=_BF16)
         FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
         gate_raw = graph.moe_grouped_matmul(X, WG, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="gate")
         up_raw = graph.moe_grouped_matmul(X, WU, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="up")
@@ -80,7 +83,7 @@ def _frost_fc1(routed_x, Wg, Wu, offsets):
 
     binding = plan.binding
     outputs = _output_map(binding)
-    gate = torch.empty(1, S, I, dtype=routed_x.dtype, device=routed_x.device)
+    gate = torch.empty(1, S, interm, dtype=routed_x.dtype, device=routed_x.device)
     up = torch.empty_like(gate)
     h = torch.empty_like(gate)
     buffers = {"gate_tap": gate, "up_tap": up, "h": h}
@@ -146,18 +149,18 @@ def _frost_mm(token, weight, offsets):
 def _frost_dswiglu(dout, Wd, gate, up, offsets):
     """Fuse the grouped down dgrad with both SwiGLU derivatives."""
     _, S, H = dout.shape
-    E, weight_h, I = Wd.shape
+    E, weight_h, interm = Wd.shape
     if weight_h != H:
         raise ValueError(f"internal grouped dSwiGLU H mismatch: dout H={H}, Wd H={weight_h}")
-    key = ("dswiglu", S, H, I, E, dout.dtype, *_device_key(dout))
+    key = ("dswiglu", S, H, interm, E, dout.dtype, *_device_key(dout))
     plan = _DSWIGLU_CACHE.get(key)
     if plan is None:
         graph = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         DY = graph.tensor(name="dout", dim=[1, S, H], stride=[S * H, H, 1], data_type=_BF16)
-        WD = graph.tensor(name="Wd", dim=[E, H, I], stride=[H * I, I, 1], data_type=_BF16)
+        WD = graph.tensor(name="Wd", dim=[E, H, interm], stride=[H * interm, interm, 1], data_type=_BF16)
         FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-        G = graph.tensor(name="gate", dim=[1, S, I], stride=[S * I, I, 1], data_type=_BF16)
-        U = graph.tensor(name="up", dim=[1, S, I], stride=[S * I, I, 1], data_type=_BF16)
+        G = graph.tensor(name="gate", dim=[1, S, interm], stride=[S * interm, interm, 1], data_type=_BF16)
+        U = graph.tensor(name="up", dim=[1, S, interm], stride=[S * interm, interm, 1], data_type=_BF16)
         dh = graph.moe_grouped_matmul(DY, WD, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="dh")
         dup = graph.mul(a=dh, b=graph.swish(input=G), name="dup")
         dgate = graph.mul(a=graph.swish_backward(loss=dh, input=G), b=U, name="dgate")
@@ -169,7 +172,7 @@ def _frost_dswiglu(dout, Wd, gate, up, offsets):
     binding = plan.binding
     outputs = _output_map(binding)
     aux = {tensor.get_name(): tensor for tensor in binding.aux}
-    dgate = torch.empty(1, S, I, dtype=dout.dtype, device=dout.device)
+    dgate = torch.empty(1, S, interm, dtype=dout.dtype, device=dout.device)
     dup = torch.empty_like(dgate)
     buffers = {"dgate": dgate, "dup": dup}
     workspace, stream = _frost_workspace(plan, dout)
@@ -189,44 +192,53 @@ def _frost_dswiglu(dout, Wd, gate, up, offsets):
     return dgate, dup
 
 
+def _cudnn_handle(tensor):
+    device = tensor.device
+    handle = _CUDNN_HANDLES.get(device.index)
+    if handle is None:
+        handle = cudnn.create_handle()
+        _CUDNN_HANDLES[device.index] = handle
+    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
+    return handle
+
+
 def _moe_wgrad(doutput, token, offsets):
-    """cuTeDSL grouped wgrad, padding each routed expert to its 256-row contract."""
+    """Native cuDNN grouped wgrad with arbitrary expert token counts."""
     _, S, N = doutput.shape
     _, token_s, K = token.shape
     E = offsets.numel()
     if token_s != S:
         raise ValueError(f"internal grouped wgrad token mismatch: {S} and {token_s}")
-    starts = [int(value) for value in offsets.tolist()]
-    if not starts or starts[0] != 0 or any(a > b for a, b in zip(starts, starts[1:])) or starts[-1] > S:
-        raise ValueError("cudnn.gemm.swiglu_moe: offsets must start at 0 and be non-decreasing within S")
-    ends = starts[1:] + [S]
-    padded_sizes = [((end - begin + 255) // 256) * 256 for begin, end in zip(starts, ends)]
-    total = sum(padded_sizes)
-    doutput_pad = torch.zeros(N, total, dtype=doutput.dtype, device=doutput.device)
-    token_pad = torch.zeros(total, K, dtype=token.dtype, device=token.device)
-    padded_ends = []
-    dst = 0
-    for begin, end, padded in zip(starts, ends, padded_sizes):
-        rows = end - begin
-        if rows:
-            doutput_pad[:, dst : dst + rows].copy_(doutput[0, begin:end].transpose(0, 1))
-            token_pad[dst : dst + rows].copy_(token[0, begin:end])
-        dst += padded
-        padded_ends.append(dst)
-    padded_offsets = torch.tensor(padded_ends, dtype=torch.int32, device=token.device)
+    key = (S, N, K, E, doutput.dtype, *_device_key(doutput))
+    cached = _WGRAD_CACHE.get(key)
+    handle = _cudnn_handle(doutput)
+    if cached is None:
+        graph = cudnn.pygraph(intermediate_data_type=_FP32, compute_data_type=_FP32, handle=handle)
+        DY = graph.tensor(name="doutput", dim=[1, S, N], stride=[S * N, N, 1], data_type=_BF16)
+        X = graph.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=_BF16)
+        FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        DW = graph.moe_grouped_matmul_bwd(DY, X, FTO, compute_data_type=_FP32, name="wgrad")
+        # Logical [E,K,N], column-major inner dimensions.  Its physical storage
+        # is a contiguous [E,N,K] tensor, exactly the public weight layout.
+        DW.set_output(True).set_data_type(_BF16)
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        graph.check_support()
+        graph.build_plans()
+        cached = (graph, DY, X, FTO, DW, graph.get_workspace_size())
+        _WGRAD_CACHE[key] = cached
 
-    from cudnn.gemm.cutedsl.grouped.wgrad.api import grouped_gemm_wgrad_wrapper_sm100
-
-    result = grouped_gemm_wgrad_wrapper_sm100(
-        doutput_pad,
-        token_pad,
-        None,
-        None,
-        padded_offsets,
-        wgrad_dtype=torch.bfloat16,
-        current_stream=torch.cuda.current_stream(token.device).cuda_stream,
-    )
-    return result["wgrad_tensor"]
+    graph, DY, X, FTO, DW, workspace_size = cached
+    output = torch.empty(E, N, K, dtype=doutput.dtype, device=doutput.device)
+    stream = torch.cuda.current_stream(doutput.device).cuda_stream
+    workspace_key = (id(graph), doutput.device.index, stream)
+    workspace = _CUDNN_WORKSPACES.get(workspace_key)
+    if workspace is None:
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=doutput.device)
+        _CUDNN_WORKSPACES[workspace_key] = workspace
+    graph.execute({DY: doutput, X: token, FTO: offsets, DW: output}, workspace, handle=handle)
+    return output
 
 
 class _SwiGLUMoE(torch.autograd.Function):
@@ -240,6 +252,7 @@ class _SwiGLUMoE(torch.autograd.Function):
         return output
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx, dout):
         routed_x, Wg, Wu, Wd, offsets, h, gate, up = ctx.saved_tensors
         need_x, need_wg, need_wu, need_wd, _ = ctx.needs_input_grad
@@ -268,8 +281,13 @@ def swiglu_moe(routed_x, Wg, Wu, Wd, first_token_offset):
         Wg, Wu: Contiguous expert gate/up weights ``[E,I,H]`` in BF16.
         Wd: Contiguous expert down weights ``[E,H,I]`` in BF16.
         first_token_offset: Contiguous INT32 starts ``[E]`` (``[E,1,1]`` is
-            also accepted). Tokens remain in routed order; routing and combine
-            probabilities are intentionally outside this operation.
+            also accepted). The first value must be 0; all values must be in
+            ``[0, S]`` and monotonically nondecreasing. The last expert ends at
+            ``S``, so the final value is its start and need not equal ``S``.
+            Tokens remain in routed order; routing and combine probabilities
+            are intentionally outside this operation. These value invariants
+            are a device-data contract and are not host-validated on the hot
+            path.
 
     Returns:
         BF16 tensor ``[1,S,H]``, differentiable with respect to the tokens and
@@ -291,16 +309,16 @@ def swiglu_moe(routed_x, Wg, Wu, Wd, first_token_offset):
         )
     if any(tensor.device != routed_x.device for _, tensor in tensors[1:]) or first_token_offset.device != routed_x.device:
         raise ValueError(f"{prefix}: inputs and first_token_offset must be on the same CUDA device")
-    E, I, H = Wg.shape
-    if Wu.shape != Wg.shape or Wd.shape != (E, H, I) or routed_x.shape[2] != H:
+    E, interm, H = Wg.shape
+    if Wu.shape != Wg.shape or Wd.shape != (E, H, interm) or routed_x.shape[2] != H:
         raise ValueError(
-            f"{prefix}: expected x[1,S,{H}], Wg/Wu[{E},{I},{H}], Wd[{E},{H},{I}]; "
+            f"{prefix}: expected x[1,S,{H}], Wg/Wu[{E},{interm},{H}], Wd[{E},{H},{interm}]; "
             f"got x{tuple(routed_x.shape)}, Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}"
         )
     if first_token_offset.dtype != torch.int32 or first_token_offset.numel() != E or not first_token_offset.is_contiguous():
         raise ValueError(f"{prefix}: first_token_offset must be contiguous int32 with E={E} elements")
-    if H % 8 or I % 8 or routed_x.shape[1] == 0:
-        raise ValueError(f"{prefix}: S must be nonzero and H/I multiples of 8; got S={routed_x.shape[1]}, H={H}, I={I}")
+    if H % 8 or interm % 8 or routed_x.shape[1] == 0:
+        raise ValueError(f"{prefix}: S must be nonzero and H/I multiples of 8; " f"got S={routed_x.shape[1]}, H={H}, I={interm}")
     capability = torch.cuda.get_device_capability(routed_x.device)
     if not ((10, 0) <= capability < (12, 0)):
         raise RuntimeError(f"{prefix}: FROST MoE requires SM100-SM119, got SM{capability[0]}{capability[1]}")
