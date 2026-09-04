@@ -187,3 +187,255 @@ def test_memo_key_covers_every_wrapper_parameter():
             checked.append(name)
 
     assert checked, "no memoized wrappers discovered -- the discovery logic is broken"
+
+
+# ---- Block-scaled (MXFP8) wrappers: glu, dglu, quant, wgrad ----------------------
+#
+# Same metadata, different data and a different valid token count (the padded_offsets
+# contents) must hit the memo, and a hit must produce the bytes the cold path produces.
+
+TENSOR_M, N_BS, K_BS, L_BS = 2048, 512, 512, 4
+MXFP8 = dict(ab_dtype=torch.float8_e4m3fn, sf_dtype=torch.float8_e8m0fnu, sf_vec_size=32, m_aligned=256)
+
+
+def _mxfp8_inputs(group_m_list, l=L_BS, b_major="k"):
+    from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors
+
+    return allocate_grouped_gemm_input_tensors(n=N_BS, k=K_BS, l=l, group_m_list=group_m_list, permuted_m=TENSOR_M, b_major=b_major, **MXFP8)
+
+
+def _bytes(tensor):
+    return tensor.contiguous().view(torch.uint8)
+
+
+class _CountingMemo(dict):
+    """Only a memo miss stores; a hit never writes. `stores` therefore counts misses."""
+
+    stores = 0
+
+    def __setitem__(self, key, value):
+        self.stores += 1
+        super().__setitem__(key, value)
+
+
+def _install_memo(monkeypatch, module, name):
+    memo = _CountingMemo()
+    monkeypatch.setattr(module, name, memo)
+    return memo
+
+
+def _assert_hit_matches_cold(monkeypatch, module, memo_name, call, inputs_a, inputs_b, pick):
+    memo = _install_memo(monkeypatch, module, memo_name)
+    call(inputs_a)
+    assert memo.stores == 1 and len(memo) == 1, "the first call should miss and populate the memo"
+    warm = _bytes(pick(call(inputs_b))).clone()
+    assert memo.stores == 1, "the second call should hit the memo"
+    memo.clear()
+    cold = _bytes(pick(call(inputs_b)))
+    assert memo.stores == 2
+    torch.cuda.synchronize()
+    assert torch.equal(warm, cold)
+
+
+def _glu_bs_call(inputs, **overrides):
+    from cudnn import grouped_gemm_glu_wrapper_sm100
+
+    kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        norm_const_tensor=inputs["norm_const_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        d_dtype=torch.float8_e4m3fn,
+        sf_vec_size=32,
+    )
+    kwargs.update(overrides)
+    return grouped_gemm_glu_wrapper_sm100(**kwargs)
+
+
+@pytest.mark.L0
+def test_glu_block_scaled_memo_hit_matches_cold_path(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.glu import api as glu_api
+
+    inputs_a = _mxfp8_inputs([256] * L_BS)
+    inputs_b = _mxfp8_inputs([512, 256, 512, 256])
+    assert inputs_a["valid_m"] != inputs_b["valid_m"]
+    _assert_hit_matches_cold(monkeypatch, glu_api, "_glu_wrapper_memo", _glu_bs_call, inputs_a, inputs_b, lambda out: out["d_tensor"][: inputs_b["valid_m"]])
+
+
+@pytest.mark.L0
+def test_glu_block_scaled_memo_misses_on_plan_time_change(monkeypatch):
+    """Expert count, output dtype and operand stride order each take a different key."""
+    from cudnn.gemm.cutedsl.grouped.glu import api as glu_api
+
+    memo = _install_memo(monkeypatch, glu_api, "_glu_wrapper_memo")
+    _glu_bs_call(_mxfp8_inputs([256] * L_BS))
+    _glu_bs_call(_mxfp8_inputs([256] * L_BS))
+    assert memo.stores == 1
+
+    fewer_experts = _glu_bs_call(_mxfp8_inputs([256] * 2, l=2))
+    assert memo.stores == 2 and fewer_experts["sfd_row_tensor"] is not None
+
+    bf16_out = _glu_bs_call(_mxfp8_inputs([256] * L_BS), d_dtype=torch.bfloat16)
+    assert memo.stores == 3 and tuple(bf16_out["amax_tensor"].shape) == (L_BS, 1)
+
+    # Same shapes and dtypes, different strides: a different key, and still rejected.
+    with pytest.raises(ValueError):
+        _glu_bs_call(_mxfp8_inputs([256] * L_BS, b_major="n"))
+    assert memo.stores == 3 and len(memo) == 3
+
+
+def _dglu_bs_inputs(group_m_list):
+    from fe_api.grouped_gemm.test_grouped_gemm_dswiglu_utils import allocate_grouped_gemm_dswiglu_tensors
+
+    inputs = _mxfp8_inputs(group_m_list)
+    inputs, outputs = allocate_grouped_gemm_dswiglu_tensors(
+        tensor_m=TENSOR_M,
+        n=N_BS,
+        l=L_BS,
+        ab_dtype=MXFP8["ab_dtype"],
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        sf_dtype=MXFP8["sf_dtype"],
+        sf_vec_size=MXFP8["sf_vec_size"],
+        input_tensors=inputs,
+    )
+    inputs["dprob_tensor"] = outputs["dprob_tensor"]
+    return inputs
+
+
+def _dglu_bs_call(inputs):
+    from cudnn import grouped_gemm_dglu_wrapper_sm100
+
+    inputs["dprob_tensor"].zero_()
+    return grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        dprob_tensor=inputs["dprob_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        norm_const_tensor=inputs["norm_const_tensor"],
+        d_dtype=torch.float8_e4m3fn,
+        sf_vec_size=32,
+    )
+
+
+@pytest.mark.L0
+def test_dglu_block_scaled_memo_hit_matches_cold_path(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
+
+    inputs_a = _dglu_bs_inputs([256] * L_BS)
+    inputs_b = _dglu_bs_inputs([512, 256, 512, 256])
+    _assert_hit_matches_cold(
+        monkeypatch, dglu_api, "_dglu_wrapper_memo", _dglu_bs_call, inputs_a, inputs_b, lambda out: out["d_row_tensor"][: inputs_b["valid_m"]]
+    )
+
+
+def _quant_call(inputs, **overrides):
+    from cudnn import grouped_gemm_quant_wrapper_sm100
+
+    kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        norm_const_tensor=inputs["norm_const_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        d_dtype=torch.float8_e4m3fn,
+        sf_vec_size=32,
+    )
+    kwargs.update(overrides)
+    return grouped_gemm_quant_wrapper_sm100(**kwargs)
+
+
+@pytest.mark.L0
+def test_quant_memo_hit_matches_cold_path(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.quant import api as quant_api
+
+    inputs_a = _mxfp8_inputs([256] * L_BS)
+    inputs_b = _mxfp8_inputs([512, 256, 512, 256])
+    _assert_hit_matches_cold(monkeypatch, quant_api, "_quant_wrapper_memo", _quant_call, inputs_a, inputs_b, lambda out: out["d_tensor"][: inputs_b["valid_m"]])
+
+
+@pytest.mark.L0
+def test_quant_memo_misses_on_plan_time_change(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.quant import api as quant_api
+
+    memo = _install_memo(monkeypatch, quant_api, "_quant_wrapper_memo")
+    _quant_call(_mxfp8_inputs([256] * L_BS))
+    _quant_call(_mxfp8_inputs([256] * L_BS))
+    assert memo.stores == 1
+    _quant_call(_mxfp8_inputs([256] * 2, l=2))
+    assert memo.stores == 2
+    bf16_out = _quant_call(_mxfp8_inputs([256] * L_BS), d_dtype=torch.bfloat16)
+    assert memo.stores == 3 and tuple(bf16_out["amax_tensor"].shape) == (L_BS, 1) and bf16_out["sfd_row_tensor"] is None
+    assert len(memo) == 3
+
+
+def _wgrad_inputs(group_k_list):
+    from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import allocate_grouped_gemm_wgrad_tensors, grouped_gemm_wgrad_init
+
+    cfg = grouped_gemm_wgrad_init(
+        ab_dtype=torch.float8_e4m3fn,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+    cfg["group_k_list"] = group_k_list
+    return allocate_grouped_gemm_wgrad_tensors(cfg)
+
+
+def _wgrad_call(inputs, **overrides):
+    from cudnn import grouped_gemm_wgrad_wrapper_sm100
+
+    kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        offsets_tensor=inputs["offsets_tensor"],
+        wgrad_dtype=torch.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+    )
+    kwargs.update(overrides)
+    return grouped_gemm_wgrad_wrapper_sm100(**kwargs)
+
+
+@pytest.mark.L0
+def test_wgrad_memo_hit_matches_cold_path(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
+
+    inputs_a = _wgrad_inputs([256, 384])
+    inputs_b = _wgrad_inputs([384, 256])
+    _assert_hit_matches_cold(monkeypatch, wgrad_api, "_wgrad_wrapper_memo", _wgrad_call, inputs_a, inputs_b, lambda out: out["wgrad_tensor"])
+
+
+@pytest.mark.L0
+def test_wgrad_memo_misses_on_plan_time_change(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
+
+    memo = _install_memo(monkeypatch, wgrad_api, "_wgrad_wrapper_memo")
+    _wgrad_call(_wgrad_inputs([256, 384]))
+    _wgrad_call(_wgrad_inputs([384, 256]))
+    assert memo.stores == 1
+    accumulate = _wgrad_call(_wgrad_inputs([256, 384]), accumulate_on_output=True)
+    assert memo.stores == 2
+    fp16_out = _wgrad_call(_wgrad_inputs([256, 384]), wgrad_dtype=torch.float16)
+    assert memo.stores == 3 and fp16_out["wgrad_tensor"].dtype == torch.float16 and accumulate["wgrad_tensor"].dtype == torch.bfloat16
+    assert len(memo) == 3
