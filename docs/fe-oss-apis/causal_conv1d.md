@@ -43,11 +43,17 @@ wrappers, and CUDA stream handles are backend details.
 
 The current optimized route covers dense and `cu_seqlens`-packed BF16-activation
 width-four SiLU forward and backward, including mathematical `W - 1` initial
-and final state. Weights may be BF16, or FP32 for the bias-free contract used by
-GLM linear-attention blocks; an FP32 weight with bias declines explicitly. The
-implementation adapts state to a private full-width buffer without exposing its
-storage or layout. `seq_idx` remains reserved and declines explicitly until a
-matching backend exists.
+and final state. Weights may be BF16, or FP32 without bias (BF16 activations
+with an FP32 depthwise filter); the FP32-weight epilogue is only tested without
+bias, so an FP32 weight with bias declines explicitly. The implementation adapts
+state to a private full-width buffer without exposing its storage or layout.
+`seq_idx` remains reserved and declines explicitly until a matching backend
+exists.
+
+`final_states_out` must not share memory with `x`, `weight`, `bias`,
+`cu_seqlens`, or `initial_states`. The final state is written after the forward
+and the inputs are saved for backward, so an aliased output would corrupt them;
+overlapping storage is rejected with `ValueError`.
 
 Packed `cu_seqlens` values are validated on the device to avoid a host read.
 Malformed metadata—including a first offset other than zero, a final offset
@@ -56,7 +62,9 @@ sequence—executes a device trap. The resulting sticky CUDA failure is not a
 recoverable Python exception; the process must discard that CUDA context before
 continuing GPU work.
 
-The current backward implementation accumulates dweight with FP32 atomics, so
-its dweight result is not bitwise reproducible across launches, even when
-PyTorch deterministic algorithms are enabled. A deterministic dweight route
-is not currently exposed by this semantic operation.
+The backward honors `torch.use_deterministic_algorithms`. By default dweight
+accumulates with FP32 atomics and is not bitwise reproducible across launches.
+When deterministic algorithms are enabled, bias-free calls select a deterministic
+dweight route (unique FP32 partials followed by a fixed-order reduction). Calls
+with `bias` have no deterministic dbias route: they raise `RuntimeError`, or warn
+and run with atomics under `warn_only=True`, mirroring PyTorch's own semantics.

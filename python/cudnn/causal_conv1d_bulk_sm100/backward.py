@@ -15,10 +15,11 @@ Compilation is exact-shape. Packed metadata values stay on device: a small
 pre-kernel validates the prefix sums and builds a bounded per-sequence tile
 map, after which the dense backward math is reused without cross-sequence
 reads. The default schedules accumulate dweight with FP32 atomics; partial
-schedules use caller-owned FP32 partials and a second reduction. The atomic
-schedules do not produce bitwise-reproducible dweight, even when PyTorch
-deterministic algorithms are enabled; request ``t64-partial`` when reproducible
-dweight is required. ``v4-stream`` is a dense, bias-free FE-native schedule
+schedules use caller-owned FP32 partials and a second reduction. With
+``deterministic=True`` (the semantic op passes torch's deterministic-algorithms
+mode) ``auto`` selects a partial schedule, and any remaining atomic
+accumulation (an explicit atomic schedule, or dbias) raises, or warns under
+torch's warn-only mode. ``v4-stream`` is a dense, bias-free FE-native schedule
 derived from the operator math: each thread streams four adjacent channels,
 and a single occupancy formula chooses its token tile instead of maintaining a
 config zoo.
@@ -31,6 +32,7 @@ schedules.
 
 from __future__ import annotations
 
+import warnings
 from typing import NamedTuple
 
 import torch
@@ -94,12 +96,21 @@ def select_bulk_bwd_schedule(total_tokens: int) -> str:
     """Choose the measured atomic schedule for the dense prototype.
 
     Both returned schedules use FP32 atomics, so dweight is not bitwise
-    reproducible across launches, including when PyTorch deterministic
-    algorithms are enabled. Request ``t64-partial`` explicitly when
-    reproducible dweight is required.
+    reproducible across launches. ``check_support`` substitutes
+    ``t64-partial`` when the caller requests deterministic execution.
     """
 
     return "t128" if total_tokens >= 16384 else "t64"
+
+
+def _alert_nondeterministic(reason: str) -> None:
+    """Mirror torch deterministic-mode semantics: strict raises, warn-only warns."""
+
+    message = f"causal_conv1d backward is not deterministic: {reason}; " "torch.use_deterministic_algorithms(True) is set"
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    else:
+        raise RuntimeError(message)
 
 
 def _align_vec2_cpasync_tile(tokens_per_cta: int) -> int:
@@ -144,9 +155,13 @@ class CausalConv1dBulkBwdPrototype(APIBase):
         sample_bias: torch.Tensor | None = None,
         sample_initial_state: torch.Tensor | None = None,
         sample_d_final_state: torch.Tensor | None = None,
+        deterministic: bool = False,
     ) -> None:
         super().__init__()
         self._warn_experimental_api()
+        if not isinstance(deterministic, bool):
+            raise TypeError(f"deterministic must be bool, got {type(deterministic).__name__}")
+        self.deterministic = deterministic
         for name, sample in (
             ("sample_x", sample_x),
             ("sample_weight", sample_weight),
@@ -436,9 +451,16 @@ class CausalConv1dBulkBwdPrototype(APIBase):
         )
         if auto_streaming:
             schedule = "v2-cpasync" if compute_capability in F32X2_COMPUTE_CAPABILITIES else "v4-stream"
+        elif self.requested_schedule == _AUTO_SCHEDULE:
+            schedule = "t64-partial" if self.deterministic else select_bulk_bwd_schedule(schedule_extent)
         else:
-            schedule = select_bulk_bwd_schedule(schedule_extent) if self.requested_schedule == _AUTO_SCHEDULE else self.requested_schedule
+            schedule = self.requested_schedule
         config = _SCHEDULES[schedule]
+        if self.deterministic:
+            if config.dweight_mode == _DWEIGHT_ATOMIC:
+                _alert_nondeterministic(f"schedule {schedule!r} accumulates dweight with FP32 atomics")
+            if self.bias_desc is not None:
+                _alert_nondeterministic("dbias accumulates with FP32 atomics")
         kernel_variant = config.kernel_variant
         sm_count = None
         if config.kernel_variant in (_VEC4_STREAM_KERNEL, _VEC2_CPASYNC_KERNEL):
@@ -848,6 +870,7 @@ def compile_causal_conv1d_bulk_bwd_prototype(
     bias: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    deterministic: bool = False,
 ) -> CausalConv1dBulkBwdPrototype:
     """Construct, support-check, and compile an exact-shape prototype."""
 
@@ -860,6 +883,7 @@ def compile_causal_conv1d_bulk_bwd_prototype(
         sample_d_final_state=d_final_state,
         schedule=schedule,
         sample_bias=bias,
+        deterministic=deterministic,
     )
     api.check_support()
     api.compile()

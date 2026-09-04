@@ -297,8 +297,8 @@ def test_bulk_backend_training_dispatch_includes_internal_state(monkeypatch):
                 "final_state_tensor": kwargs["initial_state"].clone(),
             }
 
-    def get_backend(x, native_weight, bias, cu_seqlens, native_initial, output_final_state):
-        observed.update(cache_initial=native_initial, cache_final=output_final_state)
+    def get_backend(x, native_weight, bias, cu_seqlens, native_initial, output_final_state, deterministic):
+        observed.update(cache_initial=native_initial, cache_final=output_final_state, deterministic=deterministic)
         return Backend()
 
     monkeypatch.setattr(module, "_get_causal_conv1d_training_backend", get_backend)
@@ -611,3 +611,70 @@ def test_last_route_diagnostic_is_thread_and_async_context_local():
 
     assert tuple(asyncio.run(run_async_workers())) == routes
     assert module._get_causal_conv1d_last_route() == "generic-cudnn"
+
+
+@pytest.mark.parametrize("alias", ["x", "weight", "initial_states"])
+def test_final_states_out_must_not_share_memory_with_inputs(alias):
+    module = _ops_module()
+    backing = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    x = backing.transpose(1, 2)
+    weight = torch.randn(8, 4, dtype=torch.bfloat16)
+    initial_states = torch.randn(2, 8, 3, dtype=torch.bfloat16)
+    if alias == "x":
+        final_states_out = x[..., :3]
+    elif alias == "weight":
+        final_states_out = weight.as_strided((2, 8, 3), (0, 4, 1))
+    else:
+        final_states_out = initial_states
+
+    with pytest.raises(ValueError, match=f"final_states_out must not share memory with {alias}"):
+        module.causal_conv1d(
+            x,
+            weight,
+            activation="silu",
+            initial_states=initial_states,
+            return_final_states=True,
+            final_states_out=final_states_out,
+        )
+
+
+def test_shared_memory_check_uses_addressed_byte_spans_not_storage_identity():
+    module = _ops_module()
+    storage = torch.empty(2 * 2 * 8 * 3, dtype=torch.bfloat16)
+    first = storage[: 2 * 8 * 3].view(2, 8, 3)
+    second = storage[2 * 8 * 3 :].view(2, 8, 3)
+    shifted = storage[1 : 2 * 8 * 3 + 1].view(2, 8, 3)
+
+    assert not module._tensors_share_memory(first, second)
+    assert module._tensors_share_memory(first, shifted)
+    assert module._tensors_share_memory(first, first.transpose(1, 2))
+
+
+def test_training_dispatch_keys_and_forwards_torch_deterministic_mode(monkeypatch):
+    module = _ops_module()
+    properties = SimpleNamespace(major=10, minor=0, multi_processor_count=148)
+    monkeypatch.setattr(module.torch.cuda, "get_device_properties", lambda device: properties)
+    x_btd = torch.randn(1, 5, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, 4, dtype=torch.bfloat16, requires_grad=True)
+
+    default_key = module._causal_conv1d_training_key(x_btd, weight, None, None)
+    deterministic_key = module._causal_conv1d_training_key(x_btd, weight, None, None, None, False, True)
+    assert default_key != deterministic_key
+
+    observed = []
+
+    def get_backend(x, native_weight, bias, cu_seqlens, initial_state, output_final_state, deterministic):
+        observed.append(deterministic)
+        return lambda *args, **kwargs: x.clone()
+
+    monkeypatch.setattr(module, "_get_causal_conv1d_training_backend", get_backend)
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(False)
+        module._run_causal_conv1d_bulk_backend(x_btd, weight, None, None)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        module._run_causal_conv1d_bulk_backend(x_btd, weight, None, None)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+    assert observed == [False, True]

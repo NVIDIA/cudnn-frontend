@@ -282,13 +282,15 @@ def _causal_conv1d_training_key(
     cu_seqlens: Optional[Tensor],
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
+    deterministic: bool = False,
 ):
     """Key every plan-time field consumed by the exact-shape training backend.
 
     The routed backend is fixed to BF16 width-four SiLU. Tensor signatures key
     its remaining specializations: dense versus packed presence, packed N,
     bias and state presence, final-state output, shapes, strides, dtypes, and
-    device. Device properties key the architecture-dependent schedule. Runtime
+    device. Device properties key the architecture-dependent schedule, and the
+    torch deterministic-algorithms mode keys the dweight schedule. Runtime
     ``cu_seqlens`` values are intentionally absent because the kernel consumes
     them on device.
     """
@@ -303,6 +305,7 @@ def _causal_conv1d_training_key(
         _tensor_plan_signature(cu_seqlens),
         _tensor_plan_signature(initial_state),
         bool(output_final_state),
+        bool(deterministic),
         (properties.major, properties.minor),
         properties.multi_processor_count,
     )
@@ -315,6 +318,7 @@ def _compile_causal_conv1d_training_backend(
     cu_seqlens: Optional[Tensor],
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
+    deterministic: bool = False,
 ):
     from cudnn.causal_conv1d_bulk_sm100.autograd import (
         CausalConv1dBulkAutogradPrototype as _TrainingBackend,
@@ -327,6 +331,7 @@ def _compile_causal_conv1d_training_backend(
         sample_bias=bias,
         sample_initial_state=initial_state,
         output_final_state=output_final_state,
+        deterministic=deterministic,
     )
 
 
@@ -337,6 +342,7 @@ def _get_causal_conv1d_training_backend(
     cu_seqlens: Optional[Tensor],
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
+    deterministic: bool = False,
 ):
     key = _causal_conv1d_training_key(
         x_btd,
@@ -345,6 +351,7 @@ def _get_causal_conv1d_training_backend(
         cu_seqlens,
         initial_state,
         output_final_state,
+        deterministic,
     )
     with _CAUSAL_CONV1D_TRAINING_CACHE_LOCK:
         backend = _CAUSAL_CONV1D_TRAINING_CACHE.get(key)
@@ -359,6 +366,7 @@ def _get_causal_conv1d_training_backend(
             cu_seqlens,
             initial_state,
             output_final_state,
+            deterministic,
         )
         _CAUSAL_CONV1D_TRAINING_CACHE[key] = backend
         if len(_CAUSAL_CONV1D_TRAINING_CACHE) > _CAUSAL_CONV1D_TRAINING_CACHE_CAPACITY:
@@ -385,6 +393,7 @@ def _run_causal_conv1d_bulk_backend(
             cu_seqlens,
             initial_state,
             output_final_state,
+            torch.are_deterministic_algorithms_enabled(),
         )
         result = backend(
             x_btd,
@@ -450,9 +459,8 @@ def _can_route_causal_conv1d_bulk(
         torch.float32,
     ):
         return False
-    # The current mixed-weight specialization targets the exact GLM contract:
-    # BF16 activations, FP32 depthwise weights, and no bias.  Keep other mixed
-    # combinations out of the route until their epilogue contract is tested.
+    # The FP32-weight epilogue is only tested without bias; other mixed-dtype
+    # combinations stay off the route until their epilogue contract is tested.
     if weight.dtype == torch.float32 and bias is not None:
         return False
     if bias is not None and bias.dtype != torch.bfloat16:
@@ -559,6 +567,36 @@ def _validate_causal_conv1d_sequence_contract(
             raise TypeError(f"{name} dtype must match x dtype {x.dtype}, got {state.dtype}")
         if state is not None and state.device != x.device:
             raise ValueError(f"{name} device must match x device {x.device}, got {state.device}")
+    if final_states_out is not None:
+        # The final state is written after the forward, and autograd saves the
+        # inputs for backward, so an aliased output would corrupt them.
+        for name, tensor in (
+            ("x", x),
+            ("weight", weight),
+            ("bias", bias),
+            ("cu_seqlens", cu_seqlens),
+            ("initial_states", initial_states),
+        ):
+            if tensor is not None and _tensors_share_memory(final_states_out, tensor):
+                raise ValueError(f"final_states_out must not share memory with {name}")
+
+
+def _tensor_byte_span(tensor: Tensor) -> Tuple[int, int]:
+    """Half-open device byte range addressed by a possibly strided view."""
+
+    begin = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return begin, begin
+    last_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    return begin, begin + (last_offset + 1) * tensor.element_size()
+
+
+def _tensors_share_memory(lhs: Tensor, rhs: Tensor) -> bool:
+    if lhs.device != rhs.device:
+        return False
+    lhs_begin, lhs_end = _tensor_byte_span(lhs)
+    rhs_begin, rhs_end = _tensor_byte_span(rhs)
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
 
 
 def _to_causal_conv1d_full_width_state(initial_states: Optional[Tensor]) -> Optional[Tensor]:
@@ -662,10 +700,14 @@ def causal_conv1d(
 
     The current optimized route implements dense and ``cu_seqlens``-packed
     BF16 width-four SiLU with forward and backward. Dense bias-free calls also
-    accept FP32 weights, matching models which retain the depthwise filter in
-    FP32 while their activations remain BF16. Unsupported optional modes fail
-    explicitly without changing the public state shape to match a backend
-    cache convention.
+    accept an FP32 depthwise filter with BF16 activations. Unsupported optional
+    modes fail explicitly without changing the public state shape to match a
+    backend cache convention.
+
+    ``final_states_out`` must not share memory with any input. The backward
+    honors ``torch.use_deterministic_algorithms``: bias-free calls switch to a
+    deterministic dweight schedule, while calls with ``bias`` raise (or warn
+    under ``warn_only=True``) because dbias accumulates with FP32 atomics.
     """
 
     _reset_causal_conv1d_last_route()

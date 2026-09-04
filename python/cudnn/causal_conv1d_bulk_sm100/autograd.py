@@ -145,6 +145,7 @@ class CausalConv1dBulkAutogradPrototype:
         sample_bias: torch.Tensor | None = None,
         sample_initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
+        deterministic: bool = False,
     ) -> None:
         if not isinstance(output_final_state, bool):
             raise TypeError(f"output_final_state must be bool, got {type(output_final_state).__name__}")
@@ -166,6 +167,7 @@ class CausalConv1dBulkAutogradPrototype:
             bias=sample_bias,
             initial_state=sample_initial_state,
             d_final_state=sample_d_final_state,
+            deterministic=deterministic,
         )
         self.output_final_state = output_final_state
 

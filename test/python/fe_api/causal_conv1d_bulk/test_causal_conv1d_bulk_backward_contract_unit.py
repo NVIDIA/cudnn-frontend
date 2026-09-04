@@ -43,6 +43,7 @@ def _support_checked_api(
     with_initial_state=False,
     with_d_final_state=False,
     weight_dtype=torch.bfloat16,
+    deterministic=False,
 ):
     backward, _, api_class, _ = _load_backward()
     x = torch.empty(batch, tokens, channels, dtype=torch.bfloat16)
@@ -64,6 +65,7 @@ def _support_checked_api(
         sample_bias=bias,
         sample_initial_state=initial_state,
         sample_d_final_state=d_final_state,
+        deterministic=deterministic,
     )
     monkeypatch.setattr(backward, "cutedsl_state", lambda: (True, None))
     monkeypatch.setattr(api, "_require_cuda", lambda desc, name: None)
@@ -590,3 +592,48 @@ def test_packed_execute_requires_tile_map_even_for_atomic_schedule(monkeypatch):
             torch.empty_like(weight, dtype=torch.float32),
             cu_seqlens=cu_seqlens,
         )
+
+
+def test_default_auto_schedule_still_accumulates_dweight_with_atomics(monkeypatch):
+    backward, *_ = _load_backward()
+    api, *_ = _support_checked_api(monkeypatch, schedule="auto")
+    assert api.dweight_mode == backward._DWEIGHT_ATOMIC
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"num_sequences": 4}, {"with_initial_state": True, "with_d_final_state": True}])
+def test_deterministic_auto_schedule_uses_partial_dweight(monkeypatch, kwargs):
+    backward, *_ = _load_backward()
+    api, *_ = _support_checked_api(monkeypatch, schedule="auto", deterministic=True, **kwargs)
+    assert api.dweight_mode == backward._DWEIGHT_PARTIAL
+    assert api.dweight_workspace_numel > 0
+
+
+def test_deterministic_auto_keeps_the_partial_streaming_schedule(monkeypatch):
+    backward, *_ = _load_backward()
+    api, *_ = _support_checked_api(monkeypatch, tokens=8192, channels=512, schedule="auto", deterministic=True)
+    assert api.dweight_mode == backward._DWEIGHT_PARTIAL
+
+
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        ({"schedule": "t64"}, "dweight with FP32 atomics"),
+        ({"schedule": "auto", "with_bias": True}, "dbias accumulates"),
+    ],
+)
+def test_deterministic_strict_mode_rejects_remaining_atomics(monkeypatch, kwargs, reason):
+    with pytest.raises(RuntimeError, match=reason):
+        _support_checked_api(monkeypatch, deterministic=True, **kwargs)
+
+
+def test_deterministic_warn_only_mode_warns_and_keeps_atomic_dbias(monkeypatch):
+    backward, *_ = _load_backward()
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with pytest.warns(RuntimeWarning, match="dbias accumulates"):
+            api, *_ = _support_checked_api(monkeypatch, schedule="auto", with_bias=True, deterministic=True)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+    assert api.dweight_mode == backward._DWEIGHT_PARTIAL
