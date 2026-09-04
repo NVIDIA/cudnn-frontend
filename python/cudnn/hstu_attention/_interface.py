@@ -837,6 +837,8 @@ def hstu_varlen_bwd_100(
     q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small", "legacy")
     if _q1_bwd_algorithm not in q1_bwd_algorithms:
         raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
+    if head_dim == 256 and _q1_bwd_algorithm in ("tc", "tc-small"):
+        raise ValueError("The tc and tc-small qlen=1 backward algorithms do not support D=256")
     q1_direct_supported = is_q_len_one_supported and (is_causal or is_local) and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
     if _q1_bwd_algorithm in (*_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small") and not q1_direct_supported:
         raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal or local qlen=1 with D=64/128/256 and direct layouts")

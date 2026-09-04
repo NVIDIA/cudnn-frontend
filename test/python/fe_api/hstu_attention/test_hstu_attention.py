@@ -1587,6 +1587,43 @@ def test_single_query_backward_thread_selector(capability, batch_size, heads, sp
     assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv, head_dim) == expected
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("algorithm", ("tc", "tc-small"))
+def test_single_query_backward_rejects_d256_q_major_algorithms(monkeypatch, algorithm):
+    from cudnn.hstu_attention._kernels import hstu_bwd_256_cute
+
+    shape = (1, 1, 256)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    do = torch.empty_like(q)
+    cu = torch.tensor((0, 1), dtype=torch.int32)
+
+    monkeypatch.setattr(_interface, "_get_q1_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(hstu_bwd_256_cute, "hstu_varlen_bwd_256_cute", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match="tc and tc-small qlen=1 backward algorithms do not support D=256"):
+        _interface.hstu_varlen_bwd_100(
+            do,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            1,
+            1,
+            None,
+            None,
+            None,
+            -1,
+            0,
+            1.0,
+            None,
+            False,
+            _compile_only=True,
+            _q1_bwd_algorithm=algorithm,
+        )
+
+
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
 @pytest.mark.parametrize("head_dim", (64, 128, 256))
