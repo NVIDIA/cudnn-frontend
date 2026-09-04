@@ -4,7 +4,7 @@
 """SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
 
 Two CuTe DSL kernels ported from Xinbo Zhao's ``fmha_mxfp8_large_head_dim``
-(nvbug 6686466, MLPerf Qwen3.5 MXFP8 GQA d=256), each a 2-CTA warp-specialized
+each a 2-CTA warp-specialized
 MMA pipeline over E4M3 payloads with 1x32 E8M0 block scales: the dQ kernel
 (Q.K^T, dO.V^T, dS.K) and a fused dK/dV kernel (Q.K^T, dO.V^T, dS^T.Q, P^T.dO).
 dS is quantized in-kernel with an online per-block E8M0 scale (the upstream

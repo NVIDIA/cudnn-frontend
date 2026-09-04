@@ -55,8 +55,7 @@ from ._bprop_mxfp8_common_sm100 import (
 """
 SM100 D256 MXFP8 SDPA backward: the fused dK/dV kernel (2-CTA, online or fixed dS scale).
 
-Ported from gitlab-master.nvidia.com/xinboz/fmha_mxfp8_large_head_dim @ 5acfe51f
-(2026-09-01, Xinbo Zhao) for nvbug 6686466 (MLPerf Qwen3.5 MXFP8 GQA d=256).
+Ported from Xinbo Zhao's fmha_mxfp8_large_head_dim (2026-09-01).
 Kept as close to the source as the package rules allow so upstream fixes
 stay diff-able; only the imports and this note differ.
 

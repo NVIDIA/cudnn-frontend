@@ -815,7 +815,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     """SM100 (Blackwell) d=256 block-scale MXFP8 backward row.
 
     Two kernels (dQ; fused dK/dV) ported from the ``fmha_mxfp8_large_head_dim``
-    repo for nvbug 6686466 (MLPerf Qwen3.5 MXFP8 GQA d=256), preceded by a
+    repo, preceded by a
     scale-factor repack into the kernels' 2-CTA slot layout (see
     ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is). Exact d=256 only
     -- the SF plumbing has no envelope story, as on the forward MXFP8 row.
@@ -834,7 +834,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
         name="sdpa_bwd_sm100_mxfp8",
         capabilities=Capabilities(
             sm_lo=100,
-            sm_hi=106,  # no Rubin MXFP8 lowering (matches the forward MXFP8 row)
+            sm_hi=106,  # no sm107 MXFP8 lowering (matches the forward MXFP8 row)
             d=frozenset({256}),
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),

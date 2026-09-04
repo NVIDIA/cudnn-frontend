@@ -33,8 +33,7 @@ plus the JIT-side tensor helpers of ``fmha_cute/layouts.py`` (the torch-side
 test helpers of that file are NOT ported; the adapter in ``bwd/api_dsl.py``
 builds the operand views).
 
-Ported from gitlab-master.nvidia.com/xinboz/fmha_mxfp8_large_head_dim @ 5acfe51f
-(2026-09-01, Xinbo Zhao) for nvbug 6686466 (MLPerf Qwen3.5 MXFP8 GQA d=256).
+Ported from Xinbo Zhao's fmha_mxfp8_large_head_dim (2026-09-01).
 Kept as close to the source as the package rules allow so upstream fixes
 stay diff-able; only the imports and this note differ.
 """

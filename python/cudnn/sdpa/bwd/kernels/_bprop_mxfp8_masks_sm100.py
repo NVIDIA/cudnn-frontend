@@ -31,8 +31,7 @@
 ``fmha_cute/masks.py`` of the source repo (itself the CUTLASS CuTe DSL FMHA
 example's mask module extended with the *_BWD variants).
 
-Ported from gitlab-master.nvidia.com/xinboz/fmha_mxfp8_large_head_dim @ 5acfe51f
-(2026-09-01, Xinbo Zhao) for nvbug 6686466 (MLPerf Qwen3.5 MXFP8 GQA d=256).
+Ported from Xinbo Zhao's fmha_mxfp8_large_head_dim (2026-09-01).
 Kept as close to the source as the package rules allow so upstream fixes
 stay diff-able; only the imports and this note differ.
 """

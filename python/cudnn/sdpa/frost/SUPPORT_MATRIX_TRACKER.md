@@ -45,7 +45,7 @@ front**: the seven F8_128x4 scale tensors are repacked into the kernels'
 2-CTA slot layout (eleven small launches into workspace), then a dQ kernel
 (Q·Kᵀ, dO·Vᵀ, dS·K) and a fused dK/dV kernel (Q·Kᵀ, dO·Vᵀ, dSᵀ·Q, Pᵀ·dO) run,
 both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
-`fmha_mxfp8_large_head_dim` (nvbug 6686466). dS is quantized in-kernel with an
+`fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
 online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
 documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
 
