@@ -106,6 +106,9 @@ $$
 O[q] = \sum_{b \in \mathcal{B}_q} \sum_{k \in \text{block}_b} \text{softmax}\left(\frac{Q[q] \cdot K[k]^T}{\sqrt{D}}\right) V[k]
 $$
 
+With `is_causal=True`, selected tokens with $k > q$ are masked. This includes
+future tokens in the selected block that contains the current query.
+
 #### High-level Wrapper
 
 ```python
@@ -120,6 +123,7 @@ result = NSA.selection_attention_wrapper(
     cum_seqlen_q_tensor=cum_seqlen_q,
     cum_seqlen_k_tensor=cum_seqlen_k,
     block_size=64,
+    is_causal=False,
     scale_softmax=None,  # Defaults to 1/sqrt(head_dim)
     o_dtype=torch.bfloat16,
     acc_dtype=torch.float32,
@@ -152,6 +156,7 @@ selection_attention = NSA.SelectionAttention(
     max_s_k=1024,
     acc_dtype=torch.float32,
     block_size=64,
+    is_causal=False,
     scale_softmax=None,
 )
 assert selection_attention.check_support()
@@ -176,7 +181,8 @@ selection_attention.execute(
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `block_size` | `int` | Size of each attention block. Must be one of `{16, 32, 64}` | `64` |
+| `block_size` | `int` | Size of each attention block. Must be one of `{16, 32, 64, 128}` | `64` |
+| `is_causal` | `bool` | Mask selected tokens whose sequence-local position is after the query | `False` |
 | `scale_softmax` | `float \| None` | Softmax scaling factor | `1/sqrt(head_dim)` |
 | `acc_dtype` | `torch.dtype` | Accumulator dtype. Must be `torch.float32` | `torch.float32` |
 | `max_s_q` | `int` | Maximum sequence length for queries | Required for T,H,D |
