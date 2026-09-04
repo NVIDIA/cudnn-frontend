@@ -35,6 +35,18 @@ def _is_sm80() -> bool:
 
 _SM80 = pytest.mark.skipif(not _is_sm80(), reason="needs an SM80 (A100) GPU")
 
+
+def _has_supported_cutedsl() -> bool:
+    """Rule 7 (python/cudnn/AGENTS.md): skip below CUTEDSL_MIN_VERSION instead of
+    failing inside the DSL when the kernel module loads."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    return bool(installed) and not cutedsl_too_old(version)
+
+
+pytestmark = pytest.mark.skipif(not _has_supported_cutedsl(), reason="requires nvidia-cutlass-dsl at or above cudnn.frost.buffers.CUTEDSL_MIN_VERSION")
+
 B, H, S, D = 2, 4, 512, 128
 _HALF = cudnn.data_type.HALF
 _SCALE = 1.0 / math.sqrt(D)

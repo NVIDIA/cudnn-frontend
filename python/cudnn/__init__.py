@@ -397,9 +397,41 @@ def _load_optional_symbol(name: str) -> Any:
     return value
 
 
+# `cuda` (cuda-python) is deliberately NOT here: it is a separate dependency the
+# `[cutedsl]` extra installs, so a missing `cuda` wants that install, not a DSL upgrade.
+_DSL_STACK_MODULES = ("cutlass", "tvm_ffi", "nvidia_cutlass_dsl", "cudnn")
+
+
+def _missing_non_dsl_module(error: BaseException):
+    """Name of the missing module when the failure is a ModuleNotFoundError outside
+    the CuTe DSL stack, else None.
+
+    Walks the exception chain; the first ModuleNotFoundError decides. ``cudnn``
+    counts as the DSL stack because a kernel package failing to import on an old
+    DSL surfaces as a missing cudnn.* submodule.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModuleNotFoundError):
+            name = error.name or ""
+            top = name.split(".", 1)[0]
+            return name if top and top not in _DSL_STACK_MODULES else None
+        error = error.__cause__ or error.__context__
+    return None
+
+
 def _optional_dependency_message(name: str, error: Exception) -> str:
     # A DSL that is installed but below the floor must not be reported as a
-    # missing dependency: "pip install [cutedsl]" would change nothing.
+    # missing dependency: "pip install [cutedsl]" would change nothing. The
+    # converse holds too: a failure that is plainly NOT the DSL's -- a missing
+    # third-party module such as torch -- must not be blamed on the DSL version
+    # just because an old DSL happens to be installed.
+    missing = _missing_non_dsl_module(error)
+    if missing is not None:
+        # Name the module: the install hint alone does not fetch a missing framework
+        # (torch, jax) and only fetches cuda-python via the extra.
+        return f"{name} requires the {missing!r} module, which is not installed. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {error}"
     try:
         from .frost.buffers import cutedsl_requirement_error
 

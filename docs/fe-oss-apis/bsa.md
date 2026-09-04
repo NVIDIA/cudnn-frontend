@@ -179,7 +179,7 @@ The architecture-specific FP8 contracts are:
 `block_sparse_attention_fp8_forward` requires CuTe DSL 4.6.1 or newer at call
 time. Its internal Q/K/V quantizer is also implemented in CuTe DSL and is
 loaded lazily, so importing `cudnn` still works with the package-wide CuTe DSL
-4.5 dependency floor.
+4.6.2 dependency floor.
 
 ## Backward
 

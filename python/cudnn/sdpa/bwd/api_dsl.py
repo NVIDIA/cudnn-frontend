@@ -1896,6 +1896,14 @@ def sdpa_bwd_wrapper_sm80(
     drops KV tiles, an undersized ``max_s_q`` indexes the relay counter out
     of bounds.
     """
+    # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
+    # own, so decline by DSL version here instead of surfacing the DSL's own
+    # TypeError/ModuleNotFoundError from the template load.
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    _too_old = cutedsl_requirement_error("sdpa_bwd_wrapper_sm80")
+    if _too_old is not None:
+        raise NotImplementedError(_too_old)
     # THD / varlen: q/k/v/o/dO are PACKED [1, T, H, D] (BSHD) + cu_seqlens;
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
     # transpose + dense grad alloc (mirrors the forward THD branch).

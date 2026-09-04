@@ -4469,6 +4469,14 @@ def sdpa_fwd_wrapper_sm80(
     token extents.  ALiBi, block_mask and the score-stat side outputs are not
     supported (use the graph API, which routes them to the cuDNN backend).
     """
+    # Rule 7 (python/cudnn/AGENTS.md): this entry reaches the kernel module on its
+    # own, so decline by DSL version here instead of surfacing the DSL's own
+    # TypeError/ModuleNotFoundError from the template load.
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    _too_old = cutedsl_requirement_error("sdpa_fwd_wrapper_sm80")
+    if _too_old is not None:
+        raise NotImplementedError(_too_old)
     if q_tensor.ndim != 4 or v_tensor.ndim != 4:
         raise ValueError(f"Q and V must be rank-4 BHSD; got Q={q_tensor.ndim}D V={v_tensor.ndim}D")
     if scale_output not in (None, 1.0):
