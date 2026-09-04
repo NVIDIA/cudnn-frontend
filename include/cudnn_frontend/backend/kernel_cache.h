@@ -153,22 +153,10 @@ class KernelCache : public detail::backend_descriptor {
         std::lock_guard<std::mutex> lk(mutex_);
         value = 0;
 #if (CUDNN_VERSION >= 92700)
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       "CUDNN_ATTR_KERNEL_CACHE_REVISION is only available starting 9.27.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            get_ptr() == nullptr,
-            error_code_t::CUDNN_BACKEND_API_FAILED,
-            "KernelCache::revision: descriptor not initialized; call build() or from_json() first.");
-
-        int64_t element_count = 0;
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
-            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_REVISION, CUDNN_TYPE_INT64, 1, &element_count, &value));
-        return {};
+        return get_int64_attribute_unlocked(
+            CUDNN_ATTR_KERNEL_CACHE_REVISION, "CUDNN_ATTR_KERNEL_CACHE_REVISION", "KernelCache::revision", value);
 #else
-        return {error_code_t::CUDNN_BACKEND_API_FAILED,
-                "CUDNN_ATTR_KERNEL_CACHE_REVISION is only available starting 9.27."};
+        return {error_code_t::CUDNN_BACKEND_API_FAILED, too_old_message("CUDNN_ATTR_KERNEL_CACHE_REVISION")};
 #endif
     }
 
@@ -186,22 +174,10 @@ class KernelCache : public detail::backend_descriptor {
         std::lock_guard<std::mutex> lk(mutex_);
         value = 0;
 #if (CUDNN_VERSION >= 92700)
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
-                                       error_code_t::CUDNN_BACKEND_API_FAILED,
-                                       "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT is only available starting 9.27.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            get_ptr() == nullptr,
-            error_code_t::CUDNN_BACKEND_API_FAILED,
-            "KernelCache::size: descriptor not initialized; call build() or from_json() first.");
-
-        int64_t element_count = 0;
-        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
-            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT, CUDNN_TYPE_INT64, 1, &element_count, &value));
-        return {};
+        return get_int64_attribute_unlocked(
+            CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT, "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT", "KernelCache::size", value);
 #else
-        return {error_code_t::CUDNN_BACKEND_API_FAILED,
-                "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT is only available starting 9.27."};
+        return {error_code_t::CUDNN_BACKEND_API_FAILED, too_old_message("CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT")};
 #endif
     }
 
@@ -255,6 +231,37 @@ class KernelCache : public detail::backend_descriptor {
     bool
     finalized_unlocked() const {
         return finalized;
+    }
+
+    // The message that both revision() and size() give when the attribute is not available. The
+    // runtime check and the compile-time check use it, so the text exists once.
+    static std::string
+    too_old_message(const char *attribute_name) {
+        return std::string(attribute_name) + " is only available starting 9.27.";
+    }
+
+    // Reads one CUDNN_TYPE_INT64 attribute that cuDNN 9.27 adds. revision() and size() differ only
+    // in the attribute that they read, so the version check, the descriptor check and the read live
+    // here. The caller keeps the compile-time guard, because it must name the attribute.
+    // Must only be called with mutex_ already held (mutex_ is not recursive).
+    error_t
+    get_int64_attribute_unlocked(cudnnBackendAttributeName_t attribute,
+                                 const char *attribute_name,
+                                 const char *method_name,
+                                 int64_t &value) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       too_old_message(attribute_name));
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            get_ptr() == nullptr,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            std::string(method_name) + ": descriptor not initialized; call build() or from_json() first.");
+
+        int64_t element_count = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(
+            detail::get_attribute(get_ptr(), attribute, CUDNN_TYPE_INT64, 1, &element_count, &value));
+        return {};
     }
 };
 }  // namespace cudnn_frontend
