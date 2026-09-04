@@ -1503,16 +1503,17 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    ("capability", "supported", "expected"),
+    ("capability", "supported", "head_dim", "expected"),
     (
-        ((10, 3), True, 1),
-        ((10, 7), True, 1),
-        ((10, 7), False, 1),
-        ((10, 0), True, 1),
+        ((10, 0), True, 64, _interface._Q1_FWD_D64_D128_CONFIG),
+        ((10, 3), True, 128, _interface._Q1_FWD_D64_D128_CONFIG),
+        ((10, 7), True, 256, _interface._Q1_FWD_D256_CONFIG),
+        ((10, 7), False, 32, _interface._Q1_FWD_DEFAULT_CONFIG),
+        ((9, 0), True, 128, _interface._Q1_FWD_DEFAULT_CONFIG),
     ),
 )
-def test_single_query_forward_split_selector(capability, supported, expected):
-    assert _interface._select_q1_fwd_split_kv("auto", capability, supported) == expected
+def test_single_query_forward_config_selector(capability, supported, head_dim, expected):
+    assert _interface._select_q1_fwd_config(capability, supported, head_dim) == expected
 
 
 @pytest.mark.L0
@@ -1790,11 +1791,8 @@ def test_single_query_local_window_uses_general_paths_and_matches_pytorch(head_d
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM100, SM103, or SM107 GPU")
-@pytest.mark.parametrize(
-    ("head_dim", "algorithm"),
-    ((64, "tc"), (64, "auto"), (128, "auto"), (256, "auto")),
-)
-def test_single_query_forward_cache_reuses_runtime_shapes(head_dim, algorithm):
+@pytest.mark.parametrize("head_dim", (32, 64, 128, 256))
+def test_single_query_forward_cache_reuses_runtime_shapes(head_dim):
     """Packed token and batch extents must re-bind one compiled artifact."""
     _interface.hstu_varlen_fwd_100.compile_cache.clear()
 
@@ -1819,7 +1817,6 @@ def test_single_query_forward_cache_reuses_runtime_shapes(head_dim, algorithm):
             None,
             scaling_seqlen=256.0,
             out=out,
-            _q1_fwd_algorithm=algorithm,
         )
         expected = _reference_forward(
             q.cpu().float(),

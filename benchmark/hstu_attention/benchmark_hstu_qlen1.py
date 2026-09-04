@@ -29,6 +29,58 @@ from cudnn import HSTUBwdSm100, HSTUFwdSm100
 from cudnn.hstu_attention import _interface
 
 _KV_LENGTH_PATTERN = (1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072)
+_Q1_FWD_TUNING_ALGORITHMS = (
+    "tc",
+    "tc-split2",
+    "tc-split4",
+    "tc-m64",
+    "tc-m64-split2",
+    "tc-m64-split4",
+    "tc-m64-n64",
+    "tc-m64-n64-split2",
+    "tc-m64-n64-split4",
+    "tc-m64-warp1",
+    "tc-m64-warp1-split2",
+    "tc-m64-warp1-split4",
+    "tc-m64-warp2",
+    "tc-m64-warp2-split2",
+    "tc-m64-warp2-split4",
+    "tc-m64-warp3",
+    "tc-m64-warp3-split2",
+    "tc-m64-warp3-split4",
+    "tc-m64-inplace",
+    "tc-m64-inplace-split2",
+    "tc-m64-inplace-split4",
+    "tc-m64-16dp",
+    "tc-m64-16dp-split2",
+    "tc-m64-16dp-split4",
+    "tc-m64-16dp-tail",
+    "tc-m64-16dp-tail-kv5",
+    "tc-m64-16dp-tail-kv5-split2",
+    "tc-m64-16dp-tail-kv5-split4",
+    "tc-epi1",
+    "tc-epi1-split2",
+    "tc-epi1-split4",
+)
+
+
+def _q1_fwd_tuning_config(algorithm: str) -> _interface._Q1FwdKernelConfig:
+    """Translate a benchmark-only candidate name into kernel knobs."""
+    if algorithm not in _Q1_FWD_TUNING_ALGORITHMS:
+        raise ValueError(f"Unsupported qlen=1 forward tuning algorithm: {algorithm}")
+    split_kv = 2 if algorithm.endswith("-split2") else 4 if algorithm.endswith("-split4") else 1
+    silu_warps = 1 if "tc-m64-warp1" in algorithm else 2 if "tc-m64-warp2" in algorithm else 3 if "tc-m64-warp3" in algorithm else 0
+    return _interface._Q1FwdKernelConfig(
+        block_m=64 if algorithm.startswith("tc-m64") else 128,
+        block_n=64 if "m64-n64" in algorithm else 128,
+        split_kv=split_kv,
+        single_warp_epilogue=algorithm.startswith("tc-epi1"),
+        m64_silu_warps=silu_warps,
+        m64_inplace_silu="tc-m64-inplace" in algorithm or "tc-m64-16dp" in algorithm,
+        m64_16dp_silu="tc-m64-16dp" in algorithm,
+        m64_tail_branch="tc-m64-16dp-tail" in algorithm,
+        m64_kv_stage=5 if "-kv5" in algorithm else 0,
+    )
 
 
 def _kv_lengths(batch_size: int, average_kv: int) -> list[int]:
@@ -208,6 +260,7 @@ def _compile_forward(
 
     else:
         internal_forward_impl = "auto" if forward_impl == "dispatch" else forward_impl
+        tuning_config = None if internal_forward_impl == "auto" else _q1_fwd_tuning_config(internal_forward_impl)
         call_args = (
             q,
             k,
@@ -227,7 +280,7 @@ def _compile_forward(
             scaling_seqlen=scaling_seqlen,
             out=out,
             _compile_only=True,
-            _q1_fwd_algorithm=internal_forward_impl,
+            _q1_fwd_tuning_config=tuning_config,
         )
         torch.cuda.synchronize()
         compile_seconds = time.perf_counter() - start
@@ -237,7 +290,7 @@ def _compile_forward(
                 *call_args,
                 scaling_seqlen=scaling_seqlen,
                 out=out,
-                _q1_fwd_algorithm=internal_forward_impl,
+                _q1_fwd_tuning_config=tuning_config,
             )
 
     return out, run, compile_seconds
@@ -422,37 +475,7 @@ def main() -> None:
         choices=(
             "auto",
             "dispatch",
-            "tc",
-            "tc-split2",
-            "tc-split4",
-            "tc-m64",
-            "tc-m64-split2",
-            "tc-m64-split4",
-            "tc-m64-n64",
-            "tc-m64-n64-split2",
-            "tc-m64-n64-split4",
-            "tc-m64-warp1",
-            "tc-m64-warp1-split2",
-            "tc-m64-warp1-split4",
-            "tc-m64-warp2",
-            "tc-m64-warp2-split2",
-            "tc-m64-warp2-split4",
-            "tc-m64-warp3",
-            "tc-m64-warp3-split2",
-            "tc-m64-warp3-split4",
-            "tc-m64-inplace",
-            "tc-m64-inplace-split2",
-            "tc-m64-inplace-split4",
-            "tc-m64-16dp",
-            "tc-m64-16dp-split2",
-            "tc-m64-16dp-split4",
-            "tc-m64-16dp-tail",
-            "tc-m64-16dp-tail-kv5",
-            "tc-m64-16dp-tail-kv5-split2",
-            "tc-m64-16dp-tail-kv5-split4",
-            "tc-epi1",
-            "tc-epi1-split2",
-            "tc-epi1-split4",
+            *_Q1_FWD_TUNING_ALGORITHMS,
         ),
         default="auto",
     )

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -348,20 +348,45 @@ def _get_q1_device_capability(device: torch.device) -> tuple[int, int]:
     return capability
 
 
-def _select_q1_fwd_split_kv(
-    requested: str,
+class _Q1FwdKernelConfig(NamedTuple):
+    """Compile-time qlen=1 knobs shared with the standalone tuning benchmark."""
+
+    block_m: int = 128
+    block_n: int = 128
+    split_kv: int = 1
+    single_warp_epilogue: bool = False
+    m64_silu_warps: int = 0
+    m64_inplace_silu: bool = False
+    m64_16dp_silu: bool = False
+    m64_tail_branch: bool = False
+    m64_kv_stage: int = 0
+
+
+_Q1_FWD_DEFAULT_CONFIG = _Q1FwdKernelConfig()
+_Q1_FWD_D64_D128_CONFIG = _Q1FwdKernelConfig(
+    block_m=64,
+    m64_inplace_silu=True,
+    m64_16dp_silu=True,
+    m64_tail_branch=True,
+    m64_kv_stage=5,
+)
+_Q1_FWD_D256_CONFIG = _Q1FwdKernelConfig(
+    block_m=64,
+    m64_inplace_silu=True,
+    m64_16dp_silu=True,
+    m64_tail_branch=True,
+)
+
+
+def _select_q1_fwd_config(
     capability: tuple[int, int],
     supported: bool,
-) -> int:
-    """Resolve explicit qlen=1 forward split-KV experiments."""
-    if requested == "tc-split2":
-        return 2
-    if requested == "tc-split4":
-        return 4
-    # The general SM100/SM103/SM107 schedule is deliberately unsplit. Keep these
-    # arguments so the selector remains compatible with its existing call sites.
-    _ = capability, supported
-    return 1
+    head_dim: int,
+) -> _Q1FwdKernelConfig:
+    """Select one of the two measured qlen=1 production configurations."""
+    if not supported or capability not in ((10, 0), (10, 3), (10, 7)):
+        return _Q1_FWD_DEFAULT_CONFIG
+    return _Q1_FWD_D256_CONFIG if head_dim == 256 else _Q1_FWD_D64_D128_CONFIG
 
 
 def _select_q1_bwd_algorithm(
@@ -492,7 +517,7 @@ def hstu_varlen_fwd_100(
     *,
     out: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
-    _q1_fwd_algorithm: str = "auto",
+    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     q_dtype = q.dtype
@@ -519,84 +544,19 @@ def hstu_varlen_fwd_100(
     q1_m64_supported = q1_dynamic_thd and q_dtype == torch.bfloat16 and head_dim in (64, 128, 256)
     q1_split_supported = q1_m64_supported and is_causal
     capability = _get_q1_device_capability(q.device)
-    # Keep one kernel family across all SM10x targets, masks, and the measured batch,
-    # head-count, and KV-length range. D64/D128 use the robust five-stage pipe;
-    # D256 keeps the same M64/N128 kernel but uses its capacity-limited
-    # three-stage pipe because five D256 KV stages do not fit in shared memory.
-    if _q1_fwd_algorithm == "auto" and q1_m64_supported and capability in ((10, 0), (10, 3), (10, 7)):
-        _q1_fwd_algorithm = "tc-m64-16dp-tail" if head_dim == 256 else "tc-m64-16dp-tail-kv5"
-    q1_m64_algorithm = _q1_fwd_algorithm in (
-        "tc-m64",
-        "tc-m64-split2",
-        "tc-m64-split4",
-        "tc-m64-n64",
-        "tc-m64-n64-split2",
-        "tc-m64-n64-split4",
-        "tc-m64-warp1",
-        "tc-m64-warp1-split2",
-        "tc-m64-warp1-split4",
-        "tc-m64-warp2",
-        "tc-m64-warp2-split2",
-        "tc-m64-warp2-split4",
-        "tc-m64-warp3",
-        "tc-m64-warp3-split2",
-        "tc-m64-warp3-split4",
-        "tc-m64-inplace",
-        "tc-m64-inplace-split2",
-        "tc-m64-inplace-split4",
-        "tc-m64-16dp",
-        "tc-m64-16dp-split2",
-        "tc-m64-16dp-split4",
-        "tc-m64-16dp-tail",
-        "tc-m64-16dp-tail-kv5",
-        "tc-m64-16dp-tail-kv5-split2",
-        "tc-m64-16dp-tail-kv5-split4",
-    )
-    q1_m64_inplace_silu = "tc-m64-inplace" in _q1_fwd_algorithm or "tc-m64-16dp" in _q1_fwd_algorithm
-    q1_m64_16dp_silu = "tc-m64-16dp" in _q1_fwd_algorithm
-    q1_m64_tail_branch = "tc-m64-16dp-tail" in _q1_fwd_algorithm
-    q1_m64_kv_stage = 5 if "-kv5" in _q1_fwd_algorithm else 0
-    q1_m64_silu_warps = (
-        1 if "tc-m64-warp1" in _q1_fwd_algorithm else 2 if "tc-m64-warp2" in _q1_fwd_algorithm else 3 if "tc-m64-warp3" in _q1_fwd_algorithm else 0
-    )
-    q1_single_warp_epilogue = _q1_fwd_algorithm in ("tc-epi1", "tc-epi1-split2", "tc-epi1-split4")
-    kBlockM = 64 if q1_m64_algorithm else 128
-    kBlockN = 64 if "m64-n64" in _q1_fwd_algorithm else 128
-    q1_split_algorithm = {
-        "tc-m64": "tc",
-        "tc-m64-split2": "tc-split2",
-        "tc-m64-split4": "tc-split4",
-        "tc-m64-n64": "tc",
-        "tc-m64-n64-split2": "tc-split2",
-        "tc-m64-n64-split4": "tc-split4",
-        "tc-m64-warp1": "tc",
-        "tc-m64-warp1-split2": "tc-split2",
-        "tc-m64-warp1-split4": "tc-split4",
-        "tc-m64-warp2": "tc",
-        "tc-m64-warp2-split2": "tc-split2",
-        "tc-m64-warp2-split4": "tc-split4",
-        "tc-m64-warp3": "tc",
-        "tc-m64-warp3-split2": "tc-split2",
-        "tc-m64-warp3-split4": "tc-split4",
-        "tc-m64-inplace": "tc",
-        "tc-m64-inplace-split2": "tc-split2",
-        "tc-m64-inplace-split4": "tc-split4",
-        "tc-m64-16dp": "tc",
-        "tc-m64-16dp-split2": "tc-split2",
-        "tc-m64-16dp-split4": "tc-split4",
-        "tc-m64-16dp-tail": "tc",
-        "tc-m64-16dp-tail-kv5": "tc",
-        "tc-m64-16dp-tail-kv5-split2": "tc-split2",
-        "tc-m64-16dp-tail-kv5-split4": "tc-split4",
-        "tc-epi1": "tc",
-        "tc-epi1-split2": "tc-split2",
-        "tc-epi1-split4": "tc-split4",
-    }.get(_q1_fwd_algorithm, _q1_fwd_algorithm)
-    q1_split_kv = _select_q1_fwd_split_kv(
-        q1_split_algorithm,
-        capability,
-        q1_split_supported,
-    )
+    # Production dispatch has two measured configurations. The private config
+    # override is only for the standalone tuning benchmark, which owns the
+    # larger candidate set and translates its human-readable names into knobs.
+    q1_fwd_config = _q1_fwd_tuning_config if _q1_fwd_tuning_config is not None else _select_q1_fwd_config(capability, q1_m64_supported, head_dim)
+    kBlockM = q1_fwd_config.block_m
+    kBlockN = q1_fwd_config.block_n
+    q1_split_kv = q1_fwd_config.split_kv
+    q1_single_warp_epilogue = q1_fwd_config.single_warp_epilogue
+    q1_m64_silu_warps = q1_fwd_config.m64_silu_warps
+    q1_m64_inplace_silu = q1_fwd_config.m64_inplace_silu
+    q1_m64_16dp_silu = q1_fwd_config.m64_16dp_silu
+    q1_m64_tail_branch = q1_fwd_config.m64_tail_branch
+    q1_m64_kv_stage = q1_fwd_config.m64_kv_stage
     # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
     # launch; larger batches have enough query-head CTAs and favor one CTA.
     use_2cta_instrs = (
@@ -634,44 +594,9 @@ def hstu_varlen_fwd_100(
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
-    if _q1_fwd_algorithm not in (
-        "auto",
-        "tc",
-        "tc-split2",
-        "tc-split4",
-        "tc-m64",
-        "tc-m64-split2",
-        "tc-m64-split4",
-        "tc-m64-n64",
-        "tc-m64-n64-split2",
-        "tc-m64-n64-split4",
-        "tc-m64-warp1",
-        "tc-m64-warp1-split2",
-        "tc-m64-warp1-split4",
-        "tc-m64-warp2",
-        "tc-m64-warp2-split2",
-        "tc-m64-warp2-split4",
-        "tc-m64-warp3",
-        "tc-m64-warp3-split2",
-        "tc-m64-warp3-split4",
-        "tc-m64-inplace",
-        "tc-m64-inplace-split2",
-        "tc-m64-inplace-split4",
-        "tc-m64-16dp",
-        "tc-m64-16dp-split2",
-        "tc-m64-16dp-split4",
-        "tc-m64-16dp-tail",
-        "tc-m64-16dp-tail-kv5",
-        "tc-m64-16dp-tail-kv5-split2",
-        "tc-m64-16dp-tail-kv5-split4",
-        "tc-epi1",
-        "tc-epi1-split2",
-        "tc-epi1-split4",
-    ):
-        raise ValueError(f"Unsupported qlen=1 forward algorithm: {_q1_fwd_algorithm}")
     if q1_split_kv > 1 and not q1_split_supported:
         raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
-    if q1_m64_algorithm and not q1_m64_supported:
+    if kBlockM == 64 and not q1_m64_supported:
         raise ValueError("The M64 qlen=1 forward algorithms require causal or local BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if q1_single_warp_epilogue and not q1_split_supported:
         raise ValueError("The single-warp qlen=1 forward experiment requires causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
