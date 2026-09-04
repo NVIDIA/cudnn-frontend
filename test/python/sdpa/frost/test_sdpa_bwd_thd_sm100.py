@@ -262,7 +262,22 @@ def _plan_index(g, name=_ENGINE):
     return None
 
 
-def _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, window_right=None, hkv=None,):  # fmt: skip
+def _thd_case(
+    lens_q,
+    lens_kv,
+    h,
+    d,
+    dtype,
+    cap_q=None,
+    cap_kv=None,
+    poison=False,
+    seed=7,
+    causal=False,
+    bottom_right=False,
+    window_left=None,
+    window_right=None,
+    hkv=None,
+):
     """Packed Q/K/V/dO plus the forward's O and packed LSE, per sequence in fp64.
 
     ``cap_*`` over-allocates the packed buffers past the real totals; with
