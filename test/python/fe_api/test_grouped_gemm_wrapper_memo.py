@@ -186,4 +186,4 @@ def test_memo_key_covers_every_wrapper_parameter():
             assert not missing, f"{name} parameters missing from its memo key: {missing}"
             checked.append(name)
 
-    assert checked, "no memoized wrappers discovered -- the discovery logic is broken"
+    assert checked, "no memoized wrappers discovered -- the discovery logic failed"
