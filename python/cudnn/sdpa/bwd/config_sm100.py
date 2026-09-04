@@ -76,6 +76,12 @@ class TemplateParams:
     bottom_right: bool = False
     seq_kv_lens_present: bool = False
     seq_q_lens_present: bool = False
+    # THD / varlen: Q/K/V/O/dO and the gradients are PACKED [1, T, H, D] and the
+    # per-sequence lengths come from a device metadata buffer, not from the
+    # shapes.  Mutually exclusive with the dense per-batch length tensors above
+    # -- both describe "ragged", and threading two sources of truth for the same
+    # fact is how they drift apart.
+    thd_varlen: bool = False
     sched_policy: int = SCHED_NATURAL
     # Tuning knob: halves of the fp32 S tile shipped sg0 -> sg1 per kv step.
     # 2 keeps the cross-sub-group ring 2-deep at an identical byte footprint;
@@ -105,6 +111,11 @@ class MatmulTemplateParams:
 
     a_is_m_major: bool = False
     b_is_n_major: bool = True
+    # THD / varlen: the S/dS A operand is the BLOCKED workspace, B and the
+    # output are PACKED, and the per-group offsets come from the metadata the
+    # setup launch published.  Which axis is ragged follows from
+    # ``a_is_m_major``, so it needs no parameter of its own.
+    thd_varlen: bool = False
     # Causal K-trim.  Stage 2 under a causal mask leaves the tiles above the
     # diagonal UNWRITTEN, so this is a correctness requirement before it is an
     # optimization: a stage-3 GEMM must not read them.
@@ -153,6 +164,16 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
     if params.vec_bytes_epi not in (16, 32):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
+    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
+        # The causal K-trim assumes the workspace is one dense rectangle per
+        # (batch, head), which is exactly what THD's blocked layout is not: the
+        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
+        # workspace rows. Rewriting it per group is a follow-up, not a silent
+        # approximation -- so a CAUSAL packed graph is served by rendering stage
+        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
+        # adapter zero-fills the workspace instead). This raise is what keeps
+        # that the only spelling: it is not a decline of causal under THD.
+        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:
@@ -182,6 +203,11 @@ def _validate_params(params: TemplateParams) -> None:
         raise ValueError("SM100 SDPA bwd d512: bottom_right alignment requires a causal upper bound (window_right)")
     if params.seq_q_lens_present and not params.seq_kv_lens_present:
         raise ValueError("SM100 SDPA bwd d512: seq_q_lens_present requires seq_kv_lens_present (padding mask)")
+    if params.thd_varlen and (params.seq_kv_lens_present or params.seq_q_lens_present):
+        raise ValueError(
+            "SM100 SDPA bwd d512: thd_varlen is mutually exclusive with seq_kv_lens_present / "
+            "seq_q_lens_present -- THD carries its per-sequence lengths in the metadata buffer"
+        )
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"SM100 SDPA bwd d512: sched_policy must be one of NATURAL/LPT/LPT_L2; got {params.sched_policy}")
     if params.xfer_halves not in (1, 2):
@@ -194,7 +220,10 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.seq_kv_lens_present:
+    if params.seq_kv_lens_present or params.thd_varlen:
+        # THD is padded BY CONSTRUCTION: every sequence has its own S_q / S_kv,
+        # so the tile tails need the per-cell mask exactly as a padding mask
+        # does.  The lengths just come from the metadata buffer instead.
         flags |= MASK_PADDED
     return flags
 
@@ -294,6 +323,12 @@ class CfgBwdD512:
     BOTTOM_RIGHT: int = 0
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
+    THD_VARLEN: int = 0
+    # Row granularity of the BLOCKED S/dS workspace under THD: sequence b owns
+    # ceil(S_q[b] / this) * this rows at row_off[b].  It is TILE_M, not the
+    # cluster span -- see tile_dsl/thd.write_thd_row_offsets for why it is
+    # bracketed below by stage 3's k-tile and above by nothing but waste.
+    WS_BLOCK_ROWS: int = 128
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL
@@ -413,6 +448,14 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
             "bwd d512 f16/bf16: TILE_K_HW must be 16 (1-chunk only on SM10x -- 2-chunk silently wrong)",
         ),
         (cfg.BPE == bpe(cfg.DTYPE_QKV), "bwd d512: BPE must match DTYPE_QKV"),
+        # The blocked workspace's granularity is bracketed on BOTH sides: at
+        # least stage 3's k-tile, so a dV/dK k-loop never reads past a block
+        # into the next sequence's live rows; and at least stage 2's per-CTA
+        # store box, so an out-of-range box is a boolean skip rather than a
+        # clipped per-sequence descriptor.  TILE_M satisfies both.
+        (cfg.WS_BLOCK_ROWS == cfg.TILE_M, "bwd d512: WS_BLOCK_ROWS must be TILE_M (stage 2's per-CTA store box)"),
+        (cfg.WS_BLOCK_ROWS % 64 == 0, "bwd d512: WS_BLOCK_ROWS must be a multiple of stage 3's 64-row k-tile"),
+        (cfg.THD_VARLEN == 0 or (cfg.MASK_FLAGS & MASK_PADDED) != 0, "bwd d512: THD implies the padded per-cell mask"),
         # The workspace dtype IS the io dtype.  An earlier Rubin revision tied
         # it to an independent output dtype and produced a silent mismatch
         # against the stage-3 GEMMs, which read the workspace as the io dtype.
@@ -501,6 +544,7 @@ def make_cfg_d512(params: TemplateParams) -> CfgBwdD512:
         BOTTOM_RIGHT=int(params.bottom_right),
         SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
         SCHEDULER_POLICY=params.sched_policy,
     )
     _validate_cfg_d512(cfg)

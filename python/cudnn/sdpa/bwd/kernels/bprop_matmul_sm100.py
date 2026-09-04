@@ -64,6 +64,7 @@ from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
 from cudnn.frost.tile_dsl.constants import DTYPE_FP16
+from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
 
 PARAMS = globals().get("FROST_TEMPLATE_PARAMS", MatmulTemplateParams())
@@ -101,6 +102,54 @@ matmul_b_batch = 0
 # fork serves all three; the loader instantiates this module once per params set
 # and every use is `cutlass.const_expr`, so each instance traces specialized code.
 a_is_m_major = bool(PARAMS.a_is_m_major)
+# THD / varlen.  Everything below folds out of the dense rendering, which is the
+# one that has to keep diffing clean against the upstream template.
+#
+# Which axis is ragged follows from the operand major, so it needs no parameter
+# of its own:
+#     dV = S^T.dO, dK = dS^T.Q  (A m-major) -- M is kv, K is q tokens
+#     dQ = dS.K                 (A k-major) -- M is q tokens, K is kv
+# so A's blocked-workspace row offset lands on K in the first case and on M in
+# the second, and B's token offset is cu_q in the first and cu_k in the second.
+_THD_MM = bool(getattr(PARAMS, "thd_varlen", False))
+# This GEMM's OWN descriptor scratch: one clipped output descriptor per
+# sequence, then the packed-total-clamped B operand.  Built in `_host`, which is
+# the only place that knows these descriptors' box, swizzle and dim order -- for
+# (n, m, h, b) operands the sequence axis is ord=1, which is NOT stage 2's.
+_THD_MM_SEQ_ORD = 1
+THD_MM_DESC_SLOTS = lambda b: b + 1  # noqa: E731
+B_CLAMP_SLOT = lambda b: b  # noqa: E731
+
+
+@cute.jit
+def _thd_desc_ptr(desc_words, slot):
+    """Generic-space pointer to one 128-B tensor map in the patched array."""
+    return (desc_words.iterator.raw_ptr() + slot * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+
+
+@cute.jit
+def _thd_acquire_descs(desc_words, n_batch):
+    """Acquire EVERY patched descriptor into the TMA proxy, once per warp.
+
+    ``fence.proxy.tensormap::generic.acquire`` takes a size operand whose ONLY
+    legal value is 128 -- one descriptor.  Acquiring the array's base therefore
+    orders the FIRST slot and nothing else, so a warp that later selects slot
+    ``tile_b`` (the per-sequence C descriptors) or slot ``n_batch`` (the clamped
+    B descriptor) could read metadata the TMA proxy still has stale.  Loop the
+    whole array instead: ``n_batch + 1`` fences, hoisted out of the persistent
+    loop, because the patch launch writes these once before this kernel starts
+    and never rewrites them.
+    """
+    for _slot in cutlass.range(n_batch + cutlass.Int32(1)):
+        nvvm.fence_proxy_acquire(
+            nvvm.MemScope.GPU,
+            _thd_desc_ptr(desc_words, _slot),
+            128,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
 b_is_n_major = bool(PARAMS.b_is_n_major)
 causal_mode = int(PARAMS.causal_mode)
 causal_gran = int(PARAMS.causal_gran)
@@ -271,6 +320,39 @@ def _decode_bh(l, n_head):
 
 
 @cute.jit
+def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
+    """Per-sequence offsets and k-tile count for one (head, sequence) group.
+
+    Returns ``(a_k_off, a_m_off, b_k_off, num_k_tiles)``.  Dense returns zeros
+    and the kernel-wide tile count, so every use folds away.
+
+    The k count comes from the sequence's REAL length, which is safe on both
+    sides of the ragged axis because stage 2 zero-fills further than this reads:
+    its blocked rows run to ``ceil(S_q/128)*128`` and its columns to
+    ``ceil(S_kv/128)*128``, both at least the ``ceil(len/64)`` tiles counted
+    here.  Reading further would reach the NEXT sequence's live rows -- nonzero
+    data summed into the wrong gradient, with nothing to make it look wrong.
+    """
+    if cutlass.const_expr(not _THD_MM):
+        return cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), num_k_tiles
+    meta = cutlass.make_array_view(meta_t)
+    cu_q0 = n_batch
+    cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+    row0 = cutlass.Int32(4) * n_batch + cutlass.Int32(4)
+    q_tok = cutlass.Int32(meta[cu_q0 + tile_b])
+    k_tok = cutlass.Int32(meta[cu_k0 + tile_b])
+    s_q = cutlass.Int32(meta[cu_q0 + tile_b + cutlass.Int32(1)]) - q_tok
+    s_kv = cutlass.Int32(meta[cu_k0 + tile_b + cutlass.Int32(1)]) - k_tok
+    row_off = cutlass.Int32(meta[row0 + tile_b])
+    a_k_off = row_off if cutlass.const_expr(a_is_m_major) else cutlass.Int32(0)
+    a_m_off = cutlass.Int32(0) if cutlass.const_expr(a_is_m_major) else row_off
+    b_k_off = q_tok if cutlass.const_expr(a_is_m_major) else k_tok
+    k_len = s_q if cutlass.const_expr(a_is_m_major) else s_kv
+    nkt = (k_len + cutlass.Int32(cta_tile_mnk[2] - 1)) // cutlass.Int32(cta_tile_mnk[2])
+    return a_k_off, a_m_off, b_k_off, nkt
+
+
+@cute.jit
 def _causal_k_range(coord_m_cgrp, num_k_tiles):
     """The K-tile range this M tile may read, under stage 2's causal skip.
 
@@ -304,6 +386,12 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     the high one) is what keeps the range covering every structurally non-zero
     tile; under the tight-trim invariant that outward rounding also keeps it a
     subset of what stage 2 wrote.
+
+    Never reached under THD: the adapter renders the packed stage 3 with
+    ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
+    here is an ABSOLUTE workspace row and the blocked layout renumbers rows per
+    sequence.  ``validate_matmul_params`` enforces that.  See
+    ``SdpaBwdDslSm100.compile``.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # two bounds and the min() below share one numeric type.
@@ -349,6 +437,12 @@ def _bprop_matmul_bh_sm100_kernel(
     out_stride_b_0: cutlass.Int64,
     n_head: cutlass.Int32,
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    # Dense: 1-element dummies.  THD: the metadata buffer the setup launch
+    # published, and this GEMM's own descriptor scratch (per-sequence clipped C,
+    # then the packed-total-clamped B).
+    meta_t: cute.Tensor,
+    desc_words: cute.Tensor,
+    n_batch: cutlass.Int32,
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -426,11 +520,18 @@ def _bprop_matmul_bh_sm100_kernel(
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
-        for _j in cutlass.range_constexpr(num_b_operands):
-            nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
+        # B and C's GridConstant descriptors are DEAD under THD: B loads take the
+        # packed-total-clamped slot and C stores take the per-sequence one, both
+        # from the patched array.  Prefetching them would warm metadata nobody
+        # reads -- and the patched slots must NOT be prefetched here in their
+        # place, because that would cache their contents ahead of the
+        # `fence_proxy_acquire` that makes the patch visible to the TMA proxy.
+        if cutlass.const_expr(not _THD_MM):
+            for _j in cutlass.range_constexpr(num_b_operands):
+                nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
 
-        for _ci in cutlass.range_constexpr(n_tma_outputs):
-            nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
+            for _ci in cutlass.range_constexpr(n_tma_outputs):
+                nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
 
     init_raw_m = bidx >> _preferred_cluster_m_shift
     init_raw_n = bidy >> _preferred_cluster_n_shift
@@ -702,6 +803,15 @@ def _bprop_matmul_bh_sm100_kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_tma = cutlass.Int32(0)
+        # B's THD descriptor is CLAMPED to the packed total `cu_*[B]`, so the
+        # last k tile of the last sequence reads the caller's unwritten capacity
+        # tail as TMA zeros instead of live memory.  The GridConstant descriptor
+        # is built at the buffer's CAPACITY (a declared `max_total_seq_len` is a
+        # maximum, while the row that must read zero moves every step), so using
+        # it here would multiply A's padding zeros by whatever the caller left
+        # past `cu_*[B]` -- and `0 * NaN` is NaN.
+        if cutlass.const_expr(_THD_MM):
+            _thd_acquire_descs(desc_words, n_batch)
         while is_valid != 0:
             coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             if cutlass.const_expr(cta_group == 1):
@@ -723,7 +833,13 @@ def _bprop_matmul_bh_sm100_kernel(
                 tile_h_b = tile_h
                 tile_b_b = tile_b
 
-            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, num_k_tiles)
+            _a_k_off, _a_m_off, _b_k_off, _nkt = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
+            if cutlass.const_expr(_THD_MM):
+                # Packed operands have ONE batch element; the sequence is
+                # reached by the coordinate offsets above, not by this axis.
+                tile_b_a = cutlass.Int32(0)
+                tile_b_b = cutlass.Int32(0)
+            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
@@ -733,6 +849,11 @@ def _bprop_matmul_bh_sm100_kernel(
                     pass
 
                 coord_k = k_tile_idx * cta_tile_mnk[2]
+                # A rides the blocked workspace, B the packed tokens, so the two
+                # ragged bases differ and the k coordinate cannot be shared.
+                coord_k_a = coord_k + _a_k_off
+                coord_k_b = coord_k + _b_k_off
+                coord_m_a = coord_m_per_cta + _a_m_off
                 if is_pair_leader:
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
@@ -746,7 +867,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sA_stage.subview(n_rank * _a_rows * cta_tile_mnk[2]),
                                     tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta + n_rank * _a_rows, tile_h_a, tile_b_a),
+                                    (coord_k_a, coord_m_a + n_rank * _a_rows, tile_h_a, tile_b_a),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
@@ -762,7 +883,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage.subview(_a_idx * _a_rows * cta_tile_mnk[2]),
                                         tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta + _a_idx * _a_rows, tile_h_a, tile_b_a),
+                                        (coord_k_a, coord_m_a + _a_idx * _a_rows, tile_h_a, tile_b_a),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_a,
@@ -777,8 +898,8 @@ def _bprop_matmul_bh_sm100_kernel(
                                             sA_stage.subview(m_group * a_tma_group_elems * cta_tile_mnk[2]),
                                             tma_a_desc.get_ptr(),
                                             (
-                                                coord_m_per_cta + m_group * a_tma_group_elems,
-                                                coord_k,
+                                                coord_m_a + m_group * a_tma_group_elems,
+                                                coord_k_a,
                                                 tile_h_a,
                                                 tile_b_a,
                                             ),
@@ -792,7 +913,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage,
                                         tma_a_desc.get_ptr(),
-                                        (coord_k, coord_m_per_cta, tile_h_a, tile_b_a),
+                                        (coord_k_a, coord_m_a, tile_h_a, tile_b_a),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_a,
@@ -806,8 +927,8 @@ def _bprop_matmul_bh_sm100_kernel(
                                         sA_stage.subview(m_group * a_tma_group_elems * cta_tile_mnk[2]),
                                         tma_a_desc.get_ptr(),
                                         (
-                                            coord_m_per_cta + m_group * a_tma_group_elems,
-                                            coord_k,
+                                            coord_m_a + m_group * a_tma_group_elems,
+                                            coord_k_a,
                                             tile_h_a,
                                             tile_b_a,
                                         ),
@@ -821,7 +942,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sA_stage,
                                     tma_a_desc.get_ptr(),
-                                    (coord_k, coord_m_per_cta, tile_h_a, tile_b_a),
+                                    (coord_k_a, coord_m_a, tile_h_a, tile_b_a),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
@@ -831,14 +952,18 @@ def _bprop_matmul_bh_sm100_kernel(
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                     tma_b_desc = tma_b_descs[_bj]
+                    # See the note above the persistent loop: THD substitutes
+                    # the packed-total-clamped descriptor for the capacity-sized
+                    # GridConstant one.  Dense folds back to `.get_ptr()`.
+                    _b_desc_ptr = _thd_desc_ptr(desc_words, B_CLAMP_SLOT(n_batch)) if cutlass.const_expr(_THD_MM) else tma_b_desc.get_ptr()
                     if cutlass.const_expr(b_mcast_slices > 1):
                         _b_rows = cta_tile_mnk[1] // b_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage.subview(pair_m_idx * _b_rows * cta_tile_mnk[2]),
-                                    tma_b_desc.get_ptr(),
-                                    (coord_k, coord_n_per_cta + pair_m_idx * _b_rows, tile_h_b, tile_b_b),
+                                    _b_desc_ptr,
+                                    (coord_k_b, coord_n_per_cta + pair_m_idx * _b_rows, tile_h_b, tile_b_b),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_b,
@@ -853,8 +978,8 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(_b_idx * _b_rows * cta_tile_mnk[2]),
-                                        tma_b_desc.get_ptr(),
-                                        (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_h_b, tile_b_b),
+                                        _b_desc_ptr,
+                                        (coord_k_b, coord_n_per_cta + _b_idx * _b_rows, tile_h_b, tile_b_b),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
@@ -867,10 +992,10 @@ def _bprop_matmul_bh_sm100_kernel(
                                     if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                            tma_b_desc.get_ptr(),
+                                            _b_desc_ptr,
                                             (
                                                 coord_n_per_cta + n_group * b_tma_group_elems,
-                                                coord_k,
+                                                coord_k_b,
                                                 tile_h_b,
                                                 tile_b_b,
                                             ),
@@ -883,8 +1008,8 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
-                                        tma_b_desc.get_ptr(),
-                                        (coord_k, coord_n_per_cta, tile_h_b, tile_b_b),
+                                        _b_desc_ptr,
+                                        (coord_k_b, coord_n_per_cta, tile_h_b, tile_b_b),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
@@ -896,10 +1021,10 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                        tma_b_desc.get_ptr(),
+                                        _b_desc_ptr,
                                         (
                                             coord_n_per_cta + n_group * b_tma_group_elems,
-                                            coord_k,
+                                            coord_k_b,
                                             tile_h_b,
                                             tile_b_b,
                                         ),
@@ -912,8 +1037,8 @@ def _bprop_matmul_bh_sm100_kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage,
-                                    tma_b_desc.get_ptr(),
-                                    (coord_k, coord_n_per_cta, tile_h_b, tile_b_b),
+                                    _b_desc_ptr,
+                                    (coord_k_b, coord_n_per_cta, tile_h_b, tile_b_b),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_b,
@@ -1015,7 +1140,10 @@ def _bprop_matmul_bh_sm100_kernel(
             acc_stage = cutlass.Int32(0)
             # The MMA warp tracks its own tile_m now: the causal K range depends on
             # it, and this arm must walk exactly the range the TMA warp walks.
+            # THD's per-group k count needs the SEQUENCE for the same reason, so
+            # the batch index is tracked here too.
             tile_m = init_tile_m
+            _, tile_b_mma = _decode_bh(init_tile_l, n_head)
             # Descriptor metadata and the SMEM allocation base are invariant
             # across persistent tiles.  Only the encoded start address advances.
             desc_a_roots = [
@@ -1066,7 +1194,11 @@ def _bprop_matmul_bh_sm100_kernel(
                 # Same range as the TMA producer above, or the ab ring
                 # desynchronises.  scale_d starts False here, so the accumulator
                 # is overwritten on the first k-block wherever the range begins.
-                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, num_k_tiles)
+                # Under THD that means the same PER-GROUP count too: a consumer
+                # still counting the kernel-wide tiles would wait for k-blocks
+                # the producer never issues.
+                _, _, _, _nkt_mma = _thd_group(meta_t, tile_b_mma, n_batch, num_k_tiles)
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
                 scale_d = cutlass.Boolean(False)
                 for k_tile_idx in range(k_begin, k_end):
                     stage = ab_iter % ab_stages
@@ -1141,6 +1273,7 @@ def _bprop_matmul_bh_sm100_kernel(
                         mma_nt_m = gridx >> _fallback_cluster_m_shift
                         mma_nt_n = gridy >> _fallback_cluster_n_shift
                 tile_m, _tile_n_mma = _l2_swizzle_tile(mma_raw_m, mma_raw_n, mma_nt_m, mma_nt_n, swizzle_w, identity=tile_swizzle_n == 1)
+                _, tile_b_mma = _decode_bh(_l_idx, n_head)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
                 nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -1232,6 +1365,31 @@ def _bprop_matmul_bh_sm100_kernel(
         tile_n = init_tile_n
         tile_l = init_tile_l
         tile_h, tile_b = _decode_bh(tile_l, n_head)
+        if cutlass.const_expr(_THD_MM):
+            # Once per epilogue warp, not per store: the patch launch wrote the
+            # array before this kernel started and never rewrites it.  But it is
+            # one acquire PER SLOT -- the fence's size operand only accepts 128,
+            # i.e. a single descriptor, so acquiring the base would order slot 0
+            # alone while this warp goes on to select slot `tile_b`.
+            _thd_acquire_descs(desc_words, n_batch)
+        # The C-side cu_seqlens prefix inside the metadata buffer: dV/dK write
+        # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
+        # makes when it bases each sequence's descriptor.
+        _thd_meta = cutlass.make_array_view(meta_t) if cutlass.const_expr(_THD_MM) else None
+        _thd_c_cu0 = (
+            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(a_is_m_major) else n_batch)
+            if cutlass.const_expr(_THD_MM)
+            else cutlass.Int32(0)
+        )
+        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over S_q
+        # for the m-major dV/dK GEMMs and over S_kv for the k-major dQ one,
+        # exactly opposite to which axis each writes.  Used only to detect a
+        # zero-length reduction; see `_thd_k_len` in the loop.
+        _thd_k_cu0 = (
+            (n_batch if cutlass.const_expr(a_is_m_major) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
+            if cutlass.const_expr(_THD_MM)
+            else cutlass.Int32(0)
+        )
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
@@ -1255,6 +1413,37 @@ def _bprop_matmul_bh_sm100_kernel(
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * pair_n_size
+            # A group whose OUTPUT sequence has zero rows. Its clipped C
+            # descriptor is built at extent 1 rather than 0 (a tensor map with a
+            # zero extent is INVALID and traps -- see tile_dsl.thd.emit_seq_descs),
+            # so the hardware clip that drops every other overshooting tile
+            # cannot drop this one: skip the store instead. Read once per tile,
+            # not per subtile; `tile_b` is refreshed at the bottom of the loop.
+            _thd_c_len = (
+                cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(_thd_meta[_thd_c_cu0 + tile_b])
+                if cutlass.const_expr(_THD_MM)
+                else cutlass.Int32(1)
+            )
+            # A group whose REDUCTION axis is empty: S_q[b] == 0 for dV/dK,
+            # S_kv[b] == 0 for dQ.  `_thd_group` then returns `nkt == 0`, the
+            # mainloop runs zero iterations, and `scale_d` starts False -- so no
+            # MMA ever wrote the accumulator and the TMEM read below returns
+            # whatever the previous tile left there.
+            #
+            # Unlike `_thd_c_len` this canNOT be fixed by skipping the store:
+            # the OUTPUT rows exist (`_thd_c_len > 0`) and the caller expects
+            # them written.  Store ZEROS instead, which is also the right
+            # answer -- a sequence with no queries contributes nothing to its
+            # keys' and values' gradients, and one with no keys has no gradient
+            # to receive.
+            #
+            # A select, not a multiply by zero: the uninitialised TMEM can hold
+            # any bit pattern, and `0 * NaN` is NaN (issue #624's rule).
+            _thd_k_len = (
+                cutlass.Int32(_thd_meta[_thd_k_cu0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(_thd_meta[_thd_k_cu0 + tile_b])
+                if cutlass.const_expr(_THD_MM)
+                else cutlass.Int32(1)
+            )
             if cutlass.const_expr(epi_dp22):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -1321,16 +1510,46 @@ def _bprop_matmul_bh_sm100_kernel(
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                     _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
-                    _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                    # The branch is CTA-uniform (it reads only `tile_b`) and it
+                    # wraps the store ALONE -- the fence and the named barrier
+                    # below stay outside it, so no path through here can diverge
+                    # on a sync.
+                    if cutlass.const_expr(_THD_MM):
+                        if _thd_k_len > cutlass.Int32(0):
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                        else:
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
+                    else:
+                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=128, swizzle=cutlass.Swizzle(3, 4, 3))
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:
                         if elect_one:
-                            nvvm.cp_async_bulk_tensor_global_shared_cta(
-                                tma_c_descs[0].get_ptr(),
-                                _tsv_0.data_ptr(),
-                                (col, coord_m, tile_h, tile_b),
-                            )
+                            # THD stores through THIS SEQUENCE's descriptor: its
+                            # GLOBAL_ADDRESS is the sequence's first output row
+                            # and its GLOBAL_DIM[seq] is the sequence's length,
+                            # so the last M tile -- which overshoots into the
+                            # next sequence's rows with a live accumulator
+                            # behind it -- is clipped by hardware.  The batch
+                            # coordinate is then 0: the descriptor already
+                            # carries the base, so the M coordinate stays
+                            # sequence-relative.
+                            if cutlass.const_expr(_THD_MM):
+                                # Skipping only the STORE keeps the epilogue's
+                                # pipeline intact: the commit below still runs,
+                                # and an empty bulk group commits immediately.
+                                if _thd_c_len > cutlass.Int32(0):
+                                    nvvm.cp_async_bulk_tensor_global_shared_cta(
+                                        (desc_words.iterator.raw_ptr() + tile_b * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic),
+                                        _tsv_0.data_ptr(),
+                                        (col, coord_m, tile_h, cutlass.Int32(0)),
+                                    )
+                            else:
+                                nvvm.cp_async_bulk_tensor_global_shared_cta(
+                                    tma_c_descs[0].get_ptr(),
+                                    _tsv_0.data_ptr(),
+                                    (col, coord_m, tile_h, tile_b),
+                                )
                         if elect_one:
                             nvvm.cp_async_bulk_commit_group()
                         nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
@@ -1382,12 +1601,66 @@ def _bprop_matmul_bh_sm100_kernel(
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
 
 
+@cute.kernel
+def _thd_patch_descs_kernel(
+    c_tensor: cute.Tensor,
+    base_c_desc: cutlass.GridConstant[_tma.TensorMap],
+    base_b_desc: cutlass.GridConstant[_tma.TensorMap],
+    desc_words: cute.Tensor,
+    meta_t: cute.Tensor,
+    n_batch: cutlass.Int32,
+    c_row_stride: cutlass.Int64,
+) -> None:
+    """This GEMM's own THD descriptors, patched from the published metadata.
+
+    Built HERE and not in the shared setup launch because a descriptor's box,
+    swizzle and dim ORDER are this kernel's: its operands are ``(n, m, h, b)``,
+    so the sequence axis is ``ord=1`` -- stage 2's packed ``(d, head, seq,
+    batch)`` operands put it at 2, and a shared builder told the wrong number
+    clamps the head extent instead, silently.
+
+    * one C descriptor per sequence, based at that sequence's first output row
+      with ``GLOBAL_DIM[seq]`` set to its length, so the overshooting last M
+      tile is clipped rather than writing into the next sequence;
+    * one B descriptor clamped to the CURRENT packed total, so the last k tile
+      reads the caller's unwritten capacity tail as exact zeros.  A declared
+      ``max_total_seq_len`` cannot do this job: it is a maximum, while the row
+      that must read zero is ``cu_*[B]``, which changes every step.
+
+    One elected thread; the release fence publishes both to the TMA proxy and
+    the kernel boundary orders them before the GEMM reads them.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+        meta = cutlass.make_array_view(meta_t)
+        cu_q0 = n_batch
+        cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+        # dV/dK write kv rows and read q tokens; dQ is the mirror.
+        c_cu0 = cu_k0 if cutlass.const_expr(a_is_m_major) else cu_q0
+        b_cu0 = cu_q0 if cutlass.const_expr(a_is_m_major) else cu_k0
+        emit_seq_descs(base_c_desc, desc_words, meta, c_cu0, c_tensor, n_batch, c_row_stride, seq_ord=_THD_MM_SEQ_ORD)
+        b_total = cutlass.Int32(meta[b_cu0 + n_batch])
+        emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
+        nvvm.fence_proxy_release(
+            nvvm.MemScope.GPU,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
+_thd_patch_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     problem_size: tuple,
     a_0: cute.Tensor,
     b_0: cute.Tensor,
     c_0: cute.Tensor,
+    # Dense: 1-element dummies.  THD: the setup launch's metadata and this
+    # GEMM's descriptor scratch.
+    meta_t: cute.Tensor,
+    desc_words: cute.Tensor,
     stream: _cuda.CUstream,
 ) -> None:
     _a_operands = [a_0]
@@ -1430,6 +1703,19 @@ def _host(
     out_stride_h_0 = problem_size[_stride_idx + 2]
     out_stride_b_0 = problem_size[_stride_idx + 3]
     _stride_idx += 4
+    # B's K extent, separate from A's.  They coincide on the dense path, but
+    # under THD A's K axis is the BLOCKED workspace (rows padded per sequence)
+    # while B's is the PACKED tokens -- different lengths for the same logical
+    # reduction, so one shared symbol cannot describe both.
+    k_b = problem_size[_stride_idx]
+    # A's and C's M extents, likewise separate.  Dense passes all three equal;
+    # THD does not: for dV/dK the A operand's M is the workspace's uniform kv
+    # column count while C's is the PACKED output rows, and `m` itself is only
+    # the grid's M -- the longest sequence, which every group's tiles cover and
+    # a shorter one's spare tiles are clipped out of.
+    m_a = problem_size[_stride_idx + 1]
+    m_c = problem_size[_stride_idx + 2]
+    _stride_idx += 3
 
     # A broadcast operand collapses BOTH batch extents, not just one.
     if cutlass.const_expr(matmul_a_batch == 1):
@@ -1440,6 +1726,15 @@ def _host(
         b_h, b_b = 1, 1
     else:
         b_h, b_b = n_head, n_batch
+    # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
+    # metadata -- but the packed operands hold ONE batch element, reached by the
+    # coordinate offsets instead.  Describing them as n_batch-deep builds a
+    # tensor map over memory that is not there, which fails inside
+    # cuTensorMapEncodeTiled as an abort rather than an exception.
+    if cutlass.const_expr(_THD_MM):
+        a_b = 1
+        b_b = 1
+    c_batch = 1 if cutlass.const_expr(_THD_MM) else n_batch
 
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
@@ -1449,7 +1744,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[m, k_sym, a_h, a_b],
+                    global_dims=[m_a, k_sym, a_h, a_b],
                     global_strides=[
                         a_stride_k * ab_dtype.width // 128,
                         a_stride_h * ab_dtype.width // 128,
@@ -1464,7 +1759,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_a_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[k_sym, m, a_h, a_b],
+                    global_dims=[k_sym, m_a, a_h, a_b],
                     global_strides=[
                         a_stride_m * ab_dtype.width // 128,
                         a_stride_h * ab_dtype.width // 128,
@@ -1482,7 +1777,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[n, k_sym, b_h, b_b],
+                    global_dims=[n, k_b, b_h, b_b],
                     global_strides=[
                         b_stride_k * ab_dtype.width // 128,
                         b_stride_h * ab_dtype.width // 128,
@@ -1497,7 +1792,7 @@ def _host(
                 _tma.create_tensor_map_tiled(
                     global_address=_b_op.iterator.toint(),
                     dtype=ab_tma_dtype,
-                    global_dims=[k_sym, n, b_h, b_b],
+                    global_dims=[k_b, n, b_h, b_b],
                     global_strides=[
                         b_stride_n * ab_dtype.width // 128,
                         b_stride_h * ab_dtype.width // 128,
@@ -1513,7 +1808,7 @@ def _host(
     tma_c_desc_0 = _tma.create_tensor_map_tiled(
         global_address=_c0.iterator.toint(),
         dtype=cd_dtype,
-        global_dims=[n, m, n_head, n_batch],
+        global_dims=[n, m_c, n_head, c_batch],
         global_strides=[
             # `cd_dtype.width`, not a literal 16: the A/B descriptors above already
             # derive it, and this one is now dtype-parameterized too.
@@ -1535,6 +1830,19 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch)
+    if cutlass.const_expr(_THD_MM):
+        # Ahead of the GEMM on the same stream; kernel-boundary ordering is what
+        # makes the patched descriptors visible to it.
+        _thd_patch_descs_kernel(
+            _c0,
+            tma_c_desc_0,
+            tma_b_desc_list[0],
+            desc_words,
+            meta_t,
+            n_batch,
+            out_stride_m_0,
+        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
     launch = _bprop_matmul_bh_sm100_kernel(
         problem_size[0],
         problem_size[1],
@@ -1547,6 +1855,9 @@ def _host(
         out_stride_b_0,
         n_head,
         tma_c_desc_list[0],
+        meta_t,
+        desc_words,
+        n_batch,
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does
@@ -1581,6 +1892,11 @@ def compile() -> Callable:
     # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
+    # See `_host`: A's and B's K extents are the same number only on the dense
+    # path, so they are separate symbols and the artifact serves both.
+    sym_k_b = cute.sym_int64()
+    sym_m_a = cute.sym_int64()
+    sym_m_c = cute.sym_int64()
     # Two symbolic batch extents instead of one flat `sym_l`.
     sym_h = cute.sym_int64()
     sym_b = cute.sym_int64()
@@ -1596,7 +1912,7 @@ def compile() -> Callable:
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_m, sym_k, sym_a_h, sym_a_b),
+            (sym_m_a, sym_k, sym_a_h, sym_a_b),
             stride_order=(0, 1, 2, 3) if a_is_m_major else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1604,7 +1920,7 @@ def compile() -> Callable:
     def _make_fake_b():
         return make_fake_compact_tensor(
             mma_b_dtype,
-            (sym_n, sym_k, sym_b_h, sym_b_b),
+            (sym_n, sym_k_b, sym_b_h, sym_b_b),
             stride_order=(0, 1, 2, 3) if b_is_n_major else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1612,7 +1928,7 @@ def compile() -> Callable:
     def _make_fake_c(_dt, _div, _mm):
         return make_fake_compact_tensor(
             _dt,
-            (sym_m, sym_n // _div, sym_h, sym_b),
+            (sym_m_c, sym_n // _div, sym_h, sym_b),
             stride_order=(0, 1, 2, 3) if _mm else (1, 0, 2, 3),
             assumed_align=16,
         )
@@ -1650,14 +1966,26 @@ def compile() -> Callable:
         sym_out_stride_n_0,
         sym_out_stride_h_0,
         sym_out_stride_b_0,
+        sym_k_b,
+        sym_m_a,
+        sym_m_c,
     )
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
+    # Dense binds 1-element dummies; THD's real extents are runtime, so both are
+    # symbolic and one artifact serves every sequence count.
+    # Symbolic on BOTH paths: the dense caller passes whatever 1-D buffer it has
+    # to hand (it is never read), and THD's extents are runtime, so one artifact
+    # serves every sequence count either way.
+    fake_meta = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
+    fake_desc = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int64(),), stride_order=(0,), assumed_align=16)
     return cute.compile(
         _host,
         problem_size,
         fake_a_0,
         fake_b_0,
         fake_c_0,
+        fake_meta,
+        fake_desc,
         stream=_fake_stream,
         options=frost_compile_options,
     )
@@ -1679,15 +2007,30 @@ def _permuted(t, mn_dim: int, k_dim: int, h_dim: int, b_dim: int):
     return t.permute(mn_dim, k_dim, h_dim, b_dim)
 
 
-def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None):
+def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None, meta=None, desc_words=None, grid_m: int = None):
     """Run one ``(batch, head)``-batched GEMM.
 
     ``a`` / ``b`` / ``out`` are already permuted to ``(M|N, K, H, B)`` /
     ``(M, N, H, B)``.  M, N, K and every stride are runtime values, so one
     compiled artifact serves every stage-3 shape at a given dtype and layout.
+
+    THD passes the setup launch's ``meta`` buffer and a ``desc_words`` scratch
+    of ``THD_MM_DESC_SLOTS(n_batch)`` tensor maps, which this module patches
+    itself ahead of the GEMM.  ``m`` is then the LONGEST sequence's extent: the
+    grid covers it, and tiles past a shorter sequence's own length compute a
+    garbage accumulator that its clipped C descriptor drops.
     """
+    if meta is None or desc_words is None:
+        # Required on both paths: dense never reads them, but the compiled ABI
+        # has the slots and a None would fail at the call boundary.
+        raise ValueError("matmul_bh needs `meta` and `desc_words` (dense may pass any 1-D dummies)")
     fn = compile()
-    m, k = int(a.shape[0]), int(a.shape[1])
+    # `m` sizes the GRID.  Dense: the operands' shared M.  THD: the caller
+    # passes the longest sequence, because the per-sequence extents are device
+    # values and A's own M is the workspace's column count, not an output row
+    # count.
+    m = int(a.shape[0]) if grid_m is None else int(grid_m)
+    k = int(a.shape[1])
     n = int(b.shape[0])
     problem_size = (
         m,
@@ -1698,5 +2041,8 @@ def matmul_bh(a, b, out, *, n_head: int, n_batch: int, stream=None):
         *(int(s) for s in a.stride()),
         *(int(s) for s in b.stride()),
         *(int(s) for s in out.stride()),
+        int(b.shape[1]),
+        int(a.shape[0]),
+        int(out.shape[0]),
     )
-    return fn(problem_size, a, b, out, stream=stream)
+    return fn(problem_size, a, b, out, meta, desc_words, stream=stream)

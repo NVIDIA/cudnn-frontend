@@ -458,11 +458,18 @@ def test_reject_padding_mask():
     assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
-def test_reject_thd():
-    """THD/ragged is declined: stage 3 would need a variable-K grouped GEMM.
+def test_accept_thd():
+    """THD/ragged is SERVED: the packed path with a row-blocked S/dS workspace.
 
     Same shape as the forward's THD test -- packed data behind dense-sized
-    descriptors plus a per-operand ragged_offset. Inverts when THD lands.
+    descriptors plus a per-operand ragged_offset. This was ``test_reject_thd``
+    until the packed lowering landed; it is inverted rather than deleted so the
+    claim keeps a test on this side of the row too (test/AGENTS.md). The
+    numerics and every THD conjunction live in ``test_sdpa_bwd_thd_sm100.py``.
+
+    Note the graph declares ``max_total_seq_len_q/kv``: the row REQUIRES them
+    (the blocked workspace is sized at build time), and a graph without them is
+    declined -- asserted by ``test_reject_thd_without_declared_totals`` there.
     """
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
@@ -472,7 +479,11 @@ def test_reject_thd():
     stride = [s_max * hq * _D, _D, hq * _D, 1]
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     t = {n: g.tensor(name=n, dim=shq, stride=stride) for n in ("q", "k", "v", "o", "do")}
-    st = g.tensor(name="stats", dim=[b, hq, s_max, 1], stride=[hq * s_max, s_max, 1, 1], data_type=cudnn.data_type.FLOAT)
+    # Stats is RAGGED too, token-major (stride_h == 1, stride_s == H_q): the
+    # packed path declines a dense per-batch Stats, whose stride would read as
+    # head-major over per-batch rectangles (test_reject_thd_dense_stats).
+    st = g.tensor(name="stats", dim=[b, hq, s_max, 1], stride=[s_max * hq, 1, hq, 1], data_type=cudnn.data_type.FLOAT)
+    st.set_ragged_offset(g.tensor(name="stats_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64))
     slq = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
     slk = g.tensor(name="seq_len_kv", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
     for n in ("q", "k", "v", "o", "do"):
@@ -490,17 +501,20 @@ def test_reject_thd():
             use_padding_mask=True,
             seq_len_q=slq,
             seq_len_kv=slk,
+            max_total_seq_len_q=b * s_max,
+            max_total_seq_len_kv=b * s_max,
         )
         for out in (dq, dk, dv):
             out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(stride)
             out.set_ragged_offset(g.tensor(name=f"{out.get_name()}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64))
         g.validate()
         g.build_operation_graph()
-    except cudnn.cudnnGraphNotSupportedError:
-        return  # refused before engine selection is also a decline
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        pytest.fail(f"the row claims THD, but the node refused the graph: {exc}")
     facts = ga.analyze(g)
     spec = next(s_ for s_ in ENGINE_SPECS if s_.name == _ENGINE)
-    assert facts is None or mismatch(spec.capabilities, facts) is not None
+    assert facts is not None
+    assert mismatch(spec.capabilities, facts) is None
 
 
 def test_unserved_band_graph_declines_as_not_supported():
@@ -540,8 +554,12 @@ def test_capabilities_match_what_is_implemented():
     assert c.gqa
     assert c.d_envelope and c.d_pad_multiple == 8 and max(c.d) == 512
     assert c.d_envelope_floor == 256, "an envelope with no floor silently claims every small head dim"
-    assert not c.thd, "THD needs a variable-K grouped GEMM in stage 3"
-    assert not c.padded, "per-batch seq_len is not threaded; only a uniform length is"
+    assert c.thd, "the packed path is served (blocked S/dS workspace + per-sequence descriptors)"
+    assert c.thd_declared_totals, "the blocked workspace is sized from the declared totals at BUILD time"
+    assert c.thd_causal, "the causal family is served under THD (stage 2 masks per sequence; stage 3 drops its trim)"
+    assert not c.thd_gqa, "the dK/dV partials would have to be packed per Q head"
+    assert not c.cu_seq_len, "sdpa_backward has no cu_seq_len_* port; no row can claim or test it"
+    assert not c.padded, "DENSE padding masks: the kernel compiles a scalar length; THD carries its own"
     assert not c.bias and not c.dbias and not c.sink and not c.dsink
     assert not c.deterministic
     assert c.sm_lo == 100 and c.sm_hi == 103
