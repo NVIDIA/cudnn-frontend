@@ -287,11 +287,10 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             fake_rstd,
             cutlass.Int64(0),
             cutlass.Int32(1),
-            cutlass.Int32(0),
+            cutlass.Int32(self.hidden_size),
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
             cutlass.Uint32(self._threshold),
-            cutlass.Int32(self.hidden_size),
             fake_stream,
             options="--enable-tvm-ffi",
         )
@@ -343,11 +342,10 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             rstd_tensor,
             cutlass.Int64(seed),
             cutlass.Int32(n),
-            cutlass.Int32(0),
+            cutlass.Int32(d),
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
             cutlass.Uint32(self._threshold),
-            cutlass.Int32(d),
             stream,
         )
         record_streams(

@@ -69,7 +69,6 @@ class LnMulDropoutForward:
         num_column_tiles: cutlass.Constexpr,
         seed: cutlass.Int64,
         nrows: cutlass.Int32,
-        row_off: cutlass.Int32,
         ncols: cutlass.Int32,
     ):
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -78,8 +77,7 @@ class LnMulDropoutForward:
         thread_in_row = thread_idx % self.threads_per_row
         rows_per_block = self.rows_per_cta * 32 // self.threads_per_row
         row = block_idx * rows_per_block + thread_idx // self.threads_per_row
-        valid = row < nrows
-        if valid:
+        if row < nrows:
             # Phase 1: map this thread to its row and column fragments.
             tensor_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type)
             mask_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gMask.element_type)
@@ -171,7 +169,7 @@ class LnMulDropoutForward:
                 philox_words = []
                 for mask_plane in cutlass.range_constexpr(3):
                     for h in cutlass.range_constexpr(2):
-                        c0 = cutlass.Uint32(row) + cutlass.Uint32(row_off)
+                        c0 = cutlass.Uint32(row)
                         c1 = philox_block * cutlass.Uint32(2) + cutlass.Uint32(h)
                         c2 = cutlass.Uint32(mask_plane)
                         c3 = cutlass.Uint32(0)
@@ -253,11 +251,10 @@ class LnMulDropoutForward:
         mRstd: cute.Tensor,
         seed: cutlass.Int64,
         nrows: cutlass.Int32,
-        row_off: cutlass.Int32,
+        ncols: cutlass.Int32,
         eps: cutlass.Float32,
         drop: cutlass.Float32,
         thresh: cutlass.Uint32,
-        ncols: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # The copy tile represents one row. The separate row layout describes
@@ -298,7 +295,6 @@ class LnMulDropoutForward:
             cute.size(gX, mode=[1, 1]),
             seed,
             nrows,
-            row_off,
             ncols,
         ).launch(
             grid=(grid_n, 1, 1),
