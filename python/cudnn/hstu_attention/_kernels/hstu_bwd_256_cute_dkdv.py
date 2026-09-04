@@ -1100,7 +1100,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         tSTgK = KQ_thr_mma.partition_A(gK)
         tSTgQ = KQ_thr_mma.partition_B(gQ)
-        tdK_gQT = dSQ_thr_mma.partition_B(gQT)
+        tdKgQT = dSQ_thr_mma.partition_B(gQT)
         tdPTgV = VdO_thr_mma.partition_A(gV)
         tdPTgdO = VdO_thr_mma.partition_B(gdO)
         tdVgdOT = PdO_thr_mma.partition_B(gdOT)
@@ -1128,7 +1128,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_in_cluster_coord_vmnk[1],
             cute.make_layout(cute.size(cta_layout_vmnk, mode=[1])),
             cute.group_modes(sQT, 0, 3),
-            cute.group_modes(tdK_gQT, 0, 3),
+            cute.group_modes(tdKgQT, 0, 3),
         )
         tVsV, tVgV_mkl = cute.nvgpu.cpasync.tma_partition(
             tma_atom_V,
