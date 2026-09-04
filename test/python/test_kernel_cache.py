@@ -260,3 +260,104 @@ def test_serialize_both_graph_and_kernel_cache(cudnn_handle):
     graph.execute({0: A_gpu, 1: B_gpu, 2: C_actual}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     torch.testing.assert_close(C_actual, C_expected, **global_assert_opts_defaults["default"])
+
+
+# The revision counter and the entry count are keyed on the engine configuration,
+# so the shapes here stay small: the test never executes the graph and never
+# allocates device memory, and only plan compilation costs time.
+revision_shape = problem_defintion(b=1, m=32, n=32, k=32)
+revision_shape_2 = problem_defintion(b=1, m=128, n=32, k=32)
+
+
+def build_kernel_cache_graph(handle, cache, shape, build_plans=True):
+    """Build a matmul graph in stages, so the caller can read the kernel cache
+    after finalization but before any plan is compiled."""
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=handle,
+        kernel_cache=cache,
+    )
+
+    A = graph.tensor(name="A", dim=[shape.b, shape.m, shape.k], stride=[shape.m * shape.k, shape.k, 1])
+    B = graph.tensor(name="B", dim=[shape.b, shape.k, shape.n], stride=[shape.n * shape.k, shape.n, 1])
+    C = graph.matmul(name="matmul", A=A, B=B)
+    C.set_output(True).set_uid(2)
+    A.set_uid(0)
+    B.set_uid(1)
+
+    graph.validate()
+
+    # This finalizes the kernel cache. It compiles no plan, so it cannot change
+    # the number of entries.
+    graph.build_operation_graph()
+
+    if build_plans:
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            graph.check_support()
+        except cudnn.cudnnGraphNotSupportedError as e:
+            pytest.skip(f"TEST WAIVED: unsupported graph. {e}")
+        graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+
+    return graph
+
+
+@pytest.mark.skipif(
+    LooseVersion(cudnn.backend_version_string()) < "9.27",
+    reason="requires cudnn 9.27 or higher",
+)
+@pytest.mark.L0
+def test_kernel_cache_revision_and_size(cudnn_handle):
+    # Both accessors need a finalized kernel cache.
+    cache = cudnn.create_kernel_cache()
+    with pytest.raises(Exception):
+        cache.revision()
+    with pytest.raises(Exception):
+        cache.size()
+
+    # Finalized, but no plan is compiled yet.
+    graph = build_kernel_cache_graph(cudnn_handle, cache, revision_shape, build_plans=False)
+    assert cache.revision() == 0
+    assert cache.size() == 0
+
+    # The first plan build on a cold cache always inserts one entry.
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+    assert cache.revision() == 1
+    assert cache.size() == 1
+
+    # The same shape finds the entry. A lookup does not change the counter.
+    build_kernel_cache_graph(cudnn_handle, cache, revision_shape)
+    assert cache.revision() == 1
+    assert cache.size() == 1
+
+    # A different shape does not necessarily add an entry, because two shapes can
+    # share one engine configuration. Only the relation between the two values is
+    # a contract: these graphs cause no replacement and no eviction, so the two
+    # deltas must agree.
+    revision_before, size_before = cache.revision(), cache.size()
+    build_kernel_cache_graph(cudnn_handle, cache, revision_shape_2)
+    assert cache.revision() - revision_before == cache.size() - size_before
+    assert cache.size() >= size_before
+
+    # The serialized data does not contain the counter. A load starts a new count
+    # and adds one for each entry that it puts in the cache. Thus the baseline of
+    # a loaded cache is the entry count, and not zero.
+    str_json = cache.serialize()
+    entry_count = cache.size()
+
+    loaded = cudnn.create_kernel_cache()
+    loaded.deserialize(str_json)
+
+    # The descriptor exists now, but it is not finalized.
+    with pytest.raises(Exception):
+        loaded.revision()
+    with pytest.raises(Exception):
+        loaded.size()
+
+    build_kernel_cache_graph(cudnn_handle, loaded, revision_shape, build_plans=False)
+    assert loaded.size() == entry_count
+    assert loaded.revision() == loaded.size()

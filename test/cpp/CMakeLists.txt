@@ -30,6 +30,7 @@ add_executable(
     tensor.cpp
     get_engine_and_knobs.cpp
     kernel_cache_thread_safety.cpp
+    kernel_cache_revision.cpp
 )
 
 if (MSVC)

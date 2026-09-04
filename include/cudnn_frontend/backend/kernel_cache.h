@@ -24,7 +24,7 @@ class Graph;
 /// KernelCache Class
 /// Wraps the kernel_cache backend descriptor
 /// Wraps backend utility functions for user's convenience
-/// Backend accessor functions: size()
+/// Backend accessor functions: revision(), size()
 /// Contains internal utilities for kernel cache finalization and operation graph attributes
 ///
 class KernelCache : public detail::backend_descriptor {
@@ -128,6 +128,80 @@ class KernelCache : public detail::backend_descriptor {
         (void)json_cache;
         return {error_code_t::CUDNN_BACKEND_API_FAILED,
                 "CUDNN_ATTR_KERNEL_CACHE_JSON_REPRESENTATION is only available starting 9.10."};
+#endif
+    }
+
+    /// Gets a counter that shows if the contents of the kernel cache changed.
+    ///
+    /// An insertion, a replacement, a removal, or an eviction each add one to the counter. A
+    /// lookup does not change the counter.
+    ///
+    /// Use this function, and not size(), to find if a new serialization is necessary. cuDNN can
+    /// replace the data that it holds for an engine configuration that is already in the cache.
+    /// A replacement does not change the number of entries, but it does change the data that
+    /// to_json() returns.
+    ///
+    /// The counter is local to the process. to_json() does not put the counter in its data, and
+    /// from_json() starts a new count. Two kernel caches have no common count. Thus do not keep a
+    /// counter value with a serialized cache and compare it after a reload. Read a new baseline
+    /// immediately after the cache is loaded and finalized. Then compare subsequent reads to that
+    /// baseline.
+    ///
+    /// The kernel cache must be finalized.
+    error_t
+    revision(int64_t &value) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        value = 0;
+#if (CUDNN_VERSION >= 92700)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "CUDNN_ATTR_KERNEL_CACHE_REVISION is only available starting 9.27.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            get_ptr() == nullptr,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            "KernelCache::revision: descriptor not initialized; call build() or from_json() first.");
+
+        int64_t element_count = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
+            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_REVISION, CUDNN_TYPE_INT64, 1, &element_count, &value));
+        return {};
+#else
+        return {error_code_t::CUDNN_BACKEND_API_FAILED,
+                "CUDNN_ATTR_KERNEL_CACHE_REVISION is only available starting 9.27."};
+#endif
+    }
+
+    /// Gets the number of entries in the kernel cache.
+    ///
+    /// The kernel cache keys its entries on the engine configuration, and not on the shape of the
+    /// tensors. Thus two different shapes can use one entry.
+    ///
+    /// A replacement changes the data of an entry but keeps the number of entries. Thus use
+    /// revision(), and not this function, to find if a new serialization is necessary.
+    ///
+    /// The kernel cache must be finalized.
+    error_t
+    size(int64_t &value) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        value = 0;
+#if (CUDNN_VERSION >= 92700)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 92700,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT is only available starting 9.27.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            get_ptr() == nullptr,
+            error_code_t::CUDNN_BACKEND_API_FAILED,
+            "KernelCache::size: descriptor not initialized; call build() or from_json() first.");
+
+        int64_t element_count = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_attribute(
+            get_ptr(), CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT, CUDNN_TYPE_INT64, 1, &element_count, &value));
+        return {};
+#else
+        return {error_code_t::CUDNN_BACKEND_API_FAILED,
+                "CUDNN_ATTR_KERNEL_CACHE_ENTRY_COUNT is only available starting 9.27."};
 #endif
     }
 
