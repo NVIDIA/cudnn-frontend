@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -13,6 +13,7 @@ from cutlass.cute.typing import Int32, Float16, BFloat16
 
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
+from ._kernels.hstu_bwd_q1 import HSTUAttentionBackwardQlen1Sm100
 from ._kernels.block_sparse_builder import (
     build_hstu_k2q_block_sparse,
     build_hstu_q2k_block_sparse,
@@ -68,6 +69,33 @@ def _mark_dynamic_tensor(
             divisibility=64,
         )
     return cute_tensor
+
+
+def _make_q1_dynamic_thd_tensor(
+    tensor: torch.Tensor,
+    total_tokens,
+):
+    """Build a qlen=1 THD compile descriptor with a dynamic token extent.
+
+    ``mark_layout_dynamic`` only makes strides dynamic.  Packed token totals
+    vary between continuous-batching steps, so the first shape mode must be a
+    symbol as well.  Keep heads and head dim static, while preserving the
+    qlen=1 contract's independently dynamic, 128-bit-aligned token/head
+    strides.
+    """
+    if tensor.data_ptr() % 16 != 0:
+        raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
+    element_type = Float16 if tensor.dtype == torch.float16 else BFloat16
+    return cute.runtime.make_fake_tensor(
+        element_type,
+        (total_tokens, tensor.shape[1], tensor.shape[2]),
+        (
+            cute.sym_int64(divisibility=8),
+            cute.sym_int64(divisibility=8),
+            1,
+        ),
+        assumed_align=16,
+    )
 
 
 def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
@@ -147,7 +175,7 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
 def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     """Return whether the fused epilogue can write directly to ``t``.
 
-    The D64/D128 epilogue uses 128-bit stores, so the unit-stride head
+    The D32/D64/D128 epilogue uses 128-bit stores, so the unit-stride head
     dimension and the token/head offsets must remain 16-byte aligned.
     The kernel restores those dynamic-stride divisibility assumptions before
     constructing its output views.
@@ -156,6 +184,318 @@ def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     # represents broadcast strides as static zero, so mixing them with a
     # previously compiled nonzero-stride descriptor would not be type-safe.
     return _supports_bwd_original_qkv_layout(t) and t.stride(0) != 0 and t.stride(1) != 0
+
+
+def _select_q1_bwd_num_threads(
+    capability: tuple[int, int],
+    batch_size: int,
+    num_heads: int,
+    split_kv: int,
+    head_dim: int,
+) -> int:
+    """Select the block size paired with the qlen=1 backward split."""
+    base_ctas = batch_size * num_heads
+    if split_kv == 1 and base_ctas >= 2048:
+        # Once the unsplit grid already has enough CTAs, a small block avoids
+        # spending 12--16 warps on each short sequence. Split kernels already
+        # reach the same four-warp floor below. The unsplit dQ reduction writes
+        # one element per thread, so its block must cover the full head.
+        return max(128, head_dim)
+    if capability in ((10, 0), (10, 3)):
+        # Paired B200/B300 sweeps show the same block-size trend, so SM100 and
+        # SM103 share one policy. Five 12-warp CTAs fit per B300 SM and win
+        # once the grid is large; 16 warps expose more latency-hiding work for
+        # smaller grids.
+        num_threads = 384 if batch_size >= 448 else 512
+    elif capability == (10, 7):
+        num_threads = 512
+    else:
+        num_threads = 256
+    if split_kv > 1:
+        # Shrink each split CTA, but keep at least four warps so the per-CTA
+        # dQ reduction and short KV loop still have enough parallel work.
+        num_threads = max(128, (num_threads // split_kv // 32) * 32)
+    return num_threads
+
+
+def _hstu_varlen_bwd_q1_direct(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    alpha: float,
+    scaling_seqlen: float,
+    is_local: bool,
+    window_size_left: int,
+    window_size_right: int,
+    split_kv: int,
+    rows_per_warp: int,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    *,
+    _compile_only: bool,
+):
+    no_preallocated_grads = dq is None and dk is None and dv is None
+    if not no_preallocated_grads and (dq is None or dk is None or dv is None):
+        raise ValueError("dq, dk, and dv must either all be supplied or all be omitted")
+    if no_preallocated_grads:
+        dq, dk, dv = [torch.empty_like(tensor, memory_format=torch.preserve_format) for tensor in (q, k, v)]
+    assert dq is not None and dk is not None and dv is not None
+    if dq.shape != q.shape or dk.shape != k.shape or dv.shape != v.shape:
+        raise ValueError("HSTU gradient outputs must match their corresponding inputs")
+
+    batch_size = cu_seqlens_q.shape[0] - 1
+    capability = _get_q1_device_capability(q.device)
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    num_threads = _select_q1_bwd_num_threads(capability, batch_size, num_heads, split_kv, head_dim)
+    compile_key = (q.device, q.dtype, head_dim, num_heads, num_threads, is_local, split_kv, rows_per_warp)
+    if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
+        total_q = cute.sym_int(divisibility=1)
+        total_k = cute.sym_int(divisibility=1)
+        batch_plus_one = cute.sym_int(divisibility=1)
+        q_tensor = _make_q1_dynamic_thd_tensor(q, total_q)
+        do_tensor = _make_q1_dynamic_thd_tensor(do, total_q)
+        dq_tensor = _make_q1_dynamic_thd_tensor(dq, total_q)
+        k_tensor = _make_q1_dynamic_thd_tensor(k, total_k)
+        v_tensor = _make_q1_dynamic_thd_tensor(v, total_k)
+        dk_tensor = _make_q1_dynamic_thd_tensor(dk, total_k)
+        dv_tensor = _make_q1_dynamic_thd_tensor(dv, total_k)
+        for tensor in (cu_seqlens_q, cu_seqlens_k):
+            if tensor.data_ptr() % 16 != 0:
+                raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
+        cu_q_tensor = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (batch_plus_one,),
+            stride_order=(0,),
+            assumed_align=16,
+        )
+        cu_k_tensor = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (batch_plus_one,),
+            stride_order=(0,),
+            assumed_align=16,
+        )
+        kernel = HSTUAttentionBackwardQlen1Sm100(
+            element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
+            head_dim=head_dim,
+            num_threads=num_threads,
+            split_kv=split_kv,
+            rows_per_warp=rows_per_warp,
+            is_local=is_local,
+        )
+        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+            _hstu_varlen_bwd_q1_direct.compile_cache[compile_key] = cute.compile(
+                kernel,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                do_tensor,
+                dq_tensor,
+                dk_tensor,
+                dv_tensor,
+                cu_q_tensor,
+                cu_k_tensor,
+                Int32(window_size_left),
+                Int32(window_size_right),
+                Int32(batch_size),
+                Int32(q.shape[1]),
+                alpha,
+                scaling_seqlen,
+                compile_stream,
+                options="--enable-tvm-ffi",
+            )
+
+    if not _compile_only:
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+            if split_kv > 1:
+                dq.zero_()
+            _hstu_varlen_bwd_q1_direct.compile_cache[compile_key](
+                q,
+                k,
+                v,
+                do,
+                dq,
+                dk,
+                dv,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                Int32(window_size_left),
+                Int32(window_size_right),
+                Int32(batch_size),
+                Int32(q.shape[1]),
+                alpha,
+                scaling_seqlen,
+            )
+    return dq, dk, dv
+
+
+_hstu_varlen_bwd_q1_direct.compile_cache = {}
+
+
+_q1_device_capability_cache: dict[torch.device, tuple[int, int]] = {}
+
+
+def _get_q1_device_capability(device: torch.device) -> tuple[int, int]:
+    capability = _q1_device_capability_cache.get(device)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        _q1_device_capability_cache[device] = capability
+    return capability
+
+
+class _Q1FwdKernelConfig(NamedTuple):
+    """Compile-time qlen=1 knobs shared with the standalone tuning benchmark."""
+
+    block_m: int = 128
+    block_n: int = 128
+    split_kv: int = 1
+    single_warp_epilogue: bool = False
+    m64_silu_warps: int = 0
+    m64_inplace_silu: bool = False
+    m64_16dp_silu: bool = False
+    m64_tail_branch: bool = False
+    m64_kv_stage: int = 0
+
+
+_Q1_FWD_DEFAULT_CONFIG = _Q1FwdKernelConfig()
+_Q1_FWD_D64_D128_CONFIG = _Q1FwdKernelConfig(
+    block_m=64,
+    m64_inplace_silu=True,
+    m64_16dp_silu=True,
+    m64_tail_branch=True,
+    m64_kv_stage=5,
+)
+_Q1_FWD_D256_CONFIG = _Q1FwdKernelConfig(
+    block_m=64,
+    m64_inplace_silu=True,
+    m64_16dp_silu=True,
+    m64_tail_branch=True,
+)
+
+
+def _select_q1_fwd_config(
+    capability: tuple[int, int],
+    supported: bool,
+    head_dim: int,
+) -> _Q1FwdKernelConfig:
+    """Select one of the two measured qlen=1 production configurations."""
+    if not supported or capability not in ((10, 0), (10, 3), (10, 7)):
+        return _Q1_FWD_DEFAULT_CONFIG
+    return _Q1_FWD_D256_CONFIG if head_dim == 256 else _Q1_FWD_D64_D128_CONFIG
+
+
+def _select_q1_bwd_algorithm(
+    requested: str,
+    batch_size: int,
+    device: torch.device,
+) -> str:
+    """Resolve the non-split qlen=1 fallback from measured SM10x crossovers."""
+    if requested != "auto":
+        return requested
+
+    capability = _get_q1_device_capability(device)
+
+    # B300 (SM103): direct wins at the requested BS=64 point and from BS=128.
+    # The small-MMA path retains two measured low-grid crossover regions. B200
+    # (SM100) uses the same fallback crossover policy.
+    if capability in ((10, 0), (10, 3)):
+        if batch_size < 64:
+            return "tc-small"
+        if batch_size < 80:
+            return "direct"
+        return "tc-small" if batch_size < 128 else "direct"
+
+    # Rubin (SM107): legacy wins below BS=128, small MMA wins at BS=128,
+    # and the vectorized direct path wins from the measured BS=192 point.
+    if capability == (10, 7):
+        if batch_size < 128:
+            return "legacy"
+        return "tc-small" if batch_size < 192 else "direct"
+
+    # Preserve the existing policy on other SM100-family devices.
+    return "direct" if batch_size >= 256 else "legacy"
+
+
+_Q1_BWD_DIRECT_SPLITS = {
+    "direct": 1,
+    "direct-split2": 2,
+    "direct-split4": 4,
+    "direct-split8": 8,
+    "direct-split16": 16,
+    "direct-split22": 22,
+    "direct-split26": 26,
+    "direct-split32": 32,
+    "direct-split64": 64,
+    "direct-pair": 1,
+    "direct-pair-split2": 2,
+    "direct-pair-split4": 4,
+    "direct-pair-split8": 8,
+    "direct-pair-split13": 13,
+    "direct-pair-split16": 16,
+}
+
+
+def _select_q1_bwd_split_kv(
+    requested: str,
+    capability: tuple[int, int],
+    supported: bool,
+    is_local: bool = False,
+    *,
+    batch_size: Optional[int] = None,
+    num_heads: Optional[int] = None,
+    total_kv: Optional[int] = None,
+    head_dim: Optional[int] = None,
+) -> int:
+    """Resolve the cheap workload-aware qlen=1 backward split."""
+    if requested in _Q1_BWD_DIRECT_SPLITS:
+        return _Q1_BWD_DIRECT_SPLITS[requested]
+    if requested != "auto" or not supported:
+        return 1
+
+    # Paired B200/B300 sweeps show no stable architecture-specific split
+    # crossover, so SM100 and SM103 share one default.
+    split_kv = {(10, 0): 8, (10, 3): 8, (10, 7): 13}.get(capability, 1)
+    if split_kv == 1:
+        return 1
+
+    # Compare integer totals, avoiding a device read or a floating-point
+    # average. Scaling KV by D/128 accounts for the kernel's D64/D128/D256
+    # row-packing factors. D256 keeps splitting at medium grid sizes because
+    # one warp handles only one row; D64/D128 can stop earlier. Once 4096 base
+    # CTAs already exist, the small unsplit block remains worthwhile through a
+    # somewhat larger per-sequence workload on both targets.
+    has_workload = (
+        batch_size is not None
+        and batch_size > 0
+        and num_heads is not None
+        and num_heads > 0
+        and total_kv is not None
+        and total_kv >= 0
+        and head_dim is not None
+        and head_dim > 0
+    )
+    if has_workload:
+        assert batch_size is not None
+        assert num_heads is not None
+        assert total_kv is not None
+        assert head_dim is not None
+        scaled_work = total_kv * head_dim
+        base_ctas = batch_size * num_heads
+        if scaled_work < batch_size * 128 * 256 and (head_dim < 256 or base_ctas <= 256):
+            return 1
+        if base_ctas >= 4096 and scaled_work < batch_size * 128 * 768:
+            return 1
+
+    # Causal and local use the same thresholds. Local backward still writes
+    # zeros over the complete packed KV range, so total KV—not window width—is
+    # the relevant work estimate.
+    _ = is_local
+    return split_kv
 
 
 def hstu_varlen_fwd_100(
@@ -177,6 +517,7 @@ def hstu_varlen_fwd_100(
     *,
     out: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
+    _q1_fwd_tuning_config: Optional[_Q1FwdKernelConfig] = None,
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     q_dtype = q.dtype
@@ -186,11 +527,11 @@ def hstu_varlen_fwd_100(
 
     head_dim = q.shape[2]
     head_dim_v = v.shape[2]
+    batch_size = cu_seqlens_q.shape[0] - 1
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
-    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
+    assert head_dim in (32, 64, 128, 256), "Only support head_dim 32, 64, 128 and 256"
 
-    kBlockM = 128
-    kBlockN = 128
+    is_q_len_one = max_seqlen_q == 1
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
@@ -199,8 +540,31 @@ def hstu_varlen_fwd_100(
     use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
+    q1_dynamic_thd = is_q_len_one and (is_causal or is_local) and not is_arbitrary and not is_paged and q.shape[1] == k.shape[1] == v.shape[1]
+    q1_m64_supported = q1_dynamic_thd and q_dtype == torch.bfloat16 and head_dim in (64, 128, 256)
+    q1_split_supported = q1_m64_supported and is_causal
+    capability = _get_q1_device_capability(q.device)
+    # Production dispatch has two measured configurations. The private config
+    # override is only for the standalone tuning benchmark, which owns the
+    # larger candidate set and translates its human-readable names into knobs.
+    q1_fwd_config = _q1_fwd_tuning_config if _q1_fwd_tuning_config is not None else _select_q1_fwd_config(capability, q1_m64_supported, head_dim)
+    kBlockM = q1_fwd_config.block_m
+    kBlockN = q1_fwd_config.block_n
+    q1_split_kv = q1_fwd_config.split_kv
+    q1_single_warp_epilogue = q1_fwd_config.single_warp_epilogue
+    q1_m64_silu_warps = q1_fwd_config.m64_silu_warps
+    q1_m64_inplace_silu = q1_fwd_config.m64_inplace_silu
+    q1_m64_16dp_silu = q1_fwd_config.m64_16dp_silu
+    q1_m64_tail_branch = q1_fwd_config.m64_tail_branch
+    q1_m64_kv_stage = q1_fwd_config.m64_kv_stage
+    # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
+    # launch; larger batches have enough query-head CTAs and favor one CTA.
     use_2cta_instrs = (
-        torch.cuda.get_device_capability(q.device) == (10, 7)
+        (not is_q_len_one or batch_size < 256)
+        and q1_split_kv == 1
+        and kBlockM == 128
+        and not q1_single_warp_epilogue
+        and capability == (10, 7)
         and head_dim == 128
         and is_causal
         and not is_local
@@ -230,6 +594,12 @@ def hstu_varlen_fwd_100(
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+    if q1_split_kv > 1 and not q1_split_supported:
+        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
+    if kBlockM == 64 and not q1_m64_supported:
+        raise ValueError("The M64 qlen=1 forward algorithms require causal or local BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
+    if q1_single_warp_epilogue and not q1_split_supported:
+        raise ValueError("The single-warp qlen=1 forward experiment requires causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     compile_key = (
         q.device,
         q_dtype,
@@ -244,12 +614,23 @@ def hstu_varlen_fwd_100(
         use_auto_block_metadata,
         use_2cta_instrs,
         use_clc_descriptor,
+        q1_split_kv,
+        # Head count is plan-time metadata. Packed token and batch extents are
+        # deliberately absent: the qlen=1 compile descriptors below represent
+        # them with SymInt so one artifact re-binds every runtime batch.
+        q.shape[1],
+        q1_single_warp_epilogue,
+        q1_m64_silu_warps,
+        q1_m64_inplace_silu,
+        q1_m64_16dp_silu,
+        q1_m64_tail_branch,
+        q1_m64_kv_stage,
     )
 
     block_sparse_tensors = None
     if use_auto_block_metadata:
         q2k_block_size = (
-            kBlockM if head_dim == 256 else 2 * kBlockM,
+            kBlockM if head_dim == 256 or is_q_len_one else 2 * kBlockM,
             kBlockN,
         )
         with torch.cuda.nvtx.range("hstu_q2k_block_sparse_builder"):
@@ -286,8 +667,32 @@ def hstu_varlen_fwd_100(
         paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
-        q_tensor, k_tensor, v_tensor, o_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
+        if q1_dynamic_thd:
+            total_q = cute.sym_int(divisibility=1)
+            total_k = cute.sym_int(divisibility=1)
+            batch_plus_one = cute.sym_int(divisibility=1)
+            q_tensor = _make_q1_dynamic_thd_tensor(q, total_q)
+            k_tensor = _make_q1_dynamic_thd_tensor(k, total_k)
+            v_tensor = _make_q1_dynamic_thd_tensor(v, total_k)
+            o_tensor = _make_q1_dynamic_thd_tensor(out, total_q)
+            for tensor in (cu_seqlens_q, cu_seqlens_k):
+                if tensor.data_ptr() % 16 != 0:
+                    raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
+            cu_seqlens_q_tensor = cute.runtime.make_fake_compact_tensor(
+                Int32,
+                (batch_plus_one,),
+                stride_order=(0,),
+                assumed_align=16,
+            )
+            cu_seqlens_k_tensor = cute.runtime.make_fake_compact_tensor(
+                Int32,
+                (batch_plus_one,),
+                stride_order=(0,),
+                assumed_align=16,
+            )
+        else:
+            q_tensor, k_tensor, v_tensor, o_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)]
+            cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         func_tensor = _mark_optional_tensor(func)
         paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [_mark_optional_tensor(tensor) for tensor in (paged_kv_flat, page_ids, page_indptrs)]
         block_sparse_cute = _mark_block_sparse_tensors(block_sparse_tensors)
@@ -304,6 +709,14 @@ def hstu_varlen_fwd_100(
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
             use_clc_descriptor=use_clc_descriptor,
+            is_q_len_one=is_q_len_one and not use_2cta_instrs,
+            q1_split_kv=q1_split_kv,
+            q1_single_warp_epilogue=q1_single_warp_epilogue,
+            q1_m64_silu_warps=q1_m64_silu_warps,
+            q1_m64_inplace_silu=q1_m64_inplace_silu,
+            q1_m64_16dp_silu=q1_m64_16dp_silu,
+            q1_m64_tail_branch=q1_m64_tail_branch,
+            q1_m64_kv_stage=q1_m64_kv_stage,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
@@ -312,8 +725,8 @@ def hstu_varlen_fwd_100(
                 k_tensor,
                 v_tensor,
                 o_tensor,
-                max_seqlen_q,
-                max_seqlen_k,
+                Int32(max_seqlen_q),
+                Int32(max_seqlen_k),
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
                 alpha,
@@ -333,14 +746,16 @@ def hstu_varlen_fwd_100(
         return out, None
 
     with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+        if q1_split_kv > 1:
+            out.zero_()
         compiled_fwd = hstu_varlen_fwd_100.compile_cache[compile_key]
         compiled_fwd(
             q,
             k,
             v,
             out,
-            max_seqlen_q,
-            max_seqlen_k,
+            Int32(max_seqlen_q),
+            Int32(max_seqlen_k),
             cu_seqlens_q,
             cu_seqlens_k,
             alpha,
@@ -380,6 +795,7 @@ def hstu_varlen_bwd_100(
     scaling_seqlen: Optional[float] = None,
     *,
     _compile_only: bool = False,
+    _q1_bwd_algorithm: str = "auto",
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     if deterministic:
@@ -398,12 +814,13 @@ def hstu_varlen_bwd_100(
     head_dim = q.shape[2]
     num_heads_k = k.shape[1]
 
-    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
+    assert head_dim in (32, 64, 128, 256), "Only support head_dim 32, 64, 128 and 256"
     assert num_heads == num_heads_k, "Number of heads in key/value and query must be equal"
     assert k.shape[2] == head_dim, "k and q must have the same head_dim"
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
     assert do.shape == q.shape, "do and q must have the same shape"
 
+    is_q_len_one_supported = max_seqlen_q == 1 and head_dim in (64, 128, 256)
     m_block_size = 128
     n_block_size = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
@@ -412,7 +829,65 @@ def hstu_varlen_bwd_100(
     is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
-    use_2cta_instrs = head_dim == 128 and not is_arbitrary
+    use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_supported
+    q1_inputs_direct = all(_supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
+    q1_outputs_direct = (dq is None and dk is None and dv is None) or (
+        dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
+    )
+    q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small", "legacy")
+    if _q1_bwd_algorithm not in q1_bwd_algorithms:
+        raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
+    if head_dim == 256 and _q1_bwd_algorithm in ("tc", "tc-small"):
+        raise ValueError("The tc and tc-small qlen=1 backward algorithms do not support D=256")
+    q1_direct_supported = is_q_len_one_supported and (is_causal or is_local) and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
+    if _q1_bwd_algorithm in (*_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small") and not q1_direct_supported:
+        raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal or local qlen=1 with D=64/128/256 and direct layouts")
+    if _Q1_BWD_DIRECT_SPLITS.get(_q1_bwd_algorithm, 1) > 1 and q_dtype != torch.bfloat16:
+        raise ValueError("The split-KV qlen=1 backward algorithms currently require BF16")
+    capability = _get_q1_device_capability(q.device)
+    q1_split_supported = q1_direct_supported and q_dtype == torch.bfloat16
+    q1_bwd_split_kv = _select_q1_bwd_split_kv(
+        _q1_bwd_algorithm,
+        capability,
+        q1_split_supported,
+        is_local,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        total_kv=k.shape[0],
+        head_dim=head_dim,
+    )
+    if _q1_bwd_algorithm == "auto" and q1_split_supported:
+        selected_q1_bwd_algorithm = "direct-pair"
+    elif q1_direct_supported:
+        selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device)
+    else:
+        selected_q1_bwd_algorithm = _q1_bwd_algorithm
+    use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS
+    # Keep every lane on one aligned 128-bit vector. A warp consequently packs
+    # four D64 rows, two D128 rows, or one D256 row.
+    q1_rows_per_warp = 256 // head_dim if selected_q1_bwd_algorithm.startswith("direct-pair") else 1
+    use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
+    use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"
+    if use_q1_direct_kernel:
+        return _hstu_varlen_bwd_q1_direct(
+            do,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            alpha,
+            scaling_seqlen,
+            is_local,
+            window_size_left,
+            window_size_right,
+            q1_bwd_split_kv,
+            q1_rows_per_warp,
+            dq,
+            dk,
+            dv,
+            _compile_only=_compile_only,
+        )
     if head_dim == 256:
         # The fused one-CTA kernel's live TMEM ranges exceed the SM100
         # 512-column capacity at D=256. Use the dedicated two-kernel path:
@@ -444,7 +919,7 @@ def hstu_varlen_bwd_100(
     if use_auto_block_metadata:
         # Build on every execution so in-place func updates, including CUDA
         # Graph replay updates, are visible to the consumer.  The private K2Q
-        # layout is fixed by the fused D64/D128 backward tile contract.
+        # layout is fixed by the fused D32/D64/D128 backward tile contract.
         block_sparse_tensors = build_hstu_k2q_block_sparse(
             func,
             cu_seqlens_q,
@@ -487,6 +962,8 @@ def hstu_varlen_bwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
+        use_q_major_scheduler,
+        use_q1_small_mma,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -545,7 +1022,7 @@ def hstu_varlen_bwd_100(
         dtype=torch.float32,
         device=q.device,
     )
-    if not _compile_only:
+    if not _compile_only and not use_q_major_scheduler:
         workspace_torch.zero_()
     problem_shape = (
         Int32(max_seqlen_q),
@@ -594,6 +1071,8 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
+            use_q_major_scheduler=use_q_major_scheduler,
+            use_q1_small_mma=use_q1_small_mma,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(

@@ -33,9 +33,21 @@ plan time · — not applicable · ⁿ footnote.
 ## SM100 / SM103 (Blackwell, cc 10.0–10.6)
 
 Engines: `sdpa_fwd_prefill_sm100` (f16/bf16), `sdpa_fwd_prefill_sm100_fp8`,
-`sdpa_fwd_prefill_sm100_mxfp8`, `sdpa_bwd_sm100`. The backward engine serves
-**only the large-head-dim band, d ∈ (256, 512]** — every other
-`sdpa_backward()` shape still falls through to the cuDNN backend.
+`sdpa_fwd_prefill_sm100_mxfp8`, `sdpa_bwd_sm100`, `sdpa_bwd_sm100_mxfp8`. The
+half-precision backward engine serves **only the large-head-dim band,
+d ∈ (256, 512]**, and the MXFP8 backward engine serves **exactly d = 256** —
+every other `sdpa_backward()` / `sdpa_mxfp8_backward()` shape still falls
+through to the cuDNN backend. The BPROP column below reads ᵇ for the
+half-precision row and ᵍ for the MXFP8 row.
+
+The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
+front**: the seven F8_128x4 scale tensors are repacked into the kernels'
+2-CTA slot layout (eleven small launches into workspace), then a dQ kernel
+(Q·Kᵀ, dO·Vᵀ, dS·K) and a fused dK/dV kernel (Q·Kᵀ, dO·Vᵀ, dSᵀ·Q, Pᵀ·dO) run,
+both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
+`fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
+online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
+documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
 
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
@@ -43,7 +55,7 @@ so S and dS go to a GMEM workspace and the gradients are three batched GEMMs
 over it (`do_dot` → `bprop_d512_f16_sm100` → `bprop_matmul_sm100`). Two
 consequences a user can see: the workspace is `2·B·H_chunk·S_q·S_kv·2 B` (the
 host loops over head chunks to hold it under 4 GiB; under THD it is
-`2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ᵍ), and everything in the band
+`2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ʰ), and everything in the band
 is **envelope-served** — the tiles are fixed at 512, so d=264 costs the same
 MMA as d=512.
 
@@ -52,28 +64,29 @@ MMA as d=512.
 | **Data types** | | | | | | |
 | FP16 / BF16 | ⚠️⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | — |
-| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 | f16 ×8 · fp8 ×16, floor 256² | — |
+| MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ✅ᵍ (E4M3 only, d=256) |
+| O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | ✅ᵍ (fp16/bf16 gradients) |
+| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
-| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
-| Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ |
-| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ᵍ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʰ |
+| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
+| Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
+| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʲ |
 | **Masks / features** | | | | | | |
-| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
-| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
-| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
-| Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵍ |
-| THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ · ❌ᵍ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |
+| Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ |
+| THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | dense onlyᵇ ᶠ ᵍ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ · dense only under THDʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ |
-| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `use_deterministic_algorithm` | — | — | — | — | — | ❌ᵇ · ✅ᵍ |
+| Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |
+| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ᵇ · ✅ᵍ |
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
@@ -124,7 +137,7 @@ special path: every ring is per-kv-iteration, so a zero-trip loop fires nothing.
 Causal also skips whole kv tiles above the diagonal (~44 % of them at S=2048),
 which means those workspace tiles are never written and stage 3 must trim its K
 range to match — a correctness requirement, not just an optimization.
-ᵍ **THD / ragged backward.** Q/K/V/O/dO and the gradients are PACKED
+ʰ **THD / ragged backward** (`sdpa_bwd_sm100`, the ᵇ row). Q/K/V/O/dO and the gradients are PACKED
 `[1, T, H, D]`; the S/dS workspace is **row-blocked** (each sequence owns a
 128-row-aligned block, columns uniform at `pad(S_kv_max)`), which is where the
 memory win over the dense `B · S_max²` rectangle comes from. A setup launch
@@ -155,7 +168,7 @@ path has no staging copy), and a graph that does not declare
 **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here, because
 `scratch_workspace_bytes()` is a build-time function and the blocked row count
 comes from the packed totals before any buffer exists.
-ʰ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
+ʲ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
 none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`.
@@ -163,6 +176,20 @@ none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`
 quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
 (MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
 envelope (`thd_d_shapes=None`) and works.
+ᵍ **`sdpa_bwd_sm100_mxfp8` only — `sdpa_mxfp8_backward()` with E4M3 payloads,
+d_qk = d_v = 256 exactly, fp16/bf16 `o_f16`/`dO_f16`/dQ/dK/dV.** Serves MHA /
+GQA / MQA, any fixed S_q / S_kv (the kernels mask tile tails; S_q = 1 works),
+dense and top-left causal, and honors `use_deterministic_algorithm` (both
+kernels own their output tiles — nothing accumulates through atomics).
+BSHD-physical storage only: the kernels derive head and batch strides rather
+than reading them, so a BHSD-contiguous graph is declined, not staged. Declined
+outright: E5M2, bottom-right / right-widened / sliding-window masks, padding,
+THD, bias / dBias, sink / dSink, and any of `amax_dQ/dK/dV` requested as a real
+output (the kernels write half-precision gradients and produce no amax).
+Numerics: dS is quantized in-kernel with an online per-32-block E8M0 scale;
+P with a fixed 2⁻⁸ descale (cuDNN's MXFP8 convention). Cost to know about: the
+scale-factor repack in front of the kernels (eleven launches, ~1–2 % of the
+backward) and its workspace (about one payload-equivalent of bytes).
 
 ---
 
@@ -283,14 +310,17 @@ feature-free d=64 graph.
 | Missing | Where |
 |---|---|
 | Backward pass entirely | SM107 |
-| Backward outside d ∈ (256, 512] | SM100, SM103 — the only backward engine there serves that band |
+| Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward THD + GQA | SM100, SM103 |
-| Backward sink / dSink, bias / dBias, deterministic, decode | SM100, SM103 |
+| Backward sink / dSink, bias / dBias | SM100, SM103 |
+| Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
+| MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward | SM107 (Rubin) |
 | MXFP8 forward | SM107, SM120, SM80 |
-| FP8 / MXFP8 backward | every arch |
-| THD / ragged backward | SM80, SM120 (SM100/SM103 serve it — see ᵍ) |
+| Per-tensor FP8 backward | every arch |
+| MXFP8 backward outside SM100/SM103 d = 256 | every arch |
+| THD / ragged backward | SM80, SM120, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ) |
 | THD forward | SM80 |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |

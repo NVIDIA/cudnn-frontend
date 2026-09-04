@@ -879,7 +879,7 @@ def test_d256_bwd_paired_builder_is_graph_replayable_after_func_mutation():
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 @pytest.mark.parametrize("pattern", ["empty", "full", "mask", "mixed"])
 def test_arbitrary_forward_packed_tails_match_pytorch(dtype, head_dim, pattern):
     q_lengths = (257, 129)
@@ -935,7 +935,7 @@ def test_arbitrary_forward_packed_tails_match_pytorch(dtype, head_dim, pattern):
 
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 @pytest.mark.parametrize(
     "dtype,func_num",
     [
@@ -1004,7 +1004,7 @@ def test_arbitrary_forward_handles_many_intervals(dtype, head_dim, func_num):
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize(
     "head_dim,expected_block_size",
-    [(64, (256, 128)), (256, (128, 128))],
+    [(32, (256, 128)), (64, (256, 128)), (256, (128, 128))],
 )
 def test_fp16_arbitrary_forward_uses_auto_metadata(
     monkeypatch,
@@ -1076,7 +1076,7 @@ def test_fp16_arbitrary_forward_uses_auto_metadata(
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_bf16_forward_mixes_empty_and_nonempty_work_rows(head_dim):
     q_lengths = (300,)
     k_lengths = (385,)
@@ -1177,7 +1177,7 @@ def test_forward_graph_rebuilds_metadata_after_func_mutation(dtype):
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 @pytest.mark.parametrize("pattern", ["full", "mask", "mixed"])
 def test_arbitrary_backward_packed_tails_match_pytorch(
     dtype,
@@ -1245,6 +1245,8 @@ def test_arbitrary_backward_packed_tails_match_pytorch(
 @pytest.mark.parametrize(
     "head_dim,func_num",
     [
+        (32, 3),
+        (32, 9),
         (64, 3),
         (128, 9),
         (256, 3),
@@ -1350,7 +1352,7 @@ def test_arbitrary_overlapping_intervals_match_union_semantics(
 
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 @pytest.mark.parametrize(
     "dtype,func_num",
     [
@@ -1454,7 +1456,7 @@ def test_arbitrary_backward_endpoint_prefetch_tracks_each_query_row(
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
 def test_arbitrary_backward_all_empty_is_exact_zero(dtype, head_dim):
     q_lengths = (257, 129)
     k_lengths = (385, 257)
@@ -1637,7 +1639,7 @@ def test_fp16_backward_exceeds_legacy_q_limit():
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_backward_graph_rebuilds_metadata_after_func_mutation(
     dtype,
     head_dim,
@@ -1709,7 +1711,7 @@ def test_backward_graph_rebuilds_metadata_after_func_mutation(
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_fp16_arbitrary_backward_uses_auto_metadata(monkeypatch, head_dim):
     q_lengths = (193, 65)
     k_lengths = (257, 129)
@@ -1893,7 +1895,7 @@ def test_auto_block_metadata_builder_cache_reuses_dynamic_shapes():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 256])
 def test_auto_block_metadata_consumer_cache_reuses_dynamic_shapes(head_dim):
     _interface.hstu_varlen_fwd_100.compile_cache.clear()
     _interface.hstu_varlen_bwd_100.compile_cache.clear()

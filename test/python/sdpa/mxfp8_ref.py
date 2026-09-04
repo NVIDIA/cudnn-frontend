@@ -202,7 +202,10 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     # Dequantize for dS^T @ Q_T -> dK: S-scale for Q_T
     q_t_dq = (q_t * sf_q_t_ref).nan_to_num()
 
-    s = torch.einsum("bqd,bkd->bqk", q_dq, k_dq) * attn_scale
+    # Unscaled scores are kept: the kernel folds attn_scale * log2(e) into ONE
+    # multiplier and evaluates P in the log2 domain (see below).
+    s_raw = torch.einsum("bqd,bkd->bqk", q_dq, k_dq)
+    s = s_raw * attn_scale
 
     if right_bound is not None and diag_align is not None:
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
@@ -210,19 +213,32 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         else:
             mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).triu(diagonal=s_kv - s_q + 1 + right_bound)
         s = s.masked_fill(mask.unsqueeze(0), float('-inf'))
+        s_raw = s_raw.masked_fill(mask.unsqueeze(0), float('-inf'))
     if left_bound is not None and diag_align is not None:
         if diag_align == cudnn.diagonal_alignment.TOP_LEFT:
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).tril(diagonal=-1 * left_bound)
         else:
             swa_mask = torch.ones(s_q, s_kv, dtype=torch.bool, device=s.device).tril(diagonal=-1 * left_bound + (s_kv - s_q))
         s = s.masked_fill(swa_mask.unsqueeze(0), float('-inf'))
+        s_raw = s_raw.masked_fill(swa_mask.unsqueeze(0), float('-inf'))
 
-    # The backward kernel does not renormalize: it recomputes P = exp(S - stats)
-    # from the forward's log-sum-exp, which already accounts for the sink.
+    # The backward kernel does not renormalize: it recomputes P from the
+    # forward's log-sum-exp, which already accounts for the sink. It does so in
+    # the log2 domain, P = 2^(S_raw * (attn_scale * log2 e) - stats * log2 e),
+    # and this reference follows that arithmetic on purpose: P is then rounded
+    # to E4M3 (3 mantissa bits) for the dV MMA on both sides, and a P computed
+    # as exp(S - stats) lands on the other side of an E4M3 rounding boundary
+    # often enough that a "sink-like" key (hundreds of query rows attending it
+    # with P near 1) drifts ~0.3 in dV while every other row agrees to 1e-3
+    # (test_sdpa_mxfp8_bwd_L0 at s=2404 with a 1184 sliding window). With the
+    # kernel's formulation the two round alike and the tight tolerance holds.
+    # torch.pow rather than torch.exp2: exp2 on a tensor this size raises a CUDA
+    # "invalid argument" in some torch nightlies.
     p_sink = None
     if stats is not None:
         stats_3d = stats.float().reshape(b * h_q, s_q, 1)
-        p = torch.exp(s - stats_3d).nan_to_num().float()
+        _log2e = math.log2(math.e)
+        p = torch.pow(2.0, s_raw * (attn_scale * _log2e) - stats_3d * _log2e).nan_to_num().float()
         if sink_token is not None:
             sink_3d = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1).reshape(b * h_q, s_q, 1)
             p_sink = torch.exp(sink_3d - stats_3d).nan_to_num().float()

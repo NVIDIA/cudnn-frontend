@@ -25,6 +25,15 @@ The API to set a dynamic shape graph's kernel cache is:
 graph.set_kernel_cache(kernel_cache)
 ```
 
+## Thread-safety contract for KernelCache
+
+The `KernelCache` API (`build`, `from_json`, `to_json`, `is_finalized`) is **internally synchronized** with a plain `std::mutex`. Multiple threads may call these methods concurrently on the same `KernelCache` instance without external synchronization.
+
+`build()` is idempotent under the lock: the first caller to acquire the mutex initializes and finalizes the descriptor; subsequent callers return `OK` immediately without re-initializing it. This makes it safe for N graph threads sharing one `KernelCache` to each call `build()` concurrently — exactly one backend descriptor is created and finalized.
+
+`from_json()` is synchronized the same way as `build()`. Call it before sharing the `KernelCache` with any thread that will call `build()`.
+
+
 ## Override Shape
 
 Override shape allows supplying **at execution time** tensor shapes that differ from the shapes used when building the graph. A single execution plan can thus support multiple dynamic shapes without rebuilding the graph for each shape.

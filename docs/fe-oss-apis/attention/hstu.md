@@ -198,7 +198,7 @@ are kernel padding.
 
 For native FP16 and BF16 arbitrary-mask forward and backward, the interface
 automatically builds private block metadata from `func_tensor` on every
-execution. Forward uses Q-to-K metadata; fused D64/D128 backward uses K-to-Q
+execution. Forward uses Q-to-K metadata; fused D32/D64/D128 backward uses K-to-Q
 metadata. The D256 two-kernel backward builds Q-to-K and K-to-Q views together
 from one Q256-by-K128 classification. The device-only builder and attention
 kernels run in order on the caller's current CUDA stream; metadata is not
@@ -208,7 +208,7 @@ blocks retain the exact token predicate, and fully valid blocks avoid reading
 Rebuilding on every execution means an in-place change to `func_tensor` is
 visible, including during CUDA Graph replay.
 
-Both dtypes use device-built metadata for D64, D128, and D256. The API trusts
+Both dtypes use device-built metadata for D32, D64, D128, and D256. The API trusts
 device-resident boundary values and does not validate their ordering or range
 on the host.
 
@@ -232,8 +232,8 @@ on the GPU without host-side range or monotonicity checks.
 
 | Direction | Architecture | Dtype | Head dimension | Attention |
 | --- | --- | --- | --- | --- |
-| Forward | Blackwell SM100/SM103 | FP16, BF16 | 64, 128, 256 | MHA |
-| Backward | Blackwell SM100/SM103 | FP16, BF16 | 64, 128, 256 | MHA |
+| Forward | Blackwell SM100/SM103 | FP16, BF16 | 32, 64, 128, 256 | MHA |
+| Backward | Blackwell SM100/SM103 | FP16, BF16 | 32, 64, 128, 256 | MHA |
 
 ## Current limitations
 

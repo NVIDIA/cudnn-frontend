@@ -1337,6 +1337,16 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     return "\n".join(lines)
 
 
+def _emit_splitk_partial_store(vsize: int) -> list[str]:
+    """Split-K kernel-1 STG fallback: store the raw fp32 accumulator chunk to
+    partials[tile_l][M][N]; tile_l = grid z = batch*split."""
+    chunk = min(vsize, 4)  # 4 fp32 = one 16-byte STG
+    lines = [f"_split_k_off = (tile_l * M + row) * N + col_j"]
+    for s in range(0, vsize, chunk):
+        lines.append(f"(gSplitK_partials_ptr + _split_k_off + {s}).store(vec_f32[{s} : {s + chunk}], alignment={chunk * 4})")
+    return lines
+
+
 def generate(
     chain: FusionChain,
     *,
@@ -1344,6 +1354,7 @@ def generate(
     output_elem_bytes: int = 2,
     tma_slots: "frozenset[int]" = frozenset(),
     packed_lanes: bool = False,
+    split_k_slices: int = 1,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
@@ -1537,6 +1548,13 @@ def generate(
     for red_idx, red in enumerate(chain.reductions):
         red_source = _parent_value(red.source_ref)
         body_lines.extend(_emit_reduction_atomic(_tap_of[len(specs) + red_idx], red_idx, red, red_source, chain.matmul, vsize, store_row_pred))
+
+    # Split-K partial store handling
+    if split_k_slices > 1:
+        if tma_slots:
+            body_lines = ["vec_out = vec_f32", tma_out_ready_marker(0)]
+        else:
+            body_lines = _emit_splitk_partial_store(vsize)
 
     epilogue = "\n".join(body_lines)
 

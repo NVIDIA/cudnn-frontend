@@ -253,8 +253,10 @@ def test_every_decline_names_its_reason():
     compiled = jit_from_cudnn_graph(_plain_graph())
     assert compiled.lowered is not None and compiled.declined is None
     compiled.recipe = replace(compiled.recipe, workspace_bytes=4096)
-    assert compiled._lower() is None
-    assert compiled.declined == "needs workspace"
+    lowered = compiled._lower()
+    assert lowered is not None and compiled.declined is None
+    with pytest.raises(ValueError, match="needs a workspace"):
+        lowered(_bound_buffers(compiled, *_good()), stream=None)
 
 
 @requires_sm100

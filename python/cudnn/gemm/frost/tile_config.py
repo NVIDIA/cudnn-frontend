@@ -190,12 +190,9 @@ class TileConfig:
             if got != want:
                 raise NotImplementedError(f"TileConfig {name!r}: mma_size_{axis}={got} but the tiles say {want}")
 
-        # K is never split across CTAs of a cluster, and the workspace-reduced
-        # split is not implemented -- both are axes reserved for later.
+        # K is never split across CTAs of a cluster -- an axis reserved for later.
         if self.cga_size_k != 1:
             raise NotImplementedError(f"TileConfig {name!r}: cga_size_k={self.cga_size_k} — cross-CTA K reduction is not implemented")
-        if self.split_k_slices != 1:
-            raise NotImplementedError(f"TileConfig {name!r}: split_k_slices={self.split_k_slices} — split-K is not implemented")
 
         cga = self.cga_size_m * self.cga_size_n * self.cga_size_k
         if cga > MAX_CLUSTER_SIZE:
@@ -257,7 +254,7 @@ class TileConfig:
             f"_cluster{self.cga_size_m}x{self.cga_size_n}"
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
-            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
+            + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "") + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
         )
 
     @property
@@ -765,7 +762,7 @@ _CONFIG_NAME_RE = re.compile(
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
     r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
-    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?$"
+    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?$"
 )
 
 
@@ -806,7 +803,7 @@ def _synthesize_config(name: str) -> TileConfig:
         cga_size_k=1,
         # Not spelled by the name; a family with its own block size declares it.
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
-        split_k_slices=1,
+        split_k_slices=int(m.group("split_k") or 1),
         # Only where the family HAS the axis; a name for one that does not
         # carries no such token either.
         **({"cta_group": int(m.group("cta_group") or 1)} if "cta_group" in cls.__dataclass_fields__ else {}),

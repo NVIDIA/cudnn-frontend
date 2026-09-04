@@ -728,8 +728,14 @@ surface — the features `torch.nn.functional.scaled_dot_product_attention`'s
 aten contract cannot express:
 
 - **attention sinks** — per-Q-head logits folded into the softmax denominator
-- **sliding window** — `window_left` (cuDNN convention: visible tokens
-  *including* self; FA2's `(w, 0)` maps to `window_left = w + 1`)
+- **diagonal bands** — `window_left` and `window_right`. The two bounds use
+  different conventions, matching `diagonal_band_left_bound` /
+  `diagonal_band_right_bound`: `window_left` counts visible tokens *including*
+  self (so FA2's `(w, 0)` maps to `window_left = w + 1`), while `window_right`
+  is the last visible column *past* the diagonal, with no offset (FA2's
+  `(_, r)` maps to `window_right = r`). `window_right=0` is exactly causal;
+  `window_right > 0` admits future columns and so cannot be combined with
+  `is_causal`, which the op rejects rather than silently resolving.
 - **bottom-right causal alignment** — inference-style diagonals
 - **padded batches** — per-batch actual lengths via `seq_len_q` / `seq_len_kv`
 - **THD / varlen packing** — FlashAttention-style `(T, H, D)` + `cu_seqlens`

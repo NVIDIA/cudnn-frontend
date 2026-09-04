@@ -51,7 +51,8 @@ class LaGraphFacts:
     knowledge, matched in each engine's ``check_support``. ``invalid`` is the
     one exception: a graph-consistency error (malformed regardless of which
     kernel would run — a missing required port, ``d_initial_state`` without
-    ``initial_state``, safe-gate inputs without the attribute); when set,
+    ``initial_state``, a_log/dt_bias without safe_gate, d_a_log/d_dt_bias
+    without their parameter); when set,
     every engine is ineligible."""
 
     invalid: Optional[str] = None
@@ -102,6 +103,8 @@ class LaGraphFacts:
 
     # ports present / requested
     has_initial_state: bool = False
+    has_a_log: bool = False
+    has_dt_bias: bool = False
     wants_d_initial_state: bool = False
     wants_state_checkpoints: bool = False
 
@@ -154,15 +157,13 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
     elif "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
-    elif safe_gate and ("a_log" not in ins or "dt_bias" not in ins):
-        invalid = "safe_gate requires a_log and dt_bias inputs"
     elif not safe_gate and ("a_log" in ins or "dt_bias" in ins):
         invalid = "a_log/dt_bias require safe_gate=True"
-    elif ("d_a_log" in outs or "d_dt_bias" in outs) and not (is_bwd and safe_gate):
-        invalid = "d_a_log/d_dt_bias require safe_gate=True on a bwd node"
-    elif is_bwd and safe_gate and ("d_a_log" not in outs or "d_dt_bias" not in outs):
-        invalid = "safe_gate on a bwd node requires the d_a_log and d_dt_bias outputs"
-    elif is_bwd and safe_gate and any(list(outs[d].dim or []) != list(ins[p].dim or []) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))):
+    elif ("d_a_log" in outs or "d_dt_bias" in outs) and not is_bwd:
+        invalid = "d_a_log/d_dt_bias are outputs of a bwd node"
+    elif is_bwd and any((d in outs) != (p in ins) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias"))):
+        invalid = "d_a_log is present iff a_log is, and d_dt_bias iff dt_bias"
+    elif is_bwd and any(list(outs[d].dim or []) != list(ins[p].dim or []) for d, p in (("d_a_log", "a_log"), ("d_dt_bias", "dt_bias")) if d in outs):
         invalid = "d_a_log/d_dt_bias dims must match a_log/dt_bias"
     elif params.get("gate_lower_bound") is not None and not safe_gate:
         invalid = "gate_lower_bound requires safe_gate=True"
@@ -250,6 +251,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         d_a_log_dtype=out_dt.get("d_a_log"),
         d_dt_bias_dtype=out_dt.get("d_dt_bias"),
         has_initial_state="initial_state" in ins,
+        has_a_log="a_log" in ins,
+        has_dt_bias="dt_bias" in ins,
         wants_d_initial_state="d_initial_state" in outs,
         wants_state_checkpoints="state_checkpoints" in outs,
         scale=float(scale) if scale is not None else None,
