@@ -75,5 +75,49 @@ def test_decode_update_route_declines_by_version_before_importing_the_kernel(dsl
     conv_state = torch.zeros(2, 8, 3, dtype=torch.bfloat16)
     weight = torch.zeros(8, 4, dtype=torch.bfloat16)
 
-    with pytest.raises(NotImplementedError, match="found 4.6.2"):
+    with pytest.raises(NotImplementedError, match=r"found 4\.6\.2"):
         update._validated_native_update(x, conv_state, weight, None, "silu", None, None)
+
+
+@pytest.mark.parametrize(
+    "version,too_old",
+    [
+        ("4.6.2a0", True),
+        ("4.6.2rc1", True),
+        ("4.6.9b1", True),
+        ("4.7.0a0", False),
+        ("4.7.0rc1", False),
+        ("4.7.0a0+20260727", False),
+        ("4.5.1", True),
+        ("4.7.0", False),
+        ("4.6", True),
+        ("4", True),
+        ("4.7", False),
+        ("5", False),
+    ],
+)
+def test_prerelease_versions_compare_by_release_number(version, too_old):
+    """A public prerelease of X compares as X against the floor (Rule 7): 4.6.2rc1 is
+    too old, 4.7.0a0 is not. Before, any letter in a component made the check
+    return False and an unsupported DSL walked through every gate."""
+    assert buffers.cutedsl_too_old(("nvidia-cutlass-dsl", version)) is too_old
+
+
+def test_missing_third_party_module_is_not_blamed_on_the_dsl(dsl_state):
+    """With an old DSL installed, a lazy import that fails because torch is missing
+    must report the optional-dependency hint, not a DSL upgrade."""
+    dsl_state(True, ("nvidia-cutlass-dsl", "4.6.2"))
+    missing_torch = ModuleNotFoundError("No module named 'torch'", name="torch")
+    message = cudnn._optional_dependency_message("sdpa_torch", missing_torch)
+    assert "requires nvidia-cutlass-dsl" not in message
+    assert "pip install nvidia-cudnn-frontend[cutedsl]" in message
+    assert "'torch' module" in message  # the hint alone would not fetch torch, so name it
+    # cuda-python is a separate dependency (the [cutedsl] extra), not the DSL stack:
+    missing_cuda = ModuleNotFoundError("No module named 'cuda.bindings'", name="cuda.bindings")
+    cuda_message = cudnn._optional_dependency_message("sdpa_torch", missing_cuda)
+    assert "requires nvidia-cutlass-dsl" not in cuda_message and "cuda.bindings" in cuda_message
+    # ...while a DSL-stack failure on the same old DSL still names the version
+    dsl_failure = TypeError("set_name_prefix() got an unexpected keyword argument 'remove_cutlass_symbol'")
+    assert "found 4.6.2" in cudnn._optional_dependency_message("GemmSreluSm100", dsl_failure)
+    missing_cutlass = ModuleNotFoundError("No module named 'cutlass.experimental'", name="cutlass.experimental")
+    assert "found 4.6.2" in cudnn._optional_dependency_message("GemmSreluSm100", missing_cutlass)
