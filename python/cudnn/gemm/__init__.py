@@ -12,7 +12,11 @@ Layout::
     cudnn.gemm.reference                         pure-PyTorch correctness engine
 
 Every public symbol is also re-exported at the top level (``cudnn.<symbol>``),
-which is the supported entry point for users.
+which is the supported entry point for users. The pre-1.27 module paths
+(``cudnn.grouped_gemm``, ``cudnn.discrete_grouped_gemm``, ``cudnn.gemm_amax``,
+``cudnn.gemm_swiglu``, ``cudnn.gemm_srelu``, ``cudnn.gemm_dsrelu``,
+``cudnn.gemm_proj_rope_mxfp8`` and their submodules) remain importable as
+deprecated aliases of these packages — see ``cudnn._legacy_aliases``.
 """
 
 from typing import Any

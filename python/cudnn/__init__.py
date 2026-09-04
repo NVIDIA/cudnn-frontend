@@ -307,6 +307,13 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
+# Pre-1.27 module paths (cudnn.grouped_gemm, cudnn.gemm_amax, ...) keep
+# working as deprecated sys.modules aliases of the cudnn.gemm.cutedsl.*
+# packages. Lazy (a meta-path finder) so `import cudnn` stays framework-free.
+from . import _legacy_aliases
+
+_legacy_aliases.install()
+
 _LAZY_OPTIONAL_IMPORTS = {
     "gnn": (".gnn", None),
     "FlexAttentionBwd": (".flex_attention", "FlexAttentionBwd"),
@@ -390,8 +397,23 @@ def _load_optional_symbol(name: str) -> Any:
     try:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
-    except Exception as e:
+    except ImportError as e:
+        # A cudnn-internal module that cannot be found is a packaging or
+        # lazy-table bug, not a missing optional dependency; saying "pip
+        # install ...[cutedsl]" for it sends users chasing the wrong fix.
+        missing = getattr(e, "name", None)
+        if isinstance(e, ModuleNotFoundError) and missing and missing.startswith(__name__):
+            raise ImportError(
+                f"cudnn.{name} could not be imported: internal module {missing!r} is missing. "
+                f"This is a cudnn-frontend packaging bug, not a missing optional dependency."
+            ) from e
         raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
+    except Exception as e:
+        # Anything else is a real failure inside the fusion module (or a stale
+        # table entry): surface it as such instead of blaming optional deps.
+        raise ImportError(
+            f"cudnn.{name} failed to import from {module_name!r} with " f"{type(e).__name__}: {e}. This is not a missing optional dependency."
+        ) from e
 
     globals()[name] = value
     return value
