@@ -243,9 +243,11 @@ def _run(b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=Fal
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
-    dq = _to_bshd(torch.zeros(b, hq, sq, d, device=dev, dtype=out_dt))
-    dk = _to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt))
-    dv = _to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt))
+    # NaN-poisoned outputs: a tile the kernels skip (e.g. the causal tail past
+    # S_q) must still be WRITTEN, not inherited from the buffer.
+    dq = _to_bshd(torch.full((b, hq, sq, d), float("nan"), device=dev, dtype=out_dt))
+    dk = _to_bshd(torch.full((b, hkv, skv, d), float("nan"), device=dev, dtype=out_dt))
+    dv = _to_bshd(torch.full((b, hkv, skv, d), float("nan"), device=dev, dtype=out_dt))
     pack = {
         t["q"]: Q["row"],
         t["q_T"]: Q["col"],
@@ -274,6 +276,142 @@ def _run(b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=Fal
         assert not torch.isnan(got).any(), f"{name} has NaN"
         cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.flatten(), dim=0).item()
         assert cos > tol_cos, f"{name}: cos={cos:.6f}"
+
+
+def _adapter_inputs(b, hq, hkv, sq, skv, out_dt=torch.bfloat16, causal=False, seed=0):
+    """Quantized operands + reference gradients for driving the adapter directly
+    (bypassing the graph), as a dict of BSHD-physical torch tensors."""
+    from sdpa.mxfp8_ref import compute_ref, compute_ref_backward
+
+    torch.manual_seed(seed)
+    d, dev = _D, "cuda"
+    scale = 1.0 / math.sqrt(d)
+    q, dO = torch.randn(b, hq, sq, d, device=dev), torch.randn(b, hq, sq, d, device=dev)
+    k, v = torch.randn(b, hkv, skv, d, device=dev), torch.randn(b, hkv, skv, d, device=dev)
+    Q, K, V, DO = (_quantize(x, b, h, s, d) for x, h, s in ((q, hq, sq), (k, hkv, skv), (v, hkv, skv), (dO, hq, sq)))
+    right = 0 if causal else None
+    align = cudnn.diagonal_alignment.TOP_LEFT if causal else None
+    o_ref, stats = compute_ref(
+        Q["row"], K["row"], V["col"], Q["sf_row_ref"], K["sf_row_ref"], V["sf_col_ref"], scale, output_type=out_dt, right_bound=right, diag_align=align
+    )
+    o_f16 = _to_bshd(o_ref.to(out_dt))
+    dO_f16 = _to_bshd(dO.to(out_dt))
+    dq_r, dk_r, dv_r = compute_ref_backward(
+        Q["row"],
+        Q["col"],
+        K["row"],
+        K["col"],
+        V["row"],
+        o_f16,
+        dO_f16,
+        DO["row"],
+        DO["col"],
+        scale,
+        Q["sf_row_ref"],
+        Q["sf_col_ref"],
+        K["sf_row_ref"],
+        K["sf_col_ref"],
+        V["sf_row_ref"],
+        DO["sf_row_ref"],
+        DO["sf_col_ref"],
+        torch_otype=out_dt,
+        right_bound=right,
+        diag_align=align,
+        stats=stats,
+    )[:3]
+    sf_i8 = lambda t: t.view(torch.int8)  # noqa: E731
+    return dict(
+        q=Q["row"],
+        q_T=Q["col"],
+        k=K["row"],
+        k_T=K["col"],
+        v=V["row"],
+        o=o_f16,
+        dO_f16=dO_f16,
+        dO=DO["row"],
+        dO_T=DO["col"],
+        stats=stats.contiguous(),
+        sf_q=sf_i8(Q["sf_row"]),
+        sf_q_T=sf_i8(Q["sf_col"]),
+        sf_k=sf_i8(K["sf_row"]),
+        sf_k_T=sf_i8(K["sf_col"]),
+        sf_v=sf_i8(V["sf_row"]),
+        sf_dO=sf_i8(DO["sf_row"]),
+        sf_dO_T=sf_i8(DO["sf_col"]),
+        dq=_to_bshd(torch.zeros(b, hq, sq, d, device=dev, dtype=out_dt)),
+        dk=_to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt)),
+        dv=_to_bshd(torch.zeros(b, hkv, skv, d, device=dev, dtype=out_dt)),
+        ref=(dq_r, dk_r, dv_r),
+        scale=scale,
+        causal=causal,
+    )
+
+
+def _make_adapter(inp, **kw):
+    from cudnn.sdpa.bwd.api_dsl_mxfp8_sm100 import SdpaBwdDslSm100Mxfp8
+
+    return SdpaBwdDslSm100Mxfp8(
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["o"],
+        inp["dO"],
+        inp["stats"],
+        inp["dq"],
+        inp["dk"],
+        inp["dv"],
+        sample_q_T=inp["q_T"],
+        sample_k_T=inp["k_T"],
+        sample_do_T=inp["dO_T"],
+        sample_do_f16=inp["dO_f16"],
+        sample_sf_q=inp["sf_q"],
+        sample_sf_q_T=inp["sf_q_T"],
+        sample_sf_k=inp["sf_k"],
+        sample_sf_k_T=inp["sf_k_T"],
+        sample_sf_v=inp["sf_v"],
+        sample_sf_do=inp["sf_dO"],
+        sample_sf_do_T=inp["sf_dO_T"],
+        is_causal=inp["causal"],
+        scale_softmax=inp["scale"],
+        **kw,
+    )
+
+
+def _run_adapter(api, inp):
+    api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    for t in (inp["dq"], inp["dk"], inp["dv"]):
+        t.fill_(float("nan"))
+    api.execute(
+        q_tensor=inp["q"],
+        k_tensor=inp["k"],
+        v_tensor=inp["v"],
+        o_tensor=inp["o"],
+        do_tensor=inp["dO"],
+        stats_tensor=inp["stats"],
+        dq_tensor=inp["dq"],
+        dk_tensor=inp["dk"],
+        dv_tensor=inp["dv"],
+        workspace=ws,
+        q_T_tensor=inp["q_T"],
+        k_T_tensor=inp["k_T"],
+        do_T_tensor=inp["dO_T"],
+        do_f16_tensor=inp["dO_f16"],
+        sf_q=inp["sf_q"],
+        sf_q_T=inp["sf_q_T"],
+        sf_k=inp["sf_k"],
+        sf_k_T=inp["sf_k_T"],
+        sf_v=inp["sf_v"],
+        sf_do=inp["sf_dO"],
+        sf_do_T=inp["sf_dO_T"],
+    )
+    torch.cuda.synchronize()
+    for name, got, ref in zip(("dQ", "dK", "dV"), (inp["dq"], inp["dk"], inp["dv"]), inp["ref"]):
+        assert not torch.isnan(got).any(), f"{name} has NaN"
+        cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.flatten(), dim=0).item()
+        assert cos > _TOL_COS, f"{name}: cos={cos:.6f}"
+    return tuple(t.clone() for t in (inp["dq"], inp["dk"], inp["dv"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -338,6 +476,14 @@ def test_ragged_tails_causal_gqa():
 
 
 @pytest.mark.L0
+def test_causal_kv_tail():
+    """Causal with S_kv > S_q: the KV tiles past S_q are attended by no query row,
+    their gradients are zero, and the kernel must WRITE that zero (it skips the
+    mainloop for them). Outputs start NaN-poisoned, so an unwritten tile fails."""
+    _run(hq=4, hkv=2, sq=256, skv=640, causal=True)
+
+
+@pytest.mark.L0
 def test_q_tile_boundary_causal():
     _run(hq=8, hkv=2, sq=257, skv=256, causal=True)
 
@@ -358,6 +504,37 @@ def test_deterministic_flag():
 @pytest.mark.L1
 def test_long_causal():
     _run(b=1, hq=2, hkv=2, sq=2048, skv=2048, causal=True)
+
+
+@pytest.mark.L0
+def test_dkdv_head_split_heuristic():
+    """The fused dK/dV kernel's grid is (KV tiles, KV heads, B); with few KV
+    heads the adapter splits the Q-head group across clusters so the GPU fills.
+    The split is a divisor of the group, the smallest reaching ~2 waves of
+    clusters, and 1 when there is no group (MHA) -- no partials, no fold."""
+    inp = _adapter_inputs(1, 32, 2, 2048, 2048)
+    api = _make_adapter(inp)
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    kv_clusters = 16 * 2  # 2048/128 tiles x 2 KV heads x B=1
+    assert 16 % api._dkdv_split == 0 and api._dkdv_split > 1
+    assert kv_clusters * api._dkdv_split >= 2 * sms or api._dkdv_split == 16
+    assert _make_adapter(_adapter_inputs(1, 2, 2, 256, 256))._dkdv_split == 1
+    with pytest.raises(ValueError):
+        _make_adapter(inp, dkdv_head_split=3)  # not a divisor of 16
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split", [1, 2, 8])
+def test_dkdv_head_split_forced(split):
+    """Every split writes per-slice partials that a fixed-order fold sums; the
+    result must match the reference (and the unsplit kernel) for each split."""
+    inp = _adapter_inputs(1, 8, 1, 256, 384, causal=True)
+    got = _run_adapter(_make_adapter(inp, dkdv_head_split=split), inp)
+    if split > 1:
+        base = _run_adapter(_make_adapter(inp, dkdv_head_split=1), inp)
+        for name, a, b_ in zip(("dQ", "dK", "dV"), got, base):
+            cos = torch.nn.functional.cosine_similarity(a.float().flatten(), b_.float().flatten(), dim=0).item()
+            assert cos > 0.99999, f"{name} split={split} vs unsplit: cos={cos:.7f}"
 
 
 @pytest.mark.L0

@@ -109,6 +109,7 @@ class BlackwellFmhaBackwardDKDV256:
         is_persistent: bool = False,
         online_ds_scale: bool = True,
         p_scale_log2: int = 8,
+        h_r_split: int = 1,
     ):
         mma_tiler = self._setup_specialization(element_dtype, acc_dtype, mma_tiler)
         self._setup_mma_tilers(mma_tiler)
@@ -122,6 +123,21 @@ class BlackwellFmhaBackwardDKDV256:
         if not (0 <= int(p_scale_log2) <= 126):
             raise ValueError(f"p_scale_log2 must be in [0, 126]; got {p_scale_log2}")
         self.p_scale_log2 = int(p_scale_log2)
+        # Q-head-group split. The grid is (kv tiles, h_k, b) and one cluster
+        # walks every Q head of its KV head, so at few KV heads (GQA with 1-2
+        # KV heads, small batch) most SMs idle: 2 KV heads at S=8192 is 64
+        # clusters on 148 SMs. With h_r_split = S the grid becomes
+        # (kv tiles, h_k * S, b); cluster (h_k, s) handles Q heads
+        # [s * h_r/S, (s+1) * h_r/S) and stores its dK/dV to PARTIAL slot
+        # h_k * S + s of a [B, S_kv, h_k * S, D] buffer (the host passes that
+        # buffer as dK/dV); a fixed-order fold onto the KV heads follows
+        # (kernels/bprop_chain_f16_sm120.dkv_reduce_host). h_r must be a
+        # multiple of h_r_split; 1 = the original single-pass behaviour.
+        if int(h_r_split) < 1:
+            raise ValueError(f"h_r_split must be >= 1; got {h_r_split}")
+        if int(h_r_split) > 1 and is_persistent:
+            raise ValueError("h_r_split > 1 is not implemented for the persistent scheduler")
+        self.h_r_split = int(h_r_split)
 
     def _setup_specialization(self, element_dtype, acc_dtype, mma_tiler):
         """Normalize tile orientation and set fixed instruction/type policy."""
@@ -418,8 +434,11 @@ class BlackwellFmhaBackwardDKDV256:
         V = make_kv_head_batch_tensor(V, hb, self.varlen)
         O = make_q_head_batch_tensor(O, hb, self.varlen)
         dO_16bits = cute.make_tensor(dO_16bits.iterator, O.layout)
-        dK = make_kv_head_batch_tensor(dK, hb, self.varlen)
-        dV = make_kv_head_batch_tensor(dV, hb, self.varlen)
+        # dK/dV: with h_r_split > 1 these are the PARTIAL buffers, h_k * h_r_split
+        # slots per batch (slot = h_k * h_r_split + split); see __init__.
+        hb_out = ((h_r, h_k * self.h_r_split), b)
+        dK = make_kv_head_batch_tensor(dK, hb_out, self.varlen)
+        dV = make_kv_head_batch_tensor(dV, hb_out, self.varlen)
         dO = cute.make_tensor(dO.iterator, Q.layout)
         dOT = make_transposed_tensor(dO_MN, dO.layout)
         QT = make_transposed_tensor(Q_MN, Q.layout)
@@ -996,7 +1015,7 @@ class BlackwellFmhaBackwardDKDV256:
             )
 
         bwd_grid = cute_common.compute_grid(
-            cute.shape((k_seq_max, d, ((1, h_k), b))),
+            cute.shape((k_seq_max, d, ((1, h_k * self.h_r_split), b))),
             self.cta_tiler,
         )
         # Round up grid X to be divisible by cluster X dimension (2-CTA cluster)
@@ -1886,7 +1905,11 @@ class BlackwellFmhaBackwardDKDV256:
             #  NON-PERSISTENT MODE (original code)
             # ===================================================================
             # get the current batch problem shape
+            # bidy indexes the OUTPUT slot (h_k * h_r_split + split); the input KV
+            # head and this cluster's first Q head derive from it (see __init__).
             blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
+            bidy_kv = bidy // self.h_r_split
+            h_r_begin = (bidy % self.h_r_split) * (problem_shape[3][0][0] // self.h_r_split)
             # problem_shape = (s_q_max, s_k_max, d: hidden dim, ((h_r: #q_head_per_kv, h_k: #kv_heads), orig_b: batch size)) mark
             problem_shape_cur_batch = problem_shape
             blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
@@ -1927,7 +1950,16 @@ class BlackwellFmhaBackwardDKDV256:
 
             trip_end = trip_start + trip_count
 
-            trip_count = trip_count * problem_shape_cur_batch[3][0][0]
+            # Q heads walked by this cluster: h_r / h_r_split.
+            trip_count = trip_count * (problem_shape_cur_batch[3][0][0] // self.h_r_split)
+            # The dK/dV views carry h_k * h_r_split slots; the epilogues build
+            # their global tiles from the HB they are handed.
+            problem_shape_out = (
+                problem_shape_cur_batch[0],
+                problem_shape_cur_batch[1],
+                problem_shape_cur_batch[2],
+                ((problem_shape_cur_batch[3][0][0], problem_shape_cur_batch[3][0][1] * self.h_r_split), problem_shape_cur_batch[3][1]),
+            )
 
             # Cluster wait before tensor memory alloc for 2-CTA
             pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -2008,9 +2040,10 @@ class BlackwellFmhaBackwardDKDV256:
                             load_mma_VDO_pipeline,
                         ),
                         bidx,
-                        bidy,
+                        bidy_kv,
                         bidz,
                         problem_shape[3][0][1],  # h_k
+                        h_r_begin=h_r_begin,
                     )
 
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -2117,7 +2150,7 @@ class BlackwellFmhaBackwardDKDV256:
                         self.epilogue(
                             blk_coord,
                             blk_offset,
-                            problem_shape_cur_batch,
+                            problem_shape_out,
                             dK,
                             dV,
                             tDKtDK,
@@ -2130,6 +2163,13 @@ class BlackwellFmhaBackwardDKDV256:
 
                 else:
                     cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            elif cluster_idx * self.tile_shape_K < problem_shape_cur_batch[1]:
+                # An in-range KV tile that no query row attends (causal with
+                # S_kv > S_q): its gradients are exactly zero, and the mainloop
+                # above is skipped, so the tile must be written here or the
+                # caller's dK/dV keep whatever was in the buffer.
+                if warp_idx >= self.compute_warp_id_0[0] and warp_idx <= self.compute_warp_id_1[-1]:
+                    self.epilogue_zero(blk_coord, blk_offset, problem_shape_out, dK, dV)
 
         # In persistent mode, sync across the 2-CTA cluster before TMEM dealloc
         # to prevent one CTA from freeing TMEM while partner CTA's MMA warp still accesses it.
@@ -2215,10 +2255,11 @@ class BlackwellFmhaBackwardDKDV256:
         blk_coord_b: Int32,
         num_h_k: Int32,  # total number of KV heads (replaces grid_dim_y)
         cumulative_trip_count: Int32 = Int32(0),  # accumulated trip_count across persistent tiles
+        h_r_begin: Int32 = Int32(0),  # first Q head of this cluster's slice (h_r_split)
     ):
         grid_dim_y = num_h_k
 
-        blk_coord_h_r = Int32(0)
+        blk_coord_h_r = h_r_begin
         blk_coord_h_q = (blk_coord_h_r, blk_coord_h_k)
         blk_coord_h_kv = (Int32(0), blk_coord_h_k)
 
@@ -3862,6 +3903,41 @@ class BlackwellFmhaBackwardDKDV256:
             iter_index += 1
             if iter_index == iter_end:
                 iter_index = iter_start
+
+    @cute.jit
+    def epilogue_zero(
+        self,
+        blk_coord: cute.Coord,
+        blk_offset: cute.Shape,
+        problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
+        dK: cute.Tensor,
+        dV: cute.Tensor,
+    ):
+        """Write zeros to this CTA's dK/dV tile (the epilogue's tile geometry) --
+        for KV tiles whose mainloop was skipped because no query row attends
+        them. Plain per-element stores from the compute warps; these tiles are
+        rare (the causal tail past S_q) so no vectorization is needed."""
+        tidx, _, _ = cute.arch.thread_idx()
+        _, K, D, HB = problem_shape
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
+        mdK = cute.make_tensor(
+            dK.iterator + cute.assume(blk_offset[1] * dK.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dK.stride),
+        )
+        mdV = cute.make_tensor(
+            dV.iterator + cute.assume(blk_offset[1] * dV.stride[0], divby=64),
+            cute.make_layout((K, self.tile_shape_dKdV_K, HB), stride=dV.stride),
+        )
+        rows = self.dSQ_cta_tiler[0]
+        cols = self.tile_shape_dKdV_K
+        n_threads = self.num_compute_warps * self.threads_per_warp
+        zero = Float32(0.0).to(self.element_dtype)
+        for i in cutlass.range(tidx, rows * cols, n_threads):
+            r = blk_coord_k * rows + i // cols
+            c = i % cols
+            if r < K:
+                mdK[(r, c, blk_coord_batch)] = zero
+                mdV[(r, c, blk_coord_batch)] = zero
 
     @cute.jit
     def epilogue(

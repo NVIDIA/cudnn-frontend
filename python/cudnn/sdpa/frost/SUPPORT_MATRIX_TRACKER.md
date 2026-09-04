@@ -150,7 +150,12 @@ output (the kernels write half-precision gradients and produce no amax).
 Numerics: dS is quantized in-kernel with an online per-32-block E8M0 scale;
 P with a fixed 2⁻⁸ descale (cuDNN's MXFP8 convention). Cost to know about: the
 scale-factor repack in front of the kernels (eleven launches, ~1–2 % of the
-backward) and its workspace (about one payload-equivalent of bytes).
+backward) and its workspace (about one payload-equivalent of bytes). With few
+KV heads (GQA/MQA at small batch) the fused dK/dV kernel's grid — (KV tiles,
+KV heads, B) — would leave most SMs idle, so the adapter splits the Q-head group
+across clusters (smallest divisor of the group reaching ~2 waves) and folds the
+per-slice partials with a fixed-order fp32 reduce (still deterministic); that
+costs 2·split·|dK| bytes of workspace and one extra small launch.
 
 ---
 
