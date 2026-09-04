@@ -838,6 +838,12 @@ def _sdpa_bwd_impl(
         # this backward has no dSink support yet, and silently ignoring the
         # sink term would produce numerically wrong dq/dk/dv.
         raise NotImplementedError("cudnn::sdpa_bwd does not support attention sinks yet (dSink is a follow-up); gradients would be wrong")
+    if is_causal and window_right > 0:
+        # Same rejection as the forward. Without it a direct sdpa_bwd call
+        # would build a band admitting window_right future columns while the
+        # forward that produced `o`/`lse` refused the pairing outright, so the
+        # gradients would belong to a mask the forward never applied.
+        raise ValueError(f"is_causal masks every future column but window_right={window_right} admits some; pass one or the other")
     is_thd = cu_seqlens_q is not None
     if is_thd:
         if cu_seqlens_kv is None or max_seqlen_q <= 0 or max_seqlen_kv <= 0:

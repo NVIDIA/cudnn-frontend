@@ -225,6 +225,16 @@ class TestOpContract:
             torch.ops.cudnn.sdpa_fwd(q, q.clone(), q.clone(), 0.125, is_causal=True, window_right=8)
 
     @pytest.mark.L0
+    def test_causal_with_future_window_right_rejected_bwd(self):
+        """The backward must reject the pairing the forward rejects, or a
+        direct sdpa_bwd call would compute gradients for a band the forward
+        never applied."""
+        q = bshd(1, 2, 128, 64)
+        o, lse = torch.ops.cudnn.sdpa_fwd(q, q.clone(), q.clone(), 0.125, is_causal=True, return_lse=True)
+        with pytest.raises(Exception, match="window_right"):
+            torch.ops.cudnn.sdpa_bwd(torch.randn_like(o), q, q.clone(), q.clone(), o, lse, 0.125, is_causal=True, window_right=8)
+
+    @pytest.mark.L0
     def test_opcheck(self):
         """torch.library.opcheck: fake-vs-real metadata agreement, schema
         round-trip, and autograd registration — including dynamic-shape AOT
