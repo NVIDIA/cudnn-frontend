@@ -542,7 +542,7 @@ def store(
     tCr = thr_copy_r2g.partition_S(rmem_quant)
     tPc = thr_copy_r2g.partition_D(coord)
 
-    # FIXME cute.copy expects mode 0 (atom_v,rest_v) to be removed
+    # TODO cute.copy expects mode 0 (atom_v,rest_v) to be removed
     #       Fix this so that the predicate tensor can simply be congruent to
     #       the original partitioned tensor
     preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
