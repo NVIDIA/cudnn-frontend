@@ -180,15 +180,19 @@ dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 Computes dense indexer scores:
 ``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` with a ratio-causal mask.
 For local query row `q_local`, valid KV columns satisfy
-`k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)`.
-When `q_causal_offsets` is omitted, all offsets are zero.
+`k_local < clamp((q_position + 1) // ratio, 0, seqlen_k_b)`. When
+`q_causal_offsets` is omitted, `q_position = q_local`. A `(batch,)` tensor uses
+`q_position = q_local + q_causal_offsets[b]`. THD input also accepts a
+`(total_q,)` tensor and uses
+`q_position = q_local + q_causal_offsets[cu_seqlens_q[b] + q_local]`.
 
-`q_causal_offsets[b]` is the global uncompressed token index corresponding to
-local `q[0]` for batch or THD segment `b`. It is not the packed storage offset
-from `cu_seqlens_q`: `cu_seqlens_q` locates where a local Q segment is stored,
-while `q_causal_offsets` locates that segment in the global causal timeline.
+The offset values are position deltas, not packed-storage indices:
+`cu_seqlens_q` locates a local Q segment in storage, while
+`q_causal_offsets` locates each row in the causal timeline. Negative deltas are
+allowed, and the visible-K count is clamped to the sequence's valid K range.
 The K columns are assumed to be a compressed-KV prefix starting at global
-compressed column 0.
+compressed column 0. Offset values are runtime data: after CUDA Graph capture,
+the same tensor may be updated in place before replay without recompilation.
 
 - **Inputs**
   - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 format
@@ -197,8 +201,8 @@ compressed column 0.
     described below.
   - `w`: `(B, S_q, H_q)` BF16. The SM90 FP8 path also accepts FP32 when
     weights have already been pre-scaled by `q_scale * sm_scale`.
-  - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
-    batch/THD segment, on the same device as `q`.
+  - `q_causal_offsets` (optional): CUDA INT32 tensor of shape `(batch,)`, or
+    `(total_q,)` for BF16 THD input, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32.
 - **Precision paths**
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
@@ -220,7 +224,9 @@ compressed column 0.
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
   `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
-  require `H_kv == 1` (MQA).
+  require `H_kv == 1` (MQA). Per-token offsets are BF16-forward-only and
+  THD-only; BSHD, MXFP8/FP8, combined Top-K, score recompute, and backward
+  continue to accept only per-sequence offsets.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -324,7 +330,8 @@ L1-normalised head-summed softmax over top-K entries:
 Full-KV (no top-K) analogues of §5 and §6. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
 written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
-all dense score tensors that feed the same loss path.
+all dense score tensors that feed the same loss path. These dense APIs accept
+only the per-sequence `(batch,)` form, including for THD inputs.
 
 On SM100, Indexer Forward and Dense Indexer Score Recompute use the same
 unified kernel implementation: forward runs it with `compute_lse=False`, while
