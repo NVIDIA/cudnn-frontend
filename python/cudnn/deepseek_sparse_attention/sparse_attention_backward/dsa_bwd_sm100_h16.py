@@ -400,6 +400,8 @@ class FlashAttentionDSABackwardSm100H16:
         softmax_rows = self.QK_mma_tiler[1]
         LSE_smem_layout = cute.make_layout((softmax_rows, self.load_compute_LSE_stage))
         sum_OdO_smem_layout = cute.make_layout((softmax_rows, self.load_compute_sum_OdO_stage))
+        rows_per_load_pass = self.num_load_KV_warps * 4
+        valid_smem_layout = cute.make_layout((self.num_load_KV_warps, self.block_tile // rows_per_load_pass))
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
@@ -462,6 +464,7 @@ class FlashAttentionDSABackwardSm100H16:
             sdS: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(dS_smem_layout_staged)], self.non_tma_align_bytes]
             sLSE: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(LSE_smem_layout)], self.non_tma_align_bytes]
             sSum_OdO: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(sum_OdO_smem_layout)], self.non_tma_align_bytes]
+            sValid: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, cute.cosize(valid_smem_layout)], self.non_tma_align_bytes]
 
         assert (
             SharedStorage.size_in_bytes() <= _max_smem_bytes
@@ -556,6 +559,7 @@ class FlashAttentionDSABackwardSm100H16:
             dQ4_smem_layout_staged,
             LSE_smem_layout,
             sum_OdO_smem_layout,
+            valid_smem_layout,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -693,13 +697,19 @@ class FlashAttentionDSABackwardSm100H16:
                     log2_e = -lse_scale
                     lse_log2 = lse_bhq * log2_e
                     sink_log2 = attn_sink_bh * log2_e
-                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                    lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                    scaled_lse_bhq = -lse_with_sink_log2
+                    pos_inf = Float32(float("inf"))
+                    neg_inf = Float32(float("-inf"))
 
-                    if lse_bhq == Float32(float("inf")):
-                        scaled_lse_bhq = Float32(float("-inf"))
+                    # Keep a no-mass row and every saturating denominator on
+                    # the same sentinel: inverse denominator zero. Checking
+                    # after the log2(e) multiply also catches a large finite
+                    # sink (for example 2.4e38) whose rescale overflows.
+                    scaled_lse_bhq = neg_inf
+                    if lse_log2 != pos_inf and sink_log2 != pos_inf:
+                        if lse_log2 != neg_inf or sink_log2 != neg_inf:
+                            lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                            sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                            scaled_lse_bhq = -(lse_max_log2 + cute.math.log2(sum_exp2))
 
                     sum_OdO[bidy, (idx_q + offset, bidz)] = sum_OdO_bhq
                     scaled_lse[bidy, (idx_q + offset, bidz)] = scaled_lse_bhq
@@ -722,10 +732,16 @@ class FlashAttentionDSABackwardSm100H16:
 
         log2_e = Float32(math.log2(math.e))
         sink_log2 = attn_sink[head_idx, (0, batch_idx)] * log2_e
+        pos_inf = Float32(float("inf"))
+        neg_inf = Float32(float("-inf"))
         acc = Float32(0.0)
 
         while q_idx < q_end:
-            p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+            p_sink = Float32(0.0)
+            if sink_log2 == pos_inf:
+                p_sink = Float32(1.0)
+            elif sink_log2 != neg_inf:
+                p_sink = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
             acc += p_sink * sum_OdO[head_idx, (q_idx, batch_idx)]
             q_idx += self.dSink_num_threads
 
@@ -783,6 +799,7 @@ class FlashAttentionDSABackwardSm100H16:
         dQ4_smem_layout_staged: cute.ComposedLayout,
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
+        valid_smem_layout: cute.Layout,
     ):
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         tidx, _, batch_idx = cute.arch.thread_idx()
@@ -794,6 +811,13 @@ class FlashAttentionDSABackwardSm100H16:
             topk = mTopkLength[token_idx]
         else:
             topk = mTopkIdxs.shape[0]
+
+        # A malformed supplied length must never widen the physical top-k
+        # tensor. Clamp before tile_count and every downstream index load.
+        if topk > Int32(mTopkIdxs.shape[0]):
+            topk = Int32(mTopkIdxs.shape[0])
+        if topk < Int32(0):
+            topk = Int32(0)
 
         # topk is CTA-uniform (one value per query token). Handle an empty
         # sparse row before initializing any async pipeline or allocating
@@ -871,6 +895,7 @@ class FlashAttentionDSABackwardSm100H16:
 
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
+        sValid = storage.sValid.get_tensor(valid_smem_layout)
 
         sdST_ptr = cute.recast_ptr(sdS.iterator, dST_smem_layout_staged.inner)
         sdST = cute.make_tensor(sdST_ptr, dST_smem_layout_staged.outer)
@@ -1042,6 +1067,7 @@ class FlashAttentionDSABackwardSm100H16:
                 sdS_store,
                 sdQ,
                 sdQ4,
+                sValid,
                 scale_softmax,
                 tile_count,
                 (
@@ -1096,6 +1122,7 @@ class FlashAttentionDSABackwardSm100H16:
                 tile_count,
                 topk,
                 load_mma_K_pipeline,
+                sValid,
                 mTopkLength,
             )
 
@@ -1244,6 +1271,7 @@ class FlashAttentionDSABackwardSm100H16:
         self,
         mKV: cute.Tensor,
         sK_slice: cute.Tensor,
+        sValid_slice: cute.Tensor,
         topk_idx: Int32,
         tile_index: Int32,
         topk: Int32,
@@ -1263,46 +1291,35 @@ class FlashAttentionDSABackwardSm100H16:
         idx = tile_index * self.block_tile + row
         tile_sK = sK_slice[row, (None, None)]
 
-        if cutlass.const_expr(mTopkLength is not None):
-            if cutlass.const_expr(is_first):
-                if idx < topk:
-                    self._copy_kv_row(
-                        mKV,
-                        topk_idx,
-                        batch_idx,
-                        tile_sK,
-                        lane_in_subwarp,
-                        async_copy_atom,
-                        async_thr_copy,
-                    )
-                else:
-                    self._zero_kv_row(tile_sK, lane_in_subwarp)
-            else:
-                self._copy_kv_row(
-                    mKV,
-                    topk_idx,
-                    batch_idx,
-                    tile_sK,
-                    lane_in_subwarp,
-                    async_copy_atom,
-                    async_thr_copy,
-                )
+        if cutlass.const_expr(mTopkLength is not None and not is_first):
+            row_is_valid = topk_idx >= 0 and topk_idx < mKV.shape[0]
         else:
-            if idx < topk:
-                if topk_idx >= 0:
-                    self._copy_kv_row(
-                        mKV,
-                        topk_idx,
-                        batch_idx,
-                        tile_sK,
-                        lane_in_subwarp,
-                        async_copy_atom,
-                        async_thr_copy,
-                    )
-                else:
-                    self._zero_kv_row(tile_sK, lane_in_subwarp)
-            else:
-                self._zero_kv_row(tile_sK, lane_in_subwarp)
+            row_is_valid = idx < topk and topk_idx >= 0 and topk_idx < mKV.shape[0]
+
+        # All eight lanes in a subgroup own the same sparse row. Compress the
+        # four ballot groups into one nibble, then arrange even and odd loader
+        # warps in separate contiguous halves. A compute thread can consume
+        # the four loader-warps it needs with one aligned 32-bit load.
+        valid_bits = cutlass.Uint32(cute.arch.vote_ballot_sync(row_is_valid))
+        if row_is_valid:
+            self._copy_kv_row(
+                mKV,
+                topk_idx,
+                batch_idx,
+                tile_sK,
+                lane_in_subwarp,
+                async_copy_atom,
+                async_thr_copy,
+            )
+        else:
+            self._zero_kv_row(tile_sK, lane_in_subwarp)
+
+        if local_tidx == 0:
+            valid_nibble = (valid_bits & cutlass.Uint32(1)) | ((valid_bits >> 7) & cutlass.Uint32(2))
+            valid_nibble = valid_nibble | ((valid_bits >> 14) & cutlass.Uint32(4))
+            valid_nibble = valid_nibble | ((valid_bits >> 21) & cutlass.Uint32(8))
+            packed_warp_idx = local_warp_idx // 2 + (local_warp_idx % 2) * (self.num_load_KV_warps // 2)
+            sValid_slice[packed_warp_idx] = cutlass.Uint8(valid_nibble)
 
     @cute.jit
     def load_KV(
@@ -1313,6 +1330,7 @@ class FlashAttentionDSABackwardSm100H16:
         tile_count: Int32,
         topk: Int32,
         load_mma_K_pipeline,
+        sValid: cute.Tensor,
         mTopkLength: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -1345,6 +1363,7 @@ class FlashAttentionDSABackwardSm100H16:
             rows_per_pass = self.num_load_KV_warps * 4
             row_passes = self.block_tile // rows_per_pass
             for row_pass in cutlass.range_constexpr(row_passes):
+                sValid_slice = sValid[None, row_pass]
                 row = local_warp_idx * 4 + subgroup + row_pass * rows_per_pass
                 idx = tile_index * self.block_tile + row
                 topk_idx = Int32(-1)
@@ -1357,6 +1376,7 @@ class FlashAttentionDSABackwardSm100H16:
                     self._load_kv_rows(
                         mKV,
                         sK_slice,
+                        sValid_slice,
                         topk_idx,
                         tile_index,
                         topk,
@@ -1372,6 +1392,7 @@ class FlashAttentionDSABackwardSm100H16:
                     self._load_kv_rows(
                         mKV,
                         sK_slice,
+                        sValid_slice,
                         topk_idx,
                         tile_index,
                         topk,
@@ -1716,6 +1737,36 @@ class FlashAttentionDSABackwardSm100H16:
         load_mma_QdO_consumer_state.advance()
 
     @cute.jit
+    def _load_topk_valid_word(self, sValid: cute.Tensor, row: Int32) -> cutlass.Uint32:
+        """Load the packed validity word containing one sparse-tile row."""
+        rows_per_pass = self.num_load_KV_warps * 4
+        row_in_pass = row % rows_per_pass
+        load_warp_idx = row_in_pass // 4
+        packed_byte = (row // rows_per_pass) * self.num_load_KV_warps + load_warp_idx // 2 + (load_warp_idx % 2) * (self.num_load_KV_warps // 2)
+        sValid_words = cute.make_tensor(
+            cute.recast_ptr(sValid.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((cute.size(sValid) // 4,)),
+        )
+        return sValid_words[packed_byte // 4]
+
+    @cute.jit
+    def _topk_row_is_valid(self, valid_bits: cutlass.Uint32, row: Int32) -> cutlass.Boolean:
+        """Test one row in a validity word already resident in a register."""
+        rows_per_pass = self.num_load_KV_warps * 4
+        row_in_pass = row % rows_per_pass
+        load_warp_idx = row_in_pass // 4
+        subgroup = row_in_pass % 4
+        packed_byte = load_warp_idx // 2 + (load_warp_idx % 2) * (self.num_load_KV_warps // 2)
+        bit = (packed_byte % 4) * 8 + subgroup
+        return (valid_bits & (cutlass.Uint32(1) << bit)) != 0
+
+    @cute.jit
+    def _select_valid_probability(self, probability: Float32, is_valid: cutlass.Boolean) -> Float32:
+        """Select zero for an invalid row without an inf*0 operation."""
+        zero = Float32(0.0)
+        return Float32(arith.select(is_valid.ir_value(), probability.ir_value(), zero.ir_value()))
+
+    @cute.jit
     def compute(
         self,
         tma_atom_dQ: cute.CopyAtom,
@@ -1734,6 +1785,7 @@ class FlashAttentionDSABackwardSm100H16:
         sdS_store: cute.Tensor,
         sdQ: cute.Tensor,
         sdQ4: cute.Tensor,
+        sValid: cute.Tensor,
         scale_softmax: Float32,
         tile_count: Int32,
         pipelines,
@@ -1808,6 +1860,7 @@ class FlashAttentionDSABackwardSm100H16:
             compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
 
             cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
+            valid_bits = self._load_topk_valid_word(sValid, cute.get(tTR_cS[0], mode=[0]))
 
             for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
 
@@ -1821,8 +1874,11 @@ class FlashAttentionDSABackwardSm100H16:
                     (softmax_scale_log2_e, softmax_scale_log2_e),
                     lse,
                 )
+                row_is_valid = self._topk_row_is_valid(valid_bits, cute.get(tTR_cS[i], mode=[0]))
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+                tTR_rS[i] = self._select_valid_probability(tTR_rS[i], row_is_valid)
+                tTR_rS[i + 1] = self._select_valid_probability(tTR_rS[i + 1], row_is_valid)
 
             tTR_rS_f16 = self.quantize(tTR_rS, 1)
 
@@ -2127,10 +2183,12 @@ class FlashAttentionDSABackwardSm100H16:
                 local_row_idx = cute.get(tTR_cdKV[coord_base], mode=[1])
                 global_row_idx = tile_index * self.block_tile + local_row_idx
                 if full_tiles:
-                    rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                    topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                    rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                 else:
                     if global_row_idx < topk:
-                        rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         rTopkIdx[i] = Int32(-1)
 
@@ -2140,10 +2198,12 @@ class FlashAttentionDSABackwardSm100H16:
                 local_row_idx = cute.get(tTR_cdKV_64[coord_base], mode=[1])
                 global_row_idx = tile_index * self.block_tile + local_row_idx
                 if full_tiles:
-                    rTopkIdx_64[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                    topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                    rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                 else:
                     if global_row_idx < topk:
-                        rTopkIdx_64[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         rTopkIdx_64[i] = Int32(-1)
 
