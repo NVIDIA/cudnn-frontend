@@ -51,6 +51,7 @@ class HSTUAttentionBackwardQlen1Sm100:
         assert 0 < num_threads <= 1024 and num_threads % cute.arch.WARP_SIZE == 0
         assert head_dim in (64, 128, 256)
         assert split_kv in (1, 2, 4, 8, 13, 16, 22, 26, 32, 64)
+        assert num_threads >= (head_dim if split_kv == 1 else head_dim // 2)
         assert rows_per_warp in (1, 2, 4)
         self.element_dtype = element_dtype
         self.head_dim = head_dim

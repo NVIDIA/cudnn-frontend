@@ -1511,7 +1511,7 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
         ((10, 0), True, 1),
     ),
 )
-def test_d128_single_query_forward_split_selector(capability, supported, expected):
+def test_single_query_forward_split_selector(capability, supported, expected):
     assert _interface._select_q1_fwd_split_kv("auto", capability, supported) == expected
 
 
@@ -1565,21 +1565,25 @@ def test_single_query_backward_split_selector(capability, supported, batch_size,
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    ("capability", "batch_size", "heads", "split_kv", "expected"),
+    ("capability", "batch_size", "heads", "split_kv", "head_dim", "expected"),
     (
-        ((10, 0), 64, 4, 1, 512),
-        ((10, 0), 512, 4, 1, 128),
-        ((10, 0), 64, 4, 8, 128),
-        ((10, 3), 64, 4, 1, 512),
-        ((10, 3), 512, 4, 1, 128),
-        ((10, 3), 64, 4, 8, 128),
-        ((10, 7), 64, 4, 1, 512),
-        ((10, 7), 512, 4, 1, 128),
-        ((10, 7), 64, 4, 13, 128),
+        ((10, 0), 64, 4, 1, 128, 512),
+        ((10, 0), 512, 4, 1, 128, 128),
+        ((10, 0), 512, 4, 1, 256, 256),
+        ((10, 0), 64, 4, 8, 256, 128),
+        ((10, 3), 64, 4, 1, 128, 512),
+        ((10, 3), 512, 4, 1, 128, 128),
+        ((10, 3), 512, 4, 1, 256, 256),
+        ((10, 3), 64, 4, 8, 256, 128),
+        ((10, 7), 64, 4, 1, 128, 512),
+        ((10, 7), 512, 4, 1, 128, 128),
+        ((10, 7), 512, 4, 1, 256, 256),
+        ((10, 7), 64, 4, 13, 256, 128),
+        ((9, 0), 512, 4, 1, 256, 256),
     ),
 )
-def test_single_query_backward_thread_selector(capability, batch_size, heads, split_kv, expected):
-    assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv) == expected
+def test_single_query_backward_thread_selector(capability, batch_size, heads, split_kv, head_dim, expected):
+    assert _interface._select_q1_bwd_num_threads(capability, batch_size, heads, split_kv, head_dim) == expected
 
 
 @pytest.mark.L1
@@ -1832,6 +1836,7 @@ def test_single_query_forward_cache_reuses_runtime_shapes(head_dim, algorithm):
 
     assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
     key = next(iter(_interface.hstu_varlen_fwd_100.compile_cache))
+    assert key[13] == 1
     assert key[14] == 1
 
 

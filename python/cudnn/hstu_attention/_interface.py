@@ -186,14 +186,21 @@ def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     return _supports_bwd_original_qkv_layout(t) and t.stride(0) != 0 and t.stride(1) != 0
 
 
-def _select_q1_bwd_num_threads(capability: tuple[int, int], batch_size: int, num_heads: int, split_kv: int) -> int:
+def _select_q1_bwd_num_threads(
+    capability: tuple[int, int],
+    batch_size: int,
+    num_heads: int,
+    split_kv: int,
+    head_dim: int,
+) -> int:
     """Select the block size paired with the qlen=1 backward split."""
     base_ctas = batch_size * num_heads
     if split_kv == 1 and base_ctas >= 2048:
         # Once the unsplit grid already has enough CTAs, a small block avoids
         # spending 12--16 warps on each short sequence. Split kernels already
-        # reach the same four-warp floor below.
-        return 128
+        # reach the same four-warp floor below. The unsplit dQ reduction writes
+        # one element per thread, so its block must cover the full head.
+        return max(128, head_dim)
     if capability in ((10, 0), (10, 3)):
         # Paired B200/B300 sweeps show the same block-size trend, so SM100 and
         # SM103 share one policy. Five 12-warp CTAs fit per B300 SM and win
@@ -243,9 +250,8 @@ def _hstu_varlen_bwd_q1_direct(
     batch_size = cu_seqlens_q.shape[0] - 1
     capability = _get_q1_device_capability(q.device)
     num_heads = q.shape[1]
-    num_threads = _select_q1_bwd_num_threads(capability, batch_size, num_heads, split_kv)
-
     head_dim = q.shape[2]
+    num_threads = _select_q1_bwd_num_threads(capability, batch_size, num_heads, split_kv, head_dim)
     compile_key = (q.device, q.dtype, head_dim, num_heads, num_threads, is_local, split_kv, rows_per_warp)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         total_q = cute.sym_int(divisibility=1)
@@ -664,11 +670,11 @@ def hstu_varlen_fwd_100(
     ):
         raise ValueError(f"Unsupported qlen=1 forward algorithm: {_q1_fwd_algorithm}")
     if q1_split_kv > 1 and not q1_split_supported:
-        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
+        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if q1_m64_algorithm and not q1_m64_supported:
         raise ValueError("The M64 qlen=1 forward algorithms require causal or local BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if q1_single_warp_epilogue and not q1_split_supported:
-        raise ValueError("The single-warp qlen=1 forward experiment requires causal BF16 D=128 qlen=1 with matching Q/K/V heads")
+        raise ValueError("The single-warp qlen=1 forward experiment requires causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     compile_key = (
         q.device,
         q_dtype,

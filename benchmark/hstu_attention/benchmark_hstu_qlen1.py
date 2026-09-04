@@ -52,6 +52,14 @@ def _cu_seqlens(lengths: list[int], device: torch.device) -> torch.Tensor:
     return torch.tensor(offsets, dtype=torch.int32, device=device)
 
 
+def _clamp_window_size(window_size: tuple[int, int], max_k: int) -> tuple[int, int]:
+    left, right = window_size
+    return (
+        left if left < 0 else min(left, max_k),
+        right if right < 0 else min(right, max_k),
+    )
+
+
 def _make_inputs(
     batch_size: int,
     heads: int,
@@ -173,6 +181,7 @@ def _compile_forward(
     assert isinstance(v, torch.Tensor)
     assert isinstance(cu_q, torch.Tensor)
     assert isinstance(cu_k, torch.Tensor)
+    window_size = _clamp_window_size(window_size, max_k)
     out = torch.empty_like(q)
     if forward_impl == "auto":
         api = HSTUFwdSm100(
@@ -254,6 +263,7 @@ def _compile_backward(
     assert isinstance(do, torch.Tensor)
     assert isinstance(cu_q, torch.Tensor)
     assert isinstance(cu_k, torch.Tensor)
+    window_size = _clamp_window_size(window_size, max_k)
     dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
     if backward_impl == "auto":
         api = HSTUBwdSm100(
