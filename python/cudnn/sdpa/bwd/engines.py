@@ -32,9 +32,16 @@ from cudnn.sdpa import graph_analyzer as ga
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
 _SM100 = "SdpaBwdDslSm100"
+_SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM100_MXFP8:
+        # Its own module: the MXFP8 lowering's imports stay out of the
+        # half-precision adapters' way.
+        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
+
+        return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -111,6 +118,19 @@ class Capabilities:
     # True when stats is not contiguous (B, H_q, S_q, 1) in memory.
     strided_stats: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
+    # Quantization family (mirrors fwd/engines.py): a row serves exactly one of
+    # half ``sdpa_backward`` (both False), block-scale MXFP8
+    # ``sdpa_mxfp8_backward`` (is_mxfp8), or per-tensor FP8
+    # ``sdpa_fp8_backward`` (is_fp8; no row yet). ``out_dtypes`` is the domain
+    # of the half-precision side of a quantized graph (o_f16 / dO_f16 / dQ /
+    # dK / dV share it); empty on half rows, where the io dtype IS ``dtypes``.
+    is_mxfp8: bool = False
+    is_fp8: bool = False
+    out_dtypes: frozenset = frozenset()
+    # MXFP8 backward: amax_dQ / amax_dK / amax_dV outputs. The kernels write
+    # half-precision gradients and do not produce these; a graph requesting
+    # one (set_output(True)) is declined rather than left with garbage.
+    amax_dgrad: bool = False
 
     # optional features a backward graph may request
     gqa: bool = False  # h_q != h_kv
@@ -183,8 +203,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     if cutedsl_too_old(version):
         want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
-    if facts.is_mxfp8 or facts.is_fp8:
-        return "this engine serves only half (fp16/bf16) sdpa_backward graphs"
+    if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
+        quant = (
+            "block-scale MXFP8 (sdpa_mxfp8_backward)"
+            if capabilities.is_mxfp8
+            else "per-tensor FP8 (sdpa_fp8_backward)" if capabilities.is_fp8 else "half (fp16/bf16) sdpa_backward"
+        )
+        return f"this engine serves only {quant} graphs"
     if capabilities.dqk_ge_dv:
         if facts.d_qk < facts.d_v:
             return f"D_QK must be >= D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
@@ -205,7 +230,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return f"serves D_V in {sorted(capabilities.d)}; graph has D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
-    if not facts.uniform_dtype:
+    if capabilities.is_mxfp8 or capabilities.is_fp8:
+        if not facts.uniform_dtype:
+            return "the FP8 payloads (K/V/dO and the transposed copies) must share Q's dtype"
+        if facts.dtype_o not in capabilities.out_dtypes:
+            return f"half-precision O/dO_f16/dQ/dK/dV dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
+        if not facts.uniform_out_dtype:
+            return "o_f16/dO_f16/dQ/dK/dV dtypes must match"
+        if facts.has_amax_dgrad and not capabilities.amax_dgrad:
+            return "graph requests amax_dQ/dK/dV outputs, which this engine does not produce"
+    elif not facts.uniform_dtype:
         return "K/V/O/dO/dQ/dK/dV dtypes must match Q"
     if facts.h_q != facts.h_kv and not capabilities.gqa:
         return f"GQA / MQA is not supported (H_q={facts.h_q}, H_kv={facts.h_kv})"
@@ -216,7 +250,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
                 "non-broadcast, non-overlapping strides (any B/H/S order, padded strides allowed)"
             )
     elif not facts.bshd_layout:
-        return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical (stride order 3,1,2,0)"
+        ports = "Q/K/V/O/dO/dQ/dK/dV" + ("/q_T/k_T/dO_T/dO_f16" if facts.is_mxfp8 else "")
+        return f"{ports} must be BSHD-physical (stride order 3,1,2,0)"
 
     for fact, cap, label in (
         (facts.deterministic, capabilities.deterministic, "use_deterministic_algorithm (dQ accumulates through fp32 atomics)"),
@@ -624,6 +659,206 @@ def engine_name(arch: str = "sm120") -> str:
 
 # Preference order: the ranked plan list offers these in this order (see
 # cudnn/sdpa/bwd/engine.py, which wraps each spec as a BaseEngine).
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec())
+def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None, api_type: str = _SM100_MXFP8):
+    """Lower the SM100 MXFP8 backward engine through ``SdpaBwdDslSm100Mxfp8``.
 
-__all__ = ["ENGINE_SPECS", "Capabilities", "EngineSpec", "SdpaBwdKnobs", "analyze_for", "engine_name", "mismatch"]
+    A sibling of :func:`lower_dsl_bwd` rather than a branch inside it: the
+    MXFP8 node binds eleven more operands (the transposed-quantization
+    payloads, the half-precision dO, seven block-scale tensors), and threading
+    those through the half-precision adapters' keyword filter would have every
+    one of them declare slots it never reads.
+    """
+    import torch
+
+    from cudnn.api_base import TensorDesc
+
+    ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+
+    def _desc(t, dtype_hint, name: str):
+        """Descriptor from an IR tensor (dims/strides straight from it; a
+        reordered SF tensor is an opaque byte layout and only its byte count is
+        ever consulted)."""
+        dim, stride = tuple(t.get_dim()), tuple(t.get_stride())
+        dtype = ga.to_torch_dtype(dtype_hint) if dtype_hint in ga._KNOWN_DTYPES else dtype_hint
+        return TensorDesc(
+            dtype=dtype,
+            shape=dim,
+            stride=stride,
+            stride_order=TensorDesc._compute_stride_order(dim, stride),
+            device=torch.device("cuda", torch.cuda.current_device()),
+            name=name,
+        )
+
+    def _port_desc(name: str, dtype_hint, ir_t):
+        dim, stride = ports[name]
+        dtype = ga.to_torch_dtype(dtype_hint) if dtype_hint in ga._KNOWN_DTYPES else dtype_hint
+        return TensorDesc(
+            dtype=dtype,
+            shape=dim,
+            stride=stride,
+            stride_order=TensorDesc._compute_stride_order(dim, stride),
+            device=torch.device("cuda", torch.cuda.current_device()),
+            name=name,
+        )
+
+    fp8, half = facts.dtype, facts.dtype_o
+    api = _adapter(api_type)(
+        sample_q=_port_desc("q", fp8, facts.q_t),
+        sample_k=_port_desc("k", fp8, facts.k_t),
+        sample_v=_port_desc("v", fp8, facts.v_t),
+        sample_o=_port_desc("o", half, facts.o_t),
+        sample_do=_port_desc("dO", fp8, facts.do_t),
+        sample_stats=_desc(facts.stats_t, torch.float32, "stats"),
+        sample_dq=_port_desc("dQ", half, facts.dq_t),
+        sample_dk=_port_desc("dK", half, facts.dk_t),
+        sample_dv=_port_desc("dV", half, facts.dv_t),
+        sample_q_T=_port_desc("q_T", fp8, facts.q_T_t),
+        sample_k_T=_port_desc("k_T", fp8, facts.k_T_t),
+        sample_do_T=_port_desc("dO_T", fp8, facts.dO_T_t),
+        sample_do_f16=_port_desc("dO_f16", half, facts.dO_f16_t),
+        # E8M0 has no torch dtype on the lowering boundary; the descs carry the
+        # byte view the adapter consumes.
+        sample_sf_q=_desc(facts.sf_q_t, torch.int8, "sf_q"),
+        sample_sf_q_T=_desc(facts.sf_q_T_t, torch.int8, "sf_q_T"),
+        sample_sf_k=_desc(facts.sf_k_t, torch.int8, "sf_k"),
+        sample_sf_k_T=_desc(facts.sf_k_T_t, torch.int8, "sf_k_T"),
+        sample_sf_v=_desc(facts.sf_v_t, torch.int8, "sf_v"),
+        sample_sf_do=_desc(facts.sf_dO_t, torch.int8, "sf_do"),
+        sample_sf_do_T=_desc(facts.sf_dO_T_t, torch.int8, "sf_do_T"),
+        is_causal=facts.causal or facts.right_band_widening,
+        causal_bottom_right=facts.bottom_right,
+        window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
+        deterministic=facts.deterministic,
+        scale_softmax=facts.scale,
+        tile_m=requested.tile_m if requested is not None else None,
+        tile_n=requested.tile_n if requested is not None else None,
+        seq_kv_lens_present=facts.padded,
+        seq_q_lens_present=facts.padded,
+    )
+    api.check_support()  # raises ValueError / NotImplementedError if unsupported
+    api.compile()
+    total_workspace_bytes = api.scratch_workspace_bytes()
+
+    binding = ga.SdpaBinding(
+        q=facts.q_t,
+        k=facts.k_t,
+        v=facts.v_t,
+        o=facts.o_t,
+        stats=facts.stats_t,
+        do=facts.do_t,
+        dq=facts.dq_t,
+        dk=facts.dk_t,
+        dv=facts.dv_t,
+        q_T=facts.q_T_t,
+        k_T=facts.k_T_t,
+        dO_T=facts.dO_T_t,
+        dO_f16=facts.dO_f16_t,
+        sf_q=facts.sf_q_t,
+        sf_k=facts.sf_k_t,
+        sf_v=facts.sf_v_t,
+        sf_q_T=facts.sf_q_T_t,
+        sf_k_T=facts.sf_k_T_t,
+        sf_dO=facts.sf_dO_t,
+        sf_dO_T=facts.sf_dO_T_t,
+    )
+
+    def _view(buf, name):
+        """Reinterpret a variant-pack buffer through the port's geometry (see
+        lower_dsl_bwd._canonical_view); SF buffers are consumed flat."""
+        if name not in ports:
+            return buf
+        dim, stride = ports[name]
+        if tuple(buf.shape) == dim and tuple(buf.stride()) == stride:
+            return buf
+        return buf.as_strided(dim, stride)
+
+    def _execute(variant_pack, workspace=None, stream=None):
+        r = ga.resolve_variant_pack(variant_pack, binding)
+        stats_dim, stats_stride = tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride())
+        stats_buf = r[id(binding.stats)]
+        if tuple(stats_buf.shape) != stats_dim or tuple(stats_buf.stride()) != stats_stride:
+            stats_buf = stats_buf.as_strided(stats_dim, stats_stride)
+        api.execute(
+            q_tensor=_view(r[id(binding.q)], "q"),
+            k_tensor=_view(r[id(binding.k)], "k"),
+            v_tensor=_view(r[id(binding.v)], "v"),
+            o_tensor=_view(r[id(binding.o)], "o"),
+            do_tensor=_view(r[id(binding.do)], "dO"),
+            stats_tensor=stats_buf,
+            dq_tensor=_view(r[id(binding.dq)], "dQ"),
+            dk_tensor=_view(r[id(binding.dk)], "dK"),
+            dv_tensor=_view(r[id(binding.dv)], "dV"),
+            q_T_tensor=_view(r[id(binding.q_T)], "q_T"),
+            k_T_tensor=_view(r[id(binding.k_T)], "k_T"),
+            do_T_tensor=_view(r[id(binding.dO_T)], "dO_T"),
+            do_f16_tensor=_view(r[id(binding.dO_f16)], "dO_f16"),
+            sf_q=r[id(binding.sf_q)],
+            sf_q_T=r[id(binding.sf_q_T)],
+            sf_k=r[id(binding.sf_k)],
+            sf_k_T=r[id(binding.sf_k_T)],
+            sf_v=r[id(binding.sf_v)],
+            sf_do=r[id(binding.sf_dO)],
+            sf_do_T=r[id(binding.sf_dO_T)],
+            scale_softmax=facts.scale,
+            workspace=workspace,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+        )
+        return None
+
+    _execute.workspace_bytes = total_workspace_bytes
+    _execute.binding = binding
+    return _execute
+
+
+def _sm100_mxfp8_spec() -> EngineSpec:
+    """SM100 (Blackwell) d=256 block-scale MXFP8 backward row.
+
+    Two kernels (dQ; fused dK/dV) ported from the ``fmha_mxfp8_large_head_dim``
+    repo, preceded by a
+    scale-factor repack into the kernels' 2-CTA slot layout (see
+    ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is). Exact d=256 only
+    -- the SF plumbing has no envelope story, as on the forward MXFP8 row.
+
+    Served: E4M3 payloads with fp16/bf16 half side, BSHD-physical layout, MHA /
+    GQA / MQA, any fixed S_q / S_kv (tails are masked), dense and top-left
+    causal, and ``deterministic`` (both kernels own their output tiles; nothing
+    accumulates through atomics). dS is always quantized with an in-kernel
+    per-block (online) E8M0 scale -- the upstream "fixed scale 1" mode is not
+    exposed. Declined: E5M2, bottom-right / band-widened / sliding-window
+    masks, padding, THD, bias / dBias, sink / dSink, amax_dQ/dK/dV outputs,
+    non-BSHD strides (the kernels derive their head/batch strides; no staging
+    copies).
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,  # no sm107 MXFP8 lowering (matches the forward MXFP8 row)
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            is_mxfp8=True,
+            causal=True,
+            gqa=True,
+            deterministic=True,
+            layouts=frozenset({"bshd"}),
+            tile_ms=frozenset({128}),
+            tile_ns=frozenset({128}),
+        ),
+        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8),
+    )
+
+
+ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec())
+
+__all__ = [
+    "ENGINE_SPECS",
+    "Capabilities",
+    "EngineSpec",
+    "SdpaBwdKnobs",
+    "analyze_for",
+    "engine_name",
+    "mismatch",
+]
