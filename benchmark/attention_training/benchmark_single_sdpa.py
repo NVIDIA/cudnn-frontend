@@ -906,7 +906,18 @@ else:
             if args.verbose:
                 print(f"[INFO] cudnn_oss: pinned FROST engine '{eligible[0]}' for {pass_name}")
 
-        graph_fwd.validate()
+        def validate_or_skip(graph, pass_name):
+            """A frontend-level GRAPH_NOT_SUPPORTED is a support gate (shape / dtype /
+            feature the library declines up front), not a failure: report it as a
+            skip so the runner's CSV marks the case unsupported. Anything past
+            validate() (heuristics, check_support, plan build) still fails loudly,
+            since e.g. a runtime-compile error there is a library bug."""
+            try:
+                graph.validate()
+            except cudnn.cudnnGraphNotSupportedError as e:
+                exit_unsupported(f"{pass_name} graph rejected by cuDNN frontend validation: {e}")
+
+        validate_or_skip(graph_fwd, "fwd")
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         if args.sdpa_backend == "cudnn_oss" and run_fwd:
@@ -1146,7 +1157,7 @@ else:
                 dK_bwd.set_output(True).set_dim(dKey.size()).set_stride(dKey.stride())
                 dV_bwd.set_output(True).set_dim(dValue.size()).set_stride(dValue.stride())
 
-            graph_bwd.validate()
+            validate_or_skip(graph_bwd, "bwd")
             graph_bwd.build_operation_graph()
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             if args.sdpa_backend == "cudnn_oss":

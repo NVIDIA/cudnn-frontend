@@ -1819,3 +1819,71 @@ def test_fp8_d512_mxfp8_declines():
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
     assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
+
+
+def _d512_fp8_graph(block_scaled: bool):
+    """A d512 FP8 forward pygraph; block_scaled=True is the MXFP8 form (E8M0 scale-factor descales)."""
+    import cudnn
+
+    B, H, S, D = 2, 4, 2048, 512
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16 if block_scaled else cudnn.data_type.FP8_E4M3,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    qkv = lambda n: g.tensor(name=n, dim=(B, H, S, D), stride=(H * S * D, D, H * D, 1), data_type=cudnn.data_type.FP8_E4M3)
+    q, k, v = qkv("q"), qkv("k"), qkv("v")
+    if block_scaled:
+        # Scale-factor tensor geometry follows the MXFP8 samples: 32-wide blocks, F8_128x4 reordering.
+        sf = lambda n, dim, stride: g.tensor(
+            name=n, dim=dim, stride=stride, data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4
+        )
+        d_sf = D // 32
+        s_sf = S // 32
+        o, stats, amax_o = g.sdpa_mxfp8(
+            q=q,
+            k=k,
+            v=v,
+            descale_q=sf("sf_q", (B, H, S, d_sf), (H * S * d_sf, S * d_sf, d_sf, 1)),
+            descale_k=sf("sf_k", (B, H, S, d_sf), (H * S * d_sf, S * d_sf, d_sf, 1)),
+            descale_v=sf("sf_v", (B, H, s_sf, D), (H * s_sf * D, s_sf * D, 1, s_sf)),
+            attn_scale=1.0 / math.sqrt(D),
+            generate_stats=True,
+        )
+        o.set_output(True).set_dim((B, H, S, D)).set_stride((H * S * D, D, H * D, 1)).set_data_type(cudnn.data_type.BFLOAT16)
+    else:
+        sc = lambda n: g.tensor(name=n, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
+        o, stats, _amax_s, amax_o = g.sdpa_fp8(
+            q=q,
+            k=k,
+            v=v,
+            descale_q=sc("dq"),
+            descale_k=sc("dk"),
+            descale_v=sc("dv"),
+            descale_s=sc("ds"),
+            scale_s=sc("ss"),
+            scale_o=sc("so"),
+            is_inference=False,
+            attn_scale=1.0 / math.sqrt(D),
+        )
+        o.set_output(True).set_dim((B, H, S, D)).set_stride((H * S * D, D, H * D, 1)).set_data_type(cudnn.data_type.FP8_E4M3)
+    stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+@pytest.mark.L0
+@_skip_d512_on_rubin
+def test_fp8_d512_graph_surface_admits_per_tensor_only():
+    """The graph-level support surface admits the (256, 512] head-dim band for
+    PER-TENSOR FP8 only. An MXFP8 d512 graph must be declined at validate():
+    with the band open to it, the cuDNN backend's runtime-compiled FP8 engine
+    accepts the shape at check-support and then fails NVRTC compilation
+    (CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED) at plan build -- the
+    failure the attention_training nightly reported on GB200/GB300 for the
+    deepseek_v4 mxfp8 forward cases."""
+    import cudnn
+
+    _d512_fp8_graph(block_scaled=False).validate()
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"per-tensor FP8 only"):
+        _d512_fp8_graph(block_scaled=True).validate()
