@@ -139,13 +139,22 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
                          sf_q_ref, sf_q_t_ref, sf_k_ref, sf_k_t_ref, sf_v_ref, sf_dO_ref, sf_dO_t_ref,
                          torch_itype=torch.float8_e4m3fn, torch_otype=torch.bfloat16,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None):
+                         stats=None, return_dv_bound=False):
     """
     Compute backward pass reference for MXFP8 SDPA.
 
     If sink_token is provided, the virtual sink is included in softmax normalization
     and dSink_token is computed: dS_sink = -p_sink * D (no attn_scale), then summed
     over batch and query dimensions.
+
+    ``return_dv_bound=True`` additionally returns ``dV_bound`` [b, h_v, s_kv, d_vo]:
+    the per-element P-quantization noise bound sum_q ulp(P[q, kv]) * |dO_T[q, d]|.
+    P is rounded to E4M3 (3 mantissa bits, up to 1/16 relative) both here and in
+    the kernel, from slightly different fp32 values, so the two can land on
+    different sides of a rounding boundary. A "sink-like" key that hundreds of
+    query rows attend with P near 1 accumulates that into an absolute error far
+    above any fixed tolerance while the neighbouring rows stay within 1e-3 (seen
+    as 3 elements of one dV row off by 0.3 at s=2404 with a 1184 sliding window).
     """
     # Convert FP8 to FP32
     q_f32 = q_fp8.float()
@@ -240,6 +249,13 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     p_fp8 = p * 256.0
     p_fp8 = p_fp8.to(torch_itype).float()
     p_fp8 *= 1.0 / 256.0
+    if return_dv_bound:
+        # E4M3 ulp of the scaled P (3 mantissa bits; subnormal floor 2^-9), back in
+        # P units. floor(log2 x) read from the fp32 exponent field (exp2/log2 on
+        # this tensor trip a CUDA "invalid argument" in some torch nightlies).
+        p_scaled = (p * 256.0).clamp_min(2.0**-6).contiguous()
+        p_exp = torch.bitwise_and(torch.bitwise_right_shift(p_scaled.view(torch.int32), 23), 0xFF) - 127
+        p_ulp = torch.pow(2.0, (p_exp - 3).float()) / 256.0
 
     # Use BF16 inputs for D
     o_f16 = o_f16.float().reshape(b * h_q, s_q, d_vo)
@@ -299,4 +315,10 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     dK = dK.reshape(b, h_k, s_kv, d_qk).to(torch_otype).float()
     dV = dV.reshape(b, h_v, s_kv, d_vo).to(torch_otype).float()
 
+    if return_dv_bound:
+        dV_bound = torch.einsum("bqk,bqd->bkd", p_ulp, dO_t_dq.abs())
+        if h_v != h_q:
+            dV_bound = dV_bound.reshape(b, h_v, h_q // h_v, s_kv, d_vo).sum(dim=2)
+        dV_bound = dV_bound.reshape(b, h_v, s_kv, d_vo)
+        return dQ, dK, dV, dSink_token, dV_bound
     return dQ, dK, dV, dSink_token

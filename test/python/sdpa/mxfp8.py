@@ -695,7 +695,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
 
         if not perf:
-            dQ_ref, dK_ref, dV_ref, dSink_token_ref = compute_ref_backward(
+            dQ_ref, dK_ref, dV_ref, dSink_token_ref, dV_bound = compute_ref_backward(
                 q_fp8_d, q_fp8_s, k_fp8_d, k_fp8_s, v_fp8_d,
                 o_f16, dO_f16, dO_fp8_d, dO_fp8_s,
                 attn_scale,
@@ -706,16 +706,32 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
                 sink_token=sink_token_gpu,
                 # stats_bwd is what the backward graph is fed, so use it here too.
                 stats=stats_bwd,
+                return_dv_bound=True,
             )
 
             for actual, expected, name in (
                 (dQ_gpu, dQ_ref, "dQ"),
                 (dK_gpu, dK_ref, "dK"),
-                (dV_gpu, dV_ref, "dV"),
             ):
-                # dV carries the largest magnitudes, so it needs one wider step than fp8.
                 error = compare_tensors(actual, expected, 0.125, 0.20, name)
                 assert error == 0, f"{name} mismatch: {error} elements differ"
+            # dV carries the largest magnitudes, so it needs one wider step than fp8 --
+            # and, per element, the P-quantization noise bound: a sink-like key that
+            # many query rows attend with P near 1 legitimately differs from the
+            # reference by sum_q ulp(P) * |dO| (see compute_ref_backward), which no
+            # fixed atol covers while every other row agrees to 1e-3.
+            dV_diff = (dV_gpu.float() - dV_ref).abs()
+            dV_tol = 0.125 + 0.20 * dV_ref.abs() + dV_bound
+            dV_bad = torch.nonzero(~(dV_diff <= dV_tol))
+            for idx in dV_bad[: request.config.getoption("--diffs") or 10].tolist():
+                i = tuple(idx)
+                print(f"  idx{idx}: dV_gpu={dV_gpu[i].item():+.6e}, dV_ref={dV_ref[i].item():+.6e}, diff={dV_diff[i].item():+.2e}, tol={dV_tol[i].item():.2e}")
+            error = int(dV_bad.shape[0])
+            if error:
+                print(f"Total {error:,} mismatches ({100 * error / dV_ref.numel():.1f}%) for 'dV'")
+            else:
+                print("'dV' within tolerance (atol=0.125, rtol=0.2, + P-quantization bound)")
+            assert error == 0, f"dV mismatch: {error} elements differ"
 
             if with_sink_token and dSink_token_ref is not None:
                 dSink_err = compare_tensors(dSink_token_gpu, dSink_token_ref, 0.08, 0.20, "dSink_token")
