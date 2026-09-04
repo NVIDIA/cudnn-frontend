@@ -520,11 +520,18 @@ def _bprop_matmul_bh_sm100_kernel(
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
             nvvm.prefetch_tensormap(tma_a_descs[_i].get_ptr())
-        for _j in cutlass.range_constexpr(num_b_operands):
-            nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
+        # B and C's GridConstant descriptors are DEAD under THD: B loads take the
+        # packed-total-clamped slot and C stores take the per-sequence one, both
+        # from the patched array.  Prefetching them would warm metadata nobody
+        # reads -- and the patched slots must NOT be prefetched here in their
+        # place, because that would cache their contents ahead of the
+        # `fence_proxy_acquire` that makes the patch visible to the TMA proxy.
+        if cutlass.const_expr(not _THD_MM):
+            for _j in cutlass.range_constexpr(num_b_operands):
+                nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
 
-        for _ci in cutlass.range_constexpr(n_tma_outputs):
-            nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
+            for _ci in cutlass.range_constexpr(n_tma_outputs):
+                nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
 
     init_raw_m = bidx >> _preferred_cluster_m_shift
     init_raw_n = bidy >> _preferred_cluster_n_shift
