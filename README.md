@@ -145,6 +145,22 @@ cmake --build . -j16
 ./bin/samples
 ```
 
+**4. Installing the Python Bindings with CMake (for system packagers)**
+
+If you cannot go through `pip` (e.g., distro or system packaging), the Python bindings can be built and installed directly with CMake:
+
+```bash
+mkdir build && cd build
+cmake -DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON \
+      -DCUDNN_FRONTEND_INSTALL_PYTHON_BINDINGS=ON \
+      -DCUDNN_FRONTEND_BUILD_SAMPLES=OFF \
+      -DCUDNN_FRONTEND_BUILD_TESTS=OFF ../
+cmake --build . -j16
+cmake --install .
+```
+
+This installs the `cudnn` package (Python sources plus the compiled module) and a PEP 376 `.dist-info` directory into the site-packages of the Python interpreter found by CMake, so the install is visible to `pip list`, `importlib.metadata`, and can be removed with `pip uninstall nvidia-cudnn-frontend`. The destination can be overridden with `-DCUDNN_FRONTEND_PYTHON_INSTALL_DIR=<path>` (absolute, or relative to `CMAKE_INSTALL_PREFIX`), and `DESTDIR` staging is supported. Use `-DCUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE=OFF` and `-DCUDNN_FRONTEND_USE_SYSTEM_DLPACK=ON` to build against system-provided `pybind11` and `dlpack` instead of fetching them.
+
 ## Documentation & Examples
 
 *   **Developer Guide:** [Official NVIDIA Documentation (latest)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/)
