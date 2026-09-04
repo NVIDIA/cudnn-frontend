@@ -1895,21 +1895,21 @@ class BlockSparseAttnBackwardSm100Blk128:
                     mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
                     gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
                     gdV = cute.local_tile(mdV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
-                    tdK_gdK = gmem_thr_copy_zero_dK.partition_D(gdK)
+                    tdKgdK = gmem_thr_copy_zero_dK.partition_D(gdK)
                     tdVgdV = gmem_thr_copy_zero_dV.partition_D(gdV)
                     cdK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
                     cdV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
                     tdKcdK = gmem_thr_copy_zero_dK.partition_D(cdK)
                     tdVcdV = gmem_thr_copy_zero_dV.partition_D(cdV)
-                    assert cute.size(tdK_gdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
-                    zero = cute.make_rmem_tensor_like(tdK_gdK[None, 0, 0])
+                    assert cute.size(tdKgdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
+                    zero = cute.make_rmem_tensor_like(tdKgdK[None, 0, 0])
                     zero.fill(0.0)
                     if tidx < 128:
-                        for i in cutlass.range_constexpr(tdK_gdK.shape[1]):
+                        for i in cutlass.range_constexpr(tdKgdK.shape[1]):
                             row_idx = tdKcdK[0, i, 0][0]
                             if row_idx < seqlen.seqlen_k - self.tile_n * n_block:
-                                for j in cutlass.range_constexpr(tdK_gdK.shape[2]):
-                                    cute.copy(gmem_tiled_copy_zero_dK, zero, tdK_gdK[None, i, j])
+                                for j in cutlass.range_constexpr(tdKgdK.shape[2]):
+                                    cute.copy(gmem_tiled_copy_zero_dK, zero, tdKgdK[None, i, j])
                     else:
                         for i in cutlass.range_constexpr(tdVgdV.shape[1]):
                             row_idx = tdVcdV[0, i, 0][0]

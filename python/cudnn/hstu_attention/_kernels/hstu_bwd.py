@@ -5241,23 +5241,23 @@ class HSTUAttentionBackwardSm100:
             cute.make_layout((1, vec_size)),
         )
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx - 128)
-        tdK_gdK = gmem_thr_copy.partition_D(gdK)
+        tdKgdK = gmem_thr_copy.partition_D(gdK)
         tdVgdV = gmem_thr_copy.partition_D(gdV)
         tdKcdK = gmem_thr_copy.partition_D(cdK)
         tdVcdV = gmem_thr_copy.partition_D(cdV)
-        zero = cute.make_fragment_like(tdK_gdK[None, 0, 0])
+        zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
         zero.fill(0.0)
 
-        for i in cutlass.range_constexpr(tdK_gdK.shape[1]):
+        for i in cutlass.range_constexpr(tdKgdK.shape[1]):
             if cute.elem_less(
                 tdKcdK[0, i, 0],
                 cute.select(problem_shape, mode=[1, 2]),
             ):
-                for j in cutlass.range_constexpr(tdK_gdK.shape[2]):
+                for j in cutlass.range_constexpr(tdKgdK.shape[2]):
                     cute.copy(
                         gmem_tiled_copy,
                         zero,
-                        tdK_gdK[None, i, j],
+                        tdKgdK[None, i, j],
                     )
         for i in cutlass.range_constexpr(tdVgdV.shape[1]):
             if cute.elem_less(
@@ -5376,8 +5376,8 @@ class HSTUAttentionBackwardSm100:
                 wg_idx,
             )
         )
-        tdK_gdK = thr_mma_dK.partition_C(gdK) if self.use_2cta_instrs else gdK
-        tTR_gdK = thread_t2r_dK.partition_D(tdK_gdK)
+        tdKgdK = thr_mma_dK.partition_C(gdK) if self.use_2cta_instrs else gdK
+        tTR_gdK = thread_t2r_dK.partition_D(tdKgdK)
         tTR_gdK = (
             split_wg_mma(tTR_gdK, num_warp_groups, wg_idx)
             if self.use_2cta_instrs
@@ -5491,7 +5491,7 @@ class HSTUAttentionBackwardSm100:
         tTR_sdK_epi = thr_r2s_dKV.partition_D(sdK_epi_wg)
         tTR_sdV_epi = thr_r2s_dKV.partition_D(sdV_epi_wg)
 
-        tdKsdK_epi, tdK_gdK_epi = cpasync.tma_partition(
+        tdKsdK_epi, tdKgdK_epi = cpasync.tma_partition(
             tma_atom_dK,
             0,
             cute.make_layout(1),
@@ -5668,7 +5668,7 @@ class HSTUAttentionBackwardSm100:
                 cute.copy(
                     tma_atom_dK,
                     tdKsdK_epi,
-                    tdK_gdK_epi[None, 0],
+                    tdKgdK_epi[None, 0],
                 )
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
