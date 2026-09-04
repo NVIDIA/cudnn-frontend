@@ -263,6 +263,33 @@ def test_wrappers_reuse_compiled_binaries_across_dynamic_n(monkeypatch):
 
 @pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="HSTU LMSD requires SM10x")
+def test_forward_persistent_loop_reuses_warp_barriers():
+    """A one-block grid forces repeated use of each warp-private U stage."""
+    _ops._FWD_CACHE.clear()
+    try:
+        torch.manual_seed(812)
+        n, d = 37, 512
+        x = torch.randn((n, d), device="cuda", dtype=torch.bfloat16)
+        u_storage = torch.randn((n, 4 * d), device="cuda", dtype=torch.bfloat16)
+        u = u_storage[:, :d]
+        weight = torch.randn((d,), device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn((d,), device="cuda", dtype=torch.bfloat16)
+
+        expected = hstu_lmsd_forward(x, u, weight, bias, dropout_ratio=0.1, seed=43)
+        api = next(iter(_ops._FWD_CACHE.values()))
+        api._grid_cap = 1
+        actual = hstu_lmsd_forward(x, u, weight, bias, dropout_ratio=0.1, seed=43)
+        torch.cuda.synchronize()
+
+        assert len(_ops._FWD_CACHE) == 1
+        for expected_tensor, actual_tensor in zip(expected, actual):
+            assert torch.equal(expected_tensor, actual_tensor)
+    finally:
+        _ops._FWD_CACHE.clear()
+
+
+@pytest.mark.L1
+@pytest.mark.skipif(not _IS_SM10X, reason="HSTU LMSD requires SM10x")
 def test_wrappers_use_tensor_device_and_custom_stream():
     """Compile and launch on the tensor device even when another device is current."""
     if torch.cuda.device_count() < 2:

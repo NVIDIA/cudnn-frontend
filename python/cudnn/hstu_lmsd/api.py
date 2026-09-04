@@ -18,6 +18,8 @@ from cudnn.api_base import APIBase, TensorDesc
 
 from ._runtime import record_streams, stream_handle
 from .cutedsl._common import ALIGNMENT_BYTES, keep_threshold32, normalize_dropout_ratio
+from .cutedsl.cute_dsl_ln_mul_dropout import BLOCKS_PER_SM as FWD_BLOCKS_PER_SM
+from .cutedsl.cute_dsl_ln_mul_dropout import ROWS_PER_CTA as FWD_ROWS_PER_CTA
 from .cutedsl.cute_dsl_ln_mul_dropout import LnMulDropoutForward
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import (
     MAX_NUM_ROWS,
@@ -248,6 +250,7 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         _require_matrix_layout(mask, "mask", row_stride=d)
         if not math.isfinite(self.eps) or self.eps <= 0.0:
             raise ValueError(f"eps must be positive and finite, got {self.eps}")
+        self._grid_cap = torch.cuda.get_device_properties(self.x_desc.device).multi_processor_count * FWD_BLOCKS_PER_SM
         self._is_supported = True
         return True
 
@@ -290,6 +293,9 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
             cutlass.Uint32(self._threshold),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
             fake_stream,
             options="--enable-tvm-ffi",
         )
@@ -325,6 +331,9 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         )
         stream = stream_handle(current_stream, x_tensor.device)
         d = self.hidden_size
+        num_row_blocks = (n + FWD_ROWS_PER_CTA - 1) // FWD_ROWS_PER_CTA
+        grid_size = min(num_row_blocks, self._grid_cap)
+        num_iterations = (num_row_blocks + grid_size - 1) // grid_size
         silu_output = y_tensor[:, :d]
         x_output = y_tensor[:, d : 2 * d]
         lmsd_output = y_tensor[:, 2 * d :]
@@ -345,6 +354,9 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
             cutlass.Float32(self.eps),
             cutlass.Float32(self.dropout_ratio),
             cutlass.Uint32(self._threshold),
+            cutlass.Int32(num_row_blocks),
+            cutlass.Int32(num_iterations),
+            cutlass.Int32(grid_size),
             stream,
         )
         record_streams(

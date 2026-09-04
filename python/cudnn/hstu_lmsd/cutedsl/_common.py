@@ -69,3 +69,22 @@ def domain_offset_i64(
         assumed_align=tensor.iterator.max_alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def offset_tensor_i64(
+    tensor: cute.Tensor,
+    element_offset: cutlass.Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    """Retarget a tensor by a 64-bit element offset, preserving its layout."""
+    assert isinstance(tensor.iterator, cute.Pointer)
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + element_offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)

@@ -9,8 +9,8 @@ The output is laid out as three contiguous D-wide segments:
 * segment 2: dropout(LayerNorm(x) * SiLU(u))
 
 One int8 mask stores the three keep decisions in bits 2, 1, and 0,
-respectively. See the benchmark README for the tuning history behind the
-shipping configuration.
+respectively. U is copied asynchronously to per-warp shared memory while the
+warp computes the LayerNorm statistics from X.
 """
 
 from cuda.bindings import driver as cuda
@@ -18,13 +18,16 @@ from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as _cm
+import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.utils as _cutils
 
-from ._common import LOG2E, MASK_LMSD, MASK_SILU, MASK_X, domain_offset_i64
+from ._common import LOG2E, MASK_LMSD, MASK_SILU, MASK_X, domain_offset_i64, offset_tensor_i64
 
 VECTOR_SIZE = 8
-ROWS_PER_CTA = 2
 THREADS_PER_ROW = 32
-MIN_BLOCKS_PER_MP = 0
+ROWS_PER_CTA = 4
+BLOCKS_PER_SM = 192
+MIN_BLOCKS_PER_MP = 7
 
 M0, M1 = 0xD2511F53, 0xCD9E8D57
 W0, W1 = 0x9E3779B9, 0xBB67AE85
@@ -32,14 +35,20 @@ MASK32 = 0xFFFFFFFF
 ROUNDS = 10
 
 
+@cute.struct
+class ForwardSharedStorage:
+    """One barrier and one 512-element U row for each warp in the CTA."""
+
+    barriers: cute.struct.MemRange[cutlass.Int64, ROWS_PER_CTA]
+    u_rows: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, ROWS_PER_CTA * 512], 128]
+
+
 class LnMulDropoutForward:
     """Compile-time configuration and device code for LMSD forward.
 
-    The class follows QuACK's split between a JIT-callable launch layer and a
-    ``kernel`` method. Performance-sensitive choices remain compile-time
-    attributes. Tensor names use the same scope convention: ``m`` for whole
-    tensors, ``g`` for tiled global-memory views, ``t`` for per-thread
-    partitions, and ``r`` for register fragments.
+    Four warps process four independent rows per CTA. Each warp starts an
+    asynchronous 1024-byte U copy, reduces X while that copy is in flight,
+    then consumes U from its private shared-memory row.
     """
 
     def __init__(self):
@@ -52,7 +61,7 @@ class LnMulDropoutForward:
     def kernel(
         self,
         gX: cute.Tensor,
-        gU: cute.Tensor,
+        mU: cute.Tensor,
         gW: cute.Tensor,
         gB: cute.Tensor,
         gSiluOut: cute.Tensor,
@@ -66,175 +75,185 @@ class LnMulDropoutForward:
         thresh: cutlass.Uint32,
         thr_layout: cute.Layout,
         val_layout: cute.Layout,
+        u_transaction_bytes: cutlass.Constexpr,
         num_column_tiles: cutlass.Constexpr,
         seed: cutlass.Int64,
         nrows: cutlass.Int32,
         ncols: cutlass.Int32,
+        num_row_blocks: cutlass.Int32,
+        num_iterations: cutlass.Int32,
+        grid_size: cutlass.Int32,
     ):
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
-        # A CTA owns rows_per_cta warps, and each warp owns one row.
-        thread_in_row = thread_idx % self.threads_per_row
-        rows_per_block = self.rows_per_cta * 32 // self.threads_per_row
-        row = block_idx * rows_per_block + thread_idx // self.threads_per_row
-        if row < nrows:
-            # Phase 1: map this thread to its row and column fragments.
-            tensor_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type)
-            mask_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gMask.element_type)
-            thread_copy = cute.make_tiled_copy_tv(tensor_copy_atom, thr_layout, val_layout).get_slice(thread_in_row)
-            mask_thread_copy = cute.make_tiled_copy_tv(mask_copy_atom, thr_layout, val_layout).get_slice(thread_in_row)
+        lane = thread_idx % 32
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-            row_coord = ((0, 0), (row, 0))
-            gX_row = domain_offset_i64(row_coord, gX)
-            gU_row = domain_offset_i64(row_coord, gU)
-            gSiluOut_row = domain_offset_i64(row_coord, gSiluOut)
-            gXOut_row = domain_offset_i64(row_coord, gXOut)
-            gLmsdOut_row = domain_offset_i64(row_coord, gLmsdOut)
-            gMask_row = domain_offset_i64(row_coord, gMask)
+        storage = _cutils.SmemAllocator().allocate(ForwardSharedStorage)
+        shared_u_layout = cute.make_layout(
+            (self.rows_per_cta, 1, 512, 1),
+            stride=(512, 512, 1, 512),
+        )
+        shared_u_all = cute.make_tensor(storage.u_rows.data_ptr(), shared_u_layout)
+        shared_u = shared_u_all[(warp_idx, None, None, None)]
 
-            # Python lists here are JIT-time containers unrolled by
-            # range_constexpr; they are not dynamically allocated on the GPU.
-            rX_reduction_tiles, rU_tiles = [], []
-            tXgOutput_tiles, tXgMask_tiles = [], []
-            tXgX_compute_tiles, tXgW_tiles, tXgB_tiles = [], [], []
-            for j in cutlass.range_constexpr(num_column_tiles):
-                row_tile_coord = ((None, None), (0, j))
-                for src, src_coord, dst in (
-                    (gX_row, row_tile_coord, rX_reduction_tiles),
-                    (gU_row, row_tile_coord, rU_tiles),
-                ):
-                    t = thread_copy.partition_S(src[src_coord])
-                    f = cute.make_fragment_like(t)
-                    cute.copy(tensor_copy_atom, t, f)
-                    dst.append(f)
-                # Keep the partition, not the fragment, so the compute phase can
-                # reread x after the reduction with a shorter register live range.
-                tXgX_compute_tiles.append(thread_copy.partition_S(gX_row[row_tile_coord]))
-                param_coord = ((None, None), (0, j))
-                tXgW_tiles.append(thread_copy.partition_S(gW[param_coord]))
-                tXgB_tiles.append(thread_copy.partition_S(gB[param_coord]))
-                tXgOutput_tiles.append(
-                    (
-                        thread_copy.partition_S(gSiluOut_row[row_tile_coord]),
-                        thread_copy.partition_S(gXOut_row[row_tile_coord]),
-                        thread_copy.partition_S(gLmsdOut_row[row_tile_coord]),
-                    )
-                )
-                tXgMask_tiles.append(mask_thread_copy.partition_S(gMask_row[row_tile_coord]))
+        barrier = storage.barriers.data_ptr() + warp_idx
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_init(barrier, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_warp()
 
-            # Phase 2: compute row-wise LayerNorm statistics.
-            sum_x = cutlass.Float32(0.0)
-            sum_sq_x = cutlass.Float32(0.0)
-            for j in cutlass.range_constexpr(num_column_tiles):
-                for e in cutlass.range_constexpr(self.vector_size):
-                    v = rX_reduction_tiles[j][e].to(cutlass.Float32)
-                    sum_x = sum_x + v
-                    sum_sq_x = sum_sq_x + v * v
-            # The butterfly stays inside the aligned threads-per-row subgroup.
-            for off in cutlass.range_constexpr(self.threads_per_row.bit_length() - 1):
-                sum_x = sum_x + cute.arch.shuffle_sync_bfly(sum_x, 1 << off)
-                sum_sq_x = sum_sq_x + cute.arch.shuffle_sync_bfly(sum_sq_x, 1 << off)
+        tensor_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type)
+        mask_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gMask.element_type)
+        bulk_u_copy_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), mU.element_type)
+        thread_copy = cute.make_tiled_copy_tv(tensor_copy_atom, thr_layout, val_layout).get_slice(lane)
+        mask_thread_copy = cute.make_tiled_copy_tv(mask_copy_atom, thr_layout, val_layout).get_slice(lane)
 
-            inv_d = cutlass.Float32(1.0) / ncols.to(cutlass.Float32)
-            mean = sum_x * inv_d
-            var = _cm.max(sum_sq_x * inv_d - mean * mean, cutlass.Float32(0.0))
-            rstd = cutlass.Float32(1.0) / _cm.sqrt(var + eps)
-            scale = cutlass.Float32(1.0) / (cutlass.Float32(1.0) - drop)
+        inv_d = cutlass.Float32(1.0) / ncols.to(cutlass.Float32)
+        scale = cutlass.Float32(1.0) / (cutlass.Float32(1.0) - drop)
+        key0 = cutlass.Uint32(seed & MASK32)
+        key1 = cutlass.Uint32((seed >> 32) & MASK32)
 
-            k0 = cutlass.Uint32(seed & MASK32)
-            k1 = cutlass.Uint32((seed >> 32) & MASK32)
+        # Runtime loop bounds preserve one compiled binary across all supported
+        # row counts while retaining v63's persistent grid-stride schedule.
+        for iteration in cutlass.range(num_iterations):
+            row_block = block_idx + iteration * grid_size
+            if row_block < num_row_blocks:
+                row = row_block * self.rows_per_cta + warp_idx
+                if row < nrows:
+                    # Each warp owns its barrier and shared row. Issue U first;
+                    # the X reduction below is independent work that hides it.
+                    mU_row = domain_offset_i64((row, 0), mU)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(barrier, u_transaction_bytes)
+                        cute.copy(
+                            bulk_u_copy_atom,
+                            mU_row[(0, None)],
+                            shared_u[(0, None, 0)],
+                            mbar_ptr=barrier,
+                        )
 
-            # Phase 3: generate three Philox streams, evaluate LMSD, and write
-            # segment 0 (SiLU), segment 1 (x), segment 2 (LMSD), and the mask.
-            for j in cutlass.range_constexpr(num_column_tiles):
-                tXgW = tXgW_tiles[j]
-                tXgB = tXgB_tiles[j]
-                tXgSiluOut, tXgXOut, tXgLmsdOut = tXgOutput_tiles[j]
-                tXgMask = tXgMask_tiles[j]
-                rU = rU_tiles[j]
-                rX = cute.make_fragment_like(tXgX_compute_tiles[j])
-                cute.copy(tensor_copy_atom, tXgX_compute_tiles[j], rX)
-                rW = cute.make_fragment_like(tXgW)
-                rB = cute.make_fragment_like(tXgB)
-                cute.copy(tensor_copy_atom, tXgW, rW)
-                cute.copy(tensor_copy_atom, tXgB, rB)
-                rSiluOut = cute.make_fragment_like(tXgSiluOut)
-                rXOut = cute.make_fragment_like(tXgXOut)
-                rLmsdOut = cute.make_fragment_like(tXgLmsdOut)
-                rMask = cute.make_fragment_like(tXgMask)
-                # A thread owns vector_size contiguous columns in tile j.
-                # Each mask plane uses full 32-bit samples: plane 0 is LMSD,
-                # plane 1 is x, and plane 2 is SiLU(u).
-                philox_block = cutlass.Uint32(j * self.threads_per_row) + cutlass.Uint32(thread_in_row)
-                philox_words = []
-                for mask_plane in cutlass.range_constexpr(3):
-                    for h in cutlass.range_constexpr(2):
-                        c0 = cutlass.Uint32(row)
-                        c1 = philox_block * cutlass.Uint32(2) + cutlass.Uint32(h)
-                        c2 = cutlass.Uint32(mask_plane)
-                        c3 = cutlass.Uint32(0)
-                        kk0, kk1 = k0, k1
-                        m0c = cutlass.Uint32(M0)
-                        m1c = cutlass.Uint32(M1)
-                        for _r in cutlass.range_constexpr(ROUNDS):
-                            # One mul.wide.u32 yields both halves of each
-                            # product, so no second multiply is required.
-                            p0 = cute.arch.mul_wide(m0c, c0)
-                            p1 = cute.arch.mul_wide(m1c, c2)
-                            hi0 = (p0 >> cutlass.Uint64(32)).to(cutlass.Uint32)
-                            lo0 = (p0 & cutlass.Uint64(MASK32)).to(cutlass.Uint32)
-                            hi1 = (p1 >> cutlass.Uint64(32)).to(cutlass.Uint32)
-                            lo1 = (p1 & cutlass.Uint64(MASK32)).to(cutlass.Uint32)
-                            c0 = hi1 ^ c1 ^ kk0
-                            c1 = lo1
-                            c2 = hi0 ^ c3 ^ kk1
-                            c3 = lo0
-                            kk0 = kk0 + cutlass.Uint32(W0)
-                            kk1 = kk1 + cutlass.Uint32(W1)
-                        philox_words.append((c0, c1, c2, c3))
-                for e in cutlass.range_constexpr(self.vector_size):
-                    bits = cutlass.Int8(0)
-                    for mask_plane in cutlass.range_constexpr(3):
-                        word = philox_words[mask_plane * 2 + e // 4][e % 4]
-                        keep = word >= thresh
-                        bits = bits | (cutlass.Int8(1 << mask_plane) if keep else cutlass.Int8(0))
-                    rMask[e] = bits
-                # Evaluate pairs with packed FP32 arithmetic. Accumulation and
-                # output conversion retain the shipping numerical order.
-                one2 = (cutlass.Float32(1.0), cutlass.Float32(1.0))
-                mean2 = (mean, mean)
-                rstd2 = (rstd, rstd)
-                scale2 = (scale, scale)
-                negative_log2e2 = cutlass.Float32(-LOG2E)
-                for pair in cutlass.range_constexpr(self.vector_size // 2):
-                    e0 = 2 * pair
-                    e1 = e0 + 1
-                    xf2 = (rX[e0].to(cutlass.Float32), rX[e1].to(cutlass.Float32))
-                    uf2 = (rU[e0].to(cutlass.Float32), rU[e1].to(cutlass.Float32))
-                    weight2 = (rW[e0].to(cutlass.Float32), rW[e1].to(cutlass.Float32))
-                    bias2 = (rB[e0].to(cutlass.Float32), rB[e1].to(cutlass.Float32))
-                    xhat2 = cute.arch.mul_packed_f32x2(cute.arch.sub_packed_f32x2(xf2, mean2), rstd2)
-                    layer_norm2 = cute.arch.fma_packed_f32x2(xhat2, weight2, bias2)
-                    exp2 = (cute.arch.exp2(uf2[0] * negative_log2e2), cute.arch.exp2(uf2[1] * negative_log2e2))
-                    denominator2 = cute.arch.add_packed_f32x2(exp2, one2)
-                    silu2 = (_cm.div(uf2[0], denominator2[0], approx=True), _cm.div(uf2[1], denominator2[1], approx=True))
-                    scaled_silu2 = cute.arch.mul_packed_f32x2(silu2, scale2)
-                    scaled_x2 = cute.arch.mul_packed_f32x2(xf2, scale2)
-                    scaled_lmsd2 = cute.arch.mul_packed_f32x2(layer_norm2, scaled_silu2)
-                    zero = cutlass.Float32(0.0)
-                    for q in cutlass.range_constexpr(2):
-                        mask_bits = rMask[e0 + q].to(cutlass.Int32)
-                        rSiluOut[e0 + q] = (scaled_silu2[q] if (mask_bits & MASK_SILU) != 0 else zero).to(gX.element_type)
-                        rXOut[e0 + q] = (scaled_x2[q] if (mask_bits & MASK_X) != 0 else zero).to(gX.element_type)
-                        rLmsdOut[e0 + q] = (scaled_lmsd2[q] if (mask_bits & MASK_LMSD) != 0 else zero).to(gX.element_type)
-                cute.copy(tensor_copy_atom, rSiluOut, tXgSiluOut)
-                cute.copy(tensor_copy_atom, rXOut, tXgXOut)
-                cute.copy(tensor_copy_atom, rLmsdOut, tXgLmsdOut)
-                cute.copy(mask_copy_atom, rMask, tXgMask)
+                    sum_x = cutlass.Float32(0.0)
+                    sum_sq_x = cutlass.Float32(0.0)
+                    for column_tile in cutlass.range_constexpr(num_column_tiles):
+                        tile_coord = ((None, None), (row, column_tile))
+                        tXgReduction = thread_copy.partition_S(gX[tile_coord])
+                        rXReduction = cute.make_fragment_like(tXgReduction)
+                        cute.copy(tensor_copy_atom, tXgReduction, rXReduction)
+                        for element in cutlass.range_constexpr(self.vector_size):
+                            value = rXReduction[element].to(cutlass.Float32)
+                            sum_x = sum_x + value
+                            sum_sq_x = sum_sq_x + value * value
 
-            if thread_in_row == 0:
-                gMean[row] = mean
-                gRstd[row] = rstd
+                    for offset in cutlass.range_constexpr(self.threads_per_row.bit_length() - 1):
+                        sum_x = sum_x + cute.arch.shuffle_sync_bfly(sum_x, 1 << offset)
+                        sum_sq_x = sum_sq_x + cute.arch.shuffle_sync_bfly(sum_sq_x, 1 << offset)
+
+                    mean = sum_x * inv_d
+                    variance = _cm.max(sum_sq_x * inv_d - mean * mean, cutlass.Float32(0.0))
+                    rstd = cutlass.Float32(1.0) / _cm.sqrt(variance + eps)
+
+                    # The three segments share one [N, 3D] allocation. Rebase
+                    # its first segment once, then use constant segment offsets.
+                    row_coord = ((0, 0), (row, 0))
+                    gSiluOut_row = domain_offset_i64(row_coord, gSiluOut)
+                    gXOut_row = offset_tensor_i64(gSiluOut_row, cutlass.Int64(512))
+                    gLmsdOut_row = offset_tensor_i64(gSiluOut_row, cutlass.Int64(1024))
+
+                    # This is the first U consumer. Barrier parity flips each
+                    # time the single shared stage is reused.
+                    cute.arch.mbarrier_wait(barrier, iteration % 2)
+                    shared_u_vectors = cute.zipped_divide(shared_u[(0, None, None)], (self.vector_size,))
+
+                    for column_tile in cutlass.range_constexpr(num_column_tiles):
+                        global_coord = ((None, None), (row, column_tile))
+                        local_coord = ((None, None), (0, column_tile))
+                        tXgSiluOut = thread_copy.partition_S(gSiluOut_row[local_coord])
+                        tXgXOut = thread_copy.partition_S(gXOut_row[local_coord])
+                        tXgLmsdOut = thread_copy.partition_S(gLmsdOut_row[local_coord])
+                        tXgMask = mask_thread_copy.partition_S(gMask[global_coord])
+                        rSiluOut = cute.make_fragment_like(tXgSiluOut)
+                        rXOut = cute.make_fragment_like(tXgXOut)
+                        rLmsdOut = cute.make_fragment_like(tXgLmsdOut)
+                        rMask = cute.make_fragment_like(tXgMask)
+
+                        # Match the established reread-X schedule: the reduction
+                        # fragment is dead before X is fetched for the output pass.
+                        tXgX = thread_copy.partition_S(gX[global_coord])
+                        rX = cute.make_fragment_like(tXgX)
+                        cute.copy(tensor_copy_atom, tXgX, rX)
+
+                        for element in cutlass.range_constexpr(self.vector_size):
+                            rMask[element] = cutlass.Int8(0)
+                        philox_block = cutlass.Uint32(column_tile * self.threads_per_row) + cutlass.Uint32(lane)
+                        # Consume each Philox4 result immediately so six tuples
+                        # are not simultaneously live in registers.
+                        for mask_plane in cutlass.range_constexpr(3):
+                            for half in cutlass.range_constexpr(2):
+                                counter0 = cutlass.Uint32(row)
+                                counter1 = philox_block * cutlass.Uint32(2) + cutlass.Uint32(half)
+                                counter2 = cutlass.Uint32(mask_plane)
+                                counter3 = cutlass.Uint32(0)
+                                round_key0, round_key1 = key0, key1
+                                multiplier0 = cutlass.Uint32(M0)
+                                multiplier1 = cutlass.Uint32(M1)
+                                for _round in cutlass.range_constexpr(ROUNDS):
+                                    product0 = cute.arch.mul_wide(multiplier0, counter0)
+                                    product1 = cute.arch.mul_wide(multiplier1, counter2)
+                                    high0 = (product0 >> cutlass.Uint64(32)).to(cutlass.Uint32)
+                                    low0 = (product0 & cutlass.Uint64(MASK32)).to(cutlass.Uint32)
+                                    high1 = (product1 >> cutlass.Uint64(32)).to(cutlass.Uint32)
+                                    low1 = (product1 & cutlass.Uint64(MASK32)).to(cutlass.Uint32)
+                                    counter0 = high1 ^ counter1 ^ round_key0
+                                    counter1 = low1
+                                    counter2 = high0 ^ counter3 ^ round_key1
+                                    counter3 = low0
+                                    round_key0 = round_key0 + cutlass.Uint32(W0)
+                                    round_key1 = round_key1 + cutlass.Uint32(W1)
+                                words = (counter0, counter1, counter2, counter3)
+                                for word_index in cutlass.range_constexpr(4):
+                                    element = half * 4 + word_index
+                                    bit = cutlass.Int8(1 << mask_plane) if words[word_index] >= thresh else cutlass.Int8(0)
+                                    rMask[element] = rMask[element] | bit
+
+                        # W/B do not participate in Philox. Loading them here
+                        # shortens their live range through the integer loop.
+                        parameter_coord = ((None, None), (0, column_tile))
+                        tXgW = thread_copy.partition_S(gW[parameter_coord])
+                        tXgB = thread_copy.partition_S(gB[parameter_coord])
+                        rW = cute.make_fragment_like(tXgW)
+                        rB = cute.make_fragment_like(tXgB)
+                        cute.copy(tensor_copy_atom, tXgW, rW)
+                        cute.copy(tensor_copy_atom, tXgB, rB)
+
+                        shared_u_vector = shared_u_vectors[(None, (column_tile * self.threads_per_row + lane, 0))]
+                        rU = cute.make_fragment_like(shared_u_vector)
+                        cute.autovec_copy(shared_u_vector, rU)
+
+                        zero = cutlass.Float32(0.0)
+                        for element in cutlass.range_constexpr(self.vector_size):
+                            x_value = rX[element].to(cutlass.Float32)
+                            u_value = rU[element].to(cutlass.Float32)
+                            weight = rW[element].to(cutlass.Float32)
+                            bias = rB[element].to(cutlass.Float32)
+                            layer_norm = (x_value - mean) * rstd * weight + bias
+                            denominator = cutlass.Float32(1.0) + cute.arch.exp2(-u_value * cutlass.Float32(LOG2E))
+                            silu = _cm.div(u_value, denominator, approx=True)
+                            mask_bits = rMask[element].to(cutlass.Int32)
+                            scaled_silu = silu * scale
+                            rSiluOut[element] = (scaled_silu if (mask_bits & MASK_SILU) != 0 else zero).to(gX.element_type)
+                            rXOut[element] = (x_value * scale if (mask_bits & MASK_X) != 0 else zero).to(gX.element_type)
+                            rLmsdOut[element] = (layer_norm * scaled_silu if (mask_bits & MASK_LMSD) != 0 else zero).to(gX.element_type)
+
+                        # This order is part of the measured v63 schedule.
+                        cute.copy(tensor_copy_atom, rXOut, tXgXOut)
+                        cute.copy(tensor_copy_atom, rSiluOut, tXgSiluOut)
+                        cute.copy(tensor_copy_atom, rLmsdOut, tXgLmsdOut)
+                        cute.copy(mask_copy_atom, rMask, tXgMask)
+
+                    if lane == 0:
+                        gMean[row] = mean
+                        gRstd[row] = rstd
 
     @cute.jit
     def __call__(
@@ -255,33 +274,30 @@ class LnMulDropoutForward:
         eps: cutlass.Float32,
         drop: cutlass.Float32,
         thresh: cutlass.Uint32,
+        num_row_blocks: cutlass.Int32,
+        num_iterations: cutlass.Int32,
+        grid_size: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # The copy tile represents one row. The separate row layout describes
-        # the two physical warps (and therefore two rows) owned by each CTA.
         thr_layout = cute.make_ordered_layout((1, self.threads_per_row), order=(1, 0))
-        row_thr_layout = cute.make_ordered_layout(
-            (self.rows_per_cta * 32 // self.threads_per_row, 32),
-            order=(1, 0),
-        )
         val_layout = cute.make_ordered_layout((1, self.vector_size), order=(1, 0))
-        _row_tiler, _ = cute.make_layout_tv(row_thr_layout, val_layout)
-        grid_n = cute.size(cute.zipped_divide(mX, _row_tiler), mode=[1, 0])
         tiler, _ = cute.make_layout_tv(thr_layout, val_layout)
         tile = lambda tensor: cute.zipped_divide(tensor, tiler)
+
         gX = tile(mX)
-        # Weight and bias are public rank-1 tensors. The device kernel only
-        # indexes parameter row zero, so construct that singleton mode as a
-        # zero-stride CuTe view instead of materializing a repeated tensor.
+        gSiluOut = tile(mSiluOut)
         param_layout = cute.make_layout((1, cute.size(mW)), stride=(0, 1))
         mW2 = cute.make_tensor(mW.iterator, param_layout)
         mB2 = cute.make_tensor(mB.iterator, param_layout)
+        u_stage_layout = cute.make_ordered_layout((1, 512), order=(1, 0))
+        u_transaction_bytes = cute.size_in_bytes(cutlass.BFloat16, u_stage_layout)
+
         self.kernel(
             gX,
-            tile(mU),
+            mU,
             tile(mW2),
             tile(mB2),
-            tile(mSiluOut),
+            gSiluOut,
             tile(mXOut),
             tile(mLmsdOut),
             tile(mMask),
@@ -292,13 +308,18 @@ class LnMulDropoutForward:
             thresh,
             thr_layout,
             val_layout,
-            cute.size(gX, mode=[1, 1]),
+            u_transaction_bytes,
+            cute.size(gSiluOut, mode=[1, 1]),
             seed,
             nrows,
             ncols,
+            num_row_blocks,
+            num_iterations,
+            grid_size,
         ).launch(
-            grid=(grid_n, 1, 1),
+            grid=(grid_size, 1, 1),
             block=(self.rows_per_cta * 32, 1, 1),
+            smem=ForwardSharedStorage.size_in_bytes(),
             min_blocks_per_mp=self.min_blocks_per_mp,
             stream=stream,
         )

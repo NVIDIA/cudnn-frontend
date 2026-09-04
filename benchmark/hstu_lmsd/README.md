@@ -69,23 +69,26 @@ reviewed is unambiguous.
 
 | Choice | Rationale |
 |---|---|
-| 32 threads per row, 2 rows per CTA | Preserves the established LayerNorm reduction order and bitwise output behavior. |
+| 32 threads per row, 4 rows per CTA | Gives each warp one independent row while preserving the established LayerNorm reduction order. |
 | One-row copy tile | Derives row ownership directly from the warp and avoids multi-row tile address work. |
-| Packed FP32x2 pointwise tail | Evaluates independent element pairs while retaining FP32 arithmetic. |
+| Per-warp asynchronous `u` staging | Starts one 1024-byte global-to-shared bulk copy, reduces `x` while it is in flight, then reads `u` with 128-bit shared-memory loads. |
+| One current-row stage | Avoids the register, shared-memory, and barrier state required by cross-row prefetch. |
+| Scalar FP32 pointwise tail | Retains the measured v63 instruction schedule and bitwise output behavior. |
 | Reread `x` after the row reduction | Shortens the register live range; the second read is expected to hit cache. |
-| Full 32-bit Philox samples | Matches the reference dropout probability instead of quantizing it to 16 bits. |
+| Streamed full 32-bit Philox samples | Matches the reference dropout probability and consumes each four-word result immediately to shorten its register live range. |
+| Load `weight` and `bias` after Philox | Keeps parameter fragments out of the integer-heavy random-number loop. |
 | 64-bit row pointer rebasing | Keeps large production layouts in one launch without overflowing row byte offsets. |
 
-Historical same-job tuning on Rubin SM107a at `N=2,739,421`, `D=512`, BF16,
-and a locked 4752 MHz memory clock measured this configuration at 0.933x the
-latency of the preceding CuTe DSL forward kernel (1.824 ms baseline). A
-16-thread-per-row variant was faster but changed the LayerNorm accumulation
-order, so it is not part of the shipping implementation.
+Same-job validation on Rubin SM107a at `N=2,739,421`, `D=512`, BF16, a sliced
+`u` with row stride 2,048, and a locked 4752 MHz memory clock measured the
+previous forward at 2.2224 ms and this runtime-`N` implementation at 2.1029 ms.
+That is a 5.38% latency reduction (1.0568x speedup). Each value is the median
+of five measurements with 10 warmups and 50 repetitions per measurement.
 
-The following alternatives were measured and rejected: TMA/shared-memory
-staging, shared-memory output staging, multi-warp row reductions, register
-capping, hand-selected Philox integer instructions, and deferred input or
-output partitioning. They either added staging/synchronization work, reduced
-resident warps, or reproduced instructions that the compiler already emitted.
-The detailed measurements remain available in the pull-request discussion;
-they are not part of the executable kernel contract.
+The retained staging is deliberately narrow: only the current `u` row uses an
+asynchronous bulk copy. Full `x`/`u` staging, cross-row prefetch, deeper
+pipelines, shared-memory output staging, register capping, and hand-selected
+Philox integer instructions were measured and rejected. They added more
+staging, synchronization, or live state than the overlap recovered. The
+detailed measurements remain available in the pull-request discussion; they
+are not part of the executable kernel contract.
