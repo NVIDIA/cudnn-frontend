@@ -966,37 +966,38 @@ def _tmastg_warp_group(
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_o_full[qs].wait(o_full_phase)
-            if cutlass.const_expr(_FP32_PARTIALS):
-                bars.mb_o_empty[qs].arrive()
-                continue
-
-            # O TMA params follow O's swizzle (NOT V's) — under gptoss cga2 V drops to Swz64B while O stays Swz128B.
-            if cutlass.const_expr(CFG.THD_VARLEN):
-                # THD: store each Q slab through this batch's pre-built descriptor
-                # (base at the sequence's packed row, seq extent = S_q_b → a box
-                # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
-                # batch coord collapses to 0.  Both slabs share one descriptor.
-                # DEAD unit (batch == n_batch, over-launched grid — issue #552):
-                # no O rows exist and descriptor slot n_batch is never built, so
-                # skip the store; the barrier protocol below still runs.
-                if batch_idx < n_batch:
-                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-                    o_slice = tma_slice_runtime_desc(
-                        o_desc_ptr,
-                        cutlass.Int32(0),
-                        q_head_idx,
-                        q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
-                        cutlass.Int32(0),
+            # fp32 partials wrote the workspace directly, so there is nothing
+            # staged to copy.  Skip ONLY the store: the arrive below and the
+            # QO_ALIAS handshake after it must still run, or this warp laps
+            # the loader and the parity waits deadlock.
+            if cutlass.const_expr(not _FP32_PARTIALS):
+                # O TMA params follow O's swizzle (NOT V's) — under gptoss cga2 V drops to Swz64B while O stays Swz128B.
+                if cutlass.const_expr(CFG.THD_VARLEN):
+                    # THD: store each Q slab through this batch's pre-built descriptor
+                    # (base at the sequence's packed row, seq extent = S_q_b → a box
+                    # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
+                    # batch coord collapses to 0.  Both slabs share one descriptor.
+                    # DEAD unit (batch == n_batch, over-launched grid — issue #552):
+                    # no O rows exist and descriptor slot n_batch is never built, so
+                    # skip the store; the barrier protocol below still runs.
+                    if batch_idx < n_batch:
+                        o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                        o_slice = tma_slice_runtime_desc(
+                            o_desc_ptr,
+                            cutlass.Int32(0),
+                            q_head_idx,
+                            q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
+                            cutlass.Int32(0),
+                        )
+                        tma_store_tile(sO[qs], o_slice)
+                else:
+                    tma_store_tile(
+                        sO[qs],
+                        tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), o_batch),
                     )
-                    tma_store_tile(sO[qs], o_slice)
-            else:
-                tma_store_tile(
-                    sO[qs],
-                    tma_o(cutlass.Int32(0), q_head_idx, q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), o_batch),
-                )
 
-            tma_store_commit()
-            tma_store_wait(0)
+                tma_store_commit()
+                tma_store_wait(0)
 
             bars.mb_o_empty[qs].arrive()
             # QO_ALIAS: O[qs] has drained to GMEM → the shared Q∪O slab is free
