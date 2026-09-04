@@ -15,6 +15,7 @@ from cudnn.api_base import TupleDict
 
 from ._runtime import allocation_context, tensor_signature
 from .api import HSTULMSDBwdSm100, HSTULMSDFwdSm100
+from .cutedsl._common import normalize_dropout_ratio
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import TARGET_TILES
 
 _CACHE_CAPACITY = 128
@@ -42,10 +43,12 @@ def _saved_dropout_ratio(mask_tensor: torch.Tensor, dropout_ratio: Optional[floa
     if saved_ratio is None:
         if dropout_ratio is None:
             raise ValueError("dropout_ratio is required when mask_tensor does not carry " "metadata from hstu_lmsd_forward")
-        return float(dropout_ratio)
-    saved_ratio = float(saved_ratio)
-    if dropout_ratio is not None and float(dropout_ratio) != saved_ratio:
-        raise ValueError("dropout_ratio must match the value used by hstu_lmsd_forward: " f"expected {saved_ratio}, got {float(dropout_ratio)}")
+        return normalize_dropout_ratio(dropout_ratio)
+    saved_ratio = normalize_dropout_ratio(saved_ratio)
+    if dropout_ratio is not None:
+        dropout_ratio = normalize_dropout_ratio(dropout_ratio)
+    if dropout_ratio is not None and dropout_ratio != saved_ratio:
+        raise ValueError("dropout_ratio must match the value used by hstu_lmsd_forward: " f"expected {saved_ratio}, got {dropout_ratio}")
     return saved_ratio
 
 
@@ -68,6 +71,7 @@ def hstu_lmsd_forward(
     """
     if x_tensor.ndim != 2:
         raise ValueError("x_tensor must be rank 2")
+    dropout_ratio = normalize_dropout_ratio(dropout_ratio)
     n, d = x_tensor.shape
     with torch.cuda.device(x_tensor.device), allocation_context(stream, x_tensor.device):
         y_tensor = torch.empty((n, 3 * d), dtype=x_tensor.dtype, device=x_tensor.device)
@@ -117,7 +121,7 @@ def hstu_lmsd_forward(
         seed=seed,
         current_stream=stream,
     )
-    setattr(mask_tensor, _MASK_DROPOUT_RATIO_ATTR, float(dropout_ratio))
+    setattr(mask_tensor, _MASK_DROPOUT_RATIO_ATTR, dropout_ratio)
     return TupleDict(
         y_tensor=y_tensor,
         mean_tensor=mean_tensor,

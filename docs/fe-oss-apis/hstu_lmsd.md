@@ -71,7 +71,7 @@ from cudnn import (
 | Rows (`N`) | `1 <= N <= 4,194,304` |
 | Hidden dimension (`D`) | `512` only |
 | `eps` | Positive and finite |
-| `dropout_ratio` | Finite and in `[0, 1)` |
+| `dropout_ratio` | Finite and remains in `[0, 1)` after FP32 conversion |
 
 All tensors must be CUDA tensors on the same device and have 16-byte-aligned
 storage. Output tensors and backward workspaces must not overlap inputs or one

@@ -62,7 +62,7 @@ def _desc(shape, dtype, *, stride=None, name=""):
     )
 
 
-def _metadata_only_apis(*, n=37, d=512, dtype=torch.bfloat16, x_stride=None):
+def _metadata_only_apis(*, n=37, d=512, dtype=torch.bfloat16, x_stride=None, dropout_ratio=0.1):
     """Construct both APIs exclusively from TensorDesc metadata."""
     x = _desc((n, d), dtype, stride=x_stride, name="x")
     u = _desc((n, d), dtype, stride=(4 * d, 1), name="u")
@@ -79,7 +79,7 @@ def _metadata_only_apis(*, n=37, d=512, dtype=torch.bfloat16, x_stride=None):
         sample_rstd=_desc((n,), torch.float32, name="rstd"),
         sample_mask=_desc((n, d), torch.int8, name="mask"),
         eps=1e-6,
-        dropout_ratio=0.1,
+        dropout_ratio=dropout_ratio,
     )
     bwd = HSTULMSDBwdSm100(
         sample_dy=_desc((n, 3 * d), dtype, name="dy"),
@@ -96,7 +96,7 @@ def _metadata_only_apis(*, n=37, d=512, dtype=torch.bfloat16, x_stride=None):
         sample_dbias=_desc((d,), dtype, name="dbias"),
         sample_dweight_workspace=_desc((TARGET_TILES, d), torch.float32, name="dweight_workspace"),
         sample_dbias_workspace=_desc((TARGET_TILES, d), torch.float32, name="dbias_workspace"),
-        dropout_ratio=0.1,
+        dropout_ratio=dropout_ratio,
     )
     return fwd, bwd
 
@@ -127,6 +127,46 @@ def test_metadata_only_check_support_rejects_invalid_contracts(api_index, overri
     api = _metadata_only_apis(**overrides)[api_index]
     with pytest.raises(ValueError, match=match):
         api.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="HSTU LMSD requires SM10x")
+@pytest.mark.parametrize("api_index", (0, 1), ids=("forward", "backward"))
+@pytest.mark.parametrize(
+    "dropout_ratio,match",
+    (
+        (-0.1, "finite and in"),
+        (1.0, "finite and in"),
+        (float("inf"), "finite and in"),
+        (float("nan"), "finite and in"),
+        (0.99999999, "after float32 conversion"),
+    ),
+    ids=("negative", "one", "infinity", "nan", "rounds-to-one-f32"),
+)
+def test_metadata_only_check_support_rejects_invalid_dropout(api_index, dropout_ratio, match):
+    api = _metadata_only_apis(dropout_ratio=dropout_ratio)[api_index]
+    with pytest.raises(ValueError, match=match):
+        api.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="HSTU LMSD requires SM10x")
+def test_metadata_only_check_support_normalizes_dropout_to_float32():
+    dropout_ratio = 0.99999994
+    expected = torch.tensor(dropout_ratio, dtype=torch.float32).item()
+    fwd, bwd = _metadata_only_apis(dropout_ratio=dropout_ratio)
+    for api in (fwd, bwd):
+        assert api.check_support() is True
+        assert api.dropout_ratio == expected
+    assert 0 <= fwd._threshold < (1 << 32)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="HSTU LMSD requires SM10x")
+def test_forward_wrapper_rejects_dropout_that_rounds_to_one():
+    x, u, weight, bias = _inputs(n=1)
+    with pytest.raises(ValueError, match="after float32 conversion"):
+        hstu_lmsd_forward(x, u, weight, bias, dropout_ratio=0.99999999)
 
 
 @pytest.mark.L0

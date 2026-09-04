@@ -17,7 +17,7 @@ import torch
 from cudnn.api_base import APIBase, TensorDesc
 
 from ._runtime import record_streams, stream_handle
-from .cutedsl._common import ALIGNMENT_BYTES, keep_threshold32
+from .cutedsl._common import ALIGNMENT_BYTES, keep_threshold32, normalize_dropout_ratio
 from .cutedsl.cute_dsl_ln_mul_dropout import LnMulDropoutForward
 from .cutedsl.cute_dsl_ln_mul_dropout_bwd import (
     MAX_NUM_ROWS,
@@ -150,8 +150,7 @@ class _HSTULMSDBase(APIBase):
         _require_matrix_layout(u, "u")
         _require_vector(weight, "weight", self.hidden_size)
         _require_vector(bias, "bias", self.hidden_size)
-        if not math.isfinite(self.dropout_ratio) or not (0.0 <= self.dropout_ratio < 1.0):
-            raise ValueError("dropout_ratio must be finite and in [0, 1), got " f"{self.dropout_ratio}")
+        self.dropout_ratio = normalize_dropout_ratio(self.dropout_ratio)
         major, minor = torch.cuda.get_device_capability(x.device)
         if major != 10:
             raise RuntimeError(f"HSTU LMSD requires an SM10x GPU; found SM{major}{minor}")
@@ -222,12 +221,12 @@ class HSTULMSDFwdSm100(_HSTULMSDBase):
         self.rstd_desc = self._make_tensor_desc(sample_rstd, name="rstd")
         self.mask_desc = self._make_tensor_desc(sample_mask, name="mask")
         self.eps = float(eps)
-        self._threshold = keep_threshold32(self.dropout_ratio)
 
     def check_support(self) -> bool:
         if self._is_supported:
             return True
         self._check_common()
+        self._threshold = keep_threshold32(self.dropout_ratio)
         n, d = self.num_rows, self.hidden_size
         y = self.y_desc
         mean = self.mean_desc
