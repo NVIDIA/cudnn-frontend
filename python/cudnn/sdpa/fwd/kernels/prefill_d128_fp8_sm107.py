@@ -201,6 +201,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_sm100 import (
     make_split_helpers,
+    store_fp32_partial_tile as _store_fp32_partial_tile,
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -288,6 +289,8 @@ _split_h = make_split_helpers(
     dispatch_decode_payload=_dispatch_decode_payload,
 )
 SPLIT_KV = _split_h.SPLIT_KV
+# fp32 partials replace the SMEM/TMA O path under a split rather than widening it.
+_FP32_PARTIALS = bool(PARAMS.fp32_partials) and SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
@@ -389,6 +392,7 @@ def _kernel(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
+    o_partial_f32: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -601,6 +605,7 @@ def _kernel(
             o_scale_fused=o_scale_fused,
             amax_o_tensor=amax_o_tensor,
             qh_per_kh=qh_per_kh,
+            o_partial_f32=o_partial_f32,
         )
 
     # cga2 non-leader runs quiet body (alloc+dealloc only); cga1 folds to full path.
@@ -1012,6 +1017,10 @@ def _tmastg_warp_group(
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             bars.mb_o_full[qs].wait(o_full_phase)
+            # fp32 partials bypass SMEM: nothing was staged here to move.
+            if cutlass.const_expr(_FP32_PARTIALS):
+                bars.mb_o_empty[qs].arrive()
+                continue
 
             # O TMA params follow O's swizzle, not V's (V and O swizzles may differ).
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1893,6 +1902,7 @@ def _correction_warp_group(
     o_scale_fused,
     amax_o_tensor,
     qh_per_kh,
+    o_partial_f32=None,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -2133,109 +2143,126 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
-            if cutlass.const_expr(CFG.DTYPE_O <= 1):
-                # FP8 output (DTYPE_O ∈ {0,1}): hand-rolled 16:4 fp8 pack +
-                # STS.128 — forces F2FP outputs into a register quad so STS.128
-                # needs no PRMT to gather them (vs the DSL store_swizzled which
-                # folds the swizzle XOR via byte-level PRMT).  Bit-identical to
-                # the DTYPE_O == DTYPE_QKV path.
-                _SWZ_BYTES_C = CFG.O_SWZ_BYTES
-                _SWZ_SHIFT_C = 3 - _O_SWZ_B
-                _SWZ_MASK_C = (1 << _O_SWZ_B) - 1
-                _SUBTILE_BYTES_C = CFG.TILE_M * _SWZ_BYTES_C
-
-                row_base_bytes = tid_in_wg * cutlass.Int32(_SWZ_BYTES_C)
-                row_xor_field = ((tid_in_wg >> cutlass.Int32(_SWZ_SHIFT_C)) & cutlass.Int32(_SWZ_MASK_C)) << cutlass.Int32(4)
-
-                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                    o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
-                    o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                        num=O_CHUNK,
-                    )
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    o_scaled = o_chunk * inv_sum
-                    # Dead-row sanitize: an empty mainloop never writes O TMEM,
-                    # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
-                    # cannot zero it — select 0 explicitly (keeps amax_o clean).
-                    _zero_f = cutlass.Float32(0.0)
-                    o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
-
-                    for _i in cutlass.range_constexpr(O_CHUNK):
-                        _e = o_elems[_i]
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
-
-                    # Plain range (not range_constexpr) — extraction at Python trace time.
-                    o_packed_v = fp32_to_fp8_pack(
-                        [o_elems[i] for i in range(16)],
-                        dtype=OUT_STORAGE_DTYPE,
-                    )
-
-                    col_elems = chunk_idx * O_CHUNK
-                    block_idx = col_elems // D_BLOCK_SIZE
-                    col_in_block_bytes = (col_elems % D_BLOCK_SIZE) * CFG.BPE_O
-                    block_off_bytes = block_idx * _SUBTILE_BYTES_C
-
-                    swizzled_in_row = row_xor_field ^ cutlass.Int32(col_in_block_bytes)
-                    addr_off_bytes = cutlass.Int32(block_off_bytes) + row_base_bytes + swizzled_in_row
-
-                    # Re-type pointer to Int32 so 4-i32 store maps to one st.shared.v4.b32.
-                    fp8_ptr = sO_sub_base.subview(addr_off_bytes).data_ptr()
-                    i32_ptr = Pointer(fp8_ptr, dtype=cutlass.Int32)
-                    if chunk_idx == 0:
-                        bars.mb_o_empty[qs].wait(o_empty_phase)
-                    i32_ptr.store(o_packed_v, alignment=16)
+            if cutlass.const_expr(_FP32_PARTIALS):
+                # fp32 partials: the accumulator goes straight to the workspace,
+                # bypassing the SMEM O tile and its TMA store.
+                _store_fp32_partial_tile(
+                    o_partial_f32,
+                    tmem_base_epi,
+                    tmem_O_off,
+                    inv_sum,
+                    _row_valid,
+                    _partial_batch(batch_idx, split_idx, n_batch),
+                    q_row_global,
+                    row_head_idx,
+                    CFG.TILE_O,
+                )
+                bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
-                # BF16 / FP16 output (DTYPE_O ∈ {2,3}): the 16:4 fp8 pack does
-                # not apply — cast fp32 → OUT_STORAGE_DTYPE and swizzled-store,
-                # matching the BPE_O-sized TMA-O box.  Mirrors the dsv4 d512 fp8
-                # generic epilogue (prefill_sdpa_d512_fp8.py).
-                O_EPI_BLOCK_SIZE = 64 // CFG.BPE_O  # 32 elems (half-out)
-                O_D_BLOCK = CFG.O_SWZ_BYTES // CFG.BPE_O  # TMA chunk elems
-                O_TMA_GRANU_ELEMS = CFG.TILE_M * O_D_BLOCK
-                for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):
-                    o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + b * O_EPI_BLOCK_SIZE)
-                    o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                        num=O_EPI_BLOCK_SIZE,
-                    )
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    o_scaled_h = o_chunk * inv_sum
-                    # Dead-row sanitize — see the fp8-pack path above.
-                    _zero_f = cutlass.Float32(0.0)
-                    o_scaled_h = cutlass.Vector.from_elements(
-                        tuple(
-                            cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled_h[i].ir_value())) for i in range(O_EPI_BLOCK_SIZE)
-                        ),
-                        cutlass.Float32,
-                    )
-                    for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
-                        _e = o_scaled_h[_i]
-                        _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
-                    o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.DTYPE_O <= 1):
+                    # FP8 output (DTYPE_O ∈ {0,1}): hand-rolled 16:4 fp8 pack +
+                    # STS.128 — forces F2FP outputs into a register quad so STS.128
+                    # needs no PRMT to gather them (vs the DSL store_swizzled which
+                    # folds the swizzle XOR via byte-level PRMT).  Bit-identical to
+                    # the DTYPE_O == DTYPE_QKV path.
+                    _SWZ_BYTES_C = CFG.O_SWZ_BYTES
+                    _SWZ_SHIFT_C = 3 - _O_SWZ_B
+                    _SWZ_MASK_C = (1 << _O_SWZ_B) - 1
+                    _SUBTILE_BYTES_C = CFG.TILE_M * _SWZ_BYTES_C
 
-                    col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
-                    block_idx_const = (b * O_EPI_BLOCK_SIZE) // O_D_BLOCK
-                    block_offset_const = block_idx_const * O_TMA_GRANU_ELEMS
-                    smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(O_D_BLOCK)
-                    smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
-                    if b == 0:
-                        bars.mb_o_empty[qs].wait(o_empty_phase)
-                    smem_ptr.store_swizzled(o_half, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                    row_base_bytes = tid_in_wg * cutlass.Int32(_SWZ_BYTES_C)
+                    row_xor_field = ((tid_in_wg >> cutlass.Int32(_SWZ_SHIFT_C)) & cutlass.Int32(_SWZ_MASK_C)) << cutlass.Int32(4)
 
-            # Under KV split this epilogue sees only its OWN partial, and the
-            # recombined O is a convex combination of the partials -- so a max
-            # over partials over-reports the output amax (~2.9x at 8 splits).
-            # split_combine_sm100 computes it over the recombined O instead;
-            # this write has to stay out of the way, since atomicMax only grows.
-            if cutlass.const_expr(SPLIT_KV == 1):
-                if _row_valid:
-                    nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
+                    for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_CHUNK,
+                        )
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        o_scaled = o_chunk * inv_sum
+                        # Dead-row sanitize: an empty mainloop never writes O TMEM,
+                        # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
+                        # cannot zero it — select 0 explicitly (keeps amax_o clean).
+                        _zero_f = cutlass.Float32(0.0)
+                        o_elems = [cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)]
 
-            # fence_proxy needed before TMA reads SMEM written by stores above.
-            nvvm.fence_proxy("async.shared", space="cta")
+                        for _i in cutlass.range_constexpr(O_CHUNK):
+                            _e = o_elems[_i]
+                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+
+                        # Plain range (not range_constexpr) — extraction at Python trace time.
+                        o_packed_v = fp32_to_fp8_pack(
+                            [o_elems[i] for i in range(16)],
+                            dtype=OUT_STORAGE_DTYPE,
+                        )
+
+                        col_elems = chunk_idx * O_CHUNK
+                        block_idx = col_elems // D_BLOCK_SIZE
+                        col_in_block_bytes = (col_elems % D_BLOCK_SIZE) * CFG.BPE_O
+                        block_off_bytes = block_idx * _SUBTILE_BYTES_C
+
+                        swizzled_in_row = row_xor_field ^ cutlass.Int32(col_in_block_bytes)
+                        addr_off_bytes = cutlass.Int32(block_off_bytes) + row_base_bytes + swizzled_in_row
+
+                        # Re-type pointer to Int32 so 4-i32 store maps to one st.shared.v4.b32.
+                        fp8_ptr = sO_sub_base.subview(addr_off_bytes).data_ptr()
+                        i32_ptr = Pointer(fp8_ptr, dtype=cutlass.Int32)
+                        if chunk_idx == 0:
+                            bars.mb_o_empty[qs].wait(o_empty_phase)
+                        i32_ptr.store(o_packed_v, alignment=16)
+                else:
+                    # BF16 / FP16 output (DTYPE_O ∈ {2,3}): the 16:4 fp8 pack does
+                    # not apply — cast fp32 → OUT_STORAGE_DTYPE and swizzled-store,
+                    # matching the BPE_O-sized TMA-O box.  Mirrors the dsv4 d512 fp8
+                    # generic epilogue (prefill_sdpa_d512_fp8.py).
+                    O_EPI_BLOCK_SIZE = 64 // CFG.BPE_O  # 32 elems (half-out)
+                    O_D_BLOCK = CFG.O_SWZ_BYTES // CFG.BPE_O  # TMA chunk elems
+                    O_TMA_GRANU_ELEMS = CFG.TILE_M * O_D_BLOCK
+                    for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):
+                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + b * O_EPI_BLOCK_SIZE)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_EPI_BLOCK_SIZE,
+                        )
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        o_scaled_h = o_chunk * inv_sum
+                        # Dead-row sanitize — see the fp8-pack path above.
+                        _zero_f = cutlass.Float32(0.0)
+                        o_scaled_h = cutlass.Vector.from_elements(
+                            tuple(
+                                cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled_h[i].ir_value()))
+                                for i in range(O_EPI_BLOCK_SIZE)
+                            ),
+                            cutlass.Float32,
+                        )
+                        for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
+                            _e = o_scaled_h[_i]
+                            _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                        o_half = o_scaled_h.to(OUT_STORAGE_DTYPE)
+
+                        col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
+                        block_idx_const = (b * O_EPI_BLOCK_SIZE) // O_D_BLOCK
+                        block_offset_const = block_idx_const * O_TMA_GRANU_ELEMS
+                        smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(O_D_BLOCK)
+                        smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
+                        if b == 0:
+                            bars.mb_o_empty[qs].wait(o_empty_phase)
+                        smem_ptr.store_swizzled(o_half, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+
+                # Under KV split this epilogue sees only its OWN partial, and the
+                # recombined O is a convex combination of the partials -- so a max
+                # over partials over-reports the output amax (~2.9x at 8 splits).
+                # split_combine_sm100 computes it over the recombined O instead;
+                # this write has to stay out of the way, since atomicMax only grows.
+                if cutlass.const_expr(SPLIT_KV == 1):
+                    if _row_valid:
+                        nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
+
+                # fence_proxy needed before TMA reads SMEM written by stores above.
+                nvvm.fence_proxy("async.shared", space="cta")
 
             bars.mb_o_full[qs].arrive()
 
@@ -2306,6 +2333,7 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2352,9 +2380,14 @@ def _host(
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+    # Unused under fp32 partials, but it must still BUILD: an fp32 element
+    # doubles the box's inner byte width past what the O swizzle allows.
+    _o_box = list(vo_box_o)
+    if _FP32_PARTIALS:
+        _o_box[-1] = max(1, _o_box[-1] // 2)
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
-        box_dims=vo_box_o,
+        box_dims=tuple(_o_box),
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.O_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
@@ -2434,6 +2467,7 @@ def _host(
         descale_v_t,
         scale_o_t,
         amax_o_tensor,
+        o_partial_f32,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2520,7 +2554,7 @@ def compile(  # noqa: A001
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
-        OUT_STORAGE_DTYPE,
+        cutlass.Float32 if _FP32_PARTIALS else OUT_STORAGE_DTYPE,
         (_o_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
@@ -2647,6 +2681,7 @@ def compile(  # noqa: A001
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

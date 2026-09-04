@@ -1970,7 +1970,6 @@ def _correction_warp_group(
                     tmem_base_epi,
                     tmem_O_off,
                     inv_sum,
-                    row_dead,
                     _row_valid,
                     _partial_batch(batch_idx, split_idx, n_batch),
                     q_row_global,
@@ -2144,7 +2143,6 @@ def _host(
     descale_v_t: cute.Tensor,
     scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
-    o_partial_f32: Optional[cute.Tensor] = None,
     # THD device metadata build (issue #552): the CALLER's Q/KV length
     # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
     # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) — consumed only by the
@@ -2154,6 +2152,7 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    o_partial_f32: Optional[cute.Tensor] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2500,12 +2499,12 @@ def compile(  # noqa: A001
         _fake_scale(),
         _fake_scale(),
         fake_amax_o,
-        # o_partial_f32 exists in the ABI only when the mode is on, so the
-        # traced signature matches what the adapter passes.
-        *((fake_o,) if _FP32_PARTIALS else ()),
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
+        # o_partial_f32 is LAST so the THD tensors keep their slots when the
+        # mode is off -- a mid-signature slot shifts them by one.
+        *((fake_o,) if _FP32_PARTIALS else ()),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

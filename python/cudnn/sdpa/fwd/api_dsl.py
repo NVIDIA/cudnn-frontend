@@ -2217,6 +2217,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(0),
             *dense_q_lens_args,
+            **({"o_partial_f32": O_dst} if self._fp32_partial_split() else {}),
             stream=current_stream,
         )
         if self.split_kv > 1:
@@ -2398,11 +2399,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dv_t,
             so_kernel,
             amax_o_buf,
-            # o_partial_f32: the SAME split workspace, written directly by the
-            # epilogue under fp32 partials.  Only the d128 kernel carries this
-            # slot, so it is appended only when the mode is on.
-            *((O_dst,) if self._fp32_partial_split() else ()),
             *dense_q_lens_args,
+            **({"o_partial_f32": O_dst} if self._fp32_partial_split() else {}),
             stream=current_stream,
         )
         if self.split_kv > 1:

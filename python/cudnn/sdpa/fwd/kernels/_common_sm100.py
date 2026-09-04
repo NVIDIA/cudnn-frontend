@@ -334,7 +334,6 @@ def store_fp32_partial_tile(
     tmem_base,
     tmem_o_off,
     inv_sum,
-    row_dead,
     row_valid,
     o_batch,
     q_row_global,
@@ -350,8 +349,10 @@ def store_fp32_partial_tile(
     therefore the SMEM budget -- is untouched.  Shared by every flavor whose
     epilogue holds its O accumulator in TMEM.
 
-    ``row_dead`` reproduces the staged path's sanitize: an empty mainloop never
-    wrote O TMEM, so the load returns garbage that must not reach the combine.
+    Dead rows need no separate guard: every caller has already folded the
+    empty-mainloop case into ``inv_sum`` (it is selected to 0.0 there), so the
+    garbage a dead row loads from O TMEM is multiplied out to zero -- the same
+    thing the staged path relies on.
     """
     op = cutlass.make_array_view(o_partial_f32)
     for blk in cutlass.range_constexpr(tile_o // chunk):
@@ -362,9 +363,7 @@ def store_fp32_partial_tile(
         if row_valid:
             row_out = op[o_batch, q_row_global, row_head_idx, :]
             for j in cutlass.range_constexpr(chunk):
-                row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
-                    arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
-                )
+                row_out[cutlass.Int32(blk * chunk + j)] = scaled[j]
 
 
 class SplitHelpers(NamedTuple):
