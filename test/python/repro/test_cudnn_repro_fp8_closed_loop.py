@@ -7,6 +7,8 @@ import pytest
 
 from .test_cudnn_repro_closed_loop import _assert_reproducer_json_matches_target
 
+pytestmark = pytest.mark.L1
+
 
 def _target_test_id(target):
     return target.split("::", 1)[-1]
