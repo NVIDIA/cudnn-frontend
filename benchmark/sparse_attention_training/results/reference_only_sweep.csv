@@ -1,0 +1,10 @@
+variant,seqlen,h_q,h_kv,d_k,d_v,granularity,topk,group_scope,dtype,backend,ms,tflops,flops,note
+csa-dsv4-1024,4096,64,1,512,512,4,1024,1,bfloat16,reference,4721.7578,0.23,1100585369600,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+csa-dsv4-1024,8192,64,1,512,512,4,1024,1,bfloat16,reference,11151.8932,0.3,3299608625152,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+csa-dsv4-1024,16384,64,1,512,512,4,1024,1,bfloat16,reference,19854.0716,0.39,7697655136256,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+csa-dsv4-512,4096,64,1,512,512,4,512,1,bfloat16,reference,2382.7432,0.35,825170591744,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+csa-dsv4-512,8192,64,1,512,512,4,512,1,bfloat16,reference,4542.958,0.42,1924682219520,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+csa-dsv4-512,16384,64,1,512,512,4,512,1,bfloat16,reference,9709.9648,0.42,4123705475072,compressed-entries only; window/ExtraKV union not benchmarked (contract gap)
+qwen3.8,4096,24,2,256,256,4,512,1,bfloat16,reference,838.2249,0.18,154719485952,"shared indices (issue-literal); group_scope=1 != H_kv, no GQA-substrate match"
+qwen3.8,8192,24,2,256,256,4,512,1,bfloat16,reference,1651.9142,0.22,360877916160,"shared indices (issue-literal); group_scope=1 != H_kv, no GQA-substrate match"
+qwen3.8,16384,24,2,256,256,4,512,1,bfloat16,reference,3461.3717,0.22,773194776576,"shared indices (issue-literal); group_scope=1 != H_kv, no GQA-substrate match"
