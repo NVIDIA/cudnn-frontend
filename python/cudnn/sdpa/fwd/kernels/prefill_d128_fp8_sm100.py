@@ -433,7 +433,7 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
-    # Phase four cluster fence — gates cga2 cross-CTA arrives on peer init.
+    # P4 cluster fence — gates cga2 cross-CTA arrives on peer init.
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         cga_arrive()
         cga_wait()
