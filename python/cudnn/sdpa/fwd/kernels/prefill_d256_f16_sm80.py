@@ -92,10 +92,10 @@ def from_dlpack(t, **kw):
     conversions must produce TVM-FFI tensors regardless of the
     CUTE_DSL_ENABLE_TVM_FFI environment latch."""
     kw.setdefault("enable_tvm_ffi", True)
-    return _from_dlpack_raw(t, **kw)  # was from_dlpack pre-DKG-bump
+    return _from_dlpack_raw(t, **kw)  # was from_dlpack pre-DSL-bump
 
 
-from cutlass.base_dsl.typing import Pointer  # was the DSL's Pointer pre-DKG-bump
+from cutlass.base_dsl.typing import Pointer  # was the DSL's Pointer pre-DSL-bump
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass._mlir.dialects import arith
@@ -1064,7 +1064,7 @@ def _sdpa_kernel(
         # exp2 to P → reduce sum → update l_state → pack P→half2 in regs.
         # All scaling via ``softmax_scale_log2`` is folded into the exp2
         # input late (so the row_max state stays un-scaled), matching the
-        # DKG blackwell_geforce FMHA reference convention.
+        # DSL blackwell_geforce FMHA reference convention.
 
         # Per m_block: each warp owns 2 m16-row blocks worth of softmax
         # state.  Run the full max/butterfly/α-rescale/exp/pack pipeline

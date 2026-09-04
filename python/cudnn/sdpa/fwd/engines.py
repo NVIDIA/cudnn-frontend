@@ -217,7 +217,7 @@ class Capabilities:
     decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
-    # numerically broken: eligible only when the whole grid fits in one wave
+    # numerically invalid: eligible only when the whole grid fits in one wave
     # (B*H_q*ceil(S_q/512) <= SM_count / CTA_MMA). NO CURRENT ROW SETS THIS.
     # Historical user: the fp8 d128 row, whose multi-wave wrong-O bug (14-19%
     # mismatched elements, some tiles left unwritten NaN) was root-caused to
@@ -534,7 +534,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if clusters > resident:
             return (
                 f"launch needs {clusters} Q-tile clusters but only {resident} fit in one wave; "
-                "the fp8 kernel's persistent multi-wave rescheduling is numerically broken (gated)"
+                "the fp8 kernel's persistent multi-wave rescheduling is numerically invalid (gated)"
             )
 
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:

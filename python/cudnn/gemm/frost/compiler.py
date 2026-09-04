@@ -3785,7 +3785,7 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     if config.split_k_slices == 1:
         return None
     reasons = []
-    # FIXME: only support sm100 currently.
+    # TODO: only support sm100 currently.
     if config.pipeline != "sm100":
         reasons.append(f"the {config.pipeline!r} pipeline (sm100 only)")
     if chain.has_moe:

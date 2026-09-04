@@ -961,7 +961,7 @@ def test_grouped_gemm_dsrelu_deterministic_at_scale(request):
 
     Measured (job 466159, 16 launches per config): at l=4 / [256] * 4 / n=512 -- what every other
     determinism test here uses -- the non-deterministic dprob AND dbias are both already bit-stable,
-    so those tests cannot distinguish a working fix from a broken one. At l=8 / [1024] * 8 / n=2048
+    so those tests cannot distinguish a working fix from an invalid one. At l=8 / [1024] * 8 / n=2048
     both vary 15/15. This is the case that actually demonstrates the flag does something.
 
     L1 rather than L0: it is roughly 16x the work of the smoke configs.

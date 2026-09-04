@@ -51,8 +51,8 @@ def _imported_by(code: str) -> set:
     return _modules(code) - _modules("")
 
 
-def _assert_absent(mods: set, stage: str) -> None:
-    present = sorted(m for m in _HEAVY if m in mods)
+def _assert_absent(module_names: set, stage: str) -> None:
+    present = sorted(m for m in _HEAVY if m in module_names)
     assert not present, f"{stage} imported {present}; it must not"
 
 

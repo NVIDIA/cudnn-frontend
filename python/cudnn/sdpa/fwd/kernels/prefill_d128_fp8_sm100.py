@@ -41,7 +41,7 @@ from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
 
-from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DKG-bump
+from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DSL-bump
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass.experimental.cuda import tensor_map as tmap
@@ -433,7 +433,7 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
-    # P4 cluster fence — gates cga2 cross-CTA arrives on peer init.
+    # Phase four cluster fence — gates cga2 cross-CTA arrives on peer init.
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         cga_arrive()
         cga_wait()

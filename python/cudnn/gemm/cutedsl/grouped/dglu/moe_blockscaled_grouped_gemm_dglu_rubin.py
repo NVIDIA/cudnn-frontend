@@ -3031,7 +3031,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                     # SFD Row: tile_atom_to_shape_SF layout, same path as SFA
                     real_sfd_row, _ = epi_ext.get_gmem_tensor("sfd", mSFDRow_mnl, padded_offsets, epi_work_tile_info)
                     gSFDRow_mnl = cute.local_tile(real_sfd_row, sfd_row_tile, (None, None, None))
-                    # Don't ask why, AST is shit tracking the constexpr values to loop args.
+                    # AST has trouble tracking the constexpr values to loop args.
                     tiled_copy_t2r_local, _, _ = self.epilog_tmem_copy_and_partition(epi_tidx, tCtAcc_epi_input, tCgD_epi_input, epi_tile, use_2cta_instrs)
                     thr_copy_t2r_local = tiled_copy_t2r_local.get_slice(tidx)
                     tCgSFDRow_mnl = thr_copy_t2r_local.partition_D(gSFDRow_mnl)
