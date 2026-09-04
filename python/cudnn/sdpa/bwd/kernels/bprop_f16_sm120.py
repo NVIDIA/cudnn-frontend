@@ -1404,7 +1404,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         else:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
-    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=False)
 
     @cute.jit
     def __call__(
