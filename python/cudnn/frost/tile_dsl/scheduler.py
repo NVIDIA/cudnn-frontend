@@ -98,7 +98,12 @@ def read_tile_id_arrive(mb, cga_size: int):
             target_lane = i * lane_stride
             if lane == cutlass.Int32(target_lane):
                 peer_mb = nvvm.mapa(mb, cutlass.Int32(i))
-                nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                # RELEASE (not relaxed) arrive: this signal is the credit that
+                # lets the scheduler refill the very slot this warp decodes, so
+                # the payload loads must be ordered-before the arrive becomes
+                # visible.  A relaxed arrive imposes no such order and lets the
+                # refill race a still-in-flight decode.
+                nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER)
 
 
 class Sched(NamedTuple):
@@ -108,6 +113,39 @@ class Sched(NamedTuple):
     bidx_init: object
     bidy_init: object
     bidz_init: object
+
+
+@cute.jit
+def read_clc_payload(sched, base_word):
+    """Decode one scheduler response slot with a SINGLE atomic 128-bit load.
+
+    Mirrors the canonical ``cute.arch.clc_response`` decode (one vector load
+    plus register extracts) instead of three independent 32-bit loads.  With
+    three loads a consumer holds a partially-decoded slot across two of them,
+    and the credit that permits the scheduler to refill that slot
+    (``mb_read_tile_id``) is arrived at the TOP of the same loop iteration --
+    so a refill landing mid-decode could mix word 0 of response N with word 1
+    of response N+1 and yield a tile that was never handed out.  One
+    indivisible load removes the partial-decode state entirely.
+
+    The trailing cross-proxy fence orders this generic-proxy read before the
+    scheduler's NEXT async-proxy write into the slot, which is the DSL's
+    documented requirement (see the ``insert_fence`` note in
+    ``dynamic_persistent_tile_scheduler.py``).
+
+    ``base_word`` is the Int32 index of the slot's word 0 -- i.e. the same
+    expression the raw loads used to subview.  It is taken directly rather
+    than derived from a stage index because the per-stage stride is not
+    uniform: the predecode kernels size ``tile_id_smem`` by
+    ``SCHED_PAYLOAD_WORDS`` (8, 12 or 16) to carry decoded fields after the
+    16-byte response.  Every such stride is a multiple of 4 words, so a slot
+    base is always 16-byte aligned and the vector load is legal.
+
+    Returns ``(first_ctaid_x, first_ctaid_y, is_valid)`` with is_valid 0/1.
+    """
+    vec = sched.tile_id_smem.load(base_word, vector_size=4, alignment=16)
+    nvvm.fence_proxy("async.shared", space="cta")
+    return vec[0], vec[1], vec[2] & cutlass.Int32(1)
 
 
 @cute.jit
@@ -187,24 +225,33 @@ def scheduler_warp_loop_persistent(
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
-        validity = (sched.tile_id_smem.subview(state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
-        is_valid = validity & cutlass.Int32(1)
+        _m, _n, is_valid = read_clc_payload(sched, state.idx * cutlass.Int32(8))
 
         state = advance(state, sched_stages)
 
 
 @cute.jit
-def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta):
+def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta, cga_size: int = 1):
     state = PipelineState.start()
     is_valid = cutlass.Int32(1)
 
     while is_valid > cutlass.Int32(0):
         wait(sched.mb_read_tile_id.subview(state.idx), state.phase)
 
-        if nvvm.elect_sync():
-            arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
-
+        # Canonical CLC ordering (CUTLASS PipelineClcFetchAsync): the FIRST
+        # CTA's scheduler warp arms arrive+expect_tx(16) on EVERY CTA's
+        # barrier, program-ordered BEFORE it issues the multicast try_cancel.
+        # Arming per-CTA locally instead leaves a peer's expect_tx unordered
+        # against the leader's issue -- both CTAs leave the mb_read_tile_id
+        # wait independently, so the multicast response's complete-tx can
+        # reach a peer barrier that has not been armed for this phase yet.
         if nvvm.elect_sync() and is_cga_first_cta:
+            for i in cutlass.range_constexpr(cga_size):
+                if cutlass.const_expr(i == 0):
+                    arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+                else:
+                    peer_mb = nvvm.mapa(sched.mb_scheduler.subview(state.idx), cutlass.Int32(i))
+                    nvvm.mbarrier_arrive_expect_tx(peer_mb, 16, scope=nvvm.MemScope.CLUSTER)
             nvvm.clusterlaunchcontrol_try_cancel(
                 sched.tile_id_smem.subview(state.idx * cutlass.Int32(8)),
                 sched.mb_scheduler.subview(state.idx),
@@ -214,7 +261,6 @@ def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta):
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
-        validity = (sched.tile_id_smem.subview(state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
-        is_valid = validity & cutlass.Int32(1)
+        _m, _n, is_valid = read_clc_payload(sched, state.idx * cutlass.Int32(8))
 
         state = advance(state, sched_stages)
