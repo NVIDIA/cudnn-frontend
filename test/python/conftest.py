@@ -219,10 +219,6 @@ def cudnn_handle():
 
 
 # =================== PyTest Hooks =====================
-# (pytest_load_initial_conftests is not called for conftest.py files -- pluggy
-# snapshots the hook impls before conftests are registered -- so the --tb=short
-# / --no-header defaults it used to set live in pytest.ini addopts instead.)
-
 
 def pytest_configure(config):
     global _xdist_controller, _stderr_fd
