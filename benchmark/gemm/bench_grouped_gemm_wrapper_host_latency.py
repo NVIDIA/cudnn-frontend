@@ -45,14 +45,14 @@ def make_buffers(tensor_m):
     group = VALID_M // EXPERTS
     offsets = torch.arange(group, VALID_M + 1, group, dtype=torch.int32, device=dev)
     return dict(
-        a=fp8(tensor_m, K, 1),
+        a=fp8(1, tensor_m, K).permute(1, 2, 0),
         sfa=sf6d(tensor_m, K, 1),
         b=fp8(EXPERTS, N, K).permute(1, 2, 0),
         sfb=sf6d(N, K, EXPERTS),
-        # dglu: grad (m, n/2) against the fwd activations c (m, n); wgrad: (hidden, tokens) x (tokens, inter)
-        grad=fp8(tensor_m, N // 2, 1),
-        sfgrad=sf6d(tensor_m, N // 2, 1),
-        c=torch.randn(tensor_m, N, 1, dtype=torch.bfloat16, device=dev),
+        # dglu: grad (m, k) x weight (n/2, k, l) against the fwd activations c (m, n); wgrad: (hidden, tokens) x (tokens, inter)
+        grad=fp8(1, tensor_m, K).permute(1, 2, 0),
+        sfgrad=sf6d(tensor_m, K, 1),
+        c=torch.randn(1, tensor_m, N, dtype=torch.bfloat16, device=dev).permute(1, 2, 0),
         b_half=fp8(EXPERTS, N // 2, K).permute(1, 2, 0),
         sfb_half=sf6d(N // 2, K, EXPERTS),
         wg_a=fp8(K, tensor_m),
