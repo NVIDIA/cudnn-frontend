@@ -33,7 +33,7 @@ FLOPs = 2 * S_q * H * topk * (3 * d_qk + 2 * d_v)
 - PyTorch with CUDA support
 - `pip install nvidia-cudnn-frontend` (or a development install of
   this repository's `python/` package) -- the CuTe DSL dependencies are
-  required dependencies and come with either
+  required dependencies and come with either installation method
 
 ## How to run
 
