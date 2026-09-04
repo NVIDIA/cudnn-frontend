@@ -1132,10 +1132,185 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
     }
 };
 
-class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
+// Common base of the SDPA backward node implementations, mirroring SDPANodeBase for the forward
+// node. It owns the attributes and everything that does not depend on how the backward pass is
+// lowered: dim/stride validation and the shared support surface
+// (SDPA_backward_attributes::validate_sdpa_backward_support_surface), 1-D index tensor promotion,
+// tensor dumping and serialization. Derived nodes hook in through pre_validate_node_derived() /
+// infer_properties_node_derived() (static CRTP dispatch) and own expansion and lowering.
+template <typename DerivedT>
+class SDPABackwardNodeBase : public NodeCRTP<DerivedT> {
+   protected:
     using input_names  = SDPA_backward_attributes::input_names;
     using output_names = SDPA_backward_attributes::output_names;
 
+    // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
+    // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
+    void
+    promote_index_tensors_to_4d() {
+        // TODO: Handle CU_SEQ_LEN_Q and CU_SEQ_LEN_KV once bprop supports these.
+        for (auto& key : {input_names::SEQ_LEN_Q, input_names::SEQ_LEN_KV}) {
+            auto const it = attributes.inputs.find(key);
+            if (it != attributes.inputs.end()) {
+                promote_1d_index_tensor_to_4d(it->second);
+            }
+        }
+        for (auto& [key, value] : attributes.inputs) {
+            CUDNN_FRONTEND_UNUSED(key);
+            if (value != nullptr) {
+                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
+            }
+        }
+        for (auto& [key, value] : attributes.outputs) {
+            CUDNN_FRONTEND_UNUSED(key);
+            if (value != nullptr) {
+                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
+            }
+        }
+    }
+
+    bool
+    has_input(input_names name) const {
+        auto const it = attributes.inputs.find(name);
+        return it != attributes.inputs.end() && it->second != nullptr;
+    }
+
+    bool
+    has_output(output_names name) const {
+        auto const it = attributes.outputs.find(name);
+        return it != attributes.outputs.end() && it->second != nullptr;
+    }
+
+    // Derived-node hooks (static CRTP dispatch; a derived class shadows these as needed).
+    // pre_validate_node_derived() runs after the dim/stride checks and BEFORE the shared support
+    // surface, so a derived node may still adjust its attributes (e.g. the composite node's
+    // workaround padding mask) before they are validated.
+    error_t
+    pre_validate_node_derived() const {
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    infer_properties_node_derived() {
+        return {error_code_t::OK, ""};
+    }
+
+   public:
+    // Mutable: CompositeSDPABackwardNode edits it in pre_validate_node() (workaround padding mask,
+    // deterministic auto-routing on Blackwell).
+    mutable SDPA_backward_attributes attributes;
+
+    SDPABackwardNodeBase(SDPA_backward_attributes&& attributes_, detail::Context const& context)
+        : NodeCRTP<DerivedT>(context), attributes(std::move(attributes_)) {}
+
+    error_t
+    pre_validate_node() const override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPABackwardNode " << attributes.name);
+
+        // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
+        // check that dim and strides has been assigned and last stride is 1
+#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
+    {                                                                                                           \
+        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The dim for " + std::string(#port) + " is invalid");                    \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
+                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
+                                       "The stride for " + std::string(#port) + " is invalid");                 \
+        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
+            tensor_ptr->get_stride()[3] != 1,                                                                   \
+            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
+            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
+                std::string(#port));                                                                            \
+    }
+
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::O, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Stats, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::dO, attributes.inputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
+        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
+
+        if (attributes.has_bias()) {
+            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
+        }
+
+#undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
+
+        CHECK_CUDNN_FRONTEND_ERROR(static_cast<DerivedT const*>(this)->pre_validate_node_derived());
+
+        // validate backend limitations for the operation
+        CHECK_CUDNN_FRONTEND_ERROR(attributes.validate_sdpa_backward_support_surface(this->context));
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    infer_properties_node() override final {
+        // If a 1-D length/offset index tensor [n] is supplied, promote it to the 4-D
+        // [n, 1, 1, 1] (contiguous) form the cuDNN backend requires.
+        promote_index_tensors_to_4d();
+
+        CHECK_CUDNN_FRONTEND_ERROR(static_cast<DerivedT*>(this)->infer_properties_node_derived());
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_tensors_to_dump_node(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
+        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
+            if (tensor != nullptr) {
+                tensors_to_dump.emplace_back(tensor, 'd');
+            }
+        };
+        auto add_input = [&](input_names name) {
+            auto it = attributes.inputs.find(name);
+            if (it != attributes.inputs.end()) {
+                add_tensor(it->second);
+            }
+        };
+        auto add_input_offset = [&](input_names name) {
+            auto it = attributes.inputs.find(name);
+            if (it != attributes.inputs.end() && it->second != nullptr) {
+                add_tensor(it->second->get_ragged_offset());
+            }
+        };
+        auto add_output_offset = [&](output_names name) {
+            auto it = attributes.outputs.find(name);
+            if (it != attributes.outputs.end() && it->second != nullptr) {
+                add_tensor(it->second->get_ragged_offset());
+            }
+        };
+
+        add_input(input_names::SEQ_LEN_Q);
+        add_input(input_names::SEQ_LEN_KV);
+
+        for (auto name :
+             {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO, input_names::Stats}) {
+            add_input_offset(name);
+        }
+        for (auto name : {output_names::dQ, output_names::dK, output_names::dV}) {
+            add_output_offset(name);
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    virtual void
+    serialize(json& j) const override final {
+        j = attributes;
+        j.update(R"({"tag": "SDPA_BWD"})"_json);
+    }
+#endif
+};
+
+class CompositeSDPABackwardNode : public SDPABackwardNodeBase<CompositeSDPABackwardNode> {
    private:
     // non-virtual node gpu tensors
     std::shared_ptr<Tensor_attributes> dQ_accum;
@@ -1182,87 +1357,24 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     // does not pin a backend engine that cannot possibly finalize here.
     mutable bool is_d512_on_blackwell = false;  // Will be edited in pre_validate_node()
 
-    // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
-    // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
-    void
-    promote_index_tensors_to_4d() {
-        // TODO: Handle CU_SEQ_LEN_Q and CU_SEQ_LEN_KV once bprop supports these.
-        for (auto& key : {input_names::SEQ_LEN_Q, input_names::SEQ_LEN_KV}) {
-            auto const it = attributes.inputs.find(key);
-            if (it != attributes.inputs.end()) {
-                promote_1d_index_tensor_to_4d(it->second);
-            }
-        }
-        for (auto& [key, value] : attributes.inputs) {
-            CUDNN_FRONTEND_UNUSED(key);
-            if (value != nullptr) {
-                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
-            }
-        }
-        for (auto& [key, value] : attributes.outputs) {
-            CUDNN_FRONTEND_UNUSED(key);
-            if (value != nullptr) {
-                promote_1d_index_tensor_to_4d(value->get_ragged_offset());
-            }
-        }
-    }
-
    public:
-    mutable SDPA_backward_attributes attributes;  // Will be edited in pre_validate_node() for workaround padding mask
-
     CompositeSDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
-        : NodeCRTP(context), attributes(std::move(attributes_)) {}
+        : SDPABackwardNodeBase(std::move(attributes_), context) {}
 
     Type
     getType() override final {
         return Type::COMPOSITE;
     }
 
+    // Composite-specific pre-validation. Runs before the shared support surface (see
+    // SDPABackwardNodeBase::pre_validate_node): it records the Blackwell routing decisions consumed by
+    // override_heuristics_query() and applies the pre-9.16 workaround padding mask, both of which edit
+    // `attributes`. The shapes themselves are validated by validate_sdpa_backward_support_surface().
     error_t
-    pre_validate_node() const override final {
-        CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating CompositeSDPABackwardNode" << attributes.name);
-
-        // check that Q, K, V, O, stats, dO, dQ, dK, dV tensors has been assigned
-        // check that dim and strides has been assigned and last stride is 1
-#define CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(port, port_map)                                                       \
-    {                                                                                                           \
-        std::shared_ptr<Tensor_attributes> tensor_ptr = port_map.at(port);                                      \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_dim().size() != 4,                                       \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The dim for " + std::string(#port) + " is invalid");                    \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_ptr->get_stride().size() != 4,                                    \
-                                       error_code_t::ATTRIBUTE_NOT_SET,                                         \
-                                       "The stride for " + std::string(#port) + " is invalid");                 \
-        RETURN_CUDNN_FRONTEND_ERROR_IF(                                                                         \
-            tensor_ptr->get_stride()[3] != 1,                                                                   \
-            error_code_t::GRAPH_NOT_SUPPORTED,                                                                  \
-            "The stride for the last dimension corresponding to the embedding size per head should be 1 for " + \
-                std::string(#port));                                                                            \
-    }
-
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Q, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::K, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::V, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::O, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Stats, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::dO, attributes.inputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dQ, attributes.outputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dK, attributes.outputs);
-        CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(output_names::dV, attributes.outputs);
-
-        if (attributes.has_bias()) {
-            CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE(input_names::Bias, attributes.inputs);
-        }
-
-#undef CUDNN_FE_SDPA_VALIDATE_DIM_STRIDE
-
-        // validate backend limitations for the operation
+    pre_validate_node_derived() const {
         // clang-format off
         int64_t s_q  = attributes.inputs.at(input_names::Q)->get_dim()[2];
         int64_t s_kv = attributes.inputs.at(input_names::V)->get_dim()[2];
-        int64_t h_q  = attributes.inputs.at(input_names::Q)->get_dim()[1];
-        int64_t h_k  = attributes.inputs.at(input_names::K)->get_dim()[1];
-        int64_t h_v  = attributes.inputs.at(input_names::V)->get_dim()[1];
         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
 
@@ -1271,135 +1383,19 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                                attributes.inputs.at(input_names::V)->get_ragged_offset() ||
                                attributes.inputs.at(input_names::O)->get_ragged_offset();
 
-        auto const& bias_mask = attributes.inputs.find(input_names::Bias);
-        bool const is_bias   = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);
-        auto const& dbias_mask = attributes.outputs.find(output_names::dBias);
-        bool const is_dbias   = (dbias_mask != attributes.outputs.end() && dbias_mask->second != nullptr);
-
-        auto const& dropout_mask     = attributes.inputs.find(input_names::Dropout_mask);
-        bool const is_dropout_custom = (dropout_mask != attributes.inputs.end()) && (dropout_mask->second != nullptr);
-        bool const is_dropout        = attributes.dropout_probability.has_value() || is_dropout_custom;
-
-        auto const& rng_tensor = attributes.outputs.find(output_names::RNG_DUMP);
-        bool const is_rng   = (rng_tensor != attributes.outputs.end() && rng_tensor->second != nullptr);
-
-        // validation TODO:
-        //    - validate stats has valid dims
-        //    - validate Q and dQ have the same dims
-
-        // Stop s_q = S_kv = 1 from running
-        RETURN_CUDNN_FRONTEND_ERROR_IF(s_q == 1 && s_kv == 1,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "s_q = s_kv = 1 is not supported.");
-
-        // Bug workarounds for known problematic versions (TE constraint)
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            detail::get_backend_version() == 91000 || detail::get_backend_version() == 91001,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "SDPA FP16/BF16 backward is not supported on cuDNN 9.10.0/9.10.1 due to known bugs. "
-            "Please consider upgrading to 9.10.2 or newer.");
-
-        // 9.14.0 sliding window bug: non-causal + s_kv > 1024 + sliding window
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            detail::get_backend_version() == 91400 && s_kv > 1024 && attributes.left_bound.has_value() &&
-                !attributes.has_causal_like_masking(),
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "cuDNN 9.14.0 has a known bug with non-causal + s_kv > 1024 + sliding window attention. "
-            "Please consider upgrading to 9.14.1 or newer.");
-
-        // Pre-9.26 backward bug on ragged graphs with a sink token
-        auto const& sink_token = attributes.inputs.find(input_names::SINK_TOKEN);
-        bool const has_sink    = (sink_token != attributes.inputs.end() && sink_token->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            is_ragged && has_sink && detail::get_backend_version() < 92600,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "SDPA backward with ragged offsets and a sink token requires cuDNN 9.26.0 or newer "
-            "(older versions hit an out-of-bounds read in the compute_dot_do_o pre-pass).");
-
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
-        int32_t const sm_version = context.get_sm_version();
-        int32_t const prop_major = sm_version / 10;
+        int32_t const prop_major = context.get_sm_version() / 10;
 
-        if (prop_major == 9) { 
-            // validate basic dimension requirements
-
-            if ((detail::get_backend_version() >= 91100) && (detail::get_backend_version() < 91300)) {
-                
-                if ((128 < d_qk) && (d_qk <= 192) && (64 < d_v) && (d_v <= 128)) {
-
-                    // DeepSeek case, 9.11 only supports 192 hidden dim
-                        RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128) && (d_qk != 192),
-                                                error_code_t::GRAPH_NOT_SUPPORTED,
-                                                "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
-                }
-            }
-
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 256) || (d_qk % 8 != 0) || (d_v > 256) || (d_v % 8 != 0),
-                        error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Num hidden_dim should be less than or equal to 256 and hidden_dim should be multiple of 8");
-
-        } else if (prop_major == 10 && detail::get_backend_version() >= 91100) {
-            // validate basic dimension requirements
-            if (d_qk == 192) { // special case for 192 hidden dim
-                RETURN_CUDNN_FRONTEND_ERROR_IF( (d_v != 128),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim d_v should be equal to 128 if d_qk is 192");
-            } else if (detail::get_backend_version() >= 92300 && d_qk == 256 && d_v == 256) {
+        if (prop_major == 10 && detail::get_backend_version() >= 91100 && d_qk != 192) {
+            if (detail::get_backend_version() >= 92300 && d_qk == 256 && d_v == 256) {
+                // d256 on Blackwell is only served by the deterministic (multi-kernel) engine option.
                 is_d256_on_blackwell = true;
                 attributes.is_deterministic_algorithm = true;
             } else {
-                // Head dims in (256, 512] on BOTH sides are served by the
-                // frontend-only FROST SM100 backward engine (sdpa_bwd_sm100),
-                // which runs the band through its native d = 512 tiles: the TMA
-                // descriptors carry the real extent and the overshoot is
-                // hardware zero-filled, so the padded lanes contribute nothing.
-                // The floor is the engine's -- below it the d256 flavors are the
-                // right kernel and this one would pad by more than 2x. Multiple
-                // of 8 rather than the forward surface's 16: the backward's
-                // stage-3 epilogue narrows its store vector from 32 B to 16 B
-                // when d is not also a multiple of 16, which the forward has no
-                // equivalent lever for. As on the forward path, the cuDNN
-                // backend itself has no plan for the band, so a graph that does
-                // not select that engine still fails at plan creation.
-                bool const d512_supported =
+                is_d512_on_blackwell =
                     (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 8 == 0) && (d_v % 8 == 0);
-                is_d512_on_blackwell = d512_supported;
-                RETURN_CUDNN_FRONTEND_ERROR_IF(((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0)) && !d512_supported,
-                                            error_code_t::GRAPH_NOT_SUPPORTED,
-                                            "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8 when d_qk != d_v, "
-                                            "unless both head dims are in (256, 512] and multiples of 8");
             }
-        } else {
-            // validate basic dimension requirements
-            RETURN_CUDNN_FRONTEND_ERROR_IF((d_qk > 128) || (d_qk % 8 != 0) || (d_v > 128) || (d_v % 8 != 0),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Num hidden_dim should be less than or equal to 128 and hidden_dim should be multiple of 8");
         }
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.attention_score_modifier != nullptr) &&
-                    (attributes.alibi_mask || attributes.padding_mask || attributes.has_causal_like_masking() ||
-                     attributes.left_bound.has_value()), error_code_t::GRAPH_NOT_SUPPORTED,"Attention score mod enabled and hence other subgraphs are disabled.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF((h_q % h_k != 0) || (h_q % h_v != 0),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For group-query attention, number of heads for key and query must be a factor of number of heads for query");
-
-        // validate options for attn_scale
-        auto const& attn_scale    = attributes.inputs.find(input_names::Attn_scale);
-        bool const has_attn_scale = (attn_scale != attributes.inputs.end()) && (attn_scale->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(has_attn_scale && attributes.attn_scale_value.has_value(),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "attn_scale with tensor and value cannot be set at the same time.");
-
-        // validate alibi requirements
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.alibi_mask && !(attributes.right_bound.has_value() && attributes.right_bound.value() == 0),
-                        error_code_t::GRAPH_NOT_SUPPORTED,
-                        "When alibi mask is used, diagonal_band_right_bound needs to be set to 0.");
-
-        // validate options for bias mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(is_bias && (bias_mask->second->get_data_type() == DataType_t::BOOLEAN),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Bias mask data type cannot be boolean");
 
         if (s_kv % 128 != 0 && attributes.padding_mask == false && is_ragged == false && detail::get_backend_version() <= 91500) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Workaround padding mask is enabled for s_q % 128 != 0 and use_padding_mask == false and is_ragged == false");
@@ -1415,150 +1411,18 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             attributes.set_seq_len_q(workaround_padding_mask_seq_len_q).set_seq_len_kv(workaround_padding_mask_seq_len_kv);
         }
 
-        // validate options for padding mask
-        auto const& seq_len_q     = attributes.inputs.find(input_names::SEQ_LEN_Q);
-        bool const has_seq_len_q  = (seq_len_q != attributes.inputs.end()) && (seq_len_q->second != nullptr);
-        auto const& seq_len_kv    = attributes.inputs.find(input_names::SEQ_LEN_KV);
-        bool const has_seq_len_kv = (seq_len_kv != attributes.inputs.end()) && (seq_len_kv->second != nullptr);
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.padding_mask && (!has_seq_len_q || !has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Padding mask requires seq_len_q and seq_len_kv to be set.");
-        RETURN_CUDNN_FRONTEND_ERROR_IF((!attributes.padding_mask && !attributes.attention_score_modifier) && (has_seq_len_q || has_seq_len_kv),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "seq_len_q and seq_len_kv needs to be set only if padding mask is enabled.");
-
-        // validate options for max_total_seq_len
-        RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) && !is_ragged,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "max_total_seq_len_q is only supported with packed layout");
-
-        // validate options for bottom right causal mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (!attributes.padding_mask) && s_q > s_kv,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask does not support max_s_q > max_s_kv. Please virtually slice the Q tensor and pass it as max_s_q == max_s_kv");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (is_bias || attributes.alibi_mask || (is_ragged && !attributes.padding_mask) || is_dropout),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask is only supported with is_bias=False, is_alibi=False, is_dropout=False. Further is_ragged==True is only allowed when padding_mask=True.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.has_causal_mask_bottom_right() && (detail::get_backend_version() < 90600) && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Bottom right causal mask is only supported with s_q multiple of 64, and s_kv multiple of 64, for cudnn version below 9.6.0");
-
-        // validate options for sliding window length
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && attributes.left_bound.value() <= 0,
-                                       error_code_t::INVALID_VALUE,
-                                       "Left bound (Sliding window length) should be greater than or equals to zero when set.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (s_q * attributes.left_bound.value() == s_kv * attributes.left_bound.value()) && (detail::get_backend_version() <= 90900) && (prop_major == 9) && attributes.has_causal_mask_bottom_right(),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "On Hopper architecture, this specific combination of s_q, s_kv, and left_bound + right_bound + bottom right diagonal alignment is not supported for backend version 9.9 or below");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (!attributes.padding_mask) && s_q > s_kv,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Sliding window attention is only supported with max_s_q <= max_s_kv.");
-
-        if ((detail::get_backend_version() >= 91002)) {
-             RETURN_CUDNN_FRONTEND_ERROR_IF((attributes.left_bound.has_value() || attributes.right_bound.has_value()) && ((is_ragged && !attributes.padding_mask)),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Left and right bounds with is_ragged==True is only allowed when padding_mask=True. And the diagonal alignment must be set.");
-        } else {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.left_bound.has_value() && (! attributes.has_causal_like_masking() || is_dropout || is_bias || (is_ragged && !attributes.padding_mask)),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Left and right bounds are only supported with is_dropout=False, is_bias=False. Further is_ragged==True is only allowed when padding_mask=True. Lastly the diagonal alignment must be set.");
-        }
-        
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.right_bound.has_value() && attributes.right_bound.value() < 0,
-                                       error_code_t::INVALID_VALUE,
-                                       "Right bound needs to be larger than or equal to zero");
-
-        // validate options for dropout mask
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && is_dropout_custom,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Using both, custom dropout mask and internal-mask generation using dropout probability, is ill-formed.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.dropout_probability.has_value() && attributes.dropout_probability.value() == 1.0,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Dropout probability cannot be 1 as corresponding scale wont be well formed.");
-
-        // validate options for deterministic algorithm
-        if(attributes.is_deterministic_algorithm && (prop_major == 10)) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF( (detail::get_backend_version() < 91800),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Deterministic algorithm is not supported on blackwell architecture with cudnn version below 9.18.0");
-
-            // dbias bias rng/dropout alibi
-            RETURN_CUDNN_FRONTEND_ERROR_IF(is_dbias || is_rng || is_dropout || attributes.alibi_mask,
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Deterministic algorithm is not supported on blackwell architecture when dbias, rng/dropout, alibi is enabled");
-
+        // Deterministic mode on Blackwell is served by the multi-kernel engine option pinned in
+        // override_heuristics_query(); the shared support surface rejects the unsupported combinations.
+        if (attributes.is_deterministic_algorithm && (prop_major == 10)) {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
-
-        if (detail::get_backend_version() >= 91801) {
-            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
-
-            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
-        }
-
-        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
-        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
-        // once the backward path grows a SDPA_backward_attributes support surface there —
-        // today that file serves only the forward attributes.
-        if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
-            auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
-            auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
-            bool const stats_is_packed_bhsd = stats_stride[3] == 1 &&
-                                              stats_stride[2] == stats_dim[3] &&
-                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
-                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
-            RETURN_CUDNN_FRONTEND_ERROR_IF(!stats_is_packed_bhsd,
-                                        error_code_t::GRAPH_NOT_SUPPORTED,
-                                        "For cuDNN version below 9.26.0, a non-ragged Stats input of sdpa_backward must be "
-                                        "a packed BHSD tensor.");
-        }
-
-        // version specific validation
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.5.0, dBias with variable sequence lengths is not supported");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && ((s_q % 64 != 0) || (s_kv % 64 != 0)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.5.0, dBias not support s_q/s_kv which aren't multiple of 64");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90600 && is_ragged && ((h_q != h_k) || (h_q != h_v)),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "For cuDNN version below 9.6.0, group-query attention with raggged offset is not supported");
-
-        // TODO add version check once fixed
-        RETURN_CUDNN_FRONTEND_ERROR_IF(prop_major == 10 && is_ragged && is_dbias,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "dbias with ragged is not supported for SM Major version 10");
-
-        // validate that datatype is set for the graph
-        RETURN_CUDNN_FRONTEND_ERROR_IF(this->context.get_intermediate_data_type() == DataType_t::NOT_SET,
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "Intermediate tensor data type needs to be set as internal tensors require it.");
-        // If dsink is set, sink also needs to be set
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.outputs.find(output_names::DSINK_TOKEN) != attributes.outputs.end() && attributes.inputs.find(input_names::SINK_TOKEN) == attributes.inputs.end(),
-                                       error_code_t::ATTRIBUTE_NOT_SET,
-                                       "If dsink is set, sink also needs to be set.");
         // clang-format on
 
         return {error_code_t::OK, ""};
     }
 
     error_t
-    infer_properties_node() override final {
-        // If a 1-D length/offset index tensor [n] is supplied, promote it to the 4-D
-        // [n, 1, 1, 1] (contiguous) form the cuDNN backend requires.
-        promote_index_tensors_to_4d();
-
+    infer_properties_node_derived() {
         // clang-format off
         if (detail::get_backend_version() < 90600 && (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value())) {
             CUDNN_FE_LOG_LABEL_ENDL("WARNING: sdpa_backward.attributes.max_total_seq_len has been set, but cuDNN version is below 9.6.0 does not support max_total_seq_len_q. The workspace memory size required to execute this graph may be unexpectedly large");
@@ -2371,55 +2235,243 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
         return {error_code_t::OK, ""};
     }
+};
+
+// Lowers the backward pass to a single CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR (the "unified" SDPA
+// backward engines), mirroring UnifiedSDPANode. Which features may take this route is decided by
+// SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementation(); the plumbing
+// below already covers the attributes the backend descriptor exposes (attention scale, per-batch
+// sequence lengths, sink token, packed token totals, forward score-modifier subgraph) so that widening
+// the support surface later does not require touching this node.
+class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardNode> {
+   public:
+    UnifiedSDPABackwardNode(SDPA_backward_attributes&& attributes_, detail::Context const& context)
+        : SDPABackwardNodeBase(std::move(attributes_), context) {}
+
+    Type
+    getType() override final {
+        return Type::SDPA_BWD;
+    }
 
     error_t
-    collect_tensors_to_dump_node(
-        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
-        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
-            if (tensor != nullptr) {
-                tensors_to_dump.emplace_back(tensor, 'd');
-            }
-        };
-        auto add_input = [&](input_names name) {
-            auto it = attributes.inputs.find(name);
-            if (it != attributes.inputs.end()) {
-                add_tensor(it->second);
-            }
-        };
-        auto add_input_offset = [&](input_names name) {
-            auto it = attributes.inputs.find(name);
-            if (it != attributes.inputs.end() && it->second != nullptr) {
-                add_tensor(it->second->get_ragged_offset());
-            }
-        };
-        auto add_output_offset = [&](output_names name) {
-            auto it = attributes.outputs.find(name);
-            if (it != attributes.outputs.end() && it->second != nullptr) {
-                add_tensor(it->second->get_ragged_offset());
-            }
-        };
+    expand_node() override final {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO:     Inferrencing properties for UnifiedSDPABackwardNode " << attributes.name);
 
-        add_input(input_names::SEQ_LEN_Q);
-        add_input(input_names::SEQ_LEN_KV);
+        attributes.fill_from_context(context);
 
-        for (auto name :
-             {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO, input_names::Stats}) {
-            add_input_offset(name);
+        // Optional attn scale: in case user provided a scalar value, do a fused scalar.
+        if (attributes.attn_scale_value.has_value()) {
+            attributes.inputs[input_names::Attn_scale] =
+                std::make_shared<Tensor_attributes>(attributes.attn_scale_value.value());
         }
-        for (auto name : {output_names::dQ, output_names::dK, output_names::dV}) {
-            add_output_offset(name);
+
+        // The backend applies the subgraph to the recomputed attention scores (the forward
+        // score_mod chain); score_mod_bprop has no backend counterpart yet and is gated off by the
+        // support surface.
+        if (attributes.attention_score_modifier != nullptr) {
+            if (!subgraph) init_subgraph();
+            subgraph_output = attributes.attention_score_modifier(subgraph, subgraph_output);
+        }
+
+        // Optional bias
+        if (attributes.has_bias()) {
+            if (!subgraph) init_subgraph();
+            subgraph_output =
+                attn::score_modifiers::bias(subgraph, subgraph_output, attributes.inputs[input_names::Bias]);
+        }
+
+        // Optional diagonal-band (causal / sliding-window) masking
+        if (attributes.left_bound.has_value() || attributes.right_bound.has_value()) {
+            if (!subgraph) init_subgraph();
+
+            auto s_q      = attributes.inputs[input_names::Q]->get_dim()[2];
+            auto s_kv     = attributes.inputs[input_names::K]->get_dim()[2];
+            auto s_kv_ptr = has_input(input_names::SEQ_LEN_KV) ? attributes.inputs[input_names::SEQ_LEN_KV] : nullptr;
+            auto s_q_ptr  = has_input(input_names::SEQ_LEN_Q) ? attributes.inputs[input_names::SEQ_LEN_Q] : nullptr;
+
+            subgraph_output = attn::score_modifiers::sliding_window_mask(subgraph,
+                                                                         subgraph_output,
+                                                                         attributes.diagonal_alignment,
+                                                                         attributes.left_bound,
+                                                                         attributes.right_bound,
+                                                                         s_q,
+                                                                         s_kv,
+                                                                         s_q_ptr,
+                                                                         s_kv_ptr,
+                                                                         /*cu_s_q_ptr=*/nullptr,
+                                                                         /*cu_s_kv_ptr=*/nullptr);
+        }
+
+        if (subgraph) {
+            subgraph_output->set_name(attributes.name + "::subgraph_output");
+            auto subgraph_node = std::static_pointer_cast<INode>(subgraph);
+            sub_nodes.emplace_back(subgraph_node);
         }
 
         return {error_code_t::OK, ""};
     }
 
-#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-    virtual void
-    serialize(json& j) const override final {
-        j = attributes;
-        j.update(R"({"tag": "SDPA_BWD"})"_json);
-    }
+    error_t
+    create_cudnn_operations(
+        std::unordered_set<Tensor_attributes::uid_t>& uids_involved_in_operations,
+        std::vector<std::shared_ptr<cudnn_frontend::Operation>>& operations,
+        managed_backend_descriptor_t& raw_operations,
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
+        CUDNN_FRONTEND_UNUSED(operations);
+        CUDNN_FE_LOG_LABEL("INFO: Building UnifiedSDPABackwardNode operations " << attributes.name << " ");
+        auto cudnn_ver_error =
+            error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Unified SDPA backward node requires cuDNN 9.17.0"};
+
+#if (CUDNN_VERSION >= 91700)
+        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91700, cudnn_ver_error);
+        auto unified_sdpa_bwd_operation =
+            make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR);
+
+        // Wire a tensor from the input or output map to its backend descriptor attribute; no-op if
+        // the caller did not provide it.
+        auto set_tensor_desc = [&](auto const& tensor_map, auto name, cudnnBackendAttributeName_t attr) -> error_t {
+            auto it = tensor_map.find(name);
+            if (it != tensor_map.end() && it->second != nullptr) {
+                auto backend_desc = tensors[it->second->get_uid()]->get_desc()->get_backend_descriptor();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               attr,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_desc));
+            }
+            return {error_code_t::OK, ""};
+        };
+
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::Q, CUDNN_ATTR_OPERATION_SDPA_BWD_QDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::K, CUDNN_ATTR_OPERATION_SDPA_BWD_KDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::V, CUDNN_ATTR_OPERATION_SDPA_BWD_VDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::O, CUDNN_ATTR_OPERATION_SDPA_BWD_ODESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::dO, CUDNN_ATTR_OPERATION_SDPA_BWD_DODDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::Stats, CUDNN_ATTR_OPERATION_SDPA_BWD_STATSDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.outputs, output_names::dQ, CUDNN_ATTR_OPERATION_SDPA_BWD_DQDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.outputs, output_names::dK, CUDNN_ATTR_OPERATION_SDPA_BWD_DKDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.outputs, output_names::dV, CUDNN_ATTR_OPERATION_SDPA_BWD_DVDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::Attn_scale, CUDNN_ATTR_OPERATION_SDPA_BWD_SCALEDESC));
+
+        // Per-batch sequence lengths (padding mask). Like the forward node, the backend applies the
+        // implicit padding mask whenever both are given; attributes.padding_mask itself is not lowered.
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::SEQ_LEN_Q, CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_QDESC));
+        CHECK_CUDNN_FRONTEND_ERROR(
+            set_tensor_desc(attributes.inputs, input_names::SEQ_LEN_KV, CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC));
+
+        // Sink token, packed token totals and the score-modifier subgraph need cuDNN 9.21.0.
+        bool const has_sink = has_input(input_names::SINK_TOKEN) || has_output(output_names::DSINK_TOKEN);
+        bool const has_max_total =
+            attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value();
+        if (has_sink || has_max_total || subgraph) {
+            auto v921_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                      "Sink token, max_total_seq_len or a score-modifier subgraph in the unified SDPA "
+                                      "backward node require cuDNN 9.21.0"};
+#if (CUDNN_VERSION >= 92100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92100, v921_error);
+
+            CHECK_CUDNN_FRONTEND_ERROR(
+                set_tensor_desc(attributes.inputs, input_names::SINK_TOKEN, CUDNN_ATTR_OPERATION_SDPA_BWD_SINK_DESC));
+            CHECK_CUDNN_FRONTEND_ERROR(set_tensor_desc(
+                attributes.outputs, output_names::DSINK_TOKEN, CUDNN_ATTR_OPERATION_SDPA_BWD_DSINK_DESC));
+
+            if (attributes.max_total_seq_len_q.has_value()) {
+                int64_t max_total_seq_len_q = attributes.max_total_seq_len_q.value();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_BWD_MAX_TOTAL_SEQ_LEN_Q,
+                                                               CUDNN_TYPE_INT64,
+                                                               1,
+                                                               &max_total_seq_len_q));
+            }
+            if (attributes.max_total_seq_len_kv.has_value()) {
+                int64_t max_total_seq_len_kv = attributes.max_total_seq_len_kv.value();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_BWD_MAX_TOTAL_SEQ_LEN_KV,
+                                                               CUDNN_TYPE_INT64,
+                                                               1,
+                                                               &max_total_seq_len_kv));
+            }
+
+            if (subgraph) {
+                CHECK_CUDNN_FRONTEND_ERROR(attn::score_modifiers::build_operation_subgraph(subgraph));
+                auto subgraph_cudnn   = std::static_pointer_cast<ICudnn>(subgraph);
+                auto backend_subgraph = subgraph_cudnn->get_operation_graph()->get_raw_desc();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH,
+                                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                               1,
+                                                               &backend_subgraph));
+
+                auto subgraph_input_uid = subgraph_input->get_uid();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH_INPUT_UID,
+                                                               CUDNN_TYPE_INT64,
+                                                               1,
+                                                               &subgraph_input_uid));
+
+                auto subgraph_output_uid = subgraph_output->get_uid();
+                _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_bwd_operation->get_backend_descriptor(),
+                                                               CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH_OUTPUT_UID,
+                                                               CUDNN_TYPE_INT64,
+                                                               1,
+                                                               &subgraph_output_uid));
+
+                // Add non-virtual uids from subgraph to uids_involved_in_operations
+                uids_involved_in_operations.insert(subgraph_cudnn->variant_pack_uids.begin(),
+                                                   subgraph_cudnn->variant_pack_uids.end());
+            }
+#else
+            return v921_error;
 #endif
+        }
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(unified_sdpa_bwd_operation->get_backend_descriptor()));
+
+        raw_operations.push_back(unified_sdpa_bwd_operation);
+
+        auto const& non_virtual_uids = attributes.get_non_virtual_uids();
+        uids_involved_in_operations.insert(non_virtual_uids.begin(), non_virtual_uids.end());
+        return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(uids_involved_in_operations);
+        CUDNN_FRONTEND_UNUSED(raw_operations);
+        CUDNN_FRONTEND_UNUSED(tensors);
+        return cudnn_ver_error;
+#endif  // CUDNN_VERSION >= 91700
+    }
+
+   protected:
+    std::shared_ptr<Graph> subgraph;  // Score-modifier subgraph applied to the recomputed scores
+    std::shared_ptr<Tensor_attributes> subgraph_input;
+    std::shared_ptr<Tensor_attributes> subgraph_output;
+
+    void
+    init_subgraph() {
+        subgraph               = std::make_shared<Graph>();
+        auto subgraph_node     = std::static_pointer_cast<INode>(subgraph);
+        subgraph_node->context = context;
+        subgraph_input         = std::make_shared<Tensor_attributes>();
+        subgraph_input->set_is_virtual(true);
+        subgraph_input->set_name(attributes.name + "::subgraph_input");
+        auto b    = attributes.inputs[input_names::Q]->get_dim()[0];
+        auto h_q  = attributes.inputs[input_names::Q]->get_dim()[1];
+        auto s_q  = attributes.inputs[input_names::Q]->get_dim()[2];
+        auto s_kv = attributes.inputs[input_names::K]->get_dim()[2];
+        subgraph_input->set_dim({b, h_q, s_q, s_kv});
+        subgraph_input->set_stride({h_q * s_q * s_kv, s_q * s_kv, s_kv, 1});
+        subgraph_output = subgraph_input;
+    }
 };
 
 class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {

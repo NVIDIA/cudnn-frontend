@@ -113,6 +113,10 @@ def validate_config(cfg):
         print("@@@@ Overall result: WAIVED, unified SDPA implementation requires cudnn 9.13.1 or higher.")
         pytest.skip("unified SDPA implementation requires cudnn 9.13.1 or higher")
 
+    if cudnn_version < "9.27.0" and cfg.is_train and cfg.implementation == cudnn.attention_implementation.UNIFIED:
+        print("@@@@ Overall result: WAIVED, unified SDPA backward implementation requires cudnn 9.27.0 or higher.")
+        pytest.skip("unified SDPA backward implementation requires cudnn 9.27.0 or higher")
+
     if cfg.s_q == cfg.s_kv == 1:
         print("@@@@ Overall result: WAIVED, skipping known issue of s_q == s_kv == 1.")
         pytest.skip("skipping known issue of s_q == s_kv == 1")
@@ -533,6 +537,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         use_deterministic_algorithm=cfg.is_determin,
         sink_token=sink_token,
         dSink_token=dSink_token,
+        implementation=cfg.implementation,
     )
 
     dQ.set_uid(int(dq_uid_out)).set_output(True).set_dim(cfg.shape_q).set_stride(cfg.stride_q)

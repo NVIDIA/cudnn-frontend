@@ -578,6 +578,9 @@ SDPA_backward_attributes& set_deterministic_algorithm(bool const value);
 
 SDPA_backward_attributes& set_compute_data_type(DataType_t const value);
 
+// Sets the underlying SDPA backward implementation to use (default is AUTO).
+SDPA_backward_attributes& set_implementation(AttentionImplementation_t value);
+
 ```
 
 #### Python API
@@ -604,6 +607,7 @@ graph.sdpa_backward(
     diagonal_band_right_bound=None,       # Right bound (must match forward)
     dropout=None,                         # Dropout config (must match forward)
     use_deterministic_algorithm=False,    # Force deterministic gradient computation
+    implementation=AUTO,                  # SDPA backward implementation: AUTO, COMPOSITE, UNIFIED
     compute_data_type=NOT_SET,            # Computation data type
     name=None,                            # Operation name
 )
@@ -630,6 +634,7 @@ graph.sdpa_backward(
 - `diagonal_band_right_bound` (Optional[int]): Must match the forward pass.
 - `dropout` (Optional[tuple]): Dropout configuration. Must match the forward pass to ensure the same dropout mask is applied.
 - `use_deterministic_algorithm` (Optional[bool]): If True, forces deterministic gradient computation. This ensures bitwise-identical results across multiple runs but may be slower. Default is False.
+- `implementation` (Optional[cudnn.attention_implementation]): SDPA backward implementation to use. `AUTO` (default), `COMPOSITE`, or `UNIFIED`. `UNIFIED` lowers the backward pass to a single cuDNN SDPA backward operation and requires cuDNN 9.27+; it currently covers dense FP16/BF16 graphs without masks, bias, dropout or the deterministic algorithm, and `AUTO` falls back to `COMPOSITE` for everything else.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
 - `name` (Optional[str]): Name for the operation.
 

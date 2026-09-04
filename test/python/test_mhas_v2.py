@@ -17,6 +17,7 @@ from datetime import datetime
 
 from sdpa.random_config import (
     ExecConfig,
+    compute_default_BHSD_strides,
     generate_test_seeds,
     RandomizationContext,
     RandomBatchSize,
@@ -192,6 +193,51 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_infer = False
+    test.showConfig(test_no, request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
+
+# # =====================================================
+# # L0 bprop tests on the unified SDPA backward node
+# # =====================================================
+
+# Dense FP16/BF16 backward without masks, bias, dropout, sink or the deterministic algorithm: the
+# feature set the unified backward node accepts today (cuDNN 9.27+, SM80 and up). Forces the
+# UNIFIED implementation on the backward graph (overridable with --implementation) and compares
+# dQ/dK/dV against the reference like every other backward test; configs the unified node still
+# rejects route to COMPOSITE under AUTO, so this test is the one that must actually run unified.
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=999), ids=lambda p: f"test{p[0]}")
+@pytest.mark.L0
+def test_sdpa_random_bwd_unified_L0(env_info, test_no, request, cudnn_handle):
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    # Create the randomization context within the test
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=8, with_high_probability=[1, 2, 4]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=2048, s_kv_min=1, s_kv_max=2048, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=8, d_qk_max=128, d_v_min=8, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128)]),
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
+        is_deterministic=RandomChoice({True : 0, False : 1}),
+        with_sink_token=RandomChoice({True : 0, False : 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_infer = False
+    # The unified backward engine only reads packed BHSD Stats for now; keep the randomized Q/K/V/O
+    # layouts but pin Stats so these cases exercise the engine instead of being waived.
+    test.cfg.stride_stats = compute_default_BHSD_strides(test.cfg.shape_stats)
+    test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
