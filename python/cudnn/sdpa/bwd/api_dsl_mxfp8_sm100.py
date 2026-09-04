@@ -277,6 +277,12 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _mask_types(self):
         from cudnn.sdpa.bwd.kernels import _bprop_mxfp8_masks_sm100 as masks
 
+        # Upstream's selection, kept verbatim: the residual mask is needed only
+        # for a Q-side tail. A KV-side tail (S_kv not a multiple of 128) is
+        # handled inside the window-mask path -- the kv trip count covers the
+        # partial tile and its columns are masked -- so an aligned S_q with a
+        # ragged S_kv stays on WINDOW_MASK. Pinned by
+        # test_sdpa_bwd_mxfp8_sm100.py::test_ragged_kv_only (S_kv = 160 and 96).
         if self.is_causal or self.s_q_max % 128 == 0:
             return masks.MaskEnum.WINDOW_MASK, masks.MaskEnum.WINDOW_MASK_BWD
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD

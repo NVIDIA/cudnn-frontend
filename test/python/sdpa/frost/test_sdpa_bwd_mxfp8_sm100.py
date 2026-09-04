@@ -27,7 +27,10 @@ from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 import cudnn
 
-pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
+# Levels are per test (pytest accumulates function and module markers, so a
+# module-wide L0 would keep an L1 test inside `-m L0`): every test is L0 except
+# the long-sequence case.
+pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 _ENGINE = "sdpa_bwd_sm100_mxfp8"
 _D = 256
@@ -278,28 +281,34 @@ def _run(b=1, hq=2, hkv=None, sq=256, skv=256, out_dt=torch.bfloat16, causal=Fal
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("out", list(_OUT), ids=list(_OUT))
 def test_dense(out):
     _run(out_dt=_OUT[out])
 
 
+@pytest.mark.L0
 def test_default_attn_scale():
     """attn_scale is optional on the graph; the engine must default to 1/sqrt(d)."""
     _run(omit_scale=True)
 
 
+@pytest.mark.L0
 def test_causal():
     _run(causal=True)
 
 
+@pytest.mark.L0
 def test_gqa():
     _run(hq=4, hkv=2)
 
 
+@pytest.mark.L0
 def test_mqa():
     _run(hq=4, hkv=1)
 
 
+@pytest.mark.L0
 def test_batch_and_heads():
     """Multiple (batch, head) planes: the columnwise scale factors interleave
     head planes inside each 128-row D tile at d=256 (see the repack module);
@@ -307,34 +316,51 @@ def test_batch_and_heads():
     _run(b=2, hq=2, hkv=2, sq=256, skv=384, out_dt=torch.float16)
 
 
+@pytest.mark.L0
 def test_ragged_tails():
     """S_q and S_kv that are not tile multiples: the kernels mask the tail."""
     _run(sq=129, skv=160)
 
 
+@pytest.mark.L0
+@pytest.mark.L0
+@pytest.mark.parametrize("skv", [160, 96])
+def test_ragged_kv_only(skv):
+    """Aligned S_q with a ragged S_kv (including a sub-tile one) runs on the
+    window-mask path: the KV tail is covered by the kv trip count and masked
+    there, so the residual mask is only needed for a Q-side tail."""
+    _run(hq=2, hkv=1, sq=256, skv=skv)
+
+
+@pytest.mark.L0
 def test_ragged_tails_causal_gqa():
     _run(hq=4, hkv=2, sq=129, skv=160, causal=True)
 
 
+@pytest.mark.L0
 def test_q_tile_boundary_causal():
     _run(hq=8, hkv=2, sq=257, skv=256, causal=True)
 
 
+@pytest.mark.L0
 def test_decode_shaped():
     """S_q == 1: the dQ kernel narrows its store to one element."""
     _run(sq=1, skv=128)
 
 
+@pytest.mark.L0
 def test_deterministic_flag():
     """Both kernels own their output tiles (no atomics), so the row honors
     use_deterministic_algorithm; the result must be bitwise stable."""
     _run(use_deterministic_algorithm=True)
 
 
+@pytest.mark.L1
 def test_long_causal():
     _run(b=1, hq=2, hkv=2, sq=2048, skv=2048, causal=True)
 
 
+@pytest.mark.L0
 def test_workspace_accounts_for_repack_buffers():
     """The SF repack buffers are carved from the caller's workspace; the plan
     must ask for them (a too-small request would corrupt memory, not fail)."""
@@ -382,52 +408,63 @@ def _decline_reason(**kw):
     return mismatch(spec.capabilities, facts, knobs)
 
 
+@pytest.mark.L0
 def test_accepts_the_claimed_dense_graph():
     """Sanity for the reject tests: the plain graph IS served."""
     assert _decline_reason() is None
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 192, 512])
 def test_reject_other_head_dims(d):
     """Exact d=256 only: the SF plumbing has no envelope story."""
     assert _decline_reason(d=d) is not None
 
 
+@pytest.mark.L0
 def test_reject_e5m2_payloads():
     assert _decline_reason(fp8=cudnn.data_type.FP8_E5M2) is not None
 
 
+@pytest.mark.L0
 def test_reject_gradient_dtype_mismatch():
     """o_f16/dO_f16/dQ/dK/dV share one half dtype; the kernels have one element type."""
     assert _decline_reason(out_dt=torch.bfloat16, grad_dt=torch.float16) is not None
 
 
+@pytest.mark.L0
 def test_reject_bottom_right_causal():
     assert _decline_reason(use_causal_mask_bottom_right=True) is not None
 
 
+@pytest.mark.L0
 def test_reject_right_band_widening():
     assert _decline_reason(right_bound=16) is not None
 
 
+@pytest.mark.L0
 def test_reject_sliding_window():
     assert _decline_reason(use_causal_mask=True, left_bound=64) is not None
 
 
+@pytest.mark.L0
 def test_reject_padding_mask():
     assert _decline_reason(use_padding_mask=True, seq_len_dims=(1, 1, 1, 1)) is not None
 
 
+@pytest.mark.L0
 def test_reject_amax_outputs():
     """The kernels write half gradients and never produce amax_dQ/dK/dV; a graph
     asking for one would otherwise get garbage in that buffer."""
     assert _decline_reason(declare_amax=True) is not None
 
 
+@pytest.mark.L0
 def test_reject_sink():
     assert _decline_reason(with_sink=True) is not None
 
 
+@pytest.mark.L0
 def test_reject_non_bshd_layout():
     """The kernels derive their head/batch strides from BSHD-compact storage; a
     BHSD-contiguous graph is declined, not staged (Hard Rule 2)."""
@@ -439,16 +476,19 @@ def test_reject_non_bshd_layout():
     assert _decline_reason(stride_fn=bhsd) is not None
 
 
+@pytest.mark.L0
 def test_reject_gqa_ratio_not_integer():
     assert _decline_reason(hq=6, hkv=4) is not None
 
 
+@pytest.mark.L0
 def test_reject_foreign_tiles():
     from cudnn.sdpa.bwd.engines import SdpaBwdKnobs
 
     assert _decline_reason(knobs=SdpaBwdKnobs(tile_m=64)) is not None
 
 
+@pytest.mark.L0
 def test_half_row_declines_mxfp8_graph():
     """The half-precision d512 row must not claim an MXFP8 backward (it used to
     hard-decline every quantized graph; now the family match does it)."""
@@ -463,6 +503,7 @@ def test_half_row_declines_mxfp8_graph():
             assert mismatch(spec.capabilities, facts) is not None, spec.name
 
 
+@pytest.mark.L0
 def test_capabilities_match_what_is_implemented():
     """The row must not claim anything the adapter would refuse at build."""
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
@@ -481,6 +522,7 @@ def test_capabilities_match_what_is_implemented():
     assert c.sm_lo == 100 and c.sm_hi == 106
 
 
+@pytest.mark.L0
 def test_engine_is_registered_and_opt_in():
     from cudnn.engines.manifest import MANIFEST
 
