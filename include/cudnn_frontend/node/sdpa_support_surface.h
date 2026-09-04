@@ -193,11 +193,19 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
         // (sdpa_fwd_prefill_sm100_fp8, the d512 kernel flavor), which runs the
         // band through its native d = 512 tile with TMA zero-padding. The floor
         // is the engine's: below it the flavor would pad by more than 2x, and
-        // no smaller FP8 flavor reaches above 192/128. The cuDNN backend itself
-        // has no plan for the band, so a graph that does not select that engine
-        // still fails at plan creation.
-        bool const d512_supported =
-            (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) && (d_qk % 16 == 0) && (d_v % 16 == 0);
+        // no smaller FP8 flavor reaches above 192/128.
+        //
+        // The band is PER-TENSOR FP8 only. MXFP8 (block-scaled: the descales are
+        // FP8_E8M0 scale-factor tensors) has no d512 kernel anywhere: the FROST
+        // engine declines it, and the cuDNN backend's runtime-compiled FP8
+        // engine accepts the shape at check-support time but then fails NVRTC
+        // compilation (CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED) at plan
+        // build. Reject it here so the caller sees NOT_SUPPORTED up front.
+        auto const& descale_q_it   = inputs.find(SDPA_attributes::input_names::Descale_Q);
+        bool const is_block_scaled = (descale_q_it != inputs.end()) && (descale_q_it->second != nullptr) &&
+                                     (descale_q_it->second->get_data_type() == DataType_t::FP8_E8M0);
+        bool const d512_supported = !is_block_scaled && (d_qk > 256) && (d_qk <= 512) && (d_v > 256) && (d_v <= 512) &&
+                                    (d_qk % 16 == 0) && (d_v % 16 == 0);
         bool const d256_v256_supported = (detail::get_backend_version() >= 92600);
         if (prop_major >= 10) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -206,14 +214,15 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk "
                 "should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+) "
-                "or d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of 16");
+                "or d_qk == d_v == 256 (requires cuDNN 9.26+) or, for per-tensor FP8 only (not MXFP8), both head "
+                "dims are in (256, 512] and multiples of 16");
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 ((d_v > 128) || (d_v % 16 != 0)) && !(d256_v256_supported && d_qk == 256 && d_v == 256) &&
                     !d512_supported,
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "hidden_dim d_v should be less than or equal to 128 and hidden_dim d_v should be multiple of 16 "
-                "unless d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of "
-                "16");
+                "unless d_qk == d_v == 256 (requires cuDNN 9.26+) or, for per-tensor FP8 only (not MXFP8), both head "
+                "dims are in (256, 512] and multiples of 16");
         } else {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 (d_qk > 256) || (d_qk % 16 != 0) || (d_v > 256) || (d_v % 16 != 0),
