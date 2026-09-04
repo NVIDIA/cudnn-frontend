@@ -42,7 +42,8 @@ backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
 so S and dS go to a GMEM workspace and the gradients are three batched GEMMs
 over it (`do_dot` → `bprop_d512_f16_sm100` → `bprop_matmul_sm100`). Two
 consequences a user can see: the workspace is `2·B·H_chunk·S_q·S_kv·2 B` (the
-host loops over head chunks to hold it under 4 GiB), and everything in the band
+host loops over head chunks to hold it under 4 GiB; under THD it is
+`2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ᵍ), and everything in the band
 is **envelope-served** — the tiles are fixed at 512, so d=264 costs the same
 MMA as d=512.
 
@@ -57,18 +58,18 @@ MMA as d=512.
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ |
-| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ᵍ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʰ |
 | **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
-| Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵍ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | dense onlyᵇ ᶠ ᵍ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -122,6 +123,28 @@ special path: every ring is per-kv-iteration, so a zero-trip loop fires nothing.
 Causal also skips whole kv tiles above the diagonal (~44 % of them at S=2048),
 which means those workspace tiles are never written and stage 3 must trim its K
 range to match — a correctness requirement, not just an optimization.
+ᵍ **THD / ragged backward.** Q/K/V/O/dO and the gradients are PACKED
+`[1, T, H, D]`; the S/dS workspace is **row-blocked** (each sequence owns a
+128-row-aligned block, columns uniform at `pad(S_kv_max)`), which is where the
+memory win over the dense `B · S_max²` rectangle comes from. A setup launch
+publishes the metadata, the per-sequence block offsets and the clipped output
+descriptors — all device-side, so nothing reads a length on the host. Both
+packed Stats layouts the FROST forward emits are read (token-major `(T, H)` and
+head-major `(1, QH, head_stride)`, the latter with a head stride wider than the
+packed total); a DENSE per-batch Stats on a ragged graph is declined, because its
+stride reads as head-major over storage that is not packed.
+Its own conjunctions are declined, each with a reject test: a **causal-family
+mask** (stage 3's K-trim is expressed in absolute workspace rows, which the
+blocked layout renumbers per sequence), **GQA** (the dK/dV partials would have
+to be packed per Q head), a non-BSHD-physical layout (the packed path has no
+staging copy), and a graph that does not declare
+**`max_total_seq_len_q`/`_kv`** — those are REQUIRED here, because
+`scratch_workspace_bytes()` is a build-time function and the blocked row count
+comes from the packed totals before any buffer exists.
+ʰ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
+attribute. `SDPA_backward_attributes` has no such input port and
+`pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
+none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`.
 ⁹ `thd_d_shapes` is an **exact** membership test, not an envelope: the
 quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
 (MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
@@ -247,12 +270,13 @@ feature-free d=64 graph.
 |---|---|
 | Backward pass entirely | SM107 |
 | Backward outside d ∈ (256, 512] | SM100, SM103 — the only backward engine there serves that band |
-| Backward per-batch padding mask (`seq_len_q/kv`) | SM100, SM103 — a UNIFORM non-tile-multiple length is served; a per-batch one is not |
+| Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
+| Backward THD + causal, and THD + GQA | SM100, SM103 |
 | Backward sink / dSink, bias / dBias, deterministic, decode | SM100, SM103 |
 | f16/bf16 forward | SM107 (Rubin) |
 | MXFP8 forward | SM107, SM120, SM80 |
 | FP8 / MXFP8 backward | every arch |
-| THD / ragged backward | every arch |
+| THD / ragged backward | SM80, SM120 (SM100/SM103 serve it — see ᵍ) |
 | THD forward | SM80 |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost |
 | d=64 MXFP8 / d=64 quantized THD | SM100, SM107 (exact-shape gates) |
