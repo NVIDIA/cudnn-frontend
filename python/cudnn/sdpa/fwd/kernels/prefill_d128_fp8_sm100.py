@@ -1975,6 +1975,7 @@ def _correction_warp_group(
                     q_row_global,
                     row_head_idx,
                     CFG.TILE_O,
+                    O_CHUNK,
                 )
                 # The TMA-store warp group still runs its handshake; release the
                 # slot even though nothing was staged.

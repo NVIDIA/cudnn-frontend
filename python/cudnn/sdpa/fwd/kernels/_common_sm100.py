@@ -339,7 +339,7 @@ def store_fp32_partial_tile(
     q_row_global,
     row_head_idx,
     tile_o: cutlass.Constexpr[int],
-    chunk: cutlass.Constexpr[int] = 32,
+    chunk: cutlass.Constexpr[int],
 ) -> None:
     """Store one Q row's O tile as fp32, straight from TMEM to the workspace.
 
@@ -348,6 +348,11 @@ def store_fp32_partial_tile(
     goes to global directly, so the partial can be fp32 while the tile -- and
     therefore the SMEM budget -- is untouched.  Shared by every flavor whose
     epilogue holds its O accumulator in TMEM.
+
+    ``chunk`` must be the flavor's OWN TMEM read width (its ``O_CHUNK``): the
+    O region is not uniformly addressable across flavors, so reading it in a
+    different stride than the staged epilogue does silently returns the wrong
+    columns rather than failing.
 
     Dead rows need no separate guard: every caller has already folded the
     empty-mainloop case into ``inv_sum`` (it is selected to 0.0 there), so the

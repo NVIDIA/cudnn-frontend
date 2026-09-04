@@ -2381,6 +2381,7 @@ def _correction_warp_group(
                     q_row_global,
                     head_idx,
                     CFG.TILE_O,
+                    O_CHUNK,
                 )
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
