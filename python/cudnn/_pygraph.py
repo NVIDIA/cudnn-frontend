@@ -1548,11 +1548,15 @@ class pygraph:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
-            # The overload args (handle, override_uids/shapes/strides) describe the
-            # problem, and CompiledPlan.get_workspace_size() takes none of them: a
-            # compiled python plan's workspace is a property of the plan. A
-            # shape-dependent one would have to say so through that API.
-            return self._compiled_plans[self._plan_index].get_workspace_size()
+            # A compiled python plan's workspace is normally a property of the
+            # plan. A shape-dependent one (frost split-K partials) says so by
+            # exposing get_workspace_size_for_shapes, which follows the overrides.
+            plan = self._compiled_plans[self._plan_index]
+            if override_shapes is not None:
+                sized = getattr(plan, "get_workspace_size_for_shapes", None)
+                if sized is not None:
+                    return sized(override_uids, override_shapes)
+            return plan.get_workspace_size()
 
         # Same reason execute() addresses by index; the overload args pass through.
         cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
@@ -1568,10 +1572,15 @@ class pygraph:
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
-            # Overload args accepted and not consulted — see get_workspace_size().
+            # Shape-dependent plans consult the overrides — see get_workspace_size().
             if index not in self._compiled_plans:
                 self._build_plan_at(index)
-            return self._compiled_plans[index].get_workspace_size()
+            plan = self._compiled_plans[index]
+            if override_shapes is not None:
+                sized = getattr(plan, "get_workspace_size_for_shapes", None)
+                if sized is not None:
+                    return sized(override_uids, override_shapes)
+            return plan.get_workspace_size()
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:  # delegating entry
             return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)

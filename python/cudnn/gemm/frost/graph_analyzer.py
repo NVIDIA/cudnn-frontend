@@ -565,9 +565,9 @@ def build_gemm_plan(graph: cudnn.pygraph):
     ``ValueError`` (type + message preserved) on rejection."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import jit_from_cudnn_graph, plan_config
+    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config
 
-    config = plan_config(analyze(graph))
+    config = plan_config(analyze(graph), dynamic_shapes=_graph_dynamic_shapes(graph))
     return jit_from_cudnn_graph(graph, config=config)
 
 

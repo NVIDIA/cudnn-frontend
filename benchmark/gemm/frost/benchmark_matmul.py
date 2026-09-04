@@ -75,7 +75,14 @@ def _vp(handles, a, b, c):
 
 def _build_plan(g, cfg, _name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    compiled = jit_from_cudnn_graph(g, config=cfg)
+    if getattr(compiled, "workspace_bytes", 0):
+        from cudnn.frost.workspace import Workspace
+
+        buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+        ws = Workspace(buf, compiled.workspace_bytes, "benchmark_matmul")
+        return lambda vp, stream=None: compiled(vp, stream=stream, workspace=ws)
+    return compiled
 
 
 # ---------------------------------------------------------------------------
