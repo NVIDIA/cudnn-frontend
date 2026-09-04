@@ -17,7 +17,10 @@ from unittest import mock
 
 import pytest
 
+from test_utils import require_cutedsl_version
+
 pytest.importorskip("cutlass")
+require_cutedsl_version("4.7.0")
 
 RUBIN_DISPATCH_CASES = [
     pytest.param(

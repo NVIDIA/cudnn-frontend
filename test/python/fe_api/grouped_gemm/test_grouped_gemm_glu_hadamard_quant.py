@@ -8,9 +8,12 @@ from typing import Dict, Optional
 import pytest
 import torch
 
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
+
 from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant.rht_utils import HADAMARD_SIZE
 from test_low_precision_matmul import float4_e2m1fn_x2_to_float32
-from test_utils import torch_fork_set_rng
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported

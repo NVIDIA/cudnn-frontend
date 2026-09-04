@@ -5,7 +5,10 @@ import torch
 
 import pytest
 
-from test_utils import torch_fork_set_rng
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
+
 from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import with_gemm_proj_rope_mxfp8_params
 
 

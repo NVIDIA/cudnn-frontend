@@ -11,7 +11,10 @@ and discrete weight modes, with SwiGLU and GeGLU activations.
 import torch
 import pytest
 import cudnn
-from test_utils import torch_fork_set_rng
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
+
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (

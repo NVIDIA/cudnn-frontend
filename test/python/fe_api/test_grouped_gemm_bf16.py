@@ -8,6 +8,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from test_utils import require_cutedsl_version
+
+require_cutedsl_version("4.7.0")
+
 from test_grouped_gemm_bf16_utils import (
     assert_grouped_gemm_close,
     grouped_gemm_bf16_reference,

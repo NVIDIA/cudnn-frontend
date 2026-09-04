@@ -11,7 +11,10 @@ Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
 
 import torch
 import pytest
-from test_utils import torch_fork_set_rng
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
+
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors,

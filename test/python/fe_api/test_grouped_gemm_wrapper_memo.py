@@ -16,6 +16,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from test_utils import require_cutedsl_version
+
+require_cutedsl_version("4.7.0")
+
 
 @pytest.fixture(autouse=True)
 def require_sm100():

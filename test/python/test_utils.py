@@ -5,6 +5,55 @@ import os
 import torch
 import functools
 
+
+def require_cutedsl_version(minimum: str) -> None:
+    """Skip the current test module when the public CuTe DSL is too old.
+
+    Internal RC wheels use an unrelated 0.x version scheme, so presence is
+    sufficient for them, matching the runtime support checks in
+    ``cudnn.frost.buffers``.
+    """
+    import importlib.metadata
+    import importlib.util
+
+    import pytest
+
+    try:
+        installed = importlib.util.find_spec("cutlass") is not None
+    except (ImportError, ValueError):
+        installed = False
+    if not installed:
+        pytest.skip("CuTe DSL is not installed", allow_module_level=True)
+
+    try:
+        installed_version = importlib.metadata.version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        # Internal builds are distributed as nvidia-cutlass-dsl-internal and
+        # cannot be compared with the public wheel's version numbering.
+        try:
+            importlib.metadata.version("nvidia-cutlass-dsl-internal")
+        except importlib.metadata.PackageNotFoundError:
+            return
+        return
+
+    def release_tuple(value: str):
+        try:
+            parts = [int(component) for component in value.split("+", 1)[0].split(".")[:3]]
+        except ValueError:
+            return None
+        return tuple((parts + [0, 0, 0])[:3])
+
+    installed_release = release_tuple(installed_version)
+    minimum_release = release_tuple(minimum)
+    if installed_release is None or minimum_release is None:
+        return
+    if installed_release < minimum_release:
+        pytest.skip(
+            f"requires nvidia-cutlass-dsl >= {minimum}; found {installed_version}",
+            allow_module_level=True,
+        )
+
+
 # Repeats for bitwise-determinism checks. A reduction-order race is timing-dependent, so a
 # single repeat proves little; overridable for bisecting a flaky one.
 DETERMINISM_REPEATS = int(os.environ.get("DETERMINISM_REPEATS", "8"))

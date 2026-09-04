@@ -5,7 +5,9 @@ import pytest
 import torch
 
 import cudnn
-from test_utils import torch_fork_set_rng
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
 
 from fe_api.gemm.test_gemm_srelu_utils import (
     allocate_gemm_srelu_outputs,

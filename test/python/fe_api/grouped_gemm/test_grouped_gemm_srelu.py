@@ -12,7 +12,10 @@ Reference: continugous_blockscaled_grouped_gemm_srelu_quant_fusion.py
 
 import torch
 import pytest
-from test_utils import torch_fork_set_rng
+from test_utils import require_cutedsl_version, torch_fork_set_rng
+
+require_cutedsl_version("4.7.0")
+
 from fe_api.grouped_gemm.test_grouped_gemm_srelu_utils import (
     grouped_gemm_srelu_init,
     with_grouped_gemm_srelu_params_fp4,
