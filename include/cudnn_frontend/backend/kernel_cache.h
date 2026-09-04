@@ -136,16 +136,12 @@ class KernelCache : public detail::backend_descriptor {
     /// An insertion, a replacement, a removal, or an eviction each add one to the counter. A
     /// lookup does not change the counter.
     ///
-    /// Use this function, and not size(), to find if a new serialization is necessary. cuDNN can
-    /// replace the data that it holds for an engine configuration that is already in the cache.
-    /// A replacement does not change the number of entries, but it does change the data that
-    /// to_json() returns.
+    /// Use this function, and not size(), to find if the cache changed. cuDNN can replace data
+    /// that is already in the cache, so size() is not a reliable measure. You can use that
+    /// decision, for example, to find if a new serialization is worth the cost.
     ///
     /// The counter is local to the process. to_json() does not put the counter in its data, and
-    /// from_json() starts a new count. Two kernel caches have no common count. Thus do not keep a
-    /// counter value with a serialized cache and compare it after a reload. Read a new baseline
-    /// immediately after the cache is loaded and finalized. Then compare subsequent reads to that
-    /// baseline.
+    /// from_json() starts a new count. Two kernel caches have no common count.
     ///
     /// The kernel cache must be finalized.
     error_t
@@ -162,11 +158,11 @@ class KernelCache : public detail::backend_descriptor {
 
     /// Gets the number of entries in the kernel cache.
     ///
-    /// The kernel cache keys its entries on the engine configuration, and not on the shape of the
-    /// tensors. Thus two different shapes can use one entry.
+    /// Two different shapes can use the same entry, so this count does not track the number of
+    /// shapes that were built.
     ///
     /// A replacement changes the data of an entry but keeps the number of entries. Thus use
-    /// revision(), and not this function, to find if a new serialization is necessary.
+    /// revision(), and not this function, to find if the data changed.
     ///
     /// The kernel cache must be finalized.
     error_t

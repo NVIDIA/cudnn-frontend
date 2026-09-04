@@ -296,11 +296,11 @@ init_properties(py::module_& m) {
 
                 An insertion, a replacement, a removal, or an eviction each add one to the counter.
                 A lookup does not change the counter. Use this function, and not size(), to find if
-                a new call to serialize() is necessary.
+                the cache changed. cuDNN can replace data that is already in the cache, so size()
+                is not a reliable measure.
 
                 The counter is local to the process. serialize() does not put the counter in its
-                data, and deserialize() starts a new count. Read a new baseline after the kernel
-                cache is loaded and built. Then compare subsequent reads to that baseline.
+                data, and deserialize() starts a new count.
 
                 Returns:
                     int: The revision counter.
@@ -310,8 +310,8 @@ init_properties(py::module_& m) {
              R"pbdoc(
                 Get the number of entries in the kernel cache.
 
-                The kernel cache keys its entries on the engine configuration, and not on the shape
-                of the tensors. Thus two different shapes can use one entry.
+                Two different shapes can use the same entry, so this count does not track the
+                number of shapes that were built.
 
                 Returns:
                     int: The number of entries.

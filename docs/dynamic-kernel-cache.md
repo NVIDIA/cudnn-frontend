@@ -45,17 +45,13 @@ size = kernel_cache.size()
 
 Both accessors need a finalized kernel cache. They return an error before `build()`.
 
-Three rules apply:
-
-- Use `revision()`, and not `size()`, to find if a new serialization is worth the cost. cuDNN can replace the data that it holds for an engine configuration that is already in the cache. A replacement does not change the number of entries, but it does change the serialized data. An insertion, a replacement, a removal, or an eviction each add one to the revision counter. A lookup does not change it.
+- Use `revision()`, and not `size()`, to find if the cache changed. cuDNN can replace data that is already in the cache, so `size()` is not a reliable measure. An insertion, a replacement, a removal, or an eviction each add one to the revision counter. A lookup does not change it. You can use that decision, for example, to find if a new serialization is worth the cost.
+- Two different shapes can use the same kernel cache entry, and `size()` can stay the same after a build with a new shape.
 - The revision counter is local to the process. It is not part of the serialized data, and a `from_json()` load starts a new count. Two kernel caches have no common count.
-- Do not keep a revision value with a serialized cache and compare it after a reload. Read a new baseline immediately after the cache is loaded and finalized. Then compare subsequent reads to that baseline.
-
-The kernel cache keys its entries on the engine configuration, and not on the shape of the tensors. Thus two different shapes can use one entry, and `size()` can stay the same after a build with a new shape.
 
 ## Thread-safety contract for KernelCache
 
-The `KernelCache` API (`build`, `from_json`, `to_json`, `is_finalized`) is **internally synchronized** with a plain `std::mutex`. Multiple threads may call these methods concurrently on the same `KernelCache` instance without external synchronization.
+The `KernelCache` API is **internally synchronized** with a plain `std::mutex`. Multiple threads may call these methods concurrently on the same `KernelCache` instance without external synchronization.
 
 `build()` is idempotent under the lock: the first caller to acquire the mutex initializes and finalizes the descriptor; subsequent callers return `OK` immediately without re-initializing it. This makes it safe for N graph threads sharing one `KernelCache` to each call `build()` concurrently — exactly one backend descriptor is created and finalized.
 
