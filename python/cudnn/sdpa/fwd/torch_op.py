@@ -8,7 +8,8 @@ for features ``torch.nn.functional.scaled_dot_product_attention`` cannot
 express:
 
 - **attention sinks** (per-Q-head logits folded into the softmax denominator)
-- **sliding window** (``window_left``)
+- **diagonal bands** (``window_left`` / ``window_right``, including
+  asymmetric bands that admit future columns)
 - **bottom-right causal alignment** (inference-style diagonals)
 - **padded batches** (per-batch actual sequence lengths)
 - **THD / varlen packing** (FlashAttention-style ``(T, H, D)`` + ``cu_seqlens``)
@@ -227,6 +228,7 @@ def _build_graph(
     is_causal: bool,
     causal_bottom_right: bool,
     window_left: int,
+    window_right: int,
     has_sinks: bool,
     has_seq_lens: bool,
     is_thd: bool,
@@ -263,7 +265,7 @@ def _build_graph(
         k_t.set_ragged_offset(rk)
         v_t.set_ragged_offset(rv)
 
-    rb = 0 if is_causal else None
+    rb = window_right if window_right >= 0 else (0 if is_causal else None)
     lb = window_left if window_left >= 0 else None
     alignment = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
 
@@ -311,7 +313,7 @@ _lib = torch.library.Library("cudnn", "FRAGMENT")
 
 _lib.define(
     "sdpa_fwd(Tensor q, Tensor k, Tensor v, float attn_scale, "
-    "bool is_causal=False, bool causal_bottom_right=False, int window_left=-1, "
+    "bool is_causal=False, bool causal_bottom_right=False, int window_left=-1, int window_right=-1, "
     "Tensor? sinks=None, "
     "Tensor? seq_len_q=None, Tensor? seq_len_kv=None, "
     "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_kv=None, "
@@ -328,6 +330,7 @@ def _sdpa_fwd_impl(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_left: int = -1,
+    window_right: int = -1,
     sinks: Optional[torch.Tensor] = None,
     seq_len_q: Optional[torch.Tensor] = None,
     seq_len_kv: Optional[torch.Tensor] = None,
@@ -338,8 +341,10 @@ def _sdpa_fwd_impl(
     return_lse: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _check_io_dtypes("sdpa_fwd", q=q, k=k, v=v)
-    if causal_bottom_right and not (is_causal or window_left >= 0):
-        raise ValueError("causal_bottom_right only re-anchors an active diagonal band; set is_causal or window_left too")
+    if causal_bottom_right and not (is_causal or window_left >= 0 or window_right >= 0):
+        raise ValueError("causal_bottom_right only re-anchors an active diagonal band; set is_causal, window_left or window_right too")
+    if is_causal and window_right > 0:
+        raise ValueError(f"is_causal masks every future column but window_right={window_right} admits some; pass one or the other")
     is_thd = cu_seqlens_q is not None
     if is_thd:
         if cu_seqlens_kv is None or max_seqlen_q <= 0 or max_seqlen_kv <= 0:
@@ -414,6 +419,7 @@ def _sdpa_fwd_impl(
         is_causal,
         causal_bottom_right,
         window_left,
+        window_right,
         has_sinks,
         has_seq_lens,
         is_thd,
@@ -443,6 +449,7 @@ def _sdpa_fwd_impl(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_left=window_left,
+            window_right=window_right,
             has_sinks=has_sinks,
             has_seq_lens=has_seq_lens,
             is_thd=is_thd,
@@ -503,6 +510,7 @@ def _sdpa_fwd_fake(
     is_causal=False,
     causal_bottom_right=False,
     window_left=-1,
+    window_right=-1,
     sinks=None,
     seq_len_q=None,
     seq_len_kv=None,
@@ -551,6 +559,7 @@ def _build_bwd_graph(
     is_causal: bool,
     causal_bottom_right: bool,
     window_left: int,
+    window_right: int,
     q_stride,
     k_stride,
     v_stride,
@@ -605,7 +614,7 @@ def _build_bwd_graph(
         o_t.set_ragged_offset(ro)
         do_t.set_ragged_offset(ro)
 
-    rb = 0 if is_causal else None
+    rb = window_right if window_right >= 0 else (0 if is_causal else None)
     lb = window_left if window_left >= 0 else None
     alignment = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
 
@@ -656,7 +665,7 @@ def _build_bwd_graph(
 
 _lib.define(
     "sdpa_bwd(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, float attn_scale, "
-    "bool is_causal=False, bool causal_bottom_right=False, int window_left=-1, "
+    "bool is_causal=False, bool causal_bottom_right=False, int window_left=-1, int window_right=-1, "
     "Tensor? sinks=None, "
     "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_kv=None, "
     "int max_seqlen_q=0, int max_seqlen_kv=0, "
@@ -676,6 +685,7 @@ def _sdpa_bwd_dense(
     is_causal,
     causal_bottom_right,
     window_left,
+    window_right,
     is_deterministic,
 ):
     """Dense BHSD backward.
@@ -745,6 +755,7 @@ def _sdpa_bwd_dense(
         is_causal,
         causal_bottom_right,
         window_left,
+        window_right,
         is_deterministic,
         q.device,
     )
@@ -769,6 +780,7 @@ def _sdpa_bwd_dense(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_left=window_left,
+            window_right=window_right,
             q_stride=q.stride(),
             k_stride=k.stride(),
             v_stride=v.stride(),
@@ -813,6 +825,7 @@ def _sdpa_bwd_impl(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_left: int = -1,
+    window_right: int = -1,
     sinks: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
@@ -847,6 +860,7 @@ def _sdpa_bwd_impl(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_left=window_left,
+            window_right=window_right,
             is_deterministic=is_deterministic,
         )
 
@@ -914,6 +928,7 @@ def _sdpa_bwd_impl(
         is_causal,
         causal_bottom_right,
         window_left,
+        window_right,
         is_deterministic,
         q.device,
     )
@@ -938,6 +953,7 @@ def _sdpa_bwd_impl(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_left=window_left,
+            window_right=window_right,
             q_stride=q_stride,
             k_stride=k_stride,
             v_stride=v_stride,
@@ -995,6 +1011,7 @@ def _sdpa_bwd_fake(
     is_causal=False,
     causal_bottom_right=False,
     window_left=-1,
+    window_right=-1,
     sinks=None,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
@@ -1035,6 +1052,7 @@ def _sdpa_setup_context(ctx, inputs, output):
         is_causal,
         causal_bottom_right,
         window_left,
+        window_right,
         sinks,
         seq_len_q,
         seq_len_kv,
@@ -1050,6 +1068,7 @@ def _sdpa_setup_context(ctx, inputs, output):
     ctx.is_causal = is_causal
     ctx.causal_bottom_right = causal_bottom_right
     ctx.window_left = window_left
+    ctx.window_right = window_right
     ctx.has_sinks = sinks is not None
     ctx.has_seq_lens = seq_len_q is not None or seq_len_kv is not None
     ctx.max_seqlen_q = max_seqlen_q
@@ -1093,7 +1112,7 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
     q, k, v, o, stats, cu_q, cu_kv = ctx.saved_tensors
     if grad_o is None:  # o unused in the loss; stats is non-differentiable
-        return (None,) * 15
+        return (None,) * 16
     if ctx.has_sinks:
         raise NotImplementedError("cudnn::sdpa_fwd autograd does not support attention sinks yet (dSink is a follow-up)")
     if ctx.has_seq_lens and cu_q is None:
@@ -1114,9 +1133,10 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
             is_causal=ctx.is_causal,
             causal_bottom_right=ctx.causal_bottom_right,
             window_left=ctx.window_left,
+            window_right=ctx.window_right,
             is_deterministic=torch.are_deterministic_algorithms_enabled(),
         )
-        return (dq, dk, dv) + (None,) * 12
+        return (dq, dk, dv) + (None,) * 13
 
     # Packed TH1 (T, H, 1) -> padded (B, H, max_seqlen_q, 1): the backend
     # rejects ragged LSE for bprop THD on SM8X/SM12X. Entirely device-side
@@ -1135,6 +1155,7 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
         is_causal=ctx.is_causal,
         causal_bottom_right=ctx.causal_bottom_right,
         window_left=ctx.window_left,
+        window_right=ctx.window_right,
         cu_seqlens_q=cu_q,
         cu_seqlens_kv=cu_kv,
         max_seqlen_q=ctx.max_seqlen_q,
@@ -1142,9 +1163,10 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
         is_deterministic=torch.are_deterministic_algorithms_enabled(),
     )
     # One grad slot per op input: (q, k, v, attn_scale, is_causal,
-    # causal_bottom_right, window_left, sinks, seq_len_q, seq_len_kv,
-    # cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, return_lse).
-    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+    # causal_bottom_right, window_left, window_right, sinks, seq_len_q,
+    # seq_len_kv, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+    # return_lse).
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd("cudnn::sdpa_fwd", _sdpa_backward, setup_context=_sdpa_setup_context)
@@ -1164,6 +1186,7 @@ def sdpa(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_left: int = -1,
+    window_right: int = -1,
     sinks: Optional[torch.Tensor] = None,
     seq_len_q: Optional[torch.Tensor] = None,
     seq_len_kv: Optional[torch.Tensor] = None,
@@ -1188,6 +1211,7 @@ def sdpa(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_left=window_left,
+        window_right=window_right,
         sinks=sinks,
         seq_len_q=seq_len_q,
         seq_len_kv=seq_len_kv,

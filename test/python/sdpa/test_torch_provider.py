@@ -118,7 +118,7 @@ def test_sdpa_dense_parity(B, Hq, Hkv, Sq, Skv, D, dtype, is_causal, scale, enab
         assert ours <= max(3 * flash, floor), f"{name}: cudnn err {ours:.4f} vs flash {flash:.4f}"
 
 
-def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1):
+def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1, window_right=-1):
     """Per-sequence fp32 dense reference; returns (out, q_ref, k_ref, v_ref)."""
     qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
     Hq, Hkv = q.shape[1], k.shape[1]
@@ -141,6 +141,8 @@ def ref_varlen(q, k, v, cu_q, cu_kv, is_causal, window_left=-1):
             mask |= jj > ii
         if window_left >= 0:
             mask |= jj < (ii - window_left)  # FA2: window (w, 0) attends [i-w, i]
+        if window_right >= 0:
+            mask |= jj > (ii + window_right)  # FA2: window (_, r) attends up to i+r
         s = s.masked_fill(mask, float("-inf"))
         outs.append(torch.einsum("bhqk,bhkd->bhqd", torch.softmax(s, dim=-1), vi)[0].transpose(0, 1))
     out = torch.cat(outs)
@@ -154,6 +156,11 @@ VARLEN_CASES = [
     pytest.param(16, 4, 128, [200, 312, 96], (-1, 0), True, False, id="gqa"),
     pytest.param(8, 8, 128, [400, 288], (128, 0), False, False, id="window-128"),
     pytest.param(8, 8, 128, [400, 288], (4, 0), False, False, id="window-4-tight"),
+    # Bands that admit FUTURE columns. Before window_right these fell through
+    # _varlen_supported to the flash kernels, so the `calls["fwd"]` assertion
+    # below is what pins them onto the cuDNN python path.
+    pytest.param(8, 8, 128, [400, 288], (-1, 64), False, False, id="window-right-only"),
+    pytest.param(8, 8, 128, [333, 128, 512, 47], (128, 32), False, False, id="window-asymmetric"),
     pytest.param(8, 8, 64, [512, 512], (-1, 0), False, False, id="d64"),
     pytest.param(
         8,
@@ -190,7 +197,7 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
     assert provider.calls["fwd"] == fwd0 + 1 and provider.calls["bwd"] == bwd0 + 1, "provider did not intercept"
 
     is_causal = window[1] == 0
-    ref, qr, kr, vr = ref_varlen(q, k, v, cu, cu, is_causal, window[0])
+    ref, qr, kr, vr = ref_varlen(q, k, v, cu, cu, is_causal, window[0], window[1])
     ref.backward(grad.float())
     if kv_packed:
         kv_grad = torch.stack([kr.grad, vr.grad], dim=1)
