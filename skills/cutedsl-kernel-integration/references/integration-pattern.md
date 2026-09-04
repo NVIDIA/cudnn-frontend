@@ -162,7 +162,7 @@ For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_groupe
 
 ## Dependencies
 
-`pyproject.toml` already defines `[project.optional-dependencies].cutedsl` for CuTeDSL integrations. Reuse it by default.
+`pyproject.toml` already lists the CuTeDSL stack (`nvidia-cutlass-dsl[cu13]>=4.6.2`, `cuda-python`, `apache-tvm-ffi`) under `[project] dependencies`, so it is always installed. Reuse it by default; `[project.optional-dependencies].cutedsl` is an empty back-compat alias.
 
 Only change dependencies when the new kernel requires a package not already covered by `cutedsl`. If adding one, document why it is needed and keep the dependency scoped to the optional extra.
 

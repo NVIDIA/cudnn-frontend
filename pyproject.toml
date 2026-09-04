@@ -46,6 +46,29 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+dependencies = [
+    # The CuTeDSL stack is a required dependency: the OSS kernel engines (FROST
+    # SDPA, GEMM fusions, sparse/linear attention) are Python kernels that JIT
+    # through CuTeDSL, and they are a headline part of the package rather than an
+    # add-on. Still NOT pinned to the floor those engines want (4.7.0, see
+    # CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py): pinning that high here would
+    # make this package uninstallable next to anything holding the DSL back --
+    # vLLM and friends carry their own constraints. The engines check the version
+    # at support time and decline when it is too old, so an older DSL costs those
+    # engines and nothing else. The 4.6.2 floor is the oldest DSL this package is
+    # tested against.
+    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
+    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
+    # Marker: every nvidia-cutlass-dsl release is `Requires-Python >=3.10`, and this
+    # package still declares `requires-python = ">=3.9"`. Without the marker a 3.9
+    # install stops resolving entirely instead of just losing the JIT engines, which
+    # decline at check_support when the DSL is absent -- the same trade-off the
+    # `cutile` extra below already makes for cuda-tile.
+    "nvidia-cutlass-dsl[cu13]>=4.6.2; python_version >= '3.10'",
+    "cuda-python",
+    "apache-tvm-ffi>=0.1.11",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/NVIDIA/cudnn-frontend"
 "Documentation" = "https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/"
@@ -55,19 +78,11 @@ classifiers = [
 "Release Notes" = "https://github.com/NVIDIA/cudnn-frontend/releases"
 
 [project.optional-dependencies]
-cutedsl = [
-    # NOT pinned to the floor the FROST engines need (4.7.0): pinning it here
-    # would make this package incompatible with anything holding the DSL at an
-    # older version -- quack-kernels pins ==4.6.0, and vLLM and friends carry
-    # their own constraints. The engines check the version at support time and
-    # decline when it is too old, so an older DSL costs those engines and
-    # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
-    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
-    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
-    "nvidia-cutlass-dsl[cu13]>=4.5.0",
-    "cuda-python",
-    "apache-tvm-ffi>=0.1.11",
-]
+# Back-compat alias, intentionally empty: the CuTeDSL stack moved to the required
+# [project] dependencies above, so `pip install nvidia-cudnn-frontend[cutedsl]`
+# now resolves to the same thing as a plain install. Kept so the extra keeps
+# resolving instead of warning for everyone still spelling it out.
+cutedsl = []
 cutile = [
     # The cuTile linear-attention engines. Base cuda-tile only -- its [tileiras]
     # extra pins cuda-toolkit>=13.2,<13.4, and that upper bound would cap the

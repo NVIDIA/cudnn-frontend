@@ -63,7 +63,7 @@ Training-score loss path:
 ## Installation
 
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
 
 ---

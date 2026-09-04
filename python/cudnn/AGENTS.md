@@ -6,7 +6,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 
 - `import cudnn` must work **without** torch/cutlass/cuda-python installed. Everything that needs them is exported lazily via `_LAZY_OPTIONAL_IMPORTS` in `__init__.py` — a module-level `__getattr__` imports the submodule on first attribute access and re-raises failures as `ImportError` pointing at `pip install nvidia-cudnn-frontend[cutedsl]`.
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
-- Reuse the existing `[cutedsl]` extra (`pyproject.toml` optional-dependencies) unless a kernel truly needs a new package.
+- Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra is now an empty back-compat alias — do not add to it.
 
 ## Hard rules
 

@@ -42,12 +42,13 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax, GEMM + SwiGLU, and the grouped GEMM APIs require the `cutedsl` optional dependency, which can be installed via:
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package, and so does the CuTeDSL runtime they JIT through — `nvidia-cutlass-dsl[cu13]>=4.6.2`, `cuda-python`, and `apache-tvm-ffi` are required dependencies:
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install nvidia-cudnn-frontend
 ```
+(`pip install nvidia-cudnn-frontend[cutedsl]` still works; the `cutedsl` extra is now an empty back-compat alias. A few APIs still want extras of their own — the cuTile linear-attention engines need `[cutile]`.)
 
-The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
+Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
 pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)

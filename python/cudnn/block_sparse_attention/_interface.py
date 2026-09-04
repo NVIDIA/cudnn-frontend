@@ -106,10 +106,10 @@ def _cutlass_dsl_version() -> tuple[int, int, int]:
 
 
 def _require_sage_fp8_cutedsl() -> None:
-    """Gate the new Sage FP8 kernels while preserving the package's 4.5 floor."""
+    """Gate the Sage FP8 kernels for environments that force a DSL below the package floor."""
     if _cutlass_dsl_version() < (4, 6, 1):
         raise RuntimeError(
-            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available with the package minimum of 4.5.0"
+            "Sage FP8 block-sparse attention requires nvidia-cutlass-dsl>=4.6.1; " "the BF16/FP16 BSA paths remain available on older DSL builds"
         )
 
 

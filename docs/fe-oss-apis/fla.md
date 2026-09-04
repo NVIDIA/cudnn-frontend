@@ -112,11 +112,11 @@ version-gated to the validated release:
 
 ```bash
 pip install flash-linear-attention==0.5.2
-pip install "nvidia-cudnn-frontend[cutedsl]"
+pip install nvidia-cudnn-frontend
 ```
 
-The `cutedsl` extra supplies the optional CUTLASS DSL and CUDA Python
-dependencies required by the native `gated_mlp` and `short_conv` targets. To
+The base install supplies the CUTLASS DSL and CUDA Python dependencies
+required by the native `gated_mlp` and `short_conv` targets. To
 require the native `short_conv` route instead of its typed fallback, also
 ensure CUTLASS DSL 4.7 or newer is installed using the package variant that
 matches the CUDA Toolkit:
