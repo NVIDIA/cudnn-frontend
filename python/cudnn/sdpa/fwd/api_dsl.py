@@ -111,7 +111,7 @@ def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[
 # smaller FP8 flavor reaches, at most 2x zero-padding. A smaller graph is
 # declined rather than routed onto a kernel whose cga4x1 role-split geometry is
 # tuned for d = 512.
-_SM100_FP8_ENVELOPE_FLOORS = {(512, 512): 256}
+_SM100_FP8_ENVELOPE_FLOORS = {(192, 128): 128, (256, 256): 255, (512, 512): 256}  # (192,128)/(256,256): exact shape only, see engines._sm100_fp8_spec
 
 
 def _fp8_envelope_covers(d_qk: int, d_v: int, shapes) -> bool:
@@ -1088,7 +1088,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         # An FP8 graph must only land on a flavor that HAS an fp8 kernel: the
         # per-tensor and block-scale families have different native maps.
-        self.flavor = _pick_flavor(d_qk, d_v, tuple(f for f in _SM100_FLAVORS if f in fp8_shapes) if self._fp8 else None)
+        # The FP8 walk must agree with check_support: a flavor whose envelope
+        # floor excludes (d_qk, d_v) is skipped, so the graph lands on the next
+        # covering flavor instead of the one the floor exists to keep it off.
+        self.flavor = _pick_flavor(
+            d_qk,
+            d_v,
+            (
+                tuple(
+                    f
+                    for f in _SM100_FLAVORS
+                    if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
+                )
+                if self._fp8
+                else None
+            ),
+        )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
