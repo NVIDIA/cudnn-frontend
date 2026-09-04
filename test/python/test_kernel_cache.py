@@ -33,6 +33,18 @@ shapes = [
 ]
 
 
+def build_plans_or_skip(graph):
+    """Compile the plan, and waive the test if the graph is not supported."""
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+    except cudnn.cudnnGraphNotSupportedError as e:
+        print(f"TEST WAIVED: unsupported graph. {e}")
+        pytest.skip("TEST WAIVED: unsupported graph.")
+
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+
+
 def build_cudnn_graph(handle, cache, shape, build_plans=True):
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
@@ -68,14 +80,7 @@ def build_cudnn_graph(handle, cache, shape, build_plans=True):
     if not build_plans:
         return graph
 
-    try:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print(f"TEST WAIVED: unsupported graph. {e}")
-        pytest.skip("TEST WAIVED: unsupported graph.")
-
-    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+    build_plans_or_skip(graph)
 
     return graph
 
@@ -291,9 +296,7 @@ def test_kernel_cache_revision_and_size(cudnn_handle):
     assert cache.size() == 0
 
     # The first plan build on a cold cache always inserts one entry.
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+    build_plans_or_skip(graph)
     assert cache.revision() == 1
     assert cache.size() == 1
 
