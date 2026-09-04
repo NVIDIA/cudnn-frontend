@@ -9,6 +9,8 @@ from typing import Iterator, Optional
 
 from cuda.bindings import driver as cuda
 
+from cudnn.tensor_adapter import get_device, get_shape, get_strides
+
 
 class GroupedGemmBackend(str, Enum):
     BF16 = "bf16"
@@ -40,6 +42,22 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
+def wrapper_operand_meta(tensor):
+    """Everything a wrapper's derivation reads off an operand, and nothing else.
+
+    Deliberately not the object's identity: CPython recycles a freed tensor's address,
+    so an id-keyed memo answers for tensors it never saw. Data pointers are excluded --
+    they vary per call and nothing derived depends on them; execute() re-checks them.
+    """
+    if tensor is None or not hasattr(tensor, "shape"):
+        return tensor
+    device = get_device(tensor)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
+
+
+_backend_memo: dict = {}
+
+
 def select_grouped_gemm_backend(
     *,
     operation,
@@ -48,6 +66,20 @@ def select_grouped_gemm_backend(
     scale_controls,
     block_scaled_dtype_pairs,
 ):
+    forbidden = tuple(name for name, value in scale_controls if value is not None)
+    try:
+        memo_key = (operation, a_dtype, b_dtype, forbidden, frozenset(block_scaled_dtype_pairs))
+        backend = _backend_memo.get(memo_key)
+    except TypeError:
+        memo_key = backend = None
+    if backend is None:
+        backend = _select_grouped_gemm_backend_uncached(operation, a_dtype, b_dtype, forbidden, block_scaled_dtype_pairs)
+        if memo_key is not None:
+            _backend_memo[memo_key] = backend
+    return backend
+
+
+def _select_grouped_gemm_backend_uncached(operation, a_dtype, b_dtype, forbidden, block_scaled_dtype_pairs):
     # Compare in canonical (cutlass) dtype space so torch/jax/numpy/str dtypes all
     # resolve; dtypes with no cutlass mapping fall through to the unsupported-pair error.
     import cutlass
@@ -60,7 +92,6 @@ def select_grouped_gemm_backend(
     if any(bf16_operands):
         if not all(bf16_operands):
             raise ValueError(f"{operation}: mixed dtype families: a_dtype={a_dtype}, " f"b_dtype={b_dtype}")
-        forbidden = [name for name, value in scale_controls if value is not None]
         if forbidden:
             raise ValueError(f"{operation}: BF16 forbids scale control {forbidden[0]}")
         return GroupedGemmBackend.BF16

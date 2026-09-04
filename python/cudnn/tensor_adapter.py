@@ -145,11 +145,20 @@ def cuda_is_available() -> bool:
     return err == cudart.cudaError_t.cudaSuccess and count > 0
 
 
+# Device ordinal -> (major, minor). Immutable for the process lifetime; keyed on the
+# current device so multi-GPU processes never see another device's capability.
+_compute_capability_memo: dict = {}
+
+
 def get_compute_capability() -> Tuple[int, int]:
     """(major, minor) of the current CUDA device, without requiring torch."""
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_available():
-        return torch.cuda.get_device_capability(torch.cuda.current_device())
+        device = torch.cuda.current_device()
+        capability = _compute_capability_memo.get(device)
+        if capability is None:
+            capability = _compute_capability_memo[device] = torch.cuda.get_device_capability(device)
+        return capability
     from cuda.bindings import runtime as cudart
 
     def _check(result):
@@ -159,9 +168,12 @@ def get_compute_capability() -> Tuple[int, int]:
         return values[0] if len(values) == 1 else values
 
     device = _check(cudart.cudaGetDevice())
-    major = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, device))
-    minor = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMinor, device))
-    return major, minor
+    capability = _compute_capability_memo.get(device)
+    if capability is None:
+        major = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, device))
+        minor = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMinor, device))
+        capability = _compute_capability_memo[device] = (major, minor)
+    return capability
 
 
 def canonicalize_unit_dim_strides(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> Tuple[int, ...]:

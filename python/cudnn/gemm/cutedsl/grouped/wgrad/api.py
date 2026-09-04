@@ -29,6 +29,7 @@ from ..backend_utils import (
     _torch_stream_context,
     backend_cache_key,
     select_grouped_gemm_backend,
+    wrapper_operand_meta,
 )
 from ..moe_utils import WGradInputOrder
 
@@ -234,6 +235,26 @@ def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tup
     return (shape, layout, _convert_to_cutlass_data_type(tensor.dtype), get_device(tensor))
 
 
+def _wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream):
+    if framework == "torch":
+        import torch
+
+        allocator = torch.zeros if accumulate_on_output else torch.empty
+        with _torch_stream_context(current_stream, a_tensor.device):
+            return allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "torch"), device=a_tensor.device)
+    import jax
+    import jax.numpy as jnp
+
+    # C-contiguous expert/M/N-order output; the kernel writes into this buffer
+    # on the launch stream, so materialize it before its pointer is taken.
+    allocator = jnp.zeros if accumulate_on_output else jnp.empty
+    return jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
+
+
+# Operand-metadata key -> (op, framework, output shape, output dtype); see wrapper_operand_meta.
+_wgrad_wrapper_memo: dict = {}
+
+
 def grouped_gemm_wgrad_wrapper_sm100(
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,
@@ -256,6 +277,47 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    memo_key = (
+        type(a_tensor),
+        wrapper_operand_meta(a_tensor),
+        wrapper_operand_meta(b_tensor),
+        wrapper_operand_meta(sfa_tensor),
+        wrapper_operand_meta(sfb_tensor),
+        wrapper_operand_meta(offsets_tensor),
+        output_mode,
+        wrapper_operand_meta(wgrad_tensor),
+        wrapper_operand_meta(wgrad_ptrs),
+        wrapper_operand_meta(global_scale_a),
+        wrapper_operand_meta(global_scale_b),
+        acc_dtype,
+        wgrad_dtype,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        sf_vec_size,
+        sf_fp8_dtype_override,
+        accumulate_on_output,
+        input_order,
+        os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+    )
+    memo = _wgrad_wrapper_memo.get(memo_key)
+    if memo is not None:
+        op, framework, wgrad_shape, memo_wgrad_dtype = memo
+        if wgrad_tensor is None and wgrad_ptrs is None:
+            wgrad_tensor = _wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
+        op.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            offsets_tensor=offsets_tensor,
+            wgrad_tensor=wgrad_tensor,
+            wgrad_ptrs=wgrad_ptrs,
+            global_scale_a=global_scale_a,
+            global_scale_b=global_scale_b,
+            current_stream=current_stream,
+        )
+        return TupleDict(wgrad_tensor=wgrad_tensor)
+
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wgrad_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -294,22 +356,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
     )
     if framework == "jax" and backend is GroupedGemmBackend.BLOCK_SCALED:
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
+    wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
-        wgrad_shape = (expert_cnt, hidden, intermediate)
-        if framework == "torch":
-            import torch
-
-            allocator = torch.zeros if accumulate_on_output else torch.empty
-            with _torch_stream_context(current_stream, a_tensor.device):
-                wgrad_tensor = allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "torch"), device=a_tensor.device)
-        else:
-            import jax
-            import jax.numpy as jnp
-
-            # C-contiguous expert/M/N-order output; the kernel writes into this buffer
-            # on the launch stream, so materialize it before its pointer is taken.
-            allocator = jnp.zeros if accumulate_on_output else jnp.empty
-            wgrad_tensor = jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
+        wgrad_tensor = _wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
     cache_key = backend_cache_key(
         backend,
         get_device_type(),
@@ -378,6 +427,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             raise RuntimeError("Unsupported configuration")
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
+    _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,

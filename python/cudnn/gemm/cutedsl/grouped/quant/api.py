@@ -35,7 +35,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg, wrapper_operand_meta
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
@@ -1283,6 +1283,33 @@ import logging
 _logger = logging.getLogger(__name__)
 _cache_of_GroupedGemmQuantSm100Objects = {}
 
+# Operand-metadata key -> derived output spec; see wrapper_operand_meta.
+_quant_wrapper_memo: dict = {}
+
+
+def _quant_outputs(valid_m, n_out, l, d_dtype, d_tensor, sf_dtype, sf_vec_size, low_precision_output, device) -> TupleDict:
+    import torch
+
+    if d_tensor is None:
+        d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device)
+    d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device) if low_precision_output else None
+    sfd_row_tensor = sfd_col_tensor = amax_tensor = None
+    if sf_dtype is not None:
+        mma_permute_order = (3, 4, 1, 5, 2, 0)
+        mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, sf_vec_size), 4), 32, 4, 4)
+        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=device).permute(mma_permute_order)
+        mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(ceil_div(valid_m, sf_vec_size), 4), 32, 4, 4)
+        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=device).permute(mma_permute_order)
+    if d_dtype in (torch.bfloat16, torch.float16):
+        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=device)
+    return TupleDict(
+        d_tensor=d_tensor,
+        d_col_tensor=d_col_tensor,
+        amax_tensor=amax_tensor,
+        sfd_row_tensor=sfd_row_tensor,
+        sfd_col_tensor=sfd_col_tensor,
+    )
+
 
 def grouped_gemm_quant_wrapper_sm100(
     a_tensor: torch.Tensor,
@@ -1389,6 +1416,63 @@ def grouped_gemm_quant_wrapper_sm100(
     """
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 
+    memo_key = (
+        type(a_tensor),
+        wrapper_operand_meta(a_tensor),
+        wrapper_operand_meta(sfa_tensor),
+        wrapper_operand_meta(padded_offsets),
+        wrapper_operand_meta(alpha_tensor),
+        wrapper_operand_meta(b_tensor),
+        wrapper_operand_meta(sfb_tensor),
+        wrapper_operand_meta(bias_tensor),
+        wrapper_operand_meta(b_ptrs),
+        wrapper_operand_meta(sfb_ptrs),
+        wrapper_operand_meta(norm_const_tensor),
+        wrapper_operand_meta(prob_tensor),
+        wrapper_operand_meta(row_scale_tensor),
+        wrapper_operand_meta(d_tensor),
+        n,
+        b_dtype,
+        b_major,
+        acc_dtype,
+        d_dtype,
+        cd_major,
+        tuple(mma_tiler_mn),
+        None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+        sf_vec_size,
+        sf_fp8_dtype_override,
+        vector_f32,
+        m_aligned,
+        discrete_col_sfd,
+        use_dynamic_sched,
+        use_single_group_runtime_offsets,
+    )
+    memo = _quant_wrapper_memo.get(memo_key)
+    if memo is not None:
+        grouped_gemm_quant, valid_m, n_out, l, memo_d_dtype, sf_dtype, low_precision_output = memo
+        outputs = _quant_outputs(valid_m, n_out, l, memo_d_dtype, d_tensor, sf_dtype, sf_vec_size, low_precision_output, a_tensor.device)
+        grouped_gemm_quant.execute(
+            a_tensor=a_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            d_tensor=outputs["d_tensor"],
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            d_col_tensor=outputs["d_col_tensor"],
+            sfd_row_tensor=outputs["sfd_row_tensor"],
+            sfd_col_tensor=outputs["sfd_col_tensor"],
+            amax_tensor=outputs["amax_tensor"],
+            norm_const_tensor=norm_const_tensor if low_precision_output else None,
+            prob_tensor=prob_tensor,
+            row_scale_tensor=row_scale_tensor,
+            current_stream=current_stream,
+        )
+        return outputs
+
     framework = detect_framework(a_tensor)
     if framework == "jax":
         raise ValueError(f"grouped_gemm_quant_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
@@ -1442,33 +1526,21 @@ def grouped_gemm_quant_wrapper_sm100(
 
     _logger.debug("grouped_gemm_quant_wrapper_sm100: Creating output tensors")
 
-    if cd_major == "n":
-        expected_shape = (valid_m, n_out, 1)
-        expected_stride = (n_out, 1, valid_m * n_out)
-        if d_tensor is None:
-            d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-        elif (
-            tuple(d_tensor.shape) != expected_shape
-            or tuple(d_tensor.stride()) != expected_stride
-            or _convert_to_cutlass_data_type(d_tensor.dtype) != d_dtype
-            or get_device(d_tensor) != get_device(a_tensor)
-        ):
-            raise ValueError(
-                f"d_tensor must have shape {expected_shape}, stride {expected_stride}, "
-                f"dtype {d_dtype}, device {a_tensor.device}, but got shape {tuple(d_tensor.shape)}, "
-                f"stride {tuple(d_tensor.stride())}, dtype {d_tensor.dtype}, device {d_tensor.device}."
-            )
-        d_col_tensor = (
-            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-            if is_low_precision_output_config
-            else None
-        )
-    else:
+    if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
-
-    sfd_row_tensor = None
-    sfd_col_tensor = None
-    amax_tensor = None
+    expected_shape = (valid_m, n_out, 1)
+    expected_stride = (n_out, 1, valid_m * n_out)
+    if d_tensor is not None and (
+        tuple(d_tensor.shape) != expected_shape
+        or tuple(d_tensor.stride()) != expected_stride
+        or _convert_to_cutlass_data_type(d_tensor.dtype) != d_dtype
+        or get_device(d_tensor) != get_device(a_tensor)
+    ):
+        raise ValueError(
+            f"d_tensor must have shape {expected_shape}, stride {expected_stride}, "
+            f"dtype {d_dtype}, device {a_tensor.device}, but got shape {tuple(d_tensor.shape)}, "
+            f"stride {tuple(d_tensor.stride())}, dtype {d_tensor.dtype}, device {d_tensor.device}."
+        )
 
     if is_fp8_input_config and is_low_precision_output_config and norm_const_tensor is None:
         raise ValueError(
@@ -1480,37 +1552,10 @@ def grouped_gemm_quant_wrapper_sm100(
     if not is_low_precision_output_config:
         norm_const_tensor = None
 
-    if is_fp8_input_config and is_low_precision_output_config:
-        _logger.debug("grouped_gemm_quant_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
-
-        sf_dtype = sfa_tensor.dtype
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-        sf_k_row = ceil_div(n_out, sf_vec_size)
-        mma_shape_row = (
-            1,
-            ceil_div(valid_m, 128),
-            ceil_div(sf_k_row, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-
-        sf_k_col = ceil_div(valid_m, sf_vec_size)
-        mma_shape_col = (
-            1,
-            ceil_div(n_out, 128),
-            ceil_div(sf_k_col, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-
-    if d_dtype in (cutlass.BFloat16, cutlass.Float16):
-        _logger.debug("grouped_gemm_quant_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
-        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+    sf_dtype = sfa_tensor.dtype if is_fp8_input_config and is_low_precision_output_config else None
+    torch_d_dtype = framework_dtype(d_dtype, "torch")
+    outputs = _quant_outputs(valid_m, n_out, l, torch_d_dtype, d_tensor, sf_dtype, sf_vec_size, is_low_precision_output_config, a_tensor.device)
+    d_tensor, d_col_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
 
     device_type = get_device_type()
     if row_scale_tensor is not None:
@@ -1525,13 +1570,7 @@ def grouped_gemm_quant_wrapper_sm100(
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_quant_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return TupleDict(
-            d_tensor=d_tensor,
-            d_col_tensor=d_col_tensor,
-            amax_tensor=amax_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
-        )
+        return outputs
 
     def tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
         if tensor is None:
@@ -1706,6 +1745,8 @@ def grouped_gemm_quant_wrapper_sm100(
         grouped_gemm_quant.compile()
         _cache_of_GroupedGemmQuantSm100Objects[cache_key] = grouped_gemm_quant
 
+    _quant_wrapper_memo[memo_key] = (grouped_gemm_quant, valid_m, n_out, l, torch_d_dtype, sf_dtype, is_low_precision_output_config)
+
     if is_dense:
         grouped_gemm_quant.execute(
             a_tensor=a_tensor,
@@ -1745,10 +1786,4 @@ def grouped_gemm_quant_wrapper_sm100(
             current_stream=current_stream,
         )
 
-    return TupleDict(
-        d_tensor=d_tensor,
-        d_col_tensor=d_col_tensor,
-        amax_tensor=amax_tensor,
-        sfd_row_tensor=sfd_row_tensor,
-        sfd_col_tensor=sfd_col_tensor,
-    )
+    return outputs
