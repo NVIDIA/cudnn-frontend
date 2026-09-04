@@ -74,6 +74,18 @@ def _ref_bwd(q, k, v, do, scale, causal=False, bottom_right=False, window_left=N
     return q.grad, k.grad, v.grad
 
 
+def _below_tol(msg):
+    """True when a collected ``cos ...`` line is a FAILURE.
+
+    Written as ``not (x > tol)`` and not ``x <= tol`` on purpose: ``_cos``
+    returns NaN whenever a gradient holds NaN or Inf, and every comparison
+    against NaN is False -- so ``<=`` would let a fully poisoned gradient
+    through as a pass.  ``_run_graph`` has a separate ``isfinite`` guard, but
+    ``_run`` (the direct-adapter path) does not, and this is its only net.
+    """
+    return not (float(msg.split("cos ")[1].split(" ")[0]) > _TOL_COS)
+
+
 def _cos(a, b):
     a, b = a.double().flatten(), b.double().flatten()
     if a.norm() == 0 and b.norm() == 0:
@@ -181,7 +193,7 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
             # different kernels, and stopping at the first failure throws that
             # away.
             bad.append(f"seq {i} {name}: cos {_cos(got, want):.6f} (lens q={lens_q[i]} kv={lens_kv[i]})")
-    failures = [m for m in bad if float(m.split("cos ")[1].split(" ")[0]) <= _TOL_COS]
+    failures = [m for m in bad if _below_tol(m)]
     assert not failures, "\n".join(bad)
 
 
@@ -333,7 +345,7 @@ def _check(case, dq, dk, dv):
             ("dV", dv[0, sl_k].transpose(0, 1), rv),
         ):
             bad.append(f"seq {i} {name}: cos {_cos(got, want):.6f} (lens q={case.lens_q[i]} kv={case.lens_kv[i]})")
-    failures = [m for m in bad if float(m.split("cos ")[1].split(" ")[0]) <= _TOL_COS]
+    failures = [m for m in bad if _below_tol(m)]
     assert not failures, "\n".join(bad)
 
 
@@ -540,6 +552,29 @@ def test_graph_thd_nan_capacity_tail():
     out, and ``0 * NaN`` is NaN, so this is the test that proves the clamps.
     """
     _run_graph((256, 128), (256, 128), poison=True, pad_cap=384)
+
+
+def test_graph_thd_nan_capacity_tail_unaligned_last_sequence():
+    """The capacity tail reached by a K-TILE OVERSHOOT, not by an M tile.
+
+    ``test_graph_thd_nan_capacity_tail`` uses lengths that are multiples of the
+    64-wide k tile, so every k tile stops exactly at ``cu_*[B]`` and the packed
+    B operand is never read past it.  Here the LAST sequence is 100 tokens: its
+    reduction runs ceil(100/64) = 2 tiles = 128 rows, so the final tile reads 28
+    rows PAST the packed total, into the caller's declared-but-unwritten
+    capacity.
+
+    Those rows meet A's block padding, which stage 2 zeroed -- and ``0 * NaN``
+    is NaN, so the whole gradient goes.  Only the packed-total-clamped B
+    descriptor keeps them out (the GridConstant one is built at the buffer's
+    CAPACITY, and a declared ``max_total_seq_len`` cannot help: it is a maximum,
+    while the row that must read zero is ``cu_*[B]``, which moves every step).
+
+    Both GEMM orientations are covered by one shape: 100 is a non-multiple of 64
+    on the q side (the m-major dV/dK reduction) and on the kv side (the k-major
+    dQ one).
+    """
+    _run_graph((256, 100), (256, 100), poison=True, pad_cap=384)
 
 
 def test_graph_thd_b1_matches_dense_shape():

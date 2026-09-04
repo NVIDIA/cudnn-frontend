@@ -119,6 +119,37 @@ _THD_MM = bool(getattr(PARAMS, "thd_varlen", False))
 _THD_MM_SEQ_ORD = 1
 THD_MM_DESC_SLOTS = lambda b: b + 1  # noqa: E731
 B_CLAMP_SLOT = lambda b: b  # noqa: E731
+
+
+@cute.jit
+def _thd_desc_ptr(desc_words, slot):
+    """Generic-space pointer to one 128-B tensor map in the patched array."""
+    return (desc_words.iterator.raw_ptr() + slot * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+
+
+@cute.jit
+def _thd_acquire_descs(desc_words, n_batch):
+    """Acquire EVERY patched descriptor into the TMA proxy, once per warp.
+
+    ``fence.proxy.tensormap::generic.acquire`` takes a size operand whose ONLY
+    legal value is 128 -- one descriptor.  Acquiring the array's base therefore
+    orders the FIRST slot and nothing else, so a warp that later selects slot
+    ``tile_b`` (the per-sequence C descriptors) or slot ``n_batch`` (the clamped
+    B descriptor) could read metadata the TMA proxy still has stale.  Loop the
+    whole array instead: ``n_batch + 1`` fences, hoisted out of the persistent
+    loop, because the patch launch writes these once before this kernel starts
+    and never rewrites them.
+    """
+    for _slot in cutlass.range(n_batch + cutlass.Int32(1)):
+        nvvm.fence_proxy_acquire(
+            nvvm.MemScope.GPU,
+            _thd_desc_ptr(desc_words, _slot),
+            128,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
 b_is_n_major = bool(PARAMS.b_is_n_major)
 causal_mode = int(PARAMS.causal_mode)
 causal_gran = int(PARAMS.causal_gran)
@@ -765,6 +796,15 @@ def _bprop_matmul_bh_sm100_kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_tma = cutlass.Int32(0)
+        # B's THD descriptor is CLAMPED to the packed total `cu_*[B]`, so the
+        # last k tile of the last sequence reads the caller's unwritten capacity
+        # tail as TMA zeros instead of live memory.  The GridConstant descriptor
+        # is built at the buffer's CAPACITY (a declared `max_total_seq_len` is a
+        # maximum, while the row that must read zero moves every step), so using
+        # it here would multiply A's padding zeros by whatever the caller left
+        # past `cu_*[B]` -- and `0 * NaN` is NaN.
+        if cutlass.const_expr(_THD_MM):
+            _thd_acquire_descs(desc_words, n_batch)
         while is_valid != 0:
             coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             if cutlass.const_expr(cta_group == 1):
@@ -905,13 +945,17 @@ def _bprop_matmul_bh_sm100_kernel(
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                     tma_b_desc = tma_b_descs[_bj]
+                    # See the note above the persistent loop: THD substitutes
+                    # the packed-total-clamped descriptor for the capacity-sized
+                    # GridConstant one.  Dense folds back to `.get_ptr()`.
+                    _b_desc_ptr = _thd_desc_ptr(desc_words, B_CLAMP_SLOT(n_batch)) if cutlass.const_expr(_THD_MM) else tma_b_desc.get_ptr()
                     if cutlass.const_expr(b_mcast_slices > 1):
                         _b_rows = cta_tile_mnk[1] // b_mcast_slices
                         if cutlass.const_expr(fallback_cluster_shape_mnk is None):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage.subview(pair_m_idx * _b_rows * cta_tile_mnk[2]),
-                                    tma_b_desc.get_ptr(),
+                                    _b_desc_ptr,
                                     (coord_k_b, coord_n_per_cta + pair_m_idx * _b_rows, tile_h_b, tile_b_b),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
@@ -927,7 +971,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(_b_idx * _b_rows * cta_tile_mnk[2]),
-                                        tma_b_desc.get_ptr(),
+                                        _b_desc_ptr,
                                         (coord_k_b, coord_n_per_cta + _b_idx * _b_rows, tile_h_b, tile_b_b),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
@@ -941,7 +985,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                     if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                            tma_b_desc.get_ptr(),
+                                            _b_desc_ptr,
                                             (
                                                 coord_n_per_cta + n_group * b_tma_group_elems,
                                                 coord_k_b,
@@ -957,7 +1001,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
-                                        tma_b_desc.get_ptr(),
+                                        _b_desc_ptr,
                                         (coord_k_b, coord_n_per_cta, tile_h_b, tile_b_b),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
@@ -970,7 +1014,7 @@ def _bprop_matmul_bh_sm100_kernel(
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                        tma_b_desc.get_ptr(),
+                                        _b_desc_ptr,
                                         (
                                             coord_n_per_cta + n_group * b_tma_group_elems,
                                             coord_k_b,
@@ -986,7 +1030,7 @@ def _bprop_matmul_bh_sm100_kernel(
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage,
-                                    tma_b_desc.get_ptr(),
+                                    _b_desc_ptr,
                                     (coord_k_b, coord_n_per_cta, tile_h_b, tile_b_b),
                                     ab_full_mbar_ptr.subview(stage),
                                     [],
@@ -1315,17 +1359,12 @@ def _bprop_matmul_bh_sm100_kernel(
         tile_l = init_tile_l
         tile_h, tile_b = _decode_bh(tile_l, n_head)
         if cutlass.const_expr(_THD_MM):
-            # ONE acquire per epilogue warp over the descriptor array: the patch
-            # launch wrote it once, before this kernel started, so a per-store
-            # fence would be pure cost.  The array is contiguous, so acquiring
-            # its base covers every slot this warp will read.
-            nvvm.fence_proxy_acquire(
-                nvvm.MemScope.GPU,
-                desc_words.iterator.raw_ptr().tospace(cutlass.AddressSpace.generic),
-                128,
-                from_proxy=nvvm.Proxy.GENERIC,
-                to_proxy=nvvm.Proxy.TENSORMAP,
-            )
+            # Once per epilogue warp, not per store: the patch launch wrote the
+            # array before this kernel started and never rewrites it.  But it is
+            # one acquire PER SLOT -- the fence's size operand only accepts 128,
+            # i.e. a single descriptor, so acquiring the base would order slot 0
+            # alone while this warp goes on to select slot `tile_b`.
+            _thd_acquire_descs(desc_words, n_batch)
         # The C-side cu_seqlens prefix inside the metadata buffer: dV/dK write
         # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
         # makes when it bases each sequence's descriptor.

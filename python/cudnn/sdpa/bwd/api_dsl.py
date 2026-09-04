@@ -2272,6 +2272,15 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 bool(self._stage_in or self._stage_out),
                 f"SM100 bwd THD: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical " "(the packed path has no staging copy)",
             )
+            # Declined HERE and not only at execute: `_execute_thd` raises after
+            # the workspace carve and the do_dot launch, so a direct
+            # SdpaBwdDslSm100 caller would pay a build and an allocation before
+            # learning the plan is unserved. The graph path never reaches either
+            # (the row leaves `thd_gqa` False), which is why this is a backstop.
+            self._value_error_if(
+                self._gqa_group > 1,
+                "SM100 bwd THD: GQA is not implemented yet (the dK/dV partials need packed per-Q-head buffers)",
+            )
             self._value_error_if(
                 self._thd_lse_token_major and bool(self.thd_stats_head_stride),
                 "SM100 bwd THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
