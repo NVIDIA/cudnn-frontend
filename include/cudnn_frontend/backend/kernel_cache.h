@@ -137,8 +137,8 @@ class KernelCache : public detail::backend_descriptor {
     /// lookup does not change the counter.
     ///
     /// Use this function, and not size(), to find if the cache changed. cuDNN can replace data
-    /// that is already in the cache, so size() is not a reliable measure. You can use that
-    /// decision, for example, to find if a new serialization is worth the cost.
+    /// that is already in the cache, so size() is not a reliable measure. A change in the counter
+    /// shows, for example, that a new serialization is worth the cost.
     ///
     /// The counter is local to the process. to_json() does not put the counter in its data, and
     /// from_json() starts a new count. Two kernel caches have no common count.

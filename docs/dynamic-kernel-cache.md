@@ -45,7 +45,7 @@ size = kernel_cache.size()
 
 Both accessors need a finalized kernel cache. They return an error before `build()`.
 
-- Use `revision()`, and not `size()`, to find if the cache changed. cuDNN can replace data that is already in the cache, so `size()` is not a reliable measure. An insertion, a replacement, a removal, or an eviction each add one to the revision counter. A lookup does not change it. You can use that decision, for example, to find if a new serialization is worth the cost.
+- Use `revision()`, and not `size()`, to find if the cache changed. cuDNN can replace data that is already in the cache, so `size()` is not a reliable measure. An insertion, a replacement, a removal, or an eviction each add one to the revision counter. A lookup does not change it. A change in the counter shows, for example, that a new serialization is worth the cost.
 - Two different shapes can use the same kernel cache entry, and `size()` can stay the same after a build with a new shape.
 - The revision counter is local to the process. It is not part of the serialized data, and a `from_json()` load starts a new count. Two kernel caches have no common count.
 
