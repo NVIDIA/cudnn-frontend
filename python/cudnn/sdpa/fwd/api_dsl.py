@@ -1398,6 +1398,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 has_lse=self.lse_desc is not None,
                 has_amax=self._fp8,
                 lse_stride=self._lse_stride,
+                # Rubin's D128 combine has thousands of row blocks at the
+                # admitted prefill shapes.  Up through split-6, one warp keeps
+                # that grid full while avoiding four copies of the row-uniform
+                # LSE/weight work.  Larger factors favor the wider block.
+                threads=32 if self._device_cc == (10, 7) and self.head_dim_v == 128 and self.split_kv <= 6 else 128,
             )
         self._logger.debug("compile completed")
 
