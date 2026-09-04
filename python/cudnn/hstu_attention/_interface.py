@@ -147,7 +147,7 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
 def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     """Return whether the fused epilogue can write directly to ``t``.
 
-    The D64/D128 epilogue uses 128-bit stores, so the unit-stride head
+    The D32/D64/D128 epilogue uses 128-bit stores, so the unit-stride head
     dimension and the token/head offsets must remain 16-byte aligned.
     The kernel restores those dynamic-stride divisibility assumptions before
     constructing its output views.
@@ -187,7 +187,7 @@ def hstu_varlen_fwd_100(
     head_dim = q.shape[2]
     head_dim_v = v.shape[2]
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
-    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
+    assert head_dim in (32, 64, 128, 256), "Only support head_dim 32, 64, 128 and 256"
 
     kBlockM = 128
     kBlockN = 128
@@ -398,7 +398,7 @@ def hstu_varlen_bwd_100(
     head_dim = q.shape[2]
     num_heads_k = k.shape[1]
 
-    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
+    assert head_dim in (32, 64, 128, 256), "Only support head_dim 32, 64, 128 and 256"
     assert num_heads == num_heads_k, "Number of heads in key/value and query must be equal"
     assert k.shape[2] == head_dim, "k and q must have the same head_dim"
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
@@ -444,7 +444,7 @@ def hstu_varlen_bwd_100(
     if use_auto_block_metadata:
         # Build on every execution so in-place func updates, including CUDA
         # Graph replay updates, are visible to the consumer.  The private K2Q
-        # layout is fixed by the fused D64/D128 backward tile contract.
+        # layout is fixed by the fused D32/D64/D128 backward tile contract.
         block_sparse_tensors = build_hstu_k2q_block_sparse(
             func,
             cu_seqlens_q,
