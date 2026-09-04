@@ -450,7 +450,7 @@ def _reduce_s8_dim_chunks_owned(
     p1: Float32,
     p2: Float32,
     p3: Float32,
-    lane_group4: Float32,
+    p4: Float32,
     p5: Float32,
     p6: Float32,
     p7: Float32,
@@ -466,7 +466,7 @@ def _reduce_s8_dim_chunks_owned(
             Float32(p1).ir_value(loc=loc, ip=ip),
             Float32(p2).ir_value(loc=loc, ip=ip),
             Float32(p3).ir_value(loc=loc, ip=ip),
-            Float32(lane_group4).ir_value(loc=loc, ip=ip),
+            Float32(p4).ir_value(loc=loc, ip=ip),
             Float32(p5).ir_value(loc=loc, ip=ip),
             Float32(p6).ir_value(loc=loc, ip=ip),
             Float32(p7).ir_value(loc=loc, ip=ip),
@@ -474,30 +474,30 @@ def _reduce_s8_dim_chunks_owned(
         """{
         .reg .u32 lane, bits, send_bits, recv_bits;
         .reg .pred pred;
-        .reg .f32 val<8>, y<4>, z<2>, lhs, rhs, acc, recv;
-        mov.f32 val0, $1;
-        mov.f32 val1, $2;
-        mov.f32 val2, $3;
-        mov.f32 val3, $4;
-        mov.f32 val4, $5;
-        mov.f32 val5, $6;
-        mov.f32 val6, $7;
-        mov.f32 val7, $8;
+        .reg .f32 p<8>, y<4>, z<2>, lhs, rhs, acc, recv;
+        mov.f32 p0, $1;
+        mov.f32 p1, $2;
+        mov.f32 p2, $3;
+        mov.f32 p3, $4;
+        mov.f32 p4, $5;
+        mov.f32 p5, $6;
+        mov.f32 p6, $7;
+        mov.f32 p7, $8;
         mov.u32 lane, %laneid;
 
         and.b32 bits, lane, 16;
         setp.ne.u32 pred, bits, 0;
-        selp.f32 lhs, val4, val0, pred;
-        selp.f32 rhs, val0, val4, pred;
+        selp.f32 lhs, p4, p0, pred;
+        selp.f32 rhs, p0, p4, pred;
         add.rn.f32 y0, lhs, rhs;
-        selp.f32 lhs, val5, val1, pred;
-        selp.f32 rhs, val1, val5, pred;
+        selp.f32 lhs, p5, p1, pred;
+        selp.f32 rhs, p1, p5, pred;
         add.rn.f32 y1, lhs, rhs;
-        selp.f32 lhs, val6, val2, pred;
-        selp.f32 rhs, val2, val6, pred;
+        selp.f32 lhs, p6, p2, pred;
+        selp.f32 rhs, p2, p6, pred;
         add.rn.f32 y2, lhs, rhs;
-        selp.f32 lhs, val7, val3, pred;
-        selp.f32 rhs, val3, val7, pred;
+        selp.f32 lhs, p7, p3, pred;
+        selp.f32 rhs, p3, p7, pred;
         add.rn.f32 y3, lhs, rhs;
 
         and.b32 bits, lane, 8;
