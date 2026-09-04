@@ -40,6 +40,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Int32, Float32, Boolean
+from cutlass.experimental import primitives as prims
+from cutlass.experimental.cuda import tensor_map as tmap
 
 from . import _bprop_mxfp8_masks_sm100 as fmha_masks
 from . import _bprop_mxfp8_common_sm100 as cute_common
@@ -628,109 +630,46 @@ class BlackwellFmhaBackwardDQ256:
         self.tma_copy_V_bytes = cute.size_in_bytes(LOW_PRECISION_TYPE, V_smem_layout)
         self.tma_copy_dO_bytes = cute.size_in_bytes(LOW_PRECISION_TYPE, dO_smem_layout)
 
-        # Scale storage is padded to a full 128-row atom before 2-CTA routing.
-        Q_shape_sfa = (
-            cute.round_up(q_seq_max, 128) * 2,
-            Q.shape[1],
-            cute.size(Q.shape[2]) * 2,
+        # Scale factors: TMA descriptors straight over cuDNN's canonical F8_128x4
+        # planes (one plane per (b, h)); see the native-SF section of
+        # _bprop_mxfp8_common_sm100.  Rowwise tensors (rows = S, groups along
+        # D) are plane-major; the columnwise K^T scales (rows = D, groups
+        # along S_kv) keep the D tile outside the plane and are fetched as a
+        # 2-tile box (both 128-row D tiles of one S_kv group column).
+        # (head_dim is the static template value; the kernel-side byte counts
+        # below must stay Python ints, never host IR values.)
+        sf_d_groups = self.head_dim // self.sf_vec_size
+        sf_d_tiles = self.head_dim // 128
+        # Plane counts from the problem shape: the KV tensors' grouped head mode
+        # broadcasts h_r, so its cute.size would over-count KV planes (harmless
+        # for a plane-major map, wrong for the columnwise K^T tile stride).
+        sf_q_planes = h_r * h_k * b
+        sf_kv_planes = h_k * b
+        sfq_tmap = cute_common.make_sf_tensor_map(SF_Q, q_seq_max, sf_d_groups, sf_q_planes, plane_major=True)
+        sfk_tmap = cute_common.make_sf_tensor_map(SF_K, k_seq_max, sf_d_groups, sf_kv_planes, plane_major=True)
+        sfv_tmap = cute_common.make_sf_tensor_map(SF_V, k_seq_max, sf_d_groups, sf_kv_planes, plane_major=True)
+        sfdo_tmap = cute_common.make_sf_tensor_map(SF_DO, q_seq_max, sf_d_groups, sf_q_planes, plane_major=True)
+        sfkt_tmap = cute_common.make_sf_tensor_map(
+            SF_KT,
+            self.head_dim,
+            (k_seq_max + self.sf_vec_size - 1) // self.sf_vec_size,
+            sf_kv_planes,
+            plane_major=False,
+            row_tiles_per_box=sf_d_tiles,
         )
-        sfQ_layout = blockscaled_utils.tile_atom_to_shape_SF(Q_shape_sfa, self.sf_vec_size)
-        SF_Q = cute.make_tensor(SF_Q.iterator, sfQ_layout)
-
-        sfK_shape = (cute.round_up(k_seq_max, 128), K.shape[1], cute.size(K.shape[2]) * 2)
-        sfK_layout = blockscaled_utils.tile_atom_to_shape_SF(sfK_shape, self.sf_vec_size)
-        SF_K = cute.make_tensor(SF_K.iterator, sfK_layout)
-        sfV_shape = (cute.round_up(k_seq_max, 128), V.shape[1], cute.size(V.shape[2]) * 2)
-        sfV_layout = blockscaled_utils.tile_atom_to_shape_SF(sfV_shape, self.sf_vec_size)
-        SF_V = cute.make_tensor(SF_V.iterator, sfV_layout)
-        dO_shape_sfa = (
-            cute.round_up(q_seq_max, 128) * 2,
-            dO.shape[1],
-            cute.size(dO.shape[2]) * 2,
-        )
-        sfdO_layout = blockscaled_utils.tile_atom_to_shape_SF(dO_shape_sfa, self.sf_vec_size)
-        SF_DO = cute.make_tensor(SF_DO.iterator, sfdO_layout)
-
-        KT_shape = (K.shape[1], k_seq_max, cute.size(K.shape[2]) * 2)
-        sfK_mn_layout = blockscaled_utils.tile_atom_to_shape_SF(KT_shape, self.sf_vec_size)
-        SF_K_mn = cute.make_tensor(SF_KT.iterator, sfK_mn_layout)
-
-        # Setup TMA for scale factors with correct ops for 2-CTA:
-        # - SFA (A operand's SF): multicast, CtaGroup.TWO, real cluster layout
-        # - SFB (B operand's SF): multicast, CtaGroup.ONE, real cluster layout for num_multicast
-
-        # SF_Q is SFA (A operand's scale factor) - CtaGroup.TWO (shared::cluster barrier)
-        sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-        sfQ_smem_layout = cute.slice_(sSFQ_smem_layout_staged, (None, None, None, 0, 0))
-        tma_atom_sfQ, tma_tensor_sfQ = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_op,
-            SF_Q,
-            sfQ_smem_layout,
-            self.QK_mma_tiler_sfa_load,
-            QK_tiled_mma_sfa,
-            cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        # SF_K is SFB (B operand's scale factor) - multicast
-        sfb_mcast_op = cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
-        sfK_smem_layout = cute.slice_(sSFK_smem_layout_staged, (None, None, None, 0, 0))
-        tma_atom_sfK, tma_tensor_sfK = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_mcast_op,
-            SF_K,
-            sfK_smem_layout,
-            self.QK_mma_tiler_sfb_load,
-            QK_tiled_mma_sfb,
-            cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        # SF_V is SFB (B operand's scale factor) - multicast
-        sfV_smem_layout = cute.slice_(SFV_smem_layout_staged, (None, None, None, 0, 0))
-        tma_atom_sfV, tma_tensor_sfV = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_mcast_op,
-            SF_V,
-            sfV_smem_layout,
-            self.DOV_mma_tiler_sfb_load,
-            DOV_tiled_mma_sfb,
-            cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        # SF_K_mn is SFB (B operand's scale factor for dQ computation) - multicast
-        sSFK_mn_smem_layout = cute.slice_(sSFK_mn_smem_layout_staged, (None, None, None, 0, 0))
-        tma_atom_sfK_mn, tma_tensor_sfK_mn = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_mcast_op,
-            SF_K_mn,
-            sSFK_mn_smem_layout,
-            self.dSK_mma_tiler_sfb,
-            dSK_tiled_mma_sfb,
-            cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        # SF_DO is SFA (A operand's scale factor) - multicast, CtaGroup.TWO
-        SFDO_smem_layout = cute.slice_(SFDO_smem_layout_staged, (None, None, None, 0, 0))
-        tma_atom_sfDO, tma_tensor_sfDO = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_op,
-            SF_DO,
-            SFDO_smem_layout,
-            self.DOV_mma_tiler_sfa_load,
-            DOV_tiled_mma_sfa,
-            cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        self.tma_copy_sfQ_bytes = cute.size_in_bytes(self.sf_dtype, sfQ_smem_layout)
-        self.tma_copy_sfK_bytes = cute.size_in_bytes(self.sf_dtype, sfK_smem_layout)
-        self.tma_copy_sfK_mn_bytes = cute.size_in_bytes(self.sf_dtype, sSFK_mn_smem_layout)
-        self.tma_copy_sfV_bytes = cute.size_in_bytes(self.sf_dtype, sfV_smem_layout)
-        self.tma_copy_sfdO_bytes = cute.size_in_bytes(self.sf_dtype, SFDO_smem_layout)
+        # Every SF slot is one 512-byte atom per 128-wide K half (the K^T slot
+        # holds both D tiles); the peer-CTA / row-group-shifted copies are built
+        # in smem by the load warp, not loaded.
+        sf_atom = cute_common.SF_ATOM_BYTES
+        self.sf_kv_stage_bytes = (self.SFK_halves + self.k_halves) * sf_atom + sf_d_tiles * sf_atom  # SFK + SFV + SFK_mn
+        self.sf_q_prologue_bytes = 2 * 2 * self.k_halves * sf_atom  # SFQ + SFDO, two Q sub-blocks, both K halves
 
         @cute.struct
         class SharedStorage:
             # Pipeline barriers — per-warp pipelines for 2 MMA warps
             load_mma_K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_K_stage * 2]  # shared, 2-CTA
+            # Per-CTA tx barriers for this CTA's canonical scale-factor atoms (one per K stage)
+            sf_landed_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_K_stage]
             # MMA warp 0 pipelines
             mma_compute_S_mbar_ptr_0: cute.struct.MemRange[cutlass.Int64, self.mma_compute_S_stage * 2]
             mma_compute_dP_mbar_ptr_0: cute.struct.MemRange[cutlass.Int64, self.mma_compute_dP_stage * 2]
@@ -873,16 +812,11 @@ class BlackwellFmhaBackwardDQ256:
             tma_tensor_Q,
             tma_atom_dO,
             tma_tensor_dO,
-            tma_atom_sfQ,
-            tma_tensor_sfQ,
-            tma_atom_sfK,
-            tma_tensor_sfK,
-            tma_atom_sfK_mn,
-            tma_tensor_sfK_mn,
-            tma_atom_sfV,
-            tma_tensor_sfV,
-            tma_atom_sfDO,
-            tma_tensor_sfDO,
+            sfq_tmap,
+            sfk_tmap,
+            sfkt_tmap,
+            sfv_tmap,
+            sfdo_tmap,
             dQ,
             scaled_LSE,
             scale_softmax,
@@ -936,16 +870,11 @@ class BlackwellFmhaBackwardDQ256:
         Q_in: cute.Tensor,
         tma_atom_dO: cute.CopyAtom,
         dO_in: cute.Tensor,
-        tma_atom_sfQ: cute.CopyAtom,
-        SFQ_in: cute.Tensor,
-        tma_atom_sfK: cute.CopyAtom,
-        SFK_in: cute.Tensor,
-        tma_atom_sfK_mn: cute.CopyAtom,
-        SFK_mn_in: cute.Tensor,
-        tma_atom_sfV: cute.CopyAtom,
-        SFV_in: cute.Tensor,
-        tma_atom_sfDO: cute.CopyAtom,
-        SFDO_in: cute.Tensor,
+        sfq_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfk_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfkt_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfv_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfdo_tmap: cutlass.GridConstant[tmap.TensorMap],
         dQ: cute.Tensor,
         LSE: cute.Tensor,
         scale_softmax: Float32,
@@ -1000,11 +929,11 @@ class BlackwellFmhaBackwardDQ256:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_V)
             cpasync.prefetch_descriptor(tma_atom_dO)
-            cpasync.prefetch_descriptor(tma_atom_sfQ)
-            cpasync.prefetch_descriptor(tma_atom_sfK)
-            cpasync.prefetch_descriptor(tma_atom_sfK_mn)
-            cpasync.prefetch_descriptor(tma_atom_sfV)
-            cpasync.prefetch_descriptor(tma_atom_sfDO)
+            prims.prefetch_tensormap(sfq_tmap.get_ptr())
+            prims.prefetch_tensormap(sfk_tmap.get_ptr())
+            prims.prefetch_tensormap(sfkt_tmap.get_ptr())
+            prims.prefetch_tensormap(sfv_tmap.get_ptr())
+            prims.prefetch_tensormap(sfdo_tmap.get_ptr())
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1013,6 +942,16 @@ class BlackwellFmhaBackwardDQ256:
             storage.load_mma_K_mbar_ptr.data_ptr(),
             cluster_layout_vmnk,
         )
+        # Native SF path: the stage-full barrier also collects one arrival per
+        # CTA's load warp (SF slot atoms built), and each CTA tracks its own
+        # canonical SF bytes on sf_landed.  Same warp / lane as the
+        # DSL's own init, before the cluster init fence.
+        sf_landed_mbar_ptr = storage.sf_landed_mbar_ptr.data_ptr()
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                cute_common.sf_reinit_full_barriers(load_mma_K_pipeline, self.load_mma_K_stage, 1 + 2)
+                for stage_idx in cutlass.range_constexpr(self.load_mma_K_stage):
+                    cute.arch.mbarrier_init(sf_landed_mbar_ptr + stage_idx, 1)
 
         # Per-warp pipelines for MMA warp 0
         mma_compute_S_pipeline_0 = self.make_and_init_mma_compute_S_pipeline(
@@ -1396,11 +1335,11 @@ class BlackwellFmhaBackwardDQ256:
                             V_in,
                             Q_in,
                             dO_in,
-                            SFK_in,
-                            SFK_mn_in,
-                            SFQ_in,
-                            SFV_in,
-                            SFDO_in,
+                            sfk_tmap,
+                            sfkt_tmap,
+                            sfq_tmap,
+                            sfv_tmap,
+                            sfdo_tmap,
                             sK,
                             sKT,
                             sQ,
@@ -1424,11 +1363,6 @@ class BlackwellFmhaBackwardDQ256:
                             tma_atom_Q,
                             tma_atom_V,
                             tma_atom_dO,
-                            tma_atom_sfQ,
-                            tma_atom_sfK,
-                            tma_atom_sfK_mn,
-                            tma_atom_sfV,
-                            tma_atom_sfDO,
                             blk_offset,
                             problem_shape_cur_batch,
                             trip_count,
@@ -1438,6 +1372,7 @@ class BlackwellFmhaBackwardDQ256:
                             block_in_cluster_coord_vmnk,
                             cluster_layout_vmnk,
                             (load_mma_K_pipeline,),
+                            sf_landed_mbar_ptr,
                             bidx_v,
                             blk_coord_h_r,
                             blk_coord_h_k,
@@ -2016,11 +1951,11 @@ class BlackwellFmhaBackwardDQ256:
                         V_in,
                         Q_in,
                         dO_in,
-                        SFK_in,
-                        SFK_mn_in,
-                        SFQ_in,
-                        SFV_in,
-                        SFDO_in,
+                        sfk_tmap,
+                        sfkt_tmap,
+                        sfq_tmap,
+                        sfv_tmap,
+                        sfdo_tmap,
                         sK,
                         sKT,
                         sQ,
@@ -2044,11 +1979,6 @@ class BlackwellFmhaBackwardDQ256:
                         tma_atom_Q,
                         tma_atom_V,
                         tma_atom_dO,
-                        tma_atom_sfQ,
-                        tma_atom_sfK,
-                        tma_atom_sfK_mn,
-                        tma_atom_sfV,
-                        tma_atom_sfDO,
                         blk_offset,
                         problem_shape_cur_batch,
                         trip_count,
@@ -2058,6 +1988,7 @@ class BlackwellFmhaBackwardDQ256:
                         block_in_cluster_coord_vmnk,
                         cluster_layout_vmnk,
                         (load_mma_K_pipeline,),
+                        sf_landed_mbar_ptr,
                         bidx,
                         blk_coord_h_r,
                         blk_coord_h_k,
@@ -2274,11 +2205,11 @@ class BlackwellFmhaBackwardDQ256:
         V_in: cute.Tensor,
         Q_in: cute.Tensor,
         dO_in: cute.Tensor,
-        SFK_in: cute.Tensor,
-        SFK_mn_in: cute.Tensor,
-        SFQ_in: cute.Tensor,
-        SFV_in: cute.Tensor,
-        SFDO_in: cute.Tensor,
+        sfk_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfkt_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfq_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfv_tmap: cutlass.GridConstant[tmap.TensorMap],
+        sfdo_tmap: cutlass.GridConstant[tmap.TensorMap],
         sK: cute.Tensor,
         sKT: cute.Tensor,
         sQ: cute.Tensor,
@@ -2302,11 +2233,6 @@ class BlackwellFmhaBackwardDQ256:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
-        tma_atom_sfQ: cute.CopyAtom,
-        tma_atom_sfK: cute.CopyAtom,
-        tma_atom_sfK_mn: cute.CopyAtom,
-        tma_atom_sfV: cute.CopyAtom,
-        tma_atom_sfDO: cute.CopyAtom,
         blk_offset: cute.Shape,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
         iter_count: Int32,
@@ -2317,6 +2243,7 @@ class BlackwellFmhaBackwardDQ256:
         cluster_layout_vmnk,
         # (load_mma_Q_pipeline, load_compute_LSE_pipeline, load_mma_dO_pipeline, load_compute_sum_OdO_pipeline)
         pipeline_args: tuple,
+        sf_landed_mbar_ptr: cute.Pointer,
         # Logical block coordinates (from block_idx() in non-persistent, from CLC in persistent)
         blk_coord_q: Int32,
         blk_coord_h_r: Int32,
@@ -2354,16 +2281,6 @@ class BlackwellFmhaBackwardDQ256:
         # (bN, bK, RestN, RestK, (H, B))
         gV = cute.local_tile(V, cute.select(self.DOV_mma_tiler, mode=[1, 2]), (None, None, None))
 
-        gSFQ = cute.local_tile(SFQ_in, cute.select(self.QK_mma_tiler_sfa_load, mode=[0, 2]), (None, None, None))
-
-        #  SFK_in shape: (32, 4, rest_m, 4, rest_k, l)
-        gSFK = cute.local_tile(SFK_in, cute.select(self.QK_mma_tiler_sfb_load, mode=[1, 2]), (None, None, None))
-
-        gSFK_mn = cute.local_tile(SFK_mn_in, cute.select(self.dSK_mma_tiler_sfb, mode=[1, 2]), (None, None, None))
-
-        gSFDO = cute.local_tile(SFDO_in, cute.select(self.DOV_mma_tiler_sfa_load, mode=[0, 2]), (None, None, None))
-        gSFV = cute.local_tile(SFV_in, cute.select(self.DOV_mma_tiler_sfb_load, mode=[1, 2]), (None, None, None))
-
         QK_thr_mma = QK_tiled_mma.get_slice(mma_tile_coord_v)
         DOV_thr_mma = DOV_tiled_mma.get_slice(mma_tile_coord_v)
         dSK_thr_mma = dSK_tiled_mma.get_slice(mma_tile_coord_v)
@@ -2383,17 +2300,6 @@ class BlackwellFmhaBackwardDQ256:
         tdPgdO = DOV_thr_mma.partition_A(gdO)
         # (MMA, MMA_M, MMA_K, RestM, RestK, (H, B))
         tdPgV = DOV_thr_mma.partition_B(gV)
-
-        QK_thr_mma_sfa = QK_tiled_mma_sfa.get_slice(mma_tile_coord_v)
-        DOV_thr_mma_sfa = DOV_tiled_mma_sfa.get_slice(mma_tile_coord_v)
-
-        tSTgSFQ = QK_thr_mma_sfa.partition_A(gSFQ)
-        tSTgSFK = QK_thr_mma_sfb.partition_B(gSFK)
-
-        tDPgSFDO = DOV_thr_mma_sfa.partition_A(gSFDO)
-        tDPTgSFV = DOV_thr_mma_sfb.partition_B(gSFV)
-
-        tSTgSFK_mn = dSK_thr_mma_sfb.partition_B(gSFK_mn)
 
         a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
         b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
@@ -2442,58 +2348,28 @@ class BlackwellFmhaBackwardDQ256:
             cute.group_modes(tdPgdO, 0, 3),
         )
 
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestN, RestK, RestL)
-
-        tSFKsSFK, tSFKgSFK_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfK,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sSFK, 0, 3),
-            cute.group_modes(tSTgSFK, 0, 3),
-        )
-        tSFKsSFK = cute.filter_zeros(tSFKsSFK)
-        tSFKgSFK_mkl = cute.filter_zeros(tSFKgSFK_mkl)
-
-        tSFKsSFK_mn, tSFKgSFK_mn_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfK_mn,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sSFK_mn, 0, 3),
-            cute.group_modes(tSTgSFK_mn, 0, 3),
-        )
-        tSFKsSFK_mn = cute.filter_zeros(tSFKsSFK_mn)
-        tSFKgSFK_mn_mkl = cute.filter_zeros(tSFKgSFK_mn_mkl)
-
-        tSFQsSFQ, tSFQgSFQ_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfQ,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sSFQ, 0, 3),
-            cute.group_modes(tSTgSFQ, 0, 3),
-        )
-        tSFQsSFQ = cute.filter_zeros(tSFQsSFQ)
-        tSFQgSFQ_mkl = cute.filter_zeros(tSFQgSFQ_mkl)
-
-        tSFVsSFV, tSFVgSFV_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfV,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sSFV, 0, 3),
-            cute.group_modes(tDPTgSFV, 0, 3),
-        )
-        tSFVsSFV = cute.filter_zeros(tSFVsSFV)
-        tSFVgSFV_mkl = cute.filter_zeros(tSFVgSFV_mkl)
-
-        tSFDOsSFDO, tSFDOgSFDO_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfDO,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sSFDO, 0, 3),
-            cute.group_modes(tDPgSFDO, 0, 3),
-        )
-        tSFDOsSFDO = cute.filter_zeros(tSFDOsSFDO)
-        tSFDOgSFDO_mkl = cute.filter_zeros(tSFDOgSFDO_mkl)
+        # Scale factors: canonical atoms land in slot 0 of each SF smem stage
+        # (byte geometry of the staged (..., STAGE, slot) layouts); the SF helper
+        # warp builds slot 1 (and the peer CTA's shifted A-operand atoms) in smem.
+        sfk_stage_stride, sfk_slot_stride = cute_common.sf_slot_strides(sSFK.layout)
+        sfkmn_stage_stride, sfkmn_slot_stride = cute_common.sf_slot_strides(sSFK_mn.layout)
+        sfq_stage_stride, sfq_slot_stride = cute_common.sf_slot_strides(sSFQ.layout)
+        sfv_stage_stride, sfv_slot_stride = cute_common.sf_slot_strides(sSFV.layout)
+        sfdo_stage_stride, sfdo_slot_stride = cute_common.sf_slot_strides(sSFDO.layout)
+        sfkmn_atoms_per_slot = sfkmn_slot_stride // cute_common.SF_ATOM_BYTES
+        # Each CTA's load warp loads its own canonical atoms and, once they landed
+        # (right after issuing the stage), builds its shifted slot atoms; one
+        # arrival per stage on the LEADER's stage-full barrier (remote from the
+        # peer) releases the stage, so the MMA warp's existing consumer_wait also
+        # covers the slots.
+        sf_lane = tidx % self.threads_per_warp
+        is_leader_cta = mma_tile_coord_v == 0
+        words_k = cute_common.smem_array(sSFK.iterator, Int32)
+        words_v = cute_common.smem_array(sSFV.iterator, Int32)
+        words_kmn = cute_common.smem_array(sSFK_mn.iterator, Int32)
+        words_q = cute_common.smem_array(sSFQ.iterator, Int32)
+        words_do = cute_common.smem_array(sSFDO.iterator, Int32)
+        num_sfa_stages = 2 * self.k_halves
 
         load_mma_K_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage)
         # Advance state to match mbarrier phase accumulated across D-half passes.
@@ -2518,30 +2394,51 @@ class BlackwellFmhaBackwardDQ256:
                             1,  # arrive_count = producer_group.size = 1
                         )
                 cute.arch.mbarrier_init_fence()
-        load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
-        tma_barrier_K = load_mma_K_pipeline.producer_get_barrier(load_mma_K_producer_state)
-        # 2-MMA-warp: load 2 Q tiles + 2 dO tiles + 2 SFQ tiles + 2 SFDO tiles
-        # Each A-operand TMA (CtaGroup.TWO) writes to both CTAs: 2* per tile
-        # SFA has 2 slots per tile: 4* per tile, 8* for 2 tiles
-        sfq_tx_multiplier = 2 * 4 * self.k_halves
-        sfdo_tx_multiplier = 2 * 2 * 2 * self.k_halves
-        prologue_expect_tx = (
-            2 * 2 * (self.tma_copy_Q_bytes)
-            + 2 * 2 * (self.tma_copy_dO_bytes)
-            + sfq_tx_multiplier * self.tma_copy_sfQ_bytes
-            + sfdo_tx_multiplier * self.tma_copy_sfdO_bytes
-        )
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_expect_tx(tma_barrier_K, prologue_expect_tx)
-
-        # Merged SF tensors: s0 at even L indices, s1 at odd L indices
+        # Canonical SF planes: one plane per (b, h_kv) resp. (b, h_q)
         SF_kv_load_index = blk_coord_b * grid_dim_y + blk_coord_h_k
-        SF_kv_load_index_s0 = SF_kv_load_index * 2
-        SF_kv_load_index_s1 = SF_kv_load_index * 2 + 1
         num_h_r = problem_shape[3][0][0]
         SF_q_load_index = SF_kv_load_index * num_h_r + blk_coord_h_r
-        SF_q_load_index_s0 = SF_q_load_index * 2
-        SF_q_load_index_s1 = SF_q_load_index * 2 + 1
+        q_tile_base = (blk_coord_q // 2) * 2
+
+        # Canonical SF atoms of one KV tile -> slot 0 of a K stage (issued by one
+        # elected thread before the payload TMA so they land first; the loop below
+        # re-issues the same sequence).  The DSL forbids closure capture inside
+        # staged loops, so the per-stage issue sequence is a module-level helper
+        # taking everything explicitly.
+        kv_sf_geom = (self.SFK_halves, self.k_halves, sfk_stage_stride, sfkmn_stage_stride, sfv_stage_stride)
+
+        load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
+        tma_barrier_K = load_mma_K_pipeline.producer_get_barrier(load_mma_K_producer_state)
+        first_landed = sf_landed_mbar_ptr + load_mma_K_producer_state.index
+        with cute.arch.elect_one():
+            # Multicast to both CTAs: each box completes twice on this barrier.
+            cute.arch.mbarrier_arrive_and_expect_tx(first_landed, self.sf_kv_stage_bytes + self.sf_q_prologue_bytes)
+            cute_common.sf_issue_kv_loads(
+                load_mma_K_producer_state.index,
+                iter_index,
+                SF_kv_load_index,
+                first_landed,
+                (sSFK.iterator, sSFK_mn.iterator, sSFV.iterator),
+                (sfk_tmap, sfkt_tmap, sfv_tmap),
+                kv_sf_geom,
+            )
+            # Both Q sub-block tiles of Q and dO (A operands), one canonical atom per K half.
+            for tile in range(2):
+                for k_half in range(self.k_halves):
+                    sf_stage = tile * self.k_halves + k_half
+                    cute_common.sf_tma_load_local(
+                        sfq_tmap, sSFQ.iterator + sf_stage * sfq_stage_stride, first_landed, True, k_half, q_tile_base + tile, SF_q_load_index
+                    )
+                    cute_common.sf_tma_load_local(
+                        sfdo_tmap, sSFDO.iterator + sf_stage * sfdo_stage_stride, first_landed, True, k_half, q_tile_base + tile, SF_q_load_index
+                    )
+
+        # 2-MMA-warp: load 2 Q tiles + 2 dO tiles (payload only; scale-factor
+        # bytes are tracked on this CTA's sf_landed barrier).
+        # Each A-operand TMA (CtaGroup.TWO) writes to both CTAs: 2* per tile
+        prologue_expect_tx = 2 * 2 * (self.tma_copy_Q_bytes) + 2 * 2 * (self.tma_copy_dO_bytes)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_expect_tx(tma_barrier_K, prologue_expect_tx)
 
         # (s_q, d, h_r, h_k, b)
         # Load K (B operand)
@@ -2570,59 +2467,7 @@ class BlackwellFmhaBackwardDQ256:
             mcast_mask=self.b_full_mcast_mask,
         )
 
-        # Load sfK (SFB) - two d halves, slot 0 + slot 1 from merged tensor.
-        for sfk_k_half in cutlass.range_constexpr(self.SFK_halves):
-            sfk_stage = load_mma_K_producer_state.index * self.SFK_halves + sfk_k_half
-            cute.copy(
-                tma_atom_sfK,
-                tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s0)],
-                tSFKsSFK[None, sfk_stage, 0],
-                tma_bar_ptr=tma_barrier_K,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_sfK,
-                tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s1)],
-                tSFKsSFK[None, sfk_stage, 1],
-                tma_bar_ptr=tma_barrier_K,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-
-        cute.copy(
-            tma_atom_sfK_mn,
-            tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s0)],
-            tSFKsSFK_mn[None, load_mma_K_producer_state.index, 0],
-            tma_bar_ptr=tma_barrier_K,
-            mcast_mask=self.sfb_full_mcast_mask,
-        )
-        cute.copy(
-            tma_atom_sfK_mn,
-            tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s1)],
-            tSFKsSFK_mn[None, load_mma_K_producer_state.index, 1],
-            tma_bar_ptr=tma_barrier_K,
-            mcast_mask=self.sfb_full_mcast_mask,
-        )
-
-        # Load sfV (SFB) - slot 0 + slot 1 from merged tensor
-        for sfv_k_half in cutlass.range_constexpr(self.k_halves):
-            sfv_stage = load_mma_K_producer_state.index * self.k_halves + sfv_k_half
-            cute.copy(
-                tma_atom_sfV,
-                tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s0)],
-                tSFVsSFV[None, sfv_stage, 0],
-                tma_bar_ptr=tma_barrier_K,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_sfV,
-                tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s1)],
-                tSFVsSFV[None, sfv_stage, 1],
-                tma_bar_ptr=tma_barrier_K,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-
         # Load the two 64-row Q sub-blocks for this 2-CTA cluster.
-        q_tile_base = (blk_coord_q // 2) * 2
         cute.copy(
             tma_atom_Q,
             tQgQ_mkl[(None, q_tile_base, 0, (blk_coord_h_q, blk_coord_b))],
@@ -2638,36 +2483,6 @@ class BlackwellFmhaBackwardDQ256:
             tma_bar_ptr=tma_barrier_K,
             mcast_mask=self.a_full_mcast_mask,
         )
-        # Load sSFQ tile 0/1 (SFA) - slot 0 + slot 1 from merged tensor.
-        # d=256 keeps each cp2x64 SFQ transfer to one 128-wide K half.
-        for sfq_k_half in cutlass.range_constexpr(self.k_halves):
-            sfq_stage_0 = sfq_k_half
-            sfq_stage_1 = self.k_halves + sfq_k_half
-            cute.copy(
-                tma_atom_sfQ,
-                tSFQgSFQ_mkl[(None, q_tile_base, sfq_k_half, SF_q_load_index_s0)],
-                tSFQsSFQ[None, sfq_stage_0, 0],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfQ,
-                tSFQgSFQ_mkl[(None, q_tile_base, sfq_k_half, SF_q_load_index_s1)],
-                tSFQsSFQ[None, sfq_stage_0, 1],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfQ,
-                tSFQgSFQ_mkl[(None, q_tile_base + 1, sfq_k_half, SF_q_load_index_s0)],
-                tSFQsSFQ[None, sfq_stage_1, 0],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfQ,
-                tSFQgSFQ_mkl[(None, q_tile_base + 1, sfq_k_half, SF_q_load_index_s1)],
-                tSFQsSFQ[None, sfq_stage_1, 1],
-                tma_bar_ptr=tma_barrier_K,
-            )
-
         # Load dO tile 0 (A operand) into sdO stage 0
         cute.copy(
             tma_atom_dO,
@@ -2685,34 +2500,23 @@ class BlackwellFmhaBackwardDQ256:
             mcast_mask=self.a_full_mcast_mask,
         )
 
-        # Load standard 1x32 SFDO for both Q sub-blocks and D halves.
-        for sfdo_k_half in cutlass.range_constexpr(self.k_halves):
-            sfdo_stage_0 = sfdo_k_half
-            sfdo_stage_1 = self.k_halves + sfdo_k_half
-            cute.copy(
-                tma_atom_sfDO,
-                tSFDOgSFDO_mkl[(None, q_tile_base, sfdo_k_half, SF_q_load_index_s0)],
-                tSFDOsSFDO[None, sfdo_stage_0, 0],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfDO,
-                tSFDOgSFDO_mkl[(None, q_tile_base, sfdo_k_half, SF_q_load_index_s1)],
-                tSFDOsSFDO[None, sfdo_stage_0, 1],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfDO,
-                tSFDOgSFDO_mkl[(None, q_tile_base + 1, sfdo_k_half, SF_q_load_index_s0)],
-                tSFDOsSFDO[None, sfdo_stage_1, 0],
-                tma_bar_ptr=tma_barrier_K,
-            )
-            cute.copy(
-                tma_atom_sfDO,
-                tSFDOgSFDO_mkl[(None, q_tile_base + 1, sfdo_k_half, SF_q_load_index_s1)],
-                tSFDOsSFDO[None, sfdo_stage_1, 1],
-                tma_bar_ptr=tma_barrier_K,
-            )
+        # Native SF: this CTA's canonical atoms of the stage landed -> build its shifted slots (Q / dO A-operand atoms for both sub-blocks: copies in the leader, 64-row shifts in the peer; plus the KV tile's SFB slots) and release the stage to the leader.
+        cute.arch.mbarrier_wait(first_landed, Int32(1) - load_mma_K_producer_state.phase)
+        if is_leader_cta:
+            cute_common.sf_build_slots(words_q, cute_common.sf_a_operand_ops(num_sfa_stages, sfq_stage_stride, sfq_slot_stride, False), sf_lane)
+            cute_common.sf_build_slots(words_do, cute_common.sf_a_operand_ops(num_sfa_stages, sfdo_stage_stride, sfdo_slot_stride, False), sf_lane)
+        else:
+            cute_common.sf_build_slots(words_q, cute_common.sf_a_operand_ops(num_sfa_stages, sfq_stage_stride, sfq_slot_stride, True), sf_lane)
+            cute_common.sf_build_slots(words_do, cute_common.sf_a_operand_ops(num_sfa_stages, sfdo_stage_stride, sfdo_slot_stride, True), sf_lane)
+        cute_common.sf_build_kv_slots(
+            (words_k, words_v, words_kmn),
+            load_mma_K_producer_state.index,
+            (self.SFK_halves, self.k_halves, sfkmn_atoms_per_slot),
+            (sfk_stage_stride, sfv_stage_stride, sfkmn_stage_stride),
+            (sfk_slot_stride, sfv_slot_stride, sfkmn_slot_stride),
+            sf_lane,
+        )
+        cute_common.sf_slots_ready_arrive_remote(load_mma_K_pipeline.sync_object_full.get_barrier(load_mma_K_producer_state.index), is_leader_cta)
 
         load_mma_K_producer_state.advance()
 
@@ -2725,6 +2529,20 @@ class BlackwellFmhaBackwardDQ256:
 
             load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
             tma_barrier_K_inner = load_mma_K_pipeline.producer_get_barrier(load_mma_K_producer_state)
+            # Scale factors of this KV tile: canonical atoms -> slot 0, bytes on this CTA's sf_landed.
+            landed = sf_landed_mbar_ptr + load_mma_K_producer_state.index
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(landed, self.sf_kv_stage_bytes)
+                cute_common.sf_issue_kv_loads(
+                    load_mma_K_producer_state.index,
+                    iter_index,
+                    SF_kv_load_index,
+                    landed,
+                    (sSFK.iterator, sSFK_mn.iterator, sSFV.iterator),
+                    (sfk_tmap, sfkt_tmap, sfv_tmap),
+                    kv_sf_geom,
+                )
+
             # Load K (B operand)
             cute.copy(
                 tma_atom_K,
@@ -2751,141 +2569,21 @@ class BlackwellFmhaBackwardDQ256:
                 mcast_mask=self.b_full_mcast_mask,
             )
 
-            # Load sfK (SFB) - two d halves, slot 0 + slot 1 from merged tensor.
-            for sfk_k_half in cutlass.range_constexpr(self.SFK_halves):
-                sfk_stage = load_mma_K_producer_state.index * self.SFK_halves + sfk_k_half
-                cute.copy(
-                    tma_atom_sfK,
-                    tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s0)],
-                    tSFKsSFK[None, sfk_stage, 0],
-                    tma_bar_ptr=tma_barrier_K_inner,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_sfK,
-                    tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s1)],
-                    tSFKsSFK[None, sfk_stage, 1],
-                    tma_bar_ptr=tma_barrier_K_inner,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-
-            cute.copy(
-                tma_atom_sfK_mn,
-                tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s0)],
-                tSFKsSFK_mn[None, load_mma_K_producer_state.index, 0],
-                tma_bar_ptr=tma_barrier_K_inner,
-                mcast_mask=self.sfb_full_mcast_mask,
+            # Native SF: this CTA's canonical atoms of the stage landed -> build its shifted slots (the KV tile's SFB slots) and release the stage to the leader.
+            cute.arch.mbarrier_wait(landed, Int32(1) - load_mma_K_producer_state.phase)
+            cute_common.sf_build_kv_slots(
+                (words_k, words_v, words_kmn),
+                load_mma_K_producer_state.index,
+                (self.SFK_halves, self.k_halves, sfkmn_atoms_per_slot),
+                (sfk_stage_stride, sfv_stage_stride, sfkmn_stage_stride),
+                (sfk_slot_stride, sfv_slot_stride, sfkmn_slot_stride),
+                sf_lane,
             )
-            cute.copy(
-                tma_atom_sfK_mn,
-                tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s1)],
-                tSFKsSFK_mn[None, load_mma_K_producer_state.index, 1],
-                tma_bar_ptr=tma_barrier_K_inner,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-
-            # Load sfV (SFB) - slot 0 + slot 1 from merged tensor
-            for sfv_k_half in cutlass.range_constexpr(self.k_halves):
-                sfv_stage = load_mma_K_producer_state.index * self.k_halves + sfv_k_half
-                cute.copy(
-                    tma_atom_sfV,
-                    tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s0)],
-                    tSFVsSFV[None, sfv_stage, 0],
-                    tma_bar_ptr=tma_barrier_K_inner,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_sfV,
-                    tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s1)],
-                    tSFVsSFV[None, sfv_stage, 1],
-                    tma_bar_ptr=tma_barrier_K_inner,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
+            cute_common.sf_slots_ready_arrive_remote(load_mma_K_pipeline.sync_object_full.get_barrier(load_mma_K_producer_state.index), is_leader_cta)
 
             load_mma_K_producer_state.advance()
 
             iter_count -= 1
-            iter_index += 1
-
-        # The interleaved scheduler consumes each K/V/SF stage once for both Q
-        # sub-blocks. The old persistent path used a second pass for two
-        # separate mma() calls; persistent now also uses mma_interleaved().
-        iter_count_pass2 = Int32(0)
-        iter_index = iter_start
-        while iter_count_pass2 > 0:
-            if iter_index == iter_end:
-                iter_index = iter_start
-            load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
-            tma_barrier_K_p2 = load_mma_K_pipeline.producer_get_barrier(load_mma_K_producer_state)
-            cute.copy(
-                tma_atom_K,
-                tKgK_mkl[(None, iter_index, 0, (blk_coord_h_kv, blk_coord_b))],
-                tKsK[None, load_mma_K_producer_state.index],
-                tma_bar_ptr=tma_barrier_K_p2,
-                mcast_mask=self.b_full_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_KT,
-                tKTgKT_mkl[(None, 0, iter_index, (blk_coord_h_kv, blk_coord_b))],
-                tKTsKT[None, load_mma_K_producer_state.index],
-                tma_bar_ptr=tma_barrier_K_p2,
-                mcast_mask=self.b_full_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_V,
-                tVgV_mkl[(None, iter_index, 0, (blk_coord_h_kv, blk_coord_b))],
-                tVsV[None, load_mma_K_producer_state.index],
-                tma_bar_ptr=tma_barrier_K_p2,
-                mcast_mask=self.b_full_mcast_mask,
-            )
-            for sfk_k_half in cutlass.range_constexpr(self.SFK_halves):
-                sfk_stage = load_mma_K_producer_state.index * self.SFK_halves + sfk_k_half
-                cute.copy(
-                    tma_atom_sfK,
-                    tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s0)],
-                    tSFKsSFK[None, sfk_stage, 0],
-                    tma_bar_ptr=tma_barrier_K_p2,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_sfK,
-                    tSFKgSFK_mkl[(None, iter_index, sfk_k_half, SF_kv_load_index_s1)],
-                    tSFKsSFK[None, sfk_stage, 1],
-                    tma_bar_ptr=tma_barrier_K_p2,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-            cute.copy(
-                tma_atom_sfK_mn,
-                tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s0)],
-                tSFKsSFK_mn[None, load_mma_K_producer_state.index, 0],
-                tma_bar_ptr=tma_barrier_K_p2,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-            cute.copy(
-                tma_atom_sfK_mn,
-                tSFKgSFK_mn_mkl[(None, 0, iter_index, SF_kv_load_index_s1)],
-                tSFKsSFK_mn[None, load_mma_K_producer_state.index, 1],
-                tma_bar_ptr=tma_barrier_K_p2,
-                mcast_mask=self.sfb_full_mcast_mask,
-            )
-            for sfv_k_half in cutlass.range_constexpr(self.k_halves):
-                sfv_stage = load_mma_K_producer_state.index * self.k_halves + sfv_k_half
-                cute.copy(
-                    tma_atom_sfV,
-                    tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s0)],
-                    tSFVsSFV[None, sfv_stage, 0],
-                    tma_bar_ptr=tma_barrier_K_p2,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_sfV,
-                    tSFVgSFV_mkl[(None, iter_index, sfv_k_half, SF_kv_load_index_s1)],
-                    tSFVsSFV[None, sfv_stage, 1],
-                    tma_bar_ptr=tma_barrier_K_p2,
-                    mcast_mask=self.sfb_full_mcast_mask,
-                )
-            load_mma_K_producer_state.advance()
-            iter_count_pass2 -= 1
             iter_index += 1
 
     @cute.jit
@@ -4393,18 +4091,11 @@ class BlackwellFmhaBackwardDQ256:
         mma_compute_dQ_consumer_state.advance()
 
     def make_and_init_load_mma_K_pipeline(self, load_mma_K_mbar_ptr, cluster_layout_vmnk):
-        sfv_tx_multiplier = 2 * self.k_halves
-        sfk_tx_multiplier = 2 * self.SFK_halves
+        # Payload bytes only (both CTAs' K / K^T / V halves land on the leader's
+        # barrier); scale-factor bytes are tracked per CTA on sf_landed and the
+        # stage-full barrier additionally collects both load warps' SF arrivals.
         kt_tx_multiplier = 2 * self.d_halves
-        sfkmn_tx_multiplier = 2 * self.d_halves
-        tx_count = (
-            2 * self.tma_copy_K_bytes
-            + kt_tx_multiplier * self.tma_copy_KT_bytes
-            + 2 * self.tma_copy_V_bytes
-            + sfk_tx_multiplier * self.tma_copy_sfK_bytes
-            + sfkmn_tx_multiplier * self.tma_copy_sfK_mn_bytes
-            + sfv_tx_multiplier * self.tma_copy_sfV_bytes
-        )
+        tx_count = 2 * self.tma_copy_K_bytes + kt_tx_multiplier * self.tma_copy_KT_bytes + 2 * self.tma_copy_V_bytes
         return cute_common.make_tma_umma_pipeline(
             load_mma_K_mbar_ptr,
             self.load_mma_K_stage,

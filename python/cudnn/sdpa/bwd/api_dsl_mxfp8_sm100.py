@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: SF repack -> dQ -> fused dK/dV.
+"""SM100 (Blackwell) d=256 block-scale MXFP8 backward adapter: dQ -> fused dK/dV.
 
 Two CuTe DSL kernels ported from Xinbo Zhao's ``fmha_mxfp8_large_head_dim``
 each a 2-CTA warp-specialized
@@ -20,16 +20,14 @@ payload), half-precision ``o_f16/dO_f16``, fp32 ``stats`` (natural-log LSE),
 and seven F8_128x4 scale tensors. The gradients ``dQ/dK/dV`` are half precision
 (the ``o_f16`` dtype); ``amax_*`` outputs are not produced.
 
-Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
-slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
-see ``kernels/bprop_sf_repack_mxfp8_sm100.py`` for the layouts and why a TMA
-descriptor cannot address the shifted copy. The seven graph SF tensors are
-therefore repacked (eleven small launches, one per kernel operand form) into
-workspace ahead of the two kernels. This is a documented, deliberate exception
-to Hard Rule 2 (python/cudnn/AGENTS.md) taken to ship the kernels as validated
-upstream; it costs ~1-2% of the backward (SF bytes are 1/32 of the payload)
-and is the first thing to remove once the kernels' SF path reads canonical
-atoms.
+Scale-factor layout: the kernels read cuDNN's canonical F8_128x4 scale tensors
+directly through TMA (one 512-byte atom column per load; the columnwise
+``descale_*_T`` tensors' (D tile, head plane, S group) atom order is expressed
+as TMA strides) and build the 2-CTA slot copies their tcgen05.cp path needs in
+shared memory (see the native-SF section of
+``kernels/_bprop_mxfp8_common_sm100.py``). No adapter-side repack, no extra
+launch, no scale-factor workspace: ``execute`` launches exactly the two kernels
+the plan promised (Hard Rule 2).
 
 Lives in its own module (not ``api_dsl.py``) so the MXFP8 lowering's imports
 stay out of the half-precision adapters' way; ``engines._adapter`` resolves it
@@ -55,6 +53,10 @@ _SF_BLOCK = 32
 # Agent/CUTE_COMPILER_COMPATIBILITY.md section 2.5); dKdV follows the same
 # policy in its harness.
 _COMPILE_OPTIONS = "--opt-level 2"
+# Graph SF tensor -> the kernels' positional SF operands (both kernels bind the
+# same canonical byte planes; the kernels handle the SFA / SFB roles).
+_DQ_SF_OPERANDS = ("sf_q", "sf_k", "sf_k_T", "sf_v", "sf_do")
+_DKDV_SF_OPERANDS = ("sf_q", "sf_q_T", "sf_k", "sf_v", "sf_do", "sf_do_T")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -113,36 +115,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _bshd_physical_ok(desc: TensorDesc) -> bool:
         b, h, s, d = (int(x) for x in desc.shape)
         return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
-
-    def _sf_plan(self):
-        """The eleven kernel-side SF buffers: (name, graph SF, rows, k_groups, planes, layout, plane_major).
-
-        Rowwise graph tensors (rows = S, blocks along D) are plane-major
-        canonical; columnwise ones (rows = D, blocks along S) carry the
-        producer's 2-D swizzle with the D tile outside the head plane (see the
-        repack module).
-        """
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB
-
-        b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
-        lq, lk = b * hq, b * hk
-        dg = d // _SF_BLOCK
-        sqg, skg = _cdiv(sq, _SF_BLOCK), _cdiv(sk, _SF_BLOCK)
-        return (
-            # dQ kernel operands
-            ("dq_sf_q", "sf_q", sq, dg, lq, SF_LAYOUT_SFA, True),
-            ("dq_sf_k", "sf_k", sk, dg, lk, SF_LAYOUT_SFB, True),
-            ("dq_sf_kt", "sf_k_T", d, skg, lk, SF_LAYOUT_SFB, False),
-            ("dq_sf_v", "sf_v", sk, dg, lk, SF_LAYOUT_SFB, True),
-            ("dq_sf_do", "sf_do", sq, dg, lq, SF_LAYOUT_SFA, True),
-            # fused dK/dV kernel operands
-            ("dkdv_sf_q", "sf_q", sq, dg, lq, SF_LAYOUT_SFB, True),
-            ("dkdv_sf_qt", "sf_q_T", d, sqg, lq, SF_LAYOUT_SFB, False),
-            ("dkdv_sf_k", "sf_k", sk, dg, lk, SF_LAYOUT_SFA, True),
-            ("dkdv_sf_v", "sf_v", sk, dg, lk, SF_LAYOUT_SFA, True),
-            ("dkdv_sf_do", "sf_do", sq, dg, lq, SF_LAYOUT_SFB, True),
-            ("dkdv_sf_dot", "sf_do_T", d, sqg, lq, SF_LAYOUT_SFB, False),
-        )
 
     def _sf_expected_bytes(self, graph_sf: str) -> int:
         """Byte count of a graph SF tensor under cuDNN's F8_128x4 padding rules
@@ -248,16 +220,10 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
     def scratch_workspace_bytes(self) -> int:
-        """Kernel scratch (rowsum(O*dO) + scaled LSE + the dQ fp32 slot the
-        kernels size but do not use) plus the eleven repacked scale-factor
-        buffers. A pure function of the plan geometry; all of it is carved
-        from the caller's buffer at execute."""
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import repack_geometry
-
-        total = ws_align(self._kernel_workspace_bytes())
-        for _name, _src, rows, kg, l, layout, _pm in self._sf_plan():
-            total += ws_align(repack_geometry(rows, kg, l, layout)[3])
-        return total
+        """Kernel scratch only: rowsum(O*dO) + scaled LSE + the dQ fp32 slot the
+        kernels size but do not use. A pure function of the plan geometry; the
+        scale factors are read in place, so nothing else is carved."""
+        return ws_align(self._kernel_workspace_bytes())
 
     # --- compilation -----------------------------------------------------------
     def _kernel_view_geoms(self):
@@ -288,8 +254,9 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
     def compile(self) -> None:
-        """Plan-time JIT: the eleven SF repacks, the dQ kernel and the fused dK/dV
-        kernel, all against fake operands of the plan's exact geometry."""
+        """Plan-time JIT: the dQ kernel and the fused dK/dV kernel, against fake
+        operands of the plan's exact geometry (scale factors as the flat E8M0
+        byte planes the graph binds)."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
@@ -300,7 +267,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
 
         from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
         from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import Mxfp8SfRepackSm100
 
         E4M3, E8M0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
@@ -315,12 +281,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         def fake_flat(dt, n):
             return make_fake_tensor(dt, (n,), (1,), assumed_align=16)
 
-        # SF repacks: one specialization per (rows, groups, planes, layout, source order).
-        repacks = {}
-        for name, _src, rows, kg, l, layout, pm in self._sf_plan():
-            rk = Mxfp8SfRepackSm100(rows, kg, l, layout, src_plane_major=pm)
-            fn = cute.compile(rk, fake_flat(cutlass.Int8, rk.src_bytes), fake_flat(cutlass.Int8, rk.dst_bytes), stream)
-            repacks[name] = (rk, fn)
+        def fsf(name):
+            return fake_flat(E8M0, self._sf_expected_bytes(name))
 
         # dS always gets the in-kernel per-block scale; the kernels' fixed-scale
         # specialization exists upstream but is not a mode this engine offers.
@@ -334,9 +296,6 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         fq, fkv, flse = fake(E4M3, q_geom), fake(E4M3, kv_geom), fake(Float32, lse_geom)
         fo, fdq = fake(out_dt, q_geom), fake(out_dt, q_geom)
         fdkv = fake(out_dt, kv_geom)
-
-        def fsf(name):
-            return fake_flat(E8M0, repacks[name][0].dst_bytes)
 
         dq_kernel = BlackwellFmhaBackwardDQ256(
             out_dt,
@@ -356,11 +315,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             fkv,  # K_MN
             fkv,  # V
             fo,  # O
-            fsf("dq_sf_q"),
-            fsf("dq_sf_k"),
-            fsf("dq_sf_kt"),
-            fsf("dq_sf_v"),
-            fsf("dq_sf_do"),
+            *(fsf(n) for n in _DQ_SF_OPERANDS),
             fdq,  # dQ
             fdkv,  # dK (ABI slot; this kernel never writes it)
             fdkv,  # dV
@@ -395,12 +350,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             fkv,  # K
             fkv,  # V
             fo,  # O
-            fsf("dkdv_sf_q"),
-            fsf("dkdv_sf_qt"),
-            fsf("dkdv_sf_k"),
-            fsf("dkdv_sf_v"),
-            fsf("dkdv_sf_do"),
-            fsf("dkdv_sf_dot"),
+            *(fsf(n) for n in _DKDV_SF_OPERANDS),
             fdkv,  # dK
             fdkv,  # dV
             fq,  # dO (fp8)
@@ -417,7 +367,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             True,  # skip_sum_odo: reuse the dQ launch's workspace prologue
             options=_COMPILE_OPTIONS,
         )
-        self._compiled = (repacks, dq_fn, dkdv_fn, problem_shape, wr)
+        self._compiled = (dq_fn, dkdv_fn, problem_shape, wr)
         return self._compiled
 
     # --- execution -------------------------------------------------------------
@@ -481,7 +431,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         if scale_softmax is not None and scale_softmax != 0.0 and not math.isclose(float(scale_softmax), float(self.scale_softmax), rel_tol=1e-6):
             raise ValueError(f"SM100 MXFP8 bwd: scale_softmax {scale_softmax} differs from the plan's {self.scale_softmax}")
 
-        repacks, dq_fn, dkdv_fn, problem_shape, wr = self.compile()
+        dq_fn, dkdv_fn, problem_shape, wr = self.compile()
         b, hk, sq, sk, d = self.batch_size, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         hr = self._gqa_group
         E4M3, E8M0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
@@ -500,23 +450,31 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         def half_view(t, s, h_kv_, h_r_):
             return from_dlpack(t.permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
 
-        def sf_bytes(t):
-            flat = t.contiguous()
+        def sf_view(t):
+            # The canonical F8_128x4 byte plane, bound as-is: a reordered SF
+            # tensor is an opaque byte buffer (check_support pinned its byte
+            # count), so the kernel reads the storage in memory order. The
+            # graph may declare any logical dims / strides over it (the
+            # columnwise ``*_T`` tensors are commonly declared transposed), so
+            # only density is required -- never a `.contiguous()` copy (Rule 1).
+            sizes, strides = t.shape, t.stride()
+            expected = 1
+            for i in sorted(range(t.dim()), key=lambda i: strides[i]):
+                self._value_error_if(
+                    sizes[i] != 1 and strides[i] != expected, f"SM100 MXFP8 bwd: scale-factor tensor {tuple(sizes)} / {tuple(strides)} is not dense"
+                )
+                expected *= sizes[i]
+            flat = t.as_strided((t.numel(),), (1,))
             if flat.dtype != torch.int8:
                 flat = flat.view(torch.int8)
-            return flat.reshape(-1)
+            ct = from_dlpack(flat, assumed_align=16)
+            ct.element_type = E8M0
+            return ct
 
         with _torch_stream_context(current_stream, q_tensor.device):
             carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_mxfp8")
             ws_kernel = carver.take(self._kernel_workspace_bytes(), torch.uint8)
-            sf_bufs = {}
-            for name, src, _rows, _kg, _l, _layout, _pm in self._sf_plan():
-                rk, fn = repacks[name]
-                dst = carver.take(rk.dst_bytes, torch.int8)
-                fn(from_dlpack(sf_bytes(extras[src]), assumed_align=16), from_dlpack(dst, assumed_align=16), stream)
-                ct = from_dlpack(dst, assumed_align=16)
-                ct.element_type = E8M0
-                sf_bufs[name] = ct
+            sf_views = {n: sf_view(extras[n]) for n in ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")}
 
             Q, Q_MN = fp8_view(q_tensor, sq, hk, hr), fp8_view(q_T_tensor, sq, hk, hr)
             K, K_MN = fp8_view(k_tensor, sk, hk, 1), fp8_view(k_T_tensor, sk, hk, 1)
@@ -536,11 +494,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 K_MN,
                 V,
                 O,
-                sf_bufs["dq_sf_q"],
-                sf_bufs["dq_sf_k"],
-                sf_bufs["dq_sf_kt"],
-                sf_bufs["dq_sf_v"],
-                sf_bufs["dq_sf_do"],
+                *(sf_views[n] for n in _DQ_SF_OPERANDS),
                 dQ,
                 dK,
                 dV,
@@ -563,12 +517,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
                 K,
                 V,
                 O,
-                sf_bufs["dkdv_sf_q"],
-                sf_bufs["dkdv_sf_qt"],
-                sf_bufs["dkdv_sf_k"],
-                sf_bufs["dkdv_sf_v"],
-                sf_bufs["dkdv_sf_do"],
-                sf_bufs["dkdv_sf_dot"],
+                *(sf_views[n] for n in _DKDV_SF_OPERANDS),
                 dK,
                 dV,
                 DO,

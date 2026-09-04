@@ -12,8 +12,9 @@ input to each module's cached ``compile()`` function. Import a template
 directly only for its all-defaults standalone path.
 
 The SM100 d=256 MXFP8 kernels (``bprop_dq_d256_mxfp8_sm100``,
-``bprop_dkdv_d256_mxfp8_sm100``, their shared ``_bprop_mxfp8_*_sm100`` helpers
-and the ``bprop_sf_repack_mxfp8_sm100`` scale-factor repack) are the exception:
-ported CuTe DSL kernel CLASSES that specialize through their constructors, so
-they are ordinary importable modules with no template parameters.
+``bprop_dkdv_d256_mxfp8_sm100`` and their shared ``_bprop_mxfp8_*_sm100``
+helpers) are the exception: ported CuTe DSL kernel CLASSES that specialize
+through their constructors, so they are ordinary importable modules with no
+template parameters. They read cuDNN's canonical F8_128x4 scale factors
+directly (see the native-SF section of ``_bprop_mxfp8_common_sm100``).
 """

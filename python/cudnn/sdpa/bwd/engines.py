@@ -815,9 +815,8 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     """SM100 (Blackwell) d=256 block-scale MXFP8 backward row.
 
     Two kernels (dQ; fused dK/dV) ported from the ``fmha_mxfp8_large_head_dim``
-    repo, preceded by a
-    scale-factor repack into the kernels' 2-CTA slot layout (see
-    ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is). Exact d=256 only
+    repo; they read cuDNN's canonical F8_128x4 scale factors in place (no
+    repack, no extra launch -- see ``api_dsl_mxfp8_sm100``). Exact d=256 only
     -- the SF plumbing has no envelope story, as on the forward MXFP8 row.
 
     Served: E4M3 payloads with fp16/bf16 half side, BSHD-physical layout, MHA /
