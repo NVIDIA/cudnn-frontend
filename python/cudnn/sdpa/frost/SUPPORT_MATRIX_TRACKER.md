@@ -40,14 +40,18 @@ every other `sdpa_backward()` / `sdpa_mxfp8_backward()` shape still falls
 through to the cuDNN backend. The BPROP column below reads ᵇ for the
 half-precision row and ᵍ for the MXFP8 row.
 
-The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
-front**: the seven F8_128x4 scale tensors are repacked into the kernels'
-2-CTA slot layout (eleven small launches into workspace), then a dQ kernel
-(Q·Kᵀ, dO·Vᵀ, dS·K) and a fused dK/dV kernel (Q·Kᵀ, dO·Vᵀ, dSᵀ·Q, Pᵀ·dO) run,
-both 2-CTA block-scaled MMA pipelines ported from Xinbo Zhao's
-`fmha_mxfp8_large_head_dim`. dS is quantized in-kernel with an
-online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale. The repack is a
-documented exception to Hard Rule 2 (see `bwd/api_dsl_mxfp8_sm100.py`).
+The MXFP8 backward is a **two-kernel chain**: a dQ kernel (Q·Kᵀ, dO·Vᵀ, dS·K)
+and a fused dK/dV kernel (Q·Kᵀ, dO·Vᵀ, dSᵀ·Q, Pᵀ·dO), both 2-CTA block-scaled
+MMA pipelines ported from Xinbo Zhao's `fmha_mxfp8_large_head_dim`. The seven
+F8_128x4 scale tensors are read in place: each kernel TMA-loads the canonical
+512-byte scale atoms (the columnwise `descale_*_T` tensors' D-tile-major atom
+order is expressed as TMA strides) and each CTA's load warp builds the
+row-group-shifted copies the 2-CTA MMA data path needs in shared memory -- no
+repack launch, no scale-factor workspace (the dK/dV kernel currently runs
+~20% slower than with the former repack path because the cross-CTA slot-ready
+signal sits on the MMA warp's path; end to end the engine is ~1% slower since
+the repack launches are gone; tracked as follow-up). dS is quantized in-kernel with an
+online per-32-block E8M0 scale; P with a fixed 2⁻⁸ descale.
 
 The backward is a **three-stage chain**, not one fused kernel: a fused d=512
 backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
@@ -148,9 +152,9 @@ outright: E5M2, bottom-right / right-widened / sliding-window masks, padding,
 THD, bias / dBias, sink / dSink, and any of `amax_dQ/dK/dV` requested as a real
 output (the kernels write half-precision gradients and produce no amax).
 Numerics: dS is quantized in-kernel with an online per-32-block E8M0 scale;
-P with a fixed 2⁻⁸ descale (cuDNN's MXFP8 convention). Cost to know about: the
-scale-factor repack in front of the kernels (eleven launches, ~1–2 % of the
-backward) and its workspace (about one payload-equivalent of bytes).
+P with a fixed 2⁻⁸ descale (cuDNN's MXFP8 convention). The scale factors are
+consumed in their canonical F8_128x4 layout (TMA straight from the graph
+tensors); the workspace is the kernels' own scratch only.
 
 ---
 
