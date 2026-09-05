@@ -2926,6 +2926,7 @@ class OperationBuilder_v8 {
                                             (m_operation.pointwise_mode == PointwiseMode_t::LOG) ||
                                             (m_operation.pointwise_mode == PointwiseMode_t::NEG) ||
                                             (m_operation.pointwise_mode == PointwiseMode_t::MOD) ||
+                                            (m_operation.pointwise_mode == PointwiseMode_t::FLOOR_MOD) ||
                                             (m_operation.pointwise_mode == PointwiseMode_t::POW) ||
                                             (m_operation.pointwise_mode == PointwiseMode_t::ABS) ||
                                             (m_operation.pointwise_mode == PointwiseMode_t::CEIL) ||
