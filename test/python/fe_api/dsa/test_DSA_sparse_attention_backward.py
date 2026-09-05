@@ -3,9 +3,7 @@
 
 """Tests for SparseAttentionBackward.
 
-The forward pass is a PyTorch reference (see dsa_reference.ref_sparse_attention_forward);
-the production forward is FlashMLA (C++, out of scope). Gradients are generated
-via autograd on the reference forward.
+Gradients are generated via autograd on the gather-based forward reference.
 """
 
 import math
@@ -23,8 +21,8 @@ from fe_api.dsa.dsa_utils import (
     with_dsa_sparse_attention_backward_params,
 )
 from fe_api.dsa.dsa_reference import (
-    ref_sparse_attention_forward,
     check_ref_dsa_sparse_attention_backward,
+    ref_sparse_attention_forward_chunked,
 )
 
 
@@ -114,7 +112,7 @@ def _exercise_deterministic_sm100_case(num_heads, head_dim, s_q, s_kv, repeats, 
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
     if s_q > 1:
         topk_length[s_q // 2] = 0
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -330,7 +328,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_masks_active_positive_
         topk_length = torch.tensor([2, topk // 2, topk - 1, topk], dtype=torch.int32, device=device)
 
     softmax_scale = head_dim**-0.5
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -402,7 +400,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_dsink_reduction_covers_tail():
     topk_length = pattern.repeat((s_q + pattern.numel() - 1) // pattern.numel())[:s_q]
     topk_length[-1] = topk
     softmax_scale = head_dim**-0.5
-    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
     dq = torch.empty_like(q)
     dkv = torch.empty_like(kv)
     d_sink_runs = []
@@ -461,7 +459,7 @@ def test_DSA_sparse_attention_backward_sm100_h128_two_cta_cuda_graph():
     topk_idxs = torch.stack([torch.randperm(s_kv, device="cuda")[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device="cuda")
     softmax_scale = head_dim**-0.5
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -557,8 +555,8 @@ def _run_DSA_sparse_attention_backward_wrapper(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # Run reference forward to get out + FlashMLA-style KV-only lse for backward.
-    out, lse = ref_sparse_attention_forward(
+    # Run reference forward to get out and the KV-only lse for backward.
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -680,7 +678,7 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
     lengths = torch.tensor([1, 63, 64, 65, 512], dtype=torch.int32, device=device)
     topk_length = lengths if has_topk_length else None
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -763,7 +761,6 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
     base_topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
 
     # D512 covers defensive negative handling around the 64-row tile boundary.
-    # D512 covers defensive negative handling around the 64-row tile boundary.
     # D576/H16 covers both sides of the dedicated kernel's 128-row boundary and
     # its final feature/top-k tails. D576/H32 covers the corresponding M64
     # boundary (a partial 64-row CTA on SM100), and every case also exercises
@@ -781,7 +778,7 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
         # does not consult topk_idxs before exiting.
         topk_idxs[empty_rows] = torch.iinfo(torch.int32).max
 
-        out, lse = ref_sparse_attention_forward(
+        out, lse = ref_sparse_attention_forward_chunked(
             q,
             kv,
             attn_sink,
@@ -790,7 +787,7 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
             softmax_scale=softmax_scale,
         )
         assert torch.equal(out[empty_rows], torch.zeros_like(out[empty_rows]))
-        assert torch.isneginf(lse[empty_rows]).all()
+        assert torch.isposinf(lse[empty_rows]).all()
         dout = torch.randn_like(out)
 
         # In particular, the empty-row fast path must overwrite caller-owned
@@ -960,7 +957,7 @@ def test_DSA_sparse_attention_backward_sm100_accumulates_odo_in_fp32():
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
     attn_sink = torch.linspace(2.0, 5.0, num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.arange(s_kv, dtype=torch.int32, device=device).expand(s_q, -1).contiguous()
-    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, softmax_scale=192**-0.5)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, softmax_scale=192**-0.5)
     dout = torch.randn_like(out)
 
     result = DSA.sparse_attention_backward_wrapper(
@@ -1010,7 +1007,7 @@ def test_DSA_sparse_attention_backward_sm90_padded_topk_columns_contribute_zero(
         topk_idxs[:, 3] = -1
         topk_idxs[:, 70] = -1
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1084,7 +1081,7 @@ def test_DSA_sparse_attention_backward_sm90_saturating_attn_sink(sink_value):
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1146,7 +1143,7 @@ def test_DSA_sparse_attention_backward_sm100_partial_max_topk(num_heads, s_kv, t
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1211,7 +1208,7 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
         )
     )
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1303,7 +1300,7 @@ def test_DSA_sparse_attention_backward_staged_store():
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
     dout = torch.randn_like(out)
 
     orig_setup = _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes
@@ -1390,7 +1387,7 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device) if has_topk_length else None
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1465,7 +1462,7 @@ def test_DSA_sparse_attention_backward_fp16_sm100_numerics(head_dim, num_heads):
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.tensor([16, 32, 48, 64], dtype=torch.int32, device=device)
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,
@@ -1540,7 +1537,7 @@ def test_DSA_sparse_attention_backward_noncontiguous_aux_inputs():
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
 
-    out, lse = ref_sparse_attention_forward(
+    out, lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
         attn_sink,

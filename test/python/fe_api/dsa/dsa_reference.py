@@ -7,12 +7,11 @@ Reference implementations for DSA (DeepSeek Sparse Attention) tests.
 Contains pure-PyTorch reference implementations for numerical verification of
 the cudnn-frontend DSA kernels.
 
-The forward sparse-attention reference in this file exists solely to generate
-(out, lse) inputs and run autograd against the cudnn-frontend
-SparseAttentionBackward kernel. The production DSA forward pass is FlashMLA
-(C++); FlashMLA is not integrated in this CuTe-DSL-only step. For production
-forward, use FlashMLA directly. FlashMLA returns the KV-only LSE; the attention
-sink is folded into the softmax denominator by the backward kernel.
+The sparse-attention forward reference is slot/gather based: duplicate top-k
+indices retain their multiplicity, while negative and out-of-bounds indices
+are masked before gather. It models the four outputs of the CuTe-DSL forward
+and keeps the historical ``(out, lse)`` return form for backward tests unless
+``return_full=True`` is requested.
 """
 
 import math
@@ -20,76 +19,161 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-
-def _make_topk_mask(
-    topk_idxs: torch.Tensor,  # (T, topk)
-    topk_length: Optional[torch.Tensor],  # (T,) or None
-    s_kv: int,
-) -> torch.Tensor:
-    """Materialize a boolean (T, s_kv) mask from topk indices."""
-    t, topk = topk_idxs.shape
-    mask = torch.zeros(t, s_kv, dtype=torch.bool, device=topk_idxs.device)
-    row_idx = torch.arange(t, device=topk_idxs.device).unsqueeze(1).expand(-1, topk)
-    valid = (topk_idxs >= 0) & (topk_idxs < s_kv)
-    mask[row_idx[valid], topk_idxs[valid].long()] = True
-    if topk_length is not None:
-        positions = torch.arange(topk, device=topk_idxs.device).unsqueeze(0).expand(t, -1)
-        invalid = positions >= topk_length.unsqueeze(1)
-        invalid_idx = topk_idxs.clone()
-        invalid_idx[invalid] = 0
-        # Recompute mask only where valid
-        mask = torch.zeros(t, s_kv, dtype=torch.bool, device=topk_idxs.device)
-        valid_mask = ~invalid & (topk_idxs >= 0) & (topk_idxs < s_kv)
-        valid_positions = topk_idxs[valid_mask]
-        valid_rows = row_idx[valid_mask]
-        mask[valid_rows, valid_positions] = True
-    return mask
+_DEFAULT_SPARSE_ATTENTION_QUERY_CHUNK_SIZE = 64
 
 
 def ref_sparse_attention_forward(
     q: torch.Tensor,  # (T, H, D)
     kv: torch.Tensor,  # (T_kv, D), K=V shared
-    attn_sink: torch.Tensor,  # (H,)
+    attn_sink: Optional[torch.Tensor],  # (H,) or None
     topk_idxs: torch.Tensor,  # (T, topk)
     topk_length: Optional[torch.Tensor] = None,  # (T,)
     softmax_scale: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch reference DSA forward (uncompiled, slow).
+    indexer_topk: int = 0,
+    return_full: bool = False,
+    source_parity: bool = True,
+):
+    """Gather-based PyTorch reference DSA forward (uncompiled, slow).
 
-    Returns ``(out, lse)`` where ``lse`` is the FlashMLA-style KV-only LSE,
-    excluding the attention sink. ``out`` is still computed with the sink in
-    the softmax denominator.
+    Invalid slots are never used to index ``kv`` and duplicate indices remain
+    duplicate softmax entries. ``lse`` is KV-only and excludes the sink.
+    Empty rows use the kernel sentinel ``out=0``, ``max_logits=-inf``, and
+    ``lse=+inf``.
+
+    By default this returns ``(out, lse)`` for existing backward tests. With
+    ``return_full=True`` it returns
+    ``(out, max_logits, lse, lse_indexer)``. ``source_parity=True`` reproduces
+    the kernel's ``+inf`` indexer sentinel when a row's
+    ``topk_length < indexer_topk``; those rows are outside the public forward
+    kernel's supported contract.
     """
     t, h, d = q.shape
     t_kv, d_kv = kv.shape
     assert d == d_kv
+    assert topk_idxs.ndim == 2 and topk_idxs.shape[0] == t
+    logical_topk = topk_idxs.shape[1]
+    if indexer_topk < 0 or indexer_topk > logical_topk:
+        raise ValueError(f"indexer_topk must be in [0, {logical_topk}], got {indexer_topk}")
+    if topk_length is not None and topk_length.shape != (t,):
+        raise ValueError(f"topk_length must have shape {(t,)}, got {tuple(topk_length.shape)}")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
 
     q_f = q.to(torch.float32)
-    k_f = kv.to(torch.float32)
     # The 576-wide MLA path uses all 576 dimensions for QK and the first 512
     # dimensions for V. The 512-wide path keeps K and V identical.
     head_dim_v = 512 if d == 576 else d
-    v_f = kv[:, :head_dim_v].to(torch.float32)
+    positions = torch.arange(logical_topk, device=topk_idxs.device).unsqueeze(0)
+    if topk_length is None:
+        effective_length = torch.full((t, 1), logical_topk, dtype=torch.int64, device=topk_idxs.device)
+    else:
+        effective_length = topk_length.to(torch.int64).clamp(0, logical_topk).unsqueeze(1)
+    slot_valid = (positions < effective_length) & (topk_idxs >= 0) & (topk_idxs < t_kv)
 
-    mask = _make_topk_mask(topk_idxs, topk_length, t_kv)  # (T, T_kv)
-    mask = mask.unsqueeze(1).expand(t, h, t_kv)  # (T, H, T_kv)
+    # Clamp only to create an in-range gather index. The validity predicate is
+    # computed first and is applied to scores; no invalid value contributes.
+    if t_kv == 0:
+        gathered_kv = kv.new_zeros((t, logical_topk, d), dtype=torch.float32)
+    else:
+        safe_indices = topk_idxs.to(torch.int64).clamp(0, t_kv - 1)
+        gathered_kv = kv[safe_indices].to(torch.float32)
+    # Model the kernel's predicated gather rather than relying only on a
+    # post-GEMM score mask.  In particular, an ignored slot that happens to
+    # name a KV row containing NaNs must contribute an actual zero K/V row;
+    # otherwise ``0 * NaN`` would contaminate the output reduction.
+    gathered_kv = torch.where(slot_valid.unsqueeze(-1), gathered_kv, torch.zeros_like(gathered_kv))
 
-    # scores[t, h, k] = q[t, h] @ kv[k]
-    scores = torch.einsum("thd,kd->thk", q_f, k_f) * softmax_scale
-    scores = scores.masked_fill(~mask, float("-inf"))
+    if logical_topk == 0:
+        scores = q_f.new_empty((t, h, 0))
+        raw_lse = q_f.new_full((t, h), float("-inf"))
+        max_logits = q_f.new_full((t, h), float("-inf"))
+    else:
+        scores = torch.einsum("thd,tkd->thk", q_f, gathered_kv) * softmax_scale
+        scores = scores.masked_fill(~slot_valid.unsqueeze(1), float("-inf"))
+        raw_lse = torch.logsumexp(scores, dim=-1)
+        max_logits = scores.amax(dim=-1)
 
-    lse = torch.logsumexp(scores, dim=-1)  # (T, H), excludes sink
-    sink = attn_sink.view(1, h)
-    lse_with_sink = torch.logaddexp(lse, sink)
-    weights = torch.exp(scores - lse_with_sink.unsqueeze(-1))
-    # Masked scores are -inf; with a +inf sink that is -inf - +inf = NaN.
-    weights = weights.masked_fill(~mask, 0.0)
-    out = torch.einsum("thk,kd->thd", weights, v_f)
+    has_valid = slot_valid.any(dim=-1)
+    if attn_sink is None:
+        sink = q_f.new_full((1, h), float("-inf"))
+    else:
+        sink = attn_sink.to(torch.float32).view(1, h)
+    lse_with_sink = torch.logaddexp(raw_lse, sink)
+    # Avoid an all-invalid/no-sink ``-inf - -inf`` while retaining a fully
+    # differentiable gather path for non-empty rows.
+    safe_normalizer = torch.where(has_valid.unsqueeze(1), lse_with_sink, torch.zeros_like(lse_with_sink))
+    if logical_topk == 0:
+        weights = q_f.new_empty((t, h, 0))
+    else:
+        safe_scores = scores.masked_fill(~slot_valid.unsqueeze(1), 0.0)
+        weights = torch.exp(safe_scores - safe_normalizer.unsqueeze(-1))
+        weights = weights.masked_fill(~slot_valid.unsqueeze(1), 0.0)
+    gathered_v = gathered_kv[..., :head_dim_v]
+    out = torch.einsum("thk,tkd->thd", weights, gathered_v)
 
-    return out.to(q.dtype), lse
+    lse = torch.where(has_valid.unsqueeze(1), raw_lse, torch.full_like(raw_lse, float("inf")))
+    lse_indexer = None
+    if indexer_topk:
+        prefix_scores = scores[..., :indexer_topk]
+        prefix_valid = slot_valid[:, :indexer_topk].any(dim=-1)
+        prefix_lse = torch.logsumexp(prefix_scores, dim=-1)
+        lse_indexer = torch.where(prefix_valid.unsqueeze(1), prefix_lse, torch.full_like(prefix_lse, float("inf")))
+        if source_parity and topk_length is not None:
+            short_row = topk_length < indexer_topk
+            lse_indexer = torch.where(short_row.unsqueeze(1), torch.full_like(lse_indexer, float("inf")), lse_indexer)
+
+    out = out.to(q.dtype)
+    if return_full:
+        return out, max_logits, lse, lse_indexer
+    return out, lse
+
+
+@torch.no_grad()
+def ref_sparse_attention_forward_chunked(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    topk_idxs: torch.Tensor,
+    topk_length: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    query_chunk_size: int = _DEFAULT_SPARSE_ATTENTION_QUERY_CHUNK_SIZE,
+):
+    """Materialize reference ``out`` / ``lse`` with bounded query intermediates."""
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+
+    t = q.shape[0]
+    assert topk_idxs.ndim == 2 and topk_idxs.shape[0] == t
+    if topk_length is not None and topk_length.shape != (t,):
+        raise ValueError(f"topk_length must have shape {(t,)}, got {tuple(topk_length.shape)}")
+    if t <= query_chunk_size:
+        return ref_sparse_attention_forward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+        )
+
+    out_chunks = []
+    lse_chunks = []
+    for begin in range(0, t, query_chunk_size):
+        end = min(begin + query_chunk_size, t)
+        length_chunk = None if topk_length is None else topk_length[begin:end]
+        out_chunk, lse_chunk = ref_sparse_attention_forward(
+            q[begin:end],
+            kv,
+            attn_sink,
+            topk_idxs[begin:end],
+            topk_length=length_chunk,
+            softmax_scale=softmax_scale,
+        )
+        out_chunks.append(out_chunk)
+        lse_chunks.append(lse_chunk)
+
+    return torch.cat(out_chunks, dim=0), torch.cat(lse_chunks, dim=0)
 
 
 def check_ref_dsa_sparse_attention_backward(
@@ -107,37 +191,56 @@ def check_ref_dsa_sparse_attention_backward(
     topk_length=None,
     atol: float = 1e-2,
     rtol: float = 1e-2,
+    query_chunk_size: int = _DEFAULT_SPARSE_ATTENTION_QUERY_CHUNK_SIZE,
 ):
-    """Run autograd on the reference forward to compare ``dq`` / ``dkv`` / ``d_sink``."""
-    q_r = q.detach().clone().to(torch.float32).requires_grad_(True)
+    """Run chunked autograd to compare ``dq`` / ``dkv`` / ``d_sink``."""
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+
     kv_r = kv.detach().clone().to(torch.float32).requires_grad_(True)
     sink_r = attn_sink.detach().clone().to(torch.float32).requires_grad_(True)
 
-    out_r, _ = ref_sparse_attention_forward(
-        q_r,
-        kv_r,
-        sink_r,
-        topk_idxs,
-        topk_length=topk_length,
-        softmax_scale=softmax_scale,
-    )
-    out_r.backward(dout.to(torch.float32))
+    dq_ref = torch.empty_like(q, dtype=torch.float32)
+    dkv_ref = torch.zeros_like(kv_r)
+    d_sink_ref = torch.zeros_like(sink_r)
+    for begin in range(0, q.shape[0], query_chunk_size):
+        end = min(begin + query_chunk_size, q.shape[0])
+        q_chunk_r = q[begin:end].detach().clone().to(torch.float32).requires_grad_(True)
+        length_chunk = None if topk_length is None else topk_length[begin:end]
+        out_chunk_r, _ = ref_sparse_attention_forward(
+            q_chunk_r,
+            kv_r,
+            sink_r,
+            topk_idxs[begin:end],
+            topk_length=length_chunk,
+            softmax_scale=softmax_scale,
+        )
+        dq_chunk, dkv_chunk, d_sink_chunk = torch.autograd.grad(
+            out_chunk_r,
+            (q_chunk_r, kv_r, sink_r),
+            grad_outputs=dout[begin:end].to(torch.float32),
+        )
+        with torch.no_grad():
+            dq_ref[begin:end].copy_(dq_chunk)
+            dkv_ref.add_(dkv_chunk)
+            d_sink_ref.add_(d_sink_chunk)
+        del out_chunk_r, dq_chunk, dkv_chunk, d_sink_chunk, q_chunk_r
 
     torch.testing.assert_close(
         dq_actual.to(torch.float32),
-        q_r.grad,
+        dq_ref,
         atol=atol,
         rtol=rtol,
     )
     torch.testing.assert_close(
         dkv_actual.to(torch.float32),
-        kv_r.grad,
+        dkv_ref,
         atol=atol,
         rtol=rtol,
     )
     torch.testing.assert_close(
         d_sink_actual.to(torch.float32),
-        sink_r.grad,
+        d_sink_ref,
         atol=atol,
         rtol=rtol,
     )
