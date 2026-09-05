@@ -242,6 +242,28 @@ def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
 
 
 @pytest.mark.L0
+def test_d512_mxfp8_primary_uses_measured_scheduler():
+    name = engines.engine_name(mxfp8=True)
+    offered = {name: 20510}
+    base = dict(
+        s_q=8192,
+        d_qk=512,
+        d_v=512,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_mxfp8=True,
+    )
+
+    causal = recommend("A", _facts(**base), offered)
+    dense = recommend("A", _facts(causal=False, **base), offered)
+    thd = recommend("A", _facts(thd=True, padded=True, **base), offered)
+
+    assert (causal[0].knobs.cga, causal[0].knobs.sched_policy) == (1, 1)
+    assert (dense[0].knobs.cga, dense[0].knobs.sched_policy) == (1, 0)
+    assert (thd[0].knobs.cga, thd[0].knobs.sched_policy) == (1, 0)
+
+
+@pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     """Placement is the SHARED layer's job (engines/heuristics._assemble):
     proposals lead the backend's entries inside each mode block by standing

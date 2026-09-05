@@ -91,6 +91,7 @@ _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
+    (512, 512): "prefill_d512_mxfp8_sm100.py",
 }
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
@@ -344,7 +345,7 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
     raise ValueError(f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); available envelopes: {sorted(pool)}.")
 
 
-def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int]) -> tuple[int, ...]:
+def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
     """CGA widths the STANDALONE adapter serves for a kernel flavor.
 
     A module-level function, not an inline expression in ``check_support``, so a
@@ -372,6 +373,8 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     if flavor == (192, 128):
         return (1, 2)
     if fp8 and flavor == (256, 256):
+        return (1,)
+    if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
     return (2,)
 
@@ -1184,7 +1187,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc)
+        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
@@ -1455,6 +1458,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 batch_size=self.batch_size,
                 h_q=self.h_q,
                 s_q=self.s_q_max,
+            )
+        elif self.flavor == (512, 512) and not self._pertensor:
+            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
+
+            auto_sched, auto_cga = select_d512_auto_knobs(params, pertensor=False)
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:

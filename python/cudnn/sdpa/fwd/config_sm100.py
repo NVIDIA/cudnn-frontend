@@ -795,6 +795,24 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     return cfg, _tma_iters(cfg)
 
 
+def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
+    """Build the SM100 D512 block-scale CTA1 configuration."""
+
+    cfg, _ = _make_cfg_d256(params, mxfp8=True)
+    # A 512-column MXFP8 accumulator leaves no TMEM columns for block scales.
+    # Keep the proven CTA1 M128 pipeline and emit two 256-column O slices.
+    cfg = replace(cfg, TILE_K=512, STAGES_KV=1)
+    if cfg.CTA_MMA != 1 or cfg.CGA_M != 1:
+        raise ValueError("d512 MXFP8 requires one-CTA M128 MMA")
+    if cfg.TILE_M != 128 or cfg.TILE_N != 128 or cfg.TILE_K != 512 or cfg.TILE_O != 256:
+        raise ValueError("d512 MXFP8 requires M128xN128, K512, and a 256-column output slice")
+    if cfg.STAGES_KV != 1:
+        raise ValueError("d512 MXFP8 requires one KV stage")
+    if cfg.PACK_GQA or cfg.SPLIT_KV != 1:
+        raise ValueError("d512 MXFP8 does not support PackGQA or split-KV")
+    return cfg, _tma_iters(cfg)
+
+
 # ---------------------------------------------------------------------------
 # d128 flavor — d_qk = d_v = 128, SM100 (Blackwell), cga2 (Llama-class models)
 # ---------------------------------------------------------------------------

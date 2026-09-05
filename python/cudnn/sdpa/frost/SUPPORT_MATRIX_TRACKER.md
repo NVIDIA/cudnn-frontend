@@ -63,14 +63,14 @@ MMA as d=512.
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | **Data types** | | | | | | |
 | FP16 / BF16 | ⚠️⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |
-| FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ❌ | ❌ | ✅ᵍ (E4M3 only, d=256) |
-| O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | — | ✅ | ✅ᵍ (fp16/bf16 gradients) |
-| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ | f16 ×8 · fp8 ×16, floor 256² | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
+| FP8 E4M3 / E5M2 (per-tensor descale) | ⚠️⁷ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ❌⁸ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (E4M3 only, d=256) |
+| O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (fp16/bf16 gradients) |
+| Head-dim envelope (zero-padded below native) | **none — runs the d128 kernel**⁷ | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |
 | **Layout** | | | | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |
 | Arbitrary dense B/H/S stride order (`dense_flex`) | f16 only | f16 only | f16 only | ✅ | f16 only | ✅ᵇ ᶜ · ❌ᵍ |
-| THD / ragged (packed varlen) | f16 only⁹ | ✅ | f16 only³ | ✅ | f16 + fp8³ | ✅ᵇ ʰ · ❌ᵍ |
+| THD / ragged (packed varlen) | f16 only⁹ | ✅ | ✅³ | ✅ | ✅³ | ✅ᵇ ʰ · ❌ᵍ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | f16 only⁹ | ✅ | ✅ | ✅ | ✅ | ❌ʲ |
 | **Masks / features** | | | | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |
@@ -94,7 +94,8 @@ row has no `out_dtypes` domain and `facts.uniform_dtype` requires O == Q there.
 `—` marks a column with no quantized kernel at all.
 ² The d512 FP8 flavor serves head dims in (256, 512] on both axes; a smaller
 graph is declined rather than routed onto it at >2× zero-padding cost.
-³ The d192×d128 fp8/mxfp8 kernels are dense-only; d512 has no MXFP8 kernel.
+³ Quantized THD is exact-shape only. The d192×d128 and d512 MXFP8 kernels use
+the same packed-metadata lowering as the d128/d256 kernels, not an envelope.
 ⁴ MXFP8 lacks the `SEQ_Q_LENS_PRESENT` epilogue trim (`padded_stats=False`).
 ⁵ FP8 and MXFP8 rows are not plumbed for the dense padded-Q trim.
 ⁶ Served through the padded path with synthesized full-length KV lengths, or
@@ -177,10 +178,10 @@ count comes from the packed totals before any buffer exists.
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
 none could be tested. Ragged backward lengths arrive as per-batch `seq_len_q/kv`.
-⁹ `thd_d_shapes` is an **exact** membership test, not an envelope: the
-quantized rows list `{(128,128), (512,512)}` (per-tensor) / `{(128,128)}`
-(MXFP8), so d=64 **THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the
-envelope (`thd_d_shapes=None`) and works.
+⁹ `thd_d_shapes` is an **exact** membership test, not an envelope: both
+quantized rows list `{(128,128), (192,128), (256,256), (512,512)}`, so d=64
+**THD on FP8/MXFP8 is declined**. f16/bf16 THD rides the envelope
+(`thd_d_shapes=None`) and works.
 ¹⁰ The per-tensor FP8 d192×d128 and d256 flavors are **floored to their exact
 shapes** (`d_envelope_floors` `((192,128),128), ((256,256),255)`, mirrored in
 `fwd/api_dsl._SM100_FP8_ENVELOPE_FLOORS`): with d_qk zero-padded into d192×d128
