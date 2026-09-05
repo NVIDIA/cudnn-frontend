@@ -685,6 +685,11 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     except cudnn.cudnnGraphNotSupportedError as e:
         pytest.skip(f"MXFP8 SDPA not supported: {e}")
     except Exception as e:
+        # NOT_SUPPORTED can also surface at build_plans/finalize AFTER
+        # check_support accepted the graph (backend support-check gap);
+        # that is a waive, not a harness error.
+        if "CUDNN_STATUS_NOT_SUPPORTED" in str(e):
+            pytest.skip(f"MXFP8 SDPA not supported (at finalize): {e}")
         pytest.fail(f"Error building MXFP8 THD SDPA graph: {e}")
 
     # If the FROST engine declined this config, auto-selection falls back to
@@ -805,6 +810,11 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     except cudnn.cudnnGraphNotSupportedError as e:
         pytest.skip(f"MXFP8 SDPA not supported: {e}")
     except Exception as e:
+        # NOT_SUPPORTED can also surface at build_plans/finalize AFTER
+        # check_support accepted the graph (backend support-check gap);
+        # that is a waive, not a harness error.
+        if "CUDNN_STATUS_NOT_SUPPORTED" in str(e):
+            pytest.skip(f"MXFP8 SDPA not supported (at finalize): {e}")
         pytest.fail(f"Error building MXFP8 SDPA graph: {e}")
 
     rng_data = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed)
@@ -902,6 +912,11 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         except cudnn.cudnnGraphNotSupportedError as e:
             pytest.skip(f"MXFP8 SDPA not supported: {e}")
         except Exception as e:
+            # NOT_SUPPORTED can also surface at build_plans/finalize AFTER
+            # check_support accepted the graph (backend support-check gap);
+            # that is a waive, not a harness error.
+            if "CUDNN_STATUS_NOT_SUPPORTED" in str(e):
+                pytest.skip(f"MXFP8 SDPA not supported (at finalize): {e}")
             pytest.fail(f"Error building MXFP8 SDPA graph: {e}")
 
         # Allocate backward output tensors

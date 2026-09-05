@@ -93,7 +93,7 @@ def model_params(phase):
         if not name.startswith("models.") or spec.phase != phase:
             continue
         model = name.split(".")[1]
-        params += [pytest.param(name, t, id=f"{model}-test{t[0]}") for t in spec.seeds()]
+        params += [pytest.param(name, t, id=f"{model}-{spec.dtype}-test{t[0]}") for t in spec.seeds()]
     return params
 
 

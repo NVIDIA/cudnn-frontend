@@ -203,7 +203,7 @@ _SPECS = [
         rng_seed=887,
         knobs=knobs.paged,
         post=post_paged,
-        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("block size 1..1024", "sink"),
+        fuzzed=_COMMON_FUZZ + _MASK_FUZZ + ("layout padded/cu_padded/ragged(THD Q + paged KV)", "block size 1..1024", "sink"),
         pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
     ),
     SuiteSpec(
@@ -336,7 +336,12 @@ def _model_post(phase):
     if phase == "generation":
 
         def _post(cfg, rng, request):
-            cfg.is_paged = rng.random() < 0.5
+            # Paged + ragged is a valid (serving) combo and the f16 harness
+            # supports it: packed THD Q/O against a paged dense KV cache. The
+            # fp8 harness cannot express it yet, so fp8 draws page only their
+            # non-THD configs (harness follow-up).
+            fp8_in = cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+            cfg.is_paged = rng.random() < 0.5 and not (fp8_in and cfg.is_ragged)
 
         return _post
     if phase == "bprop":
@@ -346,6 +351,29 @@ def _model_post(phase):
 
 for _preset in CATALOG:
     for _phase in ("context", "generation", "bprop"):
+        if True:  # every preset gets an fp8 flavor of every phase
+            _SPECS.append(
+                SuiteSpec(
+                    name=f"models.{_preset.name}.{_phase}.fp8",
+                    phase=_phase,
+                    dtype="fp8",
+                    level="L0",
+                    num_tests=8,
+                    rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}.fp8".encode()) % 100000,
+                    knobs=partial(knobs.model_knobs_fp8, _preset, _phase),
+                    exec_kind="fp8",
+                    post=_model_post(_phase),
+                    fuzzed=("batch", "seq lens", "layout", "mask flavor", "data", "e4m3/e5m2 in", "out fp8/fp16")
+                    + (("paged 50%",) if _phase == "generation" else ()),
+                    pinned=(
+                        f"h_q={_preset.num_q_heads}",
+                        f"h_kv={_preset.num_kv_heads}",
+                        f"d_qk={_preset.head_dim_qk}",
+                        f"d_v={_preset.head_dim_vo}",
+                    ),
+                    notes=f"{_preset.name} full/global attention layers, fp8-trained flavor",
+                )
+            )
         _SPECS.append(
             SuiteSpec(
                 name=f"models.{_preset.name}.{_phase}",
@@ -365,6 +393,36 @@ for _preset in CATALOG:
                     f"sink={'fuzzed' if (_preset.with_sink and _phase != 'generation') else 'off'}",
                 ),
                 notes=f"{_preset.name} full/global attention layers",
+            )
+        )
+
+# mxfp8 model flavor: context and bprop only — mxfp8 is a prefill/training
+# format with no decode-shaped engine, so a generation flavor would be a
+# 100%-waived shell. Out-of-envelope head dims (qwen35 d=256) waive at build.
+for _preset in CATALOG:
+    for _phase in ("context", "bprop"):
+        _SPECS.append(
+            SuiteSpec(
+                name=f"models.{_preset.name}.{_phase}.mxfp8",
+                phase=_phase,
+                dtype="mxfp8",
+                level="L0",
+                num_tests=8,
+                rng_seed=__import__("zlib").crc32(f"{_preset.name}.{_phase}.mxfp8".encode()) % 100000,
+                knobs=partial(knobs.model_knobs_mxfp8, _preset, _phase),
+                exec_kind="mxfp8",
+                min_sm=(10, 0),
+                post=combine(post_mxfp8, post_mxfp8_bwd_flags, post_train) if _phase == "bprop" else post_mxfp8,
+                fuzzed=("batch", "seq lens", "mask flavor", "data", "e4m3/e5m2 in", "out fp16/bf16"),
+                pinned=(
+                    f"h_q={_preset.num_q_heads}",
+                    f"h_kv={_preset.num_kv_heads}",
+                    f"d_qk={_preset.head_dim_qk}",
+                    f"d_v={_preset.head_dim_vo}",
+                    "layout full",
+                    "SM100+",
+                ),
+                notes=f"{_preset.name} mxfp8 flavor; no generation (no decode-shaped mxfp8 engine)",
             )
         )
 
