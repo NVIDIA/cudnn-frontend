@@ -8,7 +8,7 @@ from enum import IntEnum
 from looseversion import LooseVersion
 
 from .fp16_ref import compute_ref, compute_ref_backward
-from .random_config import packed_token_capacity
+from .random_config import compute_default_BHSD_strides, packed_token_capacity
 from .helpers import (
     convert_to_cudnn_type,
     exact_equal,
@@ -133,8 +133,10 @@ def validate_config(cfg):
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
-    max_t_q = packed_token_capacity(cfg.seq_len_q) if cfg.is_ragged else None
-    max_t_kv = packed_token_capacity(cfg.seq_len_kv) if cfg.is_ragged else None
+    # total_q/total_kv are first-class capacities: honor explicit (possibly
+    # slack-fuzzed) totals, falling back to the minimal packed capacity.
+    max_t_q = (cfg.total_q or packed_token_capacity(cfg.seq_len_q)) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or packed_token_capacity(cfg.seq_len_kv)) if cfg.is_ragged else None
 
     # When perf mode is enabled, use normal distribution instead of sparse small integers
     # to avoid artificially fast timings from GPU memory compression of sparse data.
@@ -149,14 +151,23 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         v_strides = (cfg.stride_v[2], cfg.stride_v[1], cfg.stride_v[3])
         o_strides = (cfg.stride_o[2], cfg.stride_o[1], cfg.stride_o[3])
         allocs[TensorUid.q] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, strides=q_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
-        allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
-        allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        if cfg.is_paged:
+            # Paged + ragged is the serving shape: Q/O are packed THD, but the
+            # KV CACHE stays dense-padded and is paged into containers below —
+            # a packed buffer cannot be paged, and the containers carry no
+            # ragged offsets.
+            allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=compute_default_BHSD_strides(cfg.shape_k), rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+            allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=compute_default_BHSD_strides(cfg.shape_v), rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        else:
+            allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+            allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         if not perf:
             # keep at least a few q rows in the deeply-negative-score regime
             # (see inject_negative_score_rows); 0.125 matches this file's attn_scale.
             # slice to the valid packed prefixes: max_t_* is rounded-up capacity,
             # so sampling the full buffer could land only on ignored padding rows
-            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], allocs[TensorUid.k][0][: sum(cfg.seq_len_kv)], rng_data_gen, attn_scale=0.125)
+            k_valid = allocs[TensorUid.k][0] if cfg.is_paged else allocs[TensorUid.k][0][: sum(cfg.seq_len_kv)]
+            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], k_valid, rng_data_gen, attn_scale=0.125)
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
@@ -177,7 +188,10 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         # This makes f16/bf16 consistent with the fp8 harness, whose
         # convert_uniform_to_packed always NaN-fills the tail.
         total_t_q, total_t_kv = sum(cfg.seq_len_q), sum(cfg.seq_len_kv)
-        for uid, total in ((TensorUid.q, total_t_q), (TensorUid.k, total_t_kv), (TensorUid.v, total_t_kv)):
+        poison = [(TensorUid.q, total_t_q)]
+        if not cfg.is_paged:  # paged KV is dense (containers, no packed tail)
+            poison += [(TensorUid.k, total_t_kv), (TensorUid.v, total_t_kv)]
+        for uid, total in poison:
             allocs[uid][0][total:] = float("nan")
         if cfg.is_train:
             allocs[TensorUid.dO][0][total_t_q:] = float("nan")
@@ -225,8 +239,9 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         # Offsets scale by each tensor's ACTUAL token stride (stride[2]), not an
         # assumed-packed h*d — K/V may carry a token-stride gap (kv-interleaved).
         allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_q[2] // q_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_k[2] // k_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_v[2] // v_off_mult).to(torch.int64), None, None)
+        if not cfg.is_paged:  # paged KV containers carry no ragged offsets
+            allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_k[2] // k_off_mult).to(torch.int64), None, None)
+            allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_v[2] // v_off_mult).to(torch.int64), None, None)
         allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_o[2] // o_off_mult).to(torch.int64), None, None)
         # Stats offsets are in elements and scale by its token stride: h_q for token-major stats,
         # 1 for head-major.
@@ -329,15 +344,17 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         rng_dump = graph.tensor(uid=int(TensorUid.rng_dump), dim=(cfg.batches, cfg.h_q, cfg.s_q, cfg.s_kv), stride=(cfg.h_q * cfg.s_q * cfg.s_kv, cfg.s_q * cfg.s_kv, cfg.s_kv, 1), data_type=cudnn.data_type.FLOAT)
 
     q_ragged_offset = graph.tensor(uid=int(TensorUid.q_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
-    v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
+    kv_packed = cfg.is_ragged and not cfg.is_paged  # paged KV containers carry no ragged offsets
+    k_ragged_offset = graph.tensor(uid=int(TensorUid.k_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if kv_packed else None
+    v_ragged_offset = graph.tensor(uid=int(TensorUid.v_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if kv_packed else None
     o_ragged_offset = graph.tensor(uid=int(TensorUid.o_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
     stats_ragged_offset = graph.tensor(uid=int(TensorUid.stats_ragged_offset), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if cfg.is_ragged else None
 
     if cfg.is_ragged:
         q.set_ragged_offset(q_ragged_offset)
-        k.set_ragged_offset(k_ragged_offset)
-        v.set_ragged_offset(v_ragged_offset)
+        if kv_packed:
+            k.set_ragged_offset(k_ragged_offset)
+            v.set_ragged_offset(v_ragged_offset)
         if cfg.with_ragged_offset_multiplier:
             q.set_ragged_offset_multiplier(cfg.d_qk)
             k.set_ragged_offset_multiplier(cfg.d_qk)
@@ -395,6 +412,11 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         score_sum_exp=score_sum_exp,
         sink_token=sink_token,
         unfuse_fma=cfg.with_unfuse_fma,
+        # Declared packed token totals (first-class total_q/total_kv). The
+        # backward graph always declares them; forward declaration is opt-in
+        # so it can be fuzzed on/off.
+        max_total_seq_len_q=cfg.total_q if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
+        max_total_seq_len_kv=cfg.total_kv if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
@@ -740,13 +762,16 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
 
     if cfg.is_ragged:
         q_ref = convert_packed_to_uniform(q_ref, seq_len_q_ref, cfg.s_q)
-        k_ref = convert_packed_to_uniform(k_ref, seq_len_kv_ref, cfg.s_kv)
-        v_ref = convert_packed_to_uniform(v_ref, seq_len_kv_ref, cfg.s_kv)
+        if not cfg.is_paged:  # paged KV is dense already
+            k_ref = convert_packed_to_uniform(k_ref, seq_len_kv_ref, cfg.s_kv)
+            v_ref = convert_packed_to_uniform(v_ref, seq_len_kv_ref, cfg.s_kv)
     if cfg.is_ragged and cfg.is_train:
         dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q)
 
-    max_t_q = packed_token_capacity(seq_len_q_ref.tolist()) if cfg.is_ragged else None
-    max_t_kv = packed_token_capacity(seq_len_kv_ref.tolist()) if cfg.is_ragged else None
+    # Must match the allocation capacity: first-class total_q/total_kv when
+    # set, else the guaranteed-surplus packed capacity (GitHub #624).
+    max_t_q = (cfg.total_q or packed_token_capacity(seq_len_q_ref.tolist())) if cfg.is_ragged else None
+    max_t_kv = (cfg.total_kv or packed_token_capacity(seq_len_kv_ref.tolist())) if cfg.is_ragged else None
 
     attn_scale = 0.125
 
