@@ -36,6 +36,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [HSTU Attention (Blackwell SM100/SM103)](attention/hstu.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [CSA Fused Compressor](csa.md)
+- [DeepSeek-V4 Indexer Preprocessing](deepseek_v4_indexer_preprocess.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Backward (SM120)](attention/sdpa_bwd_sm120.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
