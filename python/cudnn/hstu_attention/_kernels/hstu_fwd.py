@@ -88,12 +88,18 @@ def _tmem_load_16dp64b16x(tmem_addr: Int32):
 
 
 @cute.jit
-def _cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
+def _cvt_f32x2_to_16x2(a: Float32, b: Float32, dtype) -> Int32:
+    if const_expr(dtype == cutlass.Float16):
+        instruction = "cvt.rn.f16x2.f32 $0, $1, $2;"
+    elif const_expr(dtype == cutlass.BFloat16):
+        instruction = "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;"
+    else:
+        raise TypeError(f"Expected Float16 or BFloat16, got {dtype}")
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [Float32(b).ir_value(), Float32(a).ir_value()],
-            "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
+            instruction,
             "=r,f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -103,7 +109,7 @@ def _cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
 
 
 @cute.jit
-def _tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor):
+def _tmem_store_16x16(tmem_addr: Int32, vals: cute.Tensor):
     assert cute.size(vals) == 16
     llvm.inline_asm(
         None,
@@ -117,7 +123,7 @@ def _tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor):
 
 
 @cute.jit
-def _tmem_store_bf16x8_16dp64b(tmem_addr: Int32, vals: cute.Tensor):
+def _tmem_store_16x8_16dp64b(tmem_addr: Int32, vals: cute.Tensor):
     assert cute.size(vals) == 8
     llvm.inline_asm(
         None,
@@ -275,6 +281,11 @@ class HSTUAttentionForwardSm100:
         self.empty_warp_ids = (10, 11)
         self.use_clc_scheduler = use_clc_scheduler and self.is_persistent and not self.is_paged
         assert not self.use_2cta_instrs or self.use_clc_scheduler
+        # A persistent q_stage=1 kernel reuses a single TMEM output accumulator.
+        # Protect that reuse with the same UMMA-to-async accumulator pipeline
+        # used by the 2-CTA path: the MMA warp must not overwrite O until the
+        # epilogue warps have finished loading it.
+        self.use_o_pipeline = self.use_2cta_instrs or (self.q_stage == 1 and self.use_clc_scheduler)
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         self.sched_stages = 1
         self.descriptor_stages = 2
@@ -676,7 +687,7 @@ class HSTUAttentionForwardSm100:
         pipeline_kv_size = self.kv_stage * 2 if self.use_2cta_instrs else 0
         pipeline_s_p_size = self.s_stage * 2 if self.use_2cta_instrs else 0
         pipeline_p_full_size = self.s_stage * 2 if self.use_2cta_instrs else 0
-        pipeline_o_size = self.o_stage * 2 if self.use_2cta_instrs else 0
+        pipeline_o_size = self.o_stage * 2 if self.use_o_pipeline else 0
 
         @cute.struct
         class SharedStorage:
@@ -933,7 +944,8 @@ class HSTUAttentionForwardSm100:
                 for i in cutlass.range_constexpr(self.s_stage):
                     cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_O_rescaled_offset + i, cute.arch.WARP_SIZE * len(self.silu0_warp_ids))
                     cute.arch.mbarrier_init(mbar_ptr + self.mbar_S_full_offset + i, len([self.mma_warp_id]))
-                    cute.arch.mbarrier_init(mbar_ptr + self.mbar_O_full_offset + i, len([self.mma_warp_id]))
+                    if const_expr(not self.use_o_pipeline):
+                        cute.arch.mbarrier_init(mbar_ptr + self.mbar_O_full_offset + i, len([self.mma_warp_id]))
             if warp_idx == 4:
                 for i in cutlass.range_constexpr(self.s_stage):
                     cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_2_offset + i, cute.arch.WARP_SIZE * len(self.silu0_warp_ids))
@@ -941,6 +953,23 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_tmem_dealloc_offset,
                     cute.arch.WARP_SIZE * len((*self.silu0_warp_ids, *self.silu1_warp_ids)),
+                )
+            if const_expr(self.use_o_pipeline):
+                # Keep this initialization deferred so the following KV
+                # pipeline's CTA-wide initialization fence publishes both
+                # pipelines together.
+                pipeline_o = cutlass.pipeline.PipelineUmmaAsync.create(
+                    barrier_storage=storage.pipeline_o_mbar.data_ptr(),
+                    num_stages=self.o_stage,
+                    producer_group=cutlass.pipeline.CooperativeGroup(
+                        cutlass.pipeline.Agent.Thread,
+                    ),
+                    consumer_group=cutlass.pipeline.CooperativeGroup(
+                        cutlass.pipeline.Agent.Thread,
+                        cute.arch.WARP_SIZE * len(self.silu1_warp_ids),
+                    ),
+                    cta_layout_vmnk=cta_layout_vmnk,
+                    defer_sync=True,
                 )
             pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
@@ -1271,6 +1300,7 @@ class HSTUAttentionForwardSm100:
                         sV_layout.inner,
                         tOrPs,
                         pipeline_kv,
+                        pipeline_o,
                         mbar_ptr,
                         block_info,
                         block_sparse_tensors,
@@ -2565,6 +2595,7 @@ class HSTUAttentionForwardSm100:
         sV_swizzle: cute.Swizzle,
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
         pipeline_kv: cutlass.pipeline.PipelineAsync,
+        pipeline_o: Optional[cutlass.pipeline.PipelineUmmaAsync],
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         block_sparse_tensors: Optional[HSTUBlockSparseTensors],
@@ -2611,6 +2642,11 @@ class HSTUAttentionForwardSm100:
 
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.kv_stage)
+        if const_expr(self.use_o_pipeline):
+            o_producer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Producer,
+                self.o_stage,
+            )
         P_full_O_rescaled_phase = [Int32(0) for _ in range(self.s_stage)]
 
         tile_scheduler = TileSchedulerCls()
@@ -2665,6 +2701,11 @@ class HSTUAttentionForwardSm100:
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
 
+                # QK uses separate TMEM columns, so it can overlap the prior
+                # epilogue. Before the first PV MMA touches O, wait until those
+                # epilogue warps have released the single output accumulator.
+                if const_expr(self.use_o_pipeline):
+                    pipeline_o.producer_acquire(o_producer_state)
                 O_should_accumulate = False
                 for i in cutlass.range(n_block_nums - 2, unroll=1):  # GEMM_P0V0, GEMM_QK2 ...-> GEMM_PiVi GEMM_QK(i+2)
                     # 1. wait for V0
@@ -2780,8 +2821,12 @@ class HSTUAttentionForwardSm100:
                         mbar_phase=P_full_O_rescaled_phase[1],
                     )
                     P_full_O_rescaled_phase[1] ^= 1
-                with cute.arch.elect_one():
-                    tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
+                if const_expr(self.use_o_pipeline):
+                    pipeline_o.producer_commit(o_producer_state)
+                    o_producer_state.advance()
+                else:
+                    with cute.arch.elect_one():
+                        tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
 
@@ -2790,6 +2835,8 @@ class HSTUAttentionForwardSm100:
 
         # End of persistent scheduler loop
         tile_scheduler.consumer_tail()
+        if const_expr(self.use_o_pipeline):
+            pipeline_o.producer_tail(o_producer_state)
 
     @cute.jit
     def silu_loop(
@@ -2836,7 +2883,7 @@ class HSTUAttentionForwardSm100:
         tStP_r2t = thr_tmem_store.partition_D(tStP)
 
         epi_consumer_phase = Int32(0)
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.use_o_pipeline):
             epi_consumer_state = cutlass.pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer,
                 self.o_stage,
@@ -3029,7 +3076,7 @@ class HSTUAttentionForwardSm100:
                     m_block=m_block,
                     head_idx=head_idx,
                     stage=stage if self.q_stage == 2 else 0,
-                    o_stage=(epi_consumer_state.index if self.use_2cta_instrs else Int32(0)),
+                    o_stage=(epi_consumer_state.index if self.use_o_pipeline else Int32(0)),
                     epi_consumer_phase=epi_consumer_phase,
                     has_work=has_work,
                 )
@@ -3041,7 +3088,7 @@ class HSTUAttentionForwardSm100:
 
             # Advance to next tile
             if has_work:
-                if const_expr(self.use_2cta_instrs):
+                if const_expr(self.use_o_pipeline):
                     epi_consumer_state.advance()
                     epi_consumer_phase = epi_consumer_state.phase
                 else:
@@ -3071,7 +3118,7 @@ class HSTUAttentionForwardSm100:
         mbar_ptr: cute.Pointer,
         stage: int | Int32,
     ):
-        """Convert one M64 score row-group to BF16 P with the native 32-DP TMEM mapping."""
+        """Convert one M64 score row-group to 16-bit P with the native 32-DP TMEM mapping."""
         assert self.kBlockM == 64 and self.kBlockN in (64, 128)
         assert not self.use_2cta_instrs
 
@@ -3120,8 +3167,8 @@ class HSTUAttentionForwardSm100:
                     partner_odd = cute.arch.shuffle_sync_bfly(odd, offset=2)
                     lo = even if lane_parity == 0 else partner_odd
                     hi = partner_even if lane_parity == 0 else odd
-                    packed_16dp[i] = _cvt_f32x2_to_bf16x2(lo, hi)
-                _tmem_store_bf16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
+                    packed_16dp[i] = _cvt_f32x2_to_16x2(lo, hi, self.q_dtype)
+                _tmem_store_16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
             cute.arch.fence_view_async_tmem_store()
 
             if const_expr(self.s0_s1_barrier):
@@ -3136,8 +3183,8 @@ class HSTUAttentionForwardSm100:
                     partner_odd = cute.arch.shuffle_sync_bfly(odd, offset=2)
                     lo = even if lane_parity == 0 else partner_odd
                     hi = partner_even if lane_parity == 0 else odd
-                    packed_16dp[i] = _cvt_f32x2_to_bf16x2(lo, hi)
-                _tmem_store_bf16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
+                    packed_16dp[i] = _cvt_f32x2_to_16x2(lo, hi, self.q_dtype)
+                _tmem_store_16x8_16dp64b(Int32(self.tmem_p_offset[stage] + chunk * 16), packed_16dp)
             cute.arch.fence_view_async_tmem_store()
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
             return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
@@ -3163,8 +3210,8 @@ class HSTUAttentionForwardSm100:
 
             for chunk in cutlass.range_constexpr(split_chunk):
                 for i in cutlass.range_constexpr(16):
-                    packed[i] = _cvt_f32x2_to_bf16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1])
-                _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
+                    packed[i] = _cvt_f32x2_to_16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1], self.q_dtype)
+                _tmem_store_16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
             cute.arch.fence_view_async_tmem_store()
         else:
             active_scores = cute.make_rmem_tensor((self.kBlockN,), Float32)
@@ -3184,8 +3231,8 @@ class HSTUAttentionForwardSm100:
 
                 for chunk in cutlass.range_constexpr(split_chunk):
                     for i in cutlass.range_constexpr(16):
-                        active_packed[i] = _cvt_f32x2_to_bf16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1])
-                    _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
+                        active_packed[i] = _cvt_f32x2_to_16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1], self.q_dtype)
+                    _tmem_store_16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
                 cute.arch.fence_view_async_tmem_store()
 
         if const_expr(self.s0_s1_barrier):
@@ -3195,15 +3242,15 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.q1_m64_silu_warps == 0):
             for chunk in cutlass.range_constexpr(split_chunk, self.kBlockN // 32):
                 for i in cutlass.range_constexpr(16):
-                    packed[i] = _cvt_f32x2_to_bf16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1])
-                _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
+                    packed[i] = _cvt_f32x2_to_16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1], self.q_dtype)
+                _tmem_store_16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
             cute.arch.fence_view_async_tmem_store()
         else:
             if warp_idx < self.q1_m64_silu_warps:
                 for chunk in cutlass.range_constexpr(split_chunk, self.kBlockN // 32):
                     for i in cutlass.range_constexpr(16):
-                        active_packed[i] = _cvt_f32x2_to_bf16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1])
-                    _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
+                        active_packed[i] = _cvt_f32x2_to_16x2(active_scores[chunk * 32 + i * 2], active_scores[chunk * 32 + i * 2 + 1], self.q_dtype)
+                    _tmem_store_16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), active_packed)
                 cute.arch.fence_view_async_tmem_store()
 
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
@@ -3414,7 +3461,7 @@ class HSTUAttentionForwardSm100:
             tOsO_i[(None, None), None],
         )
 
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.use_o_pipeline):
             o_consumer_state = cutlass.pipeline.PipelineState(
                 self.o_stage,
                 Int32(0),
@@ -3422,7 +3469,7 @@ class HSTUAttentionForwardSm100:
                 epi_consumer_phase,
             )
         if has_work:
-            if const_expr(self.use_2cta_instrs):
+            if const_expr(self.use_o_pipeline):
                 pipeline_o.consumer_wait(o_consumer_state)
             else:
                 cute.arch.mbarrier_wait(
@@ -3454,7 +3501,7 @@ class HSTUAttentionForwardSm100:
                     tOrO_frg_cvt.fill(0)
                 cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
 
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.use_o_pipeline):
             if has_work:
                 cute.arch.fence_view_async_tmem_load()
                 pipeline_o.consumer_release(o_consumer_state)

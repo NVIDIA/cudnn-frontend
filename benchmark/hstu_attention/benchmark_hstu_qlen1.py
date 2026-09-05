@@ -6,9 +6,8 @@
 The default cases model the target decode-like workload: H=4, D=128, every
 sequence has one query, and per-sequence KV lengths vary around 2K tokens.
 Both explicit APIs use preallocated public outputs. Backward timing covers all
-GPU work issued by the selected implementation: ``legacy`` includes its dQ
-workspace zeroing and conversion, while ``direct`` and ``tc`` write dQ once
-without those extra launches.
+GPU work issued by production dispatch or an explicitly selected qlen=1 direct
+kernel variant.
 """
 
 from __future__ import annotations
@@ -484,24 +483,7 @@ def main() -> None:
         choices=(
             "auto",
             "dispatch",
-            "direct",
-            "direct-split2",
-            "direct-split4",
-            "direct-split8",
-            "direct-split16",
-            "direct-split22",
-            "direct-split26",
-            "direct-split32",
-            "direct-split64",
-            "direct-pair",
-            "direct-pair-split2",
-            "direct-pair-split4",
-            "direct-pair-split8",
-            "direct-pair-split13",
-            "direct-pair-split16",
-            "tc",
-            "tc-small",
-            "legacy",
+            *_interface._Q1_BWD_DIRECT_SPLITS,
         ),
         default="auto",
     )
@@ -575,24 +557,21 @@ def main() -> None:
             }
         if args.direction in ("backward", "both"):
             if args.backward_impl in ("auto", "dispatch"):
-                if hasattr(_interface, "_select_q1_bwd_algorithm"):
-                    q1_split_supported = dtype == torch.bfloat16 and args.head_dim in (64, 128, 256) and args.mask in ("causal", "local")
+                q1_direct_supported = args.head_dim in (64, 128, 256) and args.mask in ("causal", "local")
+                if q1_direct_supported:
+                    q1_split_supported = dtype == torch.bfloat16
                     split_kv = _interface._select_q1_bwd_split_kv(
                         "auto",
                         torch.cuda.get_device_capability(device),
                         q1_split_supported,
-                        args.mask == "local",
                         batch_size=batch_size,
                         num_heads=args.heads,
                         total_kv=sum(k_lengths),
                         head_dim=args.head_dim,
                     )
-                    if q1_split_supported:
-                        selected_backward_impl = "direct-pair" if split_kv == 1 else f"direct-pair-split{split_kv}"
-                    else:
-                        selected_backward_impl = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
+                    selected_backward_impl = "direct-pair" if split_kv == 1 else f"direct-pair-split{split_kv}"
                 else:
-                    selected_backward_impl = "baseline-auto"
+                    selected_backward_impl = "generic"
                 case["selected_backward_impl"] = selected_backward_impl
             _, run, compile_seconds = _compile_backward(
                 tensors,

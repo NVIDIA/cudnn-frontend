@@ -382,43 +382,17 @@ def _select_q1_fwd_config(
     capability: tuple[int, int],
     supported: bool,
     head_dim: int,
+    is_local: bool = False,
+    window_size_left: Optional[int] = None,
 ) -> _Q1FwdKernelConfig:
     """Select one of the two measured qlen=1 production configurations."""
     if not supported or capability not in ((10, 0), (10, 3), (10, 7)):
         return _Q1_FWD_DEFAULT_CONFIG
+    # The M128 baseline is consistently faster for local D256 with at most 256
+    # active KV tokens. M64 remains beneficial for wider windows and D64/D128.
+    if is_local and head_dim == 256 and window_size_left is not None and window_size_left <= 255:
+        return _Q1_FWD_DEFAULT_CONFIG
     return _Q1_FWD_D256_CONFIG if head_dim == 256 else _Q1_FWD_D64_D128_CONFIG
-
-
-def _select_q1_bwd_algorithm(
-    requested: str,
-    batch_size: int,
-    device: torch.device,
-) -> str:
-    """Resolve the non-split qlen=1 fallback from measured SM10x crossovers."""
-    if requested != "auto":
-        return requested
-
-    capability = _get_q1_device_capability(device)
-
-    # B300 (SM103): direct wins at the requested BS=64 point and from BS=128.
-    # The small-MMA path retains two measured low-grid crossover regions. B200
-    # (SM100) uses the same fallback crossover policy.
-    if capability in ((10, 0), (10, 3)):
-        if batch_size < 64:
-            return "tc-small"
-        if batch_size < 80:
-            return "direct"
-        return "tc-small" if batch_size < 128 else "direct"
-
-    # Rubin (SM107): legacy wins below BS=128, small MMA wins at BS=128,
-    # and the vectorized direct path wins from the measured BS=192 point.
-    if capability == (10, 7):
-        if batch_size < 128:
-            return "legacy"
-        return "tc-small" if batch_size < 192 else "direct"
-
-    # Preserve the existing policy on other SM100-family devices.
-    return "direct" if batch_size >= 256 else "legacy"
 
 
 _Q1_BWD_DIRECT_SPLITS = {
@@ -444,7 +418,6 @@ def _select_q1_bwd_split_kv(
     requested: str,
     capability: tuple[int, int],
     supported: bool,
-    is_local: bool = False,
     *,
     batch_size: Optional[int] = None,
     num_heads: Optional[int] = None,
@@ -494,7 +467,6 @@ def _select_q1_bwd_split_kv(
     # Causal and local use the same thresholds. Local backward still writes
     # zeros over the complete packed KV range, so total KV—not window width—is
     # the relevant work estimate.
-    _ = is_local
     return split_kv
 
 
@@ -541,13 +513,17 @@ def hstu_varlen_fwd_100(
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
     q1_dynamic_thd = is_q_len_one and (is_causal or is_local) and not is_arbitrary and not is_paged and q.shape[1] == k.shape[1] == v.shape[1]
-    q1_m64_supported = q1_dynamic_thd and q_dtype == torch.bfloat16 and head_dim in (64, 128, 256)
-    q1_split_supported = q1_m64_supported and is_causal
+    q1_m64_supported = q1_dynamic_thd and head_dim in (64, 128, 256)
+    q1_split_supported = q1_m64_supported and is_causal and q_dtype == torch.bfloat16
     capability = _get_q1_device_capability(q.device)
     # Production dispatch has two measured configurations. The private config
     # override is only for the standalone tuning benchmark, which owns the
     # larger candidate set and translates its human-readable names into knobs.
-    q1_fwd_config = _q1_fwd_tuning_config if _q1_fwd_tuning_config is not None else _select_q1_fwd_config(capability, q1_m64_supported, head_dim)
+    q1_fwd_config = (
+        _q1_fwd_tuning_config
+        if _q1_fwd_tuning_config is not None
+        else _select_q1_fwd_config(capability, q1_m64_supported, head_dim, is_local, window_size_left)
+    )
     kBlockM = q1_fwd_config.block_m
     kBlockN = q1_fwd_config.block_n
     q1_split_kv = q1_fwd_config.split_kv
@@ -597,7 +573,7 @@ def hstu_varlen_fwd_100(
     if q1_split_kv > 1 and not q1_split_supported:
         raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if kBlockM == 64 and not q1_m64_supported:
-        raise ValueError("The M64 qlen=1 forward algorithms require causal or local BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
+        raise ValueError("The M64 qlen=1 forward algorithms require causal or local BF16/FP16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     if q1_single_warp_epilogue and not q1_split_supported:
         raise ValueError("The single-warp qlen=1 forward experiment requires causal BF16 qlen=1 with D=64/128/256 and matching Q/K/V heads")
     compile_key = (
@@ -834,13 +810,11 @@ def hstu_varlen_bwd_100(
     q1_outputs_direct = (dq is None and dk is None and dv is None) or (
         dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     )
-    q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small", "legacy")
+    q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS)
     if _q1_bwd_algorithm not in q1_bwd_algorithms:
         raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
-    if head_dim == 256 and _q1_bwd_algorithm in ("tc", "tc-small"):
-        raise ValueError("The tc and tc-small qlen=1 backward algorithms do not support D=256")
     q1_direct_supported = is_q_len_one_supported and (is_causal or is_local) and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
-    if _q1_bwd_algorithm in (*_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small") and not q1_direct_supported:
+    if _q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS and not q1_direct_supported:
         raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal or local qlen=1 with D=64/128/256 and direct layouts")
     if _Q1_BWD_DIRECT_SPLITS.get(_q1_bwd_algorithm, 1) > 1 and q_dtype != torch.bfloat16:
         raise ValueError("The split-KV qlen=1 backward algorithms currently require BF16")
@@ -850,25 +824,16 @@ def hstu_varlen_bwd_100(
         _q1_bwd_algorithm,
         capability,
         q1_split_supported,
-        is_local,
         batch_size=batch_size,
         num_heads=num_heads,
         total_kv=k.shape[0],
         head_dim=head_dim,
     )
-    if _q1_bwd_algorithm == "auto" and q1_split_supported:
-        selected_q1_bwd_algorithm = "direct-pair"
-    elif q1_direct_supported:
-        selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device)
-    else:
-        selected_q1_bwd_algorithm = _q1_bwd_algorithm
-    use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS
-    # Keep every lane on one aligned 128-bit vector. A warp consequently packs
-    # four D64 rows, two D128 rows, or one D256 row.
-    q1_rows_per_warp = 256 // head_dim if selected_q1_bwd_algorithm.startswith("direct-pair") else 1
-    use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
-    use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"
-    if use_q1_direct_kernel:
+    if q1_direct_supported:
+        selected_q1_bwd_algorithm = "direct-pair" if _q1_bwd_algorithm == "auto" else _q1_bwd_algorithm
+        # Keep every lane on one aligned 128-bit vector. A warp consequently packs
+        # four D64 rows, two D128 rows, or one D256 row.
+        q1_rows_per_warp = 256 // head_dim if selected_q1_bwd_algorithm.startswith("direct-pair") else 1
         return _hstu_varlen_bwd_q1_direct(
             do,
             q,
@@ -962,8 +927,6 @@ def hstu_varlen_bwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
-        use_q_major_scheduler,
-        use_q1_small_mma,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -1022,7 +985,7 @@ def hstu_varlen_bwd_100(
         dtype=torch.float32,
         device=q.device,
     )
-    if not _compile_only and not use_q_major_scheduler:
+    if not _compile_only:
         workspace_torch.zero_()
     problem_shape = (
         Int32(max_seqlen_q),
@@ -1071,8 +1034,6 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
-            use_q_major_scheduler=use_q_major_scheduler,
-            use_q1_small_mma=use_q1_small_mma,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(
