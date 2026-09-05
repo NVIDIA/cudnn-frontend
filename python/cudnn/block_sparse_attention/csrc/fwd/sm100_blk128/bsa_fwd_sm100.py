@@ -12,6 +12,7 @@
 
 import math
 import types
+
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, Optional, Tuple, TypeAlias
@@ -38,7 +39,7 @@ from cudnn.block_sparse_attention.csrc.utils import (
 )
 from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
 from cudnn.block_sparse_attention.csrc.utils.block_sparse_tile_scheduler import (
-    BlockSparsePersistentTileScheduler as StaticPersistentTileScheduler,
+    BlockSparsePersistentTileScheduler,
     TileSchedulerProtocol,
 )
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import (
@@ -73,6 +74,8 @@ class BlockSparseAttnForwardSm100Blk128:
         pack_gqa: Optional[bool] = None,
         allow_empty_block_nums: bool = False,
         has_block_sizes: bool = True,
+        has_token_mask: bool = False,
+        q_stage: int = 1,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -83,7 +86,8 @@ class BlockSparseAttnForwardSm100Blk128:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = self.tile_m
         self.n_block_size = self.tile_n
-        self.q_stage = 1
+        assert q_stage in (1, 2), "q_stage must be 1 or 2"
+        self.q_stage = q_stage
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
@@ -92,9 +96,9 @@ class BlockSparseAttnForwardSm100Blk128:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), "Only SM 10.x and 11.x are supported"
 
-        self.cta_tiler = (self.m_block_size, self.n_block_size, self.head_dim_padded)
+        self.cta_tiler = (self.q_stage * self.m_block_size, self.n_block_size, self.head_dim_padded)
         self.mma_tiler_qk = (
             self.m_block_size,
             self.n_block_size,
@@ -108,12 +112,13 @@ class BlockSparseAttnForwardSm100Blk128:
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.is_persistent = self.is_persistent_default
-        # CLC persistent scheduling
+        # Hardware CLC is the production policy for the exact-mask workload.
         self.use_clc_scheduler = self.use_clc_scheduler_default
         self.sched_stages = 1
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.has_token_mask = has_token_mask
         self.qhead_per_kvhead = qhead_per_kvhead
         if pack_gqa is None:
             pack_gqa = qhead_per_kvhead > 1
@@ -122,8 +127,8 @@ class BlockSparseAttnForwardSm100Blk128:
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert self.m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
-        is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
-        self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
+        self.is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        self.enable_ex2_emu = self.head_dim_padded <= 128 and not self.is_sm103
         self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
         if self.overlap_sO_sQ:
             self.is_persistent = False
@@ -166,14 +171,8 @@ class BlockSparseAttnForwardSm100Blk128:
             self.num_regs_correction = 64
             self.num_regs_other = 48
         else:
-            if not self.enable_ex2_emu:
-                self.num_regs_softmax = 184
-            else:
-                self.num_regs_softmax = 184
-            if not self.enable_ex2_emu:
-                self.num_regs_correction = 88
-            else:
-                self.num_regs_correction = 88
+            self.num_regs_softmax = 184
+            self.num_regs_correction = 88
             self.num_regs_other = 56
 
         self.buffer_align_bytes = 1024
@@ -224,6 +223,8 @@ class BlockSparseAttnForwardSm100Blk128:
         mBlockSizes: cute.Tensor,  # (num_kv_blocks,), int32
         block_sparse_num: Int32,  # runtime scalar, even, >= 2
         mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
+        mTokenMaskBounds: Optional[cute.Tensor],
+        mTokenMaskFlags: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -398,11 +399,11 @@ class BlockSparseAttnForwardSm100Blk128:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         if const_expr(self.use_clc_scheduler):
-            TileScheduler = StaticPersistentTileScheduler
+            TileScheduler = BlockSparsePersistentTileScheduler
         elif const_expr(not self.is_persistent):
             TileScheduler = SingleTileScheduler
         else:
-            TileScheduler = StaticPersistentTileScheduler
+            TileScheduler = BlockSparsePersistentTileScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
@@ -488,6 +489,8 @@ class BlockSparseAttnForwardSm100Blk128:
             mBlockSizes,
             block_sparse_num,
             mBlockNums,
+            mTokenMaskBounds,
+            mTokenMaskFlags,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -523,6 +526,8 @@ class BlockSparseAttnForwardSm100Blk128:
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
+        mTokenMaskBounds: Optional[cute.Tensor],
+        mTokenMaskFlags: Optional[cute.Tensor],
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -815,6 +820,8 @@ class BlockSparseAttnForwardSm100Blk128:
                 mBlockSizes=mBlockSizes,
                 block_sparse_num=block_sparse_num,
                 mBlockNums=mBlockNums,
+                mTokenMaskBounds=mTokenMaskBounds,
+                mTokenMaskFlags=mTokenMaskFlags,
             )
 
             stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
@@ -966,7 +973,7 @@ class BlockSparseAttnForwardSm100Blk128:
             if const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
                 process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
-                block_iter_count = (raw_block_count + 1) & ~1
+                block_iter_count = raw_block_count if const_expr(self.q_stage == 2) else (raw_block_count + 1) & ~1
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
             else:
                 process_tile = True
@@ -974,36 +981,36 @@ class BlockSparseAttnForwardSm100Blk128:
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
             if process_tile:
-                load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
+                load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)
+                kv_producer_state.advance()
                 if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
-                    pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                    tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
-                    load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
-                kv_producer_state.advance()
-
-                # q_stage=1 intra-warp overlap
-                # Load order: K[N-1], Q, K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
-                block_loop_count = block_iter_count - 2
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        pipeline_q.producer_acquire_w_index_phase(stage, q_producer_phase)
+                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(stage)
+                        load_Q_fn(src_idx=stage, dst_idx=stage, tma_bar_ptr=tma_bar_ptr)
                 q_producer_phase ^= 1
-
-                # Prologue: K[N-2]
-                load_K(block=n_block(block_iter_count - 2), producer_state=kv_producer_state, page_idx=None)
-                kv_producer_state.advance()
-
-                # Flat main loop: N-2 iterations, each loads V then K
-                for i in cutlass.range(block_loop_count, unroll=1):
-                    # V[N-1-i]: V for the block whose S was computed earlier
-                    load_V(block=n_block(block_iter_count - 1 - i), producer_state=kv_producer_state, page_idx=None)
+                if const_expr(self.q_stage == 2):
+                    load_V(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)
                     kv_producer_state.advance()
-                    # K[N-3-i]: K for the next QK GEMM
-                    load_K(block=n_block(block_iter_count - 3 - i), producer_state=kv_producer_state, page_idx=None)
+                    for i in cutlass.range(block_iter_count - 1, unroll=1):
+                        logical_n = block_iter_count - 2 - i
+                        load_K(block=n_block(logical_n), producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                        load_V(block=n_block(logical_n), producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                else:
+                    block_loop_count = block_iter_count - 2
+                    load_K(block=n_block(block_iter_count - 2), producer_state=kv_producer_state, page_idx=None)
                     kv_producer_state.advance()
-
-                # Epilogue: last 2 V loads
-                load_V(block=n_block(1), producer_state=kv_producer_state, page_idx=None)
-                kv_producer_state.advance()
-                load_V(block=n_block(0), producer_state=kv_producer_state, page_idx=None)
-                kv_producer_state.advance()
+                    for i in cutlass.range(block_loop_count, unroll=1):
+                        load_V(block=n_block(block_iter_count - 1 - i), producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                        load_K(block=n_block(block_iter_count - 3 - i), producer_state=kv_producer_state, page_idx=None)
+                        kv_producer_state.advance()
+                    load_V(block=n_block(1), producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
+                    load_V(block=n_block(0), producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
 
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.consumer_advance()
@@ -1036,8 +1043,7 @@ class BlockSparseAttnForwardSm100Blk128:
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
-        # q_stage=1: both stages use the same Q (intra-warp overlap across n_blocks)
-        tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
+        tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1] if const_expr(self.q_stage == 2) else tSrQ[None, None, None, 0])
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
         qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
@@ -1062,7 +1068,9 @@ class BlockSparseAttnForwardSm100Blk128:
         sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="bsa_fwd_qk_mma_idesc")
         sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="bsa_fwd_pv_mma_idesc")
 
-        sQ_stage_stride = 0  # q_stage=1
+        sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
+        if const_expr(self.q_stage == 1):
+            sQ_stage_stride = 0
         gemm_Si = [
             partial(
                 sm100_utils.gemm_ptx_precomputed_varname,
@@ -1106,12 +1114,12 @@ class BlockSparseAttnForwardSm100Blk128:
             if const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
                 process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
-                block_iter_count = (raw_block_count + 1) & ~1
+                block_iter_count = raw_block_count if const_expr(self.q_stage == 2) else (raw_block_count + 1) & ~1
             else:
                 process_tile = True
                 block_iter_count = block_sparse_num
 
-            if process_tile:
+            if process_tile and const_expr(self.q_stage == 1):
                 # ================================================================
                 # q_stage=1: intra-warp overlap across n_block direction
                 # Pipeline KV order: K0, K1, V0, K2, V1, K3, V2, ...
@@ -1231,6 +1239,73 @@ class BlockSparseAttnForwardSm100Blk128:
                 phase_s0 ^= 1
                 phase_s1 ^= 1
 
+            if process_tile and const_expr(self.q_stage == 2):
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    pipeline_q.consumer_wait_w_index_phase(stage, mma_q_consumer_phase)
+                    if const_expr(stage == 0):
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                    sK_cur = sK[None, None, None, Ki_index]
+                    if const_expr(self.uneven_kv_smem):
+                        sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                    gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                    pipeline_s_p_o.producer_commit_w_index(stage)
+                mma_q_consumer_phase ^= 1
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+                O_should_accumulate = False
+                for i in cutlass.range(block_iter_count - 1, unroll=1):
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    v_release_state = mma_kv_consumer_state.clone()
+                    Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                    tOrVi = tOrV[None, None, None, Vi_index]
+                    sV_cur = sV[None, None, None, Vi_index]
+                    if const_expr(self.uneven_kv_smem):
+                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                    mma_kv_consumer_state.advance()
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                    sK_cur = sK[None, None, None, Ki_index]
+                    if const_expr(self.uneven_kv_smem):
+                        sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
+                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
+                            mbar_phase=P_full_O_rescaled_phase,
+                        )
+                        gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                        pipeline_s_p_o.producer_commit_w_index(stage)
+                    pipeline_kv.consumer_release(v_release_state)
+                    pipeline_kv.consumer_release(mma_kv_consumer_state)
+                    mma_kv_consumer_state.advance()
+                    P_full_O_rescaled_phase ^= 1
+                    O_should_accumulate = True
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    pipeline_q.consumer_release_w_index(stage)
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                tOrVi = tOrV[None, None, None, Vi_index]
+                sV_cur = sV[None, None, None, Vi_index]
+                if const_expr(self.uneven_kv_smem):
+                    sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                    gemm_Pi[stage](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
+                        mbar_phase=P_full_O_rescaled_phase,
+                    )
+                    pipeline_o_acc.producer_commit_w_index(stage)
+                P_full_O_rescaled_phase ^= 1
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
@@ -1238,6 +1313,39 @@ class BlockSparseAttnForwardSm100Blk128:
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
         # We don't need pipeline_o_acc.producer_tail() since we don't call
         # pipeline_o_acc.producer_acquire() inside the loop.
+
+    @cute.jit
+    def get_softmax_mask_metadata(
+        self,
+        logical_block: Int32,
+        raw_block_count: Int32,
+        n_block: Callable,
+        mBlockSizes: Optional[cute.Tensor],
+        mTokenMaskBounds: cute.Tensor,
+        mTokenMaskFlags: cute.Tensor,
+        batch_idx: Int32,
+        m_block: Int32,
+        q_row: Int32,
+    ) -> Tuple[Int32, Int32, Int32, Int32]:
+        valid = logical_block < raw_block_count
+        max_logical = cutlass.max(raw_block_count - 1, Int32(0))
+        safe_logical = cutlass.min(logical_block, max_logical)
+        block_id = n_block(logical_block)
+        if const_expr(self.has_block_sizes):
+            block_size = mBlockSizes[block_id] if valid else Int32(0)
+        else:
+            block_size = Int32(self.n_block_size) if valid else Int32(0)
+        partial_index_value = Int32(mTokenMaskFlags[batch_idx, m_block, safe_logical])
+        partial_index = cute.arch.make_warp_uniform(partial_index_value if valid else Int32(-1))
+        flag = Int32(2) if partial_index < Int32(0) else Int32(1)
+        flag = flag if valid else Int32(0)
+        interval_lo = Int32(0)
+        interval_hi = Int32(self.n_block_size)
+        if flag == Int32(1):
+            packed_bounds = Uint32(mTokenMaskBounds[partial_index, q_row])
+            interval_lo = Int32(packed_bounds & Uint32(0xFFFF))
+            interval_hi = Int32(utils.shr_u32(packed_bounds, Uint32(16)))
+        return block_size, flag, interval_lo, interval_hi
 
     # for both softmax0 and softmax1 warp group
     @cute.jit
@@ -1260,6 +1368,8 @@ class BlockSparseAttnForwardSm100Blk128:
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
+        mTokenMaskBounds: Optional[cute.Tensor],
+        mTokenMaskFlags: Optional[cute.Tensor],
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1344,21 +1454,41 @@ class BlockSparseAttnForwardSm100Blk128:
                 # WG0 (stage=0): logical indices N-1, N-3, ... (stride 2)
                 # WG1 (stage=1): logical indices N-2, N-4, ... (stride 2)
                 if const_expr(mBlockNums is not None):
-                    block_iter_count = (raw_block_count + 1) & ~1
+                    block_iter_count = raw_block_count if const_expr(self.q_stage == 2) else (raw_block_count + 1) & ~1
                 else:
                     block_iter_count = block_sparse_num
-                wg_count = block_iter_count // 2
-                # logical_first is the first logical index for this WG
-                logical_first = block_iter_count - 1 - stage
+                wg_count = block_iter_count if const_expr(self.q_stage == 2) else block_iter_count // 2
+                logical_first = block_iter_count - 1 if const_expr(self.q_stage == 2) else block_iter_count - 1 - stage
+                logical_stride = 1 if const_expr(self.q_stage == 2) else self.s_stage
+                q_row = tidx + stage * self.m_block_size if const_expr(self.q_stage == 2) else tidx
 
-                # 1st block — phantom block (logical_first >= raw_block_count) uses block_size=0
+                # First block for this softmax warpgroup.
                 n_block_first = n_block(logical_first)
-                if const_expr(self.has_block_sizes):
+                first_token_block_size = Int32(self.n_block_size)
+                first_token_flag = Int32(2)
+                first_token_lo = Int32(0)
+                first_token_hi = Int32(self.n_block_size)
+                if const_expr(self.has_token_mask):
+                    first_block_size, first_flag, first_lo, first_hi = self.get_softmax_mask_metadata(
+                        logical_first,
+                        raw_block_count,
+                        n_block,
+                        mBlockSizes,
+                        mTokenMaskBounds,
+                        mTokenMaskFlags,
+                        batch_idx,
+                        m_block,
+                        q_row,
+                    )
+                    first_mask_fn = None
+                    first_token_block_size = first_block_size
+                    first_token_flag = first_flag
+                    first_token_lo = first_lo
+                    first_token_hi = first_hi
+                elif const_expr(self.has_block_sizes):
                     first_block_size = Int32(0) if const_expr(mBlockNums is not None) and logical_first >= raw_block_count else mBlockSizes[n_block_first]
                     first_mask_fn = partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size)
                 elif const_expr(mBlockNums is not None):
-                    # No block_sizes but var block nums: phantom block still needs block_size=0 mask;
-                    # real blocks get n_block_size which is a no-op in apply_block_size_mask
                     first_block_size = Int32(0) if logical_first >= raw_block_count else Int32(self.n_block_size)
                     first_mask_fn = partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size)
                 else:
@@ -1367,13 +1497,38 @@ class BlockSparseAttnForwardSm100Blk128:
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
                     mask_fn=first_mask_fn,
+                    token_block_size=first_token_block_size,
+                    token_mask_flag=first_token_flag,
+                    token_interval_lo=first_token_lo,
+                    token_interval_hi=first_token_hi,
                     is_first=True,
                 )
-                # Remaining blocks with stride 2 — always valid (logical_n < raw_block_count)
+                # Remaining blocks with stride 2 are always valid.
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
-                    logical_n = logical_first - self.s_stage * (n_tile + 1)
+                    logical_n = logical_first - logical_stride * (n_tile + 1)
                     n_block_cur = n_block(logical_n)
-                    if const_expr(self.has_block_sizes):
+                    token_block_size_n = Int32(self.n_block_size)
+                    token_flag_n = Int32(2)
+                    token_interval_lo_n = Int32(0)
+                    token_interval_hi_n = Int32(self.n_block_size)
+                    if const_expr(self.has_token_mask):
+                        block_size_n, flag_n, interval_lo_n, interval_hi_n = self.get_softmax_mask_metadata(
+                            logical_n,
+                            raw_block_count,
+                            n_block,
+                            mBlockSizes,
+                            mTokenMaskBounds,
+                            mTokenMaskFlags,
+                            batch_idx,
+                            m_block,
+                            q_row,
+                        )
+                        remaining_mask_fn = None
+                        token_block_size_n = block_size_n
+                        token_flag_n = flag_n
+                        token_interval_lo_n = interval_lo_n
+                        token_interval_hi_n = interval_hi_n
+                    elif const_expr(self.has_block_sizes):
                         remaining_mask_fn = partial(apply_block_size_mask, block_size=mBlockSizes[n_block_cur], n_block_size=self.n_block_size)
                     else:
                         remaining_mask_fn = None
@@ -1381,6 +1536,10 @@ class BlockSparseAttnForwardSm100Blk128:
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
                         mask_fn=remaining_mask_fn,
+                        token_block_size=token_block_size_n,
+                        token_mask_flag=token_flag_n,
+                        token_interval_lo=token_interval_lo_n,
+                        token_interval_hi=token_interval_hi_n,
                     )
 
                 sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -1415,6 +1574,10 @@ class BlockSparseAttnForwardSm100Blk128:
         tStP_r2t: cute.Tensor,
         sScale: cute.Tensor,
         stage: int | Int32,
+        token_block_size: Int32,
+        token_mask_flag: Int32,
+        token_interval_lo: Int32,
+        token_interval_hi: Int32,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32]:
@@ -1446,7 +1609,12 @@ class BlockSparseAttnForwardSm100Blk128:
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
-        if const_expr(mask_fn is not None):
+        if const_expr(self.has_token_mask):
+            effective_lo = cutlass.max(Int32(0), token_interval_lo)
+            effective_hi = cutlass.max(Int32(0), cutlass.min(token_interval_hi, token_block_size))
+            if token_mask_flag != Int32(2):
+                apply_interval_mask_r2p(tSrS_t2r, effective_lo, effective_hi)
+        elif const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
@@ -1539,25 +1707,35 @@ class BlockSparseAttnForwardSm100Blk128:
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                # q_stage=1 correction loop
+                # Correction loop: one Q row group for q_stage=1, two for q_stage=2
                 if const_expr(mBlockNums is not None):
-                    block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
+                    raw_count = mBlockNums[batch_idx, head_idx, m_block]
+                    block_iter_count = raw_count if const_expr(self.q_stage == 2) else (raw_count + 1) & ~1
                 else:
                     block_iter_count = block_sparse_num
-                corr_pair_count = (block_iter_count - 2) // 2
-                # Rescale the two alternating stages as a pair.
-                for i in cutlass.range(corr_pair_count, unroll=1):
-                    for stage in cutlass.range_constexpr(self.s_stage):
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
-                        scale = sScale[tidx + stage * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        if should_rescale:
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
-                        pipeline_s_p_o.consumer_release_w_index(stage)
-                        pipeline_sm_stats.consumer_release_w_index(self.s_stage - 1 - stage)
-                    sm_stats_consumer_phase ^= 1
-                # N even: no remainder. Release final sm_stats stage 1.
-                pipeline_sm_stats.consumer_release_w_index(1)
+                if const_expr(self.q_stage == 2):
+                    for i in cutlass.range(block_iter_count - 1, unroll=1):
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                            scale = sScale[tidx + stage * self.m_block_size]
+                            if cute.arch.vote_ballot_sync(scale < 1.0) != 0:
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            pipeline_s_p_o.consumer_release_w_index(stage)
+                            pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                        sm_stats_consumer_phase ^= 1
+                    pipeline_sm_stats.consumer_release_w_index(1)
+                else:
+                    corr_pair_count = (block_iter_count - 2) // 2
+                    for i in cutlass.range(corr_pair_count, unroll=1):
+                        for stage in cutlass.range_constexpr(self.s_stage):
+                            sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                            scale = sScale[tidx + stage * self.m_block_size]
+                            if cute.arch.vote_ballot_sync(scale < 1.0) != 0:
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            pipeline_s_p_o.consumer_release_w_index(stage)
+                            pipeline_sm_stats.consumer_release_w_index(self.s_stage - 1 - stage)
+                        sm_stats_consumer_phase ^= 1
+                    pipeline_sm_stats.consumer_release_w_index(1)
                 # End of seqlen_corr_loop_steps
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
@@ -1576,45 +1754,37 @@ class BlockSparseAttnForwardSm100Blk128:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
 
-                # q_stage=1: combine O0 and O1, then write single output
-                row_sum0, row_max0, zero_or_nan0 = stats[0]
-                row_sum1, row_max1, zero_or_nan1 = stats[1]
-
-                # Compute combined scales for the two partial O accumulators
-                # row_max is in original S space (unscaled). To compute rescale
-                # factors we need exp2((row_max - max_combined) * scale_log2).
-                # For empty/padding stages (zero_or_nan=True), row_max may be 0.0 instead of -inf
-                # due to softmax's safe_max clamping. Use -inf for those to avoid polluting max_combined.
-                rm0 = row_max0 if not zero_or_nan0 else -Float32.inf
-                rm1 = row_max1 if not zero_or_nan1 else -Float32.inf
-                max_combined = cutlass.max(rm0, rm1)
-                max_safe = max_combined if max_combined != -Float32.inf else Float32(0.0)
-                scale0 = cute.math.exp2((rm0 - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan0 else Float32(0.0)
-                scale1 = cute.math.exp2((rm1 - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan1 else Float32(0.0)
-                sum_combined = row_sum0 * scale0 + row_sum1 * scale1
-                combined_zero_or_nan = sum_combined == 0.0 or sum_combined != sum_combined
-                inv_sum = cute.arch.rcp_approx(sum_combined if not combined_zero_or_nan else 1.0)
-                final_scale0 = scale0 * inv_sum
-                final_scale1 = scale1 * inv_sum
-
-                # Wait for both O accumulators from MMA warp
-                for stage in cutlass.range_constexpr(self.s_stage):
-                    pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
-                self.correction_epilogue_combine(
-                    thr_mma_pv,
-                    tOtO[None, None, None, 0],
-                    tOtO[None, None, None, 1],
-                    tidx,
-                    final_scale0,
-                    final_scale1,
-                    sO[None, None, 0],
-                )
-                # Release both O buffers in tmem
-                for stage in cutlass.range_constexpr(self.s_stage):
-                    pipeline_s_p_o.consumer_release_w_index(stage)
-                pipeline_o_epi.producer_commit_w_index(0)
-
+                if const_expr(self.q_stage == 2):
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        row_sum, row_max, zero_or_nan = stats[stage]
+                        final_scale = cute.arch.rcp_approx(row_sum if not zero_or_nan else 1.0) if not zero_or_nan else Float32(0.0)
+                        pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                        pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+                        self.correction_epilogue_combine(
+                            thr_mma_pv, tOtO[None, None, None, stage], tOtO[None, None, None, stage], tidx, final_scale, Float32(0.0), sO[None, None, stage]
+                        )
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+                        pipeline_o_epi.producer_commit_w_index(stage)
+                else:
+                    row_sum0, row_max0, zero_or_nan0 = stats[0]
+                    row_sum1, row_max1, zero_or_nan1 = stats[1]
+                    rm0 = row_max0 if not zero_or_nan0 else -Float32.inf
+                    rm1 = row_max1 if not zero_or_nan1 else -Float32.inf
+                    max_combined = cutlass.max(rm0, rm1)
+                    max_safe = max_combined if max_combined != -Float32.inf else Float32(0.0)
+                    scale0 = cute.math.exp2((rm0 - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan0 else Float32(0.0)
+                    scale1 = cute.math.exp2((rm1 - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan1 else Float32(0.0)
+                    sum_combined = row_sum0 * scale0 + row_sum1 * scale1
+                    inv_sum = cute.arch.rcp_approx(sum_combined if sum_combined != 0.0 and sum_combined == sum_combined else 1.0)
+                    for stage in cutlass.range_constexpr(self.s_stage):
+                        pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                    pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
+                    self.correction_epilogue_combine(
+                        thr_mma_pv, tOtO[None, None, None, 0], tOtO[None, None, None, 1], tidx, scale0 * inv_sum, scale1 * inv_sum, sO[None, None, 0]
+                    )
+                    for stage in cutlass.range_constexpr(self.s_stage):
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+                    pipeline_o_epi.producer_commit_w_index(0)
                 o_corr_consumer_phase ^= 1
                 sm_stats_consumer_phase ^= 1
                 corr_epi_producer_phase ^= 1
@@ -1625,44 +1795,52 @@ class BlockSparseAttnForwardSm100Blk128:
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(stage_idx)
                 sm_stats_consumer_phase ^= 1
-                # Write O=0 via correction_epilogue_combine with scale=0.
-                # Note: reads tmem which may have values from a previous tile;
-                # 0.0 * finite = 0.0. For the very first tile, tmem is hardware-zero-initialized.
-                pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
-                self.correction_epilogue_combine(
-                    thr_mma_pv,
-                    tOtO[None, None, None, 0],
-                    tOtO[None, None, None, 1],
-                    tidx,
-                    Float32(0.0),
-                    Float32(0.0),
-                    sO[None, None, 0],
-                )
-                # Do NOT release pipeline_s_p_o (MMA didn't commit)
-                pipeline_o_epi.producer_commit_w_index(0)
-                # o_corr_consumer_phase NOT toggled (pipeline_o_acc not touched)
+                if const_expr(self.q_stage == 2):
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+                        self.correction_epilogue_combine(
+                            thr_mma_pv, tOtO[None, None, None, stage], tOtO[None, None, None, stage], tidx, Float32(0.0), Float32(0.0), sO[None, None, stage]
+                        )
+                        pipeline_o_epi.producer_commit_w_index(stage)
+                else:
+                    pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
+                    self.correction_epilogue_combine(
+                        thr_mma_pv, tOtO[None, None, None, 0], tOtO[None, None, None, 1], tidx, Float32(0.0), Float32(0.0), sO[None, None, 0]
+                    )
+                    pipeline_o_epi.producer_commit_w_index(0)
                 corr_epi_producer_phase ^= 1
 
             if const_expr(mLSE is not None):
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
-                # q_stage=1: compute combined LSE from two partial softmax stats
-                m_tile_idx = m_block
-                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                row_sum0, row_max0, zero_or_nan0 = stats[0]
-                row_sum1, row_max1, zero_or_nan1 = stats[1]
-                rm0_lse = row_max0 if not zero_or_nan0 else -Float32.inf
-                rm1_lse = row_max1 if not zero_or_nan1 else -Float32.inf
-                max_combined = cutlass.max(rm0_lse, rm1_lse)
-                max_safe = max_combined if max_combined != -Float32.inf else Float32(0.0)
-                s0 = cute.math.exp2((rm0_lse - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan0 else Float32(0.0)
-                s1 = cute.math.exp2((rm1_lse - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan1 else Float32(0.0)
-                sum_comb = row_sum0 * s0 + row_sum1 * s1
-                comb_zero_or_nan = sum_comb == 0.0 or sum_comb != sum_comb
                 LN2 = math.log(2.0)
-                lse = (max_safe * softmax_scale_log2 + cute.math.log2(sum_comb, fastmath=True)) * LN2 if not comb_zero_or_nan else -Float32.inf
-                seqlen_q = seqlen.seqlen_q if const_expr(not self.pack_gqa) else seqlen.seqlen_q * self.qhead_per_kvhead
-                if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                    gLSE[tidx] = lse
+                if const_expr(self.q_stage == 2):
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        m_tile_idx = m_block * self.q_stage + stage
+                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                        row_sum, row_max, zero_or_nan = stats[stage]
+                        lse_value = (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2 if not zero_or_nan else -Float32.inf
+                        if tidx < seqlen.seqlen_q - m_tile_idx * self.m_block_size:
+                            gLSE[tidx] = lse_value
+                else:
+                    m_tile_idx = m_block
+                    gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                    row_sum0, row_max0, zero_or_nan0 = stats[0]
+                    row_sum1, row_max1, zero_or_nan1 = stats[1]
+                    rm0_lse = row_max0 if not zero_or_nan0 else -Float32.inf
+                    rm1_lse = row_max1 if not zero_or_nan1 else -Float32.inf
+                    max_combined = cutlass.max(rm0_lse, rm1_lse)
+                    max_safe = max_combined if max_combined != -Float32.inf else Float32(0.0)
+                    s0 = cute.math.exp2((rm0_lse - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan0 else Float32(0.0)
+                    s1 = cute.math.exp2((rm1_lse - max_safe) * softmax_scale_log2, fastmath=True) if not zero_or_nan1 else Float32(0.0)
+                    sum_comb = row_sum0 * s0 + row_sum1 * s1
+                    lse_value = (
+                        (max_safe * softmax_scale_log2 + cute.math.log2(sum_comb, fastmath=True)) * LN2
+                        if sum_comb != 0.0 and sum_comb == sum_comb
+                        else -Float32.inf
+                    )
+                    seqlen_q = seqlen.seqlen_q if const_expr(not self.pack_gqa) else seqlen.seqlen_q * self.qhead_per_kvhead
+                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                        gLSE[tidx] = lse_value
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
@@ -2322,8 +2500,40 @@ MaskGenFn: TypeAlias = Callable[[int], Uint32]
 
 
 @cute.jit
+def mask_f32x32_by_u32_branch(acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]) -> Tuple[Float32, ...]:
+    mask_ops = "\n\t".join(f"and.b32 tmp, $64, {hex(1 << i)};\n\t" "setp.eq.u32 p, tmp, 0;\n\t" f"@p mov.f32 ${i}, neg_inf;" for i in range(32))
+    zero_ops = "\n\t".join(f"mov.f32 ${i}, neg_inf;" for i in range(32))
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Float32(acc_s[base + i]).ir_value() for i in range(32)] + [Uint32(mask).ir_value()],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .pred full;\n\t"
+        ".reg .pred zero;\n\t"
+        ".reg .u32 tmp;\n\t"
+        ".reg .f32 neg_inf;\n\t"
+        "setp.eq.u32 full, $64, 0xffffffff;\n\t"
+        "@full bra.uni MASK_DONE;\n\t"
+        "mov.f32 neg_inf, 0fFF800000;\n\t"
+        "setp.eq.u32 zero, $64, 0;\n\t"
+        "@!zero bra.uni MASK_PARTIAL;\n\t"
+        f"{zero_ops}\n\t"
+        "bra.uni MASK_DONE;\n\t"
+        "MASK_PARTIAL:\n\t"
+        f"{mask_ops}\n\t"
+        "MASK_DONE:\n\t"
+        "}\n",
+        ",".join(["=f"] * 32 + [str(i) for i in range(32)] + ["r"]),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
 def predicate_bitmask_below(limit: Int32, s: int) -> Uint32:
-    """32-bit register-to-predicate bitmask keeping positions < limit."""
+    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound)."""
     m = max((s + 1) * PREDICATE_MASK_CHUNK_SIZE - limit, 0)
     return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
 
@@ -2347,6 +2557,20 @@ def apply_predicate_mask(
             else:
                 for r in cutlass.range_constexpr(cute.size(X.shape[0])):
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
+
+
+@cute.jit
+def apply_interval_mask_r2p(acc_s: cute.Tensor, interval_start: Int32, interval_end: Int32) -> None:
+    """Keep [start, end) using one 32-bit predicate mask per register chunk."""
+    assert cute.size(acc_s) % PREDICATE_MASK_CHUNK_SIZE == 0
+    for s in cutlass.range_constexpr(cute.size(acc_s) // PREDICATE_MASK_CHUNK_SIZE):
+        below_end = predicate_bitmask_below(interval_end, s)
+        below_start = predicate_bitmask_below(interval_start, s)
+        mask = below_end & (below_start ^ Uint32(0xFFFFFFFF))
+        vals = mask_f32x32_by_u32_branch(acc_s, mask, s * PREDICATE_MASK_CHUNK_SIZE)
+        for i in cutlass.range_constexpr(PREDICATE_MASK_CHUNK_SIZE):
+            idx = s * PREDICATE_MASK_CHUNK_SIZE + i
+            acc_s[idx] = vals[i]
 
 
 @cute.jit

@@ -650,3 +650,96 @@ def test_bsa_attention_forward_rejects_invalid_metadata():
             block_sizes,
             sparse_block_size=block_size,
         )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=16)
+def test_bsa_attention_forward_sm100_blk128_exact_token_mask():
+    major, _ = torch.cuda.get_device_capability()
+    if major not in (10, 11):
+        pytest.skip("blk128 exact masking is specific to SM100/SM110")
+
+    BSA = _import_bsa()
+    block_size = 128
+    batch, heads = 1, 2
+    seqlen_q, seqlen_k, dim = 2 * block_size, 4 * block_size, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k, block_sparse_num, block_sizes = make_fixed_metadata(batch, heads, seqlen_q, seqlen_k, block_size)
+    mask = block_sparse_mask(q2k, block_sparse_num, block_sizes, seqlen_q, seqlen_k, block_size)
+    q_blocks = seqlen_q // block_size
+    flags = torch.full(
+        (batch, q_blocks, block_sparse_num),
+        -1,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    bounds = torch.zeros((q_blocks, block_size), device=q.device, dtype=torch.int32)
+    for q_block in range(q_blocks):
+        flags[:, q_block, 1] = q_block
+        for q_row in range(block_size):
+            start = q_row // 2
+            end = min(start + 64, block_size)
+            bounds[q_block, q_row] = (end << 16) | start
+            query = q_block * block_size + q_row
+            mask[:, :, query, 2 * block_size : 3 * block_size] = float("-inf")
+            mask[:, :, query, 2 * block_size + start : 2 * block_size + end] = 0.0
+
+    result = BSA.block_sparse_attention_forward(
+        q,
+        k,
+        v,
+        q2k,
+        block_sparse_num,
+        block_sizes,
+        sparse_block_size=block_size,
+        token_mask_bounds=bounds,
+        token_mask_flags=flags,
+    )
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+def test_bsa_attention_forward_sm100_blk128_qstage2_structural_and_exact_mask():
+    major, _ = torch.cuda.get_device_capability()
+    if major not in (10, 11):
+        pytest.skip("blk128 q_stage=2 is specific to SM100/SM110")
+    BSA = _import_bsa()
+    block_size, q_tile = 128, 256
+    batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 512, 512, 128
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q_blocks = seqlen_q // q_tile
+    selected = torch.tensor((0, 2), device=q.device, dtype=torch.int32)
+    q2k = selected.view(1, 1, 1, 2).expand(batch, heads, q_blocks, 2).contiguous()
+    block_sizes = torch.full((seqlen_k // block_size,), block_size, device=q.device, dtype=torch.int32)
+    structural_mask = torch.full((batch, heads, seqlen_q, seqlen_k), float("-inf"), device=q.device)
+    structural_mask[..., :block_size] = 0.0
+    structural_mask[..., 2 * block_size : 3 * block_size] = 0.0
+    structural = BSA.block_sparse_attention_forward(q, k, v, q2k, 2, block_sizes, sparse_block_size=block_size, q_stage=2)
+    o_ref, lse_ref = attention_reference(q, k, v, structural_mask)
+    torch.testing.assert_close(structural["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(structural["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+    flags = torch.full((batch, q_blocks, 2), -1, device=q.device, dtype=torch.int32)
+    flags[..., 1] = torch.arange(q_blocks, device=q.device, dtype=torch.int32)
+    bounds = torch.zeros((q_blocks, q_tile), device=q.device, dtype=torch.int32)
+    exact_mask = structural_mask.clone()
+    for q_block in range(q_blocks):
+        for q_row in range(q_tile):
+            start = q_row // 4
+            end = min(start + 64, block_size)
+            bounds[q_block, q_row] = (end << 16) | start
+            query = q_block * q_tile + q_row
+            exact_mask[:, :, query, 2 * block_size : 3 * block_size] = float("-inf")
+            exact_mask[:, :, query, 2 * block_size + start : 2 * block_size + end] = 0.0
+    exact = BSA.block_sparse_attention_forward(
+        q, k, v, q2k, 2, block_sizes, sparse_block_size=block_size, q_stage=2, token_mask_bounds=bounds, token_mask_flags=flags
+    )
+    o_ref, lse_ref = attention_reference(q, k, v, exact_mask)
+    torch.testing.assert_close(exact["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(exact["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)

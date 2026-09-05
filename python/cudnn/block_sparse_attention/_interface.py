@@ -1735,6 +1735,9 @@ def bsa_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     layout: str = "bhsd",
     kv_splits: int | str = 1,
+    token_mask_bounds: Optional[torch.Tensor] = None,
+    token_mask_flags: Optional[torch.Tensor] = None,
+    q_stage: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for BSA block-sparse attention (SM90/SM100, non-causal, non-varlen).
 
@@ -1939,6 +1942,8 @@ def bsa_attn_fwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     has_variable_block_nums = q2k_block_nums is not None
+    has_token_mask = token_mask_bounds is not None
+    assert has_token_mask == (token_mask_flags is not None)
     if layout == "bhsd":
         q_kernel, k_kernel, v_kernel, out_kernel = q, k, v, out
     else:
@@ -1955,6 +1960,8 @@ def bsa_attn_fwd(
         pack_gqa=pack_gqa,
         allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
         has_block_sizes=has_block_sizes,
+        has_token_mask=has_token_mask,
+        q_stage=q_stage,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -1974,6 +1981,8 @@ def bsa_attn_fwd(
             has_variable_block_nums,
             allow_empty_block_nums and has_variable_block_nums,
             has_block_sizes,
+            has_token_mask,
+            q_stage,
             "bhsd_kernel_boundary",
         ),
         (
@@ -1985,6 +1994,8 @@ def bsa_attn_fwd(
             q2k_block_index,
             block_sizes,
             q2k_block_nums,
+            token_mask_bounds,
+            token_mask_flags,
         ),
     )
 
@@ -2007,6 +2018,8 @@ def bsa_attn_fwd(
         )
         block_sizes_tensor = _to_cute_tensor_with_dynamic_modes(block_sizes, dynamic_modes=0) if has_block_sizes else None
         block_nums_tensor = _to_cute_tensor_with_dynamic_modes(q2k_block_nums, dynamic_modes=(0, 1, 2)) if has_variable_block_nums else None
+        token_mask_bounds_tensor = _to_cute_tensor(token_mask_bounds, assumed_align=4) if has_token_mask else None
+        token_mask_flags_tensor = _to_cute_tensor(token_mask_flags, assumed_align=4) if has_token_mask else None
 
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
             bsa_fwd_kernel,
@@ -2020,6 +2033,8 @@ def bsa_attn_fwd(
             block_sizes_tensor,
             block_sparse_num,
             block_nums_tensor,
+            token_mask_bounds_tensor,
+            token_mask_flags_tensor,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
             options="--enable-tvm-ffi",
         )
@@ -2036,6 +2051,8 @@ def bsa_attn_fwd(
             block_sizes.detach() if has_block_sizes else None,
             block_sparse_num,
             q2k_block_nums.detach() if has_variable_block_nums else None,
+            token_mask_bounds.detach() if has_token_mask else None,
+            token_mask_flags.detach() if has_token_mask else None,
             current_stream,
         )
 
@@ -2063,6 +2080,10 @@ def bsa_attn_bwd(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    bucketed_k2q_offsets: Optional[torch.Tensor] = None,
+    bucketed_k2q_indices: Optional[torch.Tensor] = None,
+    token_mask_bounds: Optional[torch.Tensor] = None,
+    token_mask_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for BSA block-sparse attention.
 
@@ -2088,6 +2109,15 @@ def bsa_attn_bwd(
             q/k/v. When None, fresh zero-initialized tensors are allocated.
         bucket_size_blocks: Optional number of Q blocks per bucketed k2q CSR
             group. ``None`` selects the architecture default.
+        bucketed_k2q_offsets, bucketed_k2q_indices: Optional prebuilt int32
+            K-to-Q CSR tensors. Supply both to reuse CPU-prepared metadata.
+        token_mask_bounds: Optional packed int32 intervals. Shape
+            ``(partial_tiles, 128)`` stores one K interval per Q row; shape
+            ``(partial_tiles, 256)`` stores two Q bands per K row. Low/high
+            16 bits encode ``[lo, hi)``.
+        token_mask_flags: Optional blk128 int32 dense physical-tile lookup with
+            shape ``(batch, heads, num_q_blocks, num_kv_blocks)``. Values are
+            compact bound rows; negative values select the full-tile fast path.
         sparse_block_size: Explicit sparse block size. SM90 requires 64;
             SM100/SM110 accepts 64 or 128. When omitted, legacy direct callers
             retain shape-based inference on SM100/SM110.
@@ -2203,6 +2233,14 @@ def bsa_attn_bwd(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    has_token_mask = token_mask_bounds is not None
+    assert has_token_mask == (token_mask_flags is not None)
+    if has_token_mask:
+        assert arch // 10 in {10, 11} and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE
+        assert token_mask_bounds.dtype == torch.int32 and token_mask_bounds.shape[1] in (128, 256)
+        assert token_mask_flags.dtype == torch.int32
+        assert token_mask_flags.shape == (batch_size, num_heads, num_q_blocks, num_kv_blocks)
+        assert token_mask_bounds.is_cuda and token_mask_flags.is_cuda
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:
@@ -2210,13 +2248,17 @@ def bsa_attn_bwd(
                 num_q_blocks,
                 num_heads,
             )
-        bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
-            q2k_block_index,
-            block_sparse_num,
-            num_kv_blocks,
-            bucket_size_blocks=bucket_size_blocks,
-            q2k_block_nums=q2k_block_nums,
-        )
+        if bucketed_k2q_offsets is None:
+            assert bucketed_k2q_indices is None
+            bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = _build_bucketed_k2q_csr(
+                q2k_block_index,
+                block_sparse_num,
+                num_kv_blocks,
+                bucket_size_blocks=bucket_size_blocks,
+                q2k_block_nums=q2k_block_nums,
+            )
+        else:
+            assert bucketed_k2q_indices is not None
         dq_out, dk_out, dv_out = bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dout_bwd,
             q_bwd,
@@ -2226,6 +2268,8 @@ def bsa_attn_bwd(
             lse,
             bucketed_k2q_offsets,
             bucketed_k2q_indices,
+            token_mask_bounds=token_mask_bounds,
+            token_mask_flags=token_mask_flags,
             softmax_scale=softmax_scale,
             dq=dq_bwd,
             dk=dk_bwd,

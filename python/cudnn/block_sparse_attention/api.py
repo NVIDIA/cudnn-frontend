@@ -183,6 +183,11 @@ def block_sparse_attention_forward(
     layout: str = "bhsd",
     kv_splits: int | str = 1,
     use_clc: Optional[bool] = None,
+    token_mask_bounds: Optional[torch.Tensor] = None,
+    token_mask_flags: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    q_stage: int = 1,
 ) -> TupleDict:
     """Run non-causal block-sparse scaled dot-product attention.
 
@@ -192,6 +197,8 @@ def block_sparse_attention_forward(
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+    ``out`` and ``lse`` may be supplied to reuse destination buffers in
+    steady-state execution.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -204,6 +211,10 @@ def block_sparse_attention_forward(
         sparse_block_size = 64 if arch_family in {9, 12} else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
+    if q_stage not in {1, 2}:
+        raise ValueError("q_stage must be 1 or 2")
+    if q_stage == 2 and not (arch_family in {10, 11} and sparse_block_size == 128):
+        raise NotImplementedError("q_stage=2 is supported only by the SM100/SM110 blk128 forward path")
     if arch_family == 9:
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
@@ -234,12 +245,15 @@ def block_sparse_attention_forward(
     pack_gqa_effective = (
         arch_family in {10, 11} and sparse_block_size == 128 and (gqa_ratio > 1 if pack_gqa is None else bool(pack_gqa)) and 128 % gqa_ratio == 0
     )
+    if q_stage == 2 and gqa_ratio != 1:
+        raise NotImplementedError("q_stage=2 currently supports MHA only")
+    q_metadata_block_size = sparse_block_size * q_stage
     if pack_gqa_effective:
         metadata_heads = num_kv_heads
-        metadata_q_blocks = (seqlen_q * gqa_ratio + sparse_block_size - 1) // sparse_block_size
+        metadata_q_blocks = (seqlen_q * gqa_ratio + q_metadata_block_size - 1) // q_metadata_block_size
     else:
         metadata_heads = num_q_heads
-        metadata_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
+        metadata_q_blocks = (seqlen_q + q_metadata_block_size - 1) // q_metadata_block_size
     expected_prefix = (batch, metadata_heads, metadata_q_blocks)
     num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
     allowed_block_size_ranks = (1, 2, 3) if arch_family in {9, 12} else (1,)
@@ -252,6 +266,24 @@ def block_sparse_attention_forward(
         device=q_tensor.device,
         allowed_block_size_ranks=allowed_block_size_ranks,
     )
+    has_token_mask = token_mask_bounds is not None or token_mask_flags is not None
+    if has_token_mask:
+        if not (arch_family in {10, 11} and sparse_block_size == 128):
+            raise NotImplementedError("token_mask_bounds/token_mask_flags are supported only by " "the SM100/SM110 blk128 forward path")
+        if gqa_ratio != 1:
+            raise NotImplementedError("SM100/SM110 blk128 token masks currently support MHA only")
+        if token_mask_bounds is None or token_mask_flags is None:
+            raise ValueError("token_mask_bounds and token_mask_flags must be supplied together")
+        if token_mask_bounds.dtype != torch.int32 or token_mask_bounds.ndim != 2 or token_mask_bounds.shape[1] != q_metadata_block_size:
+            raise ValueError("blk128 token_mask_bounds must be packed int32 with shape " "(partial_tiles, q_block_size)")
+        if token_mask_flags.dtype != torch.int32 or tuple(token_mask_flags.shape) != (batch, metadata_q_blocks, q2k_block_index.shape[-1]):
+            raise ValueError("blk128 token_mask_flags must be int32 partial-bound indices " "with shape (B, Q_blocks, K_max); use -1 for full tiles")
+        for tensor, name in (
+            (token_mask_bounds, "token_mask_bounds"),
+            (token_mask_flags, "token_mask_flags"),
+        ):
+            if not tensor.is_cuda or tensor.device != q_tensor.device:
+                raise ValueError(f"{name} must be on the same CUDA device as q")
 
     if block_sparse_num is None:
         block_sparse_num = int(q2k_block_index.shape[-1])
@@ -298,8 +330,13 @@ def block_sparse_attention_forward(
                 softmax_scale=softmax_scale,
                 pack_gqa=pack_gqa,
                 return_lse=True,
+                out=out,
+                lse=lse,
                 layout=layout,
                 kv_splits=kv_splits,
+                token_mask_bounds=token_mask_bounds,
+                token_mask_flags=token_mask_flags,
+                q_stage=q_stage,
             )
 
     return TupleDict(o_tensor=out, lse_tensor=lse)
@@ -384,11 +421,19 @@ def block_sparse_attention_backward(
     bucket_size_blocks: Optional[int] = None,
     sparse_block_size: Optional[int] = None,
     layout: str = "bhsd",
+    bucketed_k2q_offsets: Optional[torch.Tensor] = None,
+    bucketed_k2q_indices: Optional[torch.Tensor] = None,
+    token_mask_bounds: Optional[torch.Tensor] = None,
+    token_mask_flags: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compute explicit dQ, dK, and dV for block-sparse attention.
 
     Sparse metadata values are a caller contract; see the "Sparse metadata"
     section of ``docs/fe-oss-apis/bsa.md`` for the required value ranges.
+    Packed row bounds, full/partial tile flags, and bucketed K-to-Q CSR may
+    be prepared once on CPU, copied to CUDA, and reused across calls.
+    Bounds width 128 stores Q-row-to-K intervals; width 256 stores two
+    CPU-built Q bands for every K row and is optimized for backward traversal.
     """
 
     batch, num_q_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim, value_dim = _canonical_shapes(q_tensor, k_tensor, v_tensor, layout)
@@ -439,6 +484,39 @@ def block_sparse_attention_backward(
             require_even=sparse_block_size == 128,
         )
 
+    num_q_blocks = expected_prefix[2]
+    num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
+    num_kv_blocks = int(num_kv_blocks)
+    has_prebuilt_k2q = bucketed_k2q_offsets is not None or bucketed_k2q_indices is not None
+    if has_prebuilt_k2q:
+        if bucketed_k2q_offsets is None or bucketed_k2q_indices is None:
+            raise ValueError("bucketed K-to-Q tensors must be supplied together")
+        if (
+            bucketed_k2q_offsets.dtype != torch.int32
+            or bucketed_k2q_offsets.ndim != 4
+            or tuple(bucketed_k2q_offsets.shape[:2]) != (batch, num_q_heads)
+            or bucketed_k2q_offsets.shape[-1] != num_kv_blocks + 1
+        ):
+            raise ValueError("bucketed_k2q_offsets has an invalid shape or dtype")
+        if bucketed_k2q_indices.dtype != torch.int32 or bucketed_k2q_indices.ndim != 3 or tuple(bucketed_k2q_indices.shape[:2]) != (batch, num_q_heads):
+            raise ValueError("bucketed_k2q_indices has an invalid shape or dtype")
+        if bucketed_k2q_offsets.device != q_tensor.device or bucketed_k2q_indices.device != q_tensor.device:
+            raise ValueError("bucketed K-to-Q tensors must be on the same CUDA device as q")
+
+    has_token_mask = token_mask_bounds is not None or token_mask_flags is not None
+    if has_token_mask:
+        if sparse_block_size != 128 or arch_family not in {10, 11}:
+            raise NotImplementedError("row masks require the SM100/SM110 blk128 backward path")
+        if token_mask_bounds is None or token_mask_flags is None:
+            raise ValueError("token_mask_bounds and token_mask_flags must be supplied together")
+        expected_flags_shape = (batch, num_q_heads, num_q_blocks, num_kv_blocks)
+        if token_mask_bounds.dtype != torch.int32 or token_mask_bounds.ndim != 2 or token_mask_bounds.shape[1] not in (128, 256):
+            raise ValueError("backward token_mask_bounds must have shape (partial_tiles, 128 or 256)")
+        if token_mask_flags.dtype != torch.int32 or tuple(token_mask_flags.shape) != expected_flags_shape:
+            raise ValueError(f"backward token_mask_flags must have shape {expected_flags_shape}")
+        if token_mask_bounds.device != q_tensor.device or token_mask_flags.device != q_tensor.device:
+            raise ValueError("row-mask tensors must be on the same CUDA device as q")
+
     expected_lse_shape = (batch, num_q_heads, seqlen_q)
     if tuple(lse_tensor.shape) != expected_lse_shape:
         raise ValueError(f"lse_tensor shape must be {expected_lse_shape}, got {tuple(lse_tensor.shape)}")
@@ -473,7 +551,11 @@ def block_sparse_attention_backward(
             dk=dk_tensor,
             dv=dv_tensor,
             bucket_size_blocks=bucket_size_blocks,
+            bucketed_k2q_offsets=bucketed_k2q_offsets,
+            bucketed_k2q_indices=bucketed_k2q_indices,
             sparse_block_size=sparse_block_size,
+            token_mask_bounds=token_mask_bounds,
+            token_mask_flags=token_mask_flags,
             layout=layout,
         )
     return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
