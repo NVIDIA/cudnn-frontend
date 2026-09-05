@@ -14,13 +14,18 @@ cuDNN Frontend operations.
 
 **Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
 scores/top-K, sparse/dense score recompute, and sparse/dense indexer
-backward. The production
-sparse-attention forward kernel (FlashMLA) is C++ and is **not** integrated
-here; when evaluating the backward, use the pure-PyTorch reference in
+backward. The current sparse-attention forward provider is the external C++
+implementation from `deepseek-ai/FlashMLA`; it is not copied or vendored. The
+public API is provider-neutral: its initial B200 implementation dynamically
+calls that package's `flash_mla_sparse_fwd` and connects its outputs to cuDNN
+backward and score recompute. A future cuDNN-owned forward can replace the
+provider without changing model call sites. The pure-PyTorch test reference
+remains available at
 `test/python/fe_api/dsa/dsa_reference.py::ref_sparse_attention_forward`.
 
 The module packages the following operations:
 
+0. **Token-Indexed Sparse Attention Training** – semantic forward/autograd API whose current B200 provider is FlashMLA.
 1. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
@@ -28,13 +33,15 @@ The module packages the following operations:
    Top-K selection, and optional Top-K softmax in one public API call.
 4. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
-5. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
-   of indexer and attention scores for training loss.
-6. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
+5. **Sparse Indexer Score Recompute** – sparse (top-K) recompute of indexer
+   scores for training loss.
+6. **Sparse Attention Score Recompute** – sparse (top-K) recompute of
+   attention scores for training loss.
+7. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
    of the above.
-7. **Indexer Backward** – three-stage pipeline (score-grad, three
+8. **Indexer Backward** – three-stage pipeline (score-grad, three
    GEMMs, dtype cast) for sparse top-K score tensors.
-8. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
+9. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
 
 ### Architecture
 
@@ -78,6 +85,10 @@ from cudnn import DSA
 DSA.SparseAttentionBackward
 DSA.sparse_attention_backward_wrapper
 
+DSA.sparse_attention_forward
+DSA.sparse_attention
+DSA.sparse_attention_score_recompute
+
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
 DSA.indexer_forward_top_k_wrapper
@@ -109,6 +120,79 @@ DSA.dense_indexer_backward_wrapper
 ---
 
 ## Components
+
+### 0. Token-Indexed Sparse Attention Training (B200 prototype)
+
+`DSA.sparse_attention_forward`, `DSA.sparse_attention`, and
+`DSA.sparse_attention_score_recompute` describe the model operation rather
+than a particular provider. The current implementation imports `flash_mla`
+only when forward is called and invokes the external `flash_mla_sparse_fwd`
+symbol. It was developed against official FlashMLA commit
+`15f13e5030374295491c5ce31b02d7e63a7772c6` (MIT); neither FlashMLA nor vLLM
+implementation source is present in this repository. A missing or incompatible
+optional dependency raises `SparseAttentionBackendUnavailableError` instead
+of silently selecting a different forward. Because the adapter follows the
+pinned provider's private H/Top-K launch tiling, it requires the official
+`flash_mla` distribution version `1.0.0+15f13e5`. FlashMLA's build appends the
+Git short SHA to this distribution version; its module-level `__version__`
+remains the generic `1.0.0` and is not used as proof of compatibility. The
+imported package, Python callable, and compiled extension actually bound by
+that callable must all be owned by the same installed distribution whose
+version is pinned to `1.0.0+15f13e5`; shadowed or editable source trees are
+rejected. This ownership check is cached with a call-signature check:
+the current entry point must accept `q`, `kv`, and `indices` positionally, plus
+`sm_scale`, `d_v`, `attn_sink`, and `topk_length` by keyword. Both checks are
+host-only and run before the first provider launch. Provider selection and
+launch planning remain private, so a future cuDNN forward can replace this
+bridge without renaming the semantic API.
+
+The initial functional contract is exact SM100 (validated on ComputeLab B200),
+BF16, one flat MQA KV stream,
+`D_qk in {512, 576}`, `D_v = 512`, and `H in {16, 32, 64, 128}`. H16/H32 are
+zero-padded to the external H64 launch. KV uses a zero-copy singleton-head
+view. The raw forward views aligned Top-K without copying when no lengths are
+given; with `topk_length`, it safety-masks the inactive suffix because the
+current provider can speculatively read an ignored valid index. The training
+and score paths must also safety-normalize indices because FlashMLA accepts
+high invalid sentinels that current cuDNN backward cannot address safely.
+Safe-default calls clamp lengths to the physical `[0, K]` range. For training
+with lengths, valid active entries are compacted and a safe length is derived;
+without lengths, every invalid sentinel becomes `-1`.
+This safe default launches metadata work. Producers that already emit a
+compact, bounded active prefix can opt into `trusted_compact_metadata=True`:
+every active index must then satisfy `0 <= index < S_kv`, every length must be
+in `[0, K]`, every inactive-suffix index must be negative or at least `S_kv`,
+and without lengths every nonnegative index must be below `S_kv`. That explicit
+contract skips the device scan, mask, and compactification.
+FlashMLA Top-K alignment padding and a downstream kernel's required contiguous
+copy can still occur. The contract is not inferred from device values;
+violating it can cause an illegal memory access in the tuned backward kernel
+or let an ignored provider load contaminate the output.
+Score recompute instead preserves every original slot, masks invalid/inactive
+positions to `-1`, and returns those effective `indices` beside the aligned
+`target`. No D2H validation or synchronization is introduced. Launch-only
+tails are padded with `-1` and removed from returned results.
+
+```python
+result = DSA.sparse_attention(
+    q, kv, topk_idxs, attn_sink,
+    softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+    topk_length=topk_length,
+    trusted_compact_metadata=True,  # only for a producer satisfying the contract above
+)
+loss = result["output"].float().square().mean()
+loss.backward()  # cuDNN DSA backward: q.grad, kv.grad, attn_sink.grad
+
+score = DSA.sparse_attention_score_recompute(
+    q.detach(), kv.detach(), result["lse"], topk_idxs,
+    softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+    topk_length=topk_length,
+)
+target, effective_topk_idxs = score["target"], score["indices"]
+```
+
+`max_logits` and the KV-only `lse` are non-differentiable outputs. The latter
+excludes the attention sink, exactly as required by cuDNN DSA backward.
 
 ### 1. Sparse Attention Backward
 
@@ -510,8 +594,9 @@ result = DSA.dense_indexer_backward_wrapper(
   Indexer Forward, Indexer Top-K, and Indexer Backward support SM90 and SM100.
   The combined compressed-logits + Top-K forward is SM100-only; the standalone
   Indexer Top-K remains SM90+.
-- **No fused forward** — the production forward is FlashMLA (C++); this
-  module ships only the CuTe-DSL kernels.
+- **No vendored forward** — the production forward remains external FlashMLA
+  C++; the optional bridge dynamically calls it and never silently substitutes
+  a cuDNN or PyTorch implementation.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
   `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
   support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
