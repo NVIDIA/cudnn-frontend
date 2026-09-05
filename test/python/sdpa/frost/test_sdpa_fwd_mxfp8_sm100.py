@@ -483,10 +483,10 @@ def test_mxfp8_d256_bottom_right_rectangular(in_key):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_right_band():
-    """Pin the MX-specific right-band lowering; shared combinations run in PT."""
-    d = 256
+def test_mxfp8_wide_right_band(d):
+    """Pin the wide MX-specific right-band lowerings."""
     out, out_ref, _ = _run(
         1,
         4,
@@ -503,12 +503,12 @@ def test_mxfp8_d256_right_band():
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_dense_padding(in_key, causal):
-    """D256 masks a per-batch partial KV tile in dense storage."""
-    d = 256
+def test_mxfp8_wide_dense_padding(d, in_key, causal):
+    """Wide MXFP8 kernels mask a per-batch partial KV tile in dense storage."""
     sdpa_kwargs = dict(use_causal_mask=True) if causal else {}
     O, O_ref, amax = _run(
         2,
@@ -530,10 +530,10 @@ def test_mxfp8_d256_dense_padding(in_key, causal):
 
 @_skip_dense_q_trim_on_rubin
 @pytest.mark.L1
+@pytest.mark.parametrize("d", [256, 512], ids=["d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_d256_dense_q_trim_stats_sink():
+def test_mxfp8_wide_dense_q_trim_stats_sink(d):
     """Short dense Q rows trim O/LSE even when a sink makes softmax finite."""
-    d = 256
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
     result = _run(
         2,

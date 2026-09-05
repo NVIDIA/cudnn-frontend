@@ -324,6 +324,47 @@ def test_split_points_feeds_the_exact_cluster_extent():
     assert points[-1] == 1, "no-split must remain reachable behind the chosen split"
 
 
+@pytest.mark.parametrize(
+    "mask_facts,expected",
+    [
+        ({}, [4, 1]),
+        ({"causal": True, "right_bound": 0}, [1]),
+        ({"causal": True, "right_bound": 0, "window_left": 127}, [1]),
+        ({"causal": True, "right_bound": 0, "bottom_right": True}, [4, 1]),
+    ],
+    ids=["none", "top-left-causal", "causal-swa", "bottom-right-causal"],
+)
+def test_d512_mxfp8_split_cost_uses_static_mask_reachable_kv(mask_facts, expected):
+    """Static masks shorten the main KV loop before split-KV is ranked.
+
+    For Q=512/KV=16K, top-left causal and SWA can reach only a small KV
+    prefix/window and should stay unsplit. No-mask and bottom-right causal can
+    reach the full KV extent and retain the measured four-way split.
+    """
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.heuristics import _split_points
+
+    caps = next(sp for sp in ENGINE_SPECS if sp.name == "sdpa_fwd_prefill_sm100_mxfp8").capabilities
+    facts = ga.SdpaGraphFacts(
+        b=1,
+        h_q=8,
+        h_kv=1,
+        s_q=512,
+        s_kv=16384,
+        d_qk=512,
+        d_v=512,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_mxfp8=True,
+        device_sm_count=B200_SMS,
+        device_cc=(10, 0),
+        **mask_facts,
+    )
+    assert _split_points(caps, facts, 128, 128, 1) == expected
+
+
 # --- the candidate ladder ---------------------------------------------------
 
 

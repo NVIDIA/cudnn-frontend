@@ -1163,7 +1163,7 @@ def _api_fp8_case(
 
         o = torch.zeros(b, h_q, s_q, d_v, device=dev, dtype=torch.float16)  # HALF out
         amax = torch.zeros(1, dtype=torch.float32, device=dev)
-        split_cga = 1 if d_qk == 256 else 2
+        split_cga = 1 if d_qk in (256, 512) else 2
         split_knob = (
             1
             if force_one
@@ -1198,13 +1198,13 @@ def _api_fp8_case(
 
     _, o_one, _, _ = build(True)
     split, o_split, amax, ref_inputs = build(False)
-    if d_qk == 256:
+    if d_qk in (256, 512):
         q_ref, k_ref, v_ref = (t.permute(0, 2, 1, 3) for t in ref_inputs)
         reference = _ref_sdpa(q_ref, k_ref, v_ref, 1.0 / math.sqrt(d_qk), causal, h_kv).permute(0, 2, 1, 3)
         atol = 8e-2 if fp8_dtype == torch.float8_e5m2 else 5e-2
         for name, output in (("split", o_split), ("unsplit", o_one)):
             diff = (output - reference).abs().max().item()
-            assert diff <= atol, f"D256 {name} max|O-ref|={diff:.4f} > {atol:.4f}"
+            assert diff <= atol, f"D{d_qk} {name} max|O-ref|={diff:.4f} > {atol:.4f}"
     return split, o_split, o_one, amax
 
 
@@ -1273,6 +1273,42 @@ def test_api_splits_mxfp8_d192():
     split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=True, d_qk=192, d_v=128)
     assert split > 1
     assert (got - unsplit).abs().max().item() <= 8e-2
+
+
+@pytest.mark.L0
+def test_api_splits_mxfp8_d512():
+    """D512 MXFP8 computes and recombines both Dv256 output slices."""
+    split, got, unsplit, _ = _api_fp8_case(8, 1, 512, 16384, mx=True, d_qk=512, d_v=512)
+    assert split > 1
+    assert (got - unsplit).abs().max().item() <= 5e-2
+
+
+@pytest.mark.L0
+def test_api_splits_mxfp8_d512_causal_e5m2():
+    """D512 E5M2 handles empty causal split ranges in both output slices."""
+    split, got, unsplit, _ = _api_fp8_case(
+        8,
+        1,
+        512,
+        4096,
+        mx=True,
+        d_qk=512,
+        d_v=512,
+        fp8_dtype=torch.float8_e5m2,
+        causal=True,
+    )
+    assert split > 1
+    assert (got - unsplit).abs().max().item() <= 8e-2
+
+
+@pytest.mark.L0
+def test_api_mxfp8_d512_amax_describes_recombined_output():
+    """D512 reports amax from the recombined output, not its split partials."""
+    split, got, _unsplit, amax = _api_fp8_case(8, 1, 512, 16384, mx=True, d_qk=512, d_v=512)
+    assert split > 1
+    true_amax = got.abs().max().item()
+    assert amax >= true_amax * 0.99
+    assert amax <= true_amax * 1.01
 
 
 @pytest.mark.L0

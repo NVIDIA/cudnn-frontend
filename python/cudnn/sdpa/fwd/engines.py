@@ -738,7 +738,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             d_pad_multiple=0,
             thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
-            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -752,7 +752,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
-            dense_seq_q_trim_d_shapes=frozenset({(256, 256)}),
+            dense_seq_q_trim_d_shapes=frozenset({(256, 256), (512, 512)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -1172,7 +1172,7 @@ def lower_dsl_prefill(
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
         # THD carries Q lengths via cu_seqlens; support is selected per native
-        # flavor above because only D256 FP8/MXFP8 currently consumes it.
+        # flavor above because only kernels with a quantized Q-length ABI consume it.
         seq_q_lens_present=seq_q_lens_present,
         # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
         # adapter's seq-lens execute arguments carry (B+1,) prefix sums.

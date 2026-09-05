@@ -80,7 +80,7 @@ MMA as d=512.
 | Padding mask (`seq_len_q/kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ |
 | THD + causal family (top-left / bottom-right / SWA / band) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | f16/fp8 only⁴ | f16/fp8 only⁴ | ✅ | f16/fp8 only⁴ | ❌ |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 only⁵ | ❌ |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | f16 only⁵ | f16 only⁵ | f16 only⁵ | ✅ | f16 + mxfp8⁵ | ❌ |
 | Attention sink | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |
 | Bias / dBias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -97,7 +97,8 @@ graph is declined rather than routed onto it at >2× zero-padding cost.
 ³ Quantized THD is exact-shape only. The d192×d128 and d512 MXFP8 kernels use
 the same packed-metadata lowering as the d128/d256 kernels, not an envelope.
 ⁴ MXFP8 lacks the `SEQ_Q_LENS_PRESENT` epilogue trim (`padded_stats=False`).
-⁵ FP8 and MXFP8 rows are not plumbed for the dense padded-Q trim.
+⁵ Quantized dense Q trim is implemented by the d256 FP8/MXFP8 kernels and the
+d512 MXFP8 kernel; the other quantized shapes do not expose its optional ABI slot.
 ⁶ Served through the padded path with synthesized full-length KV lengths, or
 natively when the causal band covers the KV tail.
 ⁷ **No d=64 kernel exists on SM100.** `_SM100_FLAVORS` is

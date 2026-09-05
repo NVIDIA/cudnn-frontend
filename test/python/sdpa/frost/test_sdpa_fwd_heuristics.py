@@ -97,7 +97,7 @@ def test_recommend_split_leads_and_respects_structure():
     #   S_q=985   0.955 ms -> 0.556 ms (split 4, 1.72x)
     #   S_q=2048  0.960 ms -> 0.722 ms (split 2, 1.33x)
     #   S_q>=4096 unchanged (model declines to split a full grid)
-    plans = [p for p in recommend("A", _facts(), _OFFERED) if p.engine_id == 20500]
+    plans = [p for p in recommend("A", _facts(causal=False), _OFFERED) if p.engine_id == 20500]
     assert plans[0].knobs.split_kv > 1, "an underfilled grid runs the split the model chose"
     assert any(p.knobs.split_kv == 1 for p in plans), "no-split must stay reachable as the runner-up"
     for bad in (dict(has_sink=True), dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
@@ -316,7 +316,7 @@ def _dsl_available() -> bool:
     return True
 
 
-def _build_decodeish_graph():
+def _build_decodeish_graph(*, causal=True):
     B, H, SQ, SKV, D = 1, 4, 128, 8192, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
@@ -326,7 +326,7 @@ def _build_decodeish_graph():
     q = g.tensor(dim=(B, H, SQ, D), stride=(SQ * H * D, D, H * D, 1), data_type=cudnn.data_type.HALF, name="q")
     k = g.tensor(dim=(B, H, SKV, D), stride=(SKV * H * D, D, H * D, 1), data_type=cudnn.data_type.HALF, name="k")
     v = g.tensor(dim=(B, H, SKV, D), stride=(SKV * H * D, D, H * D, 1), data_type=cudnn.data_type.HALF, name="v")
-    o, st = g.sdpa(name="sdpa", q=q, k=k, v=v, attn_scale=1.0 / math.sqrt(D), is_inference=False, use_causal_mask=True)
+    o, st = g.sdpa(name="sdpa", q=q, k=k, v=v, attn_scale=1.0 / math.sqrt(D), is_inference=False, use_causal_mask=causal)
     o.set_output(True).set_dim((B, H, SQ, D)).set_stride((SQ * H * D, D, H * D, 1))
     st.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
@@ -340,7 +340,7 @@ def _build_decodeish_graph():
 def test_split_kv_plan_pinned_by_name_matches_reference():
     """Issue F-2 regression: the split plan is graph-reachable, carves its
     slabs from the caller workspace, and recombines exactly."""
-    g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph()
+    g, (q, k, v, o, st), (B, H, SQ, SKV, D) = _build_decodeish_graph(causal=False)
     # The split value depends on this device's SM count — ask the chooser
     # rather than hard-coding one that only holds at one part's geometry.
     from cudnn._device import device_info
@@ -378,16 +378,13 @@ def test_split_kv_plan_pinned_by_name_matches_reference():
     torch.cuda.synchronize()
 
     s = torch.einsum("bhqd,bhkd->bhqk", q_gpu.float(), k_gpu.float()) / math.sqrt(D)
-    i = torch.arange(SQ, device="cuda").view(SQ, 1)
-    j = torch.arange(SKV, device="cuda").view(1, SKV)
-    s = s.masked_fill(j > i, float("-inf"))
     torch.testing.assert_close(o_gpu, torch.einsum("bhqk,bhkd->bhqd", torch.softmax(s, dim=-1), v_gpu.float()).half(), atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(st_gpu.squeeze(-1), torch.logsumexp(s, dim=-1), atol=2e-3, rtol=2e-3)
 
     # Autotune replay: the split entry round-trips through (engine_id, knobs).
     eng_id, knobs = g.get_engine_and_knobs_at_index(split_idx)
     assert knobs.split_kv == want
-    g2, handles2, _ = _build_decodeish_graph()
+    g2, handles2, _ = _build_decodeish_graph(causal=False)
     cfg = g2.create_execution_plan(eng_id, knobs)
     assert cfg is not None
 

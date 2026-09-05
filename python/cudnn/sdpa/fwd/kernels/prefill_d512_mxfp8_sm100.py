@@ -3366,14 +3366,14 @@ def _host(
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
+    # Dense padded-Q trim: separate (B,)-int32 lengths. None folds the
+    # parameter and all consumers out when the specialization is disabled.
+    seq_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    # D512 does not advertise dense padded-Q trimming. Keep the shared bounds
-    # helpers folded to their no-trim specialization without adding an ABI slot.
-    seq_q_lens_tensor = None
     B, QH, KH, SQ, SKV, _ = problem_size
     if cutlass.const_expr(CFG.THD_VARLEN):
         SQ = q_tensor.shape[1]
@@ -3669,6 +3669,16 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
+    fake_seq_q_lens = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (b,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+        if CFG.SEQ_Q_LENS_PRESENT
+        else None
+    )
     if CFG.THD_VARLEN:
         fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
@@ -3705,6 +3715,7 @@ def compile(  # noqa: A001
         (b, qh, kh, 0, 0, 0) if CFG.THD_VARLEN else (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
+        fake_seq_q_lens,
         fake_thd_q_lens,
         fake_thd_kv_lens,
         fake_thd_lens_form,
