@@ -8,6 +8,7 @@
 #include <cudnn_frontend.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,12 +37,26 @@ struct Barrier {
 };
 
 // ---------------------------------------------------------------------------
+// Shape of the matmul used by every test here.  The defaults are the shape that
+// the thread-safety tests use; the revision tests vary m.
+// ---------------------------------------------------------------------------
+struct MatmulShape {
+    int64_t b = 4;
+    int64_t m = 16;
+    int64_t n = 32;
+    int64_t k = 64;
+};
+
+// ---------------------------------------------------------------------------
 // Create a minimal dynamic-shape matmul graph, optionally pre-attaching a
 // KernelCache.  The KC MUST be set before build_operation_graph() — that is
 // the call-site where graph_interface.h calls kc->build(op_graph).
+//
+// The tests never execute the graph, so no device memory is allocated and only
+// plan compilation costs anything.
 // ---------------------------------------------------------------------------
 std::shared_ptr<cudnn_frontend::graph::Graph>
-setup_matmul_graph(std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr) {
+setup_matmul_graph(std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr, MatmulShape shape = {}) {
     namespace fe = cudnn_frontend;
     auto g       = std::make_shared<fe::graph::Graph>();
     g->set_io_data_type(fe::DataType_t::HALF)
@@ -52,8 +67,14 @@ setup_matmul_graph(std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr) {
         g->set_kernel_cache(kc);
     }
 
-    auto A = g->tensor(fe::graph::Tensor_attributes().set_name("A").set_dim({4, 16, 64}).set_stride({16 * 64, 64, 1}));
-    auto B = g->tensor(fe::graph::Tensor_attributes().set_name("B").set_dim({4, 64, 32}).set_stride({64 * 32, 32, 1}));
+    auto A = g->tensor(fe::graph::Tensor_attributes()
+                           .set_name("A")
+                           .set_dim({shape.b, shape.m, shape.k})
+                           .set_stride({shape.m * shape.k, shape.k, 1}));
+    auto B = g->tensor(fe::graph::Tensor_attributes()
+                           .set_name("B")
+                           .set_dim({shape.b, shape.k, shape.n})
+                           .set_stride({shape.k * shape.n, shape.n, 1}));
     auto C = g->matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
     C->set_output(true);
 
@@ -62,11 +83,47 @@ setup_matmul_graph(std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr) {
 }
 
 // Build the operation graph (calls kc->build(op_graph) if KC was pre-attached).
+// This finalizes the KC but compiles no plan, so it cannot change the number of
+// entries.
 std::shared_ptr<cudnn_frontend::graph::Graph>
-make_matmul_graph(cudnnHandle_t handle, std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr) {
-    auto g = setup_matmul_graph(kc);
+make_matmul_graph(cudnnHandle_t handle,
+                  std::shared_ptr<cudnn_frontend::KernelCache> kc = nullptr,
+                  MatmulShape shape                               = {}) {
+    auto g = setup_matmul_graph(kc, shape);
     REQUIRE(g->build_operation_graph(handle).is_good());
     return g;
+}
+
+// Compile the plan.  This is the only step that can add a kernel cache entry.
+void
+build_plan(cudnnHandle_t handle, std::shared_ptr<cudnn_frontend::graph::Graph> const& g) {
+    namespace fe = cudnn_frontend;
+    REQUIRE(g->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+    REQUIRE(g->check_support(handle).is_good());
+    REQUIRE(g->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+}
+
+// The two accessors are available starting cuDNN 9.27.
+constexpr int64_t MIN_REVISION_VERSION = 92700;
+
+struct CacheState {
+    int64_t revision = -1;
+    int64_t size     = -1;
+};
+
+// The revision tests vary only m, and keep the tensors in the low kilobytes.
+MatmulShape
+revision_shape(int64_t m) {
+    return MatmulShape{1, m, 32, 32};
+}
+
+// Read both accessors from a finalized kernel cache.
+CacheState
+read_state(std::shared_ptr<cudnn_frontend::KernelCache> const& kc) {
+    CacheState state;
+    REQUIRE(kc->revision(state.revision).is_good());
+    REQUIRE(kc->size(state.size).is_good());
+    return state;
 }
 
 }  // namespace
@@ -269,4 +326,150 @@ TEST_CASE("KernelCache build() is idempotent after first finalization", "[kernel
     REQUIRE(kc->build(nullptr).is_good());
     REQUIRE(kc->build(nullptr).is_good());
     REQUIRE(kc->get_ptr_locked() == ptr1);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — both accessors need a finalized cache
+//
+// An unfinalized cache fails in two different ways.  A cache that was never
+// built has no descriptor and trips the frontend guard.  A cache that came from
+// from_json() has a descriptor, but the backend rejects the read.
+//
+// The test also pins the baseline of a loaded cache.  from_json() does not
+// restore a counter: the serialized data does not contain one.  The load starts
+// a new count and adds one for each entry that it puts in the cache.  Thus the
+// baseline is the entry count, and not zero.
+// ---------------------------------------------------------------------------
+TEST_CASE("KernelCache revision() and size() need a finalized cache", "[kernel_cache][revision]") {
+    if (cudnn_frontend::detail::get_backend_version() < MIN_REVISION_VERSION) {
+        SKIP("KernelCache revision()/size() require cuDNN >= 9.27");
+    }
+
+    {
+        auto never_built = std::make_shared<cudnn_frontend::KernelCache>();
+        int64_t value    = 0;
+        REQUIRE(never_built->revision(value).is_bad());
+        REQUIRE(never_built->size(value).is_bad());
+    }
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    auto source = std::make_shared<cudnn_frontend::KernelCache>();
+    auto g      = make_matmul_graph(handle, source, revision_shape(32));
+    build_plan(handle, g);
+
+    std::string blob;
+    REQUIRE(source->to_json(blob).is_good());
+    REQUIRE(!blob.empty());
+
+    auto loaded = std::make_shared<cudnn_frontend::KernelCache>();
+    REQUIRE(loaded->from_json(blob).is_good());
+    {
+        int64_t value = 0;
+        REQUIRE(loaded->revision(value).is_bad());
+        REQUIRE(loaded->size(value).is_bad());
+    }
+
+    (void)make_matmul_graph(handle, loaded, revision_shape(32));
+    auto const baseline = read_state(loaded);
+    REQUIRE(baseline.size >= 1);
+    REQUIRE(baseline.revision == baseline.size);
+
+    cudnnDestroy(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — the counter starts at zero, an insertion adds one, a lookup adds none
+// ---------------------------------------------------------------------------
+TEST_CASE("KernelCache revision() counts insertions and ignores lookups", "[kernel_cache][revision]") {
+    if (cudnn_frontend::detail::get_backend_version() < MIN_REVISION_VERSION) {
+        SKIP("KernelCache revision()/size() require cuDNN >= 9.27");
+    }
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    auto kc = std::make_shared<cudnn_frontend::KernelCache>();
+    auto g  = make_matmul_graph(handle, kc, revision_shape(32));
+
+    // Finalized, but no plan is compiled yet.
+    auto const empty = read_state(kc);
+    REQUIRE(empty.revision == 0);
+    REQUIRE(empty.size == 0);
+
+    // The first plan build on a cold cache always inserts.
+    build_plan(handle, g);
+    auto const first = read_state(kc);
+    REQUIRE(first.revision == 1);
+    REQUIRE(first.size == 1);
+
+    // The same shape finds the entry.  A lookup does not change the counter.
+    auto g_repeat = make_matmul_graph(handle, kc, revision_shape(32));
+    build_plan(handle, g_repeat);
+    auto const repeat = read_state(kc);
+    REQUIRE(repeat.revision == first.revision);
+    REQUIRE(repeat.size == first.size);
+
+    cudnnDestroy(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — revision() advances exactly as many times as size() grows
+//
+// Two different shapes can use the same kernel cache entry, so a new shape is
+// not necessarily a new entry.  Which shapes share an entry depends on the
+// architecture and on the cuDNN version, because a different kernel may be
+// chosen.  The test therefore walks a ladder of shapes, and asserts only the
+// invariant that holds for a hit and for an insertion alike.  These graphs
+// cause no replacement and no eviction, so the two deltas must agree at each
+// step.  The ladder stops as soon as it has seen both a hit and an insertion,
+// which keeps the number of plan compilations low.
+// ---------------------------------------------------------------------------
+TEST_CASE("KernelCache revision() grows with size()", "[kernel_cache][revision]") {
+    if (cudnn_frontend::detail::get_backend_version() < MIN_REVISION_VERSION) {
+        SKIP("KernelCache revision()/size() require cuDNN >= 9.27");
+    }
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    std::vector<int64_t> const ladder = {16, 32, 64, 128, 256, 512};
+
+    auto kc = std::make_shared<cudnn_frontend::KernelCache>();
+    CacheState previous;
+    bool saw_insertion = false;
+    bool saw_hit       = false;
+
+    for (size_t i = 0; i < ladder.size() && !(saw_insertion && saw_hit); ++i) {
+        auto g = make_matmul_graph(handle, kc, revision_shape(ladder[i]));
+        if (i == 0) {
+            previous = read_state(kc);
+        }
+        build_plan(handle, g);
+        auto const now = read_state(kc);
+
+        INFO("m = " << ladder[i] << ", revision " << previous.revision << " -> " << now.revision << ", size "
+                    << previous.size << " -> " << now.size);
+        REQUIRE(now.revision >= previous.revision);
+        REQUIRE(now.size >= previous.size);
+        REQUIRE(now.revision - previous.revision == now.size - previous.size);
+
+        if (now.size > previous.size) {
+            saw_insertion = true;
+        } else {
+            saw_hit = true;
+        }
+        previous = now;
+    }
+
+    cudnnDestroy(handle);
+
+    // Which shapes share an entry is a property of the heuristics, so a supported
+    // configuration may give only insertions or only hits. That is not a failure: the delta
+    // invariant above is checked either way, and Test 7 pins an insertion and a lookup
+    // deterministically. Report the weaker coverage instead of failing.
+    if (!saw_insertion || !saw_hit) {
+        WARN("the shape ladder gave no cache hit or no cache insertion on this configuration");
+    }
 }
